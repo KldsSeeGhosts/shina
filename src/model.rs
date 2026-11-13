@@ -548,6 +548,39 @@ pub struct WorktreeSetupState {
     pub skipped: bool,
 }
 
+#[derive(Clone, Debug)]
+enum MultiModelTargetOutcome {
+    Pending,
+    Started,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+struct MultiModelTargetEntry {
+    selection: crate::model_selection::ModelSelection,
+    display_name: String,
+    thread_id: Option<usize>,
+    create_cmd_id: Option<uuid::Uuid>,
+    send_cmd_id: Option<uuid::Uuid>,
+    outcome: MultiModelTargetOutcome,
+}
+
+struct MultiModelBatch {
+    source_thread_id: usize,
+    server: String,
+    project: Option<ProjectId>,
+    base_branch: String,
+    start_from_origin: bool,
+    access: AccessMode,
+    prompt: Prompt,
+    snapshot: crate::composer_rich::Snapshot,
+    reply_to: Option<crate::composer_context::ComposerContextRecord>,
+    saved_draft_model_state: crate::model_selection::DraftModelState,
+    targets: Vec<MultiModelTargetEntry>,
+    occupied_remote_ids: Vec<usize>,
+    next_remote_index: usize,
+}
+
 struct WorktreeSetupResultMsg {
     thread_id: usize,
     run_seq: u64,
@@ -796,6 +829,7 @@ impl Thread {
             && !self.life.settled()
             && self.life.snoozed_at.is_none()
             && self.life.failed_at.is_none()
+            && !self.worktree_bootstrapping()
             && self.status == Status::Ready
             && self.unused_session()
             && self.messages.is_empty()
@@ -825,6 +859,7 @@ impl Thread {
             && self.unused_session()
             && self.messages.is_empty()
             && !self.has_draft_content()
+            && self.draft_model_state.additional_models.is_empty()
             && self.remote_send.is_none()
             && self.client_creating.is_none()
             && !self.configuring
@@ -3673,6 +3708,7 @@ pub struct State {
     vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
     worktree_bootstrap_rxs: Vec<std::sync::mpsc::Receiver<WorktreeBootstrapResult>>,
     worktree_setup_rxs: Vec<std::sync::mpsc::Receiver<WorktreeSetupResultMsg>>,
+    multi_model_batches: Vec<MultiModelBatch>,
     #[cfg(test)]
     pub(crate) test_git_context: Option<crate::vcs::GitContext>,
     #[cfg(test)]
@@ -3917,6 +3953,7 @@ impl State {
             vcs_branch_rxs: Vec::new(),
             worktree_bootstrap_rxs: Vec::new(),
             worktree_setup_rxs: Vec::new(),
+            multi_model_batches: Vec::new(),
             #[cfg(test)]
             test_git_context: None,
             #[cfg(test)]
@@ -8668,6 +8705,18 @@ impl State {
     }
 
     fn send_background_intent(&mut self, approval_redirect: bool) {
+        if !self
+            .current()
+            .draft_model_state
+            .additional_models
+            .is_empty()
+            && !self.demo
+            && !self.ownership_denied
+            && !self.current().archived()
+        {
+            let _ = self.dispatch_send_intent(true, approval_redirect);
+            return;
+        }
         let source_index = self.active;
         let source_id = self.current().id;
         let was_draft = self.current().is_draft();
@@ -8848,8 +8897,13 @@ impl State {
         if !is_repo {
             return ComposerVcsControls::Hidden;
         }
+        let mode = if !thread.draft_model_state.additional_models.is_empty() {
+            ThreadEnvMode::Worktree
+        } else {
+            self.effective_env_mode(thread)
+        };
         ComposerVcsControls::Editable {
-            mode: self.effective_env_mode(thread),
+            mode,
             base_branch: thread.base_branch.clone(),
             start_from_origin: thread.effective_start_from_origin(),
         }
@@ -9325,6 +9379,7 @@ impl State {
                     let Some(boot) = self.threads[index].worktree_bootstrap.take() else {
                         continue;
                     };
+                    let in_multi_batch = self.is_multi_model_target_thread(msg.thread_id);
                     match msg.result {
                         Ok(created) => {
                             let project_cwd = self
@@ -9383,21 +9438,46 @@ impl State {
                                     self.release_after_worktree_setup(index);
                                 }
                             }
+                            if in_multi_batch
+                                && let Some(idx) =
+                                    self.threads.iter().position(|t| t.id == msg.thread_id)
+                            {
+                                if self.threads[idx].status == Status::Failed {
+                                    let error = self.threads[idx]
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "Failed to start thread.".into());
+                                    self.remove_failed_multi_model_thread(msg.thread_id);
+                                    self.record_multi_model_target_outcome(
+                                        msg.thread_id,
+                                        Err(error),
+                                    );
+                                } else {
+                                    self.threads[idx].background_start_pending =
+                                        self.runtime_enabled || self.threads[idx].pi.is_some();
+                                    self.record_multi_model_target_outcome(msg.thread_id, Ok(()));
+                                }
+                            }
                             self.checkpoint();
                         }
                         Err(error) => {
-                            let thread = &mut self.threads[index];
-                            thread.native.queue.retain(|q| q.id != boot.queued_id);
-                            thread.native.fresh_queue_ids.remove(&boot.queued_id);
-                            thread.native.queue_held = false;
-                            thread.worktree_path = None;
-                            thread.branch = None;
-                            thread.env_mode = Some(ThreadEnvMode::Worktree);
-                            thread.restore_snapshot(&boot.snapshot);
-                            if thread.draft_reply_to.is_none() {
-                                thread.draft_reply_to = boot.reply_to;
+                            if in_multi_batch {
+                                self.remove_failed_multi_model_thread(msg.thread_id);
+                                self.record_multi_model_target_outcome(msg.thread_id, Err(error));
+                            } else {
+                                let thread = &mut self.threads[index];
+                                thread.native.queue.retain(|q| q.id != boot.queued_id);
+                                thread.native.fresh_queue_ids.remove(&boot.queued_id);
+                                thread.native.queue_held = false;
+                                thread.worktree_path = None;
+                                thread.branch = None;
+                                thread.env_mode = Some(ThreadEnvMode::Worktree);
+                                thread.restore_snapshot(&boot.snapshot);
+                                if thread.draft_reply_to.is_none() {
+                                    thread.draft_reply_to = boot.reply_to;
+                                }
+                                thread.submission_error = Some(error);
                             }
-                            thread.submission_error = Some(error);
                             self.checkpoint();
                         }
                     }
@@ -9407,7 +9487,837 @@ impl State {
             }
         }
         self.worktree_bootstrap_rxs = remaining;
+        self.resolve_completed_multi_model_batches();
         changed
+    }
+
+    fn is_multi_model_target_thread(&self, thread_id: usize) -> bool {
+        self.multi_model_batches.iter().any(|batch| {
+            batch
+                .targets
+                .iter()
+                .any(|target| target.thread_id == Some(thread_id))
+        })
+    }
+
+    fn remove_failed_multi_model_thread(&mut self, thread_id: usize) {
+        let active_id = self.threads.get(self.active).map(|t| t.id);
+        if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+            let _ = t.stop_task();
+            t.disconnect();
+        }
+        self.threads.retain(|t| t.id != thread_id);
+        self.tabs.retain(|id| *id != thread_id);
+        if let Some(aid) = active_id
+            && let Some(new_idx) = self.threads.iter().position(|t| t.id == aid)
+        {
+            self.active = new_idx;
+        } else if self.active >= self.threads.len() && !self.threads.is_empty() {
+            self.active = self.threads.len() - 1;
+        }
+    }
+
+    fn record_multi_model_target_outcome(&mut self, thread_id: usize, result: Result<(), String>) {
+        for batch in &mut self.multi_model_batches {
+            if let Some(target) = batch
+                .targets
+                .iter_mut()
+                .find(|t| t.thread_id == Some(thread_id))
+            {
+                target.outcome = match result {
+                    Ok(()) => MultiModelTargetOutcome::Started,
+                    Err(err) => MultiModelTargetOutcome::Failed(err),
+                };
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn handle_multi_model_async_failure(
+        &mut self,
+        thread_id: usize,
+        error: &str,
+    ) -> bool {
+        let in_open_batch = self
+            .multi_model_batches
+            .iter()
+            .any(|batch| batch.targets.iter().any(|t| t.thread_id == Some(thread_id)));
+        if !in_open_batch {
+            return false;
+        }
+        self.remove_failed_multi_model_thread(thread_id);
+        self.record_multi_model_target_outcome(thread_id, Err(error.to_owned()));
+        self.resolve_completed_multi_model_batches();
+        true
+    }
+
+    fn resolve_completed_multi_model_batches(&mut self) {
+        let mut remaining = Vec::with_capacity(self.multi_model_batches.len());
+        let mut completed = Vec::new();
+        for batch in self.multi_model_batches.drain(..) {
+            if batch
+                .targets
+                .iter()
+                .any(|t| matches!(t.outcome, MultiModelTargetOutcome::Pending))
+            {
+                remaining.push(batch);
+            } else {
+                completed.push(batch);
+            }
+        }
+        self.multi_model_batches = remaining;
+        for batch in completed {
+            self.finalize_multi_model_batch(batch);
+        }
+    }
+
+    fn finalize_multi_model_batch(&mut self, batch: MultiModelBatch) {
+        let started_count = batch
+            .targets
+            .iter()
+            .filter(|t| matches!(t.outcome, MultiModelTargetOutcome::Started))
+            .count();
+        let failed_entries: Vec<&MultiModelTargetEntry> = batch
+            .targets
+            .iter()
+            .filter(|t| matches!(t.outcome, MultiModelTargetOutcome::Failed(_)))
+            .collect();
+
+        if failed_entries.is_empty() {
+            self.push_toast(
+                ToastKind::Success,
+                format!(
+                    "Started {started_count} {} in background",
+                    if started_count == 1 {
+                        "thread"
+                    } else {
+                        "threads"
+                    }
+                ),
+                None,
+                None,
+                Some(5_000),
+            );
+            self.checkpoint();
+            return;
+        }
+
+        if let Some(source_idx) = self
+            .threads
+            .iter()
+            .position(|t| t.id == batch.source_thread_id)
+            && !self.threads[source_idx].has_draft_content()
+        {
+            self.threads[source_idx].restore_snapshot(&batch.snapshot);
+            if self.threads[source_idx].draft_reply_to.is_none() {
+                self.threads[source_idx].draft_reply_to = batch.reply_to.clone();
+            }
+            if started_count == 0 {
+                self.threads[source_idx].draft_model_state = batch.saved_draft_model_state.clone();
+            } else {
+                let first_failed = &failed_entries[0].selection;
+                let remaining_failed: Vec<crate::model_selection::ModelSelection> = failed_entries
+                    .iter()
+                    .skip(1)
+                    .map(|e| e.selection.clone())
+                    .collect();
+                let current_active = self.active;
+                self.active = source_idx;
+                if self.threads[source_idx].harness != first_failed.instance_id
+                    && self.validate_harness(&first_failed.instance_id).is_ok()
+                {
+                    self.choose_harness(&first_failed.instance_id);
+                }
+                let provider = if first_failed.instance_id == "pi" {
+                    "cpa".to_owned()
+                } else {
+                    first_failed.instance_id.clone()
+                };
+                self.threads[source_idx].set_model(provider, first_failed.model.clone());
+                for opt in &first_failed.options {
+                    self.threads[source_idx].set_option(opt.id.clone(), opt.value.clone());
+                }
+                self.threads[source_idx].draft_model_state =
+                    crate::model_selection::DraftModelState {
+                        active_provider: Some(first_failed.instance_id.clone()),
+                        model_selection_by_provider: std::collections::BTreeMap::from([(
+                            first_failed.instance_id.clone(),
+                            first_failed.clone(),
+                        )]),
+                        model_selection_explicit: true,
+                        additional_models: remaining_failed,
+                    };
+                self.threads[source_idx].env_mode = Some(ThreadEnvMode::Worktree);
+                if self.threads[source_idx].base_branch.is_none() {
+                    self.threads[source_idx].base_branch = Some(batch.base_branch.clone());
+                }
+                self.active = current_active;
+            }
+        }
+
+        let failed_names: Vec<String> = failed_entries
+            .iter()
+            .map(|e| e.display_name.clone())
+            .collect();
+        let mut errors = Vec::new();
+        for entry in &failed_entries {
+            if let MultiModelTargetOutcome::Failed(err) = &entry.outcome
+                && !errors.contains(err)
+            {
+                errors.push(err.clone());
+            }
+        }
+        self.push_toast(
+            ToastKind::Error,
+            format!("Could not start {}", failed_names.join(", ")),
+            (!errors.is_empty()).then(|| errors.join(" ")),
+            None,
+            None,
+        );
+        self.checkpoint();
+    }
+
+    fn model_display_name_for_selection(
+        &self,
+        selection: &crate::model_selection::ModelSelection,
+    ) -> String {
+        if selection.instance_id == "pi" {
+            if let Some(m) = self.catalog.models.iter().find(|m| m.id == selection.model) {
+                return m.name.clone();
+            }
+        }
+        self.picker_models_by_instance()
+            .get(&selection.instance_id)
+            .and_then(|opts| opts.iter().find(|o| o.slug == selection.model))
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| selection.model.clone())
+    }
+
+    fn validate_local_multi_model_target(
+        &self,
+        selection: &crate::model_selection::ModelSelection,
+        has_images: bool,
+        entries: &[crate::model_picker::ProviderInstanceEntry],
+        picker_models: &std::collections::BTreeMap<
+            String,
+            Vec<crate::model_picker::PickerModelOption>,
+        >,
+    ) -> Result<Vec<AgentModel>, String> {
+        self.validate_harness(&selection.instance_id)?;
+        if let Some(entry) = entries
+            .iter()
+            .find(|e| e.instance_id == selection.instance_id)
+            && !crate::model_picker::is_provider_instance_picker_ready(entry)
+        {
+            return Err(crate::model_picker::get_provider_status_message(entry));
+        }
+
+        if selection.instance_id == "pi" {
+            if let Some(model) = self.catalog.models.iter().find(|m| m.id == selection.model) {
+                if !model.provider.is_empty() && model.provider != "cpa" {
+                    return Err(
+                        "Choose a CPA model before sending. Shina will not send prompts to a direct provider."
+                            .into(),
+                    );
+                }
+                if has_images && model.supports_images == Some(false) {
+                    return Err(
+                        "This model does not support image attachments. Remove the images or switch to a vision model."
+                            .into(),
+                    );
+                }
+            } else if !self.catalog.models.is_empty() && !selection.model.starts_with("cpa/") {
+                return Err(
+                    "Choose a CPA model before sending. Shina will not send prompts to a direct provider."
+                        .into(),
+                );
+            }
+            return Ok(self.catalog.models.clone());
+        }
+
+        if let Some(opt) = picker_models
+            .get(&selection.instance_id)
+            .and_then(|opts| opts.iter().find(|o| o.slug == selection.model))
+            && opt.is_unavailable
+        {
+            return Err(format!("{} is unavailable.", opt.name));
+        }
+
+        let models = self.harness_models(&selection.instance_id);
+        if has_images
+            && models
+                .iter()
+                .find(|m| m.id == selection.model)
+                .is_some_and(|m| m.supports_images == Some(false))
+        {
+            return Err(
+                "This model does not support image attachments. Remove the images or switch to a vision model."
+                    .into(),
+            );
+        }
+        Ok(models)
+    }
+
+    fn advance_remote_multi_model_batch(&mut self, batch_idx: usize) {
+        let Some(batch) = self.multi_model_batches.get_mut(batch_idx) else {
+            return;
+        };
+        let server = batch.server.clone();
+        while batch.next_remote_index < batch.targets.len() {
+            let target_idx = batch.next_remote_index;
+            batch.next_remote_index += 1;
+            let selection = batch.targets[target_idx].selection.clone();
+            let provider = if selection.instance_id == "pi" {
+                "cpa".to_owned()
+            } else {
+                selection.instance_id.clone()
+            };
+            let thinking = selection
+                .options
+                .iter()
+                .find(|o| {
+                    matches!(
+                        o.id.as_str(),
+                        "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
+                    )
+                })
+                .and_then(|o| o.value.as_str())
+                .map(str::to_owned);
+            let service_tier = selection
+                .options
+                .iter()
+                .find(|o| o.id == "serviceTier")
+                .and_then(|o| o.value.as_str())
+                .map(str::to_owned);
+            let mut occupied: Vec<usize> = self
+                .threads
+                .iter()
+                .filter(|t| {
+                    !t.client_draft
+                        && (t.has_draft_content()
+                            || !t.messages.is_empty()
+                            || self.tabs.contains(&t.id))
+                })
+                .map(|t| t.id)
+                .collect();
+            for &id in &batch.occupied_remote_ids {
+                if !occupied.contains(&id) {
+                    occupied.push(id);
+                }
+            }
+            let params = json!({
+                "project": batch.project,
+                "occupiedDrafts": occupied,
+                "harness": selection.instance_id,
+                "selectedModel": (provider, selection.model),
+                "thinking": thinking,
+                "access": batch.access.id(),
+                "serviceTier": service_tier,
+            });
+            let result = self
+                .client
+                .as_ref()
+                .and_then(|client| client.commands_for(&server))
+                .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_owned())
+                .and_then(|commands| commands.send("thread.create", params));
+            match result {
+                Ok(cmd_id) => {
+                    batch.targets[target_idx].create_cmd_id = Some(cmd_id);
+                    break;
+                }
+                Err(error) => {
+                    batch.targets[target_idx].outcome = MultiModelTargetOutcome::Failed(error);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_multi_model_remote_receipt(
+        &mut self,
+        server: &str,
+        command: &crate::protocol::Command,
+        value: &Value,
+    ) -> bool {
+        let accepted = value["result"]["status"] == "accepted";
+        let error_msg = value["error"]["message"]
+            .as_str()
+            .or(value["result"]["result"]["error"].as_str())
+            .unwrap_or("Failed to send message.")
+            .to_owned();
+
+        if command.method == "thread.create" {
+            let found = self
+                .multi_model_batches
+                .iter()
+                .enumerate()
+                .find_map(|(bi, b)| {
+                    (b.server == server).then(|| {
+                        b.targets
+                            .iter()
+                            .position(|t| t.create_cmd_id == Some(command.command_id))
+                            .map(|ti| (bi, ti))
+                    })?
+                });
+            let Some((batch_idx, target_idx)) = found else {
+                return false;
+            };
+            if !accepted {
+                self.multi_model_batches[batch_idx].targets[target_idx].outcome =
+                    MultiModelTargetOutcome::Failed(error_msg);
+            } else if let Some(tid) = value["result"]["result"]["threadId"].as_u64() {
+                let tid = tid as usize;
+                self.multi_model_batches[batch_idx]
+                    .occupied_remote_ids
+                    .push(tid);
+                self.multi_model_batches[batch_idx].targets[target_idx].thread_id = Some(tid);
+                let batch = &self.multi_model_batches[batch_idx];
+                let selection = &batch.targets[target_idx].selection;
+                let commands = self
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.commands_for(server))
+                    .cloned();
+                let supports_options = self
+                    .client
+                    .as_ref()
+                    .is_some_and(|c| c.supports_capability(server, crate::protocol::MODEL_OPTIONS));
+                if supports_options
+                    && !selection.options.is_empty()
+                    && let Some(ref cmds) = commands
+                {
+                    let _ = cmds.send(
+                        "thread.configure",
+                        json!({"threadId": tid, "options": selection.options}),
+                    );
+                }
+                let params = json!({
+                    "threadId": tid,
+                    "text": batch.prompt.text,
+                    "attachments": batch.prompt.images.as_ref(),
+                    "context": batch.prompt.context,
+                    "draft": batch.prompt.draft,
+                    "editorRevision": uuid::Uuid::new_v4(),
+                    "mode": "prompt",
+                    "envMode": ThreadEnvMode::Worktree,
+                    "baseBranch": batch.base_branch,
+                    "startFromOrigin": batch.start_from_origin,
+                });
+                let send_res = commands
+                    .ok_or_else(|| "This machine is not linked. Your draft was kept.".to_owned())
+                    .and_then(|cmds| cmds.send("thread.send", params));
+                match send_res {
+                    Ok(cmd_id) => {
+                        self.multi_model_batches[batch_idx].targets[target_idx].send_cmd_id =
+                            Some(cmd_id);
+                    }
+                    Err(err) => {
+                        self.multi_model_batches[batch_idx].targets[target_idx].outcome =
+                            MultiModelTargetOutcome::Failed(err);
+                        if let Some(cmds) =
+                            self.client.as_ref().and_then(|c| c.commands_for(server))
+                        {
+                            let _ = cmds
+                                .send("thread.delete", json!({"threadId": tid, "blankOnly": true}));
+                        }
+                    }
+                }
+            } else {
+                self.multi_model_batches[batch_idx].targets[target_idx].outcome =
+                    MultiModelTargetOutcome::Failed(
+                        "Thread creation was not confirmed. Your draft was kept.".into(),
+                    );
+            }
+            self.advance_remote_multi_model_batch(batch_idx);
+            self.resolve_completed_multi_model_batches();
+            return true;
+        }
+
+        if command.method == "thread.send" {
+            let found = self
+                .multi_model_batches
+                .iter()
+                .enumerate()
+                .find_map(|(bi, b)| {
+                    (b.server == server).then(|| {
+                        b.targets
+                            .iter()
+                            .position(|t| t.send_cmd_id == Some(command.command_id))
+                            .map(|ti| (bi, ti))
+                    })?
+                });
+            let Some((batch_idx, target_idx)) = found else {
+                return false;
+            };
+            if accepted {
+                self.multi_model_batches[batch_idx].targets[target_idx].outcome =
+                    MultiModelTargetOutcome::Started;
+            } else {
+                let tid = self.multi_model_batches[batch_idx].targets[target_idx].thread_id;
+                self.multi_model_batches[batch_idx].targets[target_idx].outcome =
+                    MultiModelTargetOutcome::Failed(error_msg);
+                if let Some(tid) = tid
+                    && let Some(cmds) = self.client.as_ref().and_then(|c| c.commands_for(server))
+                {
+                    let _ = cmds.send("thread.delete", json!({"threadId": tid, "blankOnly": true}));
+                }
+            }
+            self.resolve_completed_multi_model_batches();
+            return true;
+        }
+
+        false
+    }
+
+    /// Ported from KSG Code's `components/chat/useMultipleModelSend.ts`:
+    /// starts one background thread per selected model, each in its own worktree.
+    fn dispatch_multi_model_send(&mut self) -> bool {
+        if self.current().draft.text.trim() == "/model" {
+            self.choose_slash("model".into());
+            return false;
+        }
+        if self.current().configuring
+            || self.current().native.operating()
+            || self.current().phase == "Stopping"
+            || !self.current().has_draft_content()
+        {
+            return false;
+        }
+        if self.client.is_some() {
+            if !self.machine_connected(&self.machines.selected) {
+                self.push_toast(
+                    ToastKind::Warning,
+                    "Not connected: message not sent",
+                    Some("Reconnecting to the environment. Try again once it is connected.".into()),
+                    None,
+                    Some(5_000),
+                );
+                return false;
+            }
+        } else if self.network_blocked() {
+            self.current_mut().error =
+                Some("Waiting for the network after resume. Your draft has not been sent.".into());
+            return false;
+        }
+
+        let machine = if self.client.is_some() {
+            self.machines.selected.clone()
+        } else {
+            self.current().machine.clone()
+        };
+        let server_supports = self.supports_vcs_worktrees_on(&machine);
+        let is_local_draft = self.current().is_draft()
+            && !self.current().worktree_bootstrapping()
+            && !self.current().native.queue_held
+            && self.current().worktree_path.is_none();
+        let repo_key = self.thread_vcs_repo_key(self.current());
+        let is_git_repo = repo_key
+            .as_ref()
+            .is_some_and(|k| self.vcs_branches.get(k).is_some_and(|e| e.is_repo));
+        let base_branch = self
+            .current()
+            .base_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                repo_key
+                    .as_ref()
+                    .and_then(|k| self.vcs_branches.get(k))
+                    .filter(|e| e.is_repo)
+                    .and_then(|e| {
+                        crate::branch_toolbar::default_worktree_base_branch(&e.refs, None)
+                    })
+            });
+        let selections = self.multi_model_selections();
+        match crate::model_selection::multiple_model_send_block(
+            selections.len(),
+            server_supports,
+            is_local_draft,
+            is_git_repo,
+            base_branch.as_deref(),
+        ) {
+            Some(crate::model_selection::MultipleModelSendBlock::ServerOutdated) => {
+                self.current_mut().error =
+                    Some("Update this server before starting multiple models.".into());
+                return false;
+            }
+            Some(crate::model_selection::MultipleModelSendBlock::NeedsNewGitThread) => {
+                if server_supports && is_local_draft && is_git_repo && base_branch.is_none() {
+                    self.current_mut().submission_error =
+                        Some("Select a base branch before sending in New worktree mode.".into());
+                } else {
+                    self.push_toast(
+                        ToastKind::Warning,
+                        "Choose models and a base branch",
+                        Some(
+                            "Multiple models need a new thread in a Git project. Each gets its own worktree."
+                                .into(),
+                        ),
+                        None,
+                        Some(5_000),
+                    );
+                }
+                return false;
+            }
+            None => {}
+        }
+        let base_branch = base_branch.unwrap();
+
+        let target_server_id = self.machine_identity(&machine);
+        let peers = self.peers.clone();
+        let labels: Vec<(String, String)> = peers
+            .iter()
+            .map(|p| (p.server_id.clone(), p.label.clone()))
+            .collect();
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
+            &self.current().draft,
+            &self.current().draft_images,
+            &self.current().draft_context,
+            self.current().draft_reply_to.as_ref(),
+            Some(&machine),
+            Some(&target_server_id),
+            &peers,
+            &|m| {
+                if m == "local" {
+                    "Local".into()
+                } else {
+                    labels
+                        .iter()
+                        .find(|(id, _)| id == m)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| m.to_owned())
+                }
+            },
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.current_mut().attachment_error = Some(error);
+                return false;
+            }
+        };
+        if !self.headless
+            && let Some(error) = self.current().validate_prompt_length(&prompt)
+        {
+            self.current_mut().submission_error = Some(error);
+            return false;
+        }
+
+        let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+            &self.current().draft,
+            &self.current().draft_images,
+            &self.current().draft_context,
+        );
+        let reply_to = self.current().draft_reply_to.clone();
+        let saved_draft_model_state = self.current().draft_model_state.clone();
+        let source_thread_id = self.current().id;
+        let project = self.current().project;
+        let access = self.current().native.access;
+        let start_from_origin = self.current().effective_start_from_origin();
+        let title_seed: String = if prompt.text.is_empty() {
+            prompt
+                .images
+                .first()
+                .map(|image| {
+                    format!(
+                        "{}: {}",
+                        if image.is_image() { "Image" } else { "File" },
+                        image.name
+                    )
+                })
+                .unwrap_or_else(|| "New thread".into())
+                .chars()
+                .take(45)
+                .collect()
+        } else {
+            prompt.text.chars().take(45).collect()
+        };
+
+        let targets: Vec<MultiModelTargetEntry> = selections
+            .iter()
+            .map(|sel| MultiModelTargetEntry {
+                display_name: self.model_display_name_for_selection(sel),
+                selection: sel.clone(),
+                thread_id: None,
+                create_cmd_id: None,
+                send_cmd_id: None,
+                outcome: MultiModelTargetOutcome::Pending,
+            })
+            .collect();
+
+        // Clear the source draft before starting background threads, keeping the user on the draft.
+        {
+            let thread = self.current_mut();
+            thread.prompt_history.reset();
+            thread.typing_guard.on_blur_or_send();
+            thread.paste_history = Default::default();
+            thread.draft.replace_text("");
+            thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.draft_reply_to = None;
+            thread.retained_context = Default::default();
+            thread.error = None;
+            thread.attachment_error = None;
+            thread.submission_error = None;
+            thread.draft_model_state.additional_models.clear();
+        }
+        self.usage_limits_notice_key = None;
+        self.composer_notices.remove("usage-limits");
+
+        if self.client.is_some() {
+            self.multi_model_batches.push(MultiModelBatch {
+                source_thread_id,
+                server: machine,
+                project,
+                base_branch,
+                start_from_origin,
+                access,
+                prompt,
+                snapshot,
+                reply_to,
+                saved_draft_model_state,
+                targets,
+                occupied_remote_ids: Vec::new(),
+                next_remote_index: 0,
+            });
+            let batch_idx = self.multi_model_batches.len() - 1;
+            self.advance_remote_multi_model_batch(batch_idx);
+            self.resolve_completed_multi_model_batches();
+            self.checkpoint();
+            return !self.multi_model_batches.is_empty()
+                || self
+                    .toasts
+                    .iter()
+                    .any(|t| t.kind == ToastKind::Success && t.title.contains("in background"));
+        }
+
+        let Some(project_cwd) = self.project(project).map(|p| p.path.clone()) else {
+            return false;
+        };
+        let entries = self.provider_instance_entries();
+        let picker_models = self.picker_models_by_instance();
+        let has_images = prompt.images.iter().any(Attachment::is_image);
+        let worktrees_dir = self.data_dir.join("worktrees");
+        #[cfg(test)]
+        let git_ctx = self.test_git_context.clone().unwrap_or_default();
+        #[cfg(not(test))]
+        let git_ctx = crate::vcs::GitContext::default();
+
+        let mut resolved_targets = targets;
+        for target in &mut resolved_targets {
+            let models = match self.validate_local_multi_model_target(
+                &target.selection,
+                has_images,
+                &entries,
+                &picker_models,
+            ) {
+                Ok(models) => models,
+                Err(error) => {
+                    target.outcome = MultiModelTargetOutcome::Failed(error);
+                    continue;
+                }
+            };
+            let thread_id = self.next_id;
+            self.next_id += 1;
+            let mut thread = Thread::new(thread_id);
+            thread.project = project;
+            thread.machine = machine.clone();
+            thread.harness = target.selection.instance_id.clone();
+            thread.env_mode = Some(ThreadEnvMode::Worktree);
+            thread.base_branch = Some(base_branch.clone());
+            thread.start_from_origin = Some(start_from_origin);
+            thread.native.access =
+                resolve_compatible_access_mode(access, supported_access_modes(&thread.harness)).1;
+            thread.title = title_seed.clone();
+            thread.never_sent = false;
+            thread.models = models;
+            let provider = if target.selection.instance_id == "pi" {
+                "cpa".to_owned()
+            } else {
+                target.selection.instance_id.clone()
+            };
+            thread.set_model(provider, target.selection.model.clone());
+            for opt in &target.selection.options {
+                thread.set_option(opt.id.clone(), opt.value.clone());
+            }
+            thread.native.queue_held = true;
+            thread.serial += 1;
+            let queued_id = thread.serial;
+            thread.native.queue.push_back(pi_session::QueuedMessage {
+                id: queued_id,
+                prompt: prompt.clone(),
+            });
+            thread.worktree_bootstrap = Some(WorktreeBootstrapState {
+                snapshot: snapshot.clone(),
+                reply_to: reply_to.clone(),
+                queued_id,
+                fresh_context: false,
+            });
+            self.threads.push(thread);
+
+            let wake = self.wake.clone();
+            let worktrees_dir_thread = worktrees_dir.clone();
+            let project_cwd_thread = project_cwd.clone();
+            let base_branch_thread = base_branch.clone();
+            let git_ctx_thread = git_ctx.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.worktree_bootstrap_rxs.push(rx);
+            std::thread::spawn(move || {
+                let cwd_str = project_cwd_thread.to_string_lossy().into_owned();
+                let raw_branch = crate::vcs::build_temporary_worktree_branch_name(
+                    &uuid::Uuid::new_v4().simple().to_string(),
+                );
+                let new_branch = crate::vcs::resolve_available_branch_name_with(
+                    &project_cwd_thread,
+                    &raw_branch,
+                    &git_ctx_thread,
+                )
+                .unwrap_or(raw_branch);
+                let result = crate::vcs::create_worktree_with(
+                    &crate::vcs::VcsCreateWorktreeInput {
+                        cwd: cwd_str,
+                        ref_name: base_branch_thread.clone(),
+                        new_ref_name: Some(new_branch),
+                        base_ref_name: Some(base_branch_thread.clone()),
+                        path: None,
+                        start_from_origin: Some(start_from_origin),
+                    },
+                    &worktrees_dir_thread,
+                    &git_ctx_thread,
+                );
+                let _ = tx.send(WorktreeBootstrapResult {
+                    thread_id,
+                    base_branch: base_branch_thread,
+                    result,
+                });
+                wake();
+            });
+
+            target.thread_id = Some(thread_id);
+            target.outcome = MultiModelTargetOutcome::Pending;
+        }
+
+        let any_started_or_pending = resolved_targets
+            .iter()
+            .any(|t| !matches!(t.outcome, MultiModelTargetOutcome::Failed(_)));
+        self.multi_model_batches.push(MultiModelBatch {
+            source_thread_id,
+            server: machine,
+            project,
+            base_branch,
+            start_from_origin,
+            access,
+            prompt,
+            snapshot,
+            reply_to,
+            saved_draft_model_state,
+            targets: resolved_targets,
+            occupied_remote_ids: Vec::new(),
+            next_remote_index: 0,
+        });
+        self.resolve_completed_multi_model_batches();
+        self.checkpoint();
+        any_started_or_pending
     }
 
     fn release_after_worktree_setup(&mut self, index: usize) {
@@ -10371,6 +11281,14 @@ impl State {
             }
         }
         self.reconcile_current_access_mode();
+        if !self
+            .current()
+            .draft_model_state
+            .additional_models
+            .is_empty()
+        {
+            return self.dispatch_multi_model_send();
+        }
         let fresh_session_available = self.fresh_session_available(self.current());
         let draft_markdown = crate::composer_rich::markdown(&self.current().draft);
         let composer_holds_only_text = self.current().draft_images.is_empty()
@@ -11835,10 +12753,15 @@ impl State {
         let draft_model_states: serde_json::Map<String, Value> = self
             .threads
             .iter()
-            .filter(|t| t.draft_model_state.model_selection_explicit || t.has_draft_content())
+            .filter(|t| {
+                t.draft_model_state.model_selection_explicit
+                    || !t.draft_model_state.additional_models.is_empty()
+                    || t.has_draft_content()
+            })
             .filter(|t| {
                 !t.draft_model_state.model_selection_by_provider.is_empty()
                     || t.draft_model_state.active_provider.is_some()
+                    || !t.draft_model_state.additional_models.is_empty()
             })
             .filter_map(|t| {
                 serde_json::to_value(&t.draft_model_state)
@@ -12832,7 +13755,9 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut global_changed = false;
     for (thread_id, error) in background_failures {
-        state.notify_background_failure("local", thread_id, error);
+        if !state.handle_multi_model_async_failure(thread_id, &error) {
+            state.notify_background_failure("local", thread_id, error);
+        }
         global_changed = true;
     }
     global_changed |= state.pause_offline_errors()
@@ -20154,5 +21079,363 @@ mod tests {
         assert_eq!(restored_t2.start_from_origin, Some(false));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn setup_multi_model_repo_state(root: &std::path::Path, models: Vec<AgentModel>) -> State {
+        let empty_cfg = root.join("empty.gitconfig");
+        std::fs::write(&empty_cfg, "").unwrap();
+        let repo = init_temp_git_repo(root, &empty_cfg);
+        let git_ctx = crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg.clone()),
+            git_config_system: Some(empty_cfg),
+        };
+        let mut state = State::new(repo.clone(), false);
+        state.data_dir = root.join("data");
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        state.runtime_enabled = true;
+        state.test_git_context = Some(git_ctx);
+        let project_path = state
+            .project(state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        state.vcs_branches.insert(
+            ("local".into(), project_path),
+            VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        state.catalog.models = models.clone();
+        state.catalog.default_model = models.first().cloned();
+        state.current_mut().harness = "pi".into();
+        state.current_mut().models = models;
+        if let Some(first) = state.catalog.models.first().cloned() {
+            state.current_mut().set_model(first.provider, first.id);
+        }
+        state
+    }
+
+    #[test]
+    fn multi_model_send_three_models_creates_three_worktrees_and_clears_draft() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("shina-mm-three-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let models = vec![
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/claude-sonnet-4-5".into(),
+                name: "Claude Sonnet 4.5".into(),
+                thinking_levels: vec!["low".into(), "high".into()],
+                supports_images: Some(true),
+                ..Default::default()
+            },
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gpt-5".into(),
+                name: "GPT-5".into(),
+                thinking_levels: vec!["medium".into(), "high".into()],
+                supports_images: Some(true),
+                ..Default::default()
+            },
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gemini-2-5-pro".into(),
+                name: "Gemini 2.5 Pro".into(),
+                supports_images: Some(true),
+                ..Default::default()
+            },
+        ];
+        let mut state = setup_multi_model_repo_state(&root, models);
+        let captured: std::sync::Arc<
+            std::sync::Mutex<Vec<(usize, std::sync::mpsc::Receiver<Value>)>>,
+        > = std::sync::Arc::default();
+        let captured_hook = captured.clone();
+        state.test_connect_pi = Some(Box::new(move |tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            captured_hook.lock().unwrap().push((tid, commands));
+            Some(pi)
+        }));
+
+        state.set_composer_thinking_sticky("high".into());
+        state.toggle_model_in_multi_selection("pi", "cpa/gpt-5");
+        state.toggle_model_in_multi_selection("pi", "cpa/gemini-2-5-pro");
+        assert_eq!(state.multi_model_selections().len(), 3);
+
+        let img = test_attachment("shared.png", 1);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Compare these three models");
+        state.current_mut().add_attachment(img.clone()).unwrap();
+        let draft_id = state.current().id;
+
+        state.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.threads.iter().any(|t| t.worktree_bootstrapping()) && Instant::now() < deadline
+        {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // User stays on the draft, and the draft + multi-selection are cleared.
+        assert_eq!(state.current().id, draft_id);
+        assert!(state.current().draft.text.is_empty());
+        assert!(state.current().draft_images.is_empty());
+        assert!(
+            state
+                .current()
+                .draft_model_state
+                .additional_models
+                .is_empty()
+        );
+        assert_eq!(state.threads.len(), 4);
+
+        let started: Vec<&Thread> = state.threads.iter().filter(|t| t.id != draft_id).collect();
+        assert_eq!(started.len(), 3);
+        let worktrees: std::collections::HashSet<&str> = started
+            .iter()
+            .map(|t| t.worktree_path.as_deref().expect("worktree path"))
+            .collect();
+        let branches: std::collections::HashSet<&str> = started
+            .iter()
+            .map(|t| t.branch.as_deref().expect("branch"))
+            .collect();
+        assert_eq!(worktrees.len(), 3);
+        assert_eq!(branches.len(), 3);
+        for wt in &worktrees {
+            assert!(std::path::Path::new(wt).exists(), "missing worktree {wt}");
+        }
+        for b in &branches {
+            assert!(b.starts_with("t3/"), "unexpected branch {b}");
+        }
+        assert_eq!(
+            started
+                .iter()
+                .map(|t| t.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cpa/claude-sonnet-4-5", "cpa/gpt-5", "cpa/gemini-2-5-pro"]
+        );
+        for t in &started {
+            assert_eq!(t.title, "Compare these three models");
+            assert_eq!(t.base_branch.as_deref(), Some("main"));
+            assert_eq!(t.env_mode, Some(ThreadEnvMode::Worktree));
+            assert_eq!(t.messages.len(), 1);
+            assert_eq!(t.messages[0].text, "Compare these three models");
+            assert_eq!(t.messages[0].images, vec![img.clone()]);
+        }
+
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].kind, ToastKind::Success);
+        assert_eq!(state.toasts[0].title, "Started 3 threads in background");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_model_send_partial_failure_keeps_two_threads_restores_failed_selection_and_prompt() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("shina-mm-partial-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let models = vec![
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/claude-sonnet-4-5".into(),
+                name: "Claude Sonnet 4.5".into(),
+                supports_images: Some(true),
+                ..Default::default()
+            },
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/text-only".into(),
+                name: "Text Only Model".into(),
+                supports_images: Some(false),
+                ..Default::default()
+            },
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gemini-2-5-pro".into(),
+                name: "Gemini 2.5 Pro".into(),
+                supports_images: Some(true),
+                ..Default::default()
+            },
+        ];
+        let mut state = setup_multi_model_repo_state(&root, models);
+        let kept_channels: std::sync::Arc<std::sync::Mutex<Vec<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        let kept_hook = kept_channels.clone();
+        state.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            kept_hook.lock().unwrap().push(commands);
+            Some(pi)
+        }));
+
+        state.toggle_model_in_multi_selection("pi", "cpa/text-only");
+        state.toggle_model_in_multi_selection("pi", "cpa/gemini-2-5-pro");
+        let img = test_attachment("keep-me.png", 1);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Inspect this screenshot");
+        state.current_mut().add_attachment(img.clone()).unwrap();
+        let draft_id = state.current().id;
+
+        state.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.threads.iter().any(|t| t.worktree_bootstrapping()) && Instant::now() < deadline
+        {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Two started threads remain (draft + 2 started = 3 threads total).
+        let started: Vec<&Thread> = state.threads.iter().filter(|t| t.id != draft_id).collect();
+        assert_eq!(started.len(), 2);
+        assert_eq!(
+            started
+                .iter()
+                .map(|t| t.model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cpa/claude-sonnet-4-5", "cpa/gemini-2-5-pro"]
+        );
+        for t in &started {
+            assert_eq!(t.messages[0].images, vec![img.clone()]);
+        }
+
+        // Failed middle selection stays selected and prompt + attachment are restored on draft.
+        assert_eq!(state.current().id, draft_id);
+        assert_eq!(state.current().draft.text, "Inspect this screenshot");
+        assert_eq!(state.current().draft_images, vec![img]);
+        assert_eq!(
+            state
+                .multi_model_selections()
+                .iter()
+                .map(|s| s.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cpa/text-only"]
+        );
+
+        // One notification names the failed model.
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].kind, ToastKind::Error);
+        assert_eq!(state.toasts[0].title, "Could not start Text Only Model");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_model_send_total_failure_restores_full_draft_and_missing_base_branch_blocks() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("shina-mm-total-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let models = vec![
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/claude-sonnet-4-5".into(),
+                name: "Claude Sonnet 4.5".into(),
+                ..Default::default()
+            },
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gpt-5".into(),
+                name: "GPT-5".into(),
+                ..Default::default()
+            },
+            AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gemini-2-5-pro".into(),
+                name: "Gemini 2.5 Pro".into(),
+                ..Default::default()
+            },
+        ];
+        let mut state = setup_multi_model_repo_state(&root, models);
+
+        // Missing base branch blocks before sending anything.
+        let project_path = state
+            .project(state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        state.vcs_branches.insert(
+            ("local".into(), project_path),
+            VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![],
+            },
+        );
+        state.toggle_model_in_multi_selection("pi", "cpa/gpt-5");
+        state.toggle_model_in_multi_selection("pi", "cpa/gemini-2-5-pro");
+        let img = test_attachment("retry.png", 1);
+        state
+            .current_mut()
+            .draft
+            .replace_text("Keep full draft on failure");
+        state.current_mut().add_attachment(img.clone()).unwrap();
+        state.current_mut().base_branch = None;
+
+        state.send();
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(
+            state.current().submission_error.as_deref(),
+            Some("Select a base branch before sending in New worktree mode.")
+        );
+        assert_eq!(state.current().draft.text, "Keep full draft on failure");
+
+        // Total failure when all three worktree creations fail restores full draft and all selections.
+        state.current_mut().submission_error = None;
+        state.current_mut().base_branch = Some("missing-branch-does-not-exist".into());
+        state.send();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.threads.iter().any(|t| t.worktree_bootstrapping()) && Instant::now() < deadline
+        {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(state.threads.len(), 1);
+        assert_eq!(state.current().draft.text, "Keep full draft on failure");
+        assert_eq!(state.current().draft_images, vec![img]);
+        assert_eq!(
+            state
+                .multi_model_selections()
+                .iter()
+                .map(|s| s.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cpa/claude-sonnet-4-5", "cpa/gpt-5", "cpa/gemini-2-5-pro"]
+        );
+        assert_eq!(state.toasts.len(), 1);
+        assert_eq!(state.toasts[0].kind, ToastKind::Error);
+        assert_eq!(
+            state.toasts[0].title,
+            "Could not start Claude Sonnet 4.5, GPT-5, Gemini 2.5 Pro"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

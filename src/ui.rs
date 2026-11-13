@@ -1275,6 +1275,111 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         && display.speed_label.is_none()
         && !display.ultracode
         && display.context_window.is_none();
+    let multi_selections = s.multi_model_selections();
+    if multi_selections.len() > 1 {
+        let picker_models = s.picker_models_by_instance();
+        let mut short_labels = Vec::with_capacity(multi_selections.len());
+        let mut full_labels = Vec::with_capacity(multi_selections.len());
+        let mut vendors = Vec::with_capacity(multi_selections.len().min(3));
+        for (idx, sel) in multi_selections.iter().enumerate() {
+            let opt = picker_models
+                .get(&sel.instance_id)
+                .and_then(|opts| opts.iter().find(|o| o.slug == sel.model));
+            let unavailable = if opt.is_some_and(|m| m.is_unavailable) {
+                " (Unavailable)"
+            } else {
+                ""
+            };
+            let short = opt
+                .map(|m| {
+                    format!(
+                        "{}{unavailable}",
+                        crate::model_picker::get_display_model_name(
+                            &m.name,
+                            m.short_name.as_deref(),
+                            m.sub_provider.as_deref(),
+                            true,
+                        )
+                    )
+                })
+                .unwrap_or_else(|| format!("{}{unavailable}", split_model_label(&sel.model).0));
+            let full = opt
+                .map(|m| {
+                    format!(
+                        "{}{unavailable}",
+                        crate::model_picker::get_display_model_name(
+                            &m.name,
+                            m.short_name.as_deref(),
+                            m.sub_provider.as_deref(),
+                            false,
+                        )
+                    )
+                })
+                .unwrap_or_else(|| format!("{}{unavailable}", sel.model));
+            if idx < 3 {
+                vendors.push(model_vendor(&sel.model, &full));
+            }
+            short_labels.push(short);
+            full_labels.push(full);
+        }
+        let multiple_label = if short_labels.len() > 2 {
+            format!(
+                "{}, {} more",
+                short_labels[..2].join(", "),
+                short_labels.len() - 2
+            )
+        } else {
+            short_labels.join(", ")
+        };
+        let all_model_names = full_labels.join(", ");
+        let mut icons = row().center_y().gap(2.0).shrink();
+        for vendor in vendors {
+            icons = icons.child(provider_icon(s, p, vendor, 14.0));
+        }
+        let mut trigger = row()
+            .key("model-effort")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(&all_model_names)
+            .help(&all_model_names)
+            .preserve_focus_on_press(true)
+            .center_y()
+            .gap(7.0)
+            .h(28.0)
+            .px(8.0)
+            .radius(4.0)
+            .shrink()
+            .min_w(0.0)
+            .max_w(if narrow { 200.0 } else { 340.0 })
+            .opacity(if locked { 0.65 } else { 1.0 })
+            .disabled(locked)
+            .hover(p.selected)
+            .press(p.selected);
+        if !locked {
+            trigger = trigger.on_press(|s: &mut State| {
+                s.begin_composer_menu();
+                s.open_model_picker(SettingsPicker::Thinking);
+            });
+        }
+        trigger = trigger.child(icons);
+        if !narrow {
+            trigger = trigger.child(
+                label(&multiple_label, TextStyle::new(13.0, 600.0), p.ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        }
+        return trigger.child(outlined(
+            pixel_text(format!("{}", multi_selections.len()), p.muted)
+                .key("model-multi-count")
+                .px(4.0)
+                .py(1.0)
+                .radius(4.0),
+            p,
+        ));
+    }
+
     let mut trigger = row()
         .key("model-effort")
         .role("button")
@@ -2848,6 +2953,13 @@ fn model_list(
         list = list.child(label(error, SMALL, p.muted).wrap().px(16.0).py(6.0));
     }
 
+    let multi_enabled = s.multiple_models_enabled();
+    let multi_selections = if multi_enabled {
+        s.multi_model_selections()
+    } else {
+        Vec::new()
+    };
+
     let mut jump_num = 0usize;
     for (index, model) in snap.visible_models.iter().enumerate() {
         let disabled_reason = if !can_choose {
@@ -2865,7 +2977,13 @@ fn model_list(
         let is_favorite = snap
             .favorites_set
             .contains(&provider_model_key(&model.instance_id, &model.slug));
-        let selected = t.harness == model.instance_id && t.model_id == model.slug;
+        let selected = if multi_enabled && multi_selections.len() > 1 {
+            multi_selections
+                .iter()
+                .any(|sel| sel.instance_id == model.instance_id && sel.model == model.slug)
+        } else {
+            t.harness == model.instance_id && t.model_id == model.slug
+        };
         let display_name = get_display_model_name(
             &model.name,
             model.short_name.as_deref(),
@@ -2965,7 +3083,43 @@ fn model_list(
             })
             .hover(if selected { p.coral_bg } else { p.selected })
             .focus_fill(p.selected)
-            .focus_selected(selected)
+            .focus_selected(selected);
+        if multi_enabled {
+            let toggle_instance = model.instance_id.clone();
+            let toggle_slug = model.slug.clone();
+            let mut checkbox = el()
+                .key(format!(
+                    "model-multi-toggle-{}-{}",
+                    model.instance_id, model.slug
+                ))
+                .role("checkbox")
+                .label(format!("Select {display_name} for multi-model send"))
+                .checked(selected)
+                .focusable(false)
+                .disabled(!enabled)
+                .size(14.0, 14.0)
+                .radius(0.0)
+                .border(2.0, p.ink)
+                .center()
+                .shrink()
+                .fill(if selected {
+                    p.coral
+                } else {
+                    Color::TRANSPARENT
+                });
+            if selected {
+                checkbox = checkbox.child(icon("check", p.on_coral).size(10.0, 10.0));
+            }
+            if enabled {
+                checkbox = checkbox
+                    .cursor(rune::Cursor::Pointer)
+                    .on_press(move |s: &mut State| {
+                        s.toggle_model_in_multi_selection(&toggle_instance, &toggle_slug);
+                    });
+            }
+            item = item.child(checkbox);
+        }
+        item = item
             .child(provider_icon(
                 s,
                 p,
@@ -2982,9 +3136,13 @@ fn model_list(
             let id = model.slug.clone();
             item = item
                 .cursor(rune::Cursor::Pointer)
-                .on_press(move |s: &mut State| {
-                    s.select_model_from_picker(&instance_id, &id);
-                    s.settings_picker = Some(SettingsPicker::Thinking);
+                .on_press_tx(move |s: &mut State, tx| {
+                    if tx.mods().shift && s.multiple_models_enabled() {
+                        s.toggle_model_in_multi_selection(&instance_id, &id);
+                    } else {
+                        s.select_model_from_picker(&instance_id, &id);
+                        s.settings_picker = Some(SettingsPicker::Thinking);
+                    }
                 });
         }
         list = list.child(item);
@@ -12772,7 +12930,12 @@ fn machine_picker(s: &State, p: Palette) -> El {
 
 /// Ported from KSG Code's `BranchToolbarEnvModeSelector` `SelectPopup`.
 fn env_mode_picker(s: &State, p: Palette) -> El {
-    let active = s.effective_env_mode(s.current());
+    let force_worktree = s.is_multi_model_active();
+    let active = if force_worktree {
+        crate::model::ThreadEnvMode::Worktree
+    } else {
+        s.effective_env_mode(s.current())
+    };
     let mut menu = col()
         .key("env-mode-picker")
         .role("menu")
@@ -12792,13 +12955,15 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
     ] {
         let title = crate::branch_toolbar::resolve_env_mode_label(mode);
         let selected = active == mode;
+        let disabled = force_worktree && mode == crate::model::ThreadEnvMode::Local;
         let mut item = row()
             .key(format!("env-mode-option-{slug}"))
             .role("menuitemradio")
             .checked(selected)
             .label(title)
-            .focusable(true)
-            .cursor(rune::Cursor::Pointer)
+            .focusable(!disabled)
+            .disabled(disabled)
+            .opacity(if disabled { 0.55 } else { 1.0 })
             .center_y()
             .gap(8.0)
             .h(30.0)
@@ -12809,10 +12974,10 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
             } else {
                 Color::TRANSPARENT
             })
-            .hover(p.selected)
-            .on_press(move |s: &mut State| {
-                s.set_draft_env_mode(mode);
-                s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+            .hover(if disabled {
+                Color::TRANSPARENT
+            } else {
+                p.selected
             })
             .child(icon(glyph, p.muted).size(14.0, 14.0))
             .child(
@@ -12821,6 +12986,14 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
                     .grow(1.0)
                     .min_w(0.0),
             );
+        if !disabled {
+            item = item
+                .cursor(rune::Cursor::Pointer)
+                .on_press(move |s: &mut State| {
+                    s.set_draft_env_mode(mode);
+                    s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+                });
+        }
         if selected {
             item = item.child(icon("check", p.sea));
         }
@@ -25109,6 +25282,268 @@ pub(crate) mod tests {
                 rt.presented("worktree-setup-output-tail").is_none(),
                 "{width}: output should collapse"
             );
+        }
+    }
+
+    fn setup_multi_model_git_runtime(width: f32) -> rune::Runtime<State> {
+        let mut rt = runtime(width);
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        rt.state.catalog.models = vec![
+            crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/claude-sonnet-4-5".into(),
+                name: "Claude Sonnet 4.5".into(),
+                thinking_levels: vec!["low".into(), "high".into()],
+                ..Default::default()
+            },
+            crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gpt-5".into(),
+                name: "GPT-5".into(),
+                thinking_levels: vec!["medium".into(), "high".into()],
+                ..Default::default()
+            },
+            crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/gemini-2-5-pro".into(),
+                name: "Gemini 2.5 Pro".into(),
+                ..Default::default()
+            },
+            crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "cpa/deepseek-r1".into(),
+                name: "DeepSeek R1".into(),
+                ..Default::default()
+            },
+        ];
+        rt.state.catalog.default_model = Some(rt.state.catalog.models[0].clone());
+        rt.state.current_mut().harness = "pi".into();
+        rt.state.current_mut().models = rt.state.catalog.models.clone();
+        rt.state
+            .current_mut()
+            .set_model("cpa".into(), "cpa/claude-sonnet-4-5".into());
+        rt.state.set_composer_thinking_sticky("high".into());
+        rt
+    }
+
+    #[test]
+    fn multi_model_selection_toggles_persists_across_switch_and_reload_and_respects_availability() {
+        let mut rt = setup_multi_model_git_runtime(1280.0);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "shina-multi-model-persist-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        rt.state.data_dir = temp_dir.clone();
+        rt.state.load_global_for_test();
+        rt.state.current_mut().draft.focused = true;
+        rt.frame(0.0);
+
+        // Open model picker and toggle 3 additional models on via checkboxes (4 total).
+        press(&mut rt, "model-effort");
+        assert!(rt.presented("model-list").is_some());
+        press(&mut rt, "model-multi-toggle-pi-cpa/gpt-5");
+        press(&mut rt, "model-multi-toggle-pi-cpa/gemini-2-5-pro");
+        press(&mut rt, "model-multi-toggle-pi-cpa/deepseek-r1");
+        assert_eq!(rt.state.multi_model_selections().len(), 4);
+        assert_eq!(
+            rt.state.multi_model_selections()[0].options,
+            vec![crate::model_selection::ProviderOptionSelection {
+                id: "thinking".into(),
+                value: crate::model_selection::OptionValue::Str("high".into()),
+            }]
+        );
+        assert!(rt.state.multi_model_selections()[1].options.is_empty());
+
+        // Toggle one off via checkbox.
+        press(&mut rt, "model-multi-toggle-pi-cpa/deepseek-r1");
+        assert_eq!(rt.state.multi_model_selections().len(), 3);
+
+        // Switch to a new thread and back; selection persists on the draft.
+        let draft_id = rt.state.current().id;
+        let project = rt.state.current().project;
+        rt.state.new_thread();
+        let other_id = rt.state.current().id;
+        assert_ne!(other_id, draft_id);
+        assert_eq!(rt.state.multi_model_selections().len(), 1);
+        let draft_idx = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == draft_id)
+            .unwrap();
+        rt.state.select_thread(draft_idx);
+        assert_eq!(rt.state.multi_model_selections().len(), 3);
+
+        // Persist and reload from temporary data directory.
+        rt.state.checkpoint_and_flush().unwrap();
+        let mut reloaded = State::new(rt.state.project(project).unwrap().path.clone(), false);
+        reloaded.data_dir = temp_dir.clone();
+        reloaded.load_snapshot();
+        reloaded.catalog.models = rt.state.catalog.models.clone();
+        let reloaded_idx = reloaded
+            .threads
+            .iter()
+            .position(|t| t.id == draft_id)
+            .unwrap();
+        reloaded.select_thread(reloaded_idx);
+        reloaded.vcs_branches = rt.state.vcs_branches.clone();
+        assert_eq!(reloaded.multi_model_selections().len(), 3);
+        assert_eq!(
+            reloaded
+                .multi_model_selections()
+                .iter()
+                .map(|s| s.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cpa/claude-sonnet-4-5", "cpa/gpt-5", "cpa/gemini-2-5-pro"]
+        );
+
+        // Clicking the model row itself resets to single primary model.
+        press(&mut rt, "choose-model-1");
+        assert_eq!(rt.state.multi_model_selections().len(), 1);
+        assert_eq!(rt.state.current().model_id, "cpa/gpt-5");
+
+        // Unavailable on a thread with messages.
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Started".into(),
+            images: vec![],
+            context: None,
+        });
+        assert!(!rt.state.multiple_models_enabled());
+        rt.invalidate();
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert!(rt.presented("model-multi-toggle-pi-cpa/gpt-5").is_none());
+
+        // Unavailable on a non-git project.
+        rt.state.current_mut().messages.clear();
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: false,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: Vec::new(),
+            },
+        );
+        assert!(!rt.state.multiple_models_enabled());
+        rt.invalidate();
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert!(rt.presented("model-multi-toggle-pi-cpa/gpt-5").is_none());
+
+        // Unavailable on a linked machine without vcs-worktrees-v1 capability.
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![],
+            },
+        );
+        let (client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": ["fresh-context"]});
+        rt.state.client = Some(client);
+        assert!(!rt.state.multiple_models_enabled());
+        rt.invalidate();
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert!(rt.presented("model-multi-toggle-pi-cpa/gpt-5").is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn multi_model_picker_checkboxes_and_trigger_count_fit_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = setup_multi_model_git_runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.toggle_model_in_multi_selection("pi", "cpa/gpt-5");
+            rt.state
+                .toggle_model_in_multi_selection("pi", "cpa/gemini-2-5-pro");
+            rt.frame(0.0);
+
+            // Trigger shows the count at resting/collapsed and expanded widths.
+            assert!(
+                rt.presented("model-multi-count").is_some(),
+                "{width}: trigger missing model-multi-count"
+            );
+
+            // Open picker and verify checkboxes fit inside their rows without overflowing.
+            press(&mut rt, "model-effort");
+            assert!(
+                rt.presented("model-multi-count").is_some(),
+                "{width}: trigger missing model-multi-count when open"
+            );
+            let (list_rect, _) = rt
+                .presented("model-list")
+                .unwrap_or_else(|| panic!("{width}: model-list"));
+            for (idx, slug) in [
+                "cpa/claude-sonnet-4-5",
+                "cpa/gpt-5",
+                "cpa/gemini-2-5-pro",
+                "cpa/deepseek-r1",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (row_rect, _) = rt
+                    .presented(&format!("choose-model-{idx}"))
+                    .unwrap_or_else(|| panic!("{width}: choose-model-{idx}"));
+                let (cb_rect, _) = rt
+                    .presented(&format!("model-multi-toggle-pi-{slug}"))
+                    .unwrap_or_else(|| panic!("{width}: model-multi-toggle-pi-{slug}"));
+                assert!(
+                    cb_rect[0] >= row_rect[0] - 0.5
+                        && cb_rect[0] + cb_rect[2] <= row_rect[0] + row_rect[2] + 0.5
+                        && row_rect[0] + row_rect[2] <= list_rect[0] + list_rect[2] + 0.5,
+                    "{width}: checkbox overflowed row or list: cb={cb_rect:?} row={row_rect:?} list={list_rect:?}"
+                );
+            }
         }
     }
 }
