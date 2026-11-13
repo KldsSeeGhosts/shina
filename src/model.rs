@@ -99,6 +99,11 @@ fn fetch_linked_blob(
 #[path = "pi_session.rs"]
 pub(crate) mod pi_session;
 pub use pi_session::{AccessMode, ConversationMode, PiSession, session_history};
+#[path = "approval_send.rs"]
+mod approval_send;
+#[cfg(test)]
+#[path = "approval_send_tests.rs"]
+mod approval_send_tests;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -182,6 +187,7 @@ impl Selection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
+    Info,
     Success,
     Warning,
     Error,
@@ -540,6 +546,7 @@ pub struct Thread {
     pub request: Option<Value>,
     pub(crate) requests_supported: bool,
     pub(crate) responding_request: Option<uuid::Uuid>,
+    approval_send: Option<approval_send::ApprovalSend>,
     pub reply: TextEdit,
     pub session: Option<String>,
     /// A thread made here as a new thread. Until a prompt is sent, a session on it is only a
@@ -699,7 +706,12 @@ impl Thread {
         attachments: &[Attachment],
         skip_image_inline_chip: bool,
     ) {
-        if attachments.is_empty() || self.request.is_some() {
+        if attachments.is_empty()
+            || self
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
+        {
             return;
         }
         let prose = crate::composer_context::strip_inline_context_references(
@@ -859,6 +871,7 @@ impl Thread {
             request: None,
             requests_supported: true,
             responding_request: None,
+            approval_send: None,
             reply: TextEdit::default(),
             session: None,
             never_sent: true,
@@ -1431,11 +1444,26 @@ impl Thread {
         let Some(request) = &self.request else {
             return;
         };
+        if request["method"] == "confirm" {
+            let request = request.clone();
+            match self.write_approval_response(&request, response) {
+                Ok(()) => {
+                    self.request = None;
+                    self.forwarded_question = None;
+                    self.native_dialog_done();
+                }
+                Err(error) => self.error = Some(error),
+            }
+            return;
+        }
+        if response.get("feedback").is_some() {
+            self.error = Some(
+                "Feedback requires a live approval that supports it and a decline decision.".into(),
+            );
+            return;
+        }
         response["type"] = "extension_ui_response".into();
         response["id"] = request["id"].clone();
-        let remember_grant = request["method"] == "confirm"
-            && self.harness == "pi"
-            && crate::approval::decision(&response).is_ok_and(|d| d == "acceptForSession");
         if self.harness == "pi"
             && let Some(fields) = response.as_object_mut()
         {
@@ -1450,9 +1478,6 @@ impl Thread {
             .and_then(|pi| crate::harness::send(pi, response));
         match result {
             Ok(()) => {
-                if remember_grant {
-                    self.remember_session_approval();
-                }
                 self.request = None;
                 self.forwarded_question = None;
                 self.native_dialog_done();
@@ -2255,8 +2280,16 @@ impl Thread {
                                     .rev()
                                     .collect();
                             }
-                            for (history_index, message) in messages.iter().enumerate() {
-                                self.anchor_compactions(history_index);
+                            let messages = approval_send::history_with_approval_feedback(
+                                messages,
+                                &saved_messages,
+                            );
+                            let mut native_history_index = 0;
+                            for message in &messages {
+                                if message["shinaFeedbackId"].is_null() {
+                                    self.anchor_compactions(native_history_index);
+                                    native_history_index += 1;
+                                }
                                 let role = string(message, "role");
                                 let index = self.messages.len();
                                 if matches!(role, "user" | "assistant") {
@@ -2272,7 +2305,12 @@ impl Thread {
                                             self.ensure_work();
                                         }
                                         self.messages.push(Message {
-                                            id: uuid::Uuid::new_v4().to_string(),
+                                            id: message["shinaFeedbackId"]
+                                                .as_str()
+                                                .map(str::to_owned)
+                                                .unwrap_or_else(|| {
+                                                    uuid::Uuid::new_v4().to_string()
+                                                }),
                                             role: if role != "user" {
                                                 "Pi"
                                             } else if text.starts_with(INJECTION_PREFIX) {
@@ -2332,6 +2370,11 @@ impl Thread {
                                     let found =
                                         saved_messages.iter().enumerate().find(|(i, old)| {
                                             !used.contains(i)
+                                                && if message.id.starts_with("approval-feedback:") {
+                                                    old.id == message.id
+                                                } else {
+                                                    !old.id.starts_with("approval-feedback:")
+                                                }
                                                 && old.role == message.role
                                                 && old.text == message.text
                                         });
@@ -2344,15 +2387,16 @@ impl Thread {
                             for (i, message) in self.messages.iter_mut().enumerate() {
                                 if let Some(id) = identities[i].take() {
                                     message.id = id;
-                                } else if let Some(old) = saved_messages
-                                    .get(i)
-                                    .filter(|old| old.role == message.role && !used.contains(&i))
-                                {
+                                } else if let Some(old) = saved_messages.get(i).filter(|old| {
+                                    old.role == message.role
+                                        && !used.contains(&i)
+                                        && !old.id.starts_with("approval-feedback:")
+                                }) {
                                     used.insert(i);
                                     message.id = old.id.clone();
                                 }
                             }
-                            self.anchor_compactions(messages.len());
+                            self.anchor_compactions(native_history_index);
                             for tool in &mut self.tools {
                                 if let Some(order) = saved_orders.get(&tool.id) {
                                     tool.order = *order;
@@ -7104,7 +7148,11 @@ impl State {
             Some("Open a real workspace before attaching files.".into())
         } else if self.threads[index].archived() {
             Some("Restore this thread before attaching files.".into())
-        } else if self.threads[index].request.is_some() {
+        } else if self.threads[index]
+            .request
+            .as_ref()
+            .is_some_and(|r| r["method"] != "confirm")
+        {
             Some("Answer the current question before attaching files.".into())
         } else if self.threads[index].status.busy() {
             if self.threads[index].native.operating() {
@@ -7428,6 +7476,10 @@ impl State {
     /// on a draft thread, starts in the background and opens a fresh composer; on an existing
     /// thread, dispatches the turn and opens a new draft once accepted.
     pub fn send_background(&mut self) {
+        self.send_background_intent(false);
+    }
+
+    fn send_background_intent(&mut self, approval_redirect: bool) {
         let source_index = self.active;
         let source_id = self.current().id;
         let was_draft = self.current().is_draft();
@@ -7435,7 +7487,7 @@ impl State {
         let seed = self.composer_seed();
         let server = self.machines.selected.clone();
 
-        if !self.dispatch_send() {
+        if !self.dispatch_send_intent(true, approval_redirect) {
             return;
         }
         if self.client.is_some() {
@@ -7504,6 +7556,10 @@ impl State {
     }
 
     fn dispatch_send(&mut self) -> bool {
+        self.dispatch_send_intent(false, false)
+    }
+
+    fn dispatch_send_intent(&mut self, background: bool, approval_redirect: bool) -> bool {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
@@ -7514,7 +7570,7 @@ impl State {
             );
             return false;
         }
-        if self.current().resume_pending() {
+        if self.current().resume_pending() || self.current().responding_request.is_some() {
             return false;
         }
         if self.current().queued_edit.is_some() {
@@ -7539,8 +7595,37 @@ impl State {
             self.checkpoint();
             return false;
         }
-        if self.current().request.is_some() || self.current().native.questionnaire.is_some() {
+        if self.current().approval_send.is_some() {
             return false;
+        }
+        if self.current().native.questionnaire.is_some()
+            || self
+                .current()
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
+        {
+            return false;
+        }
+        if self.current().request.is_some() {
+            if self.current().draft.text.trim() == "/model" {
+                self.choose_slash("model".into());
+                return false;
+            }
+            if self.client.is_none() && self.handle_composer_local_command() {
+                return false;
+            }
+            if !self.approval_send_is_local_command()
+                && !approval_redirect
+                && !self.headless
+                && !self.current().request_held_by_typing_guard()
+            {
+                if let Some(error) = self.approval_send_command_error() {
+                    self.current_mut().error = Some(error);
+                    return false;
+                }
+                return self.begin_approval_send(background);
+            }
         }
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
@@ -7608,6 +7693,7 @@ impl State {
                     thread.draft_images.clear();
                     thread.draft_context.clear();
                     thread.retained_context = Default::default();
+                    thread.typing_guard.on_blur_or_send();
                     true
                 }
                 Some(Err(error)) => {
@@ -7719,6 +7805,14 @@ impl State {
                 }
             }
             _ => {}
+        }
+        if self
+            .current()
+            .request
+            .as_ref()
+            .is_some_and(crate::approval::not_resumable)
+        {
+            self.current_mut().request = None;
         }
         self.release_task_results(self.current().id);
         if self.current().status.busy() {
@@ -9729,6 +9823,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     {
         state.storage_error = None;
         changed = true;
+    }
+    changed |= state.poll_approval_sends();
+    if state.approval_sends_pending() {
+        tx.wake_after(Duration::from_millis(16));
     }
     if changed {
         state.checkpoint();

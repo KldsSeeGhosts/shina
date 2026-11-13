@@ -282,6 +282,73 @@ impl Client {
         };
         info.lock().expect("connection info")["canApprove"] == true
     }
+    pub fn can_operate(&self, server: &str) -> bool {
+        let info = if server == "local" {
+            &self.info
+        } else if let Some(remote) = self.linked.get(server) {
+            &remote.info
+        } else {
+            return false;
+        };
+        info.lock().expect("connection info")["canOperate"] == true
+    }
+
+    /// Sends attachments already prepared by the composer transaction, without a second upload.
+    pub(crate) fn send_prepared(
+        &self,
+        command: Command,
+        wake: rune::Waker,
+    ) -> Result<uuid::Uuid, String> {
+        if !self.commands.connected() {
+            return Err("This machine is disconnected. Your draft was kept.".into());
+        }
+        let Some(link) = self.remote.clone() else {
+            return self.commands.send(&command.method, command.params);
+        };
+        let id = command.command_id;
+        let output = self.output.clone();
+        let stop = self.stop.clone();
+        std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| {
+                    rt.block_on(async {
+                        let mut attempt = 0;
+                        loop {
+                            if stop.load(Ordering::Acquire) {
+                                break Err("The client stopped before the send completed.".into());
+                            }
+                            match remote_request_outcome(&link, command.clone(), false).await {
+                                Ok(RemoteResponse::Receipt(result)) => break Ok(result),
+                                Ok(RemoteResponse::Refused(error)) => break Err(error),
+                                Err(error)
+                                    if stop.load(Ordering::Acquire)
+                                        || error.starts_with("Authentication denied.")
+                                        || error.starts_with("Server handshake refused")
+                                        || error.contains("Update required") =>
+                                {
+                                    break Err(error);
+                                }
+                                Err(_) => {
+                                    // The same UUID reaches the durable receipt store on every retry.
+                                    tokio::time::sleep(restart_delay(attempt)).await;
+                                    attempt = attempt.saturating_add(1);
+                                }
+                            }
+                        }
+                    })
+                });
+            let value = match result {
+                Ok(result) => json!({"result":result}),
+                Err(error) => json!({"error":{"message":error}}),
+            };
+            let _ = output.send(Event::Receipt(command, value));
+            wake();
+        });
+        Ok(id)
+    }
     pub fn show_history(&self, thread: usize) {
         self.history_thread.store(thread, Ordering::Release);
     }
@@ -651,7 +718,7 @@ async fn supervise(
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"canApprove":hello["canApprove"],"capabilities":hello["capabilities"]});
+                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"canApprove":hello["canApprove"],"canOperate":hello["canOperate"],"capabilities":hello["capabilities"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
@@ -743,6 +810,14 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if command.method == "request.respond" && command.params["response"].get("feedback").is_some()
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::APPROVAL_FEEDBACK))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::APPROVAL_FEEDBACK_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 if command.params["requestContract"] == true
                     && !info.lock().expect("connection info")["capabilities"].as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_REQUESTS))
@@ -1631,6 +1706,22 @@ async fn remote_request(
     command: Command,
     peer: bool,
 ) -> Result<Value, String> {
+    match remote_request_outcome(link, command, peer).await? {
+        RemoteResponse::Receipt(value) => Ok(value),
+        RemoteResponse::Refused(error) => Err(error),
+    }
+}
+
+enum RemoteResponse {
+    Receipt(Value),
+    Refused(String),
+}
+
+async fn remote_request_outcome(
+    link: &crate::peer::Link,
+    command: Command,
+    peer: bool,
+) -> Result<RemoteResponse, String> {
     let timeout = if command.method == "peer.thread.wait" {
         58
     } else {
@@ -1655,7 +1746,7 @@ async fn remote_request(
         )
         .await?;
         if command.method == "hello" {
-            return Ok(hello);
+            return Ok(RemoteResponse::Receipt(hello));
         }
         if peer
             && command.method != "peer.capabilities"
@@ -1701,9 +1792,9 @@ async fn remote_request(
                         serde_json::from_str(&text).map_err(|_| "Invalid remote response.")?;
                     if value["id"] == command.command_id.to_string() {
                         if let Some(error) = value["error"]["message"].as_str() {
-                            return Err(error.into());
+                            return Ok(RemoteResponse::Refused(error.into()));
                         }
-                        return Ok(value["result"].clone());
+                        return Ok(RemoteResponse::Receipt(value["result"].clone()));
                     }
                 }
                 _ => {}

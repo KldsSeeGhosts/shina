@@ -4685,6 +4685,7 @@ fn toast_stack(s: &State, p: Palette, top: f32) -> El {
     for toast in s.toasts.iter().rev() {
         let id = toast.id;
         let (glyph_name, ink) = match toast.kind {
+            crate::model::ToastKind::Info => ("dot", p.sea),
             crate::model::ToastKind::Success => ("check", p.sea),
             crate::model::ToastKind::Warning => ("alert", p.brass),
             crate::model::ToastKind::Error => ("alert", p.danger),
@@ -10547,12 +10548,36 @@ fn composer(
         area = area.child(dialog(s, p));
     }
     let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
+    let approval_send_allowed = t
+        .request
+        .as_ref()
+        .filter(|r| r["method"] == "confirm")
+        .is_none_or(|request| {
+            (crate::approval::can_respond(request) || crate::approval::not_resumable(request))
+                && t.requests_supported
+                && s.client.as_ref().is_none_or(|client| {
+                    (crate::approval::not_resumable(request)
+                        || client.can_approve(&s.machines.selected))
+                        && client.supports_capability(
+                            &s.machines.selected,
+                            crate::protocol::COMPOSER_REQUESTS,
+                        )
+                        && (request["responseCapability"]["supportsFeedback"] != true
+                            || client.supports_capability(
+                                &s.machines.selected,
+                                crate::protocol::APPROVAL_FEEDBACK,
+                            ))
+                })
+        });
     let can_send = !s.demo
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
         && !t.configuring
-        && !request_visible
+        && (!request_visible || t.request.as_ref().is_some_and(|r| r["method"] == "confirm"))
+        && !t.approval_send_pending()
+        && t.responding_request.is_none()
+        && approval_send_allowed
         && (!t.native.operating() || t.queued_edit.is_some())
         && (t.phase != "Stopping" || t.queued_edit.is_some())
         && !t.queued_edit_saving()
@@ -10741,6 +10766,15 @@ fn composer(
             "Open a real workspace to send messages".to_string()
         } else if let Some(machine) = s.unreachable_selected() {
             format!("{machine} is unreachable. Reconnecting.")
+        } else if request_visible && t.request.as_ref().is_some_and(|r| r["method"] == "confirm") {
+            if t.request
+                .as_ref()
+                .is_some_and(|r| r["responseCapability"]["supportsFeedback"] == true)
+            {
+                "Send feedback to decline this request".into()
+            } else {
+                "Send a message to decline and redirect the agent".into()
+            }
         } else if collapsed {
             "Ask anything...".to_string()
         } else {
@@ -20570,6 +20604,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn approval_feedback_and_redirect_composer_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for feedback in [false, true] {
+                let mut rt = runtime(width);
+                rt.state.current_mut().status = Status::Running;
+                rt.state.current_mut().context_window = Some(200_000);
+                rt.state.current_mut().apply(json!({
+                    "type":"extension_ui_request","id":"send-over-approval","method":"confirm",
+                    "title":"Run this command?","message":"Check the requested command.",
+                    "responseCapability":{"type":"live","supportsFeedback":feedback}
+                }));
+                rt.state
+                    .current_mut()
+                    .draft
+                    .replace_text("Use the safer command.");
+                rt.frame(0.0);
+                press(&mut rt, "composer-input");
+                let (rect, _) = rt.presented("send-message").unwrap();
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+                press(&mut rt, "send-message");
+                assert!(
+                    rt.state.current().approval_send_pending(),
+                    "{width}: {feedback}"
+                );
+                assert_eq!(rt.state.current().draft.text, "Use the safer command.");
+                assert!(rt.state.current().request.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn command_menu_escape_dismissal_persists_until_trigger_changes_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -21678,7 +21746,7 @@ pub(crate) mod tests {
                 assert!(rt.state.current().error.is_some());
             }
 
-            // 5. Guards: empty prompt, submission_error, pending request, archived, unfocused, repeat, IME composition.
+            // 5. Guards: empty prompt, submission_error, pending question, archived, unfocused, repeat, IME composition.
             {
                 let mut rt = runtime(width);
                 rt.on_key = Some(crate::key);
@@ -21714,7 +21782,7 @@ pub(crate) mod tests {
                 assert_eq!(rt.state.current().draft.text, "Unfocused");
                 rt.state.current_mut().life.archived_at = None;
 
-                // Pending request blocks sendAndNewThread
+                // A pending question blocks sendAndNewThread. Approvals use the redirect transaction.
                 rt.state.current_mut().messages.push(crate::model::Message {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: "You",
@@ -21722,7 +21790,7 @@ pub(crate) mod tests {
                     images: vec![],
                     context: None,
                 });
-                rt.state.current_mut().request = Some(json!({"id":"r1","method":"confirm"}));
+                rt.state.current_mut().request = Some(json!({"id":"r1","method":"input"}));
                 rt.key(enter_chord(true));
                 rt.frame(0.0);
                 assert_eq!(rt.state.current().id, id);

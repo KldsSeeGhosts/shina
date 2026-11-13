@@ -89,6 +89,9 @@ verification are recorded separately, not implied by this inventory.
   `chat/composerSend.logic.ts:63` defines the retry notices.
 - Normal validation and local commands precede decline. Background submission
   goes through the same path.
+- `ChatComposer.tsx:1154` forces redirects over displayed approvals to steer
+  the waiting turn, regardless of the ordinary follow-up queue preference.
+  Typing-guard-held approvals do not change that preference.
 
 ## 3. Question contract
 
@@ -122,6 +125,40 @@ verification are recorded separately, not implied by this inventory.
   not repeat. Option rows use 10 px gaps, 6 px vertical padding, 14 px labels,
   and a first-line shortcut column. `ChatComposer.tsx:616` uses initialAnswer
   to select literal answer editing and hides custom input for choice-only.
+- Pi `adapter.ts:3671` maps a native select's string options to literal values,
+  labels empty values "Empty value", and maps input to a "Submit empty value"
+  option with description "Send an empty string to the extension." Editors have
+  no options and initialAnswer is prefill or the empty string. The first nonblank
+  message or placeholder is question text and makes title the header. Otherwise
+  title is the question and header is "Question". `userInput.ts:14` recognizes
+  RPIV only by exact title and option matching, one native dialog at a time.
+  Header defaults are "Select options" and "Select an option". Preview text uses
+  the first 600 characters. Multi-select wire answers join with a comma.
+- Codex `CodexAdapterV2.ts:4454` normalizes missing or blank question ID to
+  question-1 with a one-based index, header to "Question", question to
+  "Choose an answer.", option label to Option 1 with a one-based index, and
+  description to its label. These native questions supply no multi-select,
+  literal prefill, custom-answer restriction or explicit option value.
+  At 5432 completed async agent messages with questions become message-mode
+  requests with zero-based string IDs, "Question" headers, title as question
+  and native string options as labels.
+- Claude `ClaudeAdapterV2.ts:4907` unwraps a type-record input, discards blank
+  questions and options, trims question text and labels, keys each question by
+  its question text, defaults the header to Question 1 with a one-based index
+  and blank descriptions to the option label. It preserves previews and maps
+  multiSelect only when true. No other question fields are supplied.
+- Antigravity `AntigravityProtocol.ts:111` recognizes interaction_ tool IDs,
+  rejects empty or duplicate option IDs, defaults blank titles to
+  "Choose an option.", bounds question text to 8,000 characters and labels to
+  512 characters with "...", and supplies choice-only single-select questions
+  with exact option IDs as values. Labels use trimmed name or option ID.
+  Replies prefer exact IDs, with a uniquely matching label as fallback.
+- Message-mode answers use question text, a newline, and the trimmed answer,
+  joining array answers with ", " and question replies with two newlines,
+  per `Orchestrator.ts:10170`. Optional unanswered questions are skipped.
+  A response steers the active run when supported, otherwise queues after it.
+  No replies produces "Enter an answer before sending." A dismissed
+  message-mode request dispatches no message.
 
 ## 4. Attachments and references
 
@@ -197,3 +234,42 @@ One default-concurrency suite run failed in the existing
 test because its expected undo entry was gone. The isolated test passed.
 No undo code changed. Subsequent full checks use `RUST_TEST_THREADS=4` and
 temporary `XDG_DATA_HOME` and `LOCALAPPDATA` profiles.
+
+## Item 2 implementation map
+
+`approval_send::State::{begin_approval_send,poll_approval_sends}` ports
+`useComposerSend.ts:927–1070`. It captures displayed request IDs, prepares all
+attachments before a decision, filters resolved requests, declines remaining live
+requests sequentially, and rechecks content, ordered attachment IDs, editor identity,
+runtime generation, navigation, pending imports and newly arriving approvals.
+`Thread::{pending_approvals,shown_approvals}` includes queued requests while excluding
+typing-guard-held requests. `State::respond_to_approval_id` targets queued approvals
+without changing the displayed dialog. Failed responses stop the transaction.
+
+Feedback targets the first displayed request only. It trims text, rejects
+attachments and context, sends decline with native feedback rather than a new
+prompt, and clears only the unchanged owning draft after success. Native feedback
+is retained independently of provider history by `history_with_approval_feedback`.
+`State::dispatch_send` and `send_background` share this transaction. Local commands
+and normal validation run first. Backend or typing-guard-hidden sends do not
+implicitly decline approvals. Dispatch releases the typing guard after capturing
+the displayed approval IDs, as in `ChatComposer.tsx:2169`.
+
+Protocol minor 13 adds `approval-feedback-v1`, required by the desktop for both
+feedback and redirect because old servers cannot project all queued approvals.
+Feedback commands are rejected explicitly on connections negotiated below 13.
+The underlying decision capability remains `composer-requests-v1`.
+The hello record reports `canOperate` separately from `canApprove`; redirect
+checks both before declining. A missing operate grant preserves the approval
+and the draft.
+All providers use the item 1 decision mappings. Claude ordinary permission requests
+support feedback. Pi, Codex, generic ACP and Claude MCP do not.
+
+Tests in `approval_send_tests.rs` cover plural sequential declines, arrivals during
+decline, changed drafts, later edits during remote response, background send,
+feedback history, preparation refusal, local commands, old peers and non-resumable
+requests. `approval_feedback_and_decline_redirect_use_native_decisions_and_refuse_an_older_peer`
+checks native Claude denial feedback, decline-before-redirect, transcript persistence,
+no extra feedback prompt and minor-12 refusal.
+`approval_feedback_and_redirect_composer_fit_at_supported_widths` checks all four
+requested widths.

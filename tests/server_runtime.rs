@@ -72,6 +72,160 @@ fn composer_request_capability_refuses_new_decisions_on_an_older_connection() {
     }
 }
 
+#[test]
+fn approval_feedback_and_decline_redirect_use_native_decisions_and_refuse_an_older_peer() {
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let negotiate = |client: &mut Client, minor| {
+        client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("approval-hello-{minor}")),
+        )
+    };
+    let hello = negotiate(&mut client, protocol::MINOR);
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == protocol::APPROVAL_FEEDBACK)
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"claude"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"approval-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "confirm");
+    let request = client.snapshot["threads"][0]["request"].clone();
+    assert_eq!(request["responseCapability"]["supportsFeedback"], true);
+    let args = json!({"threadId":1,"requestId":request["id"],
+        "generation":request["runtimeGeneration"],"requestContract":true,
+        "response":{"decision":"decline","feedback":"Use a safer command."}});
+    let old = negotiate(&mut client, 12);
+    assert!(
+        !old["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == protocol::APPROVAL_FEEDBACK)
+    );
+    let refused = client.command("request.respond", args.clone(), uuid::Uuid::new_v4());
+    assert_eq!(
+        refused["error"]["message"],
+        protocol::APPROVAL_FEEDBACK_UPDATE_REQUIRED
+    );
+    negotiate(&mut client, protocol::MINOR);
+    assert_eq!(
+        client.command("request.respond", args, uuid::Uuid::new_v4())["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    assert!(
+        read_full_history(&mut client, 48_000)["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "Use a safer command.")
+    );
+
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"approval-fixture again","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["request"]["method"] == "confirm");
+    let next = client.snapshot["threads"][0]["request"].clone();
+    assert_eq!(
+        client.command(
+            "request.respond",
+            json!({"threadId":1,"requestId":next["id"],
+        "generation":next["runtimeGeneration"],"requestContract":true,
+        "response":{"decision":"decline"}}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(client.command("thread.send",
+        json!({"threadId":1,"text":"Redirect to another task.","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4())["result"]["status"], "accepted");
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let redirected_history = read_full_history(&mut client, 48_000);
+    assert!(
+        redirected_history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "Redirect to another task."),
+        "{redirected_history}"
+    );
+    let records: Vec<Value> =
+        fs::read_to_string(profile.root.join("Shina/chats/1/claude-requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let feedback = records
+        .iter()
+        .find(|r| r["response"]["request_id"] == request["id"])
+        .unwrap();
+    assert_eq!(
+        feedback["response"]["response"]["message"],
+        "Use a safer command."
+    );
+    assert_ne!(feedback["response"]["response"]["interrupt"], true);
+    let decline = records
+        .iter()
+        .position(|r| r["response"]["request_id"] == next["id"])
+        .unwrap();
+    let redirect = records
+        .iter()
+        .position(|r| {
+            r["type"] == "user"
+                && r["message"]["content"]
+                    .to_string()
+                    .contains("Redirect to another task.")
+        })
+        .unwrap();
+    assert!(decline < redirect);
+    assert_eq!(
+        records[decline]["response"]["response"]["message"],
+        "User declined tool execution."
+    );
+    assert!(!records.iter().any(|r| {
+        r["type"] == "user"
+            && r["message"]["content"]
+                .to_string()
+                .contains("Use a safer command.")
+    }));
+    profile.stop();
+    profile.launch(&["serve"]);
+    let client = profile.client(uuid::Uuid::new_v4());
+    assert!(
+        client.snapshot["threads"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "Use a safer command.")
+    );
+}
+
 fn read_fixture_thread(workspace: &std::path::Path, args: Value) -> Value {
     let response = call_fixture_tool(workspace, "read_thread", args);
     assert_ne!(response["result"]["isError"], true, "{response}");
@@ -128,6 +282,11 @@ impl Profile {
             include_str!("../assets/tests/fake_acp.py"),
         )
         .unwrap();
+        fs::write(
+            root.join("fake_claude_requests.js"),
+            include_str!("../assets/tests/fake_claude_requests.cjs"),
+        )
+        .unwrap();
         fs::write(root.join("Shina/harnesses.json"), json!([{"id":"fixture-acp","name":"Fixture ACP",
             "command":if cfg!(windows) { "python" } else { "python3" },
             "args":["-u",root.join("fake_acp.py"),"--log",root.join("acp-log.jsonl"),"--delay-seconds","0.6","--resume","--no-history"]}]).to_string()).unwrap();
@@ -159,6 +318,14 @@ impl Profile {
             );
         if let Some(fault) = fault {
             command.env("SHINA_TEST_CRASH_EFFECT", fault);
+        }
+        if self.root.join("use-native-approval-fixture").exists() {
+            command
+                .env(
+                    "SHINA_CLAUDE_CLI",
+                    self.root.join("fake_claude_requests.js"),
+                )
+                .env("CLAUDE_CONFIG_DIR", self.root.join("claude-config"));
         }
         if self.root.join("measure-storage").exists() {
             command.env(

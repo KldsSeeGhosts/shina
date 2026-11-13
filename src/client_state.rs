@@ -127,6 +127,8 @@ struct ThreadView {
     diagnostics: Vec<String>,
     request: Option<Value>,
     #[serde(default)]
+    pending_approvals: Vec<Value>,
+    #[serde(default)]
     requests_supported: bool,
     questionnaire: Value,
     elapsed: Option<u64>,
@@ -237,6 +239,14 @@ impl ThreadView {
                 request["runtimeGeneration"] = json!(thread.request_generation);
                 request
             }),
+            pending_approvals: thread
+                .pending_approvals()
+                .into_iter()
+                .map(|mut request| {
+                    request["runtimeGeneration"] = json!(thread.request_generation);
+                    request
+                })
+                .collect(),
             requests_supported: true,
             questionnaire: thread.projected_form(),
             elapsed: thread.elapsed,
@@ -412,6 +422,8 @@ impl ThreadView {
                 .as_ref()
                 .map(|r| (&r["id"], &r["runtimeGeneration"]));
         thread.request = self.request;
+        thread.native.projected_approvals = self.pending_approvals;
+        thread.refresh_typing_guard();
         thread.requests_supported = self.requests_supported;
         if changed_request {
             thread.native.approval_more = false;
@@ -1162,6 +1174,7 @@ impl State {
             if let crate::client::Event::Receipt(command, value) = &event
                 && command.method == "request.respond"
             {
+                self.approval_response_receipt(command, value);
                 // Linked task cards live on their parent's machine, not the answering host.
                 for thread in self
                     .threads
@@ -1482,6 +1495,10 @@ impl State {
         }
         if let Some(wait) = crate::ui::tick_portraits(self, Instant::now()) {
             tx.wake_after(wait);
+        }
+        changed |= self.poll_approval_sends();
+        if self.approval_sends_pending() {
+            tx.wake_after(Duration::from_millis(16));
         }
         if changed {
             self.checkpoint_client();
@@ -3087,9 +3104,19 @@ impl State {
             "request.respond" => {
                 let input: crate::protocol::RequestResponse =
                     serde_json::from_value(args.clone()).map_err(|e| e.to_string())?;
-                let request = self.current().request.as_ref().ok_or("Request expired.")?;
+                let request = self
+                    .current()
+                    .pending_approvals()
+                    .into_iter()
+                    .find(|r| r["id"] == input.request_id)
+                    .or_else(|| {
+                        self.current()
+                            .request
+                            .clone()
+                            .filter(|r| r["id"] == input.request_id)
+                    })
+                    .ok_or("Request expired.")?;
                 if self.current().id != input.thread_id
-                    || request["id"] != input.request_id
                     || input.generation != self.current().request_generation
                 {
                     return Err("Request or runtime generation changed.".into());
@@ -3097,7 +3124,14 @@ impl State {
                 if input.session && request["method"] != "confirm" {
                     return Err("Session approval requires a confirmation request.".into());
                 }
-                if let Some(answers) = input
+                if request["method"] == "confirm" {
+                    let response = if input.session && input.response.get("decision").is_none() {
+                        crate::approval::response("acceptForSession")
+                    } else {
+                        input.response
+                    };
+                    self.respond_to_approval_id(input.thread_id, &input.request_id, response)?;
+                } else if let Some(answers) = input
                     .answers
                     .filter(Value::is_array)
                     .filter(|_| input.response["cancelled"] != true)

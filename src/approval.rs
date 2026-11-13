@@ -54,6 +54,11 @@ pub fn can_respond(request: &Value) -> bool {
         && request["canRespond"] != false
 }
 
+pub fn not_resumable(request: &Value) -> bool {
+    request["responseCapability"]["type"] == "not_resumable"
+        || request["responseCapability"] == "not_resumable"
+}
+
 /// Old clients still send the Pi boolean envelope. New clients send a decision too.
 pub fn decision(response: &Value) -> Result<&str, String> {
     if let Some(decision) = response["decision"].as_str() {
@@ -93,6 +98,17 @@ pub fn validate(request: &Value, response: &Value) -> Result<(), String> {
         return Err("This request is not resumable.".into());
     }
     decision(response)?;
+    if let Some(feedback) = response.get("feedback") {
+        if request["responseCapability"]["type"] != "live"
+            || request["responseCapability"]["supportsFeedback"] != true
+            || decision(response)? != "decline"
+            || feedback.as_str().is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(
+                "Feedback requires a live approval that supports it and a decline decision.".into(),
+            );
+        }
+    }
     Ok(())
 }
 

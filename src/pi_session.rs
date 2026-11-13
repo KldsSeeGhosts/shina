@@ -142,6 +142,7 @@ impl AccessMode {
 pub struct PiSession {
     pub projected_operating: bool,
     pub projected_queued: bool,
+    pub projected_approvals: Vec<Value>,
     pub questionnaire: Option<questionnaire::Questionnaire>,
     pub approval_more: bool,
     questionnaires: HashMap<String, Value>,
@@ -376,7 +377,10 @@ impl Thread {
             || self.native.lifecycle_id.is_some()
             || self.native.refreshing_session
             || self.phase == "Stopping"
-            || self.request.is_some()
+            || self
+                .request
+                .as_ref()
+                .is_some_and(|r| r["method"] != "confirm")
             || !self.has_draft_content()
             || self.harness == "pi" && self.model_provider != "cpa"
         {
@@ -426,6 +430,7 @@ impl Thread {
         self.draft_images.clear();
         self.draft_context.clear();
         self.retained_context = Default::default();
+        self.typing_guard.on_blur_or_send();
         self.life.user_sent(lifecycle::now());
         self.drive_native();
     }
@@ -747,10 +752,64 @@ impl Thread {
         self.respond(crate::approval::response("acceptForSession"));
     }
 
-    pub(super) fn remember_session_approval(&mut self) {
-        if let Some(request) = &self.request {
-            self.native.session_approvals.insert(approval_key(request));
+    pub(super) fn remember_session_approval_for(&mut self, request: &Value) {
+        self.native.session_approvals.insert(approval_key(request));
+    }
+
+    pub(crate) fn pending_approvals(&self) -> Vec<Value> {
+        let mut requests = Vec::new();
+        for request in self
+            .request
+            .iter()
+            .chain(self.native.dialogs.iter().map(|(r, _)| r))
+            .chain(
+                self.native
+                    .projected_approvals
+                    .iter()
+                    .filter(|_| self.remote.is_some()),
+            )
+        {
+            if request["method"] == "confirm"
+                && !requests.iter().any(|r: &Value| r["id"] == request["id"])
+            {
+                requests.push(request.clone());
+            }
         }
+        requests
+    }
+
+    pub(super) fn shown_approvals(&self) -> Vec<Value> {
+        self.pending_approvals()
+            .into_iter()
+            .filter(|r| {
+                let id = r["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| r.to_string());
+                !self.typing_guard.is_held(&id)
+            })
+            .collect()
+    }
+
+    pub(super) fn respond_queued_approval(
+        &mut self,
+        id: &Value,
+        response: Value,
+    ) -> Result<(), String> {
+        let at = self
+            .native
+            .dialogs
+            .iter()
+            .position(|(r, _)| r["id"] == *id && r["method"] == "confirm")
+            .ok_or("Request expired.")?;
+        let (request, deadline) = self.native.dialogs[at].clone();
+        if deadline.is_some_and(|d| d <= Instant::now()) {
+            return Err("Request expired.".into());
+        }
+        self.write_approval_response(&request, response)?;
+        self.native.dialogs.remove(at);
+        self.refresh_typing_guard();
+        Ok(())
     }
 
     fn prepare_questionnaire(&mut self, request: &Value) {
@@ -867,14 +926,15 @@ impl Thread {
     pub(super) fn refresh_typing_guard(&mut self) {
         let request_ids: Vec<String> = self
             .request
-            .as_ref()
-            .and_then(|r| {
+            .iter()
+            .chain(self.native.dialogs.iter().map(|(r, _)| r))
+            .chain(self.native.projected_approvals.iter())
+            .filter_map(|r| {
                 r["id"]
                     .as_str()
                     .map(str::to_owned)
                     .or_else(|| Some(r.to_string()))
             })
-            .into_iter()
             .collect();
         self.typing_guard
             .on_requests(&request_ids, self.draft.focused, Instant::now());
@@ -1042,6 +1102,7 @@ impl Thread {
         self.native.dialog_deadline = None;
         self.native.dialog_status = None;
         self.native.dialogs.clear();
+        self.native.projected_approvals.clear();
         self.native.session_approvals.clear();
         self.native.probe = None;
         self.native.request_id = None;
@@ -1626,6 +1687,7 @@ impl Thread {
                         );
                     } else {
                         self.native.dialogs.push_back((record.clone(), deadline));
+                        self.refresh_typing_guard();
                     }
                     return true;
                 }
