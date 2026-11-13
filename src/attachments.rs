@@ -67,6 +67,32 @@ pub struct Uploaded {
 }
 
 impl Attachment {
+    /// KSG composerDraftStore.composerFileNeedsReattach.
+    pub fn needs_reattach(&self) -> bool {
+        !self.is_image()
+            && self.mime != "inode/directory"
+            && self.uploaded.is_none()
+            && !path_for(self).is_some_and(|path| {
+                fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == self.bytes)
+            })
+    }
+
+    /// KSG composerDraftStore.composerFileMatchesReattachMarker.
+    pub fn matches_reattach(&self, name: &str, mime: &str, bytes: u64) -> bool {
+        if !self.needs_reattach() || self.name != name || self.bytes != bytes {
+            return false;
+        }
+        self.mime == mime
+            || crate::attachment_intake::file_mime(&self.name, &self.mime) == "image/x-adobe-dng"
+                && crate::attachment_intake::file_mime(name, mime) == "image/x-adobe-dng"
+            || matches!(
+                self.mime.to_ascii_lowercase().as_str(),
+                "" | "application/octet-stream"
+            ) && crate::attachment_intake::file_mime(&self.name, &self.mime)
+                .starts_with("video/")
+                && crate::attachment_intake::file_mime(name, mime).starts_with("video/")
+    }
+
     pub fn asset_id(&self) -> &str {
         self.asset_id.as_deref().unwrap_or(&self.id)
     }
@@ -1256,6 +1282,25 @@ pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reattach_matching_uses_ksg_metadata_not_content_or_case_folding() {
+        let directory = crate::store::directory().unwrap();
+        let path = directory.join("clip.mp4");
+        std::fs::write(&path, b"video").unwrap();
+        let mut marker = super::attach_file(&path).unwrap();
+        assert!(!marker.needs_reattach());
+        std::fs::remove_file(&path).unwrap();
+        assert!(marker.needs_reattach());
+        marker.mime = "application/octet-stream".into();
+        assert!(marker.matches_reattach("clip.mp4", "video/mp4", 5));
+        assert!(!marker.matches_reattach("Clip.mp4", "video/mp4", 5));
+        assert!(!marker.matches_reattach("clip.mp4", "video/mp4", 6));
+        marker.name = "raw.dng".into();
+        marker.mime = "image/dng".into();
+        assert!(marker.matches_reattach("raw.dng", "image/x-adobe-dng", 5));
+        assert!(!marker.matches_reattach("raw.dng", "application/pdf", 6));
+    }
+
     use super::*;
 
     #[test]

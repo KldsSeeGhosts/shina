@@ -9933,10 +9933,60 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
     use crate::attachment_uploads::Phase;
     let mut rows = col().w_full().gap(4.0).px(12.0).pt(8.0);
     let mut any = false;
+    // KSG ComposerAttachmentFileList retains restored files with no bytes as markers.
+    for file in s
+        .current()
+        .draft_images
+        .iter()
+        .filter(|a| a.needs_reattach())
+    {
+        any = true;
+        let id = file.id.clone();
+        let can_attach = s.file_attachment_staging_supported_on(&s.machines.selected)
+            && file.bytes <= crate::attachments::MAX_FILE_BYTES;
+        rows = rows.child(
+            row()
+                .key(format!("attachment-needs-reattach-{id}"))
+                .w_full()
+                .min_w(0.0)
+                .gap(8.0)
+                .py(4.0)
+                .center_y()
+                .label(format!("{} needs reattach", file.name))
+                .child(icon("file", p.muted))
+                .child(
+                    label(&file.name, BODY, p.ink)
+                        .truncate()
+                        .w(0.0)
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(pixel_text(
+                    if can_attach {
+                        "Attach again"
+                    } else {
+                        "Remove to send"
+                    },
+                    p.muted,
+                ))
+                .child(icon_button(
+                    &format!("remove-missing-attachment-{id}"),
+                    &format!("Remove {}", file.name),
+                    "close",
+                    p,
+                    move |s| s.remove_attachment(&id),
+                )),
+        );
+    }
     for entry in s.attachment_uploads.entries.iter().filter(|entry| {
         entry.machine == s.machines.selected
             && entry.thread == s.current().id
             && !entry.image
+            && !s
+                .current()
+                .draft_images
+                .iter()
+                .any(|a| a.id == entry.id && a.needs_reattach())
             && !matches!(entry.phase, Phase::Ready | Phase::Legacy)
     }) {
         any = true;
@@ -14013,6 +14063,42 @@ pub(crate) mod tests {
                     mods: Default::default()
                 }
             ));
+        }
+    }
+
+    #[test]
+    fn missing_attachment_markers_fit_at_all_widths_and_matching_pick_uses_no_slot() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let path = rt.state.data_dir.join("missing.txt");
+            std::fs::write(&path, "old").unwrap();
+            let marker = crate::attachments::attach_file(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            let target = rt.state.current_mut();
+            target.draft.replace_text("Inspect");
+            target.draft.focused = true;
+            target.draft_images.push(marker.clone());
+            target.insert_attachment_chips(&[marker.clone()], false);
+            rt.frame(0.0);
+            let (composer, _) = rt.presented("composer").unwrap();
+            let (row, _) = rt
+                .presented(&format!("attachment-needs-reattach-{}", marker.id))
+                .unwrap();
+            assert!(row[0] >= composer[0] && row[0] + row[2] <= composer[0] + composer[2] + 0.5);
+            assert!(rt.state.attachment_send_block_reason().is_some());
+            for i in 1..100 {
+                let mut other = marker.clone();
+                other.id = format!("file-{i}");
+                other.name = format!("other-{i}.txt");
+                rt.state.current_mut().draft_images.push(other);
+            }
+            let draft = rt.state.current().draft.text.clone();
+            std::fs::write(&path, "new").unwrap();
+            rt.state.attach_paths(&[path]);
+            assert_eq!(rt.state.current().draft_images.len(), 100);
+            assert_eq!(rt.state.current().draft_images[0].id, marker.id);
+            assert!(!rt.state.current().draft_images[0].needs_reattach());
+            assert_eq!(rt.state.current().draft.text, draft);
         }
     }
 

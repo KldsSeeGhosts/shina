@@ -7272,7 +7272,19 @@ impl State {
                 errors.push("This server does not support file attachments.".into());
                 continue;
             }
-            if self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS {
+            let replacement = self.threads[index].draft_images.iter().position(|a| {
+                a.matches_reattach(
+                    &name,
+                    &crate::attachment_intake::file_mime(
+                        &name,
+                        crate::attachment_intake::native_mime(&name),
+                    ),
+                    std::fs::metadata(path).map_or(0, |m| m.len()),
+                )
+            });
+            if replacement.is_none()
+                && self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS
+            {
                 errors.push(format!(
                     "You can attach up to {} files per message.",
                     attachments::MAX_ATTACHMENTS
@@ -7284,10 +7296,18 @@ impl State {
                 continue;
             }
             match attachments::attach_file(path) {
-                Ok(image) => match self.threads[index].add_attachment(image.clone()) {
-                    Ok(()) => attached.push(image),
-                    Err(error) => errors.push(error),
-                },
+                Ok(mut image) => {
+                    if let Some(slot) = replacement {
+                        image.asset_id = Some(image.id.clone());
+                        image.id = self.threads[index].draft_images[slot].id.clone();
+                        self.threads[index].draft_images[slot] = image;
+                    } else {
+                        match self.threads[index].add_attachment(image.clone()) {
+                            Ok(()) => attached.push(image),
+                            Err(error) => errors.push(error),
+                        }
+                    }
+                }
                 Err(error) => errors.push(error),
             }
         }

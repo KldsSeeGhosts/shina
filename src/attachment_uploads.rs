@@ -307,8 +307,20 @@ impl Queue {
         let Some(target) = target_mut(state, &machine, thread_id) else {
             return;
         };
-        let error = if target.draft_images.len() + self.preparing_count(&machine, thread_id)
-            >= attachments::MAX_ATTACHMENTS
+        let replacement = (!image)
+            .then(|| {
+                target.draft_images.iter().position(|a| {
+                    a.matches_reattach(
+                        &name,
+                        &crate::attachment_intake::file_mime(&name, &mime),
+                        bytes,
+                    )
+                })
+            })
+            .flatten();
+        let error = if replacement.is_none()
+            && target.draft_images.len() + self.preparing_count(&machine, thread_id)
+                >= attachments::MAX_ATTACHMENTS
         {
             Some(format!(
                 "You can attach up to {} files per message.",
@@ -332,7 +344,9 @@ impl Queue {
             return;
         }
         use sha2::Digest;
-        let id = if image {
+        let id = if let Some(index) = replacement {
+            target.draft_images[index].id.clone()
+        } else if image {
             format!("{}.png", uuid::Uuid::new_v4())
         } else {
             format!(
@@ -363,8 +377,13 @@ impl Queue {
                 asset_id: None,
                 uploaded: None,
             };
-            target.draft_images.push(placeholder.clone());
-            target.insert_attachment_chips(&[placeholder], false);
+            if let Some(index) = replacement {
+                target.draft_images[index] = placeholder;
+                self.remove(&machine, thread_id, &id);
+            } else {
+                target.draft_images.push(placeholder.clone());
+                target.insert_attachment_chips(&[placeholder], false);
+            }
         }
         self.entries.push(Entry {
             machine,
@@ -455,7 +474,7 @@ impl Queue {
         }
         for (machine, thread, attachments) in drafts {
             for attachment in attachments {
-                if attachment.mime == "inode/directory" {
+                if attachment.mime == "inode/directory" || attachment.needs_reattach() {
                     continue;
                 }
                 if let Some(entry) = self
@@ -636,7 +655,20 @@ impl Queue {
                                 }
                                 entry.phase = Phase::Ready;
                             }
-                            Err(error) => entry.phase = Phase::Failed(error),
+                            Err(error) => {
+                                if error == "Uploaded file expired. Remove it and attach it again."
+                                    && let Some(attachment) =
+                                        target.draft_images.iter_mut().find(|a| a.id == entry.id)
+                                    && !attachment.is_image()
+                                    && !attachments::path_for(attachment)
+                                        .is_some_and(|p| p.is_file())
+                                {
+                                    attachment.uploaded = None;
+                                    entry.uploaded = None;
+                                    dirty.insert((entry.machine.clone(), entry.thread));
+                                }
+                                entry.phase = Phase::Failed(error);
+                            }
                         },
                     }
                 }
@@ -764,12 +796,15 @@ impl Queue {
                                     .map_err(|e| e.to_string())
                                     .and_then(|runtime| {
                                         runtime.block_on(async {
-                                            if verify
-                                                && let Some(uploaded) = &attachment.uploaded
-                                                && uploaded.environment_id == upload_link.server_id
-                                                && verify_upload(&upload_link, uploaded).await?
-                                            {
-                                                return Ok(uploaded.clone());
+                                            if verify && let Some(uploaded) = &attachment.uploaded
+                                                && uploaded.environment_id == upload_link.server_id {
+                                                if verify_upload(&upload_link, uploaded).await? {
+                                                    return Ok(uploaded.clone());
+                                                }
+                                                if !attachment.is_image()
+                                                    && !attachments::path_for(&attachment).is_some_and(|p| p.is_file()) {
+                                                    return Err("Uploaded file expired. Remove it and attach it again.".into());
+                                                }
                                             }
                                             upload(&upload_link, &attachment, &cancel, |progress| {
                                                 let _ = send.send(Event::Progress(progress));
@@ -951,6 +986,14 @@ impl State {
         self.checkpoint();
     }
     pub fn attachment_send_block_reason(&self) -> Option<String> {
+        if self
+            .current()
+            .draft_images
+            .iter()
+            .any(Attachment::needs_reattach)
+        {
+            return Some("Attach missing files again or remove them to send.".into());
+        }
         if let Some(reason) = self
             .attachment_uploads
             .block_reason(&self.machines.selected, self.current().id)
