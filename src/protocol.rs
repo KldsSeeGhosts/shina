@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 19;
+pub const MINOR: u32 = 20;
+pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
+pub const VCS_WORKTREES_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to use branches and worktrees.";
 pub const FRESH_CONTEXT: &str = "fresh-context";
 pub const USAGE_LIMITS: &str = "usage-limits";
 pub const PROJECT_WRITE_FILE: &str = "project-write-file";
@@ -101,7 +104,10 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "server.status"
         | "blobs.read"
         | "filesystem.browse"
-        | "usage.limits" => "read",
+        | "usage.limits"
+        | "vcs.listBranches"
+        | "vcs.status"
+        | "vcs.listWorktrees" => "read",
         "request.respond" | "thread.user-input.dismiss" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
@@ -171,7 +177,10 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "task.send"
         | "task.cancel"
         | "project.writeFile"
-        | "uploads.write" => "operate",
+        | "uploads.write"
+        | "vcs.createWorktree"
+        | "vcs.removeWorktree"
+        | "vcs.runSetup" => "operate",
         _ => return None,
     })
 }
@@ -541,7 +550,10 @@ mod tests {
                 | "server.status"
                 | "blobs.read"
                 | "filesystem.browse"
-                | "usage.limits" => "read",
+                | "usage.limits"
+                | "vcs.listBranches"
+                | "vcs.status"
+                | "vcs.listWorktrees" => "read",
                 "request.respond" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"

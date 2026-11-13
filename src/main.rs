@@ -69,6 +69,7 @@ mod tray;
 mod ui;
 mod update;
 mod usage_limits;
+mod vcs;
 mod visuals;
 mod work;
 

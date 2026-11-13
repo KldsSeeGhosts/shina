@@ -501,6 +501,13 @@ pub struct PromptSuggestion {
     pub text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadEnvMode {
+    Local,
+    Worktree,
+}
+
 pub struct Thread {
     pub peer_origin: Option<PeerOrigin>,
     pub stop_serial: u64,
@@ -538,6 +545,10 @@ pub struct Thread {
     pub harness_context_sent: bool,
     pub harness_state: Value,
     pub project: Option<ProjectId>,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
+    pub base_branch: Option<String>,
+    pub env_mode: Option<ThreadEnvMode>,
     pub machine: String,
     pub updated: u64,
     pub title: String,
@@ -962,6 +973,10 @@ impl Thread {
             harness_context_sent: false,
             harness_state: json!({}),
             project: None,
+            worktree_path: None,
+            branch: None,
+            base_branch: None,
+            env_mode: None,
             machine: "local".into(),
             peer_origin: None,
             stop_serial: 0,
@@ -10515,6 +10530,24 @@ impl State {
                     {
                         thread.context.usage.breakdown = parsed;
                     }
+                    thread.worktree_path = record
+                        .get("worktreePath")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    thread.branch = record
+                        .get("branch")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    thread.base_branch = record
+                        .get("baseBranch")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    thread.env_mode = record
+                        .get("envMode")
+                        .and_then(|v| serde_json::from_value::<ThreadEnvMode>(v.clone()).ok());
                     if let Some(suggestion) = record.get("promptSuggestion")
                         && let Ok(parsed) =
                             serde_json::from_value::<Option<PromptSuggestion>>(suggestion.clone())
@@ -11429,6 +11462,18 @@ impl Thread {
             "promptSuggestion":self.prompt_suggestion,
             "serviceTier":self.harness_state["serviceTier"]
         }).as_object().unwrap().clone());
+        if let Some(worktree_path) = &self.worktree_path {
+            record["worktreePath"] = json!(worktree_path);
+        }
+        if let Some(branch) = &self.branch {
+            record["branch"] = json!(branch);
+        }
+        if let Some(base_branch) = &self.base_branch {
+            record["baseBranch"] = json!(base_branch);
+        }
+        if let Some(env_mode) = self.env_mode {
+            record["envMode"] = json!(env_mode);
+        }
         record
     }
 }
@@ -17793,6 +17838,93 @@ mod tests {
         let old_wire = json!({"tokens": 1000, "context_window": 200000, "percent": 0.5});
         let decoded: crate::context::ContextUsage = serde_json::from_value(old_wire).unwrap();
         assert_eq!(decoded.breakdown, None);
+    }
+
+    #[test]
+    fn worktree_thread_metadata_round_trips_and_decodes_legacy_records() {
+        let mut state = State::new(".".into(), false);
+        let thread = state.current_mut();
+        thread.worktree_path = Some("/tmp/worktrees/repo/feat-abc".into());
+        thread.branch = Some("feature/worktree".into());
+        thread.base_branch = Some("main".into());
+        thread.env_mode = Some(ThreadEnvMode::Worktree);
+
+        let with_worktree = state.snapshot();
+        assert_eq!(
+            with_worktree["threads"][0]["worktreePath"],
+            "/tmp/worktrees/repo/feat-abc"
+        );
+        assert_eq!(with_worktree["threads"][0]["branch"], "feature/worktree");
+        assert_eq!(with_worktree["threads"][0]["baseBranch"], "main");
+        assert_eq!(with_worktree["threads"][0]["envMode"], "worktree");
+
+        let mut restored = State::new(".".into(), false);
+        restored.restore_global(&with_worktree).unwrap();
+        assert_eq!(
+            restored.current().worktree_path.as_deref(),
+            Some("/tmp/worktrees/repo/feat-abc")
+        );
+        assert_eq!(
+            restored.current().branch.as_deref(),
+            Some("feature/worktree")
+        );
+        assert_eq!(restored.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(restored.current().env_mode, Some(ThreadEnvMode::Worktree));
+
+        // Thread projection also carries the worktree fields on the wire.
+        let projection = state.projection();
+        assert_eq!(
+            projection["threads"][0]["worktreePath"],
+            "/tmp/worktrees/repo/feat-abc"
+        );
+        assert_eq!(projection["threads"][0]["branch"], "feature/worktree");
+        assert_eq!(projection["threads"][0]["baseBranch"], "main");
+        assert_eq!(projection["threads"][0]["envMode"], "worktree");
+
+        // Legacy metadata without worktree fields decodes to None.
+        let mut legacy = with_worktree;
+        let obj = legacy["threads"][0].as_object_mut().unwrap();
+        for key in ["worktreePath", "branch", "baseBranch", "envMode"] {
+            obj.remove(key);
+        }
+        let mut restored_legacy = State::new(".".into(), false);
+        restored_legacy.restore_global(&legacy).unwrap();
+        assert_eq!(restored_legacy.current().worktree_path, None);
+        assert_eq!(restored_legacy.current().branch, None);
+        assert_eq!(restored_legacy.current().base_branch, None);
+        assert_eq!(restored_legacy.current().env_mode, None);
+
+        // Absent fields stay omitted and round-trip as None.
+        let empty = State::new(".".into(), false);
+        let without_worktree = empty.snapshot();
+        for key in ["worktreePath", "branch", "baseBranch", "envMode"] {
+            assert!(without_worktree["threads"][0].get(key).is_none(), "{key}");
+        }
+        let mut restored_none = State::new(".".into(), false);
+        restored_none.restore_global(&without_worktree).unwrap();
+        assert_eq!(restored_none.current().worktree_path, None);
+        assert_eq!(restored_none.current().branch, None);
+        assert_eq!(restored_none.current().base_branch, None);
+        assert_eq!(restored_none.current().env_mode, None);
+
+        // Unknown envMode value decodes leniently as None rather than failing restore.
+        let mut unknown_env = empty.snapshot();
+        unknown_env["threads"][0]["envMode"] = json!("future-mode");
+        let mut restored_unknown = State::new(".".into(), false);
+        restored_unknown.restore_global(&unknown_env).unwrap();
+        assert_eq!(restored_unknown.current().env_mode, None);
+
+        // Local envMode round-trips too.
+        let mut local_state = State::new(".".into(), false);
+        local_state.current_mut().env_mode = Some(ThreadEnvMode::Local);
+        let local_snap = local_state.snapshot();
+        assert_eq!(local_snap["threads"][0]["envMode"], "local");
+        let mut restored_local = State::new(".".into(), false);
+        restored_local.restore_global(&local_snap).unwrap();
+        assert_eq!(
+            restored_local.current().env_mode,
+            Some(ThreadEnvMode::Local)
+        );
     }
 
     #[test]
