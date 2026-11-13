@@ -1728,11 +1728,23 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
     let parent=client.command("thread.create",json!({"project":1}),uuid::Uuid::new_v4())["result"]["result"]["threadId"].as_u64().unwrap();
     let args = json!({"prompt":"remote-long-fixture","client_request_id":"one-launch",
         "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
-    let delegated = client.command(
-        "task.delegate",
-        json!({"threadId":parent,"args":args}),
-        uuid::Uuid::new_v4(),
-    );
+    // The home server learns the peer's model catalog asynchronously after linking. Until it
+    // has, delegation is refused with "does not advertise this model"; wait for the catalog.
+    let mut delegated = Value::Null;
+    for _ in 0..100 {
+        delegated = client.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args}),
+            uuid::Uuid::new_v4(),
+        );
+        let waiting = delegated["result"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not advertise this model"));
+        if !waiting {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert_eq!(delegated["result"]["status"], "accepted", "{delegated}");
     let child = delegated["result"]["result"]["thread_id"].clone();
     let retry = client.command(
