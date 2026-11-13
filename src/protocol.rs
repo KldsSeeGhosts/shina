@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 11;
+pub const MINOR: u32 = 12;
+pub const PROJECT_WRITE_FILE: &str = "project-write-file";
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";
@@ -54,6 +55,20 @@ pub struct FolderListing {
     pub entries: Vec<FolderEntry>,
     pub truncated: bool,
     pub target_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWriteFileInput {
+    pub cwd: String,
+    pub relative_path: String,
+    pub contents: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWriteFileResult {
+    pub relative_path: String,
 }
 
 /// Every routed method has an explicit grant. Unknown methods fail closed.
@@ -138,6 +153,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "task.delegate"
         | "task.send"
         | "task.cancel"
+        | "project.writeFile"
         | "uploads.write" => "operate",
         _ => return None,
     })
