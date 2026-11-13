@@ -18,6 +18,7 @@ pub(crate) enum Kind {
     Sqlite,
     Archive,
     Font,
+    Notebook,
     Unsupported,
 }
 
@@ -38,6 +39,11 @@ fn kind(name: &str, mime: &str) -> Kind {
             | "video/vnd.dlna.mpeg-tts"
             | "text/plain"
     );
+    if mime == "application/x-ipynb+json"
+        || (generic || mime == "application/json") && extension == "ipynb"
+    {
+        return Kind::Notebook;
+    }
     if matches!(
         mime.as_str(),
         "application/zip"
@@ -174,6 +180,9 @@ pub(crate) struct Preview {
     archive_loading: bool,
     archive_folder: String,
     archive_entry: Option<(String, Result<ArchiveContent, String>)>,
+    notebook: Option<Arc<attachment_notebook_preview::Notebook>>,
+    notebook_loading: bool,
+    notebook_visible: usize,
 }
 
 enum ArchiveContent {
@@ -224,6 +233,9 @@ impl Preview {
         self.archive_loading = false;
         self.archive_folder.clear();
         self.archive_entry = None;
+        self.notebook = None;
+        self.notebook_loading = false;
+        self.notebook_visible = 20;
         self.player = None;
         self.text.clear();
         self.error = None;
@@ -366,6 +378,9 @@ impl State {
             archive_loading: false,
             archive_folder: String::new(),
             archive_entry: None,
+            notebook: None,
+            notebook_loading: false,
+            notebook_visible: 20,
         };
         preview.load(self.wake.clone());
         let fetch = preview.error.is_some() && preview.selected().uploaded.is_some();
@@ -392,6 +407,9 @@ impl State {
         }
         if kind(&file.name, &file.mime) == Kind::Archive {
             self.load_attachment_archive();
+        }
+        if kind(&file.name, &file.mime) == Kind::Notebook {
+            self.load_attachment_notebook();
         }
         if fetch
             && let (Some(link), Some(handle)) = (
@@ -610,6 +628,48 @@ impl State {
         }
     }
 
+    fn load_attachment_notebook(&mut self) {
+        let Some(preview) = &mut self.attachment_preview else {
+            return;
+        };
+        if preview.notebook_loading || preview.error.is_some() {
+            return;
+        }
+        preview.notebook_loading = true;
+        let file = preview.selected().clone();
+        let cancel = preview.cancel.clone();
+        let work = move || {
+            let path =
+                crate::attachments::path_for(&file).ok_or("The attachment is unavailable.")?;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)
+                .map_err(|e| e.to_string())?
+                .take(attachment_notebook_preview::MAX_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            attachment_notebook_preview::parse(&bytes).map(Arc::new)
+        };
+        let apply = move |state: &mut State, result| {
+            if let Some(preview) = &mut state.attachment_preview
+                && Arc::ptr_eq(&preview.cancel, &cancel)
+            {
+                preview.notebook_loading = false;
+                match result {
+                    Ok(notebook) => preview.notebook = Some(notebook),
+                    Err(error) => preview.error = Some(error),
+                }
+            }
+        };
+        if let Some(handle) = self.background.handle.clone() {
+            std::thread::spawn(move || {
+                let result = work();
+                handle.update(move |state, _| apply(state, result));
+            });
+        } else {
+            apply(self, work());
+        }
+    }
+
     fn open_archive_entry(&mut self, path: &str) {
         let Some(preview) = &mut self.attachment_preview else {
             return;
@@ -648,6 +708,249 @@ fn clamped_zoom(zoom: f32) -> f32 {
 
 fn zoom_offset(old: f32, new: f32, offset: [f32; 2], point: [f32; 2]) -> [f32; 2] {
     std::array::from_fn(|i| ((offset[i] + point[i]) / old * new - point[i]).max(0.0))
+}
+
+/// Ported from KSG NotebookPreview: the cell count and language strip, the
+/// saved-outputs notice, and twenty cells at a time in a scroll region.
+fn notebook_view(s: &State, p: Palette, width: f32) -> El {
+    let preview = s.attachment_preview.as_ref().unwrap();
+    let Some(notebook) = &preview.notebook else {
+        return col()
+            .w_full()
+            .min_w(0.0)
+            .h(0.0)
+            .grow(1.0)
+            .min_h(0.0)
+            .child(label("Loading file preview…", SMALL, p.muted));
+    };
+    let attachment = preview.selected();
+    let size = if attachment.bytes == 0 {
+        "0 bytes".to_owned()
+    } else if attachment.bytes.div_ceil(1024) >= 1024 {
+        format!("{:.1} MB", attachment.bytes as f64 / 1048576.0)
+    } else {
+        format!("{} KB", attachment.bytes.div_ceil(1024))
+    };
+    let mut cells = col().w_full().min_w(0.0).px(20.0).py(24.0).gap(20.0);
+    for (index, cell) in notebook
+        .cells
+        .iter()
+        .take(preview.notebook_visible)
+        .enumerate()
+    {
+        cells = cells.child(notebook_cell(s, p, index, cell, &notebook.language, width));
+    }
+    if notebook.cells.is_empty() {
+        cells = cells.child(label("This notebook is empty.", SMALL, p.muted));
+    }
+    if preview.notebook_visible < notebook.cells.len() {
+        // KSG's `NotebookPreview` wording.
+        let more = format!(
+            "Show more cells ({} remaining)",
+            notebook.cells.len() - preview.notebook_visible
+        );
+        cells = cells.child(framed(
+            row()
+                .key("notebook-more")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(more.clone())
+                .focusable(true)
+                .center_y()
+                .h(32.0)
+                .px(14.0)
+                .radius(4.0)
+                .fill(p.card)
+                .hover(p.selected)
+                .press(p.selected)
+                .on_press(|s: &mut State| {
+                    if let Some(preview) = &mut s.attachment_preview {
+                        preview.notebook_visible += 20;
+                    }
+                })
+                .child(label(more, TextStyle::new(13.0, 600.0), p.ink)),
+            p,
+        ));
+    }
+    col()
+        .w_full()
+        .min_w(0.0)
+        .h(0.0)
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(8.0)
+        .child(pixel_text(
+            format!(
+                "{} cells · {} · {}",
+                notebook.cells.len(),
+                notebook.language,
+                size
+            ),
+            p.muted,
+        ))
+        .child(label(
+            "Saved outputs only. Code is never executed.",
+            SMALL,
+            p.muted,
+        ))
+        .child(
+            col()
+                .key("attachment-preview-notebook")
+                .w_full()
+                .min_w(0.0)
+                .h(0.0)
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(cells),
+        )
+}
+
+/// One KSG NotebookPreview section: the kind and position header, then the
+/// source and each saved output.
+fn notebook_cell(
+    s: &State,
+    p: Palette,
+    index: usize,
+    cell: &attachment_notebook_preview::NotebookCell,
+    language: &str,
+    width: f32,
+) -> El {
+    use attachment_notebook_preview::{CellKind, NotebookOutput};
+    let mut section = col()
+        .key(format!("notebook-cell-{index}"))
+        .label(format!("Cell {}", index + 1))
+        .w_full()
+        .min_w(0.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
+        .border(1.0, p.line)
+        .child(
+            el().w_full()
+                .min_w(0.0)
+                .px(12.0)
+                .py(6.0)
+                .fill(p.code_bg)
+                .child(pixel_label(
+                    &format!(
+                        "{} · {}",
+                        if cell.kind == CellKind::Code {
+                            language
+                        } else {
+                            cell.kind.name()
+                        },
+                        index + 1
+                    ),
+                    p.muted,
+                )),
+        );
+    match cell.kind {
+        CellKind::Markdown => {
+            section = section.child(el().w_full().min_w(0.0).px(16.0).py(12.0).child(
+                markdown_ui::render_with_find(
+                    &cell.source,
+                    p,
+                    s.dark,
+                    width > 760.0,
+                    false,
+                    false,
+                    &format!("notebook-md-{index}"),
+                    None,
+                ),
+            ));
+        }
+        _ if !cell.source.trim().is_empty() => {
+            section = section.child(notebook_source(cell, p));
+        }
+        _ => {}
+    }
+    for output in &cell.outputs {
+        section = section.child(rule(p)).child(match output {
+            NotebookOutput::Text { text, danger } => {
+                el().w_full().min_w(0.0).px(16.0).py(12.0).child(
+                    label(
+                        text,
+                        TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
+                        if *danger { p.danger } else { p.ink },
+                    )
+                    .wrap_anywhere()
+                    .selectable(true),
+                )
+            }
+            NotebookOutput::Html => el().w_full().min_w(0.0).px(16.0).py(12.0).child(label(
+                "HTML output is not shown",
+                SMALL,
+                p.muted,
+            )),
+            NotebookOutput::Image { mime, bytes, size } => {
+                let max_width = (width - 104.0).max(120.0);
+                let handle = s
+                    .attachment_cache
+                    .load_mime(bytes.clone(), mime, max_width, 2.0);
+                // Headless fixtures have no window waker to rebuild after decode.
+                if rune::is_headless() {
+                    let _ = handle.wait();
+                }
+                if handle.error().is_some() {
+                    el().w_full().min_w(0.0).px(16.0).py(12.0).child(label(
+                        "Unable to load image.",
+                        SMALL,
+                        p.muted,
+                    ))
+                } else {
+                    let [natural_width, natural_height] = handle.size().unwrap_or(*size);
+                    let fit = (max_width / natural_width.max(1) as f32)
+                        .min(384.0 / natural_height.max(1) as f32)
+                        .min(1.0);
+                    el().px(16.0).py(16.0).child(
+                        el().w(natural_width as f32 * fit)
+                            .h(natural_height as f32 * fit)
+                            .pixels_fit(handle.pixels(), rune::SurfaceFit::Fit),
+                    )
+                }
+            }
+        });
+    }
+    section
+}
+
+/// KSG's read-only cell source block: mono source on a `message_bg` block, with
+/// Jupyter's execution count in the gutter and the editor's height bound.
+fn notebook_source(cell: &attachment_notebook_preview::NotebookCell, p: Palette) -> El {
+    let mut body = row().w_full().min_w(0.0).px(10.0).py(8.0).gap(10.0);
+    if cell.kind == attachment_notebook_preview::CellKind::Code {
+        body = body.child(pixel_text(
+            cell.execution_count
+                .map(|count| format!("[{count}]"))
+                .unwrap_or_else(|| "[ ]".into()),
+            p.faint,
+        ));
+    }
+    body = body.child(
+        el().w(0.0)
+            .grow(1.0)
+            .min_w(0.0)
+            .max_h(360.0)
+            .scroll_xy()
+            .child(
+                label(
+                    &cell.source,
+                    TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
+                    p.ink,
+                )
+                .selectable(true),
+            ),
+    );
+    el().w_full().min_w(0.0).px(16.0).py(8.0).child(
+        el().w_full()
+            .min_w(0.0)
+            .radius(4.0)
+            .clip_rounded(4.0)
+            .fill(p.message_bg)
+            .child(body),
+    )
 }
 
 /// Ported from KSG BinaryViewer's archive branch. Archive paths never become host paths.
@@ -1629,6 +1932,9 @@ pub(super) fn view(s: &State, p: Palette) -> El {
             }
             Kind::Archive => {
                 card = card.child(archive_view(s, p));
+            }
+            Kind::Notebook => {
+                card = card.child(notebook_view(s, p, width));
             }
             Kind::Pdf | Kind::Font => {
                 let file = attachment.clone();
