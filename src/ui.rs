@@ -23,6 +23,8 @@ mod attachment_text_preview;
 mod captain_ui;
 #[path = "composer_menu.rs"]
 mod composer_menu;
+#[path = "composer_stash.rs"]
+pub(crate) mod composer_stash;
 #[path = "composer_ui.rs"]
 pub(crate) mod composer_ui;
 #[path = "crew_ui.rs"]
