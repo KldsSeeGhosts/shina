@@ -11920,6 +11920,7 @@ fn composer(
                 })
         });
     let can_send = !s.demo
+        && s.machines.draft_retarget.is_none()
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
         && (!t.initializing || t.queued_edit.is_some())
         && !t.archived()
@@ -11938,7 +11939,9 @@ fn composer(
         .key("send-message")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(if t.resume_pending() {
+        .label(if s.machines.draft_retarget.is_some() {
+            "Preparing machine"
+        } else if t.resume_pending() {
             "Resuming thread"
         } else if show_resume {
             "Resume thread"
@@ -12611,6 +12614,15 @@ fn machine_selector(s: &State, p: Palette, icon_only: bool) -> El {
                 .truncate()
                 .shrink()
                 .min_w(0.0)
+        })
+        // KSG shows a spinner beside the selector while the draft's machine
+        // change is still resolving; Rune's pending glyph is the clock.
+        .child(if s.machines.draft_retarget.is_some() {
+            icon("clock", p.coral)
+                .size(12.0, 12.0)
+                .key("machine-selector-pending")
+        } else {
+            el()
         })
         .child(icon("chevron", p.muted).size(12.0, 12.0))
 }
@@ -15781,6 +15793,37 @@ pub(crate) mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_machine_selector_marks_a_pending_draft_change_and_blocks_sending() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            connected_machines(&mut rt);
+            rt.state.current_mut().client_draft = true;
+            rt.state.machines.draft_retarget = Some(crate::peer::DraftRetarget {
+                server: "studio".into(),
+                source: "local".into(),
+                draft: rt.state.current().id,
+                project: None,
+                command: None,
+            });
+            rt.frame(0.0);
+            assert!(
+                rt.presented("machine-selector-pending").is_some(),
+                "{width}: pending indicator beside the machine label"
+            );
+            assert!(
+                rt.accessibility_json()
+                    .to_string()
+                    .contains("Preparing machine"),
+                "{width}: send is disabled with KSG's reason"
+            );
+            rt.state.machines.draft_retarget = None;
+            rt.frame(0.0);
+            assert!(rt.find("machine-selector-pending").is_none());
+        }
+    }
+
     #[test]
     fn background_settings_fit_the_existing_menu_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {

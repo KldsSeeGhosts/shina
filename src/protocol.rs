@@ -160,6 +160,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "queue.returnDraft"
         | "input.claim"
         | "project.put"
+        | "project.ensureScratch"
         | "project.remove"
         | "project.clone"
         | "project.cancelClone"

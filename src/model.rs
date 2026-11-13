@@ -11216,6 +11216,11 @@ impl State {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
+        // KSG's useComposerSend refuses while readPendingEnvironmentChange is
+        // set: the draft is still being addressed to its new machine.
+        if self.machines.draft_retarget.is_some() {
+            return false;
+        }
         if self.has_pending_context_imports(&self.machines.selected, self.current().id) {
             self.current_mut().attachment_error = Some(
                 "Still bringing attached context into this message. Send again once its chip resolves."

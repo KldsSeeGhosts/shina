@@ -75,10 +75,7 @@ pub fn folder_name(path: &str) -> String {
 /// One logical-project member on the target machine, or none. `candidates`
 /// must be the target machine's projects; hidden entries are skipped.
 /// `source` is the draft's current project on its own machine.
-pub fn match_logical_project(
-    source: &RouteProject,
-    candidates: &[RouteProject],
-) -> Option<usize> {
+pub fn match_logical_project(source: &RouteProject, candidates: &[RouteProject]) -> Option<usize> {
     let open = |p: &&RouteProject| !p.hidden;
     let winner = |projects: Vec<&RouteProject>| {
         projects
@@ -161,10 +158,25 @@ mod tests {
 
     #[test]
     fn matches_the_same_repository_on_another_machine() {
-        let source = project(3, "/Users/a/work/app", Some("git@github.com:team/app.git"), 10);
+        let source = project(
+            3,
+            "/Users/a/work/app",
+            Some("git@github.com:team/app.git"),
+            10,
+        );
         let candidates = [
-            project(1, "/home/b/code/other", Some("git@github.com:team/other.git"), 20),
-            project(7, "/home/b/code/app", Some("https://github.com/team/app.git"), 15),
+            project(
+                1,
+                "/home/b/code/other",
+                Some("git@github.com:team/other.git"),
+                20,
+            ),
+            project(
+                7,
+                "/home/b/code/app",
+                Some("https://github.com/team/app.git"),
+                15,
+            ),
         ];
         assert_eq!(match_logical_project(&source, &candidates), Some(7));
     }

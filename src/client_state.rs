@@ -2476,9 +2476,9 @@ impl State {
 
     /// Whether the target machine can open a scratch project for a retarget.
     fn draft_routing_capable(&self, server: &str) -> bool {
-        self.client
-            .as_ref()
-            .is_some_and(|client| client.supports_capability(server, crate::protocol::DRAFT_ROUTING))
+        self.client.as_ref().is_some_and(|client| {
+            client.supports_capability(server, crate::protocol::DRAFT_ROUTING)
+        })
     }
 
     /// Where the draft should land on `server`: the matching logical project,
@@ -2506,7 +2506,10 @@ impl State {
 
     /// The draft's project as a matching candidate, with the repository identity
     /// that machine already reported (or a local lookup for this machine).
-    fn route_source_project(&self, project: usize) -> Option<crate::model::draft_routing::RouteProject> {
+    fn route_source_project(
+        &self,
+        project: usize,
+    ) -> Option<crate::model::draft_routing::RouteProject> {
         let entry = self.project(Some(project))?;
         let remote = self
             .machines
@@ -2662,22 +2665,21 @@ impl State {
         }
         let source = self.machines.selected.clone();
         let draft = self.current().id;
-        let Some(index) = self.threads.iter().position(|t| t.id == draft) else {
-            return;
-        };
-        let mut thread = self.threads.remove(index);
-        if self.threads.is_empty() {
-            self.active = 0;
-        } else {
-            self.active = self.active.min(self.threads.len() - 1);
-        }
         self.capture_opened_draft();
+        // The draft rides into the source machine's stash; the switch itself
+        // never runs with an empty workspace.
         self.select_machine(server);
         if self.machines.selected != server {
-            self.threads.push(thread);
-            self.select_thread(self.threads.len() - 1);
             return;
         }
+        let Some(mut thread) = self.machines.threads.get_mut(&source).and_then(|threads| {
+            threads
+                .iter()
+                .position(|t| t.id == draft)
+                .map(|index| threads.remove(index))
+        }) else {
+            return;
+        };
         // Client draft ids descend from usize::MAX; a draft already on the
         // target with the same id would collide, so take the next free one.
         if self.threads.iter().any(|t| t.id == thread.id) {
@@ -2694,6 +2696,11 @@ impl State {
             thread.id = id;
         }
         thread.project = project;
+        // Thread pills without an owner meant a thread on the machine the
+        // draft was on; record it before the draft changes hands, the way
+        // restoring a saved draft stamps its machine.
+        crate::composer_tokens::stamp_thread_owner(&mut thread.draft, &source);
+        thread.set_machine(server.to_owned());
         thread.remote = self
             .client
             .as_ref()
@@ -4094,11 +4101,10 @@ impl State {
                 std::fs::create_dir_all(&path)
                     .map_err(|_| "The scratch folder could not be created.")?;
                 let path = crate::projects::clean_path(&path);
-                let existing = self
-                    .projects
-                    .entries
-                    .iter_mut()
-                    .find(|p| p.machine == "local" && crate::projects::same_path(&p.path, &path));
+                let existing =
+                    self.projects.entries.iter_mut().find(|p| {
+                        p.machine == "local" && crate::projects::same_path(&p.path, &path)
+                    });
                 let id = match existing {
                     Some(project) => {
                         project.hidden = false;
@@ -4781,6 +4787,377 @@ mod tests {
             state.current().draft.text.is_empty(),
             "the draft moved, it was not copied"
         );
+    }
+
+    /// A client on "local" linked to a capable "server-b". The local workspace
+    /// owns repository project 1 and folder project 2; server-b owns the same
+    /// repository as project 7 and a folder twin for project 2.
+    fn draft_routing_fixture() -> (
+        State,
+        tokio::sync::mpsc::Receiver<Command>,
+        tokio::sync::mpsc::Receiver<Command>,
+    ) {
+        let (runtime, _) = wired();
+        let project = |id, name, path, remote: Option<&str>, updated| {
+            json!({"id":id,"name":name,"path":path,"machine":"local","hidden":false,
+                "updated":updated,"captain":null,"captainThread":null,
+                "gitRemote":remote})
+        };
+        let mut local_view = runtime.state.projection();
+        local_view["index"]["projects"] = json!([
+            project(
+                1,
+                "app",
+                "/local/app",
+                Some("git@github.com:team/app.git"),
+                10
+            ),
+            project(2, "notes", "/local/notes", None, 8),
+        ]);
+        let mut remote_view = runtime.state.projection();
+        remote_view["index"]["projects"] = json!([
+            project(
+                7,
+                "app",
+                "/srv/b/app",
+                Some("https://github.com/team/app.git"),
+                20
+            ),
+            project(8, "notes", "/srv/b/notes", None, 5),
+        ]);
+        let mut state = State::new(PathBuf::new(), false);
+        let (mut client, local) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote, commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities":[crate::protocol::DRAFT_ROUTING]});
+        *remote.info.lock().unwrap() = json!({"capabilities":[crate::protocol::DRAFT_ROUTING]});
+        client.linked.insert("server-b".into(), remote);
+        state.client = Some(client);
+        state
+            .machines
+            .views
+            .insert("local".into(), local_view.clone());
+        state.machines.views.insert("server-b".into(), remote_view);
+        state.apply_projection(local_view).unwrap();
+        (state, local, commands)
+    }
+
+    /// Make the current tab a client draft on `project`.
+    fn client_draft_on(state: &mut State, project: Option<usize>, text: &str) -> usize {
+        let mut draft = Thread::new(usize::MAX - 5);
+        draft.client_draft = true;
+        draft.project = project;
+        draft.draft.replace_text(text);
+        let id = draft.id;
+        state.threads.push(draft);
+        state.select_thread(state.threads.len() - 1);
+        id
+    }
+
+    #[test]
+    fn a_matched_retarget_moves_the_draft_in_place_and_keeps_valid_context() {
+        let (mut state, _local, mut remote) = draft_routing_fixture();
+        let draft_id = client_draft_on(&mut state, Some(1), "carry me");
+        let token = crate::composer_tokens::Token::Thread {
+            id: 4,
+            title: "Design".into(),
+            machine: Some("local".into()),
+            extra: Default::default(),
+        };
+        let unowned = crate::composer_tokens::Token::Thread {
+            id: 5,
+            title: "Local task".into(),
+            machine: None,
+            extra: Default::default(),
+        };
+        let mut draft = crate::composer_rich::draft("ship @des and @pla");
+        draft.replace_with_pill(5..9, token.id(), "Design");
+        draft.replace_with_pill(14..18, unowned.id(), "Local task");
+        let image = Attachment {
+            id: "shot.png".into(),
+            name: "shot.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 2,
+            path: None,
+        };
+        let thread = state.current_mut();
+        thread.draft = draft;
+        thread.draft_images.push(image.clone());
+        thread.selected_model = Some(("cpa".into(), "fixture".into()));
+        thread.env_mode = Some(crate::model::ThreadEnvMode::Worktree);
+        thread.base_branch = Some("main".into());
+        thread.worktree_path = Some("/tmp/wt".into());
+        thread.branch = Some("feature".into());
+        thread.draft_context = vec![crate::composer_context::thread_context_record(
+            "local", 4, "Design",
+        )];
+        thread.draft_reply_to = Some(crate::composer_context::thread_context_record(
+            "local", 4, "Design",
+        ));
+
+        state.retarget_draft("server-b");
+        assert_eq!(state.machines.selected, "server-b");
+        assert!(state.machines.draft_retarget.is_none());
+        let moved = state.current();
+        // The same draft landed on the repository's twin on server-b.
+        assert_eq!(moved.id, draft_id);
+        assert_eq!(moved.project, Some(7));
+        assert_eq!(moved.machine, "server-b");
+        assert!(moved.draft.text.contains("Design"));
+        let pills: Vec<_> = moved
+            .draft
+            .pills()
+            .filter_map(|(_, id)| crate::composer_tokens::Token::decode(&id))
+            .collect();
+        assert!(matches!(
+            pills.iter().find(|token| matches!(token, crate::composer_tokens::Token::Thread { id: 4, .. })),
+            Some(crate::composer_tokens::Token::Thread {
+                machine: Some(machine),
+                ..
+            }) if machine.as_str() == "local"
+        ));
+        // An unqualified thread pill keeps pointing at the machine the draft
+        // left, which owns that thread.
+        assert!(matches!(
+            pills.iter().find(|token| matches!(token, crate::composer_tokens::Token::Thread { id: 5, .. })),
+            Some(crate::composer_tokens::Token::Thread {
+                machine: Some(machine),
+                ..
+            }) if machine.as_str() == "local"
+        ));
+        assert_eq!(moved.draft_images, [image]);
+        assert_eq!(moved.draft_context.len(), 1);
+        assert!(matches!(
+            moved.draft_reply_to.as_ref().map(|record| &record.data),
+            Some(crate::composer_context::ComposerContextData::Thread {
+                environment_id, ..
+            }) if environment_id == "local"
+        ));
+        assert_eq!(
+            moved
+                .selected_model
+                .as_ref()
+                .map(|(instance, model)| (instance.as_str(), model.as_str())),
+            Some(("cpa", "fixture"))
+        );
+        // The target is the same repository, so worktree mode and the base
+        // branch survive; the checkout itself resets, as in KSG.
+        assert_eq!(moved.env_mode, Some(crate::model::ThreadEnvMode::Worktree));
+        assert_eq!(moved.base_branch.as_deref(), Some("main"));
+        assert!(moved.worktree_path.is_none() && moved.branch.is_none());
+        assert!(
+            state.machines.threads["local"]
+                .iter()
+                .all(|thread| thread.id != draft_id),
+            "the draft left the source machine's stash"
+        );
+        assert!(
+            remote.try_recv().is_err(),
+            "a matched switch sends nothing until Send"
+        );
+    }
+
+    #[test]
+    fn a_retarget_with_no_match_uses_a_scratch_project_receipt() {
+        let (mut state, _local, mut remote) = draft_routing_fixture();
+        let draft_id = client_draft_on(&mut state, None, "scratch draft");
+        state.retarget_draft("server-b");
+        assert_eq!(state.machines.selected, "local");
+        let pending = state.machines.draft_retarget.as_ref().unwrap();
+        assert_eq!(pending.server, "server-b");
+        assert_eq!(pending.draft, draft_id);
+        assert!(pending.command.is_some());
+        let command = remote.try_recv().unwrap();
+        assert_eq!(command.method, "project.ensureScratch");
+        // An edit during the in-flight change belongs to the same draft.
+        state.current_mut().draft.replace_text("edited in flight");
+        state
+            .client
+            .as_ref()
+            .unwrap()
+            .linked
+            .get("server-b")
+            .unwrap()
+            .test_receipt(command, accepted(json!({"projectId":9})));
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.machines.selected, "server-b");
+        assert_eq!(state.current().id, draft_id);
+        assert_eq!(state.current().project, Some(9));
+        assert_eq!(state.current().draft.text, "edited in flight");
+        assert!(state.machines.draft_retarget.is_none());
+        // The draft never promoted; nothing was sent.
+        assert!(state.current().client_draft);
+        assert!(remote.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_failed_scratch_request_keeps_the_draft_and_reports_it() {
+        let (mut state, _local, mut remote) = draft_routing_fixture();
+        client_draft_on(&mut state, None, "still mine");
+        state.retarget_draft("server-b");
+        let command = remote.try_recv().unwrap();
+        state
+            .client
+            .as_ref()
+            .unwrap()
+            .linked
+            .get("server-b")
+            .unwrap()
+            .test_receipt(
+                command,
+                json!({"error":{"message":"scratch is unavailable"}}),
+            );
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.current().draft.text, "still mine");
+        assert!(state.current().project.is_none());
+        assert!(state.machines.draft_retarget.is_none());
+        assert!(state.machines.draft_picker.is_none());
+        assert_eq!(
+            state.toasts.last().map(|toast| toast.title.as_str()),
+            Some("Could not switch machine")
+        );
+    }
+
+    #[test]
+    fn an_uncapable_target_falls_back_to_project_selection() {
+        let (mut state, _local, _remote) = draft_routing_fixture();
+        *state
+            .client
+            .as_ref()
+            .unwrap()
+            .linked
+            .get("server-b")
+            .unwrap()
+            .info
+            .lock()
+            .unwrap() = json!({});
+        client_draft_on(&mut state, None, "pick a project");
+        state.retarget_draft("server-b");
+        assert_eq!(state.machines.selected, "server-b");
+        assert!(state.machines.draft_retarget.is_none());
+        assert_eq!(state.machines.draft_picker.as_deref(), Some("server-b"));
+        assert_eq!(
+            state.project_picker,
+            Some(crate::model::ProjectPicker::NewThread)
+        );
+    }
+
+    #[test]
+    fn a_pending_retarget_gates_sends_and_discards_late_results() {
+        let (mut state, _local, mut remote) = draft_routing_fixture();
+        let (second, mut remote_c) = crate::client::Client::test_connected(state.data_dir.clone());
+        *second.info.lock().unwrap() = json!({"capabilities":[crate::protocol::DRAFT_ROUTING]});
+        state
+            .client
+            .as_mut()
+            .unwrap()
+            .linked
+            .insert("server-c".into(), second);
+        let draft_id = client_draft_on(&mut state, None, "wait for it");
+        state.retarget_draft("server-b");
+        let first = remote.try_recv().unwrap();
+        // Send refuses while the change is in flight (KSG's "Preparing machine").
+        state.send();
+        assert_eq!(state.current().draft.text, "wait for it");
+        assert!(state.current().remote_send.is_none());
+        // A second change supersedes the first.
+        state.retarget_draft("server-c");
+        let second_command = remote_c.try_recv().unwrap();
+        assert_eq!(
+            state.machines.draft_retarget.as_ref().unwrap().server,
+            "server-c"
+        );
+        // The first machine's late scratch receipt is discarded.
+        state
+            .client
+            .as_ref()
+            .unwrap()
+            .linked
+            .get("server-b")
+            .unwrap()
+            .test_receipt(first, accepted(json!({"projectId":3})));
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.current().id, draft_id);
+        assert!(state.machines.draft_retarget.is_some());
+        state
+            .client
+            .as_ref()
+            .unwrap()
+            .linked
+            .get("server-c")
+            .unwrap()
+            .test_receipt(second_command, accepted(json!({"projectId":4})));
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.machines.selected, "server-c");
+        assert_eq!(state.current().project, Some(4));
+    }
+
+    #[test]
+    fn a_disconnected_target_abandons_the_change_with_the_draft_intact() {
+        let (mut state, _local, mut remote) = draft_routing_fixture();
+        client_draft_on(&mut state, None, "stay put");
+        state.retarget_draft("server-b");
+        let _scratch = remote.try_recv().unwrap();
+        state.client.as_mut().unwrap().linked.remove("server-b");
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.machines.selected, "local");
+        assert!(state.current().project.is_none());
+        assert_eq!(state.current().draft.text, "stay put");
+        assert!(state.machines.draft_retarget.is_none());
+        assert_eq!(
+            state.toasts.last().map(|toast| toast.title.as_str()),
+            Some("Could not switch machine")
+        );
+    }
+
+    #[test]
+    fn changing_back_restores_the_original_project_not_a_scratch_one() {
+        let (mut state, _local, _remote) = draft_routing_fixture();
+        let draft_id = client_draft_on(&mut state, Some(1), "round trip");
+        state.retarget_draft("server-b");
+        assert_eq!(state.current().project, Some(7));
+        state.retarget_draft("local");
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.current().id, draft_id);
+        assert_eq!(state.current().project, Some(1));
+        assert_eq!(state.current().draft.text, "round trip");
+    }
+
+    #[test]
+    fn a_retarget_reports_everything_it_dropped_in_one_notice() {
+        let (mut state, _local, _remote) = draft_routing_fixture();
+        // Folder-name match: project 2 "notes" has no repository, so its
+        // worktree settings cannot survive; the model list the target reports
+        // does not carry the selection either.
+        state.catalog.models = vec![
+            crate::model::AgentModel::from_value(
+                &json!({"provider":"cpa","id":"other-model","name":"Other"}),
+            )
+            .unwrap(),
+        ];
+        client_draft_on(&mut state, Some(2), "loses settings");
+        let thread = state.current_mut();
+        thread.selected_model = Some(("cpa".into(), "model".into()));
+        thread.env_mode = Some(crate::model::ThreadEnvMode::Worktree);
+        thread.base_branch = Some("main".into());
+        let toasts = state.toasts.len();
+        state.retarget_draft("server-b");
+        assert_eq!(state.machines.selected, "server-b");
+        let moved = state.current();
+        assert_eq!(moved.project, Some(8), "the folder-name twin on server-b");
+        assert!(moved.selected_model.is_none());
+        assert!(moved.env_mode.is_none() && moved.base_branch.is_none());
+        assert_eq!(
+            state.toasts.len(),
+            toasts + 1,
+            "one notice, not one per drop"
+        );
+        let notice = &state.toasts.last().unwrap().title;
+        assert!(notice.contains("model selection"));
+        assert!(notice.contains("worktree settings"));
     }
 
     #[test]

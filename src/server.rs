@@ -2841,16 +2841,14 @@ mod tests {
             );
             assert!(crate::client::supports_vcs_worktrees(&hello));
 
-            // Capability is absent one minor below, and client wrappers refuse before sending.
-            let older = Fixture::with_minor("vcs-older", protocol::MINOR - 1).await;
+            // Capability is absent before its introduction minor, and client
+            // wrappers refuse before sending.
+            let older = Fixture::with_minor("vcs-older", 19).await;
             let older_link = older.link(&older.shared.directory.join("client")).await;
             let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
                 .await
                 .unwrap();
-            assert_eq!(
-                older_hello["protocolMinor"].as_u64(),
-                Some(u64::from(protocol::MINOR - 1))
-            );
+            assert_eq!(older_hello["protocolMinor"].as_u64(), Some(19));
             assert!(!crate::client::supports_vcs_worktrees(&older_hello));
             let err = crate::client::vcs_status(
                 &older_link,
