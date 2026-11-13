@@ -283,9 +283,14 @@ Item 1 also retains the permitted Windows HEIC/HEIF gap.
   with pointer anchors, dragging, keyboard panning, resize refit and KSG's zoom
   constants. Full native platform gesture QA and exact media-dialog geometry
   remain unverified.
-- The virtual CSV/text viewer uses Rune virtual rows. It does not yet match
-  KSG's sticky measured header, horizontal column virtualization and table
-  measurement exactly. Small source previews do not yet use KSG-equivalent
+- The virtual CSV/text viewer now matches KSG's measured column widths
+  (sampled rows, 128-320 px clamps, fallback widths past 30 columns), fixed
+  header, sticky row-number gutter, one-column horizontal overscan and
+  keyboard scrolling. The header sits outside the vertical scroll area as in
+  KSG, and the cells draw in an absolutely positioned overlay under the
+  virtual rows because Rune keeps mounted row subtrees across scrolls;
+  measurement approximates the browser's automatic table layout rather than
+  running it. Small source previews do not yet use KSG-equivalent
   syntax highlighting.
 - Archive previews now use the already-locked `flate2` 1.1.11 and `crc32fast`
   1.5.4 as direct dependencies. ZIP/JAR, TAR and gzip/TGZ are implemented with

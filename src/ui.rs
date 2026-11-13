@@ -19,6 +19,8 @@ mod attachment_notebook_preview;
 pub(crate) mod attachment_preview;
 #[path = "attachment_sqlite_preview.rs"]
 mod attachment_sqlite_preview;
+#[path = "attachment_table_preview.rs"]
+mod attachment_table_preview;
 #[path = "attachment_text_preview.rs"]
 mod attachment_text_preview;
 #[path = "captain_ui.rs"]
@@ -16923,6 +16925,87 @@ pub(crate) mod tests {
             press(&mut rt, "notebook-more");
             assert!(rt.presented("notebook-cell-39").is_some(), "{width}");
             assert!(rt.presented("notebook-cell-40").is_none(), "{width}");
+        }
+    }
+
+    #[test]
+    fn delimited_table_sticks_and_windows_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let csv = rt.state.data_dir.join("wide.csv");
+            let mut text = String::new();
+            for c in 0..200 {
+                text += &format!("h{c},");
+            }
+            text.pop();
+            text.push('\n');
+            for r in 1..=5000 {
+                for c in 0..200 {
+                    text += &format!("r{r}c{c},");
+                }
+                text.pop();
+                text.push('\n');
+            }
+            std::fs::write(&csv, text).unwrap();
+            let file = crate::attachments::attach_file(&csv).unwrap();
+            rt.update(|s, _| s.preview_attachments(vec![file.clone()], &file.id, true));
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let (table, _) = rt
+                .presented("attachment-preview-table")
+                .unwrap_or_else(|| panic!("{width}: attachment-preview-table"));
+            assert!(
+                table[0] >= 0.0 && table[0] + table[2] <= width + 0.5,
+                "{width}: {table:?}"
+            );
+            // 200 header cells plus a window of body columns and rows, nowhere
+            // near 5000 rows × 200 columns.
+            let cells = |rt: &Runtime<State>| {
+                rt.elements()
+                    .iter()
+                    .filter(|e| {
+                        e.key
+                            .as_deref()
+                            .is_some_and(|key| key.starts_with("table-cell-"))
+                    })
+                    .count()
+            };
+            assert!(cells(&rt) < 3000, "{width}: {} cells", cells(&rt));
+            let header_y = rt.presented("table-header").unwrap().0[1];
+            assert!(
+                rt.elements()
+                    .iter()
+                    .all(|e| e.key.as_deref() != Some("table-cell-1-199")),
+                "{width}: far-right column mounted before scrolling"
+            );
+            rt.update(|_, tx| tx.scroll_to_x("attachment-preview-table", 1_000_000.0));
+            rt.frame(0.0);
+            rt.frame(0.0);
+            rt.frame(0.0);
+            assert!(
+                rt.state
+                    .attachment_preview
+                    .as_ref()
+                    .unwrap()
+                    .table_scroll_offset()[0]
+                    > 20_000.0,
+                "{width}: {:?}",
+                rt.state.attachment_preview.as_ref().map(|p| p.table_pos())
+            );
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|e| e.key.as_deref() == Some("table-cell-1-199")),
+                "{width}: far-right column did not mount after scrolling"
+            );
+            rt.update(|_, tx| tx.scroll_to_y("attachment-text-rows", 2000.0));
+            rt.frame(0.0);
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let (header, _) = rt.presented("table-header").unwrap();
+            assert_eq!(header[1], header_y, "{width}: header must stay stuck");
+            assert!(cells(&rt) < 3000, "{width}: {} cells", cells(&rt));
+            press(&mut rt, "close-attachment-preview");
         }
     }
 

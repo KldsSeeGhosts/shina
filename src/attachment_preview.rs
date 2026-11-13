@@ -151,6 +151,12 @@ fn kind(name: &str, mime: &str) -> Kind {
     Kind::Unsupported
 }
 
+/// KSG `font-mono text-xs`: a body cell's text.
+const TABLE_CELL: TextStyle = TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono);
+/// KSG `font-medium`: a header cell's text, in the interface face like KSG's
+/// `th`.
+const TABLE_HEAD: TextStyle = TextStyle::new(12.0, 600.0);
+
 pub(crate) struct Preview {
     machine: String,
     thread: usize,
@@ -168,6 +174,11 @@ pub(crate) struct Preview {
     image_drag: Option<[f32; 2]>,
     image_viewport_size: [f32; 2],
     suppress_image_click: bool,
+    table_scroll: Arc<std::sync::Mutex<rune::ScrollPos>>,
+    table_viewport: [f32; 2],
+    table: Option<Arc<attachment_table_preview::Table>>,
+    table_window: std::ops::Range<usize>,
+    table_rows: std::ops::Range<usize>,
     document: Option<Arc<attachment_text_preview::Document>>,
     cancel: Arc<AtomicBool>,
     database: Option<Arc<attachment_sqlite_preview::Database>>,
@@ -208,6 +219,13 @@ impl Preview {
     fn scroll(&self) -> rune::ScrollPos {
         *self.image_scroll.lock().unwrap_or_else(|e| e.into_inner())
     }
+    pub(super) fn table_pos(&self) -> rune::ScrollPos {
+        *self.table_scroll.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    #[cfg(test)]
+    pub(super) fn table_scroll_offset(&self) -> [f32; 2] {
+        self.table_pos().offset
+    }
     fn change_zoom(&mut self, next: f32, point: Option<[f32; 2]>, tx: &mut Tx) {
         let next = clamped_zoom(next);
         let scroll = self.scroll();
@@ -242,6 +260,11 @@ impl Preview {
         self.truncated = false;
         self.zoom = 1.0;
         *self.image_scroll.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        *self.table_scroll.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        self.table_viewport = [0.0; 2];
+        self.table = None;
+        self.table_window = 0..0;
+        self.table_rows = 0..0;
         self.image_drag = None;
         self.image_viewport_size = [0.0; 2];
         self.suppress_image_click = false;
@@ -363,6 +386,11 @@ impl State {
             wrap: true,
             zoom: 1.0,
             image_scroll: Arc::new(std::sync::Mutex::new(Default::default())),
+            table_scroll: Arc::new(std::sync::Mutex::new(Default::default())),
+            table_viewport: [0.0; 2],
+            table: None,
+            table_window: 0..0,
+            table_rows: 0..0,
             image_drag: None,
             image_viewport_size: [0.0; 2],
             suppress_image_click: false,
@@ -520,7 +548,10 @@ impl State {
                     && Arc::ptr_eq(&preview.cancel, &cancel)
                 {
                     match result {
-                        Ok(document) => preview.document = Some(Arc::new(document)),
+                        Ok(document) => {
+                            preview.document = Some(Arc::new(document));
+                            preview.table = None;
+                        }
                         Err(error) => preview.error = Some(error),
                     }
                 }
@@ -1164,6 +1195,257 @@ fn archive_view(s: &State, p: Palette) -> El {
     content
 }
 
+/// KSG `formatAttachmentSize`: whole KB rounded up, one-decimal MB once that
+/// would pass 1,023 KB.
+fn attachment_size(bytes: u64) -> String {
+    if bytes.div_ceil(1024) >= 1024 {
+        format!("{:.1} MB", bytes as f64 / 1048576.0)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024).max(1))
+    }
+}
+
+/// KSG `VirtualTablePreview` with `source` false: the measured header and row
+/// gutter over a both-ways virtualized grid. KSG's outer `overflow-x-auto`
+/// scrolls the header and rows horizontally while an inner `overflow-auto`
+/// scrolls the rows vertically; here an outer `scroll_x` does the same over an
+/// inner vertical scroll. Rune keeps mounted virtual rows as they were across
+/// scrolls, so the cells are not part of the rows: an absolute overlay under
+/// them draws the reported row range's windowed columns in content space, and
+/// a commit triggered by the sliding content's `on_layout` rebuilds it when a
+/// scroll crosses a column boundary.
+fn table_preview(
+    p: Palette,
+    preview: &Preview,
+    document: &attachment_text_preview::Document,
+    attachment: &Attachment,
+    width: f32,
+    height: f32,
+) -> El {
+    use attachment_table_preview as t;
+    let pos = preview.table_pos();
+    let viewport_w = if pos.viewport[0] > 0.0 {
+        pos.viewport[0]
+    } else if preview.table_viewport[0] > 0.0 {
+        preview.table_viewport[0]
+    } else {
+        width - 36.0
+    };
+    let viewport_h = if pos.viewport[1] > 0.0 {
+        pos.viewport[1]
+    } else if preview.table_viewport[1] > 0.0 {
+        preview.table_viewport[1]
+    } else {
+        height - 160.0
+    };
+    let table = preview.table.clone().unwrap_or_else(|| {
+        Arc::new(t::Table::measure(
+            document, viewport_w, TABLE_CELL, TABLE_HEAD,
+        ))
+    });
+    let columns = if preview.table_window.is_empty() {
+        table.visible(pos.offset[0], viewport_w)
+    } else {
+        preview.table_window.clone()
+    };
+    let rows_range = if preview.table_rows.is_empty() {
+        let estimate = (viewport_h / t::ROW_HEIGHT) as usize + 2;
+        0..estimate.min(document.len().saturating_sub(1))
+    } else {
+        preview.table_rows.clone()
+    };
+    let content = viewport_w.max(t::GUTTER + table.width());
+    let mut header = row()
+        .key("table-header")
+        .role("row")
+        .w(content)
+        .min_h(t::ROW_HEIGHT)
+        .fill(p.message_bg)
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.frame)
+        .child(
+            el().role("columnheader")
+                .w(t::GUTTER)
+                .min_h(t::ROW_HEIGHT)
+                .sticky_left(0.0)
+                .fill(p.message_bg)
+                .border_sides([0.0, 1.0, 0.0, 0.0], p.frame),
+        )
+        .child(el().w(table.offsets[columns.start]));
+    for column in columns.clone() {
+        let cell = table
+            .header
+            .get(column)
+            .cloned()
+            .unwrap_or_else(|| t::column_label(column));
+        header = header.child(
+            label(cell, TABLE_HEAD, p.ink)
+                .key(format!("table-cell-0-{column}"))
+                .role("columnheader")
+                .w(table.sizes[column])
+                .px(12.0)
+                .py(6.0)
+                .truncate()
+                .border_sides([0.0, 1.0, 0.0, 0.0], p.frame),
+        );
+    }
+    // The cells paint under the rows, so each row's bottom border and sticky
+    // gutter still cover them where a scroll slides them beneath the edge.
+    let mut cells = col().absolute(
+        t::GUTTER + table.offsets[columns.start],
+        rows_range.start as f32 * t::ROW_HEIGHT,
+    );
+    for i in rows_range.clone() {
+        let index = i + 1;
+        let mut line = row().min_h(t::ROW_HEIGHT);
+        match document.row(index, true) {
+            Ok(row_cells) => {
+                for column in columns.clone() {
+                    line = line.child(
+                        label(
+                            row_cells.get(column).map_or("", String::as_str),
+                            TABLE_CELL,
+                            p.ink,
+                        )
+                        .key(format!("table-cell-{index}-{column}"))
+                        .role("cell")
+                        .w(table.sizes[column])
+                        .px(12.0)
+                        .py(6.0)
+                        .truncate()
+                        .selectable(true)
+                        .border_sides([0.0, 1.0, 0.0, 0.0], p.frame),
+                    );
+                }
+            }
+            Err(error) => {
+                line = line.child(label(error, SMALL, p.danger).px(12.0).py(6.0));
+            }
+        }
+        cells = cells.child(line);
+    }
+    let rows = col()
+        .key("attachment-text-rows")
+        .growth(Default::default())
+        .virtual_rows(
+            document.len().saturating_sub(1),
+            t::ROW_HEIGHT,
+            |_: &State, i| format!("attachment-text-row-{i}").into(),
+            move |s: &State, i| {
+                let palette = palette(s.dark);
+                row()
+                    .min_h(t::ROW_HEIGHT)
+                    .w(content)
+                    .border_sides([0.0, 0.0, 1.0, 0.0], palette.frame)
+                    .child(
+                        pixel_text((i + 1).to_string(), palette.faint)
+                            .align(rune::Align::End)
+                            .w(t::GUTTER)
+                            .px(8.0)
+                            .py(6.0)
+                            .sticky_left(0.0)
+                            .fill(palette.card)
+                            .border_sides([0.0, 1.0, 0.0, 0.0], palette.frame),
+                    )
+            },
+        )
+        .on_visible_rows(|s: &mut State, range: std::ops::Range<usize>| {
+            let Some(preview) = &mut s.attachment_preview else {
+                return false;
+            };
+            let changed = preview.table_rows != range;
+            preview.table_rows = range;
+            changed
+        });
+    let scroll_x = preview.table_scroll.clone();
+    let scroll_y = preview.table_scroll.clone();
+    col()
+        .key("attachment-preview-table")
+        .role("table")
+        .label(attachment.name.clone())
+        .focusable(true)
+        .w_full()
+        .min_w(0.0)
+        .h(0.0)
+        .grow(1.0)
+        .min_h(0.0)
+        .clip_rounded(4.0)
+        .scroll_x()
+        .on_scroll_offset(move |at| {
+            let mut pos = scroll_x.lock().unwrap_or_else(|e| e.into_inner());
+            pos.offset[0] = at.offset[0];
+            pos.max[0] = at.max[0];
+            pos.viewport[0] = at.viewport[0];
+        })
+        .on_layout(|s: &mut State, rect| {
+            if let Some(preview) = &mut s.attachment_preview {
+                let size = [rect[2], rect[3]];
+                if preview.table_viewport != size {
+                    preview.table_viewport = size;
+                    if let Some(document) = preview.document.clone() {
+                        preview.table = Some(Arc::new(t::Table::measure(
+                            &document, size[0], TABLE_CELL, TABLE_HEAD,
+                        )));
+                    }
+                }
+            }
+        })
+        .child(
+            col()
+                .w(content)
+                .min_w(0.0)
+                .on_layout_tx(|s: &mut State, _rect, tx| {
+                    let Some(preview) = &mut s.attachment_preview else {
+                        return;
+                    };
+                    if preview.table.is_none() {
+                        let Some(document) = preview.document.clone() else {
+                            return;
+                        };
+                        preview.table = Some(Arc::new(t::Table::measure(
+                            &document,
+                            preview.table_viewport[0],
+                            TABLE_CELL,
+                            TABLE_HEAD,
+                        )));
+                        return;
+                    }
+                    let pos = preview.table_pos();
+                    let vw = if pos.viewport[0] > 0.0 {
+                        pos.viewport[0]
+                    } else {
+                        preview.table_viewport[0]
+                    };
+                    let window = preview
+                        .table
+                        .as_ref()
+                        .map(|table| table.visible(pos.offset[0], vw));
+                    match window {
+                        Some(window) if window == preview.table_window => tx.live_only(),
+                        Some(window) => preview.table_window = window,
+                        None => {}
+                    }
+                })
+                .child(header)
+                .child(
+                    col()
+                        .w_full()
+                        .h(0.0)
+                        .grow(1.0)
+                        .min_h(0.0)
+                        .scroll(rune::ScrollSpec {
+                            stick_bottom: false,
+                        })
+                        .on_scroll_offset(move |at| {
+                            let mut pos = scroll_y.lock().unwrap_or_else(|e| e.into_inner());
+                            pos.offset[1] = at.offset[1];
+                            pos.max[1] = at.max[1];
+                            pos.viewport[1] = at.viewport[1];
+                        })
+                        .child(col().w_full().min_h(0.0).child(cells).child(rows)),
+                ),
+        )
+}
+
 pub(super) fn view(s: &State, p: Palette) -> El {
     let preview = s.attachment_preview.as_ref().unwrap();
     if preview.machine != s.machines.selected || preview.thread != s.current().id {
@@ -1671,89 +1953,111 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                             .is_some()
                             && preview.rendered;
                     let count = document.len();
-                    let columns = if table { document.columns } else { 1 };
-                    let column_width =
-                        ((width - 56.0) / columns.min(6).max(1) as f32).clamp(128.0, 320.0);
+                    // KSG LargeTextViewer's status line: rows and columns for a
+                    // table, lines for text, then the size or "Indexing…".
                     card = card.child(pixel_text(
                         format!(
-                            "{} {}{}{}",
-                            count.saturating_sub(usize::from(table && count > 0)),
-                            if table { "rows" } else { "lines" },
+                            "{} · {}",
                             if table {
-                                format!(" · {columns} columns")
+                                format!(
+                                    "{} · {}",
+                                    attachment_table_preview::count_label(
+                                        count.saturating_sub(1),
+                                        "row"
+                                    ),
+                                    attachment_table_preview::count_label(
+                                        if count == 0 { 0 } else { document.columns },
+                                        "column"
+                                    )
+                                )
                             } else {
-                                String::new()
+                                attachment_table_preview::count_label(count, "line")
                             },
                             if document.complete {
-                                String::new()
+                                if attachment.bytes == 0 {
+                                    "0 bytes".to_owned()
+                                } else {
+                                    attachment_size(attachment.bytes)
+                                }
                             } else {
-                                " · Indexing…".into()
+                                "Indexing…".to_owned()
                             }
                         ),
                         p.muted,
                     ));
-                    let list = col()
-                        .key("attachment-text-rows")
-                        .growth(Default::default())
-                        .virtual_rows(
-                            count,
-                            29.0,
-                            |_: &State, i| format!("attachment-text-row-{i}").into(),
-                            move |s: &State, i| {
-                                let Some(preview) = &s.attachment_preview else {
-                                    return el();
-                                };
-                                let Some(document) = &preview.document else {
-                                    return el();
-                                };
-                                let cells = match document.row(i, table) {
-                                    Ok(cells) => cells,
-                                    Err(error) => {
-                                        return label(error, SMALL, palette(s.dark).danger).wrap();
-                                    }
-                                };
-                                let mut line = row().min_h(29.0).min_w(0.0).child(
-                                    label(
-                                        format!("{}", i + usize::from(!table)),
-                                        SMALL,
-                                        palette(s.dark).muted,
-                                    )
-                                    .w(56.0)
-                                    .px(8.0)
-                                    .py(6.0),
-                                );
-                                for cell in cells {
-                                    let label = label(
-                                        cell,
-                                        TextStyle::new(12.0, 400.0)
-                                            .family(rune::Family::SystemMono),
-                                        palette(s.dark).ink,
-                                    )
-                                    .px(12.0)
-                                    .py(6.0)
-                                    .selectable(true);
-                                    line = line.child(if table {
-                                        label.w(column_width).wrap_anywhere()
-                                    } else if preview.wrap {
-                                        label.w(0.0).grow(1.0).min_w(0.0).wrap_anywhere()
-                                    } else {
-                                        label
-                                    });
-                                }
-                                line
-                            },
+                    if count == 0 {
+                        card = card.child(
+                            col()
+                                .w_full()
+                                .h(0.0)
+                                .grow(1.0)
+                                .min_h(0.0)
+                                .center()
+                                .child(label("This file is empty.", SMALL, p.muted)),
                         );
-                    card = card.child(
-                        col()
-                            .key("attachment-preview-file")
-                            .w_full()
-                            .min_w(0.0)
-                            .h(0.0)
-                            .grow(1.0)
-                            .min_h(0.0)
-                            .scroll_xy()
-                            .child(list),
-                    );
+                    } else if table {
+                        card = card.child(table_preview(
+                            p, preview, document, attachment, width, height,
+                        ));
+                    } else {
+                        let list = col()
+                            .key("attachment-text-rows")
+                            .growth(Default::default())
+                            .virtual_rows(
+                                count,
+                                29.0,
+                                |_: &State, i| format!("attachment-text-row-{i}").into(),
+                                move |s: &State, i| {
+                                    let Some(preview) = &s.attachment_preview else {
+                                        return el();
+                                    };
+                                    let Some(document) = &preview.document else {
+                                        return el();
+                                    };
+                                    let cells = match document.row(i, false) {
+                                        Ok(cells) => cells,
+                                        Err(error) => {
+                                            return label(error, SMALL, palette(s.dark).danger)
+                                                .wrap();
+                                        }
+                                    };
+                                    let mut line = row().min_h(29.0).min_w(0.0).child(
+                                        label(format!("{}", i + 1), SMALL, palette(s.dark).muted)
+                                            .w(56.0)
+                                            .px(8.0)
+                                            .py(6.0),
+                                    );
+                                    for cell in cells {
+                                        let label = label(
+                                            cell,
+                                            TextStyle::new(12.0, 400.0)
+                                                .family(rune::Family::SystemMono),
+                                            palette(s.dark).ink,
+                                        )
+                                        .px(12.0)
+                                        .py(6.0)
+                                        .selectable(true);
+                                        line = line.child(if preview.wrap {
+                                            label.w(0.0).grow(1.0).min_w(0.0).wrap_anywhere()
+                                        } else {
+                                            label
+                                        });
+                                    }
+                                    line
+                                },
+                            );
+                        card = card.child(
+                            col()
+                                .key("attachment-preview-file")
+                                .w_full()
+                                .min_w(0.0)
+                                .h(0.0)
+                                .grow(1.0)
+                                .min_h(0.0)
+                                .scroll_xy()
+                                .child(list),
+                        );
+                    }
                     if !document.complete {
                         card = card.child(label("Loading the rest of the file…", SMALL, p.muted));
                     }
@@ -2033,6 +2337,35 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                         scroll.offset[1] + delta[1],
                     );
                     return true;
+                }
+            }
+            if !event.mods.ctrl
+                && !event.mods.cmd
+                && !event.mods.alt
+                && let Some(preview) = &mut s.attachment_preview
+            {
+                let attachment = preview.selected();
+                let table = preview.rendered
+                    && preview.document.is_some()
+                    && attachment_text_preview::delimiter(&attachment.name, &attachment.mime)
+                        .is_some();
+                if table {
+                    // KSG VirtualTablePreview's onKeyDown: a row per arrow, a
+                    // viewport per page, the ends on Home and End.
+                    let scroll = preview.table_pos();
+                    let target = match event.key {
+                        rune::Key::Up => Some(scroll.offset[1] - 29.0),
+                        rune::Key::Down => Some(scroll.offset[1] + 29.0),
+                        rune::Key::PageUp => Some(scroll.offset[1] - scroll.viewport[1]),
+                        rune::Key::PageDown => Some(scroll.offset[1] + scroll.viewport[1]),
+                        rune::Key::Home => Some(0.0),
+                        rune::Key::End => Some(scroll.max[1]),
+                        _ => None,
+                    };
+                    if let Some(y) = target {
+                        tx.scroll_to_y("attachment-text-rows", y);
+                        return true;
+                    }
                 }
             }
             match event.key {
