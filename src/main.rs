@@ -1,6 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod acp;
+mod attachment_intake;
+mod attachment_picker;
 mod attachments;
 mod backend;
 mod brand;
@@ -1385,6 +1387,7 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
         ..AppSpec::new("Shina", (1280.0, 840.0), init, ui::view)
     })
     // Portraits rest while the window is in the background or minimized.
+    .on_window(attachment_picker::set_window)
     .on_focus(|state, focused, _| state.portraits.set_focused(focused))
     .keep_running()
     .on_close(|state, tx| {

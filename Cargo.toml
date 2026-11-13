@@ -23,6 +23,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util"] }
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", features = ["sink"] }
+pollster = "=1.0.1"
+raw-window-handle = "=0.6.2"
+rfd = { version = "=0.17.2", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
 getrandom = "0.4"
 ignore = "0.4"

@@ -476,20 +476,21 @@ pub fn attach_file(path: &Path) -> Result<Attachment, String> {
         return Err("Choose a file or folder, not a device.".into());
     }
     if metadata.is_file() {
-        let mut header = [0; 32];
-        let count = fs::File::open(&path)
-            .map_err(read_error)?
-            .read(&mut header)
-            .map_err(read_error)?;
-        let image = image::guess_format(&header[..count]).is_ok_and(|format| {
-            matches!(
-                format,
-                ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
-            )
-        });
-        if image {
-            return attach_image_file(&path);
+        let mime = crate::attachment_intake::native_mime(&name);
+        match crate::attachment_intake::classify(&name, mime) {
+            crate::attachment_intake::Kind::Image => return attach_image_file(&path),
+            crate::attachment_intake::Kind::UnsupportedImage => {
+                return Err(format!(
+                    "'{name}' is not a supported image type. Attach GIF, HEIC, HEIF, JPEG, PNG, or WebP images."
+                ));
+            }
+            crate::attachment_intake::Kind::File => {}
         }
+        let mut attachment = file_reference(path, &metadata, &name)?;
+        if mime != "application/octet-stream" {
+            attachment.mime = crate::attachment_intake::file_mime(&name, mime);
+        }
+        return Ok(attachment);
     }
     file_reference(path, &metadata, &name)
 }
@@ -536,19 +537,22 @@ fn file_reference(
 fn attach_image_file(path: &Path) -> Result<Attachment, String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
-    if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(format!(
-            "{}: Choose an image that is {} MB or smaller.",
-            clean_name(&name),
-            MAX_IMAGE_BYTES / (1024 * 1024)
-        ));
+    if metadata.len() > crate::attachment_intake::MAX_SOURCE_BYTES as u64 {
+        return Err(crate::attachment_intake::Failure::TooLarge.message(&name));
     }
     let file = fs::File::open(path).map_err(|e| e.to_string())?;
     // Bound the read as well as checking metadata, since the file can grow while we read it.
     let mut bytes = Vec::new();
-    file.take(MAX_IMAGE_BYTES + 1)
+    file.take(crate::attachment_intake::MAX_SOURCE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("Could not read {}: {error}", clean_name(&name)))?;
+    let (name, bytes) = crate::attachment_intake::prepare(
+        &name,
+        crate::attachment_intake::native_mime(&name),
+        bytes,
+        MAX_IMAGE_BYTES as usize,
+    )
+    .map_err(|failure| failure.message(&name))?;
     attach_bytes(&name, bytes)
 }
 
@@ -1286,11 +1290,10 @@ mod tests {
     }
 
     #[test]
-    fn file_classification_uses_content_and_retains_missing_references() {
+    fn ordinary_file_classification_uses_content_and_retains_missing_references() {
         let directory = crate::store::directory().unwrap();
         for (name, bytes, expected) in [
             ("text.bin", b"valid UTF-8 \xc3\xa9".as_slice(), "text/plain"),
-            ("fake.png", b"actually text".as_slice(), "text/plain"),
             (
                 "binary.txt",
                 b"hello\0world".as_slice(),
@@ -1322,6 +1325,13 @@ mod tests {
             );
             assert!(attach_file(&path).unwrap_err().contains("Missing file"));
         }
+        let fake_image = directory.join("fake.png");
+        fs::write(&fake_image, b"actually text").unwrap();
+        assert_eq!(
+            attach_file(&fake_image).unwrap_err(),
+            "'fake.png' could not be read as an image."
+        );
+        assert_eq!(reference_file(&fake_image).unwrap().mime, "text/plain");
         let path = directory.join("large.txt");
         fs::write(&path, vec![b'a'; MAX_TEXT_BYTES as usize + 1]).unwrap();
         assert_eq!(attach_file(&path).unwrap().mime, "application/octet-stream");
@@ -1512,7 +1522,7 @@ mod tests {
     #[test]
     fn file_reads_keep_large_binary_sources_and_directories_as_references() {
         let directory = crate::store::directory().unwrap();
-        let path = directory.join("oversize.png");
+        let path = directory.join("oversize.bin");
         let file = fs::File::create(&path).unwrap();
         file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
         assert_eq!(attach_file(&path).unwrap().mime, "application/octet-stream");

@@ -6701,10 +6701,18 @@ impl State {
         if let Some(image) = content.image() {
             self.attach_image_with_options("Pasted image.png", image.png(), bypass_fold);
         }
-        if !content.files().is_empty() {
+        let claim_files = content.files().iter().any(|path| {
+            path.is_dir()
+                || crate::attachment_intake::claims_paste(
+                    &path.to_string_lossy(),
+                    crate::attachment_intake::native_mime(&path.to_string_lossy()),
+                    content.text(),
+                )
+        });
+        if claim_files {
             self.attach_paths(content.files());
         }
-        if !content.text().is_empty() && !has_image && content.files().is_empty() {
+        if !content.text().is_empty() && !has_image && !claim_files {
             if !bypass_fold && self.fold_paste(content.text()) {
                 return true;
             }
@@ -7119,6 +7127,68 @@ impl State {
         let mut errors = Vec::new();
         let mut attached = Vec::new();
         for path in paths {
+            if path.is_dir() {
+                let local = self.machines.selected == "local"
+                    || self
+                        .client
+                        .as_ref()
+                        .and_then(|c| c.linked.get(&self.machines.selected))
+                        .and_then(|c| c.remote.as_ref())
+                        .is_some_and(|link| {
+                            url::Url::parse(&format!("http://{}", link.host))
+                                .ok()
+                                .and_then(|u| u.host_str().map(str::to_owned))
+                                .is_some_and(|host| {
+                                    host == "localhost"
+                                        || host
+                                            .parse::<std::net::IpAddr>()
+                                            .is_ok_and(|ip| ip.is_loopback())
+                                })
+                        });
+                if !local {
+                    errors.push(
+                        "Folders can only be referenced on a server running on this computer"
+                            .into(),
+                    );
+                    continue;
+                }
+                match path.canonicalize() {
+                    Ok(path) => {
+                        let label = path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let token = crate::composer_tokens::Token::File {
+                            path,
+                            directory: true,
+                            source: None,
+                        };
+                        let draft = &mut self.threads[index].draft;
+                        let end = draft.text.len();
+                        let boundary = draft
+                            .text
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| !c.is_whitespace());
+                        draft.undo_group(|e| {
+                            e.set_selection(end, end);
+                            if boundary {
+                                e.insert(" ");
+                            }
+                            let start = e.focus;
+                            e.insert(&label);
+                            e.replace_with_pill(start..e.focus, token.id(), &label);
+                            e.insert(" ");
+                        });
+                    }
+                    Err(_) => errors.push(format!(
+                        "Couldn't get the path of \"{}\"\nType the folder path with @ instead.",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                }
+                continue;
+            }
             if self.threads[index].draft_images.len() >= attachments::MAX_ATTACHMENTS {
                 errors.push(format!(
                     "A message can carry up to {} attachments. The remaining files were not attached.",
@@ -7146,8 +7216,8 @@ impl State {
                     crate::ui::composer_ui::FocusReason::AttachmentInserted,
                 );
             }
-            self.checkpoint();
         }
+        self.checkpoint();
     }
     /// Attach a pasted PNG image, inserting an inline chip when contextual.
     #[cfg(test)]
@@ -7159,14 +7229,15 @@ impl State {
             self.current_mut().attachment_error = Some(error);
             return;
         }
-        if bytes.len() as u64 > attachments::MAX_IMAGE_BYTES {
-            self.current_mut().attachment_error = Some(format!(
-                "Choose an image that is {} MB or smaller.",
-                attachments::MAX_IMAGE_BYTES / (1024 * 1024)
-            ));
-            return;
-        }
-        match attachments::attach_bytes(name, bytes.to_vec()) {
+        let prepared = crate::attachment_intake::prepare(
+            name,
+            crate::attachment_intake::native_mime(name),
+            bytes.to_vec(),
+            attachments::MAX_IMAGE_BYTES as usize,
+        )
+        .map_err(|failure| failure.message(name))
+        .and_then(|(name, bytes)| attachments::attach_bytes(&name, bytes));
+        match prepared {
             Ok(image) => {
                 let result = self.current_mut().add_attachment(image.clone());
                 self.current_mut().attachment_error = result.as_ref().err().cloned();
@@ -14892,6 +14963,36 @@ mod tests {
         restored.restore_ui(&snapshot).unwrap();
         assert_eq!(restored.current().draft.text, "Keep this draft");
         assert_eq!(restored.current().draft_images, vec![image]);
+    }
+
+    #[test]
+    fn intake_batch_keeps_files_and_references_local_folders_without_a_slot() {
+        let root = crate::store::directory().unwrap();
+        let a = root.join("one.txt");
+        let b = root.join("two.txt");
+        let folder = root.join("folder");
+        std::fs::write(&a, "one").unwrap();
+        std::fs::write(&b, "two").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let mut state = State::new(root, false);
+        state.attach_paths(&[a, folder.clone(), b]);
+        assert_eq!(state.current().draft_images.len(), 2);
+        assert_eq!(state.current().draft.pills().count(), 3);
+        assert!(
+            state
+                .current()
+                .draft_images
+                .iter()
+                .all(|a| a.mime != "inode/directory")
+        );
+        assert!(state.current().attachment_error.is_none());
+        state.machines.selected = "remote".into();
+        state.attach_paths(&[folder]);
+        assert_eq!(state.current().draft_images.len(), 2);
+        assert_eq!(
+            state.current().attachment_error.as_deref(),
+            Some("Folders can only be referenced on a server running on this computer")
+        );
     }
 
     #[test]

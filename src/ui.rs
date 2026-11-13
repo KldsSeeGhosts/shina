@@ -9971,13 +9971,14 @@ fn attach_control(locked: bool, p: Palette) -> El {
     control
 }
 
+// Ported from KSG Code's ComposerAttachButton in ComposerAttachmentStrip.tsx.
 fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     let thread = s.current().id;
     let options = rune::FileDialogOptions {
         title: if folder {
             "Attach a folder"
         } else {
-            "Attach a file"
+            "Attach files"
         }
         .into(),
         ..Default::default()
@@ -9998,7 +9999,7 @@ fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     if folder {
         tx.open_folder(options, callback);
     } else {
-        tx.open_file(options, callback);
+        crate::attachment_picker::open(s, thread, options);
     }
 }
 
@@ -13854,7 +13855,7 @@ pub(crate) mod tests {
                 .attach_paths(&[path.clone(), crate::store::directory().unwrap()]);
             rt.frame(0.0);
             let (composer, _) = rt.presented("composer").unwrap();
-            assert_eq!(rt.state.current().draft_images.len(), 2);
+            assert_eq!(rt.state.current().draft_images.len(), 1);
             assert_eq!(rt.state.current().draft.pills().count(), 2);
             let (input, _) = rt.presented("composer-input").unwrap();
             assert!(
