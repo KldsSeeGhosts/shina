@@ -50,8 +50,178 @@ pub(super) fn clear_dismissed_if_changed(s: &mut State) {
     }
 }
 
-fn linked(s: &State) -> bool {
-    s.current().machine != "local" || s.client.is_some() && s.machines.selected != "local"
+/// Async `@` mention search state. Ported from KSG Code's `useComposerMenuItems`:
+/// the query is debounced 120 ms, answered by the thread's owning machine, and a
+/// response for an older request is discarded. Previous results stay visible
+/// while a search is pending.
+#[derive(Default)]
+pub struct MentionSearch {
+    /// `(thread id, owning machine, query)` the debounce and results belong to.
+    pub key: Option<(usize, String, String)>,
+    pub debounce_until: Option<std::time::Instant>,
+    pub request_seq: u64,
+    /// The key the last fired request ran for; results apply only while it is current.
+    pub pending_key: Option<(usize, String, String)>,
+    pub paths: Vec<crate::workspace_search::WorkspaceEntry>,
+    pub paths_cwd: String,
+    pub paths_pending: bool,
+    local_rx: Option<
+        std::sync::mpsc::Receiver<(
+            u64,
+            Result<crate::workspace_search::WorkspaceSearchResult, String>,
+        )>,
+    >,
+}
+
+/// KSG's composer path search debounce, 120 ms.
+const MENTION_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+/// KSG's `PROJECT_PATH_SEARCH_LIMIT`-style composer cap.
+const MENTION_PATH_LIMIT: usize = 80;
+
+fn apply_path_result(
+    search: &mut MentionSearch,
+    seq: u64,
+    result: Result<crate::workspace_search::WorkspaceSearchResult, String>,
+) {
+    // A response for an older query or another thread is discarded.
+    if seq != search.request_seq || search.pending_key != search.key {
+        return;
+    }
+    search.paths_pending = false;
+    search.paths = result.map(|result| result.entries).unwrap_or_default();
+}
+
+/// Applies a `mention:*` RPC response. Returns whether the tag was one of ours.
+pub(crate) fn apply_mention_result(
+    s: &mut State,
+    server: &str,
+    tag: &str,
+    result: Result<serde_json::Value, String>,
+) -> bool {
+    if let Some(seq) = tag
+        .strip_prefix("mention:path:")
+        .and_then(|rest| rest.parse::<u64>().ok())
+    {
+        // Results only apply for the machine they were requested from.
+        if s.mention_search
+            .pending_key
+            .as_ref()
+            .is_some_and(|(_, host, _)| host == server)
+        {
+            apply_path_result(
+                &mut s.mention_search,
+                seq,
+                result.and_then(|v| {
+                    serde_json::from_value::<crate::workspace_search::WorkspaceSearchResult>(v)
+                        .map_err(|e| e.to_string())
+                }),
+            );
+        }
+        return true;
+    }
+    false
+}
+
+fn mention_cwd(
+    s: &State,
+    machine: &str,
+    project: Option<crate::projects::ProjectId>,
+) -> Option<String> {
+    if machine == "local" {
+        s.project(project)
+            .map(|project| project.path.to_string_lossy().into_owned())
+    } else {
+        s.machines.views.get(machine)?["index"]["projects"]
+            .as_array()?
+            .iter()
+            .find(|p| p["id"].as_u64() == project.map(|id| id as u64))?["path"]
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+
+/// Debounced trigger for the `@` mention searches. Called from `model::poll`.
+pub(crate) fn poll_mention_search(s: &mut State, tx: &mut Tx) -> bool {
+    let mut changed = false;
+    if let Some(rx) = &s.mention_search.local_rx
+        && let Ok((seq, result)) = rx.try_recv()
+    {
+        s.mention_search.local_rx = None;
+        apply_path_result(&mut s.mention_search, seq, result);
+        changed = true;
+    }
+    let Some(active) = trigger(s) else {
+        if s.mention_search.key.is_some() {
+            s.mention_search = MentionSearch::default();
+            changed = true;
+        }
+        return changed;
+    };
+    if active.marker != '@' {
+        return changed;
+    }
+    let (thread_id, machine, project) = {
+        let t = s.current();
+        (t.id, t.machine.clone(), t.project)
+    };
+    let key = (thread_id, machine, active.query.trim().to_lowercase());
+    if s.mention_search.key.as_ref() != Some(&key) {
+        s.mention_search.key = Some(key);
+        s.mention_search.debounce_until = Some(std::time::Instant::now() + MENTION_DEBOUNCE);
+        changed = true;
+    }
+    let Some(until) = s.mention_search.debounce_until else {
+        return changed;
+    };
+    let now = std::time::Instant::now();
+    if now < until {
+        tx.wake_after(until - now);
+        return changed;
+    }
+    s.mention_search.debounce_until = None;
+    s.mention_search.request_seq += 1;
+    let seq = s.mention_search.request_seq;
+    let Some(key) = s.mention_search.key.clone() else {
+        return changed;
+    };
+    s.mention_search.pending_key = Some(key.clone());
+    let (_, machine, query) = &key;
+    s.mention_search.paths_pending = false;
+    if let Some(cwd) = mention_cwd(s, machine, project) {
+        s.mention_search.paths_cwd = cwd.clone();
+        if machine == "local" {
+            // The app host is the local machine's server, so the same workspace
+            // search runs in-process on a blocking thread.
+            let roots: Vec<std::path::PathBuf> = s
+                .projects
+                .entries
+                .iter()
+                .map(|project| project.path.clone())
+                .collect();
+            let (txc, rxc) = std::sync::mpsc::channel();
+            let query = query.clone();
+            let wake = s.wake.clone();
+            std::thread::spawn(move || {
+                let result = crate::workspace_search::resolve_cwd(&cwd, &roots).map(|cwd| {
+                    crate::workspace_search::search(&cwd, &query, MENTION_PATH_LIMIT, None, false)
+                });
+                let _ = txc.send((seq, result));
+                wake();
+            });
+            s.mention_search.local_rx = Some(rxc);
+            s.mention_search.paths_pending = true;
+        } else if let Some(client) = s.client.as_ref().and_then(|c| c.linked.get(machine))
+            && client.has_capability(crate::protocol::WORKSPACE_SEARCH)
+        {
+            client.call_rpc(
+                format!("mention:path:{seq}"),
+                "workspace.searchEntries",
+                serde_json::json!({"cwd": cwd, "query": query, "limit": MENTION_PATH_LIMIT}),
+            );
+            s.mention_search.paths_pending = true;
+        }
+    }
+    changed
 }
 
 fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
@@ -295,39 +465,51 @@ fn items(s: &State, trigger: &Trigger) -> (Vec<Item>, Vec<String>) {
             action: Action::Context(record, display_label),
         });
     }
-    if linked(s) {
+    // File rows come from `workspace.searchEntries` on the thread's machine,
+    // ranked as KSG ranks them. A linked machine without the capability keeps
+    // the old notice and no file rows.
+    let machine = t.machine.clone();
+    let path_capable = machine == "local"
+        || s.client
+            .as_ref()
+            .and_then(|c| c.linked.get(&machine))
+            .is_some_and(|c| c.has_capability(crate::protocol::WORKSPACE_SEARCH));
+    if !path_capable {
         notes.push("File search needs the machine's own Shina.".into());
-    } else if let Some(project) = s.project(t.project) {
-        let inventory = s.composer_sources.paths(&project.path, s.wake.clone());
-        if inventory.loading {
-            notes.push("Searching workspace files...".into());
-        }
-        for entry in inventory
-            .entries
-            .iter()
-            .filter(|entry| entry.relative.to_lowercase().contains(&query))
-            .take(40)
-        {
-            let label = entry
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            items.push(Item {
-                icon: None,
-                label: label.clone(),
-                description: entry.relative.clone(),
-                source: if entry.directory { "Folder" } else { "File" }.into(),
-                action: Action::Pill(
-                    Token::File {
-                        path: entry.path.clone(),
-                        directory: entry.directory,
-                        source: None,
-                    },
-                    label,
-                ),
-            });
+    } else {
+        let search = &s.mention_search;
+        let active = search
+            .key
+            .as_ref()
+            .is_some_and(|(thread, host, _)| *thread == t.id && *host == machine);
+        if active {
+            if search.paths_pending && search.paths.is_empty() {
+                notes.push("Searching workspace files...".into());
+            }
+            let cwd = std::path::Path::new(&search.paths_cwd);
+            for entry in &search.paths {
+                let label = entry
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&entry.path)
+                    .to_owned();
+                let directory = entry.kind == "directory";
+                items.push(Item {
+                    icon: None,
+                    label: label.clone(),
+                    description: entry.path.clone(),
+                    source: if directory { "Folder" } else { "File" }.into(),
+                    action: Action::Pill(
+                        Token::File {
+                            path: cwd.join(&entry.path),
+                            directory,
+                            source: None,
+                        },
+                        label,
+                    ),
+                });
+            }
         }
     }
     (items, notes)
@@ -816,6 +998,115 @@ fn menu_prefix(marker: char) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_workspace_response_for_an_older_query_is_discarded() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("@ab");
+        state.current_mut().draft.focused = true;
+        let (id, machine) = {
+            let t = state.current();
+            (t.id, t.machine.clone())
+        };
+        // Query "abc" is now current; its request superseded "ab".
+        state.mention_search.key = Some((id, machine.clone(), "abc".into()));
+        state.mention_search.pending_key = Some((id, machine.clone(), "abc".into()));
+        state.mention_search.request_seq = 2;
+        let stale = serde_json::json!({
+            "entries": [{"path": "ab.rs", "kind": "file"}],
+            "truncated": false
+        });
+        assert!(apply_mention_result(
+            &mut state,
+            &machine,
+            "mention:path:1",
+            Ok(stale)
+        ));
+        assert!(state.mention_search.paths.is_empty());
+        // The in-flight response applies.
+        let current = serde_json::json!({
+            "entries": [{"path": "abc.rs", "kind": "file"}],
+            "truncated": false
+        });
+        assert!(apply_mention_result(
+            &mut state,
+            &machine,
+            "mention:path:2",
+            Ok(current)
+        ));
+        assert_eq!(state.mention_search.paths[0].path, "abc.rs");
+        // A result sent by another machine is ignored.
+        state.mention_search.request_seq = 3;
+        assert!(apply_mention_result(
+            &mut state,
+            "other-server",
+            "mention:path:3",
+            Ok(serde_json::json!({"entries": [{"path": "x.rs", "kind": "file"}]}))
+        ));
+        assert_eq!(state.mention_search.paths[0].path, "abc.rs");
+    }
+
+    #[test]
+    fn workspace_search_entries_render_as_file_rows() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().draft.replace_text("@model");
+        state.current_mut().draft.focused = true;
+        let (id, machine) = {
+            let t = state.current();
+            (t.id, t.machine.clone())
+        };
+        state.mention_search.key = Some((id, machine, "model".into()));
+        state.mention_search.paths_cwd = "/work/proj".into();
+        state.mention_search.paths = vec![
+            crate::workspace_search::WorkspaceEntry {
+                path: "src/model.rs".into(),
+                kind: "file".into(),
+                ignored: false,
+            },
+            crate::workspace_search::WorkspaceEntry {
+                path: "src/model".into(),
+                kind: "directory".into(),
+                ignored: false,
+            },
+        ];
+        let trigger = trigger(&state).unwrap();
+        let (items, _) = items(&state, &trigger);
+        let rows: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(&i.action, Action::Pill(Token::File { .. }, _)))
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "model.rs");
+        assert_eq!(rows[0].source, "File");
+        match &rows[0].action {
+            Action::Pill(
+                Token::File {
+                    path, directory, ..
+                },
+                _,
+            ) => {
+                assert_eq!(*path, std::path::PathBuf::from("/work/proj/src/model.rs"));
+                assert!(!*directory);
+            }
+            _ => unreachable!(),
+        }
+        match &rows[1].action {
+            Action::Pill(Token::File { directory, .. }, _) => assert!(*directory),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn workspace_search_capability_is_a_minor_gate() {
+        assert_eq!(crate::protocol::WORKSPACE_SEARCH_MINOR, 24);
+        assert!(crate::protocol::WORKSPACE_SEARCH_MINOR <= crate::protocol::MINOR);
+        assert!(crate::protocol::WORKSPACE_SEARCH_MINOR > 23);
+        assert_eq!(
+            crate::protocol::method_grant("workspace.searchEntries"),
+            Some("read")
+        );
+    }
+
     #[test]
     fn linked_threads_offer_only_thread_results_and_a_machine_notice() {
         let mut state = State::new(".".into(), false);

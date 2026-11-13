@@ -731,6 +731,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut question_dismiss = false;
     let mut vcs_worktrees = false;
     let mut provider_handoff = false;
+    let mut workspace_search = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -836,6 +837,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if provider_handoff {
                             capabilities.push(protocol::PROVIDER_HANDOFF);
                         }
+                        workspace_search = minor >= u64::from(protocol::WORKSPACE_SEARCH_MINOR);
+                        if workspace_search {
+                            capabilities.push(protocol::WORKSPACE_SEARCH);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -926,6 +931,40 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         database.authorize(&device, "filesystem.browse", &json!({}))?;
                         serde_json::to_value(listing).map_err(|_| "Could not encode the folder listing.".into())
                     }).await.unwrap_or_else(|_| Err("Folder listing failed.".into()))
+                } else if method == "workspace.searchEntries" {
+                    if !workspace_search {
+                        Err("Update required. Update Shina on the client and server to search workspace entries.".into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        let cwd = args["cwd"].as_str().unwrap_or("").to_string();
+                        let query = args["query"].as_str().unwrap_or("")
+                            .chars().take(256).collect::<String>();
+                        let limit = args["limit"].as_u64().unwrap_or(80) as usize;
+                        let kind = args["kind"].as_str().map(str::to_owned);
+                        let image_only = args["imageOnly"] == true;
+                        let database = shared.database.clone();
+                        let device = device.clone();
+                        let snapshots = shared.snapshots.clone();
+                        tokio::task::spawn_blocking(move || {
+                            database.authorize(&device, "workspace.searchEntries", &json!({}))?;
+                            let roots: Vec<std::path::PathBuf> =
+                                snapshots.borrow()["state"]["index"]["projects"]
+                                    .as_array()
+                                    .map(|projects| projects.iter()
+                                        .filter_map(|project| project["path"].as_str())
+                                        .map(std::path::PathBuf::from)
+                                        .collect())
+                                    .unwrap_or_default();
+                            let cwd = crate::workspace_search::resolve_cwd(&cwd, &roots)?;
+                            let result = crate::workspace_search::search(
+                                &cwd, &query, limit, kind.as_deref(), image_only,
+                            );
+                            database.authorize(&device, "workspace.searchEntries", &json!({}))?;
+                            serde_json::to_value(result).map_err(|_| {
+                                "Could not encode the workspace search result.".into()
+                            })
+                        }).await.unwrap_or_else(|_| Err("Workspace search failed.".into()))
+                    }
                 } else if method == "project.writeFile" {
                     let args = params.get("args").unwrap_or(params);
                     match serde_json::from_value::<protocol::ProjectWriteFileInput>(args.clone()) {
@@ -3036,15 +3075,17 @@ mod tests {
             );
             assert!(crate::client::supports_provider_handoff(&hello));
 
-            // Capability is absent one minor below, and the handoff flag is refused.
-            let older = Fixture::with_minor("handoff-older", protocol::MINOR - 1).await;
+            // Capability is absent one minor below its introduction, and the
+            // handoff flag is refused.
+            let older =
+                Fixture::with_minor("handoff-older", protocol::PROVIDER_HANDOFF_MINOR - 1).await;
             let older_link = older.link(&older.shared.directory.join("client")).await;
             let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
                 .await
                 .unwrap();
             assert_eq!(
                 older_hello["protocolMinor"].as_u64(),
-                Some(u64::from(protocol::MINOR - 1))
+                Some(u64::from(protocol::PROVIDER_HANDOFF_MINOR - 1))
             );
             assert!(!crate::client::supports_provider_handoff(&older_hello));
             let refusal = crate::client::remote_rpc(

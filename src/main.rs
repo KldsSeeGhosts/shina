@@ -23,7 +23,6 @@ mod composer_notices;
 mod composer_paste;
 mod composer_rich;
 mod composer_skills;
-mod composer_sources;
 mod composer_tokens;
 mod context;
 mod context_breakdown;
@@ -79,6 +78,7 @@ mod usage_limits;
 mod vcs;
 mod visuals;
 mod work;
+mod workspace_search;
 
 use model::State;
 use rune::{AppSpec, KeyEvent, Tx};
