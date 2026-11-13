@@ -620,6 +620,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         }),
         owner: Arc::default(),
         context_sent: false,
+        prompt_suggestions: false,
     }
 }
 
@@ -1527,6 +1528,7 @@ fn codex_token_usage_notification_produces_estimated_and_inferred_breakdown() {
 #[test]
 fn codex_fresh_session_issues_thread_start_and_not_resume() {
     let mut client = Client::new(Start {
+        prompt_suggestions: false,
         id: "codex".into(),
         workspace: PathBuf::from("."),
         source: SessionSource::New,
@@ -1561,4 +1563,77 @@ fn codex_fresh_session_issues_thread_start_and_not_resume() {
         .collect();
     assert!(methods.contains(&"thread/start"), "{methods:?}");
     assert!(!methods.contains(&"thread/resume"), "{methods:?}");
+}
+
+#[test]
+fn codex_prompt_suggestion_samples_after_turn_and_discards_late_answer() {
+    let mut start = spec(SessionSource::New, "read-only");
+    start.prompt_suggestions = true;
+    let mut client = Client::new(start);
+    client.ready = true;
+    client.session = Some("codex-session-1".into());
+
+    let mut thread = Thread::new(41);
+    thread.harness = "codex".into();
+    thread.run_id = Some("run-1".into());
+
+    client
+        .command(json!({"type": "prompt", "id": "p1", "message": "hello", "runId": "run-1"}))
+        .unwrap();
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn": {"id": "turn-1", "status": "completed", "items": []}}),
+        )
+        .unwrap();
+    let sample_req = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "thread/sample")
+        .expect("expected thread/sample request")
+        .clone();
+    assert_eq!(sample_req["params"]["threadId"], "codex-session-1");
+    assert_eq!(sample_req["params"]["expectedTurnId"], "turn-1");
+    assert_eq!(sample_req["params"]["effort"], "low");
+    assert_eq!(sample_req["params"]["prompt"], PROMPT_SUGGESTION_PROMPT);
+
+    client
+        .incoming(json!({"id": sample_req["id"], "result": {"text": "  Run cargo test  "}}))
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(
+        thread.prompt_suggestion,
+        Some(crate::model::PromptSuggestion {
+            run_id: "run-1".into(),
+            text: "Run cargo test".into(),
+        })
+    );
+
+    // Start run-2 and complete it, then deliver a late thread/sample response from run-1.
+    thread.run_id = Some("run-2".into());
+    client.wire.clear();
+    client
+        .command(json!({"type": "prompt", "id": "p2", "message": "next", "runId": "run-2"}))
+        .unwrap();
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn": {"id": "turn-2", "status": "completed", "items": []}}),
+        )
+        .unwrap();
+    client.request(
+        "thread/sample",
+        json!({"threadId": "codex-session-1", "expectedTurnId": "turn-1"}),
+        json!({"type": "prompt_suggestion", "runId": "run-1"}),
+    );
+    let stale_id = client.wire.last().unwrap()["id"].clone();
+    client
+        .incoming(json!({"id": stale_id, "result": {"text": "Stale suggestion"}}))
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(thread.prompt_suggestion, None);
 }

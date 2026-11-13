@@ -280,6 +280,7 @@ fn spec(source: SessionSource) -> Start {
         }),
         owner: Arc::default(),
         context_sent: false,
+        prompt_suggestions: false,
     }
 }
 

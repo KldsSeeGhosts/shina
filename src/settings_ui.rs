@@ -102,6 +102,8 @@ pub struct ThreadDefaults {
     /// Starting directory when the Add workspace folder browser opens (KSG Code's `addProjectBaseDirectory`).
     /// Empty defaults to `"~/"`.
     pub add_project_base_directory: String,
+    /// KSG Code's `promptSuggestionsEnabled`: off by default.
+    pub prompt_suggestions_enabled: bool,
 }
 impl Default for ThreadDefaults {
     fn default() -> Self {
@@ -121,6 +123,7 @@ impl Default for ThreadDefaults {
             ],
             models: BTreeMap::new(),
             add_project_base_directory: String::new(),
+            prompt_suggestions_enabled: false,
         }
     }
 }
@@ -2201,6 +2204,27 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                             s.save_defaults(defaults);
                         },
                     )),
+                p,
+            );
+            let prompt_suggestions_enabled = defaults.prompt_suggestions_enabled;
+            pane = add(
+                pane,
+                s,
+                "settings-prompt-suggestions",
+                "Suggest next prompt",
+                "Show a predicted next message in the empty composer after a Claude or Codex turn. Tab uses it. Each is an extra cached request on your plan. Needs Codex 0.165+. Claude threads update on restart.",
+                captain_ui::switch(
+                    s,
+                    "prompt-suggestions-toggle",
+                    "Suggest next prompt",
+                    prompt_suggestions_enabled,
+                    p,
+                    |s| {
+                        let mut defaults = s.settings_defaults();
+                        defaults.prompt_suggestions_enabled = !defaults.prompt_suggestions_enabled;
+                        s.save_defaults(defaults);
+                    },
+                ),
                 p,
             );
         }

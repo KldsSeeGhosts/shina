@@ -93,6 +93,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         }),
         owner: Arc::default(),
         context_sent: false,
+        prompt_suggestions: false,
     }
 }
 
@@ -1080,6 +1081,7 @@ fn claude_context_breakdown_uses_get_context_usage_categories_on_completed_turn(
 #[test]
 fn claude_fresh_session_passes_session_id_and_not_resume() {
     let client = Client::new(Start {
+        prompt_suggestions: false,
         id: "claude".into(),
         workspace: PathBuf::from("."),
         source: SessionSource::New,
@@ -1096,4 +1098,76 @@ fn claude_fresh_session_passes_session_id_and_not_resume() {
         .collect();
     assert!(args.iter().any(|arg| arg == "--session-id"), "{args:?}");
     assert!(!args.iter().any(|arg| arg == "--resume"), "{args:?}");
+}
+
+#[test]
+fn claude_prompt_suggestion_stores_for_settled_run_and_discards_late_answer() {
+    let mut start = spec(SessionSource::New, "read-only");
+    start.prompt_suggestions = true;
+    let mut client = Client::new(start);
+    client.initialize();
+    let init_req = client
+        .wire
+        .iter()
+        .find(|r| r["request"]["subtype"] == "initialize")
+        .expect("expected initialize request");
+    assert_eq!(init_req["request"]["promptSuggestions"], true);
+    client
+        .incoming(json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": init_req["request_id"],
+                "response": { "hook_on_failure_supported": true, "commands": [], "models": [{ "value": "default", "displayName": "Default" }] }
+            }
+        }))
+        .unwrap();
+
+    let mut thread = Thread::new(33);
+    thread.harness = "claude".into();
+    thread.run_id = Some("run-1".into());
+    let (pi, _commands, _events) = crate::backend::Pi::test_connection();
+    thread.pi = Some(pi);
+
+    client
+        .command(json!({"type": "prompt", "id": "p1", "message": "hello", "runId": "run-1"}))
+        .unwrap();
+    client
+        .incoming(json!({"type": "result", "is_error": false, "queued_turn_count": 0}))
+        .unwrap();
+    client
+        .incoming(json!({"type": "prompt_suggestion", "suggestion": "  Run cargo test  "}))
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(
+        thread.prompt_suggestion,
+        Some(crate::model::PromptSuggestion {
+            run_id: "run-1".into(),
+            text: "Run cargo test".into(),
+        })
+    );
+
+    // Start a second run, then deliver a late suggestion for run-1: it must be discarded.
+    thread.run_id = Some("run-2".into());
+    client
+        .command(json!({"type": "prompt", "id": "p2", "message": "next", "runId": "run-2"}))
+        .unwrap();
+    client
+        .incoming(json!({"type": "prompt_suggestion", "suggestion": "Stale suggestion"}))
+        .unwrap();
+    // Even if run-2 settles and a late payload carrying run-1 arrives, it is discarded.
+    client
+        .incoming(json!({"type": "result", "is_error": false, "queued_turn_count": 0}))
+        .unwrap();
+    client
+        .incoming(
+            json!({"type": "prompt_suggestion", "runId": "run-1", "suggestion": "Stale for run-1"}),
+        )
+        .unwrap();
+    for event in client.events.drain(..) {
+        thread.apply(event);
+    }
+    assert_eq!(thread.prompt_suggestion, None);
 }

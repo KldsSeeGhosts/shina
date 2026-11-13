@@ -1358,6 +1358,7 @@ mod tests {
                 link: None,
                 owner: Arc::default(),
                 context_sent: true,
+                prompt_suggestions: false,
             };
             let context = crate::codex::developer_instructions(&start);
             assert!(context.contains(crate::mcp::INSTRUCTIONS));

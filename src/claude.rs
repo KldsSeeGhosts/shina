@@ -212,6 +212,9 @@ struct Client {
     wire: Vec<Value>,
     events: Vec<Value>,
     usage_limits: Value,
+    active_run_id: Option<String>,
+    settled_run_id: Option<String>,
+    turn_serial: u64,
 }
 
 impl Client {
@@ -254,6 +257,9 @@ impl Client {
             wire: vec![],
             events: vec![],
             usage_limits: Value::Null,
+            active_run_id: None,
+            settled_run_id: None,
+            turn_serial: 0,
         }
     }
 
@@ -348,6 +354,7 @@ impl Client {
     fn initialize(&mut self) {
         self.request(json!({"subtype":"initialize",
             "forwardSubagentText":true,"forwardNestedSubagentToolCalls":true,
+            "promptSuggestions":self.start.prompt_suggestions,
             "hooks":{"PreToolUse":[{"hookCallbackIds":["shina-policy"],"onFailure":"block","timeout":660}]}
         }), json!({"type":"initialize"}));
     }
@@ -744,6 +751,7 @@ impl Client {
                         "Claude failed: {error}. Sign in with the Claude CLI outside Shina, then retry. No prompt was retried."
                     ));
                 }
+                let was_compacting = self.compacting;
                 if self.compacting {
                     if error.is_none() && !self.cancelling {
                         error = Some(
@@ -784,6 +792,16 @@ impl Client {
                 }
                 self.running = record["queued_turn_count"].as_u64().unwrap_or(0) > 0;
                 if !self.running {
+                    if !self.cancelling
+                        && error.is_none()
+                        && self.queued.is_empty()
+                        && !was_compacting
+                    {
+                        self.settled_run_id = self.active_run_id.take();
+                    } else {
+                        self.active_run_id = None;
+                        self.settled_run_id = None;
+                    }
                     if let Some(error) = &error {
                         self.events.push(json!({"type":"message_end","message":{
                             "role":"assistant","stopReason":"error","errorMessage":error}}));
@@ -889,6 +907,26 @@ impl Client {
                 self.usage_limits =
                     crate::usage_limits::claude(&record["rate_limit_info"], &self.usage_limits);
                 self.update("usageLimits", self.usage_limits.clone());
+            }
+            "prompt_suggestion" => {
+                if self.start.prompt_suggestions
+                    && !self.running
+                    && let Some(run_id) = self.settled_run_id.as_deref()
+                    && record
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| id == run_id)
+                {
+                    let text = record["suggestion"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    self.events.push(json!({
+                        "type": "prompt_suggestion",
+                        "runId": run_id,
+                        "text": text,
+                    }));
+                }
             }
             "auth_status" if record["error"].is_string() => {
                 return Err(AUTH_ERROR.into());
@@ -1229,6 +1267,7 @@ impl Client {
                     let input = json!({"message":format!("/compact {instructions}")});
                     self.compact = Some(record);
                     self.cancelling = false;
+                    self.settled_run_id = None;
                     self.begin_compaction();
                     self.send_input(&input)?;
                 }
@@ -1275,6 +1314,14 @@ impl Client {
         }
         self.cancelling = false;
         if !was_running {
+            self.turn_serial += 1;
+            self.active_run_id = Some(
+                record["runId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("claude-turn-{}", self.turn_serial)),
+            );
+            self.settled_run_id = None;
             self.compact_failure = None;
             self.compact_reported = false;
             self.events.push(json!({"type":"agent_start"}));
