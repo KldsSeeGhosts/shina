@@ -1544,6 +1544,25 @@ pub(super) fn header(s: &State, p: Palette) -> El {
                 reload
             }),
     );
+    // KSG's file-tree toggle sits last in the header and only while the lane
+    // can hold the tree's minimum plus the diff's content reserve. The glyph
+    // is the existing "folder" icon — the skin has no folder-tree drawing.
+    if ready.is_some_and(|ready| !ready.files.is_empty())
+        && diff_tree::lane_width() >= diff_tree::MIN_LANE
+    {
+        bar = bar.child(toggle_button(
+            "diff-tree-toggle",
+            if s.diff_tree_open {
+                "Hide file tree"
+            } else {
+                "Show file tree"
+            },
+            "folder",
+            s.diff_tree_open,
+            p,
+            |s: &mut State| s.diff_tree_toggle(),
+        ));
+    }
     bar.into()
 }
 
@@ -1928,8 +1947,10 @@ fn diff_row(s: &State, p: Palette, panel_key: &str, i: usize) -> El {
 }
 
 /// KSG's ready state: notices, then either the raw patch or the virtualized
-/// file list.
-fn ready_body(p: Palette, panel_key: &str, ready: &Ready) -> El {
+/// file list with the file tree beside it (KSG mounts the tree only in the
+/// structured-files branch — raw patch, loading, empty and error states
+/// never reach it).
+fn ready_body(s: &State, p: Palette, panel_key: &str, ready: &Ready) -> El {
     let mut body = col().w_full().h_full().min_h(0.0).min_w(0.0);
     if ready.incomplete {
         body = body.child(el().w_full().px(8.0).py(6.0).child(label(
@@ -2013,7 +2034,22 @@ fn ready_body(p: Palette, panel_key: &str, ready: &Ready) -> El {
                     needs && s.diff_load_next(&key3)
                 }),
         );
-    body.child(list)
+    // KSG mounts the tree beside the diff once the lane can hold its 160 px
+    // minimum plus the diff's 256 px content reserve; the toggle can only
+    // open it, never squeeze past that.
+    if s.diff_tree_open && diff_tree::lane_width() >= diff_tree::MIN_LANE {
+        body.child(
+            row()
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .min_w(0.0)
+                .child(list)
+                .child(diff_tree::column(s, p, panel_key)),
+        )
+    } else {
+        body.child(list)
+    }
 }
 
 /// A one-shot scroll trigger for `reveal_file`'s resolved row: mounting it
@@ -2066,7 +2102,7 @@ pub(super) fn body(s: &State, p: Palette) -> El {
         Some(Done::Failed(error)) => centered_state(error.clone(), p, true).into(),
         Some(Done::Empty) => centered_state(EMPTY_TEXT, p, false).into(),
         Some(Done::Missing) => centered_state(MISSING_TEXT, p, false).into(),
-        Some(Done::Ready(ready)) => ready_body(p, &panel_key, ready).into(),
+        Some(Done::Ready(ready)) => ready_body(s, p, &panel_key, ready).into(),
     };
     let mut root = el()
         .key("diff-body-root")

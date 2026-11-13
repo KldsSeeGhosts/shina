@@ -17312,6 +17312,193 @@ pub(crate) mod tests {
         }
     }
 
+    /// Six files across three folder levels — the spec's tree fixture. Each
+    /// file gets fifteen added lines so the diff outgrows the 600 pt viewport
+    /// and the reveal has somewhere to scroll.
+    const TREE_PATCH: &str = "diff --git a/a.txt b/a.txt\n\
+        --- a/a.txt\n+++ b/a.txt\n@@ -1,0 +1,15 @@\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n\
+        diff --git a/src/lib.rs b/src/lib.rs\n\
+        --- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,0 +1,15 @@\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n\
+        diff --git a/src/ui/app.rs b/src/ui/app.rs\n\
+        --- a/src/ui/app.rs\n+++ b/src/ui/app.rs\n@@ -1,0 +1,15 @@\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n\
+        diff --git a/src/ui/widgets/list.rs b/src/ui/widgets/list.rs\n\
+        --- a/src/ui/widgets/list.rs\n+++ b/src/ui/widgets/list.rs\n@@ -1,0 +1,15 @@\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n\
+        diff --git a/tests/app.test.ts b/tests/app.test.ts\n\
+        --- a/tests/app.test.ts\n+++ b/tests/app.test.ts\n@@ -1,0 +1,15 @@\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n\
+        diff --git a/src/ui/widgets/deep/item.rs b/src/ui/widgets/deep/item.rs\n\
+        --- a/src/ui/widgets/deep/item.rs\n+++ b/src/ui/widgets/deep/item.rs\n@@ -1,0 +1,15 @@\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n+l\n";
+
+    /// KSG `FileExplorerPane` beside the diff: the tree column sits inside the
+    /// panel without overlapping the diff list, pressing a file reveals its
+    /// header, a folder press folds, the toggle unmounts it, and a 5,000-file
+    /// diff still builds only the rows on screen.
+    #[test]
+    fn diff_tree_lays_out_reveals_and_virtualizes_at_all_widths() {
+        use crate::right_panel::SingletonKind;
+        // At 960 px the docked panel squeezes to ~362 px for the conversation's
+        // 360 px reserve — under the tree's 416 px lane minimum, so the tree
+        // and its toggle hide outright (KSG's implied threshold).
+        let mut rt = runtime(960.0);
+        let key = rt.state.panel_key();
+        rt.state.right_panels.open(&key, SingletonKind::Diff);
+        rt.state.diffs.insert(
+            key.clone(),
+            diff_panel::ThreadDiff {
+                done: Some(parsed_ready(TREE_PATCH)),
+                last_refresh_at: Some(std::time::Instant::now()),
+                ..Default::default()
+            },
+        );
+        rt.state.diff_rebuild_rows(&key);
+        rt.state.diff_tree_open = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.5);
+        rt.frame(0.5);
+        assert!(rt.presented("diff-rows").is_some());
+        assert!(rt.presented("diff-tree").is_none(), "tree hides at 960");
+        assert!(
+            rt.presented("diff-tree-toggle").is_none(),
+            "toggle hides at 960"
+        );
+
+        for width in [1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let key = rt.state.panel_key();
+            rt.state.right_panels.open(&key, SingletonKind::Diff);
+            rt.state.diffs.insert(
+                key.clone(),
+                diff_panel::ThreadDiff {
+                    done: Some(parsed_ready(TREE_PATCH)),
+                    last_refresh_at: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            );
+            rt.state.diff_rebuild_rows(&key);
+            rt.state.diff_tree_open = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.5);
+            rt.frame(0.5);
+
+            let (panel, _) = rt
+                .presented("right-panel")
+                .unwrap_or_else(|| panic!("panel mounts at {width}"));
+            let (tree, _) = rt
+                .presented("diff-tree")
+                .unwrap_or_else(|| panic!("tree mounts at {width}"));
+            let (rows, _) = rt
+                .presented("diff-rows")
+                .unwrap_or_else(|| panic!("list mounts at {width}"));
+            // The tree sits inside the panel's right side, beside the list.
+            assert!(
+                tree[0] >= panel[0] - 0.5
+                    && tree[0] + tree[2] <= panel[0] + panel[2] + 0.5
+                    && tree[1] >= panel[1] - 0.5
+                    && tree[1] + tree[3] <= panel[1] + panel[3] + 0.5,
+                "{width}: tree {tree:?} inside panel {panel:?}"
+            );
+            assert!(
+                tree[0] >= rows[0] + rows[2] - 0.5,
+                "{width}: tree {tree:?} beside list {rows:?}"
+            );
+            // KSG's bounds: the lane holds 160..=560 minus the diff reserve.
+            assert!(
+                (crate::ui::diff_tree::MIN_W..=crate::ui::diff_tree::MAX_W).contains(&tree[2]),
+                "{width}: tree width {}",
+                tree[2]
+            );
+
+            // The toggle rides the header while the lane fits.
+            assert!(rt.presented("diff-tree-toggle").is_some(), "{width}");
+            // File and folder rows mount; the tree's file-3 is the diff's
+            // file-3 (src/ui/widgets/list.rs).
+            assert!(rt.presented("diff-tree-file-3").is_some(), "{width}");
+            assert!(rt.presented("diff-tree-dir-src/").is_some(), "{width}");
+
+            // Pressing the file reveals its diff header at the list's top.
+            press(&mut rt, "diff-tree-file-3");
+            rt.frame(0.5);
+            rt.frame(0.5);
+            let (revealed, _) = rt
+                .presented("diff-file-3")
+                .unwrap_or_else(|| panic!("diff-file-3 at {width}"));
+            let (list_top, _) = rt.presented("diff-rows").unwrap();
+            assert!(
+                (revealed[1] - list_top[1]).abs() <= 1.0,
+                "{width}: diff-file-3 {revealed:?} tops the list {list_top:?}"
+            );
+            // The marked file carries the tree's current-file sync too.
+            let key = rt.state.panel_key();
+            assert_eq!(rt.state.diffs[&key].current_file, Some(3), "{width}");
+
+            // Pressing a folder row removes its file rows. `order_like_tree`
+            // puts the deep item at file 4 and `tests/app.test.ts` at file 5,
+            // so folding `src/` leaves the test file as `diff-tree-file-5`.
+            press(&mut rt, "diff-tree-dir-src/");
+            rt.frame(0.5);
+            assert!(rt.presented("diff-tree-file-1").is_none(), "{width}");
+            assert!(rt.presented("diff-tree-file-3").is_none(), "{width}");
+            assert!(rt.presented("diff-tree-file-4").is_none(), "{width}");
+            assert!(rt.presented("diff-tree-file-5").is_some(), "{width}");
+
+            // The toggle hides the tree and the diff list takes the width.
+            press(&mut rt, "diff-tree-toggle");
+            rt.frame(0.5);
+            assert!(rt.presented("diff-tree").is_none(), "{width}");
+            let (wide_rows, _) = rt.presented("diff-rows").unwrap();
+            assert!(
+                wide_rows[2] > rows[2] + 100.0,
+                "{width}: {wide_rows:?} vs {rows:?}"
+            );
+        }
+
+        // 5,000 changed files still build only the visible tree rows.
+        let mut rt = runtime(1280.0);
+        let key = rt.state.panel_key();
+        rt.state.right_panels.open(&key, SingletonKind::Diff);
+        let patch: String = (0..5_000)
+            .map(|i| {
+                format!(
+                    "diff --git a/dir{}/sub/f{}.rs b/dir{}/sub/f{}.rs\n\
+                    --- a/dir{}/sub/f{}.rs\n+++ b/dir{}/sub/f{}.rs\n@@ -1,0 +1,1 @@\n+x\n",
+                    i % 50,
+                    i,
+                    i % 50,
+                    i,
+                    i % 50,
+                    i,
+                    i % 50,
+                    i
+                )
+            })
+            .collect();
+        rt.state.diffs.insert(
+            key.clone(),
+            diff_panel::ThreadDiff {
+                done: Some(parsed_ready(&patch)),
+                last_refresh_at: Some(std::time::Instant::now()),
+                ..Default::default()
+            },
+        );
+        rt.state.diff_rebuild_rows(&key);
+        rt.state.diff_tree_open = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.5);
+        rt.frame(0.5);
+        let mounted = rt
+            .elements()
+            .into_iter()
+            .filter(|e| {
+                e.key.as_deref().is_some_and(|key| {
+                    key.starts_with("diff-tree-file-") || key.starts_with("diff-tree-dir-")
+                })
+            })
+            .count();
+        assert!(mounted < 200, "5,000 files: {mounted} tree rows built");
+    }
+
     /// KSG `PanelLayoutControls` in the chat header: the diff toggle opens and
     /// closes the Diff tab, the panel toggle the whole panel, and the loaded
     /// diff's totals sit beside the diff toggle once the row is wide enough.

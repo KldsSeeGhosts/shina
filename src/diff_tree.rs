@@ -1,6 +1,3 @@
-// The view half mounts in the next commit.
-#![allow(dead_code)]
-
 //! The Diff tab's file tree: the folder column beside the diff list.
 //!
 //! Ported from KSG Code's `components/diffs/DiffFileTree.tsx` (the tree of
