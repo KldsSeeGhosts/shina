@@ -143,10 +143,6 @@ fn read_tool(name: &str) -> bool {
     )
 }
 
-fn edit_tool(name: &str) -> bool {
-    matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit")
-}
-
 fn tool_name(name: &str) -> String {
     match name {
         "Read" => "read",
@@ -174,6 +170,7 @@ struct Approval {
     name: String,
     tool_id: Value,
     hook: bool,
+    suggestions: Vec<Value>,
 }
 
 struct Client {
@@ -187,6 +184,7 @@ struct Client {
     serial: usize,
     pending: HashMap<String, Pending>,
     approvals: HashMap<String, Approval>,
+    elicitation_grants: HashSet<String>,
     models: Vec<Value>,
     commands: Vec<Value>,
     model: Value,
@@ -230,6 +228,7 @@ impl Client {
             serial: 0,
             pending: HashMap::new(),
             approvals: HashMap::new(),
+            elicitation_grants: HashSet::new(),
             models: vec![],
             commands: vec![],
             model: Value::Null,
@@ -872,6 +871,38 @@ impl Client {
         if self.approvals.contains_key(id) {
             return Ok(());
         }
+        if request["subtype"] == "elicitation" {
+            let Some(acceptance) = crate::approval::claude_mcp_acceptance(request) else {
+                self.control_reply(id, json!({"action":"decline"}));
+                return Ok(());
+            };
+            let grant_key = format!(
+                "{}\0{}",
+                request["mcp_server_name"].as_str().unwrap_or(""),
+                request["message"].as_str().unwrap_or("")
+            );
+            if self.elicitation_grants.contains(&grant_key) {
+                self.control_reply(id, acceptance);
+            } else if self.cancelling || !self.running {
+                self.control_reply(id, json!({"action":"cancel"}));
+            } else {
+                self.events.push(json!({"type":"extension_ui_request","id":id,"method":"confirm",
+                    "title":request["display_name"].as_str().or(request["title"].as_str()).unwrap_or(request["mcp_server_name"].as_str().unwrap_or("")),
+                    "message":request["message"],"approvalOptions":crate::approval::defaults()}));
+                self.approvals.insert(
+                    id.into(),
+                    Approval {
+                        request_id: id.into(),
+                        input: request.clone(),
+                        name: "__mcp_elicitation".into(),
+                        tool_id: Value::Null,
+                        hook: false,
+                        suggestions: vec![],
+                    },
+                );
+            }
+            return Ok(());
+        }
         let hook = request["subtype"] == "hook_callback";
         if hook
             && (request["callback_id"] != "shina-policy"
@@ -897,6 +928,10 @@ impl Client {
             name: name.clone(),
             tool_id: data["tool_use_id"].clone(),
             hook,
+            suggestions: data["permission_suggestions"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
         };
         if self.cancelling || self.approvals.len() >= 32 {
             self.answer(approval, false, None);
@@ -955,14 +990,44 @@ impl Client {
         } else if hook {
             // Continue normal CLI permission evaluation; only read-only must override allow rules.
             self.control_reply(id, json!({}));
-        } else if read_tool(&name)
-            || self.access() == "full-access"
-            || self.access() == "auto-accept-edits" && edit_tool(&name)
-        {
-            self.answer(approval, true, None);
         } else {
-            self.events.push(json!({"type":"extension_ui_request","id":id,"method":"confirm",
-                "title":format!("Allow Claude {name}?"),"message":self.redact(&format!("{}\n{input}",data["decision_reason"].as_str().unwrap_or("")))}));
+            // Node util.stripVTControlCharacters, used by KSG's claudeApprovalPresentation.
+            let reason =
+                regex::Regex::new(r"(?:\x1b\][\s\S]*?(?:\x07|\x1b\\|\u{009c}))|[\x1b\u{009b}][\[\]()#;?]*(?:[0-9]{1,4}(?:[;:][0-9]{0,4})*)?[0-9A-PR-TZcf-nq-uy=><~]")
+                    .expect("constant terminal escape regex")
+                    .replace_all(data["decision_reason"].as_str().unwrap_or(""), "")
+                    .trim()
+                    .to_owned();
+            if name == "Bash"
+                && self.access() == "full-access"
+                && data["matched_ask_rule"].is_null()
+                && (regex::Regex::new(r"(?i)^Dangerous rm(?:dir)?\b")
+                    .expect("constant regex")
+                    .is_match(&reason)
+                    || reason == "This shell -c script runs rm and could not be checked"
+                    || reason == "A permission rule denies a command in this shell -c script")
+            {
+                self.control_reply(id, json!({"behavior":"deny","toolUseID":approval.tool_id,
+                    "message":format!("Claude Code's removal safety check denied this command; the user did not reject it. The command did not run. Do not bypass the check by splitting the removal, putting it in a script, or using another tool or shell. If the warning below supplies a safe rewrite, use it and let the same check evaluate it. Otherwise continue the rest of the task without the removal and tell the user what you needed to delete and why. Warning: {reason}")}));
+                return Ok(());
+            }
+            let mut event = json!({"type":"extension_ui_request","id":id,"method":"confirm",
+                "responseCapability":{"type":"live","supportsFeedback":true},
+                "title":format!("Allow Claude {name}?"),"message":self.redact(&format!("{reason}\n{input}"))});
+            if data["suppress_always_allow_rule"] == true {
+                event["approvalOptions"] = json!([
+                    {"decision":"decline","label":"Decline"},
+                    {"decision":"accept","label":"Approve"}
+                ]);
+            }
+            if self.access() == "full-access" {
+                event["fullAccessOverride"] = json!(if data["matched_ask_rule"].is_null() {
+                    "provider_check"
+                } else {
+                    "ask_rule"
+                });
+            }
+            self.events.push(event);
             self.approvals.insert(id.into(), approval);
         }
         Ok(())
@@ -994,6 +1059,53 @@ impl Client {
         } else {
             json!({"behavior":"deny","message":message,"toolUseID":approval.tool_id})
         };
+        self.control_reply(&approval.request_id, response);
+    }
+
+    fn answer_decision(&mut self, approval: Approval, decision: &str, feedback: Option<&str>) {
+        if approval.name == "__mcp_elicitation" {
+            let response = if matches!(decision, "accept" | "acceptForSession") {
+                if decision == "acceptForSession" {
+                    self.elicitation_grants.insert(format!(
+                        "{}\0{}",
+                        approval.input["mcp_server_name"].as_str().unwrap_or(""),
+                        approval.input["message"].as_str().unwrap_or("")
+                    ));
+                }
+                crate::approval::claude_mcp_acceptance(&approval.input)
+                    .unwrap_or(json!({"action":"decline"}))
+            } else {
+                json!({"action":if decision == "cancel" {"cancel"} else {"decline"}})
+            };
+            self.control_reply(&approval.request_id, response);
+            return;
+        }
+        let allow = matches!(decision, "accept" | "acceptForSession");
+        if approval.hook {
+            self.answer(approval, allow, None);
+            return;
+        }
+        let mut response = if allow {
+            json!({"behavior":"allow","updatedInput":approval.input,"toolUseID":approval.tool_id,
+                "decisionClassification":if decision == "acceptForSession" {"user_permanent"} else {"user_temporary"}})
+        } else {
+            json!({"behavior":"deny","toolUseID":approval.tool_id,"decisionClassification":"user_reject",
+                "message":feedback.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(
+                    if decision == "cancel" {"User cancelled tool execution."} else {"User declined tool execution."})})
+        };
+        if decision == "cancel" {
+            response["interrupt"] = json!(true);
+        }
+        if decision == "acceptForSession" {
+            let mut updates = approval.suggestions;
+            if updates.is_empty() {
+                updates.push(json!({"type":"addRules","rules":[{"toolName":approval.name}],"behavior":"allow"}));
+            }
+            for update in &mut updates {
+                update["destination"] = json!("session");
+            }
+            response["updatedPermissions"] = json!(updates);
+        }
         self.control_reply(&approval.request_id, response);
     }
 
@@ -1047,10 +1159,13 @@ impl Client {
                         self.queue_update();
                     }
                 } else {
-                    let allow = allowed
-                        && record["confirmed"] == true
-                        && (self.access() != "read-only" || read_tool(&approval.name));
-                    self.answer(approval, allow, None);
+                    let decision = crate::approval::decision(&record)?;
+                    let decision = if self.access() == "read-only" && !read_tool(&approval.name) {
+                        "decline"
+                    } else {
+                        decision
+                    };
+                    self.answer_decision(approval, decision, record["feedback"].as_str());
                 }
             }
             return Ok(());
@@ -1176,7 +1291,7 @@ impl Client {
                 record["sentUuids"] = json!(self.sent.keys().collect::<Vec<_>>());
                 self.cancelling = self.running;
                 for (_, approval) in std::mem::take(&mut self.approvals) {
-                    self.answer(approval, false, None);
+                    self.answer_decision(approval, "cancel", None);
                 }
                 self.request(json!({"subtype":"interrupt","cancel_queued":true}), record);
                 if !self.running {

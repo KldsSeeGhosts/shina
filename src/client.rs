@@ -272,6 +272,16 @@ impl Client {
             .as_array()
             .is_some_and(|caps| caps.iter().any(|cap| cap == capability))
     }
+    pub fn can_approve(&self, server: &str) -> bool {
+        let info = if server == "local" {
+            &self.info
+        } else if let Some(remote) = self.linked.get(server) {
+            &remote.info
+        } else {
+            return false;
+        };
+        info.lock().expect("connection info")["canApprove"] == true
+    }
     pub fn show_history(&self, thread: usize) {
         self.history_thread.store(thread, Ordering::Release);
     }
@@ -641,7 +651,7 @@ async fn supervise(
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"capabilities":hello["capabilities"]});
+                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"canApprove":hello["canApprove"],"capabilities":hello["capabilities"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
@@ -733,6 +743,14 @@ async fn supervise(
         tokio::select! {
             command = input.recv(), if pending.len() < 32 => {
                 let Some(command) = command else { break; };
+                if command.params["requestContract"] == true
+                    && !info.lock().expect("connection info")["capabilities"].as_array()
+                        .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_REQUESTS))
+                {
+                    let _ = output.try_send(Event::Receipt(command, json!({"error":{"message":protocol::REQUESTS_UPDATE_REQUIRED}})));
+                    wake();
+                    continue;
+                }
                 if matches!(command.method.as_str(), "queue.update" | "queue.returnDraft")
                     && !info.lock().expect("connection info")["capabilities"].as_array()
                         .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::COMPOSER_TRANSACTIONS))

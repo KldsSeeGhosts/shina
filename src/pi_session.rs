@@ -81,7 +81,12 @@ pub fn session_history(record: &mut Value) {
 
 fn approval_key(request: &Value) -> String {
     let title = string(request, "title");
-    format!("{}:{}{}", title.len(), title, string(request, "message"))
+    format!(
+        "{}:{}{}",
+        title.encode_utf16().count(),
+        title,
+        string(request, "message")
+    )
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -138,6 +143,7 @@ pub struct PiSession {
     pub projected_operating: bool,
     pub projected_queued: bool,
     pub questionnaire: Option<questionnaire::Questionnaire>,
+    pub approval_more: bool,
     questionnaires: HashMap<String, Value>,
     questionnaire_replies: Vec<(String, String, String)>,
     questionnaire_advance: Option<Instant>,
@@ -697,6 +703,7 @@ impl Thread {
     }
 
     pub(super) fn native_dialog_done(&mut self) {
+        self.native.approval_more = false;
         self.native.questionnaire_advance = None;
         self.native.questionnaire = None;
         self.native.dialog_deadline = None;
@@ -735,14 +742,14 @@ impl Thread {
         }
     }
 
+    #[cfg(test)]
     pub fn approve_for_session(&mut self) {
-        if self.remote.is_some() {
-            self.respond(json!({"confirmed":true,"allowForSession":true}));
-            return;
-        }
-        if let Some(request) = self.request.as_ref().filter(|r| r["method"] == "confirm") {
+        self.respond(crate::approval::response("acceptForSession"));
+    }
+
+    pub(super) fn remember_session_approval(&mut self) {
+        if let Some(request) = &self.request {
             self.native.session_approvals.insert(approval_key(request));
-            self.respond(json!({"confirmed":true}));
         }
     }
 

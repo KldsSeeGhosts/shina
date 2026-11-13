@@ -3,6 +3,61 @@ use crate::model::{Status, Thread};
 use std::sync::Arc;
 
 #[test]
+fn approval_options_and_wire_mapping_do_not_promote_decline_to_persistent_rejection() {
+    let request = json!({"id":42,"params":{"sessionId":"session",
+    "toolCall":{"toolCallId":"tool","kind":"execute","title":"Run it?"},
+    "options":[
+        {"optionId":"once","kind":"allow_once","name":"Once"},
+        {"optionId":"always","kind":"allow_always","name":"Always"},
+        {"optionId":"never","kind":"reject_always","name":"Never"}
+    ]}});
+    for (decision, expected) in [
+        ("accept", json!({"outcome":"selected","optionId":"once"})),
+        (
+            "acceptForSession",
+            json!({"outcome":"selected","optionId":"always"}),
+        ),
+        ("decline", json!({"outcome":"cancelled"})),
+        ("cancel", json!({"outcome":"cancelled"})),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New));
+        client.permission(&request).unwrap();
+        let key = client.events.last().unwrap()["id"].clone();
+        client
+            .command(json!({"type":"extension_ui_response","id":key,"decision":decision}))
+            .unwrap();
+        assert_eq!(client.wire.last().unwrap()["result"]["outcome"], expected);
+    }
+}
+
+#[test]
+fn provider_approval_option_lists_preserve_warnings_and_persistent_grant_restrictions() {
+    let params = json!({"toolCall":{"toolCallId":"tool"},"options":[
+        {"kind":"allow_once","optionId":"once"},
+        {"kind":"allow_always","optionId":"always","_meta":{"agy.security.warning":{"message":" Check this grant. "}}},
+        {"kind":"reject_once","optionId":"no"}
+    ]});
+    let options = acp_approval_options("antigravity", &params).unwrap();
+    assert_eq!(
+        options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(),
+        ["Allow once", "Allow for this thread", "Deny", "Cancel"]
+    );
+    assert_eq!(options[1].warning.as_deref(), Some("Check this grant."));
+    assert!(
+        !acp_approval_options("kiro", &params)
+            .unwrap()
+            .iter()
+            .any(|o| o.decision == "acceptForSession")
+    );
+    assert!(
+        !acp_approval_options("grok", &params)
+            .unwrap()
+            .iter()
+            .any(|o| o.decision == "acceptForSession")
+    );
+    assert!(acp_approval_options("generic-acp", &params).is_none());
+}
+#[test]
 fn steering_requires_the_exact_identity_and_ownership_advertisement() {
     for advertisement in [
         Value::Null,

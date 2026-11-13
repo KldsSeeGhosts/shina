@@ -2,6 +2,87 @@ use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
 #[test]
+fn approval_decisions_keep_cancel_session_and_legacy_wire_meanings() {
+    for (decision, expected) in [
+        ("accept", json!("accept")),
+        ("acceptForSession", json!("acceptForSession")),
+        ("acceptAlways", json!("acceptForSession")),
+        ("decline", json!("decline")),
+        ("cancel", json!("cancel")),
+    ] {
+        let mut client = Client::new(Start::discovery(
+            "codex",
+            crate::store::directory().unwrap(),
+        ));
+        client.answer_decision(
+            Approval {
+                id: json!(19),
+                method: "item/commandExecution/requestApproval".into(),
+                params: json!({}),
+            },
+            decision,
+        );
+        assert_eq!(client.wire.last().unwrap()["result"]["decision"], expected);
+    }
+}
+
+#[test]
+fn provider_approval_messages_keep_session_scope_and_mcp_offered_options() {
+    for method in [
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+        "execCommandApproval",
+        "applyPatchApproval",
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+        client.server_request(
+            method,
+            &json!({"id":42,"params":{"permissions":{"network":{"enabled":true}}}}),
+        );
+        let key = client.events.last().unwrap()["id"].clone();
+        client
+            .command(json!({"type":"extension_ui_response","id":key,"decision":"acceptForSession"}))
+            .unwrap();
+        let response = &client.wire.last().unwrap()["result"];
+        if method == "item/permissions/requestApproval" {
+            assert_eq!(response["scope"], "session");
+            assert_eq!(response["permissions"]["network"]["enabled"], true);
+        } else {
+            assert!(matches!(
+                response["decision"].as_str(),
+                Some("acceptForSession" | "approved_for_session")
+            ));
+        }
+    }
+    let mut client = Client::new(spec(SessionSource::New, "approval-required"));
+    client.running = true;
+    client.turn = Some("turn".into());
+    client.server_request(
+        "mcpServer/elicitation/request",
+        &json!({"id":43,"params":{
+            "turnId":"turn","mode":"form","serverName":"browser","message":"Allow browser?",
+            "requestedSchema":{"properties":{}},"_meta":{"persist":["session","always"]}
+        }}),
+    );
+    let request = client.events.last().unwrap().clone();
+    assert_eq!(
+        request["approvalOptions"][2]["decision"],
+        "acceptForSession"
+    );
+    assert_eq!(request["approvalOptions"][3]["decision"], "acceptAlways");
+    client
+        .command(
+            json!({"type":"extension_ui_response","id":request["id"],"decision":"acceptAlways"}),
+        )
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["_meta"]["persist"],
+        "always"
+    );
+}
+
+#[test]
 fn prompt_free_probe_paginates_models_and_discovers_workspace_skills() {
     for flags in [
         vec![],

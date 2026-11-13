@@ -33,6 +33,45 @@ struct Profile {
     children: Vec<Child>,
 }
 
+#[test]
+fn composer_request_capability_refuses_new_decisions_on_an_older_connection() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    for minor in [11, protocol::MINOR] {
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("request-capability-{minor}")),
+        );
+        assert_eq!(
+            hello["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == protocol::COMPOSER_REQUESTS),
+            minor >= 12
+        );
+        let response = client.command(
+            "request.respond",
+            json!({"threadId":1,"requestId":"expired","generation":"expired",
+                "requestContract":true,"response":{"decision":"cancel"}}),
+            uuid::Uuid::new_v4(),
+        );
+        if minor < 12 {
+            assert_eq!(
+                response["error"]["message"],
+                protocol::REQUESTS_UPDATE_REQUIRED
+            );
+        } else {
+            assert!(
+                response.to_string().contains("Request expired."),
+                "{response}"
+            );
+        }
+    }
+}
+
 fn read_fixture_thread(workspace: &std::path::Path, args: Value) -> Value {
     let response = call_fixture_tool(workspace, "read_thread", args);
     assert_ne!(response["result"]["isError"], true, "{response}");

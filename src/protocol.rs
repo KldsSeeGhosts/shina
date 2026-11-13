@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 11;
+pub const MINOR: u32 = 12;
+pub const COMPOSER_REQUESTS: &str = "composer-requests-v1";
+pub const REQUESTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to answer composer requests.";
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
 pub const FILE_ATTACHMENTS: &str = "file-attachments-v1";

@@ -11631,6 +11631,144 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
     )
 }
 
+/// Ported from KSG Code's ComposerPendingApprovalActions.
+fn approval_actions(s: &State, id: usize, inline: bool, allowed: bool, p: Palette) -> El {
+    let Some(t) = s.threads.iter().find(|t| t.id == id) else {
+        return el();
+    };
+    let Some(request) = &t.request else {
+        return el();
+    };
+    let server = s
+        .remote_task(id)
+        .map(|r| r.server_id.as_str())
+        .unwrap_or(&s.machines.selected);
+    let disabled = !allowed
+        || !t.requests_supported
+        || t.responding_request.is_some()
+        || !crate::approval::can_respond(request)
+        || s.client.as_ref().is_some_and(|client| {
+            !client.can_approve(server)
+                || !client.supports_capability(server, crate::protocol::COMPOSER_REQUESTS)
+        });
+    let options = crate::approval::options(request);
+    let option_button = |option: &crate::approval::OptionItem| {
+        let decision = option.decision.clone();
+        let ink = if decision == "accept" {
+            p.on_coral
+        } else {
+            p.ink
+        };
+        let key = match (inline, decision.as_str()) {
+            (false, "accept") => "dialog-confirm".to_owned(),
+            (false, "acceptForSession") => "dialog-session".to_owned(),
+            (false, "cancel") => "dialog-cancel".to_owned(),
+            (false, "decline") => "dialog-decline".to_owned(),
+            (true, "accept") => format!("approve-{id}"),
+            (true, "decline") => format!("decline-{id}"),
+            _ => format!("approval-{id}-{decision}"),
+        };
+        let mut content = row().gap(4.0).center_y();
+        if option.warning.is_some() {
+            content = content.child(icon("alert", ink));
+        }
+        content = content.child(if inline {
+            label(&option.label, LABEL, ink).wrap().min_w(0.0)
+        } else {
+            label(&option.label, LABEL, ink).max_w(160.0).truncate()
+        });
+        let request_id = request["id"].clone();
+        framed(
+            row()
+                .key(&key)
+                .role("button")
+                .label(&option.label)
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .center_y()
+                .gap(4.0)
+                .px(8.0)
+                .min_h(24.0)
+                .radius(4.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .fill(if option.decision == "accept" {
+                    p.coral
+                } else {
+                    p.card
+                })
+                .child(content),
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            if !disabled
+                && s.threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.request.as_ref())
+                    .is_some_and(|r| r["id"] == request_id)
+            {
+                let _ = s.respond_to_request(id, crate::approval::response(&decision));
+            }
+        })
+        .disabled(disabled)
+        .help(option.warning.as_deref().unwrap_or(&option.label))
+    };
+    let mut actions = row().gap(6.0).center_y().flex_wrap();
+    for option in options
+        .iter()
+        .filter(|o| matches!(o.decision.as_str(), "decline" | "accept"))
+    {
+        actions = actions.child(option_button(option));
+    }
+    let more: Vec<_> = options
+        .iter()
+        .filter(|o| !matches!(o.decision.as_str(), "decline" | "accept"))
+        .collect();
+    if !more.is_empty() {
+        let mut control = col().child(
+            button(
+                &format!("approval-more-{id}"),
+                if inline { "More" } else { "..." },
+                p,
+                move |s| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.native.approval_more = !t.native.approval_more;
+                    }
+                },
+            )
+            .label("More approval options")
+            .disabled(disabled),
+        );
+        if t.native.approval_more {
+            let mut menu = popover(
+                &format!("approval-menu-{id}"),
+                "More approval options",
+                s,
+                p,
+            );
+            for option in more {
+                menu = menu.child(option_button(option));
+            }
+            control = control.child(
+                menu.anchored_fit(
+                    format!("approval-more-{id}"),
+                    rune::Side::Top,
+                    rune::Align::End,
+                    4.0,
+                )
+                .modal(true, move |s: &mut State| {
+                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                        t.native.approval_more = false;
+                    }
+                }),
+            );
+        }
+        actions = actions.child(control);
+    }
+    actions
+}
+
 fn dialog(s: &State, p: Palette) -> El {
     let t = s.current();
     let request = t.request.as_ref().expect("pending dialog");
@@ -11657,19 +11795,13 @@ fn dialog(s: &State, p: Palette) -> El {
         .border(1.0, p.line)
         .child(label(crate::model::string(request, "title"), LABEL, p.ink).wrap())
         .child(label(crate::model::string(request, "message"), BODY, p.ink).wrap());
+    if !t.requests_supported {
+        card = card.child(label(crate::protocol::REQUESTS_UPDATE_REQUIRED, SMALL, p.danger).wrap());
+    }
     let mut actions = row().gap(6.0).flex_wrap();
     match crate::model::string(request, "method") {
         "confirm" => {
-            actions = actions
-                .child(button("dialog-confirm", "Confirm", p, |s| {
-                    let _ = s.respond_to_request(s.current().id, json!({"confirmed":true}));
-                }))
-                .child(button("dialog-session", "Allow for session", p, |s| {
-                    let _ = s.respond_to_request(
-                        s.current().id,
-                        json!({"confirmed":true,"allowForSession":true}),
-                    );
-                }));
+            actions = approval_actions(s, t.id, false, can_answer, p);
         }
         "select" => {
             if let Some(options) = request["options"].as_array() {
@@ -11712,13 +11844,12 @@ fn dialog(s: &State, p: Palette) -> El {
             }));
         }
     }
-    card = card.child(
-        actions
-            .child(button("dialog-cancel", "Cancel", p, |s| {
-                let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
-            }))
-            .disabled(!can_answer),
-    );
+    if request["method"] != "confirm" {
+        actions = actions.child(button("dialog-cancel", "Cancel", p, |s| {
+            let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
+        }));
+    }
+    card = card.child(actions.disabled(!can_answer));
     if !linked && let Some(remote) = remote {
         card = card
             .child(
@@ -20387,6 +20518,53 @@ pub(crate) mod tests {
             assert!(
                 rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
                 "{width}: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_options_warnings_and_responding_guards_fit_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().apply(json!({
+                "type":"extension_ui_request","id":"options","method":"confirm",
+                "title":"Allow this command?","message":"Check the requested command.",
+                "approvalOptions":[
+                    {"decision":"decline","label":"Deny"},
+                    {"decision":"accept","label":"Allow once","warning":"This command changes files."},
+                    {"decision":"acceptForSession","label":"Allow for this thread","warning":"Future commands can run."},
+                    {"decision":"cancel","label":"Cancel"}
+                ]
+            }));
+            rt.frame(0.0);
+            for key in ["dialog-confirm", "dialog-decline"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            assert!(rt.find("dialog-session").is_none());
+            let id = rt.state.current().id;
+            press(&mut rt, &format!("approval-more-{id}"));
+            for key in ["dialog-session", "dialog-cancel"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width}: {rect:?}"
+                );
+            }
+            rt.state.current_mut().responding_request = Some(uuid::Uuid::new_v4());
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "dialog-confirm");
+            assert_eq!(
+                rt.state.current().request.as_ref().unwrap()["id"],
+                "options"
             );
         }
     }

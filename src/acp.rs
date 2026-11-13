@@ -94,7 +94,9 @@ struct Pending {
 struct Permission {
     id: Value,
     allow: Option<String>,
+    session: Option<String>,
     reject: Option<String>,
+    offered: Option<Vec<crate::approval::OptionItem>>,
 }
 
 /// KSG Code's opt-in ACP extension. Standard ACP v1 does not admit active steering.
@@ -540,12 +542,22 @@ impl Client {
         if kind == "extension_ui_response" {
             let key = record["id"].as_str().unwrap_or("");
             if let Some(permission) = self.permissions.remove(key) {
-                let option = if record["cancelled"] == true {
-                    None
-                } else if record["confirmed"] == true {
-                    permission.allow
+                let decision = crate::approval::decision(&record)?;
+                let decision = if decision == "acceptForSession"
+                    && permission
+                        .offered
+                        .as_ref()
+                        .is_some_and(|options| !options.iter().any(|o| o.decision == decision))
+                {
+                    "accept"
                 } else {
-                    permission.reject
+                    decision
+                };
+                let option = match decision {
+                    "accept" => permission.allow,
+                    "acceptForSession" => permission.session.or(permission.allow),
+                    "decline" => permission.reject,
+                    _ => None,
                 };
                 self.wire.push(permission_response(permission.id, option));
             }
@@ -848,8 +860,10 @@ impl Client {
         };
         let permission = Permission {
             id: record["id"].clone(),
-            allow: option(&["allow_once", "allow_always"]),
-            reject: option(&["reject_once", "reject_always"]),
+            allow: option(&["allow_once"]),
+            session: option(&["allow_always"]),
+            reject: option(&["reject_once"]),
+            offered: acp_approval_options(&self.start.id, params),
         };
         let tool = &params["toolCall"];
         let access = self
@@ -858,16 +872,17 @@ impl Client {
             .as_ref()
             .map(|h| h.access_mode.as_str())
             .unwrap_or("");
-        let auto = access == "full-access"
+        let auto = (access == "full-access"
             || matches!(tool["kind"].as_str(), Some("read" | "search"))
-            || access == "auto-accept-edits" && tool["kind"] == "edit";
+            || access == "auto-accept-edits" && tool["kind"] == "edit")
+            && (!self.start.id.contains("kiro") || permission.allow.is_some());
         if auto || self.cancelling {
             self.wire.push(permission_response(
                 permission.id,
                 if self.cancelling {
                     None
                 } else {
-                    permission.allow
+                    permission.allow.or(permission.session)
                 },
             ));
         } else if self.permissions.len() >= 32 {
@@ -875,10 +890,14 @@ impl Client {
         } else {
             self.serial += 1;
             let key = format!("acp-permission-{}", self.serial);
-            self.events.push(json!({"type":"extension_ui_request","id":key,"method":"confirm",
+            let mut event = json!({"type":"extension_ui_request","id":key,"method":"confirm",
                 "title":params["title"].as_str().or_else(||tool["title"].as_str()).unwrap_or("Allow ACP tool?"),
                 "message":format!("{}\n{}",params["description"].as_str().unwrap_or(""),tool["rawInput"]),
-            }));
+            });
+            if let Some(options) = &permission.offered {
+                event["approvalOptions"] = json!(options);
+            }
+            self.events.push(event);
             self.permissions.insert(key, permission);
         }
         Ok(())
@@ -1083,6 +1102,98 @@ impl Client {
                 self.events.push(json!({"type":"extension_ui_request","method":"notify","message":format!("Unsupported ACP session update: {other}")}));
             }
         }
+    }
+}
+
+/// KSG AntigravityProtocol, provider-kiro/acpSupport, provider-grok/acpSupport.
+fn acp_approval_options(
+    provider: &str,
+    params: &Value,
+) -> Option<Vec<crate::approval::OptionItem>> {
+    let options = params["options"].as_array()?;
+    let find = |kind: &str| {
+        options.iter().find(|o| {
+            o["kind"] == kind
+                && o["optionId"]
+                    .as_str()
+                    .is_some_and(|id| !id.trim().is_empty())
+        })
+    };
+    let option = |decision: &str, label: &str| crate::approval::OptionItem {
+        decision: decision.into(),
+        label: label.into(),
+        warning: None,
+    };
+    if provider.contains("antigravity") {
+        if params["toolCall"]["toolCallId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("interaction_"))
+        {
+            return Some(vec![]);
+        }
+        let mut result = vec![];
+        if find("allow_once").is_some() {
+            result.push(option("accept", "Allow once"));
+        }
+        if let Some(always) = find("allow_always") {
+            let warning = &always["_meta"]["agy.security.warning"];
+            let text = warning["message"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    warning["title"]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                });
+            let mut entry = option("acceptForSession", "Allow for this thread");
+            entry.warning = text.map(|s| {
+                if s.encode_utf16().count() > 512 {
+                    format!(
+                        "{}...",
+                        String::from_utf16_lossy(&s.encode_utf16().take(509).collect::<Vec<_>>())
+                    )
+                } else {
+                    s.to_owned()
+                }
+            });
+            result.push(entry);
+        }
+        if find("reject_once").is_some() {
+            result.push(option("decline", "Deny"));
+        }
+        result.push(option("cancel", "Cancel"));
+        Some(result)
+    } else if provider.contains("kiro") {
+        let mut result = vec![];
+        if find("allow_once").is_some() {
+            result.push(option("accept", "Allow once"));
+        } else if find("allow_always").is_some() {
+            result.push(option("acceptForSession", "Always allow"));
+        }
+        if find("reject_once").is_some() {
+            result.push(option("decline", "Deny"));
+        }
+        result.push(option("cancel", "Cancel"));
+        Some(result)
+    } else if provider.contains("grok") {
+        let mut result = vec![option("cancel", "Cancel")];
+        if find("reject_once").is_some() {
+            result.push(option("decline", "Decline"));
+        }
+        if options
+            .iter()
+            .any(|o| o["kind"] == "allow_always" && o["optionId"] == "allow-edits-session")
+        {
+            result.push(option("acceptForSession", "Allow all edits this session"));
+        }
+        if find("allow_once").is_some() {
+            result.push(option("accept", "Approve"));
+        }
+        Some(result)
+    } else {
+        None
     }
 }
 

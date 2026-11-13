@@ -4,6 +4,92 @@ use crate::model::{AccessMode, Status, Thread};
 const SESSION: &str = "40000000-0000-4000-8000-000000000031";
 
 #[test]
+fn approval_cancel_interrupts_decline_does_not_and_session_uses_session_rules() {
+    for decision in ["accept", "acceptForSession", "decline", "cancel"] {
+        let mut client = client("approval-required");
+        client.answer_decision(
+            Approval {
+                request_id: "decision".into(),
+                input: json!({"command":"echo hello"}),
+                name: "Bash".into(),
+                tool_id: json!("tool"),
+                hook: false,
+                suggestions: vec![],
+            },
+            decision,
+            None,
+        );
+        let response = &client.wire.last().unwrap()["response"]["response"];
+        assert_eq!(response["interrupt"] == true, decision == "cancel");
+        assert_eq!(
+            response["behavior"],
+            if decision.starts_with("accept") {
+                "allow"
+            } else {
+                "deny"
+            }
+        );
+        if decision == "acceptForSession" {
+            assert_eq!(response["updatedPermissions"][0]["destination"], "session");
+            assert_eq!(
+                response["updatedPermissions"][0]["rules"][0]["toolName"],
+                "Bash"
+            );
+        }
+    }
+}
+
+#[test]
+fn forwarded_requests_keep_suppressed_options_and_mcp_session_grants() {
+    let mut client = client("full-access");
+    client
+        .server_request(
+            &json!({"request_id":"ask-rule","request":{"subtype":"can_use_tool",
+        "tool_name":"Bash","tool_use_id":"tool","input":{"command":"echo test"},
+        "suppress_always_allow_rule":true,"matched_ask_rule":{"source":"settings"},
+        "decision_reason":"\u{1b}[31mCheck this command.\u{1b}[0m"}}),
+        )
+        .unwrap();
+    let request = client.events.last().unwrap();
+    assert_eq!(
+        request["approvalOptions"],
+        json!([
+        {"decision":"decline","label":"Decline"},{"decision":"accept","label":"Approve"}])
+    );
+    assert_eq!(request["fullAccessOverride"], "ask_rule");
+    assert!(!request["message"].as_str().unwrap().contains('\u{1b}'));
+    client
+        .command(json!({"type":"extension_ui_response","id":"ask-rule","decision":"cancel"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["response"]["response"]["interrupt"],
+        true
+    );
+
+    client.running = true;
+    let request = json!({"request_id":"mcp","request":{"subtype":"elicitation",
+        "mcp_server_name":"browser","message":"Allow browser?","mode":"form",
+        "requested_schema":{"properties":{}}}});
+    client.server_request(&request).unwrap();
+    assert_eq!(
+        client.events.last().unwrap()["approvalOptions"],
+        json!(crate::approval::defaults())
+    );
+    client
+        .command(json!({"type":"extension_ui_response","id":"mcp","decision":"acceptForSession"}))
+        .unwrap();
+    let count = client.events.len();
+    let mut repeat = request;
+    repeat["request_id"] = json!("repeat");
+    client.server_request(&repeat).unwrap();
+    assert_eq!(client.events.len(), count);
+    assert_eq!(
+        client.wire.last().unwrap()["response"]["response"]["action"],
+        "accept"
+    );
+}
+
+#[test]
 fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
     let dir = crate::store::directory().unwrap();
     let script = dir.join("claude-probe.py");
@@ -261,8 +347,8 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
                 "tool_name":name,"tool_use_id":"call","input":{"path":"x"}}}),
                 )
                 .unwrap();
-            let ask = access == "approval-required" && name != "Read"
-                || access == "auto-accept-edits" && !matches!(name, "Read" | "Edit");
+            // A CLI-forwarded ask requires consent even under bypass or an ask rule for Read.
+            let ask = access != "read-only" || name == "Read";
             assert_eq!(!client.approvals.is_empty(), ask, "{access} {name}");
             if ask {
                 client

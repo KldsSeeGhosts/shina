@@ -768,6 +768,19 @@ fn session_approvals_are_scoped_to_the_process_and_other_dialogs_still_need_the_
 }
 
 #[test]
+fn failed_session_approval_does_not_remember_a_grant() {
+    let (mut t, commands) = thread(Status::Running);
+    t.apply(
+        json!({"type":"extension_ui_request","id":"failed-grant","method":"confirm",
+        "title":"Allow write?","message":"file"}),
+    );
+    drop(commands);
+    t.approve_for_session();
+    assert!(t.native.session_approvals.is_empty());
+    assert!(t.request.is_some());
+}
+
+#[test]
 fn tool_results_keep_structured_data_exit_codes_and_nested_call_metadata() {
     let (mut t, _) = thread(Status::Running);
     t.apply(json!({"type":"tool_execution_start","toolCallId":"parent/1","parentToolCallId":"parent","toolName":"powershell","args":{"command":"exit 7"}}));

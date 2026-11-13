@@ -126,6 +126,8 @@ struct ThreadView {
     error: Option<String>,
     diagnostics: Vec<String>,
     request: Option<Value>,
+    #[serde(default)]
+    requests_supported: bool,
     questionnaire: Value,
     elapsed: Option<u64>,
     #[serde(default)]
@@ -235,6 +237,7 @@ impl ThreadView {
                 request["runtimeGeneration"] = json!(thread.request_generation);
                 request
             }),
+            requests_supported: true,
             questionnaire: thread.projected_form(),
             elapsed: thread.elapsed,
             started_at: thread.started.map(stable_timestamp),
@@ -409,7 +412,9 @@ impl ThreadView {
                 .as_ref()
                 .map(|r| (&r["id"], &r["runtimeGeneration"]));
         thread.request = self.request;
+        thread.requests_supported = self.requests_supported;
         if changed_request {
+            thread.native.approval_more = false;
             thread.reply.replace_text(
                 thread
                     .request
@@ -1151,6 +1156,27 @@ impl State {
                     thread.resume_command = None;
                     if value["result"]["status"] != "accepted" {
                         thread.error = Some("Could not resume thread.".into());
+                    }
+                }
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
+                && command.method == "request.respond"
+            {
+                // Linked task cards live on their parent's machine, not the answering host.
+                for thread in self
+                    .threads
+                    .iter_mut()
+                    .chain(self.machines.threads.values_mut().flatten())
+                    .filter(|thread| thread.responding_request == Some(command.command_id))
+                {
+                    thread.responding_request = None;
+                    if value["result"]["status"] != "accepted" {
+                        thread.error = Some(
+                            value["error"]["message"]
+                                .as_str()
+                                .unwrap_or("Could not answer request.")
+                                .into(),
+                        );
                     }
                 }
             }
@@ -3077,8 +3103,11 @@ impl State {
                     .filter(|_| input.response["cancelled"] != true)
                 {
                     self.current_mut().respond_projected_form(answers)?;
-                } else if input.session {
-                    self.current_mut().approve_for_session();
+                } else if input.session && input.response.get("decision").is_none() {
+                    self.respond_to_request(
+                        input.thread_id,
+                        crate::approval::response("acceptForSession"),
+                    )?;
                 } else {
                     self.respond_to_request(input.thread_id, input.response)?;
                 }

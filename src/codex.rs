@@ -166,6 +166,7 @@ struct Client {
     serial: usize,
     pending: HashMap<String, Pending>,
     approvals: HashMap<String, Approval>,
+    session_allowances: HashSet<String>,
     queued: VecDeque<Value>,
     models: Vec<Value>,
     raw_models: Vec<Value>,
@@ -216,6 +217,7 @@ impl Client {
             serial: 0,
             pending: HashMap::new(),
             approvals: HashMap::new(),
+            session_allowances: HashSet::new(),
             queued: VecDeque::new(),
             models: vec![],
             raw_models: vec![],
@@ -890,10 +892,13 @@ impl Client {
                         .push(json!({"id":approval.id,"result":{"answers":answers}}));
                     return Ok(());
                 }
-                let allow = record["confirmed"] == true
-                    && record["cancelled"] != true
-                    && self.access() != "read-only";
-                self.answer_approval(approval, allow);
+                let decision = crate::approval::decision(&record)?;
+                let decision = if self.access() == "read-only" {
+                    "decline"
+                } else {
+                    decision
+                };
+                self.answer_decision(approval, decision);
             }
             return Ok(());
         }
@@ -1250,6 +1255,33 @@ impl Client {
     }
 
     fn server_request(&mut self, method: &str, record: &Value) {
+        if method == "mcpServer/elicitation/request" {
+            let params = &record["params"];
+            if crate::approval::mcp_response(params, "accept")["action"] != "accept"
+                || !self.running
+                || params["turnId"].as_str() != self.turn.as_deref()
+            {
+                self.wire
+                    .push(json!({"id":record["id"],"result":{"action":"decline"}}));
+                return;
+            }
+            self.serial += 1;
+            let key = format!("codex-elicitation-{}", self.serial);
+            self.events.push(
+                json!({"type":"extension_ui_request","id":key,"method":"confirm",
+                "title":crate::approval::mcp_app_name(params),"message":params["message"],
+                "approvalOptions":crate::approval::mcp_options(params)}),
+            );
+            self.approvals.insert(
+                key,
+                Approval {
+                    id: record["id"].clone(),
+                    method: method.into(),
+                    params: params.clone(),
+                },
+            );
+            return;
+        }
         if method == "item/tool/requestUserInput" {
             let questions = record["params"]["questions"]
                 .as_array()
@@ -1299,6 +1331,8 @@ impl Client {
             "item/commandExecution/requestApproval"
                 | "item/fileChange/requestApproval"
                 | "item/permissions/requestApproval"
+                | "execCommandApproval"
+                | "applyPatchApproval"
         ) {
             let approval = Approval {
                 id: record["id"].clone(),
@@ -1307,6 +1341,11 @@ impl Client {
             };
             if self.access() == "read-only" || self.cancelling || self.approvals.len() >= 32 {
                 self.answer_approval(approval, false);
+            } else if self
+                .session_allowances
+                .contains(Self::approval_kind(method))
+            {
+                self.answer_decision(approval, "acceptForSession");
             } else if self.access() == "full-access"
                 || self.access() == "auto-accept-edits"
                     && method == "item/fileChange/requestApproval"
@@ -1333,12 +1372,43 @@ impl Client {
     }
 
     fn answer_approval(&mut self, approval: Approval, allow: bool) {
-        let result = if approval.method == "item/tool/requestUserInput" {
+        self.answer_decision(approval, if allow { "accept" } else { "decline" });
+    }
+
+    fn approval_kind(method: &str) -> &'static str {
+        match method {
+            "item/fileChange/requestApproval" | "applyPatchApproval" => "file-change",
+            "item/permissions/requestApproval" => "permission",
+            _ => "command",
+        }
+    }
+
+    fn answer_decision(&mut self, approval: Approval, decision: &str) {
+        if matches!(decision, "acceptForSession" | "acceptAlways")
+            && Self::approval_kind(&approval.method) != "permission"
+        {
+            self.session_allowances
+                .insert(Self::approval_kind(&approval.method).into());
+        }
+        let result = if approval.method == "mcpServer/elicitation/request" {
+            crate::approval::mcp_response(&approval.params, decision)
+        } else if approval.method == "item/tool/requestUserInput" {
             json!({"answers":{}})
         } else if approval.method == "item/permissions/requestApproval" {
-            json!({"permissions":if allow {approval.params["permissions"].clone()} else {json!({})},"scope":"turn"})
+            json!({"permissions":if matches!(decision,"accept" | "acceptForSession") {approval.params["permissions"].clone()} else {json!({})},
+                "scope":if decision == "acceptForSession" {"session"} else {"turn"}})
+        } else if matches!(
+            approval.method.as_str(),
+            "execCommandApproval" | "applyPatchApproval"
+        ) {
+            json!({"decision":match decision {
+                "accept" => json!("approved"),
+                "acceptForSession" | "acceptAlways" => json!("approved_for_session"),
+                "cancel" => json!("abort"),
+                _ => json!({"denied":{"rejection":"User declined the request."}}),
+            }})
         } else {
-            json!({"decision":if allow {"accept"} else {"decline"}})
+            json!({"decision":if decision == "acceptAlways" {"acceptForSession"} else {decision}})
         };
         self.wire.push(json!({"id":approval.id,"result":result}));
     }

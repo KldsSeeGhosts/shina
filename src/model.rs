@@ -538,6 +538,8 @@ pub struct Thread {
     pub error: Option<String>,
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
+    pub(crate) requests_supported: bool,
+    pub(crate) responding_request: Option<uuid::Uuid>,
     pub reply: TextEdit,
     pub session: Option<String>,
     /// A thread made here as a new thread. Until a prompt is sent, a session on it is only a
@@ -855,6 +857,8 @@ impl Thread {
             error: None,
             diagnostics: vec![],
             request: None,
+            requests_supported: true,
+            responding_request: None,
             reply: TextEdit::default(),
             session: None,
             never_sent: true,
@@ -1376,10 +1380,49 @@ impl Thread {
     }
 
     pub fn respond(&mut self, mut response: Value) {
+        if self.responding_request.is_some() {
+            return;
+        }
+        if let Some(request) = &self.request {
+            if !crate::approval::can_respond(request) {
+                self.error = Some("This request is not resumable.".into());
+                return;
+            }
+            if request["method"] == "confirm" {
+                if let Err(error) = crate::approval::validate(request, &response) {
+                    self.error = Some(error);
+                    return;
+                }
+                let decision = crate::approval::decision(&response)
+                    .expect("validated")
+                    .to_owned();
+                let feedback = response.get("feedback").cloned();
+                response = crate::approval::response(&decision);
+                if let Some(feedback) = feedback {
+                    response["feedback"] = feedback;
+                }
+                if self.remote.is_none() && self.harness == "pi" && decision == "acceptAlways" {
+                    response = json!({"cancelled":true});
+                }
+            }
+        }
         if self.remote.is_some() {
+            if !self.requests_supported {
+                self.error = Some(crate::protocol::REQUESTS_UPDATE_REQUIRED.into());
+                return;
+            }
             let request = self.request.clone().unwrap_or(Value::Null);
-            self.forward("request.respond", json!({"requestId":request["id"],"generation":request["runtimeGeneration"],
-                "session":response["allowForSession"] == true,"answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response}));
+            let params = json!({"threadId":self.id,"requestId":request["id"],"generation":request["runtimeGeneration"],
+                "requestContract":true,"answers":self.native.questionnaire.as_ref().map(|form| json!(form.answers)),"response":response});
+            match self
+                .remote
+                .as_ref()
+                .expect("remote")
+                .send("request.respond", params)
+            {
+                Ok(id) => self.responding_request = Some(id),
+                Err(error) => self.error = Some(error),
+            }
             return;
         }
         if response["cancelled"] == true {
@@ -1390,6 +1433,16 @@ impl Thread {
         };
         response["type"] = "extension_ui_response".into();
         response["id"] = request["id"].clone();
+        let remember_grant = request["method"] == "confirm"
+            && self.harness == "pi"
+            && crate::approval::decision(&response).is_ok_and(|d| d == "acceptForSession");
+        if self.harness == "pi"
+            && let Some(fields) = response.as_object_mut()
+        {
+            // Pi's extension transport consumes only its boolean reply, not our contract.
+            fields.remove("decision");
+            fields.remove("allowForSession");
+        }
         let result = self
             .pi
             .as_ref()
@@ -1397,6 +1450,9 @@ impl Thread {
             .and_then(|pi| crate::harness::send(pi, response));
         match result {
             Ok(()) => {
+                if remember_grant {
+                    self.remember_session_approval();
+                }
                 self.request = None;
                 self.forwarded_question = None;
                 self.native_dialog_done();
