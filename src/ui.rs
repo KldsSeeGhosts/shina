@@ -12362,6 +12362,30 @@ fn composer_reply_banner(t: &Thread, p: Palette) -> Option<El> {
     )
 }
 
+/// The composer input's decorations: `preview_decorations`' Markdown-source spans,
+/// then the draft's per-block syntax colours (KSG's `composerCodeBlockHighlight`),
+/// which win colour on an overlap and leave the preview's other attributes alone.
+fn composer_decorations(
+    s: &State,
+    p: Palette,
+) -> (Vec<rune::text::Span>, Vec<(usize, usize, Option<Color>)>) {
+    let t = s.current();
+    let (mut spans, strikes) = crate::composer_source::preview_decorations(
+        &t.draft,
+        COMPOSER.family(rune::Family::Named("Inter Variable")),
+        p.faint,
+        p.ink,
+        p.code_bg,
+    );
+    spans.extend(t.code_highlight.borrow_mut().spans(
+        &t.draft,
+        s.dark,
+        &markdown_ui::syntax_theme(s.dark, p),
+        std::time::Instant::now(),
+    ));
+    (spans, strikes)
+}
+
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
     s: &State,
@@ -12874,13 +12898,7 @@ fn composer(
             s.send();
         }
     });
-    let (source_spans, source_strikes) = crate::composer_source::preview_decorations(
-        &t.draft,
-        composer_style,
-        p.faint,
-        p.ink,
-        p.code_bg,
-    );
+    let (source_spans, source_strikes) = composer_decorations(s, p);
     let field = field
         .on_input_selection_change(|s: &mut State, _| {
             let t = s.current_mut();
@@ -18342,6 +18360,52 @@ pub(crate) mod tests {
                 "{width}"
             );
         }
+    }
+
+    /// KSG's composerCodeBlockHighlight: a fenced block's content takes the
+    /// transcript's syntax colours inside the composer input, the colours never
+    /// reach outside the block, and decorations never enter the serialized
+    /// Markdown.
+    #[test]
+    fn composer_code_block_contents_take_syntax_colours() {
+        let source = "before\n\n```rust\nfn main() {\n    let a = 1;\n}\n```\n\nafter";
+        let mut rt = runtime(1280.0);
+        {
+            let t = rt.state.current_mut();
+            t.draft = crate::composer_rich::draft("");
+            crate::composer_rich::paste_with_path_query(&mut t.draft, source, false, &|_| None);
+            t.draft.focused = true;
+        }
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("composer-input").is_some());
+        let p = palette(rt.state.dark);
+        let draft = &rt.state.current().draft;
+        let block = draft
+            .logical_blocks()
+            .find(|b| b.kind == rune::BlockKind::Code)
+            .expect("a fenced code block");
+        let (decorations, _) = composer_decorations(&rt.state, p);
+        let keyword =
+            markdown_ui::syntax_theme(rt.state.dark, p).color(rune_kit::syntax::Syntax::Keyword);
+        let mut keyword_spans = 0;
+        for sp in &decorations {
+            let (start, end) = (sp.start as usize, sp.end as usize);
+            assert!(
+                !(start < block.range.start && end > block.range.start)
+                    && !(start < block.range.end && end > block.range.end),
+                "span {start}..{end} crosses the block content {:?}",
+                block.range
+            );
+            if sp.color == Some(keyword) {
+                keyword_spans += 1;
+            }
+        }
+        assert!(
+            keyword_spans > 0,
+            "no keyword-coloured span in the Rust block"
+        );
+        assert_eq!(crate::composer_rich::markdown(draft), source);
     }
 
     #[test]

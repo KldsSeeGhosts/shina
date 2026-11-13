@@ -715,6 +715,9 @@ pub struct Thread {
     pub paste_history: crate::composer_paste::PasteHistory,
     pub composer_rules: crate::composer_rich::Rules,
     pub composer_source: crate::composer_source::MarkdownSourceState,
+    /// Per-block syntax-colour state for the draft's code fences (KSG's
+    /// `composerCodeBlockHighlight` plugin state), owned per thread.
+    pub code_highlight: std::cell::RefCell<crate::composer_code_highlight::ComposerCodeHighlight>,
     pub draft_images: Vec<Attachment>,
     pub draft_context: Vec<crate::composer_context::ComposerContextRecord>,
     pub draft_reply_to: Option<crate::composer_context::ComposerContextRecord>,
@@ -1223,6 +1226,7 @@ impl Thread {
             paste_history: crate::composer_paste::PasteHistory::default(),
             composer_rules: crate::composer_rich::Rules::default(),
             composer_source: crate::composer_source::MarkdownSourceState::default(),
+            code_highlight: Default::default(),
             draft_images: Vec::new(),
             draft_context: Vec::new(),
             draft_reply_to: None,
