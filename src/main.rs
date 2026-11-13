@@ -100,6 +100,9 @@ fn init() -> State {
 }
 
 pub(crate) fn key(state: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if ui::transcript_context::copy_selection(state, event, tx) {
+        return true;
+    }
     key_inner(
         state,
         event,

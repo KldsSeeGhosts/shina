@@ -2946,6 +2946,8 @@ pub struct State {
     pub html_lane_width: u32,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
+    pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
+    pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
     pub composer_ui: crate::ui::composer_ui::Behavior,
     pub captain_picker: bool,
     pub captain_picker_query: TextEdit,
@@ -3153,6 +3155,8 @@ impl State {
             artwork,
             attachment_cache,
             attachment_drop_hover: false,
+            transcript_preview: None,
+            transcript_layout: Default::default(),
             composer_ui: Default::default(),
             captain_picker: false,
             captain_picker_query: TextEdit::default(),

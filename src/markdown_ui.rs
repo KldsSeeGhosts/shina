@@ -10,7 +10,7 @@ const OPTIONS: Options = Options::ENABLE_STRIKETHROUGH
 
 /// Convert only Markdown soft breaks. The parser leaves fenced/indented code,
 /// tables and existing hard breaks untouched. Stored messages never change.
-fn user_source(source: &str) -> Cow<'_, str> {
+pub(super) fn user_source(source: &str) -> Cow<'_, str> {
     let breaks: Vec<_> = Parser::new_ext(source, OPTIONS)
         .into_offset_iter()
         .filter_map(|(event, range)| matches!(event, Event::SoftBreak).then_some(range.start))

@@ -28,6 +28,8 @@ mod pixel_icons;
 pub(crate) mod settings_ui;
 #[path = "sidebar_ui.rs"]
 mod sidebar_ui;
+#[path = "transcript_context.rs"]
+pub(crate) mod transcript_context;
 #[path = "work_ui.rs"]
 mod work_ui;
 pub(crate) use pi_ui::questionnaire_key;
@@ -991,7 +993,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let top = chrome.height.max(40.0 * zoom) / zoom;
         root = root.child(captain_ui::brief_sheet(s, p, top));
     }
-    if s.rename_thread.is_some() || s.delete_thread.is_some() {
+    if s.transcript_preview.is_some() {
+        root = root.child(transcript_context::preview(s, p));
+    } else if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
     } else if s.confirm_remove_attachment.is_some() {
         root = root.child(remove_attachment_dialog(s, p));
@@ -8912,8 +8916,9 @@ fn build_user_or_system_row(
             .max_w(max_width)
             .shrink()
             .min_w(0.0);
-        if !message.images.is_empty() {
-            user = user.child(message_images(s, p, &message.images, &key));
+        let unchipped = transcript_context::unchipped_attachments(message);
+        if !unchipped.is_empty() {
+            user = user.child(message_images(s, p, &unchipped, &key));
         }
         if !message.text.trim().is_empty() {
             let find_query = (s.thread_find_active()
@@ -8927,7 +8932,9 @@ fn build_user_or_system_row(
                     .map(|m| m.occurrence)
             });
             let memo_find = find_query.map(|q| (q.to_owned(), active_occ));
-            user = user.child(
+            let content = if transcript_context::has_context(message) {
+                transcript_context::render(s, p, wide, message, max_width - 28.0)
+            } else {
                 memo(
                     format!("msg-md-{}-{message_id}", t.id),
                     (&message.text, s.dark, wide, memo_find),
@@ -8944,15 +8951,18 @@ fn build_user_or_system_row(
                         )
                     },
                 )
-                .key(format!("{key}-text"))
-                .max_w(max_width)
-                .min_w(0.0)
-                .padding(12.0)
-                .radius(6.0)
-                .fill(p.message_bg)
-                // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
-                // `line` colour disappeared on the `message_bg` fill). No shadow.
-                .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
+            };
+            user = user.child(
+                content
+                    .key(format!("{key}-text"))
+                    .max_w(max_width)
+                    .min_w(0.0)
+                    .padding(12.0)
+                    .radius(6.0)
+                    .fill(p.message_bg)
+                    // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
+                    // `line` colour disappeared on the `message_bg` fill). No shadow.
+                    .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
             );
         }
         row().justify_end().child(user)
@@ -13087,6 +13097,218 @@ pub(crate) mod tests {
                 .unwrap()
                 .path;
             assert_eq!(before, after, "{width}: captain button identity changed");
+        }
+    }
+
+    #[test]
+    fn transcript_context_chips_copy_fragments_preview_files_and_open_threads_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.on_key = Some(crate::key);
+            let clipboard = rune::clipboard::memory();
+            rt.use_clipboard(&clipboard);
+            let path = crate::store::directory()
+                .unwrap()
+                .join("transcript-spec.txt");
+            std::fs::write(&path, "File preview body").unwrap();
+            let file = crate::attachments::attach_file(&path).unwrap();
+            let file_record = crate::composer_context::attachment_context_record(&file);
+            let thread_record =
+                crate::composer_context::thread_context_record("local", 2, "Reference thread");
+            let code_record = crate::composer_context::ComposerContextRecord {
+                version: 1,
+                context_id: "code".into(),
+                label: "not a chip".into(),
+                data: crate::composer_context::ComposerContextData::Terminal {
+                    terminal_id: "code".into(),
+                    terminal_label: "Terminal".into(),
+                    line_start: 1,
+                    line_end: 1,
+                    text: "Must not be copied as context".into(),
+                },
+            };
+            let file_href = crate::composer_context::format_composer_context_href(
+                "file",
+                &file_record.context_id,
+            );
+            let thread_href = crate::composer_context::format_composer_context_href(
+                "thread",
+                &thread_record.context_id,
+            );
+            let source = format!(
+                "Read [spec]({file_href}) and [thread]({thread_href}) plus [missing](t3-context://v1/terminal/gone).\n\n`[not a chip](t3-context://v1/terminal/code)`"
+            );
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "context-row".into(),
+                role: "You",
+                text: source.clone(),
+                images: vec![file],
+                context: Some(crate::composer_context::MessageContext {
+                    version: 1,
+                    records: vec![file_record.clone(), thread_record.clone(), code_record],
+                }),
+            });
+            rt.state.threads.push(Thread::new(2));
+            rt.frame(0.0);
+            let key = "context-text-1-context-row-0";
+            let bubble = rt.presented("message-1-0-text").unwrap().0;
+            let text = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .unwrap();
+            assert!(!text.text.as_deref().unwrap().contains("t3-context:"));
+            assert!(
+                text.text
+                    .as_deref()
+                    .unwrap()
+                    .contains("transcript-spec.txt")
+            );
+            assert!(
+                text.rect[0] >= bubble[0]
+                    && text.rect[0] + text.rect[2] <= bubble[0] + bubble[2] + 0.5
+            );
+            assert!(
+                rt.presented("message-1-0-image-0").is_none(),
+                "no duplicate inline file card"
+            );
+            rt.update(|_, tx| {
+                tx.blur();
+                tx.select_all_text(key);
+            });
+            rt.frame(0.0);
+            assert!(
+                rt.selection().is_some(),
+                "{:?}",
+                rt.elements()
+                    .iter()
+                    .filter(|e| e.key.as_deref() == Some(key))
+                    .collect::<Vec<_>>()
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('c'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.0);
+            let content = clipboard.content().unwrap();
+            let fragment =
+                crate::composer_context::decode_composer_context_clipboard_html(content.html())
+                    .unwrap();
+            assert_eq!(fragment.source.message_id.as_deref(), Some("context-row"));
+            assert_eq!(fragment.records, vec![file_record.clone(), thread_record]);
+            assert!(content.text().contains(&file_href));
+            assert!(content.text().contains(&thread_href));
+            assert!(!fragment.records.iter().any(|r| r.context_id == "code"));
+            assert!(
+                rt.find("t3-context://v1/terminal/gone").is_none(),
+                "unresolved context has no action"
+            );
+            // Selecting literal reference syntax does not grant authority to export its record.
+            rt.update(|_, tx| {
+                tx.blur();
+                tx.select_all_text("context-text-1-context-row-1");
+            });
+            rt.frame(0.0);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Command('c'),
+                mods: rune::Mods {
+                    cmd: true,
+                    ..Default::default()
+                },
+            });
+            rt.frame(0.0);
+            assert!(
+                crate::composer_context::decode_composer_context_clipboard_html(
+                    clipboard.content().unwrap().html()
+                )
+                .is_none()
+            );
+            press(&mut rt, &file_href);
+            rt.frame(0.0);
+            assert!(rt.presented("transcript-context-preview").is_some());
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|e| e.text.as_deref() == Some("File preview body"))
+            );
+            press(&mut rt, "close-transcript-context-preview");
+            press(&mut rt, &thread_href);
+            assert_eq!(rt.state.current().id, 2);
+        }
+    }
+
+    #[test]
+    fn transcript_thread_chip_opens_linked_machine_and_future_context_stays_unresolved() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let (client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+            rt.state.client = Some(client);
+            let mut remote = State::new(std::path::PathBuf::new(), false);
+            remote.current_mut().id = 7;
+            rt.state
+                .machines
+                .views
+                .insert("server-b".into(), remote.projection());
+            rt.state
+                .machines
+                .threads
+                .insert("server-b".into(), vec![Thread::new(7)]);
+            let record =
+                crate::composer_context::thread_context_record("server-b", 7, "Remote thread");
+            let href =
+                crate::composer_context::format_composer_context_href("thread", &record.context_id);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "linked-context-row".into(),
+                role: "You",
+                text: format!("[Remote]({href}) [Future](t3-context://v1/future/future_1)"),
+                images: vec![],
+                context: Some(crate::composer_context::MessageContext {
+                    version: 1,
+                    records: vec![record],
+                }),
+            });
+            rt.frame(0.0);
+            press(&mut rt, &href);
+            assert_eq!(rt.state.machines.selected, "server-b");
+            assert_eq!(rt.state.current().id, 7);
+        }
+    }
+
+    #[test]
+    fn transcript_long_context_labels_stay_inside_the_bubble_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let title = "界".repeat(180);
+            let record = crate::composer_context::thread_context_record("local", 77, &title);
+            let href =
+                crate::composer_context::format_composer_context_href("thread", &record.context_id);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "long-context".into(),
+                role: "You",
+                text: format!("Before [{title}]({href}) after."),
+                images: vec![],
+                context: Some(crate::composer_context::MessageContext {
+                    version: 1,
+                    records: vec![record],
+                }),
+            });
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let bubble = rt.presented("message-1-0-text").unwrap().0;
+            let chip = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(&href))
+                .unwrap();
+            assert!(
+                chip.rect[0] >= bubble[0]
+                    && chip.rect[0] + chip.rect[2] <= bubble[0] + bubble[2] + 0.5,
+                "{width}: {:?} in {bubble:?}",
+                chip.rect
+            );
         }
     }
 
