@@ -1010,12 +1010,15 @@ impl Thread {
         });
     }
 
+    /// Insert a context pill into the draft. The returned `InsertedSpaces` say
+    /// which spaces the insert added, so a cancelled citation edit can undo it
+    /// (KSG's `insertedSpaces`); `None` means nothing was inserted.
     pub(crate) fn insert_context_chip(
         &mut self,
         record: crate::composer_context::ComposerContextRecord,
-    ) {
+    ) -> Option<crate::ui::citation_comment::InsertedSpaces> {
         if self.request.is_some() {
-            return;
+            return None;
         }
         let (start, end) = if self.draft.focused {
             self.draft.range()
@@ -1034,7 +1037,16 @@ impl Thread {
             record.kind(),
             &record.context_id,
         );
-        let chip_label = record.label.clone();
+        // A citation chip carries a gutter at its right end for the comment
+        // action overlay (KSG's ContextChipAction inside the chip).
+        let chip_label = if matches!(
+            record.data,
+            crate::composer_context::ComposerContextData::Response { .. }
+        ) {
+            crate::ui::citation_comment::chip_text(&record.label)
+        } else {
+            record.label.clone()
+        };
         if let Some(existing) = self
             .draft_context
             .iter_mut()
@@ -1053,6 +1065,10 @@ impl Thread {
             e.replace_with_pill(pill_start..pill_end, pill_id, &chip_label);
             e.insert(" ");
         });
+        Some(crate::ui::citation_comment::InsertedSpaces {
+            before: needs_leading_space,
+            after: replace_end == end,
+        })
     }
 
     pub fn add_attachment(&mut self, image: Attachment) -> Result<(), String> {
@@ -4177,6 +4193,8 @@ pub struct State {
     pub(crate) transcript_layout: std::collections::HashMap<String, (bool, f32)>,
     pub(crate) assistant_selection: Option<AssistantSelection>,
     pub(crate) citation_highlight: Option<CitationHighlight>,
+    /// The open citation comment popover, if any (`citation_comment::Editing`).
+    pub(crate) citation_comment: Option<crate::ui::citation_comment::Editing>,
     pub composer_ui: crate::ui::composer_ui::Behavior,
     pub captain_picker: bool,
     pub captain_picker_query: TextEdit,
@@ -4392,6 +4410,7 @@ impl State {
             opened_draft: None,
             assistant_selection: None,
             citation_highlight: None,
+            citation_comment: None,
             snooze_menu: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
@@ -4595,6 +4614,7 @@ impl State {
         self.base_branch_picker = false;
         self.assistant_selection = None;
         self.citation_highlight = None;
+        self.citation_comment = None;
         if visit && !self.demo {
             self.forward("thread.visit", json!({"threadId":self.current().id}));
         }
@@ -5018,7 +5038,13 @@ impl State {
         };
         let record =
             crate::assistant_citation::citation_context_record(citation, &message.id, None);
-        self.current_mut().insert_context_chip(record);
+        let context_id = record.context_id.clone();
+        // KSG opens the comment editor as soon as the chip lands; cancelling it
+        // undoes the insert (`removeOnCancel` carries the spaces it added).
+        let spaces = self.current_mut().insert_context_chip(record);
+        if let Some(spaces) = spaces {
+            crate::ui::citation_comment::open_after_insert(self, &context_id, spaces);
+        }
         self.restore_composer_focus(crate::ui::composer_ui::FocusReason::Inserted);
         self.assistant_selection = None;
         tx.clear_text_selection();

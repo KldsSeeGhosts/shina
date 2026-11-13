@@ -25,6 +25,8 @@ pub(crate) struct Behavior {
     expanded_width: Cell<f32>,
     wrapped_prompt: Cell<bool>,
     pending_focus: Cell<Option<FocusReason>>,
+    /// A citation chip's body press waits here for a `Tx`-bearing tick to scroll.
+    pub pending_citation: Option<crate::composer_context::AssistantCitation>,
     pub scope_focused: Cell<bool>,
     /// KSG's forceExpandedOnMobile override for a host that requires the full editor.
     pub force_expanded: bool,
@@ -55,6 +57,7 @@ impl Default for Behavior {
             expanded_width: Cell::new(700.0),
             wrapped_prompt: Cell::new(false),
             pending_focus: Cell::new(None),
+            pending_citation: None,
             scope_focused: Cell::new(false),
             force_expanded: false,
             permission_preview: Cell::new(None),
@@ -298,12 +301,18 @@ pub(crate) fn tick(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tx.wake_after(wait);
         }
     }
+    let jumped = if let Some(citation) = s.composer_ui.pending_citation.take() {
+        s.navigate_to_citation(&citation, tx)
+    } else {
+        false
+    };
+    let comment_changed = super::citation_comment::settle(s);
     let transition = s.composer_ui.transition.get();
     let active = transition.duration > 0.0 && now < transition.start + transition.duration + 0.050;
     if active {
         tx.wake_after(std::time::Duration::from_millis(16));
     }
-    active || restore.is_some() || highlight_due
+    active || restore.is_some() || highlight_due || jumped || comment_changed
 }
 
 /// Keep the expanded form mounted while Tab moves among its controls. Rune routes a field's

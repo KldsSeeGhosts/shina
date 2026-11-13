@@ -16,12 +16,27 @@ pub(crate) enum PillAction {
     /// Open this path in the attachment preview dialog. It never joins the
     /// draft's attachments.
     Preview(PathBuf),
+    /// KSG's `composerSourceLink`: pressing a citation chip's body scrolls the
+    /// timeline to the cited passage.
+    JumpToCitation(crate::composer_context::AssistantCitation),
     /// Directories have no preview in KSG's viewer, and thread, model and
     /// machine pills are inert there too.
     Nothing,
 }
 
 pub(crate) fn action(s: &State, id: &str) -> PillAction {
+    if let Some((kind, context_id)) = crate::composer_context::parse_composer_context_href(id)
+        && kind == "response"
+        && let Some(record) = s
+            .current()
+            .draft_context
+            .iter()
+            .find(|r| r.context_id == context_id)
+        && let crate::composer_context::ComposerContextData::Response { citation, .. } =
+            &record.data
+    {
+        return PillAction::JumpToCitation(citation.clone());
+    }
     match Token::decode(id) {
         Some(Token::File {
             path,
@@ -64,6 +79,12 @@ impl State {
     /// decodes to the token, so resolution always uses the current draft and
     /// skill inventory rather than stale pointer-down state.
     pub(crate) fn press_composer_pill(&mut self, id: &str) {
+        if let PillAction::JumpToCitation(citation) = action(self, id) {
+            // `on_input_pill_press` passes no `Tx`, so the jump waits a frame
+            // for `composer_ui::tick`, which has one.
+            self.composer_ui.pending_citation = Some(citation);
+            return;
+        }
         let PillAction::Preview(path) = action(self, id) else {
             return;
         };

@@ -10,6 +10,8 @@ use crate::model::Message;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 pub const ASSISTANT_CITATION_MAX_TEXT_LENGTH: usize = 8_000;
+/// KSG's `ASSISTANT_CITATION_MAX_COMMENT_LENGTH`, counted in UTF-16 code units.
+pub const ASSISTANT_CITATION_MAX_COMMENT_LENGTH: usize = 8_000;
 pub const ASSISTANT_CITATION_CONTEXT_LENGTH: usize = 32;
 pub const ASSISTANT_CITATION_MAX_ID_LENGTH: usize = 4_096;
 pub const ASSISTANT_CITATION_LABEL_MAX_CHARS: usize = 64;
@@ -280,6 +282,19 @@ pub fn locate_selection_in_message(
         }
     }
     (selected_text.to_owned(), 0, selected_text.len())
+}
+
+/// Ported from KSG Code's `withAssistantCitationComment`
+/// (`packages/shared/src/assistantCitations.ts`): the comment is trimmed and a
+/// blank one removes the field.
+pub fn with_assistant_citation_comment(
+    citation: &AssistantCitation,
+    comment: &str,
+) -> AssistantCitation {
+    let mut next = citation.clone();
+    let trimmed = comment.trim();
+    next.comment = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    next
 }
 
 pub fn build_assistant_citation(

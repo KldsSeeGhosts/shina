@@ -256,7 +256,36 @@ impl<'a> Document<'a> {
 
     fn block(&mut self, block: &Block) -> El {
         match block {
-            Block::Para(inline) => self.inline(inline, body_style(self.wide)),
+            Block::Para(inline) => {
+                let para = self.inline(inline, body_style(self.wide));
+                // KSG's `ResponseCard`: a citation's saved comment follows its
+                // card as pre-wrapped text.
+                let comments = inline
+                    .links
+                    .iter()
+                    .filter_map(|(_, _, href)| {
+                        let record = known(&self.records, href)?;
+                        if let Data::Response { citation, .. } = &record.data {
+                            citation.comment.clone()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if comments.is_empty() {
+                    para
+                } else {
+                    let mut out = col().w_full().min_w(0.0).gap(6.0).child(para);
+                    for comment in comments {
+                        out = out.child(
+                            label(&comment, TextStyle::new(14.0, 400.0), self.palette.ink)
+                                .wrap()
+                                .w_full(),
+                        );
+                    }
+                    out
+                }
+            }
             Block::Heading(level, inline) => self.inline(
                 inline,
                 TextStyle::new(
