@@ -501,13 +501,7 @@ pub struct PromptSuggestion {
     pub text: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThreadEnvMode {
-    #[default]
-    Local,
-    Worktree,
-}
+pub use crate::protocol::ThreadEnvMode;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VcsBranchCacheEntry {
@@ -522,6 +516,20 @@ struct VcsBranchResultMsg {
     machine: String,
     project_path: String,
     result: Result<crate::vcs::VcsListBranchesResult, String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorktreeBootstrapState {
+    pub(crate) snapshot: crate::composer_rich::Snapshot,
+    pub(crate) reply_to: Option<crate::composer_context::ComposerContextRecord>,
+    pub(crate) queued_id: usize,
+    pub(crate) fresh_context: bool,
+}
+
+struct WorktreeBootstrapResult {
+    thread_id: usize,
+    base_branch: String,
+    result: Result<crate::vcs::VcsCreateWorktreeResult, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -565,6 +573,11 @@ pub struct Thread {
     pub(crate) background_start_pending: bool,
     pub(crate) background_send: Option<String>,
     pub(crate) pending_send_and_new_thread: Option<(uuid::Uuid, String)>,
+    pub(crate) worktree_bootstrap: Option<WorktreeBootstrapState>,
+    pub(crate) remote_bootstrap_snapshot: Option<(
+        crate::composer_rich::Snapshot,
+        Option<crate::composer_context::ComposerContextRecord>,
+    )>,
     request_generation: String,
     server_owned: bool,
     recovery_command: Option<uuid::Uuid>,
@@ -981,6 +994,8 @@ impl Thread {
             background_start_pending: false,
             background_send: None,
             pending_send_and_new_thread: None,
+            worktree_bootstrap: None,
+            remote_bootstrap_snapshot: None,
             queued_edit: None,
             queued_save: None,
             queue_edit_supported: true,
@@ -1484,6 +1499,10 @@ impl Thread {
 
     pub fn effective_start_from_origin(&self) -> bool {
         self.start_from_origin.unwrap_or(true)
+    }
+
+    pub fn worktree_bootstrapping(&self) -> bool {
+        self.worktree_bootstrap.is_some()
     }
 
     pub fn reconcile_draft_context(&mut self) {
@@ -3608,6 +3627,14 @@ pub struct State {
     pub base_branch_query: TextEdit,
     pub(crate) vcs_branches: std::collections::BTreeMap<(String, String), VcsBranchCacheEntry>,
     vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
+    worktree_bootstrap_rxs: Vec<std::sync::mpsc::Receiver<WorktreeBootstrapResult>>,
+    #[cfg(test)]
+    pub(crate) test_git_context: Option<crate::vcs::GitContext>,
+    #[cfg(test)]
+    pub(crate) test_connect_workspaces: Vec<(usize, PathBuf)>,
+    #[cfg(test)]
+    pub(crate) test_connect_pi:
+        Option<Box<dyn FnMut(usize, &std::path::Path) -> Option<Pi> + Send>>,
     next_vcs_request_id: u64,
     pending_vcs_requests: std::collections::HashMap<u64, (String, String)>,
     pub captain_project: Option<Option<ProjectId>>,
@@ -3843,6 +3870,13 @@ impl State {
             base_branch_query: TextEdit::default(),
             vcs_branches: Default::default(),
             vcs_branch_rxs: Vec::new(),
+            worktree_bootstrap_rxs: Vec::new(),
+            #[cfg(test)]
+            test_git_context: None,
+            #[cfg(test)]
+            test_connect_workspaces: Vec::new(),
+            #[cfg(test)]
+            test_connect_pi: None,
             next_vcs_request_id: 0,
             pending_vcs_requests: Default::default(),
             captain_project: None,
@@ -4537,6 +4571,9 @@ impl State {
                 .ok_or("The remote server has not reported this thread's host directory.".into());
         }
         crate::backend::BackendHost::resolve(&thread.machine)?;
+        if let Some(worktree_path) = &thread.worktree_path {
+            return Ok(PathBuf::from(worktree_path));
+        }
         match thread.project {
             Some(id) => {
                 let project = self
@@ -6861,6 +6898,30 @@ impl State {
                 return;
             }
         };
+        #[cfg(test)]
+        {
+            let tid = self.threads[index].id;
+            self.test_connect_workspaces.push((tid, path.clone()));
+            if let Some(hook) = self.test_connect_pi.as_mut()
+                && let Some(pi) = hook(tid, &path)
+            {
+                let thread = &mut self.threads[index];
+                thread.error = None;
+                if !thread.pending_injections.is_empty() && !thread.status.busy() {
+                    thread.arm_task();
+                    thread.status = Status::Running;
+                    thread.started = None;
+                    thread.phase = "Working".into();
+                } else if thread.status == Status::Failed {
+                    thread.status = Status::Ready;
+                }
+                thread.initializing = false;
+                thread.prewarm_attempted = true;
+                thread.pi = Some(pi);
+                thread.drive_session();
+                return;
+            }
+        }
         if self.threads[index].project.is_none()
             && let Err(error) = std::fs::create_dir_all(&path)
         {
@@ -8969,6 +9030,303 @@ impl State {
         self.checkpoint();
     }
 
+    pub(crate) fn missing_worktree_base_branch_error(&self, thread: &Thread) -> Option<String> {
+        let should_create = !thread.worktree_bootstrapping()
+            && !thread.native.queue_held
+            && thread.messages.is_empty()
+            && thread.worktree_path.is_none()
+            && thread.project.is_some()
+            && !self.is_captain_home(thread)
+            && self.effective_env_mode(thread) == ThreadEnvMode::Worktree;
+        if should_create
+            && thread
+                .base_branch
+                .as_deref()
+                .is_none_or(|b| b.trim().is_empty())
+        {
+            Some("Select a base branch before sending in New worktree mode.".into())
+        } else {
+            None
+        }
+    }
+
+    fn build_current_prompt(&mut self) -> Option<Prompt> {
+        if self.current().harness == "pi"
+            && !self.current().model_provider.is_empty()
+            && self.current().model_provider != "cpa"
+        {
+            self.current_mut().error = Some(
+                "Choose a CPA model before sending. Shina will not send prompts to a direct provider."
+                    .into(),
+            );
+            return None;
+        }
+        if self.current().draft_images.iter().any(Attachment::is_image)
+            && self.current().supports_images == Some(false)
+        {
+            let err = self.current().image_model_error();
+            self.current_mut().attachment_error = Some(err);
+            return None;
+        }
+        let local_server_id = self.machine_identity(&self.machines.selected);
+        let peers = self.peers.clone();
+        let labels: Vec<(String, String)> = peers
+            .iter()
+            .map(|p| (p.server_id.clone(), p.label.clone()))
+            .collect();
+        let prompt = match crate::composer_tokens::prompt_for_target_with_reply(
+            &self.current().draft,
+            &self.current().draft_images,
+            &self.current().draft_context,
+            self.current().draft_reply_to.as_ref(),
+            Some(&self.current().machine),
+            Some(&local_server_id),
+            &peers,
+            &|m| {
+                if m == "local" {
+                    "Local".into()
+                } else {
+                    labels
+                        .iter()
+                        .find(|(id, _)| id == m)
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_else(|| m.to_owned())
+                }
+            },
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                self.current_mut().attachment_error = Some(error);
+                return None;
+            }
+        };
+        if !self.headless
+            && let Some(error) = self.current().validate_prompt_length(&prompt)
+        {
+            self.current_mut().submission_error = Some(error);
+            return None;
+        }
+        self.current_mut().submission_error = None;
+        Some(prompt)
+    }
+
+    fn try_worktree_bootstrap_send(
+        &mut self,
+        fresh_context: bool,
+        fresh_arm: Option<u64>,
+    ) -> Option<bool> {
+        let queue_behind_bootstrap = self.current().worktree_bootstrapping()
+            || (self.current().native.queue_held
+                && self.current().worktree_path.is_some()
+                && !self.current().status.busy());
+        if queue_behind_bootstrap {
+            let prompt = match self.build_current_prompt() {
+                Some(p) => p,
+                None => return Some(false),
+            };
+            let thread = self.current_mut();
+            thread.prompt_history.reset();
+            thread.typing_guard.on_blur_or_send();
+            thread.paste_history = Default::default();
+            thread.draft.replace_text("");
+            thread.draft_images.clear();
+            thread.draft_context.clear();
+            thread.draft_reply_to = None;
+            thread.retained_context = Default::default();
+            thread.native.queue_held = true;
+            thread.serial += 1;
+            let queued_id = thread.serial;
+            if fresh_context {
+                thread.native.fresh_queue_ids.insert(queued_id);
+            }
+            thread.native.queue.push_back(pi_session::QueuedMessage {
+                id: queued_id,
+                prompt,
+            });
+            thread.life.user_sent(lifecycle::now());
+            let id = thread.id;
+            let server = self.machines.selected.clone();
+            self.set_keep_full_history(&server, id, false);
+            if let Some(arm) = fresh_arm {
+                self.disarm_fresh_session(id, Some(arm));
+            }
+            self.checkpoint();
+            return Some(true);
+        }
+
+        let is_first_worktree = self.current().messages.is_empty()
+            && self.current().worktree_path.is_none()
+            && self.current().project.is_some()
+            && !self.is_captain_home(self.current())
+            && self.effective_env_mode(self.current()) == ThreadEnvMode::Worktree;
+        if !is_first_worktree {
+            return None;
+        }
+
+        if let Some(error) = self.missing_worktree_base_branch_error(self.current()) {
+            self.current_mut().submission_error = Some(error);
+            return Some(false);
+        }
+        let base_branch = self
+            .current()
+            .base_branch
+            .clone()
+            .map(|b| b.trim().to_owned())
+            .filter(|b| !b.is_empty())?;
+        let prompt = match self.build_current_prompt() {
+            Some(p) => p,
+            None => return Some(false),
+        };
+        let project_cwd = self
+            .project(self.current().project)
+            .map(|p| p.path.clone())?;
+        let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+            &self.current().draft,
+            &self.current().draft_images,
+            &self.current().draft_context,
+        );
+        let thread = self.current_mut();
+        let reply_to = thread.draft_reply_to.take();
+        let start_from_origin = thread.effective_start_from_origin();
+        thread.prompt_history.reset();
+        thread.typing_guard.on_blur_or_send();
+        thread.paste_history = Default::default();
+        thread.draft.replace_text("");
+        thread.draft_images.clear();
+        thread.draft_context.clear();
+        thread.retained_context = Default::default();
+        thread.error = None;
+        thread.attachment_error = None;
+        if thread.pi.is_some() && thread.session.is_none() {
+            thread.disconnect();
+            thread.prewarm_attempted = false;
+        }
+        thread.native.queue_held = true;
+        thread.serial += 1;
+        let queued_id = thread.serial;
+        if fresh_context {
+            thread.native.fresh_queue_ids.insert(queued_id);
+        }
+        thread.native.queue.push_back(pi_session::QueuedMessage {
+            id: queued_id,
+            prompt,
+        });
+        thread.worktree_bootstrap = Some(WorktreeBootstrapState {
+            snapshot,
+            reply_to,
+            queued_id,
+            fresh_context,
+        });
+        let thread_id = thread.id;
+        let server = self.machines.selected.clone();
+        self.set_keep_full_history(&server, thread_id, false);
+        self.invalidate_undo(thread_id);
+        if let Some(arm) = fresh_arm {
+            self.disarm_fresh_session(thread_id, Some(arm));
+        }
+
+        let worktrees_dir = self.data_dir.join("worktrees");
+        let wake = self.wake.clone();
+        #[cfg(test)]
+        let git_ctx = self.test_git_context.clone().unwrap_or_default();
+        #[cfg(not(test))]
+        let git_ctx = crate::vcs::GitContext::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.worktree_bootstrap_rxs.push(rx);
+        std::thread::spawn(move || {
+            let cwd_str = project_cwd.to_string_lossy().into_owned();
+            let raw_branch = crate::vcs::build_temporary_worktree_branch_name(
+                &uuid::Uuid::new_v4().simple().to_string(),
+            );
+            let new_branch =
+                crate::vcs::resolve_available_branch_name_with(&project_cwd, &raw_branch, &git_ctx)
+                    .unwrap_or(raw_branch);
+            let result = crate::vcs::create_worktree_with(
+                &crate::vcs::VcsCreateWorktreeInput {
+                    cwd: cwd_str,
+                    ref_name: base_branch.clone(),
+                    new_ref_name: Some(new_branch),
+                    base_ref_name: Some(base_branch.clone()),
+                    path: None,
+                    start_from_origin: Some(start_from_origin),
+                },
+                &worktrees_dir,
+                &git_ctx,
+            );
+            let _ = tx.send(WorktreeBootstrapResult {
+                thread_id,
+                base_branch,
+                result,
+            });
+            wake();
+        });
+        self.checkpoint();
+        Some(true)
+    }
+
+    pub fn poll_worktree_bootstraps(&mut self) -> bool {
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.worktree_bootstrap_rxs.len());
+        let rxs = std::mem::take(&mut self.worktree_bootstrap_rxs);
+        for rx in rxs {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    changed = true;
+                    let Some(index) = self.threads.iter().position(|t| t.id == msg.thread_id)
+                    else {
+                        continue;
+                    };
+                    let Some(boot) = self.threads[index].worktree_bootstrap.take() else {
+                        continue;
+                    };
+                    match msg.result {
+                        Ok(created) => {
+                            let thread = &mut self.threads[index];
+                            thread.worktree_path = Some(created.worktree.path.clone());
+                            thread.branch = Some(created.worktree.ref_name.clone());
+                            thread.base_branch = Some(msg.base_branch);
+                            thread.env_mode = Some(ThreadEnvMode::Worktree);
+                            thread.submission_error = None;
+                            thread.life.user_sent(lifecycle::now());
+                            thread.native.queue_held = false;
+                            if boot.fresh_context {
+                                self.persist_transcripts = true;
+                            }
+                            if self.runtime_enabled || self.threads[index].pi.is_some() {
+                                if self.threads[index].pi.is_none() {
+                                    self.connect_thread(index);
+                                }
+                                if self.threads[index].pi.is_some() {
+                                    self.threads[index].drive_session();
+                                }
+                            }
+                            self.checkpoint();
+                        }
+                        Err(error) => {
+                            let thread = &mut self.threads[index];
+                            thread.native.queue.retain(|q| q.id != boot.queued_id);
+                            thread.native.fresh_queue_ids.remove(&boot.queued_id);
+                            thread.native.queue_held = false;
+                            thread.worktree_path = None;
+                            thread.branch = None;
+                            thread.env_mode = Some(ThreadEnvMode::Worktree);
+                            thread.restore_snapshot(&boot.snapshot);
+                            if thread.draft_reply_to.is_none() {
+                                thread.draft_reply_to = boot.reply_to;
+                            }
+                            thread.submission_error = Some(error);
+                            self.checkpoint();
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => remaining.push(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => changed = true,
+            }
+        }
+        self.worktree_bootstrap_rxs = remaining;
+        changed
+    }
+
     pub fn open_external_url(&mut self, url: &str) {
         self.pending_open_urls.push(url.to_owned());
     }
@@ -9842,6 +10200,10 @@ impl State {
                 self.current_mut().submission_error = Some(error);
                 return false;
             }
+            if let Some(error) = self.missing_worktree_base_branch_error(self.current()) {
+                self.current_mut().submission_error = Some(error);
+                return false;
+            }
             self.current_mut().submission_error = None;
             if self.current().client_draft {
                 self.promote_client_draft();
@@ -9850,8 +10212,12 @@ impl State {
             let supports_fresh_cap = self.client.as_ref().is_some_and(|c| {
                 c.supports_capability(&self.current().machine, crate::protocol::FRESH_CONTEXT)
             });
-            let mut mode = if self.current().status.busy()
-                && (self.current().follow_up_queues() || fresh_context)
+            let supports_vcs_cap = self.client.as_ref().is_some_and(|c| {
+                c.supports_capability(&self.current().machine, crate::protocol::VCS_WORKTREES)
+            });
+            let mut mode = if (self.current().status.busy()
+                && (self.current().follow_up_queues() || fresh_context))
+                || self.current().native.queue_held
             {
                 "queue"
             } else if self.current().status.busy() {
@@ -9861,6 +10227,19 @@ impl State {
             };
             let mut params = json!({"threadId":self.current().id,"text":prompt.text,
                 "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":mode});
+            let sending_worktree_bootstrap = supports_vcs_cap
+                && self.current().worktree_path.is_none()
+                && self.current().messages.is_empty()
+                && self.current().project.is_some()
+                && !self.is_captain_home(self.current())
+                && self.effective_env_mode(self.current()) == ThreadEnvMode::Worktree;
+            if sending_worktree_bootstrap {
+                params["envMode"] = json!(ThreadEnvMode::Worktree);
+                if let Some(base) = &self.current().base_branch {
+                    params["baseBranch"] = json!(base);
+                }
+                params["startFromOrigin"] = json!(self.current().effective_start_from_origin());
+            }
             if fresh_context {
                 params["freshContext"] = json!(true);
             }
@@ -9882,6 +10261,11 @@ impl State {
                         &self.current().draft_context,
                     );
                     let thread = self.current_mut();
+                    let reply_for_remote = thread.draft_reply_to.clone();
+                    if sending_worktree_bootstrap {
+                        thread.remote_bootstrap_snapshot =
+                            Some((snapshot.clone(), reply_for_remote));
+                    }
                     thread.remote_send = Some((id, snapshot));
                     thread.remote_send_fresh_arm = fresh_arm;
                     thread.remote_send_reply_to = thread.draft_reply_to.take();
@@ -10015,6 +10399,9 @@ impl State {
             self.current_mut().request = None;
         }
         self.release_task_results(self.current().id);
+        if let Some(sent) = self.try_worktree_bootstrap_send(fresh_context, fresh_arm) {
+            return sent;
+        }
         if compact_before_send && !self.current().status.busy() {
             if self.current().harness == "pi"
                 && !self.current().model_provider.is_empty()
@@ -11947,6 +12334,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     changed |= state.prewarm_current();
     changed |= state.poll_vcs_branches();
+    changed |= state.poll_worktree_bootstraps();
     changed |= state.poll_question_answers();
     if state.runtime_enabled && state.client.is_none() {
         for index in 0..state.threads.len() {
@@ -18932,6 +19320,232 @@ mod tests {
         state.sync_fallback_model(1_700_010_060_000);
         assert_eq!(state.current().harness, "codex");
         assert!(state.composer_notices.ordered().is_empty());
+    }
+
+    #[test]
+    fn worktree_send_without_base_branch_is_refused_with_exact_message() {
+        let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "claude".into();
+        state.current_mut().model_provider = "claude".into();
+        state.current_mut().env_mode = Some(ThreadEnvMode::Worktree);
+        state.current_mut().base_branch = None;
+        state.current_mut().draft.replace_text("Do work");
+        state.send();
+        assert_eq!(
+            state.current().submission_error.as_deref(),
+            Some("Select a base branch before sending in New worktree mode.")
+        );
+        assert_eq!(state.current().draft.text, "Do work");
+        assert!(state.current().messages.is_empty());
+        assert!(state.current().native.queue.is_empty());
+        assert!(state.current().worktree_path.is_none());
+    }
+
+    fn init_temp_git_repo(root: &std::path::Path, empty_config: &std::path::Path) -> PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.arg("-c")
+                .arg("user.name=Test User")
+                .arg("-c")
+                .arg("user.email=test@example.com")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_GLOBAL", empty_config)
+                .env("GIT_CONFIG_SYSTEM", empty_config);
+            let out = crate::process::output(&mut cmd, Duration::from_secs(10), 1024 * 1024)
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&repo, &["init", "-b", "main", "--quiet"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        run(&repo, &["add", "README.md"]);
+        run(&repo, &["commit", "-m", "initial", "--quiet"]);
+        repo
+    }
+
+    #[test]
+    fn worktree_bootstrap_creates_worktree_starts_harness_and_queues_second_send() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("shina-wt-boot-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty_cfg = root.join("empty.gitconfig");
+        std::fs::write(&empty_cfg, "").unwrap();
+        let repo = init_temp_git_repo(&root, &empty_cfg);
+        let git_ctx = crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg.clone()),
+            git_config_system: Some(empty_cfg.clone()),
+        };
+
+        let mut state = State::new(repo.clone(), false);
+        state.data_dir = root.join("data");
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        state.runtime_enabled = true;
+        state.test_git_context = Some(git_ctx);
+
+        let commands_slot: std::sync::Arc<
+            std::sync::Mutex<Option<std::sync::mpsc::Receiver<Value>>>,
+        > = std::sync::Arc::default();
+        let commands_slot_hook = commands_slot.clone();
+        state.test_connect_pi = Some(Box::new(move |_tid, _path| {
+            let (pi, commands, _events) = Pi::test_connection();
+            *commands_slot_hook.lock().unwrap() = Some(commands);
+            Some(pi)
+        }));
+
+        {
+            let t = state.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("main".into());
+            t.start_from_origin = Some(true);
+            t.draft.replace_text("First turn in worktree");
+        }
+        state.send();
+        assert!(state.current().worktree_bootstrapping());
+        assert!(state.current().native.queue_held);
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert!(state.current().draft.text.is_empty());
+
+        // Second send while bootstrap is in progress queues behind the first message.
+        state.current_mut().draft.replace_text("Second queued turn");
+        state.send();
+        assert_eq!(state.current().native.queue.len(), 2);
+        assert!(state.current().native.queue_held);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !state.current().worktree_bootstrapping(),
+            "bootstrap did not finish in time"
+        );
+
+        let wt_path = state
+            .current()
+            .worktree_path
+            .clone()
+            .expect("worktreePath recorded");
+        assert!(std::path::Path::new(&wt_path).exists());
+        assert!(
+            state
+                .current()
+                .branch
+                .as_deref()
+                .is_some_and(|b| b.starts_with("t3/"))
+        );
+        assert_eq!(state.current().base_branch.as_deref(), Some("main"));
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(state.test_connect_workspaces.len(), 1);
+        assert_eq!(state.test_connect_workspaces[0].1, PathBuf::from(&wt_path));
+        assert_eq!(
+            state.thread_directory(state.active).unwrap(),
+            PathBuf::from(&wt_path)
+        );
+
+        // First prompt was released and sent to the harness; second stays queued behind it.
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert_eq!(
+            state.current().native.queue[0].prompt.text,
+            "Second queued turn"
+        );
+        let commands = commands_slot.lock().unwrap().take().expect("pi commands");
+        let first_cmd = commands
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("first prompt dispatched");
+        assert_eq!(first_cmd["message"], "First turn in worktree");
+
+        // Settling turn 1 releases the queued second turn in the same worktree.
+        state.current_mut().apply(json!({
+            "type": "response",
+            "id": first_cmd["id"],
+            "command": "prompt",
+            "success": true,
+            "data": {}
+        }));
+        state
+            .current_mut()
+            .apply(json!({"type": "agent_settled", "aborted": false}));
+        assert!(state.current().native.queue.is_empty());
+        let second_cmd = commands
+            .try_iter()
+            .find(|c| c["type"] == "prompt")
+            .expect("second prompt dispatched");
+        assert_eq!(second_cmd["message"], "Second queued turn");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_bootstrap_failure_restores_draft_and_records_nothing() {
+        if !crate::vcs::git_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("shina-wt-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty_cfg = root.join("empty.gitconfig");
+        std::fs::write(&empty_cfg, "").unwrap();
+        let repo = init_temp_git_repo(&root, &empty_cfg);
+        let git_ctx = crate::vcs::GitContext {
+            git_config_global: Some(empty_cfg.clone()),
+            git_config_system: Some(empty_cfg.clone()),
+        };
+
+        let mut state = State::new(repo, false);
+        state.data_dir = root.join("data");
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        state.runtime_enabled = true;
+        state.test_git_context = Some(git_ctx);
+
+        {
+            let t = state.current_mut();
+            t.harness = "claude".into();
+            t.model_provider = "claude".into();
+            t.env_mode = Some(ThreadEnvMode::Worktree);
+            t.base_branch = Some("missing-branch-does-not-exist".into());
+            t.start_from_origin = Some(false);
+            t.draft.replace_text("Keep this draft on failure");
+        }
+        state.send();
+        assert!(state.current().worktree_bootstrapping());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.current().worktree_bootstrapping() && Instant::now() < deadline {
+            state.poll_worktree_bootstraps();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!state.current().worktree_bootstrapping());
+        assert_eq!(state.current().draft.text, "Keep this draft on failure");
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert!(state.current().worktree_path.is_none());
+        assert!(state.current().branch.is_none());
+        assert!(state.current().native.queue.is_empty());
+        assert!(!state.current().native.queue_held);
+        assert!(state.test_connect_workspaces.is_empty());
+        assert!(
+            state
+                .current()
+                .submission_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Git command failed")),
+            "expected git error, got {:?}",
+            state.current().submission_error
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
