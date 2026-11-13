@@ -43,6 +43,20 @@ pub struct MarkdownSourceState {
     pub pending_typed: bool,
 }
 
+impl MarkdownSourceState {
+    pub fn on_history_change(&mut self, edit: &TextEdit) {
+        self.detached = true;
+        self.pending_typed = false;
+        self.revealed = source_regions(edit);
+        self.prev_text = edit.text.clone();
+    }
+
+    pub fn on_doc_change(&mut self, _edit: &TextEdit) {
+        self.detached = false;
+        self.pending_typed = true;
+    }
+}
+
 fn is_style_mark(mark: &Mark) -> bool {
     matches!(mark, Mark::Bold | Mark::Italic | Mark::Strike | Mark::Code)
 }
@@ -663,12 +677,31 @@ fn reveal_styled_text(
     Some(revealed)
 }
 
+/// Ported from KSG Code's `normalizeDetached`: after undo or redo, rewrites stay
+/// transient (`typed = false`) until the next recorded edit.
+pub fn normalize_detached(state: &mut MarkdownSourceState, edit: &mut TextEdit) {
+    state.pending_typed = false;
+    normalize_markdown_source_with_typed(state, edit, false);
+}
+
 /// Ported from KSG Code's `normalizeMarkdownSource`.
 pub fn normalize_markdown_source(state: &mut MarkdownSourceState, edit: &mut TextEdit) {
-    if edit.is_composing() || edit.is_secure() {
+    if state.detached {
+        normalize_detached(state, edit);
         return;
     }
     let typed = std::mem::take(&mut state.pending_typed);
+    normalize_markdown_source_with_typed(state, edit, typed);
+}
+
+fn normalize_markdown_source_with_typed(
+    state: &mut MarkdownSourceState,
+    edit: &mut TextEdit,
+    typed: bool,
+) {
+    if edit.is_composing() || edit.is_secure() {
+        return;
+    }
     let takes_before = caret_takes_marks_before(edit);
     let (anchor, focus) = (edit.anchor, edit.focus);
     let block_sel = matches!(edit.selection(), EditorSelection::Block(_));

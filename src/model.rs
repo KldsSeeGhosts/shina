@@ -8663,7 +8663,7 @@ impl State {
         t.draft.focus = 0;
         t.draft.insert(&text);
         t.native.slash_index = 0;
-        t.composer_source.pending_typed = true;
+        t.composer_source.on_doc_change(&t.draft);
         t.composer_rules.changed(&mut t.draft);
         t.reconcile_draft_context();
         t.typing_guard.on_type(std::time::Instant::now());

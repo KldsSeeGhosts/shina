@@ -120,6 +120,7 @@ pub fn prepend(submitted: &TextEdit, later: &TextEdit) -> TextEdit {
 pub struct Rules {
     converted: Option<TextEdit>,
     suppress: bool,
+    suppress_history: bool,
 }
 
 fn same_document(a: &TextEdit, b: &TextEdit) -> bool {
@@ -137,17 +138,23 @@ impl Rules {
     pub fn pasted(&mut self) {
         self.converted = None;
         self.suppress = true;
+        self.suppress_history = false;
+    }
+
+    pub fn take_history_suppress(&mut self) -> bool {
+        std::mem::take(&mut self.suppress_history)
     }
 
     /// Ported from ComposerPromptEditorTiptap and the Composer* mark extensions.
     pub fn key(&mut self, edit: &mut TextEdit, ev: &KeyEvent) -> bool {
         if edit.is_composing() {
             self.suppress = false;
+            self.suppress_history = false;
             return false;
         }
+        self.suppress_history = ev.is_command('z') || ev.is_command('y');
         self.suppress = matches!(ev.key, Key::Backspace | Key::Delete)
-            || ev.is_command('z')
-            || ev.is_command('y')
+            || self.suppress_history
             || ev.is_command('x');
         if ev.key == Key::Backspace
             && !ev.mods.cmd

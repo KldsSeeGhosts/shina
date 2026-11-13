@@ -1,6 +1,6 @@
 use super::*;
-use crate::composer_rich;
-use rune::Ime;
+use crate::composer_rich::{self, Rules};
+use rune::{BlockKind, Cx, El, Env, Ime, Key, KeyEvent, Mods, Runtime, text_input};
 
 fn state_from(md: &str) -> TextEdit {
     let mut edit = composer_rich::draft("");
@@ -344,4 +344,388 @@ fn part_a_draft_save_and_send_while_revealed_use_collapsed_text() {
         assert_eq!(snap.text, "bold after");
         assert!(!snap.html.contains("markdown-source"));
     });
+}
+
+struct TestEditor {
+    edit: TextEdit,
+    rules: Rules,
+    source: MarkdownSourceState,
+}
+
+impl TestEditor {
+    fn new(initial_md: &str) -> Runtime<Self> {
+        let mut edit = if initial_md.is_empty() {
+            composer_rich::draft("")
+        } else {
+            state_from(initial_md)
+        };
+        edit.focused = true;
+        let state = Self {
+            edit,
+            rules: Rules::default(),
+            source: MarkdownSourceState::default(),
+        };
+        let view = |s: &Self, _: &mut Cx<Self>| -> El {
+            let style = TextStyle::new(15.0, 400.0);
+            let (spans, strikes) = preview_decorations(
+                &s.edit,
+                style,
+                Color::from_oklab([0.5, 0.0, 0.0, 1.0]),
+                Color::WHITE,
+                Color::BLACK,
+            );
+            text_input(&s.edit, style)
+                .key("editor")
+                .w(400.0)
+                .min_h(80.0)
+                .on_edit(|s: &mut Self| &mut s.edit)
+                .on_input_key(|s: &mut Self, ev, _| {
+                    let before = s.edit.text.clone();
+                    let handled = s.rules.key(&mut s.edit, ev);
+                    if handled && s.edit.text != before {
+                        s.source.on_doc_change(&s.edit);
+                    }
+                    handled
+                })
+                .on_input_change(|s: &mut Self, _| {
+                    if s.rules.take_history_suppress() {
+                        s.source.on_history_change(&s.edit);
+                    } else {
+                        s.source.on_doc_change(&s.edit);
+                    }
+                    s.rules.changed(&mut s.edit);
+                })
+                .on_input_selection_change(|s: &mut Self, _| {
+                    on_selection_change(&mut s.source, &mut s.edit);
+                })
+                .decorations(spans)
+                .strikes(strikes)
+        };
+        let mut rt = Runtime::new(state, view, (420.0, 120.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt
+    }
+}
+
+fn send_key(rt: &mut Runtime<TestEditor>, key: Key, mods: Mods) {
+    rt.key(KeyEvent { key, mods });
+    rt.frame(0.0);
+}
+
+fn type_str(rt: &mut Runtime<TestEditor>, s: &str) {
+    for ch in s.chars() {
+        send_key(rt, Key::Text(ch.to_string()), Mods::default());
+    }
+}
+
+fn cmd_z(rt: &mut Runtime<TestEditor>, redo: bool) {
+    send_key(
+        rt,
+        Key::Command('z'),
+        Mods {
+            cmd: true,
+            shift: redo,
+            ..Mods::default()
+        },
+    );
+}
+
+fn doc_key(edit: &TextEdit) -> (String, Vec<MarkRange>, Vec<rune::Block>) {
+    (
+        edit.text.clone(),
+        edit.marks().to_vec(),
+        edit.blocks().to_vec(),
+    )
+}
+
+fn probe_redo_depth(edit: &TextEdit, has_undo: bool) -> usize {
+    let mut probe = edit.clone();
+    let mut depth = 0usize;
+    loop {
+        let before = (doc_key(&probe), probe.anchor, probe.focus);
+        probe.redo();
+        let after = (doc_key(&probe), probe.anchor, probe.focus);
+        if after == before {
+            break;
+        }
+        if depth == 0 && has_undo {
+            let mut check = edit.clone();
+            check.undo();
+            check.redo();
+            if doc_key(&probe) == doc_key(&check) {
+                break;
+            }
+        }
+        depth += 1;
+    }
+    depth
+}
+
+#[test]
+fn part_b_type_reveal_edit_collapse_undo_and_redo_step_by_step() {
+    let mut rt = TestEditor::new("");
+
+    // Step 1: Type "**bold** after".
+    type_str(&mut rt, "**bold** after");
+    assert_eq!(rt.state.edit.text, "bold after");
+    assert!(!has_shown_source(&rt.state.edit));
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 0);
+
+    // Step 2: Reveal by moving caret inside "bold" (no undo step added, redo stays 0).
+    rt.update(|s, _| s.edit.set_caret(2));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after");
+    assert!(has_shown_source(&rt.state.edit));
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 0);
+
+    // Step 3: Edit while revealed ("**boXld** after").
+    send_key(&mut rt, Key::Text("X".into()), Mods::default());
+    assert_eq!(rt.state.edit.text, "**boXld** after");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 0);
+
+    // Step 4: Collapse by moving caret to end.
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(rt.state.edit.text, "boXld after");
+    assert!(!has_shown_source(&rt.state.edit));
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**boXld** after");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 0);
+
+    // Step 5: Undo once -> restores collapsed "**bold** after" (revealed because caret
+    // returned to pos 2 inside "bold", and redo depth becomes 1!).
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+    assert_eq!(rt.state.edit.text, "**bold** after");
+    assert!(has_shown_source(&rt.state.edit));
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    // Collapse by moving caret out -> redo depth STILL 1!
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(rt.state.edit.text, "bold after");
+    assert!(!has_shown_source(&rt.state.edit));
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    // Reveal again after undo -> keeps redo depth 1!
+    rt.update(|s, _| s.edit.set_caret(2));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after");
+    assert!(has_shown_source(&rt.state.edit));
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    // Step 6: Undo again -> undoes " after", back to "**bold**" (caret at end of "bold", revealed).
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold**");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 2);
+
+    // Step 7: Undo again -> undoes "**bold**" input rule back to "**bold*".
+    cmd_z(&mut rt, false);
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 3);
+
+    // Redo step by step back to "**boXld** after".
+    cmd_z(&mut rt, true);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold**");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 2);
+
+    cmd_z(&mut rt, true);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    cmd_z(&mut rt, true);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**boXld** after");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 0);
+
+    // Move caret out to confirm collapsed state.
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(rt.state.edit.text, "boXld after");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+}
+
+#[test]
+fn part_b_ksg_undoes_a_marker_edit_in_one_step_without_extra_step_for_showing_markers() {
+    // Ported from KSG ComposerPromptEditorTiptap.input.browser.test.tsx:
+    // "undoes a marker edit in one step without an extra step for showing markers"
+    let mut rt = TestEditor::new("**bold** after");
+    rt.update(|s, _| s.edit.set_caret(s.edit.text.len()));
+    rt.frame(0.0);
+    type_str(&mut rt, "!");
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after!");
+
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after!");
+    assert!(has_shown_source(&rt.state.edit));
+
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::Delete, Mods::default());
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "bold** after!");
+    assert!(rt.state.edit.marks().is_empty());
+
+    // Undo restores the markers in one step; caret is at 0 so they reveal.
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after!");
+    assert!(has_shown_source(&rt.state.edit));
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    // Leaving hides them without touching the text undo needs.
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(rt.state.edit.text, "bold after!");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    // Undo again removes "!".
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+    assert_eq!(probe_redo_depth(&rt.state.edit, false), 2);
+
+    // Moving the caret into styled text keeps redo, and adds no undo step after it.
+    rt.update(|s, _| s.edit.set_caret(2));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after");
+    assert!(has_shown_source(&rt.state.edit));
+    assert_eq!(probe_redo_depth(&rt.state.edit, false), 2);
+
+    // Redo restores "!", then redo again restores "bold** after!".
+    cmd_z(&mut rt, true);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after!");
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    cmd_z(&mut rt, true);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "bold** after!");
+    assert!(!rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+    assert_eq!(probe_redo_depth(&rt.state.edit, true), 0);
+
+    // Undo twice, redo once, leave, then type "?" and undo/redo it.
+    cmd_z(&mut rt, false);
+    cmd_z(&mut rt, false);
+    cmd_z(&mut rt, true);
+    send_key(&mut rt, Key::End, Mods::default());
+    type_str(&mut rt, "?");
+    cmd_z(&mut rt, false);
+    cmd_z(&mut rt, true);
+    assert_eq!(rt.state.edit.text, "bold after!?");
+    rt.update(|s, _| s.edit.set_caret(0));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after!?");
+    assert!(has_shown_source(&rt.state.edit));
+
+    send_key(&mut rt, Key::Delete, Mods::default());
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "*bold** after!?");
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after!?");
+    assert!(has_shown_source(&rt.state.edit));
+    send_key(&mut rt, Key::End, Mods::default());
+    assert_eq!(rt.state.edit.text, "bold after!?");
+    assert!(rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold));
+}
+
+#[test]
+fn part_b_line_break_inside_revealed_bold_keeps_both_halves_bold() {
+    // Ported from KSG ComposerPromptEditorTiptap.input.browser.test.tsx:
+    // "a line break inside bold keeps both halves bold"
+    let mut rt = TestEditor::new("**bold** after");
+    rt.update(|s, _| s.edit.set_caret(2));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after");
+    assert_eq!(rt.state.edit.focus, 4);
+
+    send_key(
+        &mut rt,
+        Key::Enter,
+        Mods {
+            shift: true,
+            ..Mods::default()
+        },
+    );
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "**bo**\n**ld** after"
+    );
+
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+
+    cmd_z(&mut rt, true);
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "**bo**\n**ld** after"
+    );
+}
+
+#[test]
+fn part_b_splitting_list_item_inside_revealed_bold_keeps_both_halves_bold() {
+    // Ported from KSG ComposerPromptEditorTiptap.input.browser.test.tsx:
+    // "splitting a list item inside bold keeps both halves bold"
+    let mut rt = TestEditor::new("- **bold** after");
+    assert_eq!(rt.state.edit.block_kind(0), BlockKind::Bullet(0));
+    rt.update(|s, _| s.edit.set_caret(2));
+    rt.frame(0.0);
+    assert_eq!(rt.state.edit.text, "**bold** after");
+    assert_eq!(rt.state.edit.focus, 4);
+
+    send_key(&mut rt, Key::Enter, Mods::default());
+    assert_eq!(
+        composer_rich::markdown(&rt.state.edit),
+        "- **bo**\n- **ld** after"
+    );
+
+    cmd_z(&mut rt, false);
+    assert_eq!(composer_rich::markdown(&rt.state.edit), "- **bold** after");
+}
+
+#[test]
+fn part_b_ksg_undoes_composition_in_revealed_markdown_through_earlier_paste() {
+    // Ported from KSG ComposerPromptEditorTiptap.input.browser.test.tsx:
+    // "undoes composition $at in revealed Markdown through the earlier paste"
+    for (sel, composed, expect_bold) in [
+        ((4, 4), "**bo漢ld** after", true),
+        ((0, 2), "漢bold** after", false),
+        ((8, 8), "**bold**漢 after", true),
+    ] {
+        let mut rt = TestEditor::new("");
+        rt.update(|s, _| {
+            composer_rich::paste(&mut s.edit, "**bold** after", &|_| None);
+        });
+        rt.frame(0.0);
+        type_str(&mut rt, "!");
+        cmd_z(&mut rt, false);
+        assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+
+        rt.update(|s, _| s.edit.set_caret(2));
+        rt.frame(0.0);
+        assert_eq!(rt.state.edit.text, "**bold** after");
+        assert!(has_shown_source(&rt.state.edit));
+
+        // Canceled composition keeps redo and adds no undo.
+        rt.update(move |s, _| s.edit.set_selection(sel.0, sel.1));
+        rt.frame(0.0);
+        rt.ime(Ime::Preedit(" ".into(), None));
+        rt.frame(0.0);
+        rt.ime(Ime::Preedit("".into(), None));
+        rt.frame(0.0);
+        assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
+
+        // Actual composition commit records one step against the revealed/collapsed history.
+        rt.ime(Ime::Preedit("漢".into(), None));
+        rt.frame(0.0);
+        rt.ime(Ime::Commit("漢".into()));
+        rt.frame(0.0);
+        send_key(&mut rt, Key::End, Mods::default());
+        assert_eq!(composer_rich::markdown(&rt.state.edit), composed);
+
+        cmd_z(&mut rt, false);
+        assert_eq!(composer_rich::markdown(&rt.state.edit), "**bold** after");
+        cmd_z(&mut rt, false);
+        assert_eq!(composer_rich::markdown(&rt.state.edit), "");
+
+        cmd_z(&mut rt, true);
+        cmd_z(&mut rt, true);
+        send_key(&mut rt, Key::End, Mods::default());
+        assert_eq!(composer_rich::markdown(&rt.state.edit), composed);
+        assert_eq!(
+            rt.state.edit.marks().iter().any(|m| m.mark == Mark::Bold),
+            expect_bold
+        );
+    }
 }

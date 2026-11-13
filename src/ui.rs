@@ -11573,7 +11573,7 @@ fn composer(
         if handled {
             t.reconcile_draft_context();
             if t.draft.text != before {
-                t.composer_source.pending_typed = true;
+                t.composer_source.on_doc_change(&t.draft);
                 t.typing_guard.on_type(std::time::Instant::now());
             }
             t.update_submission_error();
