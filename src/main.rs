@@ -12,6 +12,7 @@ mod client_history;
 mod codex;
 mod composer;
 mod composer_context;
+mod composer_notices;
 mod composer_paste;
 mod composer_rich;
 mod composer_skills;

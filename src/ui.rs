@@ -992,6 +992,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     {
         root = root.child(context_popover(s, p));
     }
+    if context_popover_shown && let Some(notice) = s.composer_notices.open_details_notice() {
+        root = root.child(composer_notice_details_popover(notice, p));
+    }
     if brief && narrow {
         let top = chrome.height.max(40.0 * zoom) / zoom;
         root = root.child(captain_ui::brief_sheet(s, p, top));
@@ -10226,6 +10229,217 @@ fn context_cost_text(cost: f64) -> String {
     }
 }
 
+fn attach_composer_notices(s: &State, p: Palette, lane: f32, composer_card: El) -> El {
+    if let Some(notices) = composer_notice_stack(s, p, lane) {
+        col().w_full().gap(0.0).child(notices).child(composer_card)
+    } else {
+        composer_card
+    }
+}
+
+/// Ported from KSG Code's `ComposerBannerStack` and `ComposerBanner` (`attached`,
+/// `density="comfortable"`), skinned per Pixel Voyage: 2 px `outlined` frame, 6 px outer corners
+/// only on the top card, variant colour on the icon and a 2 px left edge.
+fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
+    use crate::composer_notices::Variant;
+    let notices = s.composer_notices.ordered();
+    if notices.is_empty() {
+        return None;
+    }
+    let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
+    let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
+    let action_style = TextStyle::new(12.0, 450.0);
+    let mut stack = col().key("composer-notices").w_full().gap(0.0);
+    for (index, notice) in notices.iter().enumerate() {
+        let top = index == 0;
+        let corners = if top { [6.0, 6.0, 0.0, 0.0] } else { [0.0; 4] };
+        let variant_color = match notice.variant {
+            Variant::Error => p.danger,
+            Variant::Warning => p.brass,
+            Variant::Success | Variant::Info => p.sea,
+            Variant::Default => p.muted,
+        };
+        let role = match notice.variant {
+            Variant::Error | Variant::Warning => "alert",
+            Variant::Default | Variant::Info | Variant::Success => "status",
+        };
+        let a11y_label = match &notice.description {
+            Some(desc) if !desc.is_empty() => format!("{}: {desc}", notice.title),
+            _ => notice.title.clone(),
+        };
+        let mut actions_width = 0.0;
+        for act in &notice.actions {
+            actions_width +=
+                20.0 + rune::text::measure(&act.label, &[], action_style, None).0 + 4.0;
+        }
+        let dismiss_width = if notice.dismiss_label.is_some() {
+            24.0 + 4.0
+        } else {
+            0.0
+        };
+        let available_text =
+            (lane - 4.0 - 8.0 - 24.0 - 4.0 - actions_width - dismiss_width - 4.0).max(0.0);
+        let title_width = rune::text::measure(&notice.title, &[], title_style, None).0;
+        let desc_width = notice.description.as_deref().map_or(0.0, |desc| {
+            4.0 + rune::text::measure(desc, &[], desc_style, None).0
+        });
+        let overflows = title_width + desc_width > available_text + 0.5;
+
+        let mut content = row()
+            .key(format!("composer-notice-content-{}", notice.id))
+            .grow(1.0)
+            .shrink()
+            .min_w(0.0)
+            .center_y()
+            .gap(4.0)
+            .child(
+                label(&notice.title, title_style, p.ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        if let Some(desc) = &notice.description {
+            content = content.child(
+                label(desc, desc_style, p.muted)
+                    .truncate()
+                    .grow(1.0)
+                    .shrink()
+                    .min_w(0.0),
+            );
+        }
+
+        let mut actions = row().center_y().gap(4.0);
+        if overflows {
+            let details_id = notice.id.clone();
+            actions = actions.child(button(
+                &format!("composer-notice-details-{}", notice.id),
+                "Details",
+                p,
+                move |s| s.composer_notices.toggle_details(&details_id),
+            ));
+        }
+        for (action_index, act) in notice.actions.iter().enumerate() {
+            let handler = act.handler.clone();
+            let mut btn = button(
+                &format!("composer-notice-action-{}-{action_index}", notice.id),
+                &act.label,
+                p,
+                move |s| handler.call(s),
+            )
+            .disabled(act.disabled);
+            if let Some(tip) = &act.tooltip {
+                btn = btn.help(tip.clone());
+            }
+            actions = actions.child(btn);
+        }
+        if let Some(dismiss_label) = &notice.dismiss_label {
+            let dismiss_id = notice.id.clone();
+            actions = actions.child(icon_button(
+                &format!("composer-notice-dismiss-{}", notice.id),
+                dismiss_label,
+                "close",
+                p,
+                move |s| s.composer_notices.dismiss(&dismiss_id),
+            ));
+        }
+
+        let card_row = row()
+            .min_h(24.0)
+            .w_full()
+            .min_w(0.0)
+            .center_y()
+            .gap(4.0)
+            .child(
+                el().size(24.0, 24.0)
+                    .center()
+                    .child(icon(notice.icon, variant_color)),
+            )
+            .child(content)
+            .child(actions);
+
+        let card = col()
+            .key(format!("composer-notice-{}", notice.id))
+            .role(role)
+            .label(a11y_label)
+            .w_full()
+            .px(4.0)
+            .py(5.0)
+            .corners(corners)
+            .clip_corners(corners)
+            .fill(p.card)
+            .border(2.0, p.frame)
+            .child(
+                el().w(2.0)
+                    .fill(variant_color)
+                    .pin(Some(0.0), Some(0.0), None, Some(0.0))
+                    .a11y_hidden(),
+            )
+            .child(card_row);
+
+        stack = stack.child(card);
+    }
+    Some(stack)
+}
+
+/// Overflow details popover for a composer notice, reusing `context_popover` styling.
+fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: Palette) -> El {
+    let mut card = col()
+        .key("composer-notice-details-popover")
+        .role("dialog")
+        .label("Notice details")
+        .w(360.0)
+        .max_w(480.0)
+        .padding(12.0)
+        .gap(8.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .anchored(
+            &format!("composer-notice-details-{}", notice.id),
+            rune::Side::Top,
+            rune::Align::End,
+            4.0,
+        )
+        .modal(true, |s: &mut State| s.composer_notices.close_details())
+        .on_key(|s: &mut State, event, _| {
+            if event.key == rune::Key::Escape {
+                s.composer_notices.close_details();
+                true
+            } else {
+                false
+            }
+        })
+        .child(
+            row()
+                .center_y()
+                .gap(12.0)
+                .child(pixel_label("Notice details", p.muted))
+                .child(spacer())
+                .child(icon_button(
+                    "close-notice-details",
+                    "Close",
+                    "close",
+                    p,
+                    |s| s.composer_notices.close_details(),
+                )),
+        )
+        .child(
+            label(&notice.title, TextStyle::new(12.0, 500.0).lh(16.0), p.ink)
+                .wrap()
+                .selectable(true),
+        );
+    if let Some(desc) = &notice.description {
+        card = card.child(
+            label(desc, SMALL.lh(16.0), p.muted)
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
+    card
+}
+
 /// The usage popover, ported from KSG Code's `ContextWindowMeter` popup (the branch without a
 /// breakdown, which is what Pi reports): a `w-64` tooltip-style card above the ring, aligned to
 /// its end, with "Context Window" and `percent · used/limit` in `text-2xs tabular-nums`, a
@@ -10908,16 +11122,13 @@ fn composer(
         }
         preview = preview.child(action);
         let controls = composer_ui::controls(s, p, lane - 32.0, true, locked);
+        let composer_card = composer_ui::frame_card(s, p, card.child(preview).child(controls));
         return col()
             .key("composer-lane")
             .w_full()
             .px(lane_gutter(pane_width))
             .items_center()
-            .child(area.child(composer_ui::frame_card(
-                s,
-                p,
-                card.child(preview).child(controls),
-            )));
+            .child(area.child(attach_composer_notices(s, p, lane, composer_card)));
     }
     card = card.child(
         col()
@@ -10999,11 +11210,8 @@ fn composer(
                 .child(label(error, SMALL, p.danger).wrap().selectable(true)),
         );
     }
-    area = area.child(composer_ui::frame_card(
-        s,
-        p,
-        card.child(actions.child(action.ml(4.0))),
-    ));
+    let composer_card = composer_ui::frame_card(s, p, card.child(actions.child(action.ml(4.0))));
+    area = area.child(attach_composer_notices(s, p, lane, composer_card));
     // KSG Code's context strip: a bare muted row under the card, machine on the left and the
     // access mode on the right, inset to line up with the card's controls.
     let mut footer = row()
@@ -21723,5 +21931,96 @@ pub(crate) mod tests {
         assert!(transcript_context::has_context(
             &rt.state.current().messages[0]
         ));
+    }
+
+    #[test]
+    fn composer_notice_stack_attaches_above_composer_and_shows_details_on_overflow() {
+        use crate::composer_notices::{Group, Notice, NoticeAction, Variant};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            let clicks = Arc::new(AtomicUsize::new(0));
+            let clicks_action = clicks.clone();
+            rt.state.composer_notices.push(
+                Notice::new("att-long", Variant::Info, "alert", "Attention notice")
+                    .description(Some(
+                        "This description is deliberately very long so that it overflows a single line even on wide composer lanes and triggers the Details popover button across every width under test."
+                            .into(),
+                    ))
+                    .dismiss_label("Dismiss attention notice"),
+            );
+            rt.state.composer_notices.push(
+                Notice::new("env-first", Variant::Warning, "alert", "Studio is offline")
+                    .group(Group::Environment)
+                    .description(Some("This device is offline".into()))
+                    .actions(vec![NoticeAction::new("Retry", move |_| {
+                        clicks_action.fetch_add(1, Ordering::Relaxed);
+                    })]),
+            );
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (stack_rect, _) = rt.presented("composer-notices").expect("notice stack");
+            let (env_rect, _) = rt
+                .presented("composer-notice-env-first")
+                .expect("environment notice");
+            let (att_rect, _) = rt
+                .presented("composer-notice-att-long")
+                .expect("attention notice");
+            let (composer_rect, _) = rt.presented("composer").expect("composer card");
+
+            // Environment notice precedes Attention notice, consecutive cards touch, and the
+            // last card touches the composer with no gap at the same lane width.
+            assert!(
+                env_rect[1] < att_rect[1],
+                "{width}: env should be above att"
+            );
+            assert!(
+                (att_rect[1] - (env_rect[1] + env_rect[3])).abs() < 0.5,
+                "{width}: gap between notices: env={env_rect:?} att={att_rect:?}"
+            );
+            assert!(
+                (composer_rect[1] - (att_rect[1] + att_rect[3])).abs() < 0.5,
+                "{width}: gap before composer: att={att_rect:?} composer={composer_rect:?}"
+            );
+            assert!(
+                (stack_rect[2] - composer_rect[2]).abs() < 0.5,
+                "{width}: stack width {stack_rect:?} vs composer {composer_rect:?}"
+            );
+
+            // Long description shows Details and opens the details popover; Retry triggers action;
+            // Dismiss hides the attention notice.
+            assert!(
+                rt.presented("composer-notice-details-att-long").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "composer-notice-details-att-long");
+            rt.frame(1.0);
+            assert!(
+                rt.presented("composer-notice-details-popover").is_some(),
+                "{width}"
+            );
+            press(&mut rt, "close-notice-details");
+            rt.frame(1.0);
+            assert!(
+                rt.presented("composer-notice-details-popover").is_none(),
+                "{width}"
+            );
+
+            press(&mut rt, "composer-notice-action-env-first-0");
+            rt.frame(1.0);
+            assert_eq!(clicks.load(Ordering::Relaxed), 1, "{width}");
+
+            press(&mut rt, "composer-notice-dismiss-att-long");
+            rt.frame(1.0);
+            assert!(
+                rt.presented("composer-notice-att-long").is_none(),
+                "{width}"
+            );
+        }
     }
 }
