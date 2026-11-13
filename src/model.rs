@@ -4163,12 +4163,9 @@ pub struct State {
     pub right_panels: crate::right_panel::RightPanels,
     /// The right-panel tab context menu: the surface it opened on, and its anchor in window
     /// points, as `row_menu_at` holds the thread menu's. The panel view uses both.
-    #[allow(dead_code)]
     pub right_panel_menu: Option<String>,
-    #[allow(dead_code)]
     pub right_panel_menu_at: Option<(f32, f32)>,
     /// The resize handle is mid-drag: the edge line turns coral.
-    #[allow(dead_code)]
     pub right_panel_resizing: bool,
     pub ui_store: Option<crate::store::Store>,
     last_sweep: u64,

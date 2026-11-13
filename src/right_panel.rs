@@ -6,12 +6,9 @@ pub const MIN_WIDTH: f32 = 360.0;
 pub const DEFAULT_WIDTH: f32 = 540.0;
 /// KSG's keyboard resize step for the panel's Left and Right keys. The resize
 /// handle's key handler uses it.
-#[allow(dead_code)]
 pub const KEYBOARD_STEP: f32 = 16.0;
-#[allow(dead_code)]
 const MAX_FRACTION: f32 = 0.7;
 /// KSG keeps the conversation at least this wide beside an inline panel.
-#[allow(dead_code)]
 const SIBLING_MIN: f32 = 360.0;
 
 /// The key a thread's panel state lives under: machine plus thread id, so the
@@ -24,7 +21,6 @@ pub fn key(machine: &str, thread: usize) -> String {
 /// capped so the conversation keeps [`SIBLING_MIN`], never below [`MIN_WIDTH`].
 /// `container` is the width of the row the panel shares with the conversation.
 /// The panel view and resize handle use it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn max_width(viewport: f32, container: f32) -> f32 {
     (viewport * MAX_FRACTION)
         .floor()
@@ -34,7 +30,6 @@ pub fn max_width(viewport: f32, container: f32) -> f32 {
 
 /// KSG's `clamp`: a non-finite stored width falls back to the default. The
 /// panel view and resize handle use it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn clamp_width(width: f32, max: f32) -> f32 {
     if !width.is_finite() {
         return DEFAULT_WIDTH;
@@ -45,7 +40,6 @@ pub fn clamp_width(width: f32, max: f32) -> f32 {
 /// When the row the panel shares with the conversation is narrower than the
 /// panel's minimum plus the conversation's, the panel covers it instead (KSG's
 /// sheet mode). The panel view uses it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn covers(container: f32) -> bool {
     container < MIN_WIDTH + SIBLING_MIN
 }
@@ -181,8 +175,6 @@ impl RightPanels {
         });
     }
 
-    // The tab strip's press handler lands with the panel view; tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn activate(&mut self, thread: &str, surface_id: &str) {
         self.update_thread(thread, |current| {
             if current
@@ -219,8 +211,6 @@ impl RightPanels {
         });
     }
 
-    // The tab context menu lands with the panel view; tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn close_others(&mut self, thread: &str, surface_id: &str) {
         self.update_thread(thread, |current| {
             let Some(surface) = current
@@ -240,8 +230,6 @@ impl RightPanels {
         });
     }
 
-    // The tab context menu lands with the panel view; tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn close_to_right(&mut self, thread: &str, surface_id: &str) {
         self.update_thread(thread, |current| {
             let Some(index) = current
@@ -267,8 +255,6 @@ impl RightPanels {
         });
     }
 
-    // The tab context menu lands with the panel view; tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn close_all(&mut self, thread: &str) {
         self.update_thread(thread, |current| {
             if current.surfaces.is_empty() {
@@ -300,8 +286,6 @@ impl RightPanels {
         });
     }
 
-    // The close-panel button lands with the panel view; tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn close(&mut self, thread: &str) {
         self.update_thread(thread, |current| {
             if current.open {
