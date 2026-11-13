@@ -61,6 +61,34 @@ the timeline; Shina matches:
   project directory, folding absolute paths inside it and matching a rename's
   old or new path.
 
+## File tree
+
+`src/diff_tree.rs` ports KSG's `DiffFileTree.tsx` (mounted in the
+`FileExplorerPane` aside, right of the diff list). Where KSG feeds Pierre's
+`FileTree`, Shina flattens the same model — shown files deduped by path, with
+conflicting statuses folding to `Modified`, plus their ancestor directories in
+first-seen order — into `Ready::tree_rows`, drawn through `virtual_rows` at
+KSG's compact 24 px row height. Single-child directory chains show as one
+`a / b / c` row keyed on the deepest directory, folder presses fold the chain
+as one node, and `dirs_collapsed` is per thread, session only.
+
+Pressing a file calls `diff_panel::apply_reveal` — the same reveal the
+timeline rows take — and its selection sync opens the file's ancestor chain
+and scrolls the tree row into view. The diff list's first visible row drives
+the current file the other way: `diff_note_visible` marks the file whose
+section tops the viewport with `p.selected` and a 2 px coral bar, except while
+a reveal is in flight, which owns the position as KSG's
+`useCodeViewFileReveal` does. Arrow keys move a tree cursor on `diff-tree`;
+Left folds or goes to the parent, Right opens, Enter or Space activates.
+
+KSG's `useResizableWidth` bounds the pane to 160–560 px with a 40%/256 px
+default against a 256 px diff reserve; `diff-tree-resize` drags and keys the
+same way from the tree's left edge and the width persists as `diffTreeWidth`.
+The header's `diff-tree-toggle` (the `folder` glyph — the skin has no
+folder-tree drawing) saves as `diffTreeOpen` only when on, matching KSG's
+hidden default; KSG never names a hide threshold, so the tree and its toggle
+disappear below the lane its own bounds imply (160 + 256 = 416 px).
+
 ## Remaining
 
 Ported behavior still missing, with the KSG source that owns it:
@@ -68,7 +96,6 @@ Ported behavior still missing, with the KSG source that owns it:
 - Turn and tool-call diff sources, and the per-turn file list — `apps/web/src/components/DiffPanel.tsx`. KSG's timeline rows open a per-turn diff (`onOpenTurnDiff` selects the turn's checkpoint); Shina's `reveal_file` opens the working-tree diff instead, because turn checkpoints are not ported yet.
 - Commit list and the commits menu — `apps/web/src/components/DiffPanel.tsx` (`review.getBranchCommits`).
 - Branch base picker — `apps/web/src/components/DiffPanel.tsx` (`selectGitScope`'s chosen-base path).
-- File tree sidebar — `apps/web/src/components/diffs/diffFileTree.logic.ts`; `src/review_tree.rs` already holds the `TreeEntry` builder and sorts.
 - File explorer hand-off — `apps/web/src/components/DiffPanel.tsx`.
 - Diff annotations and comments — `apps/web/src/components/diffs/`.
 - Per-line syntax colouring by file extension is done; word-level change highlights and multi-line constructs (coloured line by line) remain — `apps/web/src/lib/diffRendering.ts`.

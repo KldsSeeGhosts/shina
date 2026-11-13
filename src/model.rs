@@ -4172,6 +4172,13 @@ pub struct State {
     /// App-wide "hide test files" switch for the diff panel; saved in the UI snapshot
     /// only when on.
     pub diff_hide_tests: bool,
+    /// KSG `fileTreeOpen`: whether the diff's file tree column shows. App-wide,
+    /// saved in the UI snapshot only when on — KSG's default is hidden.
+    pub diff_tree_open: bool,
+    /// KSG's persisted explorer-pane width; `None` tracks its 40%/256 px default.
+    pub diff_tree_width: Option<f32>,
+    /// The tree lane's resize handle is mid-drag: its edge line turns coral.
+    pub diff_tree_resizing: bool,
     /// Diff request ids; a newer request supersedes an older one.
     pub(crate) next_diff_request_id: u64,
     /// In-flight review.getDiffPreview RPCs: request id -> what it is for.
@@ -4458,6 +4465,9 @@ impl State {
             right_panel_resizing: false,
             diffs: Default::default(),
             diff_hide_tests: false,
+            diff_tree_open: false,
+            diff_tree_width: None,
+            diff_tree_resizing: false,
             next_diff_request_id: 0,
             pending_diff_requests: Default::default(),
             diff_rxs: Vec::new(),
@@ -13708,6 +13718,14 @@ impl State {
         if self.diff_hide_tests {
             value["diffHideTests"] = json!(true);
         }
+        // KSG's file tree defaults hidden; only a turn-on and a chosen lane
+        // width are saved.
+        if self.diff_tree_open {
+            value["diffTreeOpen"] = json!(true);
+        }
+        if let Some(width) = self.diff_tree_width {
+            value["diffTreeWidth"] = json!(width);
+        }
         value
     }
     pub(crate) fn runtime_input_snapshot(
@@ -13765,6 +13783,17 @@ impl State {
             .transpose()?
             .unwrap_or(crate::right_panel::DEFAULT_WIDTH);
         self.diff_hide_tests = ui["diffHideTests"].as_bool().unwrap_or(false);
+        self.diff_tree_open = ui["diffTreeOpen"].as_bool().unwrap_or(false);
+        self.diff_tree_width = ui
+            .get("diffTreeWidth")
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite())
+            .map(|n| {
+                n.clamp(
+                    crate::ui::diff_tree::MIN_W as f64,
+                    crate::ui::diff_tree::MAX_W as f64,
+                ) as f32
+            });
         self.project_scope = match ui["scope"].as_str() {
             Some("all") => ProjectScope::All,
             Some("none") => ProjectScope::NoProject,
