@@ -21325,6 +21325,7 @@ mod tests {
             )
             .unwrap(),
         );
+        state.claude_catalog.installed = true;
         state.thread_defaults.fallback_model_selection =
             Some(crate::model_selection::ModelSelection {
                 instance_id: "claude".into(),

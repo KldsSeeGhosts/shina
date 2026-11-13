@@ -16807,15 +16807,19 @@ pub(crate) mod tests {
                             .player()
                             .unwrap()
                             .clone();
-                        rt.frame(0.25);
-                        assert!(
-                            !matches!(player.state(), rune::PlayerState::Failed(_)),
-                            "{:?}",
-                            player.state()
-                        );
-                        assert!(player.duration().is_some_and(|duration| duration > 0.0));
-                        rt.frame(0.25);
-                        assert!(player.time() > 0.0);
+                        // Rune has no video playback on Linux yet, so only the
+                        // layout is checked there.
+                        if cfg!(any(target_os = "macos", windows)) {
+                            rt.frame(0.25);
+                            assert!(
+                                !matches!(player.state(), rune::PlayerState::Failed(_)),
+                                "{:?}",
+                                player.state()
+                            );
+                            assert!(player.duration().is_some_and(|duration| duration > 0.0));
+                            rt.frame(0.25);
+                            assert!(player.time() > 0.0);
+                        }
                     } else if attachment.id == file.id {
                         assert!(
                             rt.elements()
@@ -23046,6 +23050,7 @@ pub(crate) mod tests {
                 capabilities: opus_caps,
                 ..Default::default()
             }];
+            rt.state.claude_catalog.installed = true;
             rt.state.choose_harness("claude");
             rt.state
                 .current_mut()

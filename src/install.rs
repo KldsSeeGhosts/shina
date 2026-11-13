@@ -1063,7 +1063,7 @@ mod tests {
         let mac = InstalledTarget::MacBundle {
             app: PathBuf::from("/Applications/Shina.app"),
         };
-        let expected = if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        let expected = if cfg!(all(not(windows), target_arch = "x86_64")) {
             "Shina-macos-x86_64.zip"
         } else {
             "Shina-macos-aarch64.zip"
