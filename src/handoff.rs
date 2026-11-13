@@ -384,7 +384,9 @@ pub struct Package {
     pub context: String,
     pub covered: RunOrdinals,
     pub strategy: HandoffStrategy,
+    #[allow(dead_code)]
     pub selected: usize,
+    #[allow(dead_code)]
     pub omitted: usize,
     pub omitted_item_ids: Vec<String>,
     pub delivered_item_ids: Vec<String>,

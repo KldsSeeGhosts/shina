@@ -1980,6 +1980,7 @@ impl Thread {
     }
 
     /// The staged switch's destination, if any.
+    #[allow(dead_code)] // Read by UI tests and the picker's pending-row checks.
     pub fn staged_handoff(&self) -> Option<&crate::handoff::Handoff> {
         self.staged_handoff
             .and_then(|index| self.handoffs.get(index))
