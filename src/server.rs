@@ -595,6 +595,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut question_contract = false;
     let mut question_attachments = false;
     let mut question_dismiss = false;
+    let mut vcs_worktrees = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
     let mut cursor = None;
@@ -687,6 +688,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if question_attachments {capabilities.push(protocol::QUESTION_ATTACHMENTS);}
                         question_dismiss=minor>=19;
                         if question_dismiss {capabilities.push(protocol::QUESTION_DISMISS);}
+                        vcs_worktrees = minor >= 20;
+                        if vcs_worktrees {
+                            capabilities.push(protocol::VCS_WORKTREES);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -792,6 +797,198 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             })
                             .await
                             .unwrap_or_else(|_| Err("Writing workspace file failed.".into()))
+                        }
+                    }
+                } else if method == "vcs.listBranches" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsListBranchesInput>(args.clone())
+                        {
+                            Err(err) => Err(format!("Invalid vcs.listBranches parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.listBranches", &json!({}))?;
+                                    let result = crate::vcs::list_branches(&input)?;
+                                    database.authorize(&device, "vcs.listBranches", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the branch listing result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Listing branches failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.status" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsStatusInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid vcs.status parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.status", &json!({}))?;
+                                    let result = crate::vcs::status(&input)?;
+                                    database.authorize(&device, "vcs.status", &json!({}))?;
+                                    serde_json::to_value(result)
+                                        .map_err(|_| "Could not encode the status result.".into())
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Reading VCS status failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.listWorktrees" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsListWorktreesInput>(
+                            args.clone(),
+                        ) {
+                            Err(err) => Err(format!("Invalid vcs.listWorktrees parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.listWorktrees", &json!({}))?;
+                                    let result = crate::vcs::list_worktrees(&input)?;
+                                    database.authorize(&device, "vcs.listWorktrees", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the worktree listing result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Listing worktrees failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.createWorktree" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsCreateWorktreeInput>(
+                            args.clone(),
+                        ) {
+                            Err(err) => {
+                                Err(format!("Invalid vcs.createWorktree parameters: {err}"))
+                            }
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let worktrees_dir = shared.directory.join("worktrees");
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(
+                                        &device,
+                                        "vcs.createWorktree",
+                                        &json!({}),
+                                    )?;
+                                    if let Some(ref target) = input.path {
+                                        let trimmed = target.trim();
+                                        if trimmed.is_empty()
+                                            || !crate::vcs::is_managed_worktree_path(
+                                                std::path::Path::new(trimmed),
+                                                &worktrees_dir,
+                                            )
+                                        {
+                                            return Err("Worktree target path must be inside the server's worktrees directory.".into());
+                                        }
+                                    }
+                                    let result =
+                                        crate::vcs::create_worktree(&input, &worktrees_dir)?;
+                                    database.authorize(
+                                        &device,
+                                        "vcs.createWorktree",
+                                        &json!({}),
+                                    )?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the created worktree result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Creating worktree failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.removeWorktree" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsRemoveWorktreeInput>(
+                            args.clone(),
+                        ) {
+                            Err(err) => {
+                                Err(format!("Invalid vcs.removeWorktree parameters: {err}"))
+                            }
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                let worktrees_dir = shared.directory.join("worktrees");
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(
+                                        &device,
+                                        "vcs.removeWorktree",
+                                        &json!({}),
+                                    )?;
+                                    let cwd = crate::vcs::validate_existing_directory(
+                                        &input.cwd, "cwd",
+                                    )?;
+                                    let target = input.path.trim();
+                                    if target.is_empty()
+                                        || !crate::vcs::is_managed_worktree_path(
+                                            std::path::Path::new(target),
+                                            &worktrees_dir,
+                                        )
+                                        || !crate::vcs::is_registered_worktree(
+                                            &cwd,
+                                            std::path::Path::new(target),
+                                        )?
+                                    {
+                                        return Err("Worktree path must be a managed worktree inside the server's worktrees directory.".into());
+                                    }
+                                    crate::vcs::remove_worktree(&input)?;
+                                    database.authorize(
+                                        &device,
+                                        "vcs.removeWorktree",
+                                        &json!({}),
+                                    )?;
+                                    Ok(json!({}))
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Removing worktree failed.".into()))
+                            }
+                        }
+                    }
+                } else if method == "vcs.runSetup" {
+                    if !vcs_worktrees {
+                        Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into())
+                    } else {
+                        let args = params.get("args").unwrap_or(params);
+                        match serde_json::from_value::<crate::vcs::VcsRunSetupInput>(args.clone()) {
+                            Err(err) => Err(format!("Invalid vcs.runSetup parameters: {err}")),
+                            Ok(input) => {
+                                let database = shared.database.clone();
+                                let device = device.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    database.authorize(&device, "vcs.runSetup", &json!({}))?;
+                                    let result = crate::vcs::run_setup(&input)?;
+                                    database.authorize(&device, "vcs.runSetup", &json!({}))?;
+                                    serde_json::to_value(result).map_err(|_| {
+                                        "Could not encode the setup script result.".into()
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("Running setup script failed.".into()))
+                            }
                         }
                     }
                 } else if method == "peer.thread.wait" {
@@ -2617,6 +2814,277 @@ mod tests {
                     .await
                     .unwrap_err();
             assert!(!missing.is_empty());
+        });
+    }
+
+    #[test]
+    fn vcs_requests_capabilities_and_authorization() {
+        if !crate::vcs::git_available() {
+            eprintln!("skipping test: git is not on PATH");
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("vcs-rpc").await;
+            let profile = fixture.shared.directory.join("client");
+            let link = fixture.link(&profile).await;
+
+            // Capability is present at protocol::MINOR.
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::MINOR))
+            );
+            assert!(crate::client::supports_vcs_worktrees(&hello));
+
+            // Capability is absent one minor below, and client wrappers refuse before sending.
+            let older = Fixture::with_minor("vcs-older", protocol::MINOR - 1).await;
+            let older_link = older.link(&older.shared.directory.join("client")).await;
+            let older_hello = crate::client::remote_rpc(&older_link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(
+                older_hello["protocolMinor"].as_u64(),
+                Some(u64::from(protocol::MINOR - 1))
+            );
+            assert!(!crate::client::supports_vcs_worktrees(&older_hello));
+            let err = crate::client::vcs_status(
+                &older_link,
+                &crate::vcs::VcsStatusInput {
+                    cwd: older.shared.directory.to_string_lossy().into_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err, protocol::VCS_WORKTREES_UPDATE_REQUIRED);
+
+            // Set up a temporary git repo inside the fixture directory.
+            let empty_cfg = fixture.shared.directory.join("empty.gitconfig");
+            std::fs::write(&empty_cfg, "").unwrap();
+            let repo = fixture.shared.directory.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let run_git = |cwd: &std::path::Path, args: &[&str]| {
+                let mut cmd = std::process::Command::new("git");
+                cmd.arg("-c")
+                    .arg("user.name=Test User")
+                    .arg("-c")
+                    .arg("user.email=test@example.com")
+                    .args(args)
+                    .current_dir(cwd)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_CONFIG_GLOBAL", &empty_cfg)
+                    .env("GIT_CONFIG_SYSTEM", &empty_cfg);
+                let out =
+                    crate::process::output(&mut cmd, Duration::from_secs(10), 1024 * 1024).unwrap();
+                assert!(out.status.success(), "{:?} failed", args);
+            };
+            run_git(&repo, &["init", "-b", "main", "--quiet"]);
+            std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+            std::fs::write(
+                repo.join("t3.json"),
+                r#"{"scripts":[{"name":"Setup","command":"echo ok","runOnWorktreeCreate":true}]}"#,
+            )
+            .unwrap();
+            run_git(&repo, &["add", "README.md", "t3.json"]);
+            run_git(&repo, &["commit", "-m", "init", "--quiet"]);
+            let repo_str = repo.to_string_lossy().into_owned();
+
+            // 1. vcs.listBranches
+            let branches = crate::client::vcs_list_branches(
+                &link,
+                &crate::vcs::VcsListBranchesInput {
+                    cwd: repo_str.clone(),
+                    query: None,
+                    cursor: None,
+                    include_matching_remote_refs: None,
+                    ref_kind: None,
+                    refresh: None,
+                    limit: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(branches.is_repo);
+            assert_eq!(branches.refs[0].name, "main");
+            assert!(branches.refs[0].current);
+
+            // 2. vcs.status
+            let st = crate::client::vcs_status(
+                &link,
+                &crate::vcs::VcsStatusInput {
+                    cwd: repo_str.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(st.is_repo);
+            assert_eq!(st.ref_name.as_deref(), Some("main"));
+
+            // 3. vcs.createWorktree outside worktrees dir is rejected.
+            let outside = fixture.shared.directory.join("outside-wt");
+            let outside_err = crate::client::vcs_create_worktree(
+                &link,
+                &crate::vcs::VcsCreateWorktreeInput {
+                    cwd: repo_str.clone(),
+                    ref_name: "main".into(),
+                    new_ref_name: Some("feature/outside".into()),
+                    base_ref_name: None,
+                    path: Some(outside.to_string_lossy().into_owned()),
+                    start_from_origin: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(outside_err.contains("worktrees directory"), "{outside_err}");
+            assert!(!outside.exists());
+
+            // 4. vcs.createWorktree with managed path succeeds.
+            let created = crate::client::vcs_create_worktree(
+                &link,
+                &crate::vcs::VcsCreateWorktreeInput {
+                    cwd: repo_str.clone(),
+                    ref_name: "main".into(),
+                    new_ref_name: Some("feature/rpc-wt".into()),
+                    base_ref_name: Some("main".into()),
+                    path: None,
+                    start_from_origin: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(std::path::Path::new(&created.worktree.path).exists());
+            assert_eq!(created.worktree.ref_name, "feature/rpc-wt");
+
+            // 5. vcs.listWorktrees
+            let wts = crate::client::vcs_list_worktrees(
+                &link,
+                &crate::vcs::VcsListWorktreesInput {
+                    cwd: repo_str.clone(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(wts.is_repo);
+            assert_eq!(wts.worktrees.len(), 2);
+
+            // 6. vcs.runSetup
+            let setup = crate::client::vcs_run_setup(
+                &link,
+                &crate::vcs::VcsRunSetupInput {
+                    cwd: repo_str.clone(),
+                    worktree_path: Some(created.worktree.path.clone()),
+                    timeout_ms: Some(10_000),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(setup.status, "completed");
+            assert_eq!(setup.exit_code, Some(0));
+            assert!(setup.output.contains("ok"));
+
+            // 7. Unknown/missing fields rejected clearly.
+            let unknown_err = crate::client::remote_rpc(
+                &link,
+                "vcs.status",
+                json!({"cwd": repo_str, "unexpected": true}),
+            )
+            .await
+            .unwrap_err();
+            assert!(unknown_err.contains("unknown field"), "{unknown_err}");
+
+            // 8. Read-only device can read, cannot operate.
+            fixture
+                .shared
+                .database
+                .issue_scoped_device("vcs-reader", "vcs-reader-secret", &["paired", "read"])
+                .unwrap();
+            let mut reader = link.clone();
+            reader.device_id = "vcs-reader".into();
+            reader.token = "vcs-reader-secret".into();
+            assert!(
+                crate::client::vcs_status(
+                    &reader,
+                    &crate::vcs::VcsStatusInput {
+                        cwd: repo_str.clone(),
+                    },
+                )
+                .await
+                .is_ok()
+            );
+            assert!(
+                crate::client::vcs_list_worktrees(
+                    &reader,
+                    &crate::vcs::VcsListWorktreesInput {
+                        cwd: repo_str.clone(),
+                    },
+                )
+                .await
+                .is_ok()
+            );
+            for (method, payload) in [
+                (
+                    "vcs.createWorktree",
+                    json!({"cwd": repo_str, "refName": "main", "newRefName": "feature/ro"}),
+                ),
+                (
+                    "vcs.removeWorktree",
+                    json!({"cwd": repo_str, "path": created.worktree.path}),
+                ),
+                ("vcs.runSetup", json!({"cwd": repo_str})),
+            ] {
+                let denied = crate::client::remote_rpc(&reader, method, payload)
+                    .await
+                    .unwrap_err();
+                assert!(denied.contains("operate"), "{method}: {denied}");
+            }
+
+            // 9. vcs.removeWorktree rejects foreign paths (outside worktrees dir and non-worktree inside).
+            std::fs::create_dir_all(&outside).unwrap();
+            let foreign_err = crate::client::vcs_remove_worktree(
+                &link,
+                &crate::vcs::VcsRemoveWorktreeInput {
+                    cwd: repo_str.clone(),
+                    path: outside.to_string_lossy().into_owned(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(foreign_err.contains("managed worktree"), "{foreign_err}");
+
+            let fake_inside = fixture
+                .shared
+                .directory
+                .join("worktrees")
+                .join("repo")
+                .join("not-a-worktree");
+            std::fs::create_dir_all(&fake_inside).unwrap();
+            let fake_err = crate::client::vcs_remove_worktree(
+                &link,
+                &crate::vcs::VcsRemoveWorktreeInput {
+                    cwd: repo_str.clone(),
+                    path: fake_inside.to_string_lossy().into_owned(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(fake_err.contains("managed worktree"), "{fake_err}");
+            assert!(fake_inside.exists());
+
+            // 10. Valid vcs.removeWorktree removes the created worktree.
+            crate::client::vcs_remove_worktree(
+                &link,
+                &crate::vcs::VcsRemoveWorktreeInput {
+                    cwd: repo_str,
+                    path: created.worktree.path.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!std::path::Path::new(&created.worktree.path).exists());
         });
     }
 }

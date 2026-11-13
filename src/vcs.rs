@@ -21,7 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub const WORKTREE_BRANCH_PREFIX: &str = "t3";
+#[cfg_attr(not(test), allow(dead_code))]
 pub const GIT_LIST_BRANCHES_DEFAULT_LIMIT: usize = 100;
 pub const GIT_LIST_BRANCHES_MAX_LIMIT: usize = 200;
 pub const T3_PROJECT_FILE_NAME: &str = "t3.json";
@@ -141,6 +143,7 @@ pub struct VcsStatusResult {
 }
 
 impl VcsStatusResult {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_detached(&self) -> bool {
         self.is_repo && self.ref_name.is_none()
     }
@@ -251,6 +254,7 @@ pub struct VcsRunSetupResult {
     pub duration_ms: u64,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BranchNamingMode {
     Semantic,
@@ -286,6 +290,7 @@ struct GitOutput {
     stderr: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn git_available() -> bool {
     let mut cmd = Command::new("git");
     cmd.arg("--version");
@@ -2128,6 +2133,20 @@ pub fn list_worktrees_with(
     })
 }
 
+pub fn is_registered_worktree(cwd: &Path, target: &Path) -> Result<bool, String> {
+    let listed = list_worktrees(&VcsListWorktreesInput {
+        cwd: cwd.to_string_lossy().into_owned(),
+    })?;
+    if !listed.is_repo {
+        return Ok(false);
+    }
+    let real_target = real_location(target);
+    Ok(listed
+        .worktrees
+        .iter()
+        .any(|entry| real_location(Path::new(&entry.path)) == real_target))
+}
+
 /// Ported from KSG Code's `packages/shared/src/git.ts` (`sanitizeBranchFragment`).
 pub fn sanitize_branch_fragment(raw: &str) -> String {
     let stripped = strip_combining_marks(raw);
@@ -2214,6 +2233,7 @@ fn collapse_char(s: &str, target: char) -> String {
 }
 
 /// Ported from KSG Code's `formatGeneratedBranchName` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn format_generated_branch_name(raw: &str, mode: BranchNamingMode) -> String {
     match mode {
         BranchNamingMode::Custom => raw.trim().to_owned(),
@@ -2247,6 +2267,7 @@ pub fn format_generated_branch_name(raw: &str, mode: BranchNamingMode) -> String
 }
 
 /// Ported from KSG Code's `sanitizeFeatureBranchName` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn sanitize_feature_branch_name(raw: &str) -> String {
     let sanitized = sanitize_branch_fragment(raw);
     if sanitized.contains('/') {
@@ -2257,6 +2278,7 @@ pub fn sanitize_feature_branch_name(raw: &str) -> String {
 }
 
 /// Ported from KSG Code's `resolveAutoFeatureBranchName` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resolve_auto_feature_branch_name(
     existing_branch_names: &[&str],
     preferred_branch: Option<&str>,
@@ -2299,6 +2321,7 @@ pub fn resolve_auto_feature_branch_name(
 }
 
 /// Ported from KSG Code's `resolveAvailableBranchName` in `GitVcsDriverCore.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resolve_available_branch_name_from_list(
     existing_branches: &[String],
     requested_branch: &str,
@@ -2337,10 +2360,12 @@ pub fn resolve_available_branch_name_from_list(
     ))
 }
 
+#[allow(dead_code)]
 pub fn resolve_available_branch_name(cwd: &Path, requested_branch: &str) -> Result<String, String> {
     resolve_available_branch_name_with(cwd, requested_branch, &GitContext::default())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resolve_available_branch_name_with(
     cwd: &Path,
     requested_branch: &str,
@@ -2364,6 +2389,7 @@ pub fn resolve_available_branch_name_with(
 }
 
 /// Ported from KSG Code's `buildTemporaryWorktreeBranchName` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_temporary_worktree_branch_name(random_hex: &str) -> String {
     let token: String = random_hex
         .to_ascii_lowercase()
@@ -2375,6 +2401,7 @@ pub fn build_temporary_worktree_branch_name(random_hex: &str) -> String {
 }
 
 /// Ported from KSG Code's `flattenTemporaryWorktreeBranchName` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn flatten_temporary_worktree_branch_name(ref_name: &str) -> String {
     let normalized = ref_name.trim().to_ascii_lowercase();
     let token_start = normalized.find(['-', '/']).map_or(0, |idx| idx + 1);
@@ -2383,6 +2410,7 @@ pub fn flatten_temporary_worktree_branch_name(ref_name: &str) -> String {
 }
 
 /// Ported from KSG Code's `isTemporaryWorktreeBranch` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_temporary_worktree_branch(ref_name: &str) -> bool {
     let trimmed = ref_name.trim().to_ascii_lowercase();
     if let Some(rest) = trimmed
@@ -2436,6 +2464,7 @@ fn is_uuid_v4(s: &str) -> bool {
 }
 
 /// Ported from KSG Code's `sanitizeNewRefName` in `packages/shared/src/git.ts`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn sanitize_new_ref_name(raw_name: &str) -> String {
     let mut out = String::new();
     let mut in_ws = false;

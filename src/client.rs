@@ -2021,6 +2021,11 @@ async fn remote_request_outcome(
             .map(Vec::len)
             .sum::<usize>();
         8 + 16 * files as u64
+    } else if matches!(
+        command.method.as_str(),
+        "vcs.createWorktree" | "vcs.removeWorktree" | "vcs.runSetup"
+    ) {
+        120
     } else {
         8
     };
@@ -2099,6 +2104,18 @@ async fn remote_request_outcome(
         }
         if matches!(
             command.method.as_str(),
+            "vcs.listBranches"
+                | "vcs.status"
+                | "vcs.createWorktree"
+                | "vcs.removeWorktree"
+                | "vcs.listWorktrees"
+                | "vcs.runSetup"
+        ) && !supports_vcs_worktrees(&hello)
+        {
+            return Err(protocol::VCS_WORKTREES_UPDATE_REQUIRED.into());
+        }
+        if matches!(
+            command.method.as_str(),
             "server.updateStatus" | "server.requestUpdate"
         ) && hello["protocolMinor"].as_u64().unwrap_or(0) < 6
         {
@@ -2153,6 +2170,76 @@ pub fn supports_project_write_file(hello: &Value) -> bool {
                 .iter()
                 .any(|capability| capability == protocol::PROJECT_WRITE_FILE)
         })
+}
+
+pub fn supports_vcs_worktrees(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::VCS_WORKTREES)
+        })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_list_branches(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsListBranchesInput,
+) -> Result<crate::vcs::VcsListBranchesResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.listBranches", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.listBranches response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_status(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsStatusInput,
+) -> Result<crate::vcs::VcsStatusResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.status", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.status response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_create_worktree(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsCreateWorktreeInput,
+) -> Result<crate::vcs::VcsCreateWorktreeResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.createWorktree", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.createWorktree response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_remove_worktree(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsRemoveWorktreeInput,
+) -> Result<(), String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let _ = remote_rpc(link, "vcs.removeWorktree", args).await?;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_list_worktrees(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsListWorktreesInput,
+) -> Result<crate::vcs::VcsListWorktreesResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.listWorktrees", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.listWorktrees response: {e}"))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn vcs_run_setup(
+    link: &crate::peer::Link,
+    input: &crate::vcs::VcsRunSetupInput,
+) -> Result<crate::vcs::VcsRunSetupResult, String> {
+    let args = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    let result = remote_rpc(link, "vcs.runSetup", args).await?;
+    serde_json::from_value(result).map_err(|e| format!("Invalid vcs.runSetup response: {e}"))
 }
 
 fn wire_command(command: &Command) -> Message {
