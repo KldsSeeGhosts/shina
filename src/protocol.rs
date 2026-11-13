@@ -3,13 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 24;
+pub const MINOR: u32 = 25;
 pub const STAGED_ATTACHMENTS_MINOR: u32 = 21;
 pub const VCS_WORKTREES_MINOR: u32 = 20;
 pub const DRAFT_ROUTING_MINOR: u32 = 22;
 pub const PROVIDER_HANDOFF_MINOR: u32 = 23;
 pub const WORKSPACE_SEARCH_MINOR: u32 = 24;
 pub const WORKSPACE_SEARCH: &str = "workspace-search-v1";
+pub const WORKSPACE_READ_FILE_MINOR: u32 = 25;
+pub const WORKSPACE_READ_FILE: &str = "workspace-read-file-v1";
 pub const THREAD_TITLE_SEARCH_MINOR: u32 = 24;
 pub const THREAD_TITLE_SEARCH: &str = "thread-title-search-v1";
 pub const VCS_WORKTREES: &str = "vcs-worktrees-v1";
@@ -198,6 +200,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "filesystem.browse"
         | "usage.limits"
         | "workspace.searchEntries"
+        | "workspace.readFile"
         | "vcs.listBranches"
         | "vcs.status"
         | "vcs.listWorktrees" => "read",
@@ -661,6 +664,7 @@ mod tests {
                 | "filesystem.browse"
                 | "usage.limits"
                 | "workspace.searchEntries"
+                | "workspace.readFile"
                 | "vcs.listBranches"
                 | "vcs.status"
                 | "vcs.listWorktrees" => "read",

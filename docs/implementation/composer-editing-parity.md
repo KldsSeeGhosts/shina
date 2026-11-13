@@ -159,3 +159,7 @@ Implementation commits:
 - `a003af6` adds the initial failing parity tests.
 - `8007652` ports inline rules, serialization and code commands.
 - `e546478` adds Markdown paste, token-source retention, structural paste and integration tests.
+
+## Remaining
+
+- Pill hover tooltips (KSG's `WorkspaceEntryTooltip`) are not ported; Shina pills show no hover card.

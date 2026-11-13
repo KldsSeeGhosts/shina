@@ -950,7 +950,10 @@ impl State {
         })
     }
     pub(crate) fn attachment_preview_link(&self) -> Option<Link> {
-        connection(self, &self.machines.selected).2
+        self.attachment_preview_link_on(&self.machines.selected.clone())
+    }
+    pub(crate) fn attachment_preview_link_on(&self, machine: &str) -> Option<Link> {
+        connection(self, machine).2
     }
     pub(crate) fn file_attachment_staging_supported_on(&self, machine: &str) -> bool {
         self.file_attachment_staging_limit_on(machine).is_some()

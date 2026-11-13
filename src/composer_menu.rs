@@ -174,7 +174,7 @@ pub(crate) fn apply_mention_result(
     true
 }
 
-fn mention_cwd(
+pub(crate) fn mention_cwd(
     s: &State,
     machine: &str,
     project: Option<crate::projects::ProjectId>,

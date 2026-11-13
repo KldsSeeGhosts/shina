@@ -322,7 +322,7 @@ fn logical_file_id(id: &str) -> bool {
         })
 }
 
-fn validate_file_metadata(name: &str, mime: &str, length: u64) -> Result<(), String> {
+pub(crate) fn validate_file_metadata(name: &str, mime: &str, length: u64) -> Result<(), String> {
     if name.trim().is_empty()
         || name.encode_utf16().count() > 255
         || mime.trim().is_empty()
@@ -389,6 +389,26 @@ pub(crate) fn store_uploaded_file(
         uploaded: None,
         source: None,
     })
+}
+
+/// `workspace.readFile` stores a bounded read in the same content-addressed
+/// store uploads use, so clients fetch it through `/v1/blobs` like any file
+/// attachment. The caller resolves the path; this only bounds and stores it.
+pub(crate) fn store_read_file(
+    directory: &Path,
+    path: &Path,
+    name: &str,
+    mime: &str,
+) -> Result<Attachment, String> {
+    let file = fs::File::open(path).map_err(|e| format!("Missing file {}: {e}", path.display()))?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Workspace path is not a file.".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read {name}: {e}"))?;
+    store_uploaded_file(directory, name, mime, &bytes)
 }
 
 pub(crate) fn transfer_file_bytes(attachment: &Attachment) -> Result<Vec<u8>, String> {

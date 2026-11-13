@@ -4221,6 +4221,8 @@ pub struct State {
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
     pub mention_search: crate::ui::composer_menu::MentionSearch,
+    /// Sequence for `mention:preview:{seq}` workspace.readFile calls.
+    pub(crate) file_preview_seq: u64,
     pub pending_open_urls: Vec<String>,
     pub next_usage_limits_request_id: u64,
     pub pending_usage_limits_request: Option<(u64, String, usize, String)>,
@@ -4476,6 +4478,7 @@ impl State {
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
             mention_search: crate::ui::composer_menu::MentionSearch::default(),
+            file_preview_seq: 0,
             pending_open_urls: Vec::new(),
             next_usage_limits_request_id: 0,
             pending_usage_limits_request: None,

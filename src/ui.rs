@@ -27,6 +27,8 @@ mod attachment_text_preview;
 mod captain_ui;
 #[path = "composer_menu.rs"]
 pub(crate) mod composer_menu;
+#[path = "composer_press.rs"]
+pub(crate) mod composer_press;
 #[path = "composer_stash.rs"]
 pub(crate) mod composer_stash;
 #[path = "composer_ui.rs"]
@@ -12877,6 +12879,7 @@ fn composer(
             let t = s.current_mut();
             crate::composer_source::on_selection_change(&mut t.composer_source, &mut t.draft);
         })
+        .on_input_pill_press(|s: &mut State, id, _, _| s.press_composer_pill(id))
         .decorations(source_spans)
         .strikes(source_strikes);
     if collapsed {
@@ -16590,6 +16593,46 @@ pub(crate) mod tests {
                     mods: Default::default()
                 }
             ));
+        }
+    }
+
+    #[test]
+    fn composer_file_pill_opens_a_transient_preview_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            let file = rt.state.data_dir.join(format!("mention-{width}.txt"));
+            std::fs::write(&file, "mention preview body").unwrap();
+            let token = crate::composer_tokens::Token::File {
+                path: file,
+                directory: false,
+                source: None,
+            };
+            let id = token.id();
+            rt.state
+                .current_mut()
+                .draft
+                .replace_with_pill(0..0, id.clone(), "mention.txt");
+            rt.invalidate();
+            rt.frame(0.0);
+            // The headless runtime cannot point at a pill inside a text field,
+            // so press through the same handler `on_input_pill_press` calls.
+            rt.update(|s, _| s.press_composer_pill(&id));
+            rt.frame(0.0);
+            let (dialog, _) = rt
+                .presented("attachment-preview")
+                .unwrap_or_else(|| panic!("{width}"));
+            assert!(
+                dialog[0] >= 0.0 && dialog[0] + dialog[2] <= width + 0.5,
+                "{width}: {dialog:?}"
+            );
+            let preview = rt.state.attachment_preview.as_ref().unwrap();
+            assert!(preview.transient && preview.error.is_none());
+            assert!(rt.state.current().draft_images.is_empty());
+            let draft = rt.state.current().draft.text.clone();
+            press(&mut rt, "close-attachment-preview");
+            assert!(rt.state.attachment_preview.is_none());
+            assert_eq!(rt.state.current().draft.text, draft);
         }
     }
 
