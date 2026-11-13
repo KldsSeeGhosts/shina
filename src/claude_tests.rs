@@ -986,3 +986,24 @@ fn auto_mode_maps_to_claude_auto_permission_mode() {
     assert_eq!(client.wire[0]["request"]["subtype"], "set_permission_mode");
     assert_eq!(client.wire[0]["request"]["mode"], "auto");
 }
+
+#[test]
+fn claude_fresh_session_passes_session_id_and_not_resume() {
+    let client = Client::new(Start {
+        id: "claude".into(),
+        workspace: PathBuf::from("."),
+        source: SessionSource::New,
+        instructions: None,
+        link: None,
+        owner: Arc::default(),
+        context_sent: false,
+    });
+    let mut command = Command::new("claude");
+    client.launch(&mut command);
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.iter().any(|arg| arg == "--session-id"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg == "--resume"), "{args:?}");
+}

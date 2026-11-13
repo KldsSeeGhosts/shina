@@ -494,6 +494,9 @@ pub struct Thread {
     pub(crate) client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
     pub(crate) remote_send: Option<(uuid::Uuid, crate::composer_rich::Snapshot)>,
+    pub(crate) remote_send_fresh_arm: Option<u64>,
+    pub fresh_session_arm: Option<u64>,
+    pub fresh_session_messages: Vec<String>,
     pub composer_context_supported: bool,
     pub(crate) background_start_pending: bool,
     pub(crate) background_send: Option<String>,
@@ -615,6 +618,20 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub fn is_fresh_session_message(&self, message_id: &str) -> bool {
+        self.fresh_session_messages
+            .iter()
+            .any(|id| id == message_id)
+    }
+
+    #[cfg(test)]
+    pub fn fresh_session_command_available_local(&self) -> bool {
+        !self.messages.is_empty()
+            && crate::harness::supports_fresh_context(&self.harness)
+            && self.request.is_none()
+            && self.native.questionnaire.is_none()
+    }
+
     pub fn can_choose_harness(&self) -> bool {
         if self.remote.is_some() {
             return self.projected_harness_choice;
@@ -806,6 +823,9 @@ impl Thread {
         Self {
             remote: None,
             remote_send: None,
+            remote_send_fresh_arm: None,
+            fresh_session_arm: None,
+            fresh_session_messages: Vec::new(),
             composer_context_supported: true,
             background_start_pending: false,
             background_send: None,
@@ -970,17 +990,7 @@ impl Thread {
         self.startup_selection_verified = false;
         self.context_startup_requested = false;
         self.context.begin_model_change();
-        let source = self
-            .native
-            .fork_source
-            .clone()
-            .map(crate::backend::SessionSource::Fork)
-            .or_else(|| {
-                self.session
-                    .clone()
-                    .map(crate::backend::SessionSource::Resume)
-            })
-            .unwrap_or(crate::backend::SessionSource::New);
+        let source = self.planned_session_source();
         match crate::harness::start(
             backend,
             crate::harness::Start {
@@ -997,6 +1007,19 @@ impl Thread {
             Ok(session) => self.pi = Some(session),
             Err(error) => self.fail_session(error),
         }
+    }
+
+    pub(crate) fn planned_session_source(&self) -> crate::backend::SessionSource {
+        self.native
+            .fork_source
+            .clone()
+            .map(crate::backend::SessionSource::Fork)
+            .or_else(|| {
+                self.session
+                    .clone()
+                    .map(crate::backend::SessionSource::Resume)
+            })
+            .unwrap_or(crate::backend::SessionSource::New)
     }
 
     pub fn set_model(&mut self, provider: String, model_id: String) {
@@ -1197,14 +1220,15 @@ impl Thread {
 
     #[cfg(test)]
     pub fn send(&mut self) {
-        self.send_with_peers(None, &[], &str::to_owned);
+        self.send_with_fresh(None, &[], &str::to_owned, false);
     }
 
-    pub(crate) fn send_with_peers(
+    pub(crate) fn send_with_fresh(
         &mut self,
         target_server_id: Option<&str>,
         peers: &[crate::peer::Peer],
         machine_name: &dyn Fn(&str) -> String,
+        fresh_context: bool,
     ) {
         if self.offline_blocked || self.status == Status::Paused {
             return;
@@ -1249,7 +1273,7 @@ impl Thread {
             supported_access_modes(&self.harness),
         )
         .1;
-        self.begin_prompt(prompt);
+        self.begin_prompt_with_fresh(prompt, fresh_context);
     }
 
     pub fn reconcile_draft_context(&mut self) {
@@ -1285,7 +1309,31 @@ impl Thread {
         self.submission_error = crate::composer::prompt_length_validation_message(&expanded);
     }
 
-    fn begin_prompt(&mut self, prompt: Prompt) {
+    pub(super) fn begin_prompt(&mut self, prompt: Prompt) {
+        self.begin_prompt_with_fresh(prompt, false);
+    }
+
+    pub(super) fn begin_prompt_with_fresh(&mut self, prompt: Prompt, fresh_context: bool) {
+        if fresh_context {
+            let held_queue = !self.native.queue.is_empty();
+            let previous_held = self.native.queue_held;
+            if held_queue {
+                self.native.queue_held = true;
+            }
+            if self.pi.is_some() {
+                self.disconnect();
+            }
+            if held_queue {
+                self.native.queue_held = previous_held;
+            }
+            self.session = None;
+            self.harness_context_sent = false;
+            self.native.fork_source = None;
+            self.native.fork_entry = None;
+            self.native.previous_session = None;
+            self.native.session_name = None;
+            self.context.begin_model_change();
+        }
         self.run_id = Some(uuid::Uuid::new_v4().to_string());
         self.resumable_run_id = None;
         self.continuation_of_run_id = None;
@@ -1314,8 +1362,12 @@ impl Thread {
                 prompt.text.chars().take(45).collect()
             };
         }
+        let message_id = uuid::Uuid::new_v4().to_string();
+        if fresh_context {
+            self.fresh_session_messages.push(message_id.clone());
+        }
         self.messages.push(Message {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: message_id,
             role: "You",
             text: prompt.text.clone(),
             images: prompt.images.to_vec(),
@@ -2191,6 +2243,27 @@ impl Thread {
                             return;
                         }
                         if let Some(messages) = record["data"]["messages"].as_array() {
+                            let fresh_boundary = self
+                                .messages
+                                .iter()
+                                .rposition(|m| self.is_fresh_session_message(&m.id));
+                            if let Some(b) = fresh_boundary
+                                && messages.is_empty()
+                                && record["data"]["replaceHistory"] != true
+                                && self.queued_prompt.is_none()
+                                && self.pending_prompt.is_none()
+                                && self.messages.len() > b
+                            {
+                                self.recover_native_inputs();
+                                self.history_loaded = true;
+                                self.drive_session();
+                                return;
+                            }
+                            let saved_queued_id = self
+                                .queued_prompt
+                                .as_ref()
+                                .and_then(|(_, idx)| self.messages.get(*idx).map(|m| m.id.clone()));
+                            let _ = &saved_queued_id;
                             let saved_work = self.work.clone();
                             let saved_orders: std::collections::HashMap<_, _> = self
                                 .tools
@@ -2204,9 +2277,44 @@ impl Thread {
                                 .filter(|t| t.order > 0)
                                 .map(|t| (t.anchor, t.block, t.order))
                                 .collect();
-                            let saved_messages = std::mem::take(&mut self.messages);
-                            self.tools.clear();
-                            self.thoughts.clear();
+                            let mut saved_messages = std::mem::take(&mut self.messages);
+                            let mut prefix_messages = Vec::new();
+                            let mut prefix_tools = Vec::new();
+                            let mut prefix_thoughts = Vec::new();
+                            let mut prefix_work = Vec::new();
+                            let mut prefix_compactions = Vec::new();
+                            let message_offset = fresh_boundary.unwrap_or(0);
+                            if let Some(b) = fresh_boundary {
+                                let keep = b.min(saved_messages.len());
+                                prefix_messages = saved_messages.drain(..keep).collect();
+                                for tool in std::mem::take(&mut self.tools) {
+                                    if tool.anchor.message < keep {
+                                        prefix_tools.push(tool);
+                                    }
+                                }
+                                for thought in std::mem::take(&mut self.thoughts) {
+                                    if thought.anchor.message < keep {
+                                        prefix_thoughts.push(thought);
+                                    }
+                                }
+                                for work in &saved_work {
+                                    if work.start < keep {
+                                        prefix_work.push(work.clone());
+                                    }
+                                }
+                                for compaction in std::mem::take(&mut self.native.compactions) {
+                                    if compaction["anchor"]["message"]
+                                        .as_u64()
+                                        .is_some_and(|m| (m as usize) < keep)
+                                    {
+                                        prefix_compactions.push(compaction);
+                                    }
+                                }
+                            } else {
+                                self.tools.clear();
+                                self.thoughts.clear();
+                                self.native.compactions.clear();
+                            }
                             self.work.clear();
                             self.assistant = None;
                             if let Some(points) = record["data"]["forkMessages"].as_array() {
@@ -2339,24 +2447,59 @@ impl Thread {
                                 if work.outcome.is_none() {
                                     work.outcome = saved_work
                                         .iter()
-                                        .find(|saved| saved.start == work.start)
+                                        .find(|saved| saved.start == work.start + message_offset)
                                         .and_then(|saved| saved.outcome);
                                 }
-                                if let Some(saved) = saved_work
-                                    .iter()
-                                    .find(|saved| saved.start == work.start && saved.stopped)
-                                {
+                                if let Some(saved) = saved_work.iter().find(|saved| {
+                                    saved.start == work.start + message_offset && saved.stopped
+                                }) {
                                     work.stopped = true;
                                     work.stopped_order = saved.stopped_order;
                                     work.elapsed = saved.elapsed;
                                 }
                             }
-                            for saved in saved_work.into_iter().filter(|w| w.stopped) {
-                                if !self.work.iter().any(|w| w.start == saved.start) {
-                                    self.work.push(saved);
+                            for saved in saved_work
+                                .into_iter()
+                                .filter(|w| w.stopped && w.start >= message_offset)
+                            {
+                                let local_start = saved.start - message_offset;
+                                if !self.work.iter().any(|w| w.start == local_start) {
+                                    let mut shifted = saved;
+                                    shifted.start = local_start;
+                                    self.work.push(shifted);
                                 }
                             }
                             self.work.sort_by_key(|w| w.start);
+                            if message_offset > 0 {
+                                for tool in &mut self.tools {
+                                    tool.anchor.message += message_offset;
+                                }
+                                for thought in &mut self.thoughts {
+                                    thought.anchor.message += message_offset;
+                                }
+                                for work in &mut self.work {
+                                    work.start += message_offset;
+                                }
+                                for compaction in &mut self.native.compactions {
+                                    if let Some(m) = compaction["anchor"]["message"].as_u64() {
+                                        compaction["anchor"]["message"] =
+                                            json!(m + message_offset as u64);
+                                    }
+                                }
+                                if let Some(assistant) = &mut self.assistant {
+                                    *assistant += message_offset;
+                                }
+                                prefix_messages.append(&mut self.messages);
+                                self.messages = prefix_messages;
+                                prefix_tools.append(&mut self.tools);
+                                self.tools = prefix_tools;
+                                prefix_thoughts.append(&mut self.thoughts);
+                                self.thoughts = prefix_thoughts;
+                                prefix_work.append(&mut self.work);
+                                self.work = prefix_work;
+                                prefix_compactions.append(&mut self.native.compactions);
+                                self.native.compactions = prefix_compactions;
+                            }
                             // A process can accept a prompt before its response reaches us.
                             // Do not replay it if its unique delivery marker is already saved.
                             self.pending_injections.retain_mut(|injection| {
@@ -2370,8 +2513,20 @@ impl Thread {
                         }
                         if let Some((prompt, index)) = &mut self.queued_prompt {
                             *index = self.messages.len();
+                            let mut id = uuid::Uuid::new_v4().to_string();
+                            if record["data"]["messages"]
+                                .as_array()
+                                .is_some_and(|messages| messages.is_empty())
+                                && let Some(prev_id) =
+                                    self.fresh_session_messages.last().filter(|prev_id| {
+                                        self.messages.iter().all(|m| m.id != **prev_id)
+                                    })
+                            {
+                                id = prev_id.clone();
+                            }
+                            let _ = &id;
                             self.messages.push(Message {
-                                id: uuid::Uuid::new_v4().to_string(),
+                                id,
                                 role: "You",
                                 text: prompt.text.clone(),
                                 images: prompt.images.to_vec(),
@@ -2816,7 +2971,14 @@ impl Thread {
             return false;
         }
         let (_, snapshot) = self.remote_send.take().unwrap();
-        if !accepted {
+        let sent_arm = self.remote_send_fresh_arm.take();
+        if accepted {
+            if let Some(arm) = sent_arm
+                && self.fresh_session_arm == Some(arm)
+            {
+                self.fresh_session_arm = None;
+            }
+        } else {
             self.restore_snapshot(&snapshot);
         }
         true
@@ -2981,6 +3143,7 @@ pub struct State {
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
     pub composer_notices: crate::composer_notices::Store,
+    fresh_arm_seq: u64,
     pub plan_menu: Option<String>,
     pub plan_copied: Option<(String, u64)>,
     pub plan_expanded: std::collections::HashSet<String>,
@@ -3199,6 +3362,7 @@ impl State {
             toasts: Vec::new(),
             next_toast_id: 1,
             composer_notices: crate::composer_notices::Store::default(),
+            fresh_arm_seq: 0,
             plan_menu: None,
             plan_copied: None,
             plan_expanded: Default::default(),
@@ -3392,6 +3556,7 @@ impl State {
             self.project_scope = ProjectScope::All;
             self.scope_additional.clear();
         }
+        self.sync_fresh_session_notice();
         self.checkpoint();
     }
     /// Closing a blank draft also deletes it. Written drafts survive without a tab.
@@ -7676,7 +7841,80 @@ impl State {
         }
     }
 
+    pub(crate) fn fresh_session_available(&self, thread: &Thread) -> bool {
+        !self.demo
+            && !thread.messages.is_empty()
+            && crate::harness::supports_fresh_context(&thread.harness)
+            && self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&thread.machine, crate::protocol::FRESH_CONTEXT)
+            })
+    }
+
+    pub(crate) fn fresh_session_command_available(&self, thread: &Thread) -> bool {
+        self.fresh_session_available(thread)
+            && thread.request.is_none()
+            && thread.native.questionnaire.is_none()
+    }
+
+    pub fn slash_matches(&self) -> Vec<pi_session::SlashCommand> {
+        self.current()
+            .slash_matches_with_fresh(self.fresh_session_command_available(self.current()))
+    }
+
+    pub fn arm_fresh_session(&mut self, thread_id: usize) {
+        self.fresh_arm_seq = self.fresh_arm_seq.saturating_add(1).max(1);
+        let arm = self.fresh_arm_seq;
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+            thread.fresh_session_arm = Some(arm);
+        }
+        self.sync_fresh_session_notice();
+    }
+
+    pub fn disarm_fresh_session(&mut self, thread_id: usize, expected_arm: Option<u64>) {
+        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id)
+            && expected_arm.is_none_or(|arm| thread.fresh_session_arm == Some(arm))
+        {
+            thread.fresh_session_arm = None;
+        }
+        self.sync_fresh_session_notice();
+    }
+
+    pub fn dismiss_composer_notice(&mut self, id: &str) {
+        if id == "fresh-session" {
+            let thread_id = self.current().id;
+            self.disarm_fresh_session(thread_id, None);
+            self.composer_notices.remove(id);
+            self.checkpoint();
+        } else {
+            self.composer_notices.dismiss(id);
+        }
+    }
+
+    pub(crate) fn sync_fresh_session_notice(&mut self) -> bool {
+        let t = self.current();
+        let show =
+            self.fresh_session_available(t) && t.fresh_session_arm.is_some() && t.request.is_none();
+        let notice = show.then(|| {
+            crate::composer_notices::Notice::new(
+                "fresh-session",
+                crate::composer_notices::Variant::Info,
+                "alert",
+                "Your next message starts a fresh session",
+            )
+            .group(crate::composer_notices::Group::Attention)
+            .description(Some(
+                "The agent won't see earlier messages in this thread.".into(),
+            ))
+            .dismiss_label("Keep the current session")
+        });
+        self.composer_notices.sync("fresh-session", notice)
+    }
+
     fn dispatch_send(&mut self) -> bool {
+        self.dispatch_send_with_fresh(None)
+    }
+
+    pub(crate) fn dispatch_send_with_fresh(&mut self, forced_fresh_context: Option<bool>) -> bool {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
@@ -7716,6 +7954,37 @@ impl State {
             return false;
         }
         self.reconcile_current_access_mode();
+        let fresh_session_available = self.fresh_session_available(self.current());
+        let draft_markdown = crate::composer_rich::markdown(&self.current().draft);
+        let composer_holds_only_text = self.current().draft_images.is_empty()
+            && self.current().draft_context.is_empty()
+            && self.current().draft.pills().next().is_none();
+        if forced_fresh_context.is_none()
+            && fresh_session_available
+            && composer_holds_only_text
+            && is_clear_command(&draft_markdown)
+        {
+            let thread_id = self.current().id;
+            self.arm_fresh_session(thread_id);
+            let t = self.current_mut();
+            t.prompt_history.reset();
+            t.typing_guard.on_blur_or_send();
+            t.paste_history = Default::default();
+            t.draft.replace_text("");
+            t.submission_error = None;
+            t.attachment_error = None;
+            self.checkpoint();
+            return false;
+        }
+        // Read once: an arm made while this send is in flight belongs to the next message.
+        let fresh_arm = if forced_fresh_context.is_some() {
+            None
+        } else if fresh_session_available {
+            self.current().fresh_session_arm
+        } else {
+            None
+        };
+        let fresh_context = forced_fresh_context.unwrap_or(fresh_arm.is_some());
         if self.client.is_some() {
             if self.current().draft.text.trim() == "/model" {
                 self.choose_slash("model".into());
@@ -7767,8 +8036,21 @@ impl State {
                 self.promote_client_draft();
                 return self.current().client_creating.is_some();
             }
-            let result = self.remote("thread.send", json!({"threadId":self.current().id,"text":prompt.text,
-                "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":if self.current().status.busy() && self.current().follow_up_queues() { "queue" } else if self.current().status.busy() { "steer" } else { "prompt" }}));
+            let mode = if self.current().status.busy()
+                && (self.current().follow_up_queues() || fresh_context)
+            {
+                "queue"
+            } else if self.current().status.busy() {
+                "steer"
+            } else {
+                "prompt"
+            };
+            let mut params = json!({"threadId":self.current().id,"text":prompt.text,
+                "attachments":prompt.images.as_ref(),"context":prompt.context,"draft":prompt.draft,"editorRevision":revision,"mode":mode});
+            if fresh_context {
+                params["freshContext"] = json!(true);
+            }
+            let result = self.remote("thread.send", params);
             return match result {
                 Some(Ok(id)) => {
                     let snapshot = crate::composer_rich::Snapshot::capture_with_context(
@@ -7778,6 +8060,7 @@ impl State {
                     );
                     let thread = self.current_mut();
                     thread.remote_send = Some((id, snapshot));
+                    thread.remote_send_fresh_arm = fresh_arm;
                     thread.draft.replace_text("");
                     thread.draft_images.clear();
                     thread.draft_context.clear();
@@ -7807,9 +8090,7 @@ impl State {
         {
             return false;
         }
-        let text = crate::composer_rich::markdown(&self.current().draft)
-            .trim()
-            .to_owned();
+        let text = draft_markdown.trim().to_owned();
         let mut words = text.splitn(2, char::is_whitespace);
         match words.next().filter(|_| {
             !self
@@ -7826,6 +8107,7 @@ impl State {
                 self.choose_slash("model".into());
                 return false;
             }
+            Some(command) if command.eq_ignore_ascii_case("/clear") => {}
             Some("/compact") if crate::harness::supports_compaction(&self.current().harness) => {
                 if !self.current().draft_images.is_empty() {
                     self.current_mut().attachment_error =
@@ -7918,8 +8200,10 @@ impl State {
                 .iter()
                 .map(|p| (p.server_id.clone(), p.label.clone()))
                 .collect();
-            self.current_mut()
-                .send_during_run_with_peers(Some(&local_server_id), &peers, &|m| {
+            self.current_mut().send_during_run_with_fresh(
+                Some(&local_server_id),
+                &peers,
+                &|m| {
                     if m == "local" {
                         "Local".into()
                     } else {
@@ -7929,9 +8213,18 @@ impl State {
                             .map(|(_, l)| l.clone())
                             .unwrap_or_else(|| m.to_owned())
                     }
-                });
+                },
+                fresh_context,
+            );
             let dispatched = !self.current().has_draft_content();
             if dispatched {
+                if fresh_context {
+                    self.persist_transcripts = true;
+                }
+                if let Some(arm) = fresh_arm {
+                    let thread_id = self.current().id;
+                    self.disarm_fresh_session(thread_id, Some(arm));
+                }
                 self.checkpoint();
             }
             return dispatched;
@@ -7958,8 +8251,10 @@ impl State {
             .iter()
             .map(|p| (p.server_id.clone(), p.label.clone()))
             .collect();
-        self.current_mut()
-            .send_with_peers(Some(&local_server_id), &peers, &|m| {
+        self.current_mut().send_with_fresh(
+            Some(&local_server_id),
+            &peers,
+            &|m| {
                 if m == "local" {
                     "Local".into()
                 } else {
@@ -7969,12 +8264,20 @@ impl State {
                         .map(|(_, l)| l.clone())
                         .unwrap_or_else(|| m.to_owned())
                 }
-            });
+            },
+            fresh_context,
+        );
         if self.current().has_draft_content() || self.current().status != Status::Running {
             return false;
         }
         let id = self.current().id;
         self.invalidate_undo(id);
+        if fresh_context {
+            self.persist_transcripts = true;
+        }
+        if let Some(arm) = fresh_arm {
+            self.disarm_fresh_session(id, Some(arm));
+        }
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
         }
@@ -8920,15 +9223,25 @@ impl State {
                     (&t.draft, &t.draft_images, &t.draft_context),
                     |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context),
                 );
-                let value = if images.is_empty() && context.is_empty() && !crate::composer_rich::has_format(draft) && draft.pills().next().is_none() {
+                let value = if images.is_empty()
+                    && context.is_empty()
+                    && !crate::composer_rich::has_format(draft)
+                    && draft.pills().next().is_none()
+                    && t.fresh_session_arm.is_none()
+                {
                     json!(draft.text)
                 } else {
-                    json!({
+                    let mut obj = json!({
                         "text": draft.text,
                         "richHtml": draft.to_html(),
                         "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
                         "context": if context.is_empty() { Value::Null } else { json!({ "version": 1, "records": context }) },
-                    })
+                    });
+                    if let Some(arm) = t.fresh_session_arm {
+                        obj["freshSession"] = json!(true);
+                        obj["freshSessionArm"] = json!(arm);
+                    }
+                    obj
                 };
                 (t.id.to_string(), value)
             }).collect::<serde_json::Map<_,_>>(),
@@ -9037,6 +9350,16 @@ impl State {
                     .map(|c| c.records)
                     .unwrap_or_default();
                 t.retained_context = Default::default();
+                if draft["freshSession"] == true {
+                    let arm = draft["freshSessionArm"].as_u64().unwrap_or_else(|| {
+                        self.fresh_arm_seq = self.fresh_arm_seq.saturating_add(1).max(1);
+                        self.fresh_arm_seq
+                    });
+                    self.fresh_arm_seq = self.fresh_arm_seq.max(arm);
+                    t.fresh_session_arm = Some(arm);
+                } else {
+                    t.fresh_session_arm = None;
+                }
                 t.attachment_error = if missing_images {
                     Some("Some saved draft images are missing or invalid. Attach those images again.".into())
                 } else {
@@ -9068,6 +9391,7 @@ impl State {
             }
         }
         self.capture_opened_draft();
+        self.sync_fresh_session_notice();
         Ok(())
     }
     pub fn checkpoint(&mut self) {
@@ -9290,7 +9614,13 @@ impl State {
         index["serverEpoch"] = json!(self.server_epoch);
         index["serverSeq"] = json!(self.server_seq);
         index["recoveredInputs"] = json!(self.recovered_inputs);
-        if self.headless || self.persist_transcripts {
+        if self.headless
+            || self.persist_transcripts
+            || self
+                .threads
+                .iter()
+                .any(|t| !t.fresh_session_messages.is_empty())
+        {
             index["threadViews"] = self.thread_views();
             index["runtimeInputs"] = json!(
                 self.threads
@@ -9511,6 +9841,11 @@ impl Thread {
     }
 }
 
+/// Ported from KSG Code's `isClearComposerCommand` (`packages/shared/src/composerTrigger.ts`).
+pub fn is_clear_command(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case("/clear")
+}
+
 pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     let composer_changed = state.composer_sources.take_changed()
         | (!state.headless && crate::ui::composer_ui::tick(state, now, tx));
@@ -9615,6 +9950,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         .filter(|t| t.remote.is_some())
         .map(|t| t.child_thread_id)
         .collect();
+    let mut connect_indices = Vec::new();
     for (index, thread) in state.threads.iter_mut().enumerate() {
         if remote_children.contains(&thread.id) {
             continue;
@@ -9757,6 +10093,18 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             };
             tx.wake_after(remaining);
         }
+        if thread.pi.is_none()
+            && thread.queued_prompt.is_some()
+            && thread.status == Status::Running
+            && !thread.offline_blocked
+            && thread.session_started.is_none()
+        {
+            connect_indices.push(index);
+        }
+    }
+    for index in connect_indices {
+        state.connect_thread(index);
+        changed = true;
     }
     for (parent, question) in crew_questions {
         state.persistence_scope = None;
@@ -9776,6 +10124,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     global_changed |= state.pause_offline_errors()
         | state.poll_tasks(Instant::now())
         | state.poll_background_end(tx);
+    changed |= state.sync_fresh_session_notice();
     if global_changed {
         state.persistence_scope = None;
         changed = true;
@@ -15738,5 +16087,223 @@ mod tests {
         let dismiss_id = async_state.toasts[0].id;
         async_state.dismiss_toast(dismiss_id);
         assert!(async_state.toasts.is_empty());
+    }
+
+    #[test]
+    fn clear_command_arms_when_alone_sends_text_with_attachment_and_unavailable_with_approval() {
+        let mut state = State::new(".".into(), false);
+        // Empty thread: /clear is unavailable.
+        state.current_mut().draft.replace_text("/");
+        state.current_mut().draft.focused = true;
+        assert!(!state.slash_matches().iter().any(|c| c.name == "clear"));
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().messages.len(), 1);
+        assert_eq!(state.current().messages[0].text, "/clear");
+
+        // Thread with history: /clear alone arms, clears draft, and sends nothing.
+        state.current_mut().status = Status::Completed;
+        state.current_mut().draft.replace_text("/");
+        assert!(state.slash_matches().iter().any(|c| c.name == "clear"));
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_some());
+        assert!(state.current().draft.text.is_empty());
+        assert_eq!(state.current().messages.len(), 1);
+        assert!(
+            state
+                .composer_notices
+                .ordered()
+                .iter()
+                .any(|n| n.id == "fresh-session")
+        );
+
+        // With an attachment present, /clear is sent as ordinary text and does not arm.
+        state.disarm_fresh_session(state.current().id, None);
+        state.current_mut().draft.replace_text("/clear");
+        state
+            .current_mut()
+            .add_attachment(test_attachment("note.png", 1))
+            .unwrap();
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().messages.len(), 2);
+        assert_eq!(state.current().messages[1].text, "/clear");
+
+        // Unavailable with a pending approval.
+        state.current_mut().status = Status::Waiting;
+        state.current_mut().request = Some(json!({"id":"perm-1","method":"confirm"}));
+        state.current_mut().draft.replace_text("/");
+        assert!(!state.slash_matches().iter().any(|c| c.name == "clear"));
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().messages.len(), 2);
+
+        // Unavailable on a linked machine lacking the `fresh-context` capability.
+        state.current_mut().status = Status::Completed;
+        state.current_mut().request = None;
+        let (old_client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *old_client.info.lock().unwrap() = json!({"capabilities": []});
+        state.client = Some(old_client);
+        state.current_mut().draft.replace_text("/");
+        assert!(!state.slash_matches().iter().any(|c| c.name == "clear"));
+    }
+
+    #[test]
+    fn fresh_session_arm_is_read_once_keeps_on_failed_send_and_persists_with_draft() {
+        let dir = crate::store::directory().unwrap().join("fresh-arm-persist");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut state = State::new(dir.clone(), false);
+        state.load_global_for_test();
+        state.persist_transcripts = true;
+        state.current_mut().messages.push(Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Earlier".into(),
+            images: vec![],
+            context: None,
+        });
+        state.current_mut().status = Status::Completed;
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        let first_arm = state.current().fresh_session_arm.expect("armed");
+
+        // Persist draft and reload in a fresh State against the same temp directory.
+        state.current_mut().draft.replace_text("Carry over");
+        state.checkpoint_and_flush().unwrap();
+        drop(state);
+
+        let mut reloaded = State::new(dir, false);
+        reloaded.load_global_for_test();
+        assert_eq!(reloaded.current().draft.text, "Carry over");
+        assert_eq!(reloaded.current().fresh_session_arm, Some(first_arm));
+        assert!(
+            reloaded
+                .composer_notices
+                .ordered()
+                .iter()
+                .any(|n| n.id == "fresh-session")
+        );
+
+        // Failed local send (e.g., Pi with non-CPA model) keeps the arm.
+        reloaded.current_mut().harness = "pi".into();
+        reloaded.current_mut().model_provider = "anthropic".into();
+        reloaded.send();
+        assert_eq!(reloaded.current().fresh_session_arm, Some(first_arm));
+        assert_eq!(reloaded.current().draft.text, "Carry over");
+
+        // Accepted local send clears the arm, keeps visible transcript, and marks the message.
+        reloaded.current_mut().model_provider = "cpa".into();
+        reloaded.send();
+        assert!(reloaded.current().fresh_session_arm.is_none());
+        assert_eq!(reloaded.current().messages.len(), 2);
+        assert_eq!(reloaded.current().messages[0].text, "Earlier");
+        assert_eq!(reloaded.current().messages[1].text, "Carry over");
+        assert!(
+            reloaded
+                .current()
+                .is_fresh_session_message(&reloaded.current().messages[1].id)
+        );
+
+        // Read-once semantics for in-flight remote sends: re-arming during flight stays armed.
+        let (client, mut rx_cmd) = crate::client::Client::test_connected(reloaded.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities": [crate::protocol::FRESH_CONTEXT]});
+        let commands = client.commands.clone();
+        let mut remote_state = State::new(reloaded.data_dir.clone(), false);
+        remote_state.client = Some(client);
+        remote_state.current_mut().remote = Some(commands);
+        remote_state.current_mut().messages.push(Message {
+            id: "rm1".into(),
+            role: "You",
+            text: "First".into(),
+            images: vec![],
+            context: None,
+        });
+        remote_state.current_mut().draft.replace_text("/clear");
+        remote_state.send();
+        let inflight_arm = remote_state.current().fresh_session_arm.unwrap();
+        remote_state.current_mut().draft.replace_text("Second");
+        assert!(remote_state.dispatch_send());
+        let sent = rx_cmd.try_recv().unwrap();
+        assert_eq!(sent.params["freshContext"], true);
+        let cmd_id = sent.command_id;
+
+        // User re-arms while first send is in flight.
+        remote_state.current_mut().draft.replace_text("/clear");
+        remote_state.send();
+        let newer_arm = remote_state.current().fresh_session_arm.unwrap();
+        assert_ne!(newer_arm, inflight_arm);
+
+        // First send acceptance must not clear the newer arm.
+        assert!(remote_state.current_mut().finish_remote_send(cmd_id, true));
+        assert_eq!(remote_state.current().fresh_session_arm, Some(newer_arm));
+
+        // A failed remote send keeps its arm.
+        remote_state.current_mut().draft.replace_text("Third");
+        assert!(remote_state.dispatch_send());
+        let failed_cmd = rx_cmd.try_recv().unwrap().command_id;
+        assert!(
+            remote_state
+                .current_mut()
+                .finish_remote_send(failed_cmd, false)
+        );
+        assert_eq!(remote_state.current().fresh_session_arm, Some(newer_arm));
+    }
+
+    #[test]
+    fn fresh_turn_with_steer_mode_queues_instead_and_cannot_steer() {
+        let mut state = State::new(".".into(), false);
+        let (pi, commands, _events) = Pi::test_connection();
+        state.current_mut().pi = Some(pi);
+        state.current_mut().model_provider = "cpa".into();
+        state.current_mut().status = Status::Running;
+        state.current_mut().native.follow_up = false; // steer mode
+        state.current_mut().harness_state["turnCapabilities"] =
+            json!({"supportsInterrupt": true, "supportsActiveSteering": true});
+        state.current_mut().messages.push(Message {
+            id: "m1".into(),
+            role: "You",
+            text: "Running turn".into(),
+            images: vec![],
+            context: None,
+        });
+        state.current_mut().draft.replace_text("/clear");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_some());
+
+        state.current_mut().draft.replace_text("Fresh queued turn");
+        state.send();
+        assert!(state.current().fresh_session_arm.is_none());
+        assert_eq!(state.current().native.queue.len(), 1);
+        let queued_id = state.current().native.queue[0].id;
+        assert!(state.current().native.fresh_queue_ids.contains(&queued_id));
+        assert!(
+            commands.try_recv().is_err(),
+            "fresh turn must queue, never steer"
+        );
+
+        // Attempting to steer the queued fresh-context item is rejected.
+        state.current_mut().steer_queued(queued_id);
+        assert_eq!(state.current().native.queue.len(), 1);
+        assert!(state.current().error.is_some());
+
+        // When the active turn settles, the queued item pops and starts a fresh session.
+        state.current_mut().error = None;
+        state.current_mut().session = Some("old-session.jsonl".into());
+        state
+            .current_mut()
+            .apply(json!({"type":"agent_settled","aborted":false}));
+        assert!(state.current().native.queue.is_empty());
+        assert!(state.current().session.is_none());
+        assert!(state.current().pi.is_none());
+        assert_eq!(state.current().messages.len(), 2);
+        assert!(
+            state
+                .current()
+                .is_fresh_session_message(&state.current().messages[1].id)
+        );
     }
 }

@@ -350,10 +350,11 @@ pub struct PiSession {
     dialogs: VecDeque<(Value, Option<Instant>)>,
     session_approvals: HashSet<String>,
     dialog_status: Option<Status>,
-    session_name: Option<String>,
+    pub(super) session_name: Option<String>,
     probe: Option<String>,
     request_id: Option<String>,
     state_floor: usize,
+    pub fresh_queue_ids: HashSet<usize>,
 }
 
 pub struct QueuedMessage {
@@ -439,7 +440,12 @@ impl Thread {
         Some(trigger)
     }
 
+    #[cfg(test)]
     pub fn slash_matches(&self) -> Vec<SlashCommand> {
+        self.slash_matches_with_fresh(self.fresh_session_command_available_local())
+    }
+
+    pub fn slash_matches_with_fresh(&self, fresh_session_available: bool) -> Vec<SlashCommand> {
         let Some(trigger) = self.slash_trigger() else {
             return vec![];
         };
@@ -448,6 +454,13 @@ impl Thread {
             description: "Switch response model for this thread".into(),
             source: "Shina".into(),
         }];
+        if trigger.range.start == 0 && fresh_session_available {
+            commands.push(SlashCommand {
+                name: "clear".into(),
+                description: "Start a fresh session; earlier messages stay visible".into(),
+                source: "Shina".into(),
+            });
+        }
         if trigger.range.start == 0 && crate::harness::supports_compaction(&self.harness) {
             commands.push(SlashCommand {
                 name: "compact".into(),
@@ -472,6 +485,7 @@ impl Thread {
                 .iter()
                 .filter(|c| {
                     c.name != "model"
+                        && (!fresh_session_available || c.name != "clear")
                         && !c.name.starts_with('$')
                         && (trigger.range.start == 0 || c.name.starts_with("skill:"))
                         && (!crate::harness::supports_compaction(&self.harness)
@@ -522,14 +536,15 @@ impl Thread {
     /// Unlike the initial prompt, a steering submission must not reset the current run.
     #[cfg(test)]
     pub fn send_during_run(&mut self) {
-        self.send_during_run_with_peers(None, &[], &str::to_owned);
+        self.send_during_run_with_fresh(None, &[], &str::to_owned, false);
     }
 
-    pub(crate) fn send_during_run_with_peers(
+    pub(crate) fn send_during_run_with_fresh(
         &mut self,
         target_server_id: Option<&str>,
         peers: &[crate::peer::Peer],
         machine_name: &dyn Fn(&str) -> String,
+        fresh_context: bool,
     ) {
         if self.initializing
             || self.configuring
@@ -564,13 +579,15 @@ impl Thread {
         };
         // KSG owns queued runs in the application, and only submits them once the active run
         // settles. Keeping follow-ups here makes edit/cancel/promote atomic and preserves images.
-        if self.follow_up_queues() {
+        // A fresh-context turn never steers or restarts: it queues behind the active run.
+        if self.follow_up_queues() || fresh_context {
             self.native.queue_held = false;
             self.serial += 1;
-            self.native.queue.push_back(QueuedMessage {
-                id: self.serial,
-                prompt,
-            });
+            let id = self.serial;
+            if fresh_context {
+                self.native.fresh_queue_ids.insert(id);
+            }
+            self.native.queue.push_back(QueuedMessage { id, prompt });
         } else {
             self.native.sends.push_back(PendingSend {
                 id: None,
@@ -597,6 +614,7 @@ impl Thread {
         ) {
             return;
         }
+        self.native.fresh_queue_ids.remove(&id);
         self.native.queue.retain(|q| q.id != id);
         self.reconcile_queued_edit();
     }
@@ -611,6 +629,12 @@ impl Thread {
         if self.request.is_some() || self.configuring {
             return;
         }
+        if self.status.busy() && self.native.fresh_queue_ids.contains(&id) {
+            self.error = Some(
+                "A fresh-session message cannot steer the active turn. It stays queued.".into(),
+            );
+            return;
+        }
         if self.status.busy() && !self.can_steer() {
             self.error = Some(
                 "This provider cannot steer the active turn. The message stays queued.".into(),
@@ -622,6 +646,7 @@ impl Thread {
         {
             self.reconcile_queued_edit();
             if self.status.busy() {
+                self.native.fresh_queue_ids.remove(&id);
                 self.native.sends.push_back(PendingSend {
                     id: None,
                     prompt: queued.prompt,
@@ -640,6 +665,7 @@ impl Thread {
     pub(super) fn return_local_queue(&mut self) {
         self.cancel_queued_edit();
         let queue = std::mem::take(&mut self.native.queue);
+        self.native.fresh_queue_ids.clear();
         self.native.queue_held = false;
         for queued in queue.into_iter().rev() {
             self.restore_prompt(&queued.prompt);
@@ -774,8 +800,9 @@ impl Thread {
             && self.pending_prompt.is_none()
             && let Some(queued) = self.native.queue.pop_front()
         {
+            let fresh_context = self.native.fresh_queue_ids.remove(&queued.id);
             self.reconcile_queued_edit();
-            self.begin_prompt(queued.prompt);
+            self.begin_prompt_with_fresh(queued.prompt, fresh_context);
             return true;
         }
         // One in-flight submission preserves order and gives rejected prompts their own owner.
@@ -1079,7 +1106,8 @@ impl Thread {
             "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after,"draft":s.prompt.draft,"context":s.prompt.context
         })).collect();
         values.extend(self.native.queue.iter().map(|q| json!({"kind":"queued","inputId":q.id,
-            "held":self.native.queue_held,"text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft,"context":q.prompt.context})));
+            "held":self.native.queue_held,"freshContext":self.native.fresh_queue_ids.contains(&q.id),
+            "text":q.prompt.text,"images":q.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":self.messages.len(),"draft":q.prompt.draft,"context":q.prompt.context})));
         json!(values)
     }
 
@@ -1122,6 +1150,9 @@ impl Thread {
                     .ok_or("Invalid queued input identity.")?;
                 self.serial = self.serial.max(id);
                 self.native.queue_held = true;
+                if item["freshContext"] == true {
+                    self.native.fresh_queue_ids.insert(id);
+                }
                 if !self.native.queue.iter().any(|q| q.id == id) {
                     self.native.queue.push_back(QueuedMessage { id, prompt });
                 }
@@ -1945,6 +1976,9 @@ impl State {
     }
 
     pub fn choose_slash(&mut self, name: String) {
+        if name == "clear" && !self.fresh_session_command_available(self.current()) {
+            return;
+        }
         let range = self.current().slash_trigger().map(|t| t.range).or_else(|| {
             (name == "model" && self.current().draft.text.trim() == "/model")
                 .then(|| 0..self.current().draft.text.len())
@@ -1952,7 +1986,7 @@ impl State {
         let Some(range) = range else {
             return;
         };
-        let replacement = if name == "model" {
+        let replacement = if name == "model" || name == "clear" {
             String::new()
         } else {
             format!("/{name} ")
@@ -1965,6 +1999,10 @@ impl State {
         edit.focused = true;
         if name == "model" {
             self.open_model_picker(SettingsPicker::Model);
+        } else if name == "clear" {
+            let thread_id = self.current().id;
+            self.arm_fresh_session(thread_id);
+            self.checkpoint();
         }
     }
 

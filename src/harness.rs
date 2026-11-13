@@ -19,6 +19,13 @@ pub fn supports_compaction(id: &str) -> bool {
     matches!(id, "pi" | "codex" | "claude")
 }
 
+/// Providers for which KSG Code declares `freshContext` support (server-wide in KSG's
+/// `ServerEnvironment`): Pi (`SessionSource::New`), Codex (`thread/start`), Claude
+/// (`--session-id`), and ACP (`session/new`).
+pub fn supports_fresh_context(id: &str) -> bool {
+    matches!(id, "pi" | "codex" | "claude") || valid_id(id)
+}
+
 impl Start {
     /// Metadata discovery never registers MCP, starts a conversation or sends a prompt.
     pub(crate) fn discovery(id: &str, workspace: PathBuf) -> Self {

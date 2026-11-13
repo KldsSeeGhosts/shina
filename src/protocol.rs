@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 12;
+pub const MINOR: u32 = 13;
+pub const FRESH_CONTEXT: &str = "fresh-context";
 pub const PROJECT_WRITE_FILE: &str = "project-write-file";
 pub const DEFERRED_WORK: &str = "deferred-work";
 pub const COMPOSER_CONTEXT: &str = "composer-context-v1";
@@ -354,6 +355,8 @@ pub struct SendInput {
     pub draft: Option<Value>,
     #[serde(default)]
     pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_context: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

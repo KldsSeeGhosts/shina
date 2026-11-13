@@ -9086,7 +9086,34 @@ fn build_user_or_system_row(
             .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
             .child(lbl)
     };
-    col().w_full().child(body.key(key))
+    let mut wrapper = col().w_full();
+    if message.role == "You" && t.is_fresh_session_message(&message.id) {
+        wrapper = wrapper.gap(8.0).child(fresh_session_row(&message.id, p));
+    }
+    wrapper.child(body.key(key))
+}
+
+/// Ported from KSG Code's `FreshSessionRow` (`components/chat/V2LifecycleRow.tsx`) and
+/// `TimelineSystemDivider` (`components/chat/TimelineSystemDivider.tsx`).
+fn fresh_session_row(message_id: &str, p: Palette) -> El {
+    row()
+        .key(format!("fresh-session-row-{message_id}"))
+        .role("status")
+        .label("New session")
+        .w_full()
+        .min_w(0.0)
+        .py(8.0)
+        .gap(8.0)
+        .center_y()
+        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(
+            row()
+                .center_y()
+                .gap(6.0)
+                .child(icon("alert", p.muted))
+                .child(pixel_text("New session", p.muted)),
+        )
+        .child(el().h(1.0).grow(1.0).fill(p.line))
 }
 
 /// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
@@ -10322,7 +10349,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
                 dismiss_label,
                 "close",
                 p,
-                move |s| s.composer_notices.dismiss(&dismiss_id),
+                move |s| s.dismiss_composer_notice(&dismiss_id),
             ));
         }
 
@@ -22036,6 +22063,74 @@ pub(crate) mod tests {
             rt.frame(1.0);
             assert!(
                 rt.presented("composer-notice-att-long").is_none(),
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn armed_fresh_session_notice_and_transcript_row_render_at_narrow_and_wide_widths() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "u1".into(),
+                role: "You",
+                text: "Old question".into(),
+                images: vec![],
+                context: None,
+            });
+            rt.state.current_mut().status = Status::Completed;
+            rt.state.current_mut().draft.replace_text("/clear");
+            rt.state.send();
+            assert!(rt.state.current().fresh_session_arm.is_some(), "{width}");
+            assert!(
+                rt.state
+                    .composer_notices
+                    .ordered()
+                    .iter()
+                    .any(|n| n.id == "fresh-session"),
+                "{width}: notices={:?}",
+                rt.state
+                    .composer_notices
+                    .ordered()
+                    .iter()
+                    .map(|n| &n.id)
+                    .collect::<Vec<_>>()
+            );
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            assert!(
+                rt.presented("composer-notice-fresh-session").is_some(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-notice-dismiss-fresh-session")
+                    .is_some(),
+                "{width}"
+            );
+
+            // Dismissing the notice disarms the fresh session.
+            press(&mut rt, "composer-notice-dismiss-fresh-session");
+            rt.frame(1.0);
+            assert!(rt.state.current().fresh_session_arm.is_none(), "{width}");
+            assert!(
+                rt.presented("composer-notice-fresh-session").is_none(),
+                "{width}"
+            );
+
+            // Re-arm and send a fresh turn; the fresh-session divider row appears in transcript.
+            rt.state.current_mut().draft.replace_text("/clear");
+            rt.state.send();
+            rt.state.current_mut().draft.replace_text("Fresh question");
+            rt.state.send();
+            rt.invalidate();
+            rt.frame(0.0);
+            let fresh_msg_id = rt.state.current().messages[1].id.clone();
+            assert!(
+                rt.presented(&format!("fresh-session-row-{fresh_msg_id}"))
+                    .is_some(),
                 "{width}"
             );
         }

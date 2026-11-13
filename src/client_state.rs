@@ -175,6 +175,10 @@ struct ThreadView {
     commands_error: Option<String>,
     #[serde(default)]
     memory_suggestions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fresh_session_messages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    queue_fresh: Vec<usize>,
 }
 
 impl ThreadView {
@@ -290,11 +294,20 @@ impl ThreadView {
             commands_loaded: thread.native.commands_loaded,
             commands_error: thread.native.commands_error.clone(),
             memory_suggestions: thread.memory_suggestions.clone(),
+            fresh_session_messages: thread.fresh_session_messages.clone(),
+            queue_fresh: thread
+                .native
+                .queue
+                .iter()
+                .filter(|q| thread.native.fresh_queue_ids.contains(&q.id))
+                .map(|q| q.id)
+                .collect(),
         }
     }
 
     fn apply(self, thread: &mut Thread) -> Result<(), String> {
         thread.memory_suggestions = self.memory_suggestions;
+        thread.fresh_session_messages = self.fresh_session_messages;
         if thread.remote.is_some() {
             thread.request_generation = self.generation;
         }
@@ -470,6 +483,7 @@ impl ThreadView {
         thread.projected_harness_choice = self.harness_choice;
         thread.native.commands_loaded = self.commands_loaded;
         thread.native.commands_error = self.commands_error;
+        thread.native.fresh_queue_ids = self.queue_fresh.into_iter().collect();
         Ok(())
     }
 }
@@ -1078,6 +1092,7 @@ impl State {
                 let mut bg_failed: Option<(String, usize, String)> = None;
                 let mut open_new_after: Option<(usize, String)> = None;
                 let mut handled_background = false;
+                let mut sync_fresh = false;
                 {
                     let threads = if server == self.machines.selected {
                         Some(&mut self.threads)
@@ -1093,6 +1108,7 @@ impl State {
                         })
                     }) {
                         thread.finish_remote_send(command.command_id, accepted);
+                        sync_fresh = accepted && server == self.machines.selected;
                         let bg = thread.background_send.take();
                         let send_new = thread.pending_send_and_new_thread.take();
                         handled_background = bg.is_some() || send_new.is_some();
@@ -1114,6 +1130,9 @@ impl State {
                             open_new_after = Some((thread.id, pending_server));
                         }
                     }
+                }
+                if sync_fresh {
+                    self.sync_fresh_session_notice();
                 }
                 if let Some((bg_server, thread_id)) = bg_started {
                     self.notify_background_started(&bg_server, thread_id);
@@ -1906,7 +1925,7 @@ impl State {
         if let (Some(tx), Some(delay)) = (tx, wake) {
             tx.wake_after(delay);
         }
-        changed
+        changed | self.sync_fresh_session_notice()
     }
     pub fn retry_machine(&mut self, server: &str) {
         let result = if server == "local" {
@@ -2925,7 +2944,7 @@ impl State {
                     .unwrap_or_default();
                 self.current_mut().native.follow_up =
                     matches!(input.mode, crate::protocol::SendMode::Queue);
-                self.send();
+                let _ = self.dispatch_send_with_fresh(Some(input.fresh_context == Some(true)));
                 if self.current().has_draft_content() {
                     let error = self
                         .current()
