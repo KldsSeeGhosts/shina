@@ -298,6 +298,17 @@ pub(super) fn control_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) ->
     if !s.current().draft.focused && !s.composer_ui.scope_focused.get() {
         return false;
     }
+    if event.key == rune::Key::Tab
+        && !event.mods.shift
+        && !event.mods.cmd
+        && !event.mods.ctrl
+        && !event.mods.alt
+        && tx.focused() == Some("composer-input")
+        && !super::pi_ui::suggestion_menu_open(s)
+        && s.offered_prompt_suggestion().is_some()
+    {
+        return false;
+    }
     if event.key == rune::Key::Tab && !event.mods.cmd && !event.mods.ctrl && !event.mods.alt {
         let last = if s.demo {
             "leave-example"

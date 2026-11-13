@@ -11214,6 +11214,7 @@ fn composer(
     // field with `max_h` laid out at the cap but let the card size to all of its text, which
     // drew the last lines under the actions and left an empty strip below them.
     let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
+    let offered_suggestion = s.offered_prompt_suggestion();
     let blank_preview = rune::TextEdit::default();
     let field = text_input(
         if collapsed && t.draft.text.trim().is_empty() {
@@ -11243,6 +11244,8 @@ fn composer(
             "Open a real workspace to send messages".to_string()
         } else if let Some(machine) = s.unreachable_selected() {
             format!("{machine} is unreachable. Reconnecting.")
+        } else if offered_suggestion.is_some() {
+            String::new()
         } else if collapsed {
             "Ask anything...".to_string()
         } else {
@@ -11344,7 +11347,10 @@ fn composer(
                 el().key("composer-preview")
                     .role("button")
                     .label(if t.draft.text.trim().is_empty() {
-                        "Expand composer. Ask anything...".to_owned()
+                        format!(
+                            "Expand composer. {}",
+                            offered_suggestion.unwrap_or("Ask anything...")
+                        )
                     } else {
                         format!("Expand composer. {}", t.draft.display().0)
                     })
@@ -11358,7 +11364,32 @@ fn composer(
                     })
                     .child(composer_ui::prompt_surface(
                         s,
-                        field.single_line().padding(0.0).h(28.0).min_h(0.0).inert(),
+                        {
+                            let preview_field =
+                                field.single_line().padding(0.0).h(28.0).min_h(0.0).inert();
+                            let mut host = el().w_full().h(28.0).child(preview_field);
+                            if let Some(suggestion) = offered_suggestion {
+                                host = host.child(
+                                    row()
+                                        .key("composer-suggestion")
+                                        .inert()
+                                        .h(28.0)
+                                        .center_y()
+                                        .gap(8.0)
+                                        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                                        .child(
+                                            label(suggestion, composer_style, p.muted)
+                                                .truncate()
+                                                .min_w(0.0)
+                                                .shrink(),
+                                        )
+                                        .child(
+                                            keycap_chip("Tab", p).key("composer-suggestion-key"),
+                                        ),
+                                );
+                            }
+                            host
+                        },
                         true,
                     )),
             );
@@ -11428,7 +11459,55 @@ fn composer(
                     })
                     // ProseMirror's scroll margin: the caret line keeps the 4 pt padding in view.
                     .scroll_margin(4.0)
-                    .child(field),
+                    .child({
+                        let mut host = el().key("composer-input-host").w_full();
+                        let field = if let Some(suggestion) = offered_suggestion {
+                            let content_w = (lane - 24.0 - COMPOSER_FIELD_PAD * 2.0).max(40.0);
+                            let (natural_w, _) =
+                                rune::text::measure(suggestion, &[], composer_style, None);
+                            let min_h = if natural_w + 48.0 <= content_w {
+                                COMPOSER_FIELD_MIN
+                            } else {
+                                let (_, text_h) = rune::text::measure(
+                                    suggestion,
+                                    &[],
+                                    composer_style,
+                                    Some(content_w),
+                                );
+                                (text_h + 24.0 + COMPOSER_FIELD_PAD * 2.0).max(COMPOSER_FIELD_MIN)
+                            };
+                            host = host.min_h(min_h);
+                            field.min_h(min_h)
+                        } else {
+                            host = host.min_h(COMPOSER_FIELD_MIN);
+                            field
+                        };
+                        host = host.child(field);
+                        if let Some(suggestion) = offered_suggestion {
+                            host = host.child(
+                                row()
+                                    .key("composer-suggestion")
+                                    .inert()
+                                    .flex_wrap()
+                                    .center_y()
+                                    .gap(8.0)
+                                    .pin(
+                                        Some(COMPOSER_FIELD_PAD),
+                                        Some(COMPOSER_FIELD_PAD),
+                                        None,
+                                        Some(COMPOSER_FIELD_PAD),
+                                    )
+                                    .child(
+                                        label(suggestion, composer_style, p.muted)
+                                            .wrap()
+                                            .min_w(0.0)
+                                            .shrink(),
+                                    )
+                                    .child(keycap_chip("Tab", p).key("composer-suggestion-key")),
+                            );
+                        }
+                        host
+                    }),
                 false,
             )),
     );
@@ -22473,6 +22552,142 @@ pub(crate) mod tests {
             assert!(
                 rt.presented("composer-notice-att-long").is_none(),
                 "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_prompt_suggestion_tab_and_escape_behavior() {
+        let mut rt = runtime(1280.0);
+        rt.state.thread_defaults.prompt_suggestions_enabled = true;
+        {
+            let t = rt.state.current_mut();
+            t.harness = "codex".into();
+            t.status = Status::Completed;
+            t.run_id = Some("run-1".into());
+            t.prompt_suggestion = Some(crate::model::PromptSuggestion {
+                run_id: "run-1".into(),
+                text: "Run cargo test".into(),
+            });
+            t.draft.focused = true;
+        }
+        rt.frame(0.0);
+        rt.frame(1.0);
+        press(&mut rt, "composer-input");
+        rt.frame(1.0);
+
+        // Tab inserts the suggestion as editable text with caret at the end, and does not send.
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.current().draft.text, "Run cargo test");
+        assert_eq!(rt.state.current().draft.focus, "Run cargo test".len());
+        assert_eq!(rt.state.current().draft.anchor, "Run cargo test".len());
+        assert_eq!(rt.state.current().status, Status::Completed);
+        assert!(rt.state.current().messages.is_empty());
+
+        // Tab with the slash menu open keeps the menu's behaviour.
+        rt.state.current_mut().apply(json!({
+            "type": "response",
+            "command": "get_commands",
+            "success": true,
+            "data": {"commands": [{"name": "skill:review", "description": "Review", "source": "skill"}]}
+        }));
+        rt.state.current_mut().draft.replace_text("/skill:");
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.presented("slash-menu").is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Tab,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.current().draft.text, "/skill:review ");
+        assert!(rt.find("slash-menu").is_none());
+
+        // Deleting back to empty shows the suggestion again; Escape dismisses only the suggestion
+        // and does not close anything else on that press.
+        rt.state.current_mut().draft.replace_text("");
+        rt.state.open_thread_find();
+        rt.invalidate();
+        rt.frame(1.0);
+        press(&mut rt, "composer-input");
+        rt.frame(1.0);
+        assert_eq!(rt.state.offered_prompt_suggestion(), Some("Run cargo test"));
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.offered_prompt_suggestion(), None);
+        assert!(rt.state.thread_find_active());
+        assert_eq!(focused_key(&rt).as_deref(), Some("composer-input"));
+    }
+
+    #[test]
+    fn composer_prompt_suggestion_layout_at_620_and_1280() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.thread_defaults.prompt_suggestions_enabled = true;
+            let t = rt.state.current_mut();
+            t.harness = "claude".into();
+            t.status = Status::Completed;
+            t.run_id = Some("run-1".into());
+            t.prompt_suggestion = Some(crate::model::PromptSuggestion {
+                run_id: "run-1".into(),
+                text: "Run cargo test".into(),
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (composer_rect, _) = rt.presented("composer").expect("composer card");
+            let (suggestion_rect, _) = rt
+                .presented("composer-suggestion")
+                .expect("composer-suggestion");
+            let (keycap_rect, _) = rt
+                .presented("composer-suggestion-key")
+                .expect("composer-suggestion-key");
+
+            assert!(
+                suggestion_rect[0] >= composer_rect[0]
+                    && suggestion_rect[1] >= composer_rect[1]
+                    && suggestion_rect[0] + suggestion_rect[2]
+                        <= composer_rect[0] + composer_rect[2]
+                    && suggestion_rect[1] + suggestion_rect[3]
+                        <= composer_rect[1] + composer_rect[3],
+                "suggestion outside composer card at {width}"
+            );
+            assert!(
+                keycap_rect[0] >= composer_rect[0]
+                    && keycap_rect[1] >= composer_rect[1]
+                    && keycap_rect[0] + keycap_rect[2] <= composer_rect[0] + composer_rect[2]
+                    && keycap_rect[1] + keycap_rect[3] <= composer_rect[1] + composer_rect[3],
+                "keycap outside composer card at {width}"
+            );
+
+            let elements = rt.elements();
+            assert!(
+                elements
+                    .iter()
+                    .any(|e| e.text.as_deref() == Some("Run cargo test")),
+                "suggestion text missing at {width}"
+            );
+            assert!(
+                elements.iter().any(|e| e.text.as_deref() == Some("Tab")),
+                "Tab keycap text missing at {width}"
+            );
+            assert!(
+                !elements.iter().any(|e| {
+                    e.text
+                        .as_deref()
+                        .is_some_and(|t| t.contains("Ask anything"))
+                        || e.label
+                            .as_deref()
+                            .is_some_and(|l| l.contains("Ask anything"))
+                }),
+                "default placeholder still present at {width}"
             );
         }
     }

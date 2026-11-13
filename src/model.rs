@@ -3002,6 +3002,7 @@ pub struct State {
     tab_intents: std::collections::HashMap<(String, uuid::Uuid), (u64, TabIntent)>,
     requested_tab: Option<(String, usize, u64, Option<usize>)>,
     requested_tab_restore: Option<RequestedTabRestore>,
+    pub dismissed_prompt_suggestions: std::collections::HashSet<(String, usize, String)>,
     undo_tabs: std::collections::HashMap<(String, usize), (usize, bool)>,
     deleted_threads: Vec<Thread>,
     deleted_records: Option<DeletedRecords>,
@@ -3222,6 +3223,7 @@ impl State {
             server_epoch: uuid::Uuid::new_v4().to_string(),
             server_seq: 0,
             persist_transcripts: false,
+            dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
@@ -7754,6 +7756,95 @@ impl State {
             }
             self.checkpoint();
         }
+    }
+
+    pub fn prompt_suggestions_enabled(&self) -> bool {
+        if self.client.is_some() {
+            self.machines
+                .views
+                .get(&self.machines.selected)
+                .and_then(|v| v["index"]["threadDefaults"]["prompt_suggestions_enabled"].as_bool())
+                .unwrap_or(self.thread_defaults.prompt_suggestions_enabled)
+        } else {
+            self.thread_defaults.prompt_suggestions_enabled
+        }
+    }
+
+    /// Ported condition by condition from KSG Code's `usePromptSuggestion.ts` and `ChatComposer.tsx`.
+    pub fn offered_prompt_suggestion(&self) -> Option<&str> {
+        if !self.prompt_suggestions_enabled()
+            || self.demo
+            || self.ownership_denied
+            || self.unreachable_selected().is_some()
+        {
+            return None;
+        }
+        let t = self.current();
+        if t.delegated
+            || t.archived()
+            || t.offline_blocked
+            || t.status != Status::Completed
+            || t.configuring
+            || t.initializing
+            || t.phase == "Stopping"
+            || t.remote_send.is_some()
+            || t.client_creating.is_some()
+            || t.queued_edit.is_some()
+            || t.request.is_some()
+            || t.native.questionnaire.is_some()
+            || !t.draft.text.is_empty()
+            || t.draft.is_composing()
+            || t.draft.pills().next().is_some()
+            || !t.draft_images.is_empty()
+            || !t.draft_context.is_empty()
+            || !crate::harness::supports_prompt_suggestions(&t.harness)
+        {
+            return None;
+        }
+        let run_id = t.run_id.as_deref()?;
+        let suggestion = t.prompt_suggestion.as_ref()?;
+        if suggestion.run_id != run_id || suggestion.text.trim().is_empty() {
+            return None;
+        }
+        if self
+            .dismissed_prompt_suggestions
+            .contains(&(t.machine.clone(), t.id, run_id.to_owned()))
+        {
+            return None;
+        }
+        Some(suggestion.text.as_str())
+    }
+
+    pub fn dismiss_prompt_suggestion(&mut self) -> bool {
+        if self.offered_prompt_suggestion().is_none() {
+            return false;
+        }
+        let machine = self.current().machine.clone();
+        let thread_id = self.current().id;
+        if let Some(run_id) = self.current().run_id.clone() {
+            self.dismissed_prompt_suggestions
+                .insert((machine, thread_id, run_id));
+            return true;
+        }
+        false
+    }
+
+    pub fn accept_prompt_suggestion(&mut self) -> bool {
+        let Some(text) = self.offered_prompt_suggestion().map(str::to_owned) else {
+            return false;
+        };
+        let t = self.current_mut();
+        t.draft.anchor = 0;
+        t.draft.focus = 0;
+        t.draft.insert(&text);
+        t.native.slash_index = 0;
+        t.composer_rules.changed(&mut t.draft);
+        t.reconcile_draft_context();
+        t.typing_guard.on_type(std::time::Instant::now());
+        t.update_submission_error();
+        self.ensure_composer_commands();
+        self.checkpoint();
+        true
     }
 
     fn dispatch_send(&mut self) -> bool {
@@ -15919,5 +16010,67 @@ mod tests {
         state.current_mut().prompt_suggestion = Some(suggestion);
         state.current_mut().set_machine("remote-host");
         assert_eq!(state.current().prompt_suggestion, None);
+    }
+
+    #[test]
+    fn prompt_suggestion_show_rule_conditions() {
+        let mut state = State::new(".".into(), false);
+        state.thread_defaults.prompt_suggestions_enabled = true;
+        let t = state.current_mut();
+        t.harness = "claude".into();
+        t.status = Status::Completed;
+        t.run_id = Some("run-1".into());
+        t.prompt_suggestion = Some(PromptSuggestion {
+            run_id: "run-1".into(),
+            text: "Run cargo test".into(),
+        });
+
+        // 1. Shows on empty draft after completion.
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 2. Hidden with text, shows again after deleting back to empty.
+        state.current_mut().draft.replace_text("hi");
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().draft.replace_text("");
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 3. Hidden with an attachment.
+        state.current_mut().draft_images.push(Attachment {
+            id: "att-1".into(),
+            name: "a.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 3,
+            path: None,
+        });
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().draft_images.clear();
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 4. Hidden with a pending approval.
+        state.current_mut().request = Some(json!({"id": "req-1", "method": "confirm"}));
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().request = None;
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 5. Hidden while running.
+        state.current_mut().status = Status::Running;
+        assert_eq!(state.offered_prompt_suggestion(), None);
+        state.current_mut().status = Status::Completed;
+        assert_eq!(state.offered_prompt_suggestion(), Some("Run cargo test"));
+
+        // 6. Hidden after dismissal for this run.
+        assert!(state.dismiss_prompt_suggestion());
+        assert_eq!(state.offered_prompt_suggestion(), None);
+
+        // 7. Shows again for the next run.
+        let t = state.current_mut();
+        t.run_id = Some("run-2".into());
+        t.prompt_suggestion = Some(PromptSuggestion {
+            run_id: "run-2".into(),
+            text: "Inspect the diff".into(),
+        });
+        assert_eq!(state.offered_prompt_suggestion(), Some("Inspect the diff"));
     }
 }

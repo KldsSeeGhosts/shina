@@ -265,6 +265,9 @@ pub(super) fn composer_pi_key(
     {
         return true;
     }
+    if composer_suggestion_key(s, event, tx.key_repeat()) {
+        return true;
+    }
     if let Some(intent) = submission_intent {
         if !s.demo && !s.current().archived() {
             match intent {
@@ -400,6 +403,52 @@ fn composer_queue_key(s: &mut State, event: &rune::KeyEvent, tx: &rune::Tx) -> b
     }
     s.checkpoint();
     true
+}
+
+pub(super) fn suggestion_menu_open(s: &State) -> bool {
+    composer_menu::trigger(s).is_some()
+        || s.settings_picker.is_some()
+        || s.captain_picker
+        || s.machines.picker
+        || s.current().native.access_picker
+        || s.project_picker.is_some()
+        || s.open_option_menu.is_some()
+        || s.row_menu.is_some()
+        || s.thread_menu
+        || s.settings_menu
+        || s.attention_menu
+        || s.plan_menu.is_some()
+        || s.snooze_menu.is_some()
+        || s.current().context.popover_open()
+}
+
+fn composer_suggestion_key(s: &mut State, event: &rune::KeyEvent, key_repeat: bool) -> bool {
+    if suggestion_menu_open(s) || s.offered_prompt_suggestion().is_none() {
+        return false;
+    }
+    if event.key == rune::Key::Tab
+        && !event.mods.shift
+        && !event.mods.alt
+        && !event.mods.cmd
+        && !event.mods.ctrl
+    {
+        if key_repeat {
+            return true;
+        }
+        return s.accept_prompt_suggestion();
+    }
+    if event.key == rune::Key::Escape
+        && !event.mods.shift
+        && !event.mods.alt
+        && !event.mods.cmd
+        && !event.mods.ctrl
+    {
+        if key_repeat {
+            return true;
+        }
+        return s.dismiss_prompt_suggestion();
+    }
+    false
 }
 
 /// Ported from KSG Code's QueuedRunsControl: right-aligned unsent messages, per-message edit,
