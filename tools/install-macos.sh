@@ -7,6 +7,16 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
+# Ad-hoc signatures normally identify an app by its code hash, so macOS forgets every privacy
+# approval when the app updates. A fixed designated requirement keeps the approval. The inner
+# binary is signed first because the bundle's main executable is the launch script.
+sign_bundle() {
+    requirement='designated => identifier "com.kidsseeghosts.shina"'
+    /usr/bin/codesign --force --sign - --identifier com.kidsseeghosts.shina \
+        -r="$requirement" "$1/Contents/MacOS/shina"
+    /usr/bin/codesign --force --sign - -r="$requirement" "$1"
+}
+
 # The complete bundle: executable and launcher, version and source revision, icon, ad-hoc
 # signature. The updater validates exactly these before it replaces the installed app.
 build_bundle() {
@@ -33,7 +43,7 @@ build_bundle() {
         /bin/rm "$iconset/icon_${size}x${size}.png" "$iconset/icon_${size}x${size}@2x.png"
     done
     rmdir "$iconset"
-    /usr/bin/codesign --force --deep --sign - "$app"
+    sign_bundle "$app"
     /usr/bin/codesign --verify --deep --strict "$app"
 }
 
@@ -95,7 +105,7 @@ build_bundle() {
         /bin/rm "$iconset/icon_${size}x${size}.png" "$iconset/icon_${size}x${size}@2x.png"
     done
     rmdir "$iconset"
-    /usr/bin/codesign --force --deep --sign - "$app"
+    sign_bundle "$app"
     /usr/bin/codesign --verify --deep --strict "$app"
 }
 

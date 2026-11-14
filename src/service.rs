@@ -490,8 +490,23 @@ pub fn cli(args: &[String]) -> Result<(), String> {
 
 /// KSG serviceLauncher reads the host's existing service.env at launch, not at installation.
 pub fn launch(path: &Path) -> Result<(), String> {
-    let service: Service = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let bytes = match fs::read(path) {
+        Err(error)
+            if cfg!(target_os = "macos")
+                && error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            // launchd restarts a failed job after 5 seconds, and every start raises the macOS
+            // privacy prompt again. Wait so a denied job asks once a minute, not 12 times.
+            eprintln!(
+                "macOS denied Shina access to {}. Allow Shina in System Settings, Privacy & Security, Files and Folders. Retrying in 60 seconds.",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_secs(60));
+            return Err(error.to_string());
+        }
+        other => other.map_err(|e| e.to_string())?,
+    };
+    let service: Service = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let log_path = service.log_path();
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;

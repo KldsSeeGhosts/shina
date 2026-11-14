@@ -654,12 +654,31 @@ impl UpdateHost for Gh {
                     let staged =
                         install::prepare_macos_bundle(&bundle, &install::bundle_staging(app))
                             .map_err(Failure::quiet)?;
-                    let mut sign = Command::new("/usr/bin/codesign");
-                    sign.args(["--force", "--deep", "--sign", "-"])
+                    // Same two steps as `sign_bundle` in tools/install-macos.sh: the fixed
+                    // designated requirement keeps macOS privacy approvals across updates.
+                    let requirement = format!(
+                        "-r=designated => identifier \"{}\"",
+                        install::MACOS_BUNDLE_ID
+                    );
+                    let mut inner = Command::new("/usr/bin/codesign");
+                    inner
+                        .args(["--force", "--sign", "-", "--identifier"])
+                        .arg(install::MACOS_BUNDLE_ID)
+                        .arg(&requirement)
+                        .arg(staged.join("Contents/MacOS/shina"))
+                        .stdin(Stdio::null());
+                    let mut outer = Command::new("/usr/bin/codesign");
+                    outer
+                        .args(["--force", "--sign", "-"])
+                        .arg(&requirement)
                         .arg(&staged)
                         .stdin(Stdio::null());
-                    if !run_bounded(sign, METADATA_TIMEOUT)?.0.success() {
-                        return Err(Failure::quiet("Could not sign the prepared Shina bundle."));
+                    for sign in [inner, outer] {
+                        if !run_bounded(sign, METADATA_TIMEOUT)?.0.success() {
+                            return Err(Failure::quiet(
+                                "Could not sign the prepared Shina bundle.",
+                            ));
+                        }
                     }
                     if let Some(problem) = mac_bundle_problem(&staged, &release.tag) {
                         return Err(Failure::quiet(problem));
