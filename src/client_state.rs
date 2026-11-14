@@ -1116,7 +1116,11 @@ impl State {
         }
         let mut projection = json!({
             "index":index,"threads":views,"recoveryNotice":self.recovery_notice,
-            "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error},
+            // Thread summaries carry no model list, so a client draft reads the Pi catalog here,
+            // like `nativeCatalogs` for Codex and Claude.
+            "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error,
+                "models":self.catalog.models,"defaultModel":self.catalog.default_model,
+                "defaultThinking":self.catalog.default_thinking},
             "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
@@ -1969,6 +1973,7 @@ impl State {
             .map(Value::take)
             .unwrap_or(Value::Null);
         self.client_views = projection;
+        self.apply_projected_catalog();
         self.apply_native_catalogs();
         if first && !local.is_null() {
             // Live cached editors also own pending sends and isolated queue edits. Restoring the
@@ -2140,6 +2145,18 @@ impl State {
     }
     /// Whether this desktop's connection to a machine's Shina server is ready. Demo data has no
     /// server, so it never shows a dropped connection.
+    /// Mirror the selected machine's Pi catalog. A server from before the catalog was projected
+    /// sends no list, which leaves the catalog empty as it was then.
+    fn apply_projected_catalog(&mut self) {
+        let catalog = &self.client_views["catalog"];
+        self.catalog.models = serde_json::from_value(catalog["models"].clone()).unwrap_or_default();
+        self.catalog.default_model =
+            serde_json::from_value(catalog["defaultModel"].clone()).unwrap_or_default();
+        self.catalog.default_thinking = catalog["defaultThinking"].as_str().unwrap_or("").into();
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+    }
     pub fn machine_connected(&self, server: &str) -> bool {
         if self.demo {
             return true;
@@ -4329,6 +4346,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_client_reads_the_pi_catalog_from_the_projection() {
+        let mut server = State::new(PathBuf::new(), false);
+        server.catalog.models = vec![
+            crate::session::AgentModel::from_value(
+                &json!({"provider":"cpa","id":"proxy","name":"Proxy"}),
+            )
+            .unwrap(),
+        ];
+        server.catalog.default_model = server.catalog.models.first().cloned();
+        let mut state = State::new(PathBuf::new(), false);
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.catalog.models[0].id, "proxy");
+        assert_eq!(state.catalog.default_model.as_ref().unwrap().id, "proxy");
+        // A server from before the catalog was projected sends no list.
+        let mut old = server.projection();
+        old["catalog"] = json!({"loading":false,"error":null});
+        state.apply_projection(old).unwrap();
+        assert!(state.catalog.models.is_empty());
+    }
+    #[test]
     fn question_collapse_survives_matching_projections_but_not_a_new_request_or_navigation() {
         let mut server = Thread::new(1);
         server.apply(
@@ -5185,12 +5222,12 @@ mod tests {
         // Folder-name match: project 2 "notes" has no repository, so its
         // worktree settings cannot survive; the model list the target reports
         // does not carry the selection either.
-        state.catalog.models = vec![
+        state.machines.views.get_mut("server-b").unwrap()["catalog"] = json!({"models":[
             crate::model::AgentModel::from_value(
                 &json!({"provider":"cpa","id":"other-model","name":"Other"}),
             )
             .unwrap(),
-        ];
+        ]});
         client_draft_on(&mut state, Some(2), "loses settings");
         let thread = state.current_mut();
         thread.selected_model = Some(("cpa".into(), "model".into()));
