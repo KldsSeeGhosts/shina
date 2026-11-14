@@ -2509,6 +2509,10 @@ impl State {
         // A second change supersedes the first: the pending record is the
         // request's identity, so dropping it discards the earlier change.
         self.machines.draft_retarget = None;
+        self.move_editor_to_client_draft();
+        if !self.current().client_draft {
+            return;
+        }
         let server = server.to_owned();
         let source = self.machines.selected.clone();
         let draft = self.current().id;
@@ -2536,6 +2540,40 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Only a client draft can change machines. The empty thread the app opens with is a
+    /// server record, so its unsent editor moves into a client draft on the same machine first.
+    fn move_editor_to_client_draft(&mut self) {
+        if self.current().client_draft {
+            return;
+        }
+        let origin = self.current().id;
+        let project = self.current().project;
+        let draft = self.current().draft.clone();
+        let images = std::mem::take(&mut self.current_mut().draft_images);
+        let context = std::mem::take(&mut self.current_mut().draft_context);
+        let reply_to = self.current_mut().draft_reply_to.take();
+        let retained = std::mem::take(&mut self.current_mut().retained_context);
+        self.current_mut().draft.replace_text("");
+        self.new_client_draft(project);
+        if !self.current().client_draft {
+            // The project is unknown here, so no draft was made. Put the editor back.
+            if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == origin) {
+                thread.draft = draft;
+                thread.draft_images = images;
+                thread.draft_context = context;
+                thread.draft_reply_to = reply_to;
+                thread.retained_context = retained;
+            }
+            return;
+        }
+        let thread = self.current_mut();
+        thread.draft = draft;
+        thread.draft_images = images;
+        thread.draft_context = context;
+        thread.draft_reply_to = reply_to;
+        thread.retained_context = retained;
     }
 
     /// Whether the target machine can open a scratch project for a retarget.
@@ -5079,6 +5117,39 @@ mod tests {
         // The draft never promoted; nothing was sent.
         assert!(state.current().client_draft);
         assert!(remote.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_opening_server_thread_can_change_machines() {
+        let (mut state, _local, mut remote) = draft_routing_fixture();
+        let mut opening = Thread::new(41);
+        opening.draft.replace_text("typed at launch");
+        state.threads.push(opening);
+        state.select_thread(state.threads.len() - 1);
+        assert!(!state.current().client_draft);
+        state.retarget_draft("server-b");
+        assert!(state.current().client_draft);
+        let draft_id = state.current().id;
+        let command = remote.try_recv().unwrap();
+        assert_eq!(command.method, "project.ensureScratch");
+        state
+            .client
+            .as_ref()
+            .unwrap()
+            .linked
+            .get("server-b")
+            .unwrap()
+            .test_receipt(command, accepted(json!({"projectId":9})));
+        state.poll_client(&mut Tx::default());
+        assert_eq!(state.machines.selected, "server-b");
+        assert_eq!(state.current().id, draft_id);
+        assert_eq!(state.current().project, Some(9));
+        assert_eq!(state.current().draft.text, "typed at launch");
+        let left = state.machines.threads["local"]
+            .iter()
+            .find(|thread| thread.id == 41)
+            .unwrap();
+        assert_eq!(left.draft.text, "");
     }
 
     #[test]
