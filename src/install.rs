@@ -416,6 +416,69 @@ pub fn launch_child(exe: &Path, args: &[&str]) -> Result<std::process::Child, St
         .map_err(|e| format!("Could not start {}: {e}", exe.display()))
 }
 
+/// Start the update helper so that it outlives the server that started it. A service
+/// manager ends everything it started with the server: systemd kills the unit's control
+/// group, launchd kills the job's process group, and the Windows task action waits for
+/// every descendant. The helper therefore starts in its own scope, session or process tree.
+pub fn launch_detached(exe: &Path, args: &[&str]) -> Result<std::process::Child, String> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        let mut command = Command::new("systemd-run");
+        command
+            .args(["--user", "--scope", "--collect", "--quiet", "--"])
+            .arg(exe)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(child) = command.spawn() {
+            return Ok(child);
+        }
+    }
+    #[cfg(windows)]
+    if std::env::var_os("SHINA_BOOT_SERVICE").is_some() {
+        // A process created through WMI belongs to the WMI host, not to this task.
+        let line = std::iter::once(format!("\"{}\"", exe.display()))
+            .chain(args.iter().map(|arg| (*arg).to_owned()))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('\'', "''");
+        let script = format!(
+            "$ErrorActionPreference='Stop'; $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{line}'}}; if ($r.ReturnValue -ne 0) {{ exit 1 }}"
+        );
+        let mut command = Command::new("powershell.exe");
+        hidden(&mut command);
+        return command
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Could not start {}: {e}", exe.display()));
+    }
+    let mut command = Command::new(exe);
+    #[cfg(windows)]
+    hidden(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Could not start {}: {e}", exe.display()))
+}
+
 pub fn report_notice(message: &str) {
     if let Some(directory) = crate::store::directory() {
         let _ = fs::create_dir_all(&directory);
@@ -610,7 +673,13 @@ pub fn wait_for_marker(
         if marker.is_file() {
             return Ok(());
         }
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        // A starter that only hands the helper to another process tree exits cleanly
+        // before the helper acknowledges. Only a failed exit ends the wait early.
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| e.to_string())?
+            .filter(|status| !status.success())
+        {
             let mut details = String::new();
             if let Some(directory) = crate::store::directory()
                 && let Ok(file) = fs::File::open(directory.join("startup-warning.txt"))

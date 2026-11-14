@@ -1485,7 +1485,7 @@ fn start_coordinated_helper_id(update: &PreparedUpdate, id: &str) -> Result<(), 
         fs::remove_file(&handshake).map_err(|e| e.to_string())?;
     }
     drop(_lock);
-    let mut child = install::launch_child(&helper, &["--coordinated-update"])?;
+    let mut child = install::launch_detached(&helper, &["--coordinated-update"])?;
     install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT)
 }
 
