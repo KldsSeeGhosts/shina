@@ -14487,6 +14487,9 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
         let update = device["scopes"]
             .as_array()
             .is_some_and(|scopes| scopes.iter().any(|scope| scope == "update"));
+        let paired = device["scopes"]
+            .as_array()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "paired"));
         let title = format!("Device {}", &id[..id.len().min(8)]);
         card = card.child(
             row()
@@ -14500,10 +14503,12 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                         &format!("device-update-{id}"),
                         if maintenance {
                             "Local maintenance permits updates"
+                        } else if paired {
+                            "Pairing permits updates"
                         } else {
                             "Allow updates"
                         },
-                        update || maintenance,
+                        update || maintenance || paired,
                         p,
                         move |s| {
                             s.machine_action(
@@ -14516,7 +14521,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                             )
                         },
                     )
-                    .disabled(busy || maintenance),
+                    .disabled(busy || maintenance || paired),
                 )
                 .child(
                     settings_ui::destructive_button(

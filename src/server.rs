@@ -2658,29 +2658,10 @@ mod tests {
                     .unwrap()
                     .join(format!("update-client-{rollback}"));
                 let link = fixture.link(&profile).await;
-                assert!(
-                    crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
-                        .await
-                        .unwrap_err()
-                        .contains("update grant")
-                );
-                assert!(
-                    crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
-                        .await
-                        .is_err()
-                );
-                let audit =
-                    rusqlite::Connection::open(fixture.shared.directory.join("state.sqlite"))
-                        .unwrap();
-                let refused: u32 = audit
-                    .query_row(
-                        "SELECT count(*) FROM update_audit WHERE device_id=?1 AND accepted=0",
-                        [&link.device_id],
-                        |r| r.get(0),
-                    )
+                // Pairing gives the update right, so a paired device needs no separate grant.
+                crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
+                    .await
                     .unwrap();
-                assert_eq!(refused, 1);
-                drop(audit);
                 assert!(
                     crate::client::remote_rpc(
                         &link,
@@ -2777,17 +2758,6 @@ mod tests {
                         .database
                         .update_rate_limited(&link.device_id, crate::lifecycle::now() + 600_001)
                         .unwrap()
-                );
-                fixture
-                    .local_command(
-                        "devices.revokeGrant",
-                        json!({"deviceId":link.device_id,"grant":"update"}),
-                    )
-                    .await;
-                assert!(
-                    crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
-                        .await
-                        .is_err()
                 );
             }
         });

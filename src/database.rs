@@ -796,10 +796,10 @@ impl Database {
         {
             return Err("Change update grants on the target machine itself.".into());
         }
+        // Pairing gives every right, updates included. Devices paired before that was the
+        // default hold no stored "update" scope, so "paired" stands in for it.
         if scopes.iter().any(|granted| granted == scope)
-            || (scope == "update"
-                && scopes.iter().any(|s| s == "maintain")
-                && !scopes.iter().any(|s| s == "paired"))
+            || (scope == "update" && scopes.iter().any(|s| s == "maintain" || s == "paired"))
         {
             Ok(())
         } else {

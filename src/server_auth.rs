@@ -68,7 +68,7 @@ impl Pairing {
         let scopes: &[&str] = if self.peer {
             &["read", "peer-delegate"]
         } else {
-            &["paired", "read", "operate", "approve"]
+            &["paired", "read", "operate", "approve", "update"]
         };
         database.issue_scoped_device(device, &token, scopes)?;
         Ok(token)
