@@ -1,12 +1,28 @@
 //! Process-bound effects follow KSG EffectOutbox. Lost processes are never replayed.
 use serde_json::{Value, json};
-use std::{cell::RefCell, sync::mpsc::SyncSender};
+use std::{
+    cell::RefCell,
+    sync::mpsc::{Sender, SyncSender},
+};
+
+/// Private dispatch representation. Public `id`/`payload` stay the durable
+/// record; the live channel and record exist only in memory and are never
+/// persisted or replayed at restart.
+enum Dispatch {
+    Harness {
+        sender: SyncSender<Value>,
+        record: Value,
+    },
+    McpReply {
+        sender: Sender<Result<Value, String>>,
+        result: Result<Value, String>,
+    },
+}
 
 pub struct Effect {
     pub id: String,
     pub payload: Value,
-    sender: SyncSender<Value>,
-    record: Value,
+    dispatch: Dispatch,
 }
 
 thread_local! {
@@ -48,14 +64,45 @@ pub fn send(sender: &SyncSender<Value>, record: Value) -> Result<(), String> {
                 // The durable input lives in the command/runtime input documents.
                 // Do not retain raw RPC records, which can contain credentials.
                 payload: json!({"type":record["type"],"id":record["id"]}),
-                sender: sender.clone(),
-                record,
+                dispatch: Dispatch::Harness {
+                    sender: sender.clone(),
+                    record,
+                },
             });
             Ok(())
         } else {
             sender
                 .try_send(record)
                 .map_err(|e| format!("The agent did not accept the command: {e}"))
+        }
+    })
+}
+
+/// Captures an MCP reply so `saved` results cannot reach the caller before the
+/// mutation commits. Without a capture the reply stays synchronous, matching
+/// direct tests and non-runtime callers.
+pub fn reply(
+    sender: &Sender<Result<Value, String>>,
+    result: Result<Value, String>,
+) -> Result<(), String> {
+    CAPTURE.with(|capture| {
+        if let Some(effects) = capture.borrow_mut().as_mut() {
+            if effects.len() >= 1024 {
+                return Err("Too many outbound effects in one runtime batch.".into());
+            }
+            effects.push(Effect {
+                id: uuid::Uuid::new_v4().to_string(),
+                // Only the marker is durable: never the tool args, result or body.
+                payload: json!({"type":"mcp.reply"}),
+                dispatch: Dispatch::McpReply {
+                    sender: sender.clone(),
+                    result,
+                },
+            });
+            Ok(())
+        } else {
+            let _ = sender.send(result);
+            Ok(())
         }
     })
 }
@@ -74,20 +121,38 @@ pub fn drain(database: &crate::database::Database, effects: Vec<Effect>) -> Resu
         database.effect_status(&effect.id, "dispatching", None)?;
         #[cfg(debug_assertions)]
         crash_boundary(&effect.payload, "dispatching");
-        match effect.sender.try_send(effect.record) {
-            Ok(()) => {
-                #[cfg(debug_assertions)]
-                crash_boundary(&effect.payload, "sent");
-                database.effect_status(&effect.id, "completed", None)?;
-            }
-            Err(_) => {
-                database.effect_status(
-                    &effect.id,
-                    "interrupted",
-                    Some("Harness did not accept dispatch. Review before retrying."),
-                )?;
-                return Err("Harness dispatch interrupted. Review before retrying.".into());
-            }
+        match effect.dispatch {
+            Dispatch::Harness { sender, record } => match sender.try_send(record) {
+                Ok(()) => {
+                    #[cfg(debug_assertions)]
+                    crash_boundary(&effect.payload, "sent");
+                    database.effect_status(&effect.id, "completed", None)?;
+                }
+                Err(_) => {
+                    database.effect_status(
+                        &effect.id,
+                        "interrupted",
+                        Some("Harness did not accept dispatch. Review before retrying."),
+                    )?;
+                    return Err("Harness dispatch interrupted. Review before retrying.".into());
+                }
+            },
+            Dispatch::McpReply { sender, result } => match sender.send(result) {
+                Ok(()) => {
+                    #[cfg(debug_assertions)]
+                    crash_boundary(&effect.payload, "sent");
+                    database.effect_status(&effect.id, "completed", None)?;
+                }
+                // A dropped MCP receiver must not fail the batch or block later
+                // effects; the reply is process-bound and never replays.
+                Err(_) => {
+                    database.effect_status(
+                        &effect.id,
+                        "interrupted",
+                        Some("MCP caller disconnected before receiving the committed result."),
+                    )?;
+                }
+            },
         }
     }
     Ok(())

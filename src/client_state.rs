@@ -4382,6 +4382,19 @@ impl State {
                 self.require_captain(captain)?;
                 return Ok(self.captain_crew_value(captain));
             }
+            "captain.reports.list" => {
+                return self.captain_reports_value(number("captain")?, &args);
+            }
+            "captain.report.answer" => {
+                return self.captain_report_answer(
+                    "local",
+                    number("captain")?,
+                    &text("reportId")?,
+                    &text("answer")?,
+                    number("expectedRevision")? as u64,
+                    &text("requestId")?,
+                );
+            }
             "captain.crew.join" => {
                 self.captain_crew_join(number("captain")?, number("threadId")?)?
             }

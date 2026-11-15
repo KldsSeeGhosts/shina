@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 29;
+pub const MINOR: u32 = 30;
 pub const CAPTAIN_STATE_MINOR: u32 = 29;
 pub const CAPTAIN_STATE: &str = "captain-state-v1";
 pub const CAPTAIN_STATE_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the server to manage captain crew state.";
+pub const CAPTAIN_REPORTS_MINOR: u32 = 30;
+pub const CAPTAIN_REPORTS: &str = "captain-reports-v1";
+pub const CAPTAIN_REPORTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to answer crew questions.";
 pub const MOBILE_PUSH_MINOR: u32 = 28;
 pub const MOBILE_PUSH: &str = "mobile-push-v1";
 pub const MOBILE_PUSH_UPDATE_REQUIRED: &str =
@@ -228,8 +232,9 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "review.getDiffFileContents"
         | "captain.read"
         | "captain.document.read"
-        | "captain.crew.list" => "read",
-        "request.respond" | "thread.user-input.dismiss" => "approve",
+        | "captain.crew.list"
+        | "captain.reports.list" => "read",
+        "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
         | "peer.link"
@@ -707,8 +712,9 @@ mod tests {
                 | "review.getDiffFileContents"
                 | "captain.read"
                 | "captain.document.read"
-                | "captain.crew.list" => "read",
-                "request.respond" => "approve",
+                | "captain.crew.list"
+                | "captain.reports.list" => "read",
+                "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"
                 | "peer.link"

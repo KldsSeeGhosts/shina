@@ -53,7 +53,8 @@
       "thread-title-search-v1",
       "notification-feed-v1",
       "mobile-push-v1",
-      "captain-state-v1"
+      "captain-state-v1",
+      "captain-reports-v1"
     ],
     "deviceId": "<uuid>",
     "epoch": "<epoch>",

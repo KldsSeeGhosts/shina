@@ -908,6 +908,290 @@ mod tests {
     }
 
     #[test]
+    fn crew_answers_commit_before_the_answer_prompt_dispatches() {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        let channels: std::sync::Arc<std::sync::Mutex<Vec<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        {
+            let state = &mut runtime.state;
+            state.captains = crate::captains::Captain::presets();
+            state.open_captain(0);
+            let hook_channels = channels.clone();
+            state.test_connect_pi = Some(Box::new(move |_tid, _path| {
+                let (pi, commands, _events) = crate::harness::Session::test_connection();
+                hook_channels.lock().unwrap().push(commands);
+                Some(pi)
+            }));
+            let worker = state.next_id;
+            state.next_id += 1;
+            let mut thread = crate::model::Thread::new(worker);
+            thread.crew_captain = Some(0);
+            thread.captain = Some(0);
+            thread.title = "Crew worker".into();
+            thread.run_id = Some("run-q".into());
+            thread.model_provider = "cpa".into();
+            state.threads.push(thread);
+            // The crew root claims a question; the primary home answers it.
+            let report_id = state
+                .mcp_call(
+                    worker,
+                    "captain_crew_report",
+                    &json!({
+                        "requestId":uuid::Uuid::new_v4().to_string(),
+                        "outcome":"blocked","summary":"waiting",
+                        "question":{"text":"Which branch?","recipient":"captain"}
+                    }),
+                )
+                .unwrap()["reportId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let home = state.captain_home(0).unwrap();
+            state
+                .mcp_call(
+                    home,
+                    "captain_question_answer",
+                    &json!({
+                        "reportId":report_id,"expectedRevision":0,
+                        "requestId":uuid::Uuid::new_v4().to_string(),"answer":"main"
+                    }),
+                )
+                .unwrap();
+        }
+        // The batch: scope starts empty so answer delivery must promote a full
+        // snapshot before any fake prompt dispatches.
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        let changed = crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        let effects = capture.finish();
+        assert!(changed);
+        assert!(runtime.state.persistence_scope.is_none());
+        // Every fake backend (the Captain's home for the report, the worker for
+        // the answer) has seen nothing before the commit.
+        let mut guard = channels.lock().unwrap();
+        let receivers: Vec<_> = guard.drain(..).collect();
+        drop(guard);
+        assert!(!receivers.is_empty());
+        for commands in &receivers {
+            assert!(commands.try_recv().is_err());
+        }
+        // The previous committed snapshot has no answer state.
+        let before = database.read("index.json").unwrap();
+        assert!(
+            before
+                .and_then(|index| index["captainQuestionAnswers"].as_array().cloned())
+                .is_none_or(|answers| answers.is_empty())
+        );
+        let answer_id = runtime.state.crew_answers()[0].id.clone();
+        runtime.persist(None, effects).unwrap();
+        let committed = database.read("index.json").unwrap().unwrap();
+        assert_eq!(
+            committed["captainQuestionAnswers"][0]["id"],
+            json!(answer_id)
+        );
+        // Only after the commit does the worker's fake backend get the answer.
+        let prompt = receivers
+            .iter()
+            .filter_map(|commands| commands.try_recv().ok())
+            .find(|command| {
+                serde_json::to_string(command)
+                    .unwrap_or_default()
+                    .contains(&answer_id)
+            })
+            .expect("answer prompt after commit");
+        // Its real command id acknowledges the delivery; nothing replays.
+        let worker_index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|t| Some(t.id) == runtime.state.crew_answers().first().map(|a| a.thread_id))
+            .unwrap();
+        runtime.state.threads[worker_index].apply(json!({
+            "type":"response","command":"prompt","id":prompt["id"],"success":true
+        }));
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        let effects = capture.finish();
+        runtime.persist(None, effects).unwrap();
+        let committed = database.read("index.json").unwrap().unwrap();
+        assert_eq!(
+            committed["captainQuestionAnswers"][0]["delivered"],
+            json!(true)
+        );
+        assert!(receivers.iter().all(|commands| {
+            commands.try_iter().all(|command| {
+                !serde_json::to_string(&command)
+                    .unwrap_or_default()
+                    .contains(&answer_id)
+            })
+        }));
+    }
+
+    fn runtime_fixture_with_crew() -> (
+        RuntimeState,
+        crate::database::Database,
+        std::sync::Arc<std::sync::Mutex<Vec<std::sync::mpsc::Receiver<Value>>>>,
+        usize,
+    ) {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        let channels: std::sync::Arc<std::sync::Mutex<Vec<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        {
+            let state = &mut runtime.state;
+            state.captains = crate::captains::Captain::presets();
+            state.open_captain(0);
+            let hook_channels = channels.clone();
+            state.test_connect_pi = Some(Box::new(move |_tid, _path| {
+                let (pi, commands, _events) = crate::harness::Session::test_connection();
+                hook_channels.lock().unwrap().push(commands);
+                Some(pi)
+            }));
+            let worker = state.next_id;
+            state.next_id += 1;
+            let mut thread = crate::model::Thread::new(worker);
+            thread.crew_captain = Some(0);
+            thread.captain = Some(0);
+            thread.title = "Crew worker".into();
+            thread.run_id = Some("run-q".into());
+            state.threads.push(thread);
+            let home = state.captain_home(0).unwrap();
+            let home_index = state.threads.iter().position(|t| t.id == home).unwrap();
+            state.threads[home_index].model_provider = "cpa".into();
+            (runtime, database, channels, worker)
+        }
+    }
+
+    #[test]
+    fn mcp_replies_dispatch_only_after_the_commit() {
+        let (mut runtime, database, channels, worker) = runtime_fixture_with_crew();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        runtime.state.mcp_request(crate::mcp::Request {
+            thread: worker,
+            tool: "captain_crew_report".into(),
+            args: json!({
+                "requestId":uuid::Uuid::new_v4().to_string(),
+                "outcome":"blocked","summary":"waiting",
+                "question":{"text":"Which branch?","recipient":"captain"}
+            }),
+            reply: reply_tx,
+        });
+        // The saved result is not visible before the batch commits.
+        assert!(reply_rx.try_recv().is_err());
+        let changed = crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        let effects = capture.finish();
+        assert!(changed);
+        // The reply is captured with only its marker, never the tool payload.
+        let reply_effect = effects
+            .iter()
+            .find(|effect| effect.payload["type"] == "mcp.reply")
+            .expect("captured mcp reply");
+        assert_eq!(reply_effect.payload, json!({"type":"mcp.reply"}));
+        assert!(reply_rx.try_recv().is_err());
+        // The previous committed snapshot has no report.
+        let before = database.read("index.json").unwrap();
+        assert!(
+            before
+                .and_then(|index| index["captainReports"].as_array().cloned())
+                .is_none_or(|reports| reports.is_empty())
+        );
+        runtime.persist(None, effects).unwrap();
+        // The committed snapshot carries the report before the reply lands.
+        let committed = database.read("index.json").unwrap().unwrap();
+        let committed_id = committed["captainReports"][0]["id"].as_str().unwrap();
+        let reply = reply_rx.try_recv().expect("reply after commit").unwrap();
+        assert_eq!(reply["saved"], json!(true));
+        assert_eq!(reply["reportId"], json!(committed_id));
+        // The Captain wake prompt dispatches in the same drain.
+        let mut guard = channels.lock().unwrap();
+        let prompt = guard
+            .iter_mut()
+            .filter_map(|commands| commands.try_recv().ok())
+            .find(|command| {
+                serde_json::to_string(command)
+                    .unwrap_or_default()
+                    .contains(committed_id)
+            });
+        assert!(prompt.is_some());
+    }
+
+    #[test]
+    fn a_failed_persist_never_dispatches_the_saved_reply() {
+        let (mut runtime, database, _channels, worker) = runtime_fixture_with_crew();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        runtime.state.mcp_request(crate::mcp::Request {
+            thread: worker,
+            tool: "captain_crew_report".into(),
+            args: json!({
+                "requestId":uuid::Uuid::new_v4().to_string(),
+                "outcome":"progress","summary":"half"
+            }),
+            reply: reply_tx,
+        });
+        crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        let effects = capture.finish();
+        database.fail("injected storage failure".into());
+        assert!(runtime.persist(None, effects).is_err());
+        // No saved:true ever reached the caller.
+        match reply_rx.try_recv() {
+            Err(_) => {}
+            Ok(reply) => assert!(
+                reply.is_err() || reply.unwrap()["saved"] != json!(true),
+                "no saved:true may reach the caller after a failed persist"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_dropped_reply_receiver_does_not_block_later_dispatch() {
+        let (mut runtime, database, channels, worker) = runtime_fixture_with_crew();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        runtime.state.mcp_request(crate::mcp::Request {
+            thread: worker,
+            tool: "captain_crew_report".into(),
+            args: json!({
+                "requestId":uuid::Uuid::new_v4().to_string(),
+                "outcome":"blocked","summary":"waiting",
+                "question":{"text":"Which branch?","recipient":"captain"}
+            }),
+            reply: reply_tx,
+        });
+        crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        let effects = capture.finish();
+        // The MCP caller disconnects before the commit completes.
+        drop(reply_rx);
+        runtime.persist(None, effects).unwrap();
+        let committed = database.read("index.json").unwrap().unwrap();
+        let report_id = committed["captainReports"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(runtime.failure.is_none());
+        // The harness prompt behind the reply still dispatches.
+        let mut guard = channels.lock().unwrap();
+        assert!(guard.iter_mut().any(|commands| {
+            commands.try_iter().any(|command| {
+                serde_json::to_string(&command)
+                    .unwrap_or_default()
+                    .contains(&report_id)
+            })
+        }));
+    }
+
+    #[test]
     fn crew_reports_commit_before_the_wake_prompt_dispatches() {
         let mut runtime = durable();
         let database = runtime.database.clone().unwrap();

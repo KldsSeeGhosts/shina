@@ -921,6 +921,20 @@ impl State {
                 "The thread's crew report must reach its Captain before membership changes.".into(),
             );
         }
+        let open_question = self.captain_reports.iter().any(|report| {
+            report.thread_id == owner
+                && report.question.is_some()
+                && !self
+                    .captain_question_answers
+                    .iter()
+                    .any(|answer| answer.report_id == report.id && answer.delivered)
+        });
+        if open_question {
+            return Err(
+                "The thread's question and its answer must reach their destination before membership changes."
+                    .into(),
+            );
+        }
         if self.crew_descendant_busy(owner) {
             return Err(
                 "Stop the thread's delegated work before changing its crew membership.".into(),
@@ -1034,6 +1048,26 @@ impl State {
         match target {
             Some(target) if !target.has_capability(crate::protocol::CAPTAIN_STATE) => {
                 Err(crate::protocol::CAPTAIN_STATE_UPDATE_REQUIRED.into())
+            }
+            None if self.machines.selected != "local" => Err("This machine is not linked.".into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// `captain-reports-v1` gate: report listing and answer RPCs are only
+    /// negotiated for clients that declare minor 30 support.
+    pub(crate) fn require_captain_reports_capability(&self) -> Result<(), String> {
+        let Some(client) = &self.client else {
+            return Ok(());
+        };
+        let target = if self.machines.selected == "local" {
+            Some(client)
+        } else {
+            client.linked.get(&self.machines.selected)
+        };
+        match target {
+            Some(target) if !target.has_capability(crate::protocol::CAPTAIN_REPORTS) => {
+                Err(crate::protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED.into())
             }
             None if self.machines.selected != "local" => Err("This machine is not linked.".into()),
             _ => Ok(()),
@@ -1314,6 +1348,13 @@ impl State {
                 }
                 self.captain_reports_list(caller, target, args)
             }
+            "captain_crew_report" => {
+                if args.get("captain").is_some_and(|v| !v.is_u64()) {
+                    return Err("captain must be an integer.".into());
+                }
+                self.captain_crew_report(caller, target, args)
+            }
+            "captain_question_answer" => self.captain_question_answer(caller, target, args),
             "captain_crew_release" => {
                 if !primary {
                     return Err("Only this captain's primary home may release crew.".into());

@@ -109,6 +109,8 @@ mod approval_send;
 #[cfg(test)]
 #[path = "approval_send_tests.rs"]
 mod approval_send_tests;
+#[path = "crew_questions.rs"]
+pub(crate) mod crew_questions;
 #[path = "crew_reports.rs"]
 pub(crate) mod crew_reports;
 #[path = "question_answers.rs"]
@@ -4155,6 +4157,7 @@ struct DeletedRecords {
     homes: Vec<(usize, usize)>,
     projects: Vec<(ProjectId, usize)>,
     reports: Vec<crew_reports::CrewReport>,
+    answers: Vec<crew_questions::CrewAnswer>,
 }
 
 struct RequestedTabRestore {
@@ -4390,6 +4393,7 @@ pub struct State {
     captain_homes: std::collections::BTreeMap<usize, usize>,
     captain_books: std::collections::BTreeMap<usize, captain_state::CaptainBook>,
     captain_reports: Vec<crew_reports::CrewReport>,
+    captain_question_answers: Vec<crew_questions::CrewAnswer>,
     /// In-memory Captain document drafts, keyed by server, captain and document name. Never
     /// persisted: an unsaved draft quits with the app (separate follow-up).
     pub captain_drafts: std::collections::BTreeMap<DocumentDraftKey, DocumentDraft>,
@@ -4675,6 +4679,7 @@ impl State {
             captain_homes: Default::default(),
             captain_books: Default::default(),
             captain_reports: Vec::new(),
+            captain_question_answers: Vec::new(),
             captain_drafts: Default::default(),
             crew_pending: Default::default(),
             doc_discard: None,
@@ -6377,6 +6382,12 @@ impl State {
                 .filter(|report| ids.contains(&report.thread_id))
                 .cloned()
                 .collect(),
+            answers: self
+                .captain_question_answers
+                .iter()
+                .filter(|answer| ids.contains(&answer.thread_id))
+                .cloned()
+                .collect(),
             homes: self
                 .captain_homes
                 .iter()
@@ -6484,9 +6495,23 @@ impl State {
             .collect();
         self.captain_reports
             .retain(|report| !ids.contains(&report.thread_id));
+        let removed_answers: std::collections::HashSet<String> = self
+            .captain_question_answers
+            .iter()
+            .filter(|answer| ids.contains(&answer.thread_id))
+            .map(|answer| answer.id.clone())
+            .collect();
+        self.captain_question_answers
+            .retain(|answer| !ids.contains(&answer.thread_id));
+        let removed_deliveries: std::collections::HashSet<&str> = removed_reports
+            .iter()
+            .map(String::as_str)
+            .chain(removed_answers.iter().map(String::as_str))
+            .collect();
         for thread in &mut self.threads {
             thread.pending_injections.retain(|injection| {
-                !tasks::delivery_id(&injection.text).is_some_and(|id| removed_reports.contains(id))
+                !tasks::delivery_id(&injection.text)
+                    .is_some_and(|id| removed_deliveries.contains(id))
             });
         }
         self.tabs.retain(|id| !ids.contains(id));
@@ -6932,6 +6957,16 @@ impl State {
                         && !self.captain_reports.iter().any(|r| r.id == report.id)
                     {
                         self.captain_reports.push(report);
+                    }
+                }
+                for answer in records.answers {
+                    if self.threads.iter().any(|t| t.id == answer.thread_id)
+                        && !self
+                            .captain_question_answers
+                            .iter()
+                            .any(|a| a.id == answer.id)
+                    {
+                        self.captain_question_answers.push(answer);
                     }
                 }
                 for (captain, home) in records.homes {
@@ -7890,7 +7925,12 @@ impl State {
         thread.connect_with_instructions(path, wake, instructions);
     }
     /// Answers a Shina MCP tool call on the UI thread. `caller` is the calling thread's id.
-    fn mcp_call(&mut self, caller: usize, tool: &str, args: &Value) -> Result<Value, String> {
+    pub(crate) fn mcp_call(
+        &mut self,
+        caller: usize,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
         if self
             .threads
             .iter()
@@ -8224,12 +8264,14 @@ impl State {
             | "captain_crew_list"
             | "captain_crew_join"
             | "captain_crew_release"
-            | "captain_reports_list" => self.captain_mcp(caller_index, tool, args),
+            | "captain_reports_list"
+            | "captain_crew_report"
+            | "captain_question_answer" => self.captain_mcp(caller_index, tool, args),
             _ => Err(format!("Shina has no tool named {tool}.")),
         }
     }
 
-    fn mcp_request(&mut self, request: crate::mcp::Request) {
+    pub(crate) fn mcp_request(&mut self, request: crate::mcp::Request) {
         if request.tool == "delegate_task"
             && let Some(preparation) = self.prepare_remote_delegation(request.thread, &request.args)
         {
@@ -8297,10 +8339,10 @@ impl State {
                 });
             }
             Ok((_, value)) => {
-                let _ = request.reply.send(Ok(value));
+                let _ = crate::outbox::reply(&request.reply, Ok(value));
             }
             Err(error) => {
-                let _ = request.reply.send(Err(error));
+                let _ = crate::outbox::reply(&request.reply, Err(error));
             }
         }
     }
@@ -8361,7 +8403,7 @@ impl State {
                     .is_ok_and(|value| value["status"] == "interrupted")
                 || now >= waiter.deadline
             {
-                let _ = waiter.reply.send(result);
+                let _ = crate::outbox::reply(&waiter.reply, result);
             } else {
                 self.task_waiters.push(waiter);
             }
@@ -13756,6 +13798,7 @@ impl State {
             self.restore_captain_records(index, &project_remap)?;
             self.captain_books = self.restore_captain_books(index)?;
             self.restore_crew_reports(index)?;
+            self.restore_crew_answers(index)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             if restore_session {
@@ -14392,6 +14435,7 @@ impl State {
             "captainHomes":self.captain_homes,
             "captainBooks":self.captain_book_value(),
             "captainReports":self.captain_reports,
+            "captainQuestionAnswers":self.captain_question_answers,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
                 self.headless || self.persist_transcripts || !thread.blank_draft() || thread.crew_captain.is_some() || thread.id == self.current().id || self.tabs.contains(&thread.id)
