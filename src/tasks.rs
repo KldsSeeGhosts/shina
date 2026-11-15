@@ -136,7 +136,7 @@ fn excerpt(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
-const REPORT_CUT: &str = "\n[Report truncated. Use read_thread to continue.]";
+pub(super) const REPORT_CUT: &str = "\n[Report truncated. Use read_thread to continue.]";
 pub(super) fn report_excerpt(text: &str) -> String {
     if text.chars().count() <= 6000 {
         text.into()
@@ -148,7 +148,7 @@ pub(super) fn report_excerpt(text: &str) -> String {
     }
 }
 
-fn delivery_id(text: &str) -> Option<&str> {
+pub(super) fn delivery_id(text: &str) -> Option<&str> {
     text.strip_prefix(INJECTION_PREFIX)?
         .lines()
         .next()?
@@ -676,6 +676,7 @@ impl State {
                 delivery.hold = false;
             }
         }
+        self.release_crew_reports(parent_thread_id);
     }
 
     pub(super) fn check_task_capacity(&self, parent: usize) -> Result<(), String> {
@@ -1057,6 +1058,7 @@ impl State {
                 }
             }
         }
+        self.prepare_crew_report_recovery();
     }
 
     pub(super) fn start_task_recovery(&mut self) {
@@ -1073,7 +1075,8 @@ impl State {
     }
 
     pub(super) fn poll_tasks(&mut self, now: Instant) -> bool {
-        let mut changed = self.poll_remote_tasks();
+        let mut changed = self.poll_crew_reports();
+        changed |= self.poll_remote_tasks();
         let routes: Vec<Option<usize>> =
             self.tasks.iter().map(|task| self.task_home(task)).collect();
         for task in &mut self.tasks {

@@ -261,6 +261,7 @@ impl State {
         }
         // Acceptance evidence on the old home survives the reset as durable task state.
         self.reconcile_task_acceptances();
+        self.reconcile_crew_report_acceptances();
         if let Some(index) = self.threads.iter().position(|t| Some(t.id) == old) {
             self.threads[index].disconnect();
         }
@@ -279,6 +280,8 @@ impl State {
         let id = fresh.id;
         self.threads.push(fresh);
         self.captain_homes.insert(captain, id);
+        // The superseded home must not flush queued crew reports later.
+        self.scrub_crew_report_injections();
         // Open Captain document tabs follow the captain to its new home; other surfaces stay.
         if let Some(old) = old {
             self.right_panels.carry_captain_documents(

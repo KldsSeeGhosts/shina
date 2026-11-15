@@ -51,7 +51,17 @@ Drafts belong to a machine, Captain and document. They survive tab, thread and m
 
 Agent tools are `captain_read`, `captain_document_read`, `captain_document_write`, `captain_crew_list`, `captain_crew_join` and `captain_crew_release`. Only the primary Captain home can mutate Captain state through these tools. The Captain receives bounded prefixes of its private rules and plan each turn. Local crew receives a bounded prefix of shared crew rules; full documents are available through reads. Repository read-only mode does not prevent the Captain from maintaining its planning documents.
 
-These operations require `captain-state-v1`, introduced at protocol minor 29. This increment does not add automatic structured reports from recruited root threads, an event-driven digest, or Captain promotion, archive, demotion and deletion. Propagating shared crew rules to peer-launched workers also remains follow-up work.
+These operations require `captain-state-v1`, introduced at protocol minor 29. This increment does not add structured questions or artifacts to crew reports, independent crew creation, broader event policies, an event-driven digest, or Captain promotion, archive, demotion and deletion. Propagating shared crew rules to peer-launched workers also remains follow-up work.
+
+## Crew turn reports
+
+A recruited root thread records each observed terminal turn outcome (completed, failed or cancelled) as a durable crew report. The report captures the run id, thread title, the final reply of that turn and the error text; it never infers work completion, questions, artifacts or pull requests from message text. Delegated subagents, peer-launched workers and Captain homes do not produce crew reports.
+
+Reports persist in `captainReports` and deliver to the Captain's current home through the same durable injection and acceptance machinery as delegated results. A report keeps one globally unique `crew-` delivery id through capture, restart, home reset and retry. The Captain's home acknowledges a report only when its exact id appears in a Captain home's accepted history; evidence on a different Captain's home never acknowledges it. A reset preserves pending reports and strips their queued copies from superseded homes. After a restart, undelivered reports are held until the Captain's current home sees an explicit user turn or a resume action; a reset alone does not release them. A thread with an undelivered report cannot leave or move crews, and deleting the source thread removes its reports unless the deletion is undone.
+
+Captain homes, including earlier conversations, can read their own Captain's reports through `captain_reports_list`. Crew threads can read only reports they authored. Reading never acknowledges a report or wakes a process.
+
+Structured questions and artifacts in reports remain future work, as do independent crew creation, broader event policies and the remaining Captain lifecycle work.
 
 ## Explicit memory
 

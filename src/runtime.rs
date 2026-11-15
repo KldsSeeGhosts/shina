@@ -906,6 +906,109 @@ mod tests {
             .unwrap();
         runtime
     }
+
+    #[test]
+    fn crew_reports_commit_before_the_wake_prompt_dispatches() {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        let channels: std::sync::Arc<std::sync::Mutex<Vec<std::sync::mpsc::Receiver<Value>>>> =
+            std::sync::Arc::default();
+        {
+            let state = &mut runtime.state;
+            state.captains = crate::captains::Captain::presets();
+            state.open_captain(0);
+            let hook_channels = channels.clone();
+            state.test_connect_pi = Some(Box::new(move |_tid, _path| {
+                let (pi, commands, _events) = crate::harness::Session::test_connection();
+                hook_channels.lock().unwrap().push(commands);
+                Some(pi)
+            }));
+            let worker = state.next_id;
+            state.next_id += 1;
+            let mut thread = crate::model::Thread::new(worker);
+            thread.crew_captain = Some(0);
+            thread.captain = Some(0);
+            thread.title = "Crew worker".into();
+            state.threads.push(thread);
+            let home = state.captain_home(0).unwrap();
+            let home_index = state.threads.iter().position(|t| t.id == home).unwrap();
+            state.threads[home_index].model_provider = "cpa".into();
+            let index = state.threads.iter().position(|t| t.id == worker).unwrap();
+            // A real provider turn: start, reply, settle.
+            state.threads[index].apply(json!({"type":"agent_start"}));
+            state.threads[index].apply(json!({
+                "type":"message_end","message":{"role":"assistant","content":"Turn reply"}}));
+            state.threads[index].apply(json!({"type":"agent_settled","aborted":false}));
+        }
+        let report_id = runtime
+            .state
+            .threads
+            .iter()
+            .find(|t| t.crew_captain == Some(0))
+            .unwrap()
+            .id;
+        // The batch: scope starts empty so any change must promote a full snapshot.
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        let changed = crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        let effects = capture.finish();
+        assert!(changed);
+        assert!(runtime.state.persistence_scope.is_none());
+        // Nothing reached the fake backend yet: the prompt waits for the commit.
+        let mut guard = channels.lock().unwrap();
+        let commands = guard.remove(0);
+        drop(guard);
+        assert!(commands.try_recv().is_err());
+        // The previous committed snapshot has no report state.
+        let before = database.read("index.json").unwrap();
+        assert!(
+            before
+                .and_then(|index| index["captainReports"].as_array().cloned())
+                .is_none_or(|reports| reports.is_empty())
+        );
+        let report_id = runtime
+            .state
+            .crew_reports()
+            .iter()
+            .find(|report| report.thread_id == report_id)
+            .map(|report| report.id.clone())
+            .expect("captured crew report");
+        runtime.persist(None, effects).unwrap();
+        let committed = database.read("index.json").unwrap().unwrap();
+        assert_eq!(committed["captainReports"][0]["id"], json!(report_id));
+        // Only after the commit does the fake backend see the prompt.
+        let prompt = commands.try_recv().expect("wake prompt after commit");
+        assert!(serde_json::to_string(&prompt).unwrap().contains(&report_id));
+        // Its real command id acknowledges the delivery; no duplicate prompt follows.
+        let home = runtime.state.captain_home(0).unwrap();
+        let home_index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == home)
+            .unwrap();
+        runtime.state.threads[home_index].apply(json!({
+            "type":"response","command":"prompt","id":prompt["id"],"success":true
+        }));
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        assert!(crate::model::poll(
+            &mut runtime.state,
+            0.0,
+            &mut rune::Tx::default()
+        ));
+        let effects = capture.finish();
+        runtime.persist(None, effects).unwrap();
+        let committed = database.read("index.json").unwrap().unwrap();
+        assert_eq!(committed["captainReports"][0]["delivered"], json!(true));
+        assert!(commands.try_iter().all(|command| {
+            !serde_json::to_string(&command)
+                .unwrap()
+                .contains(&report_id)
+        }));
+    }
     #[test]
     fn row_storage_committed_snapshot_restores_message_draft_and_queue_context() {
         let mut runtime = durable();

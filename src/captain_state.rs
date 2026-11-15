@@ -911,6 +911,16 @@ impl State {
             );
         }
         let owner = self.threads[index].id;
+        if !thread.crew_report_outbox.is_empty()
+            || self
+                .captain_reports
+                .iter()
+                .any(|report| report.thread_id == owner && !report.delivered)
+        {
+            return Err(
+                "The thread's crew report must reach its Captain before membership changes.".into(),
+            );
+        }
         if self.crew_descendant_busy(owner) {
             return Err(
                 "Stop the thread's delegated work before changing its crew membership.".into(),
@@ -1233,7 +1243,7 @@ impl State {
     }
 
     /// A pending crew change for a thread on the selected machine, if one is in flight.
-    fn captain_actor(&self, caller: usize) -> (Option<usize>, bool) {
+    pub(super) fn captain_actor(&self, caller: usize) -> (Option<usize>, bool) {
         let thread = &self.threads[caller];
         if let Some(captain) = thread.captain_home.then_some(thread.captain).flatten() {
             return (Some(captain), self.captain_home(captain) == Some(thread.id));
@@ -1297,6 +1307,12 @@ impl State {
                     .ok_or("threadId is required.")?;
                 self.captain_crew_join_local(captain, thread_id)?;
                 Ok(self.captain_crew_value(captain))
+            }
+            "captain_reports_list" => {
+                if args.get("captain").is_some_and(|v| !v.is_u64()) {
+                    return Err("captain must be an integer.".into());
+                }
+                self.captain_reports_list(caller, target, args)
             }
             "captain_crew_release" => {
                 if !primary {

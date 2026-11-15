@@ -109,6 +109,8 @@ mod approval_send;
 #[cfg(test)]
 #[path = "approval_send_tests.rs"]
 mod approval_send_tests;
+#[path = "crew_reports.rs"]
+pub(crate) mod crew_reports;
 #[path = "question_answers.rs"]
 mod question_answers;
 #[cfg(test)]
@@ -912,6 +914,9 @@ pub struct Thread {
     completion_notified: bool,
     forwarded_question: Option<String>,
     accepted_deliveries: Vec<String>,
+    crew_report_run: Option<crew_reports::CrewRun>,
+    crew_report_outbox: Vec<crew_reports::CrewReport>,
+    crew_report_last_run: Option<String>,
     recovering_task: bool,
     task_history: Option<Value>,
     memory: Option<memory::MemoryLink>,
@@ -1431,6 +1436,9 @@ impl Thread {
             completion_notified: true,
             forwarded_question: None,
             accepted_deliveries: Vec::new(),
+            crew_report_run: None,
+            crew_report_outbox: Vec::new(),
+            crew_report_last_run: None,
             recovering_task: false,
             task_history: None,
             memory: None,
@@ -2485,6 +2493,7 @@ impl Thread {
     }
 
     fn arm_task(&mut self) {
+        self.arm_crew_report();
         if self.delegated {
             self.task_result = None;
             self.completion_notified = false;
@@ -2492,6 +2501,7 @@ impl Thread {
     }
 
     fn complete_task(&mut self, result: &'static str) {
+        self.complete_crew_report(result);
         if self.delegated && !self.completion_notified && self.task_result.is_none() {
             self.task_result = Some(result);
         }
@@ -3580,6 +3590,7 @@ impl Thread {
                 if self.run_id.is_none() {
                     self.run_id = Some(uuid::Uuid::new_v4().to_string());
                 }
+                self.arm_crew_report();
                 self.prompt_suggestion = None;
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
@@ -4143,6 +4154,7 @@ struct DeletedRecords {
     tasks: Vec<Task>,
     homes: Vec<(usize, usize)>,
     projects: Vec<(ProjectId, usize)>,
+    reports: Vec<crew_reports::CrewReport>,
 }
 
 struct RequestedTabRestore {
@@ -4377,6 +4389,7 @@ pub struct State {
     captain_remote_scopes: std::collections::BTreeMap<usize, Vec<RemoteProject>>,
     captain_homes: std::collections::BTreeMap<usize, usize>,
     captain_books: std::collections::BTreeMap<usize, captain_state::CaptainBook>,
+    captain_reports: Vec<crew_reports::CrewReport>,
     /// In-memory Captain document drafts, keyed by server, captain and document name. Never
     /// persisted: an unsaved draft quits with the app (separate follow-up).
     pub captain_drafts: std::collections::BTreeMap<DocumentDraftKey, DocumentDraft>,
@@ -4661,6 +4674,7 @@ impl State {
             captain_remote_scopes: Default::default(),
             captain_homes: Default::default(),
             captain_books: Default::default(),
+            captain_reports: Vec::new(),
             captain_drafts: Default::default(),
             crew_pending: Default::default(),
             doc_discard: None,
@@ -6357,6 +6371,12 @@ impl State {
                 })
                 .cloned()
                 .collect(),
+            reports: self
+                .captain_reports
+                .iter()
+                .filter(|report| ids.contains(&report.thread_id))
+                .cloned()
+                .collect(),
             homes: self
                 .captain_homes
                 .iter()
@@ -6419,6 +6439,7 @@ impl State {
         for thread in &mut self.threads {
             if ids.contains(&thread.id) {
                 panel_keys.push(crate::right_panel::key(&thread.machine, thread.id));
+                thread.crew_report_run = None;
                 let _ = thread.stop_task();
                 thread.disconnect();
                 if let Some(parent) = thread.parent.filter(|id| !ids.contains(id)) {
@@ -6455,6 +6476,19 @@ impl State {
         self.tasks.retain(|task| {
             !ids.contains(&task.parent_thread_id) && !ids.contains(&task.child_thread_id)
         });
+        let removed_reports: std::collections::HashSet<String> = self
+            .captain_reports
+            .iter()
+            .filter(|report| ids.contains(&report.thread_id))
+            .map(|report| report.id.clone())
+            .collect();
+        self.captain_reports
+            .retain(|report| !ids.contains(&report.thread_id));
+        for thread in &mut self.threads {
+            thread.pending_injections.retain(|injection| {
+                !tasks::delivery_id(&injection.text).is_some_and(|id| removed_reports.contains(id))
+            });
+        }
         self.tabs.retain(|id| !ids.contains(id));
         for project in &mut self.projects.entries {
             if project.captain_thread.is_some_and(|id| ids.contains(&id)) {
@@ -6891,6 +6925,13 @@ impl State {
                         && self.threads.iter().any(|t| t.id == task.child_thread_id)
                     {
                         self.tasks.push(task);
+                    }
+                }
+                for report in records.reports {
+                    if self.threads.iter().any(|t| t.id == report.thread_id)
+                        && !self.captain_reports.iter().any(|r| r.id == report.id)
+                    {
+                        self.captain_reports.push(report);
                     }
                 }
                 for (captain, home) in records.homes {
@@ -8182,7 +8223,8 @@ impl State {
             | "captain_document_write"
             | "captain_crew_list"
             | "captain_crew_join"
-            | "captain_crew_release" => self.captain_mcp(caller_index, tool, args),
+            | "captain_crew_release"
+            | "captain_reports_list" => self.captain_mcp(caller_index, tool, args),
             _ => Err(format!("Shina has no tool named {tool}.")),
         }
     }
@@ -13584,6 +13626,16 @@ impl State {
                         Some(value) if value.is_null() => None,
                         Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
                     };
+                    if let Some(outbox) = record.get("crewReportOutbox") {
+                        thread.crew_report_outbox = serde_json::from_value(outbox.clone()).ok()?;
+                    }
+                    if let Some(last) = record.get("crewReportLastRun") {
+                        thread.crew_report_last_run = if last.is_null() {
+                            None
+                        } else {
+                            Some(last.as_str()?.to_owned())
+                        };
+                    }
                     thread.delegated = record["delegated"] == true;
                     thread.peer_origin = record
                         .get("peerOrigin")
@@ -13703,6 +13755,7 @@ impl State {
             self.projects.entries = projects;
             self.restore_captain_records(index, &project_remap)?;
             self.captain_books = self.restore_captain_books(index)?;
+            self.restore_crew_reports(index)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             if restore_session {
@@ -14338,6 +14391,7 @@ impl State {
             "captainRemoteScopes":self.captain_remote_scopes,
             "captainHomes":self.captain_homes,
             "captainBooks":self.captain_book_value(),
+            "captainReports":self.captain_reports,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
                 self.headless || self.persist_transcripts || !thread.blank_draft() || thread.crew_captain.is_some() || thread.id == self.current().id || self.tabs.contains(&thread.id)
@@ -14563,7 +14617,8 @@ impl Thread {
             "forkSource":self.native.fork_source, "forkEntry":self.native.fork_entry,
             "previousSession":self.native.previous_session,"accessMode":self.native.access.id(),
             "captain":self.captain, "captainHome":self.captain_home, "crewCaptain":self.crew_captain,
-            "delegated":self.delegated,"parent":self.parent
+            "delegated":self.delegated,"parent":self.parent,
+            "crewReportOutbox":self.crew_report_outbox,"crewReportLastRun":self.crew_report_last_run
         });
         record.as_object_mut().unwrap().extend(json!({
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,

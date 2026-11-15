@@ -432,6 +432,12 @@ pub fn tools() -> Value {
             "description":"Release an idle thread from the calling primary Captain's crew without deleting its conversation, files or historical task records. A running or queued attempt must stop before its thread can leave. Released threads no longer send new crew reports to this Captain.",
             "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
             "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_reports_list",
+            "description":"Read durable crew turn reports for the caller's Captain without acknowledging them or waking a thread. Reports describe observed turn outcomes, not verified work completion. Omit captain to use the caller's Captain. Use after for the last returned report id and limit up to 100. A Captain may read its own reports; crew may read only reports they authored.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"after":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
         }
     ]);
     tools
@@ -1215,6 +1221,12 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
                 "description":"Release an idle thread from the calling primary Captain's crew without deleting its conversation, files or historical task records. A running or queued attempt must stop before its thread can leave. Released threads no longer send new crew reports to this Captain.",
                 "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
                 "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_reports_list",
+                "description":"Read durable crew turn reports for the caller's Captain without acknowledging them or waking a thread. Reports describe observed turn outcomes, not verified work completion. Omit captain to use the caller's Captain. Use after for the last returned report id and limit up to 100. A Captain may read its own reports; crew may read only reports they authored.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"after":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
             }
         ]);
         let published = tools();
