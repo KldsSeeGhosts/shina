@@ -23466,31 +23466,36 @@ pub(crate) mod tests {
         let origin = rt.state.current().id;
         rt.state.open_captain(0);
         let parent = rt.state.current().id;
-        let mut child = crate::model::Thread::new(3);
+        let worker_id = rt.state.next_id;
+        rt.state.next_id += 1;
+        assert_ne!(worker_id, origin);
+        assert_ne!(worker_id, parent);
+        let mut child = crate::model::Thread::new(worker_id);
         child.title = "Cross captain child".into();
         child.parent = Some(origin);
         child.project = Some(1);
         child.delegated = true;
-        child.captain = Some(1);
+        child.captain = Some(0);
         child.crew_captain = Some(0);
         rt.state.threads.push(child);
         rt.frame(0.0);
-        assert!(rt.presented("thread-3").is_some());
+        let worker_key = format!("thread-{worker_id}");
+        assert!(rt.presented(&worker_key).is_some());
         rt.state.threads.last_mut().unwrap().life.archived_at = Some(1);
         rt.state.show_archive = true;
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
         let (home, _) = rt.presented(&format!("thread-{parent}")).unwrap();
-        let (worker, _) = rt.presented("thread-3").unwrap();
+        let (worker, _) = rt.presented(&worker_key).unwrap();
         assert!(worker[0] >= home[0] + 24.0 && worker[1] > home[1]);
         assert!(
             !rt.state
                 .sidebar_threads()
                 .iter()
-                .any(|i| rt.state.threads[*i].id == 3)
+                .any(|i| rt.state.threads[*i].id == worker_id)
         );
-        press(&mut rt, "thread-3");
+        press(&mut rt, &worker_key);
         press(&mut rt, "thread-actions");
         press(&mut rt, "menu-archive-thread");
         assert!(!rt.state.current().archived());
