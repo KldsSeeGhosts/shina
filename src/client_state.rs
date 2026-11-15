@@ -875,6 +875,7 @@ impl State {
             return Err(error.clone());
         }
         self.validate_captain_archive_routines()?;
+        self.validate_captain_deleted_storage()?;
         self.runtime_enabled = true;
         self.warm_repository_identities();
         self.start_task_recovery();
@@ -4422,6 +4423,26 @@ impl State {
                 let crew = serde_json::from_value::<Vec<usize>>(args["crewSeen"].clone())
                     .map_err(|_| "crewSeen must be the exact crew IDs from the preview.")?;
                 return self.captain_demote(number("captain")?, &text("expectedVersion")?, &crew);
+            }
+            "captain.delete" => {
+                let crew = serde_json::from_value::<Vec<usize>>(args["crewSeen"].clone())
+                    .map_err(|_| "crewSeen must be the exact crew IDs from the preview.")?;
+                let keep = args
+                    .get("keepConversations")
+                    .map(|value| {
+                        value
+                            .as_bool()
+                            .ok_or("keepConversations must be a boolean.")
+                    })
+                    .transpose()?
+                    .unwrap_or(true);
+                return self.captain_delete(
+                    number("captain")?,
+                    &text("expectedVersion")?,
+                    &crew,
+                    &text("confirmName")?,
+                    keep,
+                );
             }
             "captain.archive" | "captain.unarchive" => {
                 let crew: Vec<usize> = serde_json::from_value(args["crewSeen"].clone())

@@ -276,6 +276,16 @@ impl Routines {
         Ok(paused)
     }
 
+    pub fn remove_captain(&mut self, captain: usize) -> Result<(), String> {
+        self.captain_idle(captain)?;
+        let mut ledger = self.ledger.clone();
+        ledger.routines.retain(|routine| routine.captain != captain);
+        if ledger.routines.len() != self.ledger.routines.len() {
+            self.commit(ledger)?;
+        }
+        Ok(())
+    }
+
     /// Skip missed slots even for run_once schedules. A restore never replays work.
     pub fn unarchive_captain(
         &mut self,

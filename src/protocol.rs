@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 32;
+pub const MINOR: u32 = 33;
+pub const CAPTAIN_DELETE_MINOR: u32 = 33;
+pub const CAPTAIN_DELETE: &str = "captain-delete-v1";
+pub const CAPTAIN_DELETE_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to delete Captain profiles.";
 pub const CAPTAIN_ROLES_MINOR: u32 = 32;
 pub const CAPTAIN_PROMOTE: &str = "captain-promote-v1";
 pub const CAPTAIN_RETIRE: &str = "captain-retire-v1";
@@ -329,7 +333,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.archive"
         | "captain.unarchive"
         | "captain.promote"
-        | "captain.demote" => "operate",
+        | "captain.demote"
+        | "captain.delete" => "operate",
         _ => return None,
     })
 }

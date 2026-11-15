@@ -53,7 +53,7 @@ Agent tools are `captain_read`, `captain_document_read`, `captain_document_write
 
 Peer-launched workers receive the shared crew context in each new launch or work follow-up command. The command captures its context once; retries and restored pending commands keep the original payload and UUID even if the rules change. The snapshot never includes private Captain profile instructions or AGENTS.md/NOTES.md contents. Input, editor and select answers retain their exact value without appended context. A brief or follow-up that exceeds the peer's 64 KiB limit after adding context rejects before allocating or requeueing work. Full originating documents remain on the Captain's server.
 
-These operations require `captain-state-v1`, introduced at protocol minor 29. Structured report submission, question answers and the `captain.reports.list`/`captain.report.answer` user RPCs require `captain-reports-v1`, introduced at protocol minor 30. Independent crew creation, broader event policies, an event-driven digest and Captain deletion remain unfinished.
+These operations require `captain-state-v1`, introduced at protocol minor 29. Structured report submission, question answers and the `captain.reports.list`/`captain.report.answer` user RPCs require `captain-reports-v1`, introduced at protocol minor 30. Independent crew creation, broader event policies, an event-driven digest and the lifecycle UI remain unfinished.
 
 ## Lifecycle backend
 
@@ -69,7 +69,11 @@ Promotion appends a stable Captain identity and uses the existing ordinary threa
 
 Demotion requires every owned Task result, crew report, question and answer to be settled. It keeps the current home as an ordinary thread, archives earlier homes, releases canonical crew, clears project default-Captain links and pauses routines. Task and report identities do not change. The profile, documents, curated memory and scope remain under the retired Captain's stable index. Restoring that profile requires its surviving ordinary former home and original workspace; it does not resume paused routines. A newly promoted Captain starts with fresh memory rather than copying another profile.
 
-Archive, unarchive, promotion and demotion require the existing runtime database transaction. Routine and index changes commit together. File-only legacy mode refuses these multi-record transitions. A persistence failure quarantines the runtime rather than falling back to JSON. These commands do not delete files, provider history or backups.
+Protocol minor 33 adds `captain-delete-v1`. Use `captain.lifecycle.preview` with `action:"delete"`, then `captain.delete` with the preview's `expectedVersion`, exact `crewSeen`, and `confirmName` equal to the current name. `keepConversations` defaults to true. Deletion requires the same settled report, question, answer and Task-result checks as demotion. It removes the profile's private instructions, books, curated memory, scope and routines in one transaction, leaving a minimal stable-index tombstone. Other Captains keep their indices and records.
+
+Kept homes become archived ordinary threads. Crew always survives. Deleting an archived Captain restores the crew's pre-group archive markers. `keepConversations:false` removes only explicit home IDs, never recursive descendants. The preview refuses that option when Tasks, parent links or historical report/answer records still reference a home. A retired profile no longer owns its former ordinary conversations; deleting those threads is a separate action. Old thread undo cannot restore a deleted Captain's roles or crew.
+
+Archive, unarchive, promotion, demotion and deletion require the existing runtime database transaction. Memory, routine and index changes commit together. File-only legacy mode refuses these multi-record transitions. A persistence failure quarantines the runtime rather than falling back to JSON. These commands do not delete files, worktrees, provider history, external learned memory or backups. The deletion preview reports whether an external memory backend is configured so the client can explain that separate retention.
 
 ## Crew turn reports
 

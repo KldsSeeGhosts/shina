@@ -601,6 +601,24 @@ impl State {
         (error, healthy)
     }
 
+    pub(super) fn captain_memory_delete_ready(&self) -> Result<(), String> {
+        let book = self.memory.lock().expect("captain memory");
+        book.writable()?;
+        if book.store.as_ref().is_none_or(|store| !store.healthy()) {
+            return Err("Captain memory storage is unavailable. Nothing was deleted.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_captain_curated_memory(&self, captain: usize) -> Result<(), String> {
+        {
+            let mut book = self.memory.lock().expect("captain memory");
+            book.writable()?;
+            book.data.captains.remove(&captain);
+        }
+        self.flush_memory()
+    }
+
     pub(super) fn memory_call(
         &mut self,
         caller: usize,

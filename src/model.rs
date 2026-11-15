@@ -152,6 +152,8 @@ pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
 #[path = "captain_lifecycle.rs"]
 mod captain_lifecycle;
 pub use captain_lifecycle::CaptainPhase;
+#[path = "captain_delete.rs"]
+mod captain_delete;
 #[path = "captain_roles.rs"]
 mod captain_roles;
 #[cfg(test)]
@@ -8009,6 +8011,7 @@ impl State {
                 | "search_memories"
                 | "orchestrator_capabilities"
                 | "list_threads"
+                | "list_captains"
                 | "read_thread"
                 | "task_status"
                 | "captain_read"
@@ -8088,6 +8091,7 @@ impl State {
                     .captains
                     .iter()
                     .enumerate()
+                    .filter(|(captain, _)| self.captain_phase(*captain) != CaptainPhase::Deleted)
                     .map(|(i, c)| {
                         json!({
                             "name": c.name,
@@ -8096,6 +8100,7 @@ impl State {
                             "scope": self.scope_value(Some(i)),
                             "earlier_conversations": self.earlier_conversations(i),
                             "role": c.role,
+                            "lifecycle":self.captain_phase(i),
                             "status": status_word(self.captain_status(i)),
                             "assigned": self.threads.iter().any(|t| t.captain_home && t.captain == Some(i)),
                         })

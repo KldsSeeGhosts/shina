@@ -763,6 +763,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut captain_reports = false;
     let mut captain_archive = false;
     let mut captain_roles = false;
+    let mut captain_delete = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -908,6 +909,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             capabilities.push(protocol::CAPTAIN_PROMOTE);
                             capabilities.push(protocol::CAPTAIN_RETIRE);
                         }
+                        captain_delete = minor >= u64::from(protocol::CAPTAIN_DELETE_MINOR);
+                        if captain_delete { capabilities.push(protocol::CAPTAIN_DELETE); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -929,6 +932,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     || method == "captain.lifecycle.preview"
                         && params.get("args").unwrap_or(params)["action"] == "demote") && !captain_roles {
                     Err(protocol::CAPTAIN_ROLES_UPDATE_REQUIRED.into())
+                } else if (method == "captain.delete" || method == "captain.lifecycle.preview"
+                    && params.get("args").unwrap_or(params)["action"] == "delete") && !captain_delete {
+                    Err(protocol::CAPTAIN_DELETE_UPDATE_REQUIRED.into())
                 } else if matches!(method, "notifications.get" | "notifications.push.status") {
                     if !mobile_push {
                         Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())
@@ -2459,6 +2465,33 @@ mod tests {
                     .await
                     .unwrap_err(),
                     protocol::CAPTAIN_ROLES_UPDATE_REQUIRED
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn captain_delete_requires_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-delete-old", protocol::CAPTAIN_DELETE_MINOR - 1).await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-delete-reader"),
+                )
+                .await;
+            for method in ["captain.delete", "captain.lifecycle.preview"] {
+                assert_eq!(
+                    crate::client::remote_rpc(
+                        &link,
+                        method,
+                        json!({"captain":0,"action":"delete"})
+                    )
+                    .await
+                    .unwrap_err(),
+                    protocol::CAPTAIN_DELETE_UPDATE_REQUIRED
                 );
             }
         });

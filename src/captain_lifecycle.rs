@@ -149,8 +149,11 @@ impl State {
         blockers
     }
 
-    /// Read-only confirmation data. Only the advertised archive actions are accepted.
+    /// Read-only confirmation data for supported lifecycle actions.
     pub fn captain_lifecycle_preview(&self, captain: usize, action: &str) -> Result<Value, String> {
+        if action == "delete" {
+            return self.captain_delete_preview(captain);
+        }
         self.require_captain(captain)?;
         let mut blockers = Vec::new();
         match (action, self.captain_phase(captain)) {
@@ -403,7 +406,7 @@ impl State {
         let threads: Vec<_> = self
             .threads
             .iter()
-            .filter(|thread| group.contains(&thread.id) || homes.contains(&thread.id))
+            .filter(|thread| group.contains(&thread.id) || homes.contains(&thread.id) || thread.captain == Some(captain))
             .map(|thread| {
                 json!({"id":thread.id,"title":thread.title,"project":thread.project,
                     "parent":thread.parent,"crew":thread.crew_captain,
@@ -569,6 +572,21 @@ impl State {
                 {
                     return Err("A retired Captain has no former home identity.".into());
                 }
+            }
+            if record.phase == CaptainPhase::Deleted
+                && (self.captains[captain].name != format!("Deleted Captain {captain}")
+                    || !self.captains[captain].role.is_empty()
+                    || !self.captains[captain].instructions.is_empty()
+                    || self.captains[captain].portrait != 0
+                    || self.captain_books.contains_key(&captain)
+                    || self.captain_scopes.contains_key(&captain)
+                    || self.captain_remote_scopes.contains_key(&captain)
+                    || self
+                        .threads
+                        .iter()
+                        .any(|thread| thread.captain == Some(captain)))
+            {
+                return Err("A deleted Captain still has private or assigned records.".into());
             }
         }
         Ok(())

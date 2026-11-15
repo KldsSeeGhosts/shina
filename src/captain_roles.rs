@@ -148,7 +148,7 @@ impl State {
 
     /// Resolve relative Pi session references before changing the role's default
     /// scratch directory. Git-worktree metadata is never used as a scratch alias.
-    fn prepare_role_directory(
+    pub(super) fn prepare_role_directory(
         &self,
         index: usize,
     ) -> Result<(Option<String>, Option<String>), String> {
@@ -240,11 +240,18 @@ impl State {
     }
 
     pub(super) fn captain_retirement_blockers(&self, captain: usize) -> Vec<String> {
-        let mut blockers = Vec::new();
         if let Err(error) = self.require_active_captain(captain) {
-            blockers.push(error);
-            return blockers;
+            return vec![error];
         }
+        let mut blockers = self.captain_settlement_blockers(captain);
+        if self.captain_home(captain).is_none() {
+            blockers.push("This Captain has no primary home.".into());
+        }
+        blockers
+    }
+
+    pub(super) fn captain_settlement_blockers(&self, captain: usize) -> Vec<String> {
+        let mut blockers = Vec::new();
         if let Err(error) = self.background.routines.captain_idle(captain) {
             blockers.push(error);
         }
@@ -256,15 +263,12 @@ impl State {
                 blockers.push(error);
             }
         }
-        if self.captain_home(captain).is_none() {
-            blockers.push("This Captain has no primary home.".into());
-        }
         if self.tasks.iter().any(|task| {
             group.contains(&task.child_thread_id)
                 && (!task.state.finished() || !task.delivered || task.pending_deliveries())
         }) {
             blockers.push(
-                "Every owned task result must be accepted before demoting the Captain.".into(),
+                "Every owned task result must be accepted before changing the Captain.".into(),
             );
         }
         if self
@@ -285,7 +289,7 @@ impl State {
                                 .any(|answer| answer.report_id == report.id && answer.delivered))
             })
         {
-            blockers.push("Deliver every crew report and settle every question and answer before demoting the Captain.".into());
+            blockers.push("Deliver every crew report and settle every question and answer before changing the Captain.".into());
         }
         blockers
     }
