@@ -39,7 +39,7 @@ pub struct CrewAnswer {
 }
 
 impl CrewAnswer {
-    fn message(&self, question: &str) -> String {
+    pub(super) fn message(&self, question: &str) -> String {
         let payload = json!({
             "reportId":self.report_id, "captain":self.captain, "threadId":self.thread_id,
             "question":question, "answer":self.answer, "actor":self.actor,
@@ -264,6 +264,7 @@ impl State {
                 "saved":true, "reportId":existing.id, "duplicate":true
             }));
         }
+        self.require_active_captain(target)?;
         let run_id = thread_run
             .filter(|id| !id.is_empty() && id.len() <= 256)
             .ok_or("This thread has no current run to report against.")?;
@@ -416,6 +417,7 @@ impl State {
             }
             return Err("This requestId already names a different answer.".into());
         }
+        self.require_active_captain(report.captain)?;
         if self
             .captain_question_answers
             .iter()

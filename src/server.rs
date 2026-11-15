@@ -761,6 +761,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut notification_feed = false;
     let mut mobile_push = false;
     let mut captain_reports = false;
+    let mut captain_archive = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -897,6 +898,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if captain_reports {
                             capabilities.push(protocol::CAPTAIN_REPORTS);
                         }
+                        captain_archive = minor >= u64::from(protocol::CAPTAIN_ARCHIVE_MINOR);
+                        if captain_archive {
+                            capabilities.push(protocol::CAPTAIN_ARCHIVE);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -912,6 +917,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err("Send hello before other requests.".into())
                 } else if matches!(method, "captain.reports.list" | "captain.report.answer") && !captain_reports {
                     Err(protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED.into())
+                } else if matches!(method, "captain.lifecycle.preview" | "captain.archive" | "captain.unarchive") && !captain_archive {
+                    Err(protocol::CAPTAIN_ARCHIVE_UPDATE_REQUIRED.into())
                 } else if matches!(method, "notifications.get" | "notifications.push.status") {
                     if !mobile_push {
                         Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())
@@ -2383,6 +2390,34 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert_eq!(error, protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED);
+            }
+        });
+    }
+
+    #[test]
+    fn captain_archive_requires_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-archive-old", protocol::CAPTAIN_ARCHIVE_MINOR - 1)
+                    .await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-archive-reader"),
+                )
+                .await;
+            for method in [
+                "captain.lifecycle.preview",
+                "captain.archive",
+                "captain.unarchive",
+            ] {
+                assert_eq!(
+                    crate::client::remote_rpc(&link, method, json!({"captain":0}))
+                        .await
+                        .unwrap_err(),
+                    protocol::CAPTAIN_ARCHIVE_UPDATE_REQUIRED
+                );
             }
         });
     }

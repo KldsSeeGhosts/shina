@@ -206,6 +206,27 @@ impl Task {
         !self.prior_deliveries.is_empty()
     }
 
+    pub(super) fn result_notifications(&self) -> Vec<String> {
+        let mut texts: Vec<_> = self
+            .prior_deliveries
+            .iter()
+            .map(|delivery| delivery.text.clone())
+            .collect();
+        if self.state.finished() && !self.delivered {
+            texts.push(self.completion_message());
+        }
+        texts
+    }
+
+    pub(super) fn hold_result_notifications(&mut self) {
+        for delivery in &mut self.prior_deliveries {
+            delivery.hold = true;
+        }
+        if self.state.finished() && !self.delivered {
+            self.hold_delivery = true;
+        }
+    }
+
     pub(super) fn finish(&mut self, state: TaskState, reply: &str, error: &str) {
         self.state = state;
         self.result_excerpt = report_excerpt(reply);
@@ -586,6 +607,7 @@ impl State {
         if self.tasks[index].recovering || self.tasks[index].state != TaskState::Interrupted {
             return Err("Only a reconciled interrupted task can be resumed.".into());
         }
+        self.require_active_thread_owner(self.tasks[index].child_thread_id)?;
         let message = format!(
             "{RESUME_MESSAGE}\n\nOriginal brief for reference. Do not repeat completed actions:\n{}",
             self.tasks[index].brief
@@ -610,6 +632,7 @@ impl State {
             return Err("This task has already finished.".into());
         }
         let child = self.tasks[index].child_thread_id;
+        self.require_active_thread_owner(child)?;
         self.tasks[index].owe_remote_stop();
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == child) {
             if self.tasks[index].remote.is_none() {
@@ -636,6 +659,7 @@ impl State {
         {
             return result.map(|_| ());
         }
+        self.require_active_thread_owner(parent_thread_id)?;
         if !self
             .threads
             .iter()
@@ -757,6 +781,7 @@ impl State {
         tool: &str,
         args: &Value,
     ) -> Result<bool, String> {
+        self.require_active_thread_owner(self.threads[index].id)?;
         let thread = &self.threads[index];
         if !self.owns_child(caller, index) {
             return Err(format!(
@@ -860,6 +885,12 @@ impl State {
         for index in 0..self.tasks.len() {
             let task = &self.tasks[index];
             if task.state != TaskState::Queued || task.recovering {
+                continue;
+            }
+            if self
+                .require_active_thread_owner(task.child_thread_id)
+                .is_err()
+            {
                 continue;
             }
             if self

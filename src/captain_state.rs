@@ -757,6 +757,9 @@ impl State {
         if captain >= self.captains.len() {
             return CaptainAccess::NoRecords;
         }
+        if self.captain_phase(captain) == CaptainPhase::Deleted {
+            return CaptainAccess::NoRecords;
+        }
         if self.machines.selected != "local" {
             let linked = self
                 .client
@@ -782,7 +785,7 @@ impl State {
         let earlier = home.captain_home
             && home.captain == Some(captain)
             && (self.captain_home(captain) != Some(home.id) || home.archived());
-        if earlier {
+        if earlier || self.captain_phase(captain) != CaptainPhase::Active {
             return CaptainAccess::Earlier;
         }
         CaptainAccess::Full
@@ -815,7 +818,7 @@ impl State {
         ) {
             return result.map(|id| json!({"name":name,"pending":true,"command":id.to_string()}));
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         valid_document_name(name)?;
         valid_document_text(&text)?;
         let current = self.captain_document(captain, name);
@@ -865,6 +868,8 @@ impl State {
             .collect();
         Ok(json!({
             "captain":captain,
+            "lifecycle":self.captain_phase(captain),
+            "captainVersion":self.captain_version(captain)?,
             "name":profile.name,
             "role":profile.role,
             "portrait":profile.portrait,
@@ -1026,12 +1031,14 @@ impl State {
     }
 
     pub(crate) fn join_blocker(&self, captain: usize, index: usize) -> Result<(), String> {
+        self.require_active_captain(captain)?;
         self.join_gate(index)?;
         self.crew_scope_check(captain, index)
     }
 
     /// Why `thread` at `index` cannot move to `to`'s crew: idle first, then the target's scope.
     pub(crate) fn move_blocker(&self, to: usize, index: usize) -> Result<(), String> {
+        self.require_active_captain(to)?;
         self.crew_idle(index)?;
         self.crew_scope_check(to, index)
     }
@@ -1114,7 +1121,7 @@ impl State {
         captain: usize,
         thread_id: usize,
     ) -> Result<(), String> {
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let index = self
             .threads
             .iter()
@@ -1140,7 +1147,7 @@ impl State {
         captain: usize,
         thread_id: usize,
     ) -> Result<(), String> {
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let index = self.crew_member_index(captain, thread_id)?;
         self.crew_idle(index)?;
         self.apply_membership(index, None)
@@ -1159,8 +1166,8 @@ impl State {
         ) {
             return result.map(|_| ());
         }
-        self.require_captain(from)?;
-        self.require_captain(to)?;
+        self.require_active_captain(from)?;
+        self.require_active_captain(to)?;
         if from == to {
             return Err("The thread is already in this captain's crew.".into());
         }
@@ -1186,6 +1193,7 @@ impl State {
         if expected_server != self.machines.selected {
             return Err("That crew command belonged to another machine.".into());
         }
+        self.require_active_captain(captain)?;
         match self.captain_access(captain) {
             CaptainAccess::Full => {}
             CaptainAccess::Earlier => {

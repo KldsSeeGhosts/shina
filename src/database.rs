@@ -405,6 +405,18 @@ impl Database {
         self.0.lock().expect("database").document_revision
     }
 
+    /// Multi-record lifecycle changes must stage on the runtime's current batch.
+    pub fn require_batch(&self) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(error) = &inner.failure {
+            return Err(error.clone());
+        }
+        if inner.batch != Some(std::thread::current().id()) {
+            return Err("This Captain change requires a durable runtime transaction.".into());
+        }
+        Ok(())
+    }
+
     pub fn begin(&self) -> Result<(), String> {
         let mut inner = self.0.lock().expect("database");
         if let Some(error) = &inner.failure {

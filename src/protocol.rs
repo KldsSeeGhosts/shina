@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 30;
+pub const MINOR: u32 = 31;
+pub const CAPTAIN_ARCHIVE_MINOR: u32 = 31;
+pub const CAPTAIN_ARCHIVE: &str = "captain-archive-v1";
+pub const CAPTAIN_ARCHIVE_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to archive Captain groups.";
 pub const CAPTAIN_STATE_MINOR: u32 = 29;
 pub const CAPTAIN_STATE: &str = "captain-state-v1";
 pub const CAPTAIN_STATE_UPDATE_REQUIRED: &str =
@@ -233,7 +237,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.read"
         | "captain.document.read"
         | "captain.crew.list"
-        | "captain.reports.list" => "read",
+        | "captain.reports.list"
+        | "captain.lifecycle.preview" => "read",
         "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
@@ -314,7 +319,9 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.document.write"
         | "captain.crew.join"
         | "captain.crew.release"
-        | "captain.crew.move" => "operate",
+        | "captain.crew.move"
+        | "captain.archive"
+        | "captain.unarchive" => "operate",
         _ => return None,
     })
 }
@@ -713,7 +720,8 @@ mod tests {
                 | "captain.read"
                 | "captain.document.read"
                 | "captain.crew.list"
-                | "captain.reports.list" => "read",
+                | "captain.reports.list"
+                | "captain.lifecycle.preview" => "read",
                 "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"

@@ -149,6 +149,9 @@ pub use run_control::{StopControl, TurnCapabilities};
 #[path = "captain_state.rs"]
 mod captain_state;
 pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
+#[path = "captain_lifecycle.rs"]
+mod captain_lifecycle;
+pub use captain_lifecycle::CaptainPhase;
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
 mod handoff_tests;
@@ -4392,6 +4395,7 @@ pub struct State {
     captain_remote_scopes: std::collections::BTreeMap<usize, Vec<RemoteProject>>,
     captain_homes: std::collections::BTreeMap<usize, usize>,
     captain_books: std::collections::BTreeMap<usize, captain_state::CaptainBook>,
+    captain_lifecycles: std::collections::BTreeMap<usize, captain_lifecycle::CaptainLifecycle>,
     captain_reports: Vec<crew_reports::CrewReport>,
     captain_question_answers: Vec<crew_questions::CrewAnswer>,
     /// In-memory Captain document drafts, keyed by server, captain and document name. Never
@@ -4678,6 +4682,7 @@ impl State {
             captain_remote_scopes: Default::default(),
             captain_homes: Default::default(),
             captain_books: Default::default(),
+            captain_lifecycles: Default::default(),
             captain_reports: Vec::new(),
             captain_question_answers: Vec::new(),
             captain_drafts: Default::default(),
@@ -6366,6 +6371,13 @@ impl State {
         self.delete_with_undo(ids, Action::Delete);
     }
     fn delete_with_undo(&mut self, ids: std::collections::HashSet<usize>, action: Action) {
+        if let Some(error) = ids
+            .iter()
+            .find_map(|id| self.require_active_thread_owner(*id).err())
+        {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         self.deleted_threads.clear();
         self.deleted_records = Some(DeletedRecords {
             tasks: self
@@ -6420,6 +6432,13 @@ impl State {
     /// Removes threads and their records, then selects the survivor and saves. The caller
     /// handles undo and tab refusals.
     fn remove_threads(&mut self, ids: &std::collections::HashSet<usize>) {
+        if let Some(error) = ids
+            .iter()
+            .find_map(|id| self.require_active_thread_owner(*id).err())
+        {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         let current = self.current().id;
         let local_only = self.client.is_some()
             && self
@@ -6625,6 +6644,10 @@ impl State {
         else {
             return;
         };
+        if let Err(error) = self.require_active_thread_owner(id) {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         if self.lifecycle_busy(id) {
             self.lifecycle_error = Some("Stop this thread and its crew before archiving.".into());
             return;
@@ -6936,6 +6959,27 @@ impl State {
         }
         if self.client.is_some() && self.undo.is_some() && !self.client_undo_is_local() {
             self.forward("thread.undo", json!({"expected":self.undo}));
+            return;
+        }
+        let inactive_owner = self
+            .undo
+            .as_ref()
+            .and_then(|notice| {
+                notice
+                    .entries
+                    .iter()
+                    .find_map(|entry| self.require_active_thread_owner(entry.id).err())
+            })
+            .or_else(|| {
+                self.deleted_threads.iter().find_map(|thread| {
+                    thread
+                        .crew_captain
+                        .or_else(|| thread.captain_home.then_some(thread.captain).flatten())
+                        .and_then(|captain| self.require_active_captain(captain).err())
+                })
+            });
+        if let Some(error) = inactive_owner {
+            self.lifecycle_error = Some(error);
             return;
         }
         let Some(notice) = self.undo.take().filter(|n| n.expires > at) else {
@@ -7374,7 +7418,19 @@ impl State {
             self.captain_picker = false;
             return;
         }
-        if captain >= self.captains.len() {
+        if self.require_captain(captain).is_err() {
+            return;
+        }
+        if self.captain_phase(captain) != CaptainPhase::Active {
+            self.captain_project = None;
+            self.projects.captain_target = None;
+            if let Some(index) = self
+                .captain_home(captain)
+                .and_then(|home| self.threads.iter().position(|thread| thread.id == home))
+            {
+                self.select_thread(index);
+            }
+            self.captain_picker = false;
             return;
         }
         let explicit = self.captain_project.take();
@@ -7405,12 +7461,11 @@ impl State {
             .project(project_id)
             .map(|p| p.machine.clone())
             .unwrap_or_else(|| "local".into());
-        if let Some(index) = self
+        if self
             .captain_home(captain)
             .and_then(|home| self.threads.iter().position(|t| t.id == home))
+            .is_none()
         {
-            self.threads[index].life.archived_at = None;
-        } else {
             let mut thread = Thread::new(self.next_id);
             thread.harness = self.default_harness.clone();
             self.next_id += 1;
@@ -7546,6 +7601,7 @@ impl State {
         let error = profile
             .validate()
             .err()
+            .or_else(|| editing.and_then(|id| self.require_active_captain(id).err()))
             .or_else(|| {
                 self.captains
                     .iter()
@@ -7828,6 +7884,13 @@ impl State {
         {
             return;
         }
+        if self
+            .require_active_thread_owner(self.threads[index].id)
+            .is_err()
+            || self.threads[index].archived()
+        {
+            return;
+        }
         self.threads[index].server_owned = self.headless || self.persist_transcripts;
         let path = match self.thread_directory(index) {
             Ok(path) => path,
@@ -7931,6 +7994,24 @@ impl State {
         tool: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        if !matches!(
+            tool,
+            "list_routines"
+                | "list_memories"
+                | "search_memories"
+                | "orchestrator_capabilities"
+                | "list_threads"
+                | "read_thread"
+                | "task_status"
+                | "captain_read"
+                | "captain_document_read"
+                | "captain_crew_list"
+                | "captain_reports_list"
+                | "captain_crew_report"
+                | "captain_question_answer"
+        ) {
+            self.require_active_thread_owner(caller)?;
+        }
         if self
             .threads
             .iter()
@@ -12322,6 +12403,10 @@ impl State {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
+        if let Err(error) = self.require_active_thread_owner(self.current().id) {
+            self.current_mut().error = Some(error);
+            return false;
+        }
         // KSG's useComposerSend refuses while readPendingEnvironmentChange is
         // set: the draft is still being addressed to its new machine.
         if self.machines.draft_retarget.is_some() {
@@ -13130,6 +13215,7 @@ impl State {
         if self.runtime_enabled
             && !self.demo
             && !thread.archived()
+            && self.require_active_thread_owner(thread.id).is_ok()
             && thread.pi.is_none()
             && !thread.prewarm_attempted
             && thread.status != Status::Failed
@@ -13794,11 +13880,14 @@ impl State {
                 }
             }
             self.captains = captains;
+            // A different machine's records must not consult the old lifecycle map.
+            self.captain_lifecycles.clear();
             self.projects.entries = projects;
             self.restore_captain_records(index, &project_remap)?;
             self.captain_books = self.restore_captain_books(index)?;
             self.restore_crew_reports(index)?;
             self.restore_crew_answers(index)?;
+            self.restore_captain_lifecycles(index)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             if restore_session {
@@ -13862,6 +13951,7 @@ impl State {
             self.capture_opened_draft();
         }
         self.restore_tasks(index, &project_remap)?;
+        self.validate_captain_archives()?;
         self.sync_memory_links();
         self.refresh_captain_contexts();
         if self.persist_transcripts && !self.headless && self.client.is_none() {
@@ -14434,6 +14524,7 @@ impl State {
             "captainRemoteScopes":self.captain_remote_scopes,
             "captainHomes":self.captain_homes,
             "captainBooks":self.captain_book_value(),
+            "captainLifecycles":self.captain_lifecycles,
             "captainReports":self.captain_reports,
             "captainQuestionAnswers":self.captain_question_answers,
             "threads":self.threads.iter().filter(|thread| {

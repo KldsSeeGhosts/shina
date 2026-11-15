@@ -63,7 +63,7 @@ impl State {
         captain: usize,
         projects: Vec<RemoteProject>,
     ) -> Result<Vec<RemoteProject>, String> {
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         if self
             .captain_home(captain)
             .and_then(|id| self.threads.iter().find(|t| t.id == id))
@@ -197,7 +197,7 @@ impl State {
         ) {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let home = self.captain_home(captain);
         let machine = self
             .threads
@@ -249,7 +249,7 @@ impl State {
         ) {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let old = self.captain_home(captain);
         if let Some(index) = self.threads.iter().position(|t| Some(t.id) == old) {
             let thread = &self.threads[index];
@@ -309,7 +309,7 @@ impl State {
     }
 
     pub(super) fn require_captain(&self, captain: usize) -> Result<(), String> {
-        if captain < self.captains.len() {
+        if captain < self.captains.len() && self.captain_phase(captain) != CaptainPhase::Deleted {
             Ok(())
         } else {
             Err("Captain does not exist.".into())

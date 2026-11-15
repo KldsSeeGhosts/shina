@@ -242,6 +242,69 @@ impl Routines {
         self.revision
     }
 
+    pub fn captain_idle(&self, captain: usize) -> Result<(), String> {
+        if let Some(error) = &self.error {
+            return Err(format!(
+                "{error} The routines file has not been overwritten."
+            ));
+        }
+        if self
+            .ledger
+            .routines
+            .iter()
+            .any(|routine| routine.captain == captain && routine.active_delivery.is_some())
+        {
+            return Err("Wait for the Captain's active routine to settle.".into());
+        }
+        Ok(())
+    }
+
+    /// Record only routines this action paused. User-paused schedules stay paused.
+    pub fn archive_captain(&mut self, captain: usize) -> Result<Vec<u64>, String> {
+        self.captain_idle(captain)?;
+        let mut ledger = self.ledger.clone();
+        let mut paused = Vec::new();
+        for routine in &mut ledger.routines {
+            if routine.captain == captain && !routine.paused {
+                routine.paused = true;
+                paused.push(routine.id);
+            }
+        }
+        if !paused.is_empty() {
+            self.commit(ledger)?;
+        }
+        Ok(paused)
+    }
+
+    /// Skip missed slots even for run_once schedules. A restore never replays work.
+    pub fn unarchive_captain(
+        &mut self,
+        captain: usize,
+        ids: &[u64],
+        now: DateTime<Local>,
+    ) -> Result<(), String> {
+        self.captain_idle(captain)?;
+        let mut ledger = self.ledger.clone();
+        for id in ids {
+            let routine = ledger
+                .routines
+                .iter_mut()
+                .find(|routine| routine.id == *id && routine.captain == captain && routine.paused)
+                .ok_or("An archive-paused routine changed. Review the Captain's routines.")?;
+            routine.paused = false;
+            let after = routine
+                .last_slot
+                .and_then(|slot| DateTime::from_timestamp(slot, 0))
+                .map(|slot| now.max(slot.with_timezone(&Local)))
+                .unwrap_or(now);
+            routine.next_at = routine.schedule.next(after).timestamp();
+        }
+        if !ids.is_empty() {
+            self.commit(ledger)?;
+        }
+        Ok(())
+    }
+
     /// A home reset changes routing only. Reserved slots and delivery identities
     /// must not move while a routine is still awaiting acceptance or settlement.
     pub fn rebind_captain(&mut self, captain: usize, home: usize) -> Result<(), String> {
@@ -575,6 +638,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn captain_archive_preserves_reserved_slots_and_skips_missed_runs_on_restore() {
+        let mut store = fixture();
+        let now = Local::now();
+        let id = store
+            .create(
+                0,
+                7,
+                "Review".into(),
+                "Read status".into(),
+                Schedule::Every { minutes: 15 },
+                MissedPolicy::RunOnce,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .due(now + Duration::minutes(15), |_| false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.archive_captain(0).is_err());
+        store.finish(id, "Finished").unwrap();
+        let slot = store.entries()[0].last_slot;
+        let paused = store.archive_captain(0).unwrap();
+        assert_eq!(paused, vec![id]);
+        // Even a clock rollback cannot put next_at before the reserved slot.
+        store
+            .unarchive_captain(0, &paused, now - Duration::days(1))
+            .unwrap();
+        assert_eq!(store.entries()[0].last_slot, slot);
+        assert!(store.entries()[0].next_at > slot.unwrap());
+        store.archive_captain(0).unwrap();
+        let later = now + Duration::days(4);
+        store.unarchive_captain(0, &paused, later).unwrap();
+        assert!(store.due(later, |_| false).unwrap().is_empty());
+        assert_eq!(store.entries()[0].last_slot, slot);
+        let reopened = Routines::load(store.path.clone());
+        assert!(reopened.error.is_none());
+        assert_eq!(reopened.entries()[0].last_slot, slot);
     }
 
     #[test]

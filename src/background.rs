@@ -165,6 +165,15 @@ impl State {
         if let Some(result) = self.remote("routine.pause", json!({"id":id,"paused":paused})) {
             return result.map(|_| ());
         }
+        if let Some(routine) = self
+            .background
+            .routines
+            .entries()
+            .iter()
+            .find(|r| r.id == id)
+        {
+            self.require_active_captain(routine.captain)?;
+        }
         self.background.routines.set_paused(id, paused)?;
         (self.wake)();
         Ok(())
@@ -172,6 +181,15 @@ impl State {
     pub fn delete_routine(&mut self, id: u64) -> Result<(), String> {
         if let Some(result) = self.remote("routine.remove", json!({"id":id})) {
             return result.map(|_| ());
+        }
+        if let Some(routine) = self
+            .background
+            .routines
+            .entries()
+            .iter()
+            .find(|r| r.id == id)
+        {
+            self.require_active_captain(routine.captain)?;
         }
         self.background.routines.delete(id)?;
         (self.wake)();
@@ -350,6 +368,7 @@ impl State {
         if self.captain_home(captain) != Some(caller) {
             return Err("Only the Captain's current primary home can manage its routines.".into());
         }
+        self.require_active_captain(captain)?;
         if tool == "create_routine" {
             let name = args["name"].as_str().ok_or("name is required.")?.to_owned();
             let prompt = args["prompt"]
@@ -495,6 +514,9 @@ impl State {
             .iter()
             .enumerate()
             .filter_map(|(captain, _)| {
+                if self.captain_phase(captain) != CaptainPhase::Active {
+                    return None;
+                }
                 let home = self.captain_home(captain)?;
                 self.threads
                     .iter()

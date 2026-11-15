@@ -331,7 +331,7 @@ impl State {
         ) {
             return result.map(|id| id.to_string());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         validate_text(&text)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
@@ -375,7 +375,7 @@ impl State {
         {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         validate_text(&text)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
@@ -404,7 +404,7 @@ impl State {
         if let Some(result) = self.remote("memory.remove", json!({"captain":captain,"id":id})) {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
         let memories = book
@@ -432,7 +432,7 @@ impl State {
         ) {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
         let memory = book

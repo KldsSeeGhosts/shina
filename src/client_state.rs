@@ -874,6 +874,7 @@ impl State {
         if let Some(error) = &self.background.routines.error {
             return Err(error.clone());
         }
+        self.validate_captain_archive_routines()?;
         self.runtime_enabled = true;
         self.warm_repository_identities();
         self.start_task_recovery();
@@ -2461,6 +2462,9 @@ impl State {
             self.captain_remote_scopes.clear();
             self.captain_homes.clear();
             self.captain_books.clear();
+            self.captain_lifecycles.clear();
+            self.captain_reports.clear();
+            self.captain_question_answers.clear();
             self.tasks.clear();
             self.refresh_captain_contexts();
         }
@@ -3719,6 +3723,14 @@ impl State {
                 .map(str::to_owned)
                 .ok_or_else(|| format!("{key} must be text."))
         };
+        if args.get("threadId").is_some()
+            && !matches!(
+                command.method.as_str(),
+                "thread.stop" | "thread.visit" | "input.claim" | "thread.rename"
+            )
+        {
+            self.require_active_thread_owner(self.current().id)?;
+        }
         if self.remote_task(self.current().id).is_some()
             && command.method.starts_with("thread.")
             && !matches!(
@@ -3969,6 +3981,13 @@ impl State {
                 }
             }
             "thread.delete" => {
+                let roots: Vec<usize> = serde_json::from_value(args["threadIds"].clone())
+                    .unwrap_or_else(|_| vec![self.current().id]);
+                for root in roots {
+                    for id in self.deletion_ids(root) {
+                        self.require_active_thread_owner(id)?;
+                    }
+                }
                 if args["blankOnly"] == true {
                     if self.current().blank_draft() {
                         self.remove_threads(&std::collections::HashSet::from([self.current().id]));
@@ -3978,6 +3997,9 @@ impl State {
                     self.delete_roots =
                         serde_json::from_value(args["threadIds"].clone()).unwrap_or_default();
                     self.confirm_delete();
+                }
+                if let Some(error) = self.lifecycle_error.take() {
+                    return Err(error);
                 }
             }
             "thread.lifecycle" => {
@@ -4019,6 +4041,9 @@ impl State {
                     return Err("The undo action changed or expired.".into());
                 }
                 self.undo_thread_action();
+                if let Some(error) = self.lifecycle_error.take() {
+                    return Err(error);
+                }
             }
             "thread.drop" => {
                 let to = match args["to"].as_str() {
@@ -4309,6 +4334,7 @@ impl State {
                 }
             }
             "captain.open" => {
+                self.require_captain(number("captain")?)?;
                 self.captain_project = args
                     .get("project")
                     .map(|value| serde_json::from_value::<Option<ProjectId>>(value.clone()))
@@ -4365,6 +4391,23 @@ impl State {
             "captain.reset" => self.reset_captain_conversation(number("captain")?)?,
             "captain.read" => {
                 return self.captain_read_value(number("captain")?, true);
+            }
+            "captain.lifecycle.preview" => {
+                return self.captain_lifecycle_preview(number("captain")?, &text("action")?);
+            }
+            "captain.archive" | "captain.unarchive" => {
+                let crew: Vec<usize> = serde_json::from_value(args["crewSeen"].clone())
+                    .map_err(|_| "crewSeen must be the exact crew IDs from the preview.")?;
+                return self.captain_archive_command(
+                    number("captain")?,
+                    if command.method == "captain.archive" {
+                        "archive"
+                    } else {
+                        "unarchive"
+                    },
+                    &text("expectedVersion")?,
+                    &crew,
+                );
             }
             "captain.document.read" => {
                 return self.captain_document_value(number("captain")?, &text("name")?);
