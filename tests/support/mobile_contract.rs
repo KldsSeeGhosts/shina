@@ -602,7 +602,18 @@ fn mobile_scoped_history_pages_replays_and_gap_falls_back() {
     while live.is_none() {
         assert!(Instant::now() < deadline, "no thread.stream event arrived");
         let value = mobile.read();
-        if value["method"] == "thread.stream" && value["params"]["kind"] == "event" {
+        // Catalog refresh events may legitimately arrive before the sent message.
+        if value["method"] == "thread.stream"
+            && value["params"]["kind"] == "event"
+            && value["params"]["threadId"] == 1
+            && value["params"]["events"].as_array().is_some_and(|events| {
+                events.iter().any(|row| {
+                    row["row"]["field"] == "messages"
+                        && row["row"]["item"]["role"] == "You"
+                        && row["row"]["item"]["text"] == "mobile-live-fixture"
+                })
+            })
+        {
             live = Some(value["params"].clone());
         }
     }
