@@ -815,11 +815,12 @@ impl State {
             if !self.tasks[task_index].state.finished() {
                 return self.queue_remote_send(task_index, message).map(|_| true);
             }
+            let message_with_context = self.remote_task_message(task_index, message)?;
             self.queue_task_attempt(task_index, message)?;
             let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
             remote.send_command = Some(crate::protocol::Command::new(
                 "peer.thread.send",
-                json!({"threadId":remote.thread_id,"message":message}),
+                json!({"threadId":remote.thread_id,"message":message_with_context}),
             ));
             remote.state = RemoteState::Launching;
             remote.next_retry_at = 0;

@@ -249,7 +249,7 @@ impl State {
         )
     }
 
-    fn crew_turn_context(&self, captain: usize) -> String {
+    pub(super) fn crew_turn_context(&self, captain: usize) -> String {
         format!(
             "{CAPTAIN_CONTEXT_PREFIX}{CREW_CONTEXT_HEADER}\n\n{CREW_RULES_LABEL}\n{}\n\n{DOCUMENT_INDEX_LABEL}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
             serde_json::to_string(&bounded(
