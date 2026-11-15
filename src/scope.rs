@@ -259,6 +259,9 @@ impl State {
                 );
             }
         }
+        self.background
+            .routines
+            .rebind_captain(captain, self.next_id)?;
         // Acceptance evidence on the old home survives the reset as durable task state.
         self.reconcile_task_acceptances();
         self.reconcile_crew_report_acceptances();

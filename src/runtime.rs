@@ -1067,6 +1067,79 @@ mod tests {
     }
 
     #[test]
+    fn captain_reset_commits_routine_routing_with_the_home_and_rolls_back_together() {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.captains = crate::captains::Captain::presets();
+        runtime.state.open_captain(0);
+        let old = runtime.state.captain_home(0).unwrap();
+        let routine = runtime
+            .state
+            .background
+            .routines
+            .create(
+                0,
+                old,
+                "Review".into(),
+                "Read status".into(),
+                crate::routines::Schedule::Every { minutes: 15 },
+                crate::routines::MissedPolicy::Skip,
+                chrono::Local::now(),
+            )
+            .unwrap();
+        runtime.state.persistence_scope = None;
+        runtime.persist(None, capture.finish()).unwrap();
+        let receipt = runtime
+            .command(
+                "maintainer",
+                Command::new("captain.reset", json!({"captain":0})),
+            )
+            .unwrap();
+        assert_eq!(receipt["status"], "accepted");
+        let home = runtime.state.captain_home(0).unwrap();
+        assert_ne!(home, old);
+        assert_eq!(
+            database.read("index.json").unwrap().unwrap()["captainHomes"]["0"],
+            home
+        );
+        let ledger = database.read("routines.json").unwrap().unwrap();
+        assert_eq!(ledger["routines"][0]["home"], home);
+        assert_eq!(ledger["routines"][0]["id"], routine);
+
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = None;
+        runtime.state.reset_captain_conversation(0).unwrap();
+        assert_ne!(runtime.state.captain_home(0), Some(home));
+        database.fail("injected reset persist failure".into());
+        assert!(runtime.persist(None, capture.finish()).is_err());
+        assert!(
+            database.read("index.json").is_err(),
+            "failed runtime stays quarantined"
+        );
+        database.test_connection(|connection| {
+            let index = crate::projection_store::read(connection, "index.json")
+                .unwrap()
+                .unwrap();
+            let persisted: String = connection
+                .query_row(
+                    "SELECT payload FROM documents WHERE name='routines.json'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(index["captainHomes"]["0"], home);
+            assert_eq!(
+                serde_json::from_str::<Value>(&persisted).unwrap(),
+                ledger,
+                "a failed reset cannot commit new routine routing without the new home"
+            );
+        });
+    }
+
+    #[test]
     fn mcp_replies_dispatch_only_after_the_commit() {
         let (mut runtime, database, channels, worker) = runtime_fixture_with_crew();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();

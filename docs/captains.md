@@ -94,6 +94,8 @@ Shina saves committed memory and the profile in a separate `memory.json`, using 
 
 `reset_captain_conversation` requires an idle home. It retains the old thread and session file, creates a fresh primary thread with no session or transcript, and keeps the captain profile, scope, memory and user profile. It preserves the harness and pinned model choices. Task control and completion route to the new home without changing task ids, delivery ids, attempts, or historical parent links. The next send starts a fresh Pi or ACP session. The old thread remains in "Earlier conversations".
 
+Routines follow the current primary home. Reset rebinds idle routines without changing their IDs, schedules, paused state or reserved slots; an active delivery blocks reset. Startup repairs legacy routing left on earlier homes. Earlier conversations may list routines but cannot create, pause or delete them. Dispatch checks both Captain and home identity, and unanswered user-recipient crew questions hold scheduled work. In the durable server, routine routing and the new home commit in one database transaction. File-only legacy storage does not provide that multi-record guarantee.
+
 ## Optional Honcho learned memory
 
 Honcho is a second, optional memory backend. Without configuration, Shina keeps its existing local-only behavior. `memory.json` still owns explicit memories, essential flags, user edits and locks, and the global user profile. Honcho cannot edit them. Enabling Honcho does not upload that file or import earlier conversation history.

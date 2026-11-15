@@ -157,10 +157,8 @@ impl State {
             )
             .unwrap_or_default();
         }
-        self.threads
-            .iter()
-            .find(|t| t.captain_home && t.captain == Some(captain))
-            .map(|home| self.background.routines.views(home.id))
+        self.captain_home(captain)
+            .map(|home| self.background.routines.views(home))
             .unwrap_or_default()
     }
     pub fn set_routine_paused(&mut self, id: u64, paused: bool) -> Result<(), String> {
@@ -246,6 +244,7 @@ impl State {
     }
     pub(super) fn setup_background(&mut self) {
         self.background.routines = Routines::load(self.data_dir.join("routines.json"));
+        self.reconcile_routine_homes();
         self.background.endpoint = discover_endpoint();
         self.background.started = true;
         match crate::tray::Tray::start(self.wake.clone()) {
@@ -256,8 +255,19 @@ impl State {
     }
     pub(super) fn setup_headless_background(&mut self) {
         self.background.routines = Routines::load(self.data_dir.join("routines.json"));
+        self.reconcile_routine_homes();
         self.background.endpoint = discover_endpoint();
         self.background.started = true;
+    }
+    fn reconcile_routine_homes(&mut self) {
+        for captain in 0..self.captains.len() {
+            if let Some(home) = self.captain_home(captain)
+                && let Err(error) = self.background.routines.rebind_captain(captain, home)
+            {
+                self.background.status.error = Some(error);
+                break;
+            }
+        }
     }
     pub(super) fn setup_client_background(&mut self) {
         self.background.started = true;
@@ -330,8 +340,15 @@ impl State {
             return Err("Routine storage is unavailable.".into());
         }
         if tool == "list_routines" {
-            return serde_json::to_value(self.background.routines.views(caller))
-                .map_err(|e| e.to_string());
+            return serde_json::to_value(
+                self.background
+                    .routines
+                    .views(self.captain_home(captain).unwrap_or(caller)),
+            )
+            .map_err(|e| e.to_string());
+        }
+        if self.captain_home(captain) != Some(caller) {
+            return Err("Only the Captain's current primary home can manage its routines.".into());
         }
         if tool == "create_routine" {
             let name = args["name"].as_str().ok_or("name is required.")?.to_owned();
@@ -362,7 +379,7 @@ impl State {
             .routines
             .entries()
             .iter()
-            .any(|r| r.id == id && r.home == caller)
+            .any(|r| r.id == id && r.home == caller && r.captain == captain)
         {
             return Err("This routine does not belong to the calling captain.".into());
         }
@@ -472,6 +489,25 @@ impl State {
             return false;
         }
         let before = self.background.status.clone();
+        let routines_revision = self.background.routines.revision();
+        let current_owners: HashSet<(usize, usize)> = self
+            .captains
+            .iter()
+            .enumerate()
+            .filter_map(|(captain, _)| {
+                let home = self.captain_home(captain)?;
+                self.threads
+                    .iter()
+                    .any(|thread| {
+                        thread.id == home
+                            && thread.captain_home
+                            && !thread.delegated
+                            && thread.captain == Some(captain)
+                            && !thread.archived()
+                    })
+                    .then_some((captain, home))
+            })
+            .collect();
         let now = Instant::now();
         let can_write = self.background.routine_retry.is_none_or(|at| at <= now);
         // Finish only once Pi has accepted the delivery and the home has settled. A
@@ -486,6 +522,9 @@ impl State {
                 let delivery = r.active_delivery.as_ref()?;
                 let home = self.threads.iter().find(|t| t.id == r.home);
                 let state = match home {
+                    _ if !current_owners.contains(&(r.captain, r.home)) => {
+                        Some("Captain home changed")
+                    }
                     None => Some("Captain home removed"),
                     Some(t) if matches!(t.status, Status::Failed | Status::Paused) => {
                         Some("Needs review")
@@ -512,28 +551,37 @@ impl State {
             .threads
             .iter()
             .filter(|t| t.request.is_some() || t.status == Status::Waiting)
-            .flat_map(|t| [Some(t.id), t.parent].into_iter().flatten())
+            .flat_map(|t| {
+                [
+                    Some(t.id),
+                    t.parent,
+                    t.crew_captain
+                        .and_then(|captain| self.captain_home(captain)),
+                ]
+                .into_iter()
+                .flatten()
+            })
             .collect();
-        let blocked: HashSet<usize> = self
+        let mut waiting = waiting;
+        for report in &self.captain_reports {
+            if report.question.as_ref().is_some_and(|question| {
+                question.recipient == crate::model::crew_reports::QuestionRecipient::User
+            }) && !self
+                .captain_question_answers
+                .iter()
+                .any(|answer| answer.report_id == report.id)
+                && let Some(home) = self.captain_home(report.captain)
+            {
+                waiting.insert(home);
+            }
+        }
+        let blocked_homes: HashSet<usize> = self
             .threads
             .iter()
             .filter(|t| {
                 waiting.contains(&t.id) || matches!(t.status, Status::Failed | Status::Paused)
             })
             .map(|t| t.id)
-            .chain(
-                self.background
-                    .routines
-                    .entries()
-                    .iter()
-                    .filter(|r| {
-                        !self
-                            .threads
-                            .iter()
-                            .any(|t| t.id == r.home && t.captain_home && !t.archived())
-                    })
-                    .map(|r| r.home),
-            )
             .collect();
         let mut changed = false;
         if !self.background.status.paused_offline
@@ -544,10 +592,13 @@ impl State {
             && self.background.routine_retry.is_none_or(|at| at <= now)
         {
             self.background.routine_retry = None;
-            if let Err(error) = self
-                .background
-                .routines
-                .hold_for_response(chrono::Local::now(), |home| waiting.contains(&home))
+            if let Err(error) =
+                self.background
+                    .routines
+                    .hold_for_response(chrono::Local::now(), |routine| {
+                        current_owners.contains(&(routine.captain, routine.home))
+                            && waiting.contains(&routine.home)
+                    })
             {
                 self.background.status.error = Some(error);
                 self.background.routine_retry = Some(now + Duration::from_secs(30));
@@ -555,8 +606,10 @@ impl State {
             match self
                 .background
                 .routines
-                .due(chrono::Local::now(), |home| blocked.contains(&home))
-            {
+                .due(chrono::Local::now(), |routine| {
+                    !current_owners.contains(&(routine.captain, routine.home))
+                        || blocked_homes.contains(&routine.home)
+                }) {
                 Ok(messages) => {
                     for (home, message) in messages {
                         if let Some(index) = self.threads.iter().position(|t| t.id == home) {
@@ -577,11 +630,10 @@ impl State {
                     self.background.routine_retry = Some(now + Duration::from_secs(30));
                 }
             }
-            if let Some(deadline) = self
-                .background
-                .routines
-                .deadline(|home| blocked.contains(&home))
-                && self.background.routine_retry.is_none()
+            if let Some(deadline) = self.background.routines.deadline(|routine| {
+                !current_owners.contains(&(routine.captain, routine.home))
+                    || blocked_homes.contains(&routine.home)
+            }) && self.background.routine_retry.is_none()
             {
                 tx.wake_after((deadline - chrono::Utc::now()).to_std().unwrap_or_default());
             }
@@ -604,7 +656,7 @@ impl State {
             let hidden = bg.handle.as_ref().is_some_and(|h| !h.is_visible());
             tray.update(working, bg.settings.keep_working || hidden);
         }
-        changed || before != bg.status
+        changed || before != bg.status || routines_revision != bg.routines.revision()
     }
 
     /// Run before task delivery, so an offline failure does not start a parent turn.
@@ -774,6 +826,9 @@ mod tests {
     fn cancelled_routine_delivery_releases_the_update_guard() {
         let (mut state, _commands, _events) = wired();
         state.load_global_for_test();
+        state.captains = Captain::presets();
+        state.current_mut().captain = Some(0);
+        state.current_mut().captain_home = true;
         state.background.started = true;
         state.background.routines = Routines::load(state.data_dir.join("routines.json"));
         state
@@ -864,5 +919,142 @@ mod tests {
         assert!(state.current().accepted_deliveries.contains(&delivery));
         state.delete_routine(id).unwrap();
         assert!(state.routines(0).is_empty());
+    }
+
+    #[test]
+    fn routine_reset_rebinds_the_primary_home_and_earlier_homes_cannot_mutate() {
+        let (mut state, _commands, _events) = wired();
+        state.load_global_for_test();
+        state.captains = Captain::presets();
+        state.captain_homes.clear();
+        state.current_mut().captain = Some(0);
+        state.current_mut().captain_home = true;
+        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
+        let id = state.mcp_call(1, "create_routine", &json!({
+            "name":"Review", "prompt":"Read status", "schedule":{"kind":"every","minutes":15}
+        })).unwrap()["id"].as_u64().unwrap();
+        let mut before = serde_json::to_value(&state.background.routines.entries()[0]).unwrap();
+        state.reset_captain_conversation(0).unwrap();
+        let home = state.captain_home(0).unwrap();
+        assert_ne!(home, 1);
+        before["home"] = json!(home);
+        assert_eq!(
+            serde_json::to_value(&state.background.routines.entries()[0]).unwrap(),
+            before
+        );
+        assert_eq!(state.routines(0).len(), 1);
+        for (tool, args) in [
+            ("pause_routine", json!({"id":id})),
+            ("delete_routine", json!({"id":id})),
+            (
+                "create_routine",
+                json!({"name":"Another","prompt":"Read","schedule":{"kind":"every","minutes":15}}),
+            ),
+        ] {
+            assert!(
+                state
+                    .mcp_call(1, tool, &args)
+                    .unwrap_err()
+                    .contains("primary")
+            );
+        }
+        assert_eq!(
+            state
+                .mcp_call(1, "list_routines", &json!({}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        state
+            .mcp_call(home, "pause_routine", &json!({"id":id,"paused":true}))
+            .unwrap();
+        assert!(state.routines(0)[0].paused);
+        // A previous build may have left this routine attached to an earlier
+        // home. Startup repairs routing without changing the schedule.
+        state.background.routines.rebind_captain(0, 1).unwrap();
+        state.reconcile_routine_homes();
+        assert_eq!(state.background.routines.entries()[0].home, home);
+    }
+
+    #[test]
+    fn routine_dispatch_rejects_a_home_with_the_wrong_captain() {
+        let (mut state, commands, _events) = wired();
+        state.load_global_for_test();
+        state.captains = Captain::presets();
+        state.captain_homes.clear();
+        state.current_mut().captain = Some(0);
+        state.current_mut().captain_home = true;
+        state.background.started = true;
+        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
+        state
+            .background
+            .routines
+            .create(
+                1,
+                1,
+                "Wrong owner".into(),
+                "Do not dispatch".into(),
+                Schedule::Every { minutes: 15 },
+                MissedPolicy::RunOnce,
+                chrono::Local::now() - chrono::Duration::minutes(16),
+            )
+            .unwrap();
+        let before = serde_json::to_value(&state.background.routines.entries()[0]).unwrap();
+        state.poll_background_end(&mut Tx::default());
+        assert!(commands.try_recv().is_err());
+        assert!(state.current().pending_injections.is_empty());
+        assert_eq!(
+            serde_json::to_value(&state.background.routines.entries()[0]).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn unanswered_user_crew_questions_hold_routines_without_waking_the_home() {
+        let (mut state, commands, _events) = wired();
+        state.load_global_for_test();
+        state.captains = Captain::presets();
+        state.captain_homes.clear();
+        state.current_mut().captain = Some(0);
+        state.current_mut().captain_home = true;
+        state.background.started = true;
+        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
+        state
+            .background
+            .routines
+            .create(
+                0,
+                1,
+                "Review".into(),
+                "Read status".into(),
+                Schedule::Every { minutes: 15 },
+                MissedPolicy::RunOnce,
+                chrono::Local::now() - chrono::Duration::minutes(16),
+            )
+            .unwrap();
+        let worker = state.next_id;
+        state.next_id += 1;
+        let mut thread = Thread::new(worker);
+        thread.crew_captain = Some(0);
+        thread.captain = Some(0);
+        thread.run_id = Some("question-run".into());
+        state.threads.push(thread);
+        state.mcp_call(worker, "captain_crew_report", &json!({
+            "requestId":uuid::Uuid::new_v4().to_string(),"outcome":"blocked","summary":"Needs a decision",
+            "question":{"text":"Which branch?","recipient":"user"}
+        })).unwrap();
+        assert!(
+            state.poll_background_end(&mut Tx::default()),
+            "routine ledger changes must promote a persisted global update"
+        );
+        assert_eq!(
+            state.routines(0)[0].last_status,
+            "Waiting for your response"
+        );
+        assert!(!state.routines_running());
+        assert!(commands.try_recv().is_err());
+        assert!(state.current().pending_injections.is_empty());
     }
 }
