@@ -870,6 +870,7 @@ impl State {
             "captain":captain,
             "lifecycle":self.captain_phase(captain),
             "captainVersion":self.captain_version(captain)?,
+            "formerHome":self.captain_former_home(captain),
             "name":profile.name,
             "role":profile.role,
             "portrait":profile.portrait,

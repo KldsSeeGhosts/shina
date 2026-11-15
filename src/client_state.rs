@@ -1863,6 +1863,7 @@ impl State {
                 local.harness_context_sent = thread.harness_context_sent;
                 local.project = thread.project;
                 local.worktree_path = thread.worktree_path;
+                local.scratch_directory = thread.scratch_directory;
                 local.branch = thread.branch;
                 local.base_branch = thread.base_branch;
                 local.env_mode = thread.env_mode;
@@ -4394,6 +4395,33 @@ impl State {
             }
             "captain.lifecycle.preview" => {
                 return self.captain_lifecycle_preview(number("captain")?, &text("action")?);
+            }
+            "captain.promote.preview" | "captain.promote" => {
+                let restore = args
+                    .get("restoreCaptain")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .and_then(|id| usize::try_from(id).ok())
+                            .ok_or("restoreCaptain must be a Captain id.")
+                    })
+                    .transpose()?;
+                if command.method == "captain.promote.preview" {
+                    return self.captain_promote_preview(number("threadId")?, restore);
+                }
+                let profile =
+                    Captain::from_value(&args["record"]).ok_or("Invalid Captain record.")?;
+                return self.captain_promote(
+                    number("threadId")?,
+                    profile,
+                    restore,
+                    &text("expectedVersion")?,
+                );
+            }
+            "captain.demote" => {
+                let crew = serde_json::from_value::<Vec<usize>>(args["crewSeen"].clone())
+                    .map_err(|_| "crewSeen must be the exact crew IDs from the preview.")?;
+                return self.captain_demote(number("captain")?, &text("expectedVersion")?, &crew);
             }
             "captain.archive" | "captain.unarchive" => {
                 let crew: Vec<usize> = serde_json::from_value(args["crewSeen"].clone())

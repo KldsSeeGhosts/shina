@@ -53,7 +53,23 @@ Agent tools are `captain_read`, `captain_document_read`, `captain_document_write
 
 Peer-launched workers receive the shared crew context in each new launch or work follow-up command. The command captures its context once; retries and restored pending commands keep the original payload and UUID even if the rules change. The snapshot never includes private Captain profile instructions or AGENTS.md/NOTES.md contents. Input, editor and select answers retain their exact value without appended context. A brief or follow-up that exceeds the peer's 64 KiB limit after adding context rejects before allocating or requeueing work. Full originating documents remain on the Captain's server.
 
-These operations require `captain-state-v1`, introduced at protocol minor 29. Structured report submission, question answers and the `captain.reports.list`/`captain.report.answer` user RPCs require `captain-reports-v1`, introduced at protocol minor 30. This increment does not add independent crew creation, broader event policies, an event-driven digest, or Captain promotion, archive, demotion and deletion.
+These operations require `captain-state-v1`, introduced at protocol minor 29. Structured report submission, question answers and the `captain.reports.list`/`captain.report.answer` user RPCs require `captain-reports-v1`, introduced at protocol minor 30. Independent crew creation, broader event policies, an event-driven digest and Captain deletion remain unfinished.
+
+## Lifecycle backend
+
+The durable server supports `captain.lifecycle.preview`, `captain.archive` and `captain.unarchive` through `captain-archive-v1` at protocol minor 31. A preview returns an opaque `captainVersion`, the exact `crewSeen` IDs, affected thread IDs and blockers. Mutations require that version and crew list. A stale confirmation must be reviewed again with a new command ID. An uncertain command retains its original ID and body for receipt lookup or retry.
+
+Archive requires idle current and earlier homes, idle canonical crew, no queued input or pending provider requests, and no active routine or Task. Exact saved report, answer and Task-result notifications may be held instead of delivered. The action records each affected thread's previous archive marker and the IDs of enabled routines it paused. It does not infer membership from historical parents of moved or released crew.
+
+Unarchive restores only those recorded thread markers. Independently archived members stay archived. User-paused routines stay paused; action-paused routines get a new future schedule without replaying missed or already reserved slots. Unarchive does not release held notifications or start providers. An explicit user turn or Deliver now releases notifications through the existing acceptance checks. Opening an archived home does not restore it. Inactive owners cannot write documents, change scope or crew, run routines, send work or bypass the group action with individual thread restore, delete or undo.
+
+Protocol minor 32 adds `captain-promote-v1` for `captain.promote.preview` and `captain.promote`, and `captain-retire-v1` for `captain.demote`. These are backend commands; the lifecycle dialogs and promotion editor are not yet connected.
+
+Promotion appends a stable Captain identity and uses the existing ordinary thread as its home. It preserves the thread ID, history, native access mode, model, session, machine, project and Git worktree. A separate `scratchDirectory` record preserves project-less working directories across role changes. Pi session paths become absolute before a role change; ACP session IDs remain opaque. No role command grants permissions or starts a turn.
+
+Demotion requires every owned Task result, crew report, question and answer to be settled. It keeps the current home as an ordinary thread, archives earlier homes, releases canonical crew, clears project default-Captain links and pauses routines. Task and report identities do not change. The profile, documents, curated memory and scope remain under the retired Captain's stable index. Restoring that profile requires its surviving ordinary former home and original workspace; it does not resume paused routines. A newly promoted Captain starts with fresh memory rather than copying another profile.
+
+Archive, unarchive, promotion and demotion require the existing runtime database transaction. Routine and index changes commit together. File-only legacy mode refuses these multi-record transitions. A persistence failure quarantines the runtime rather than falling back to JSON. These commands do not delete files, provider history or backups.
 
 ## Crew turn reports
 

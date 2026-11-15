@@ -502,6 +502,7 @@ impl State {
                     .project
                     .and_then(|id| self.projects.entries.iter().find(|p| p.id == id))
                     .map(|p| p.path.clone())
+                    .or_else(|| thread.scratch_directory.as_ref().map(PathBuf::from))
                     .unwrap_or_else(|| {
                         if legacy_scratch {
                             self.data_dir.join("chats").join(thread.id.to_string())
@@ -662,6 +663,21 @@ mod tests {
         restored.captain_project = Some(Some(1));
         restored.open_captain(0);
         assert_eq!(restored.current().id, primary);
+        assert!(
+            restored.current().archived(),
+            "navigation never restores an archived home"
+        );
+        assert_eq!(
+            restored.captain_phase(0),
+            CaptainPhase::Active,
+            "legacy individual archives do not imply a group archive"
+        );
+        restored
+            .execute_command(&crate::protocol::Command::new(
+                "thread.lifecycle",
+                json!({"threadId":primary,"action":"unarchive"}),
+            ))
+            .unwrap();
         assert!(!restored.current().archived());
         assert_eq!(
             restored

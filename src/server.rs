@@ -762,6 +762,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut mobile_push = false;
     let mut captain_reports = false;
     let mut captain_archive = false;
+    let mut captain_roles = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -902,6 +903,11 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if captain_archive {
                             capabilities.push(protocol::CAPTAIN_ARCHIVE);
                         }
+                        captain_roles = minor >= u64::from(protocol::CAPTAIN_ROLES_MINOR);
+                        if captain_roles {
+                            capabilities.push(protocol::CAPTAIN_PROMOTE);
+                            capabilities.push(protocol::CAPTAIN_RETIRE);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -919,6 +925,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err(protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED.into())
                 } else if matches!(method, "captain.lifecycle.preview" | "captain.archive" | "captain.unarchive") && !captain_archive {
                     Err(protocol::CAPTAIN_ARCHIVE_UPDATE_REQUIRED.into())
+                } else if (matches!(method, "captain.promote.preview" | "captain.promote" | "captain.demote")
+                    || method == "captain.lifecycle.preview"
+                        && params.get("args").unwrap_or(params)["action"] == "demote") && !captain_roles {
+                    Err(protocol::CAPTAIN_ROLES_UPDATE_REQUIRED.into())
                 } else if matches!(method, "notifications.get" | "notifications.push.status") {
                     if !mobile_push {
                         Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())
@@ -2417,6 +2427,38 @@ mod tests {
                         .await
                         .unwrap_err(),
                     protocol::CAPTAIN_ARCHIVE_UPDATE_REQUIRED
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn captain_roles_require_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-roles-old", protocol::CAPTAIN_ROLES_MINOR - 1).await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-roles-reader"),
+                )
+                .await;
+            for method in [
+                "captain.promote.preview",
+                "captain.promote",
+                "captain.demote",
+                "captain.lifecycle.preview",
+            ] {
+                assert_eq!(
+                    crate::client::remote_rpc(
+                        &link,
+                        method,
+                        json!({"captain":0,"action":"demote"})
+                    )
+                    .await
+                    .unwrap_err(),
+                    protocol::CAPTAIN_ROLES_UPDATE_REQUIRED
                 );
             }
         });

@@ -1143,6 +1143,13 @@ mod tests {
     fn captain_archive_restores_exact_markers_and_schedules_without_waking_work() {
         let (mut runtime, database, channels, worker) = runtime_fixture_with_crew();
         let home = runtime.state.captain_home(0).unwrap();
+        let home_index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|thread| thread.id == home)
+            .unwrap();
+        runtime.state.threads[home_index].session = Some("unloaded-home-history.jsonl".into());
         // A member archived independently must stay archived after group restore.
         let worker_index = runtime
             .state
@@ -1417,6 +1424,247 @@ mod tests {
         );
         assert!(reopened.state.crew_reports().is_empty());
         assert_eq!(reopened.command("maintainer", command).unwrap(), receipt);
+    }
+
+    #[test]
+    fn captain_roles_commit_preserved_placement_and_restore_retained_private_records() {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        let directory = runtime.state.data_dir.clone();
+        let home = runtime.state.current().id;
+        let cwd = runtime
+            .state
+            .thread_directory(runtime.state.active)
+            .unwrap();
+        runtime.state.current_mut().session = Some("relative-session.jsonl".into());
+        runtime.state.current_mut().native.access = crate::model::AccessMode::Full;
+        let profile = crate::captains::Captain::presets().remove(0);
+        let preview = runtime.state.captain_promote_preview(home, None).unwrap();
+        let promote = Command::new(
+            "captain.promote",
+            json!({
+                "threadId":home,"record":profile.to_value(),"expectedVersion":preview["threadVersion"]
+            }),
+        );
+        let receipt = runtime.command("maintainer", promote.clone()).unwrap();
+        assert_eq!(receipt["status"], "accepted", "{receipt}");
+        let captain = receipt["result"]["captain"].as_u64().unwrap() as usize;
+        assert_eq!(runtime.command("maintainer", promote).unwrap(), receipt);
+        let receipt = runtime
+            .command(
+                "maintainer",
+                Command::new(
+                    "memory.put",
+                    json!({
+                        "captain":captain,"text":"Retain this private memory","essential":true
+                    }),
+                ),
+            )
+            .unwrap();
+        assert_eq!(receipt["status"], "accepted", "{receipt}");
+        let receipt = runtime.command("maintainer", Command::new("captain.document.write", json!({
+            "captain":captain,"name":"NOTES.md","text":"Retain this plan","expectedRevision":0
+        }))).unwrap();
+        assert_eq!(receipt["status"], "accepted", "{receipt}");
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        let routine = runtime
+            .state
+            .background
+            .routines
+            .create(
+                captain,
+                home,
+                "Review".into(),
+                "Read status".into(),
+                crate::routines::Schedule::Every { minutes: 15 },
+                crate::routines::MissedPolicy::RunOnce,
+                chrono::Local::now(),
+            )
+            .unwrap();
+        runtime.state.persistence_scope = None;
+        runtime.persist(None, capture.finish()).unwrap();
+        let memories = runtime.state.memories(captain);
+        let notes = runtime
+            .state
+            .captain_document_value(captain, "NOTES.md")
+            .unwrap();
+        let preview = runtime
+            .state
+            .captain_lifecycle_preview(captain, "demote")
+            .unwrap();
+        let demote = Command::new(
+            "captain.demote",
+            json!({
+                "captain":captain,"expectedVersion":preview["captainVersion"],"crewSeen":preview["crewSeen"]
+            }),
+        );
+        let receipt = runtime.command("maintainer", demote.clone()).unwrap();
+        assert_eq!(receipt["status"], "accepted", "{receipt}");
+        let index = database.read("index.json").unwrap().unwrap();
+        assert_eq!(
+            index["captainLifecycles"][captain.to_string()]["phase"],
+            "retired"
+        );
+        assert_eq!(runtime.state.current().id, home);
+        assert!(!runtime.state.current().captain_home);
+        assert_eq!(
+            runtime
+                .state
+                .thread_directory(runtime.state.active)
+                .unwrap(),
+            cwd
+        );
+        assert_eq!(
+            runtime.state.current().native.access,
+            crate::model::AccessMode::Full
+        );
+        assert!(
+            runtime
+                .state
+                .background
+                .routines
+                .entries()
+                .iter()
+                .find(|entry| entry.id == routine)
+                .unwrap()
+                .paused
+        );
+        assert_eq!(runtime.command("maintainer", demote).unwrap(), receipt);
+        drop(runtime);
+        drop(database);
+        let mut runtime = RuntimeState::open(directory, std::sync::Arc::new(|| {})).unwrap();
+        assert_eq!(
+            runtime.state.captain_phase(captain),
+            crate::model::CaptainPhase::Retired
+        );
+        assert_eq!(
+            serde_json::to_value(runtime.state.memories(captain)).unwrap(),
+            serde_json::to_value(memories).unwrap()
+        );
+        assert_eq!(
+            runtime
+                .state
+                .captain_document_value(captain, "NOTES.md")
+                .unwrap(),
+            notes
+        );
+        let preview = runtime
+            .state
+            .captain_promote_preview(home, Some(captain))
+            .unwrap();
+        let reconnects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = reconnects.clone();
+        runtime.state.test_connect_pi = Some(Box::new(move |_, _| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (session, _, _) = crate::harness::Session::test_connection();
+            Some(session)
+        }));
+        let receipt = runtime.command("maintainer", Command::new("captain.promote", json!({
+            "threadId":home,"restoreCaptain":captain,"record":profile.to_value(),"expectedVersion":preview["threadVersion"]
+        }))).unwrap();
+        assert_eq!(receipt["status"], "accepted", "{receipt}");
+        assert_eq!(receipt["result"]["captain"], captain);
+        assert_eq!(runtime.state.captains.len(), 1);
+        assert_eq!(
+            runtime
+                .state
+                .thread_directory(runtime.state.active)
+                .unwrap(),
+            cwd
+        );
+        assert_eq!(
+            runtime.state.current().native.access,
+            crate::model::AccessMode::Full
+        );
+        assert_eq!(
+            runtime.state.current().session.as_deref(),
+            cwd.join("relative-session.jsonl").to_str()
+        );
+        assert!(runtime.state.current().pi.is_none());
+        assert!(
+            runtime
+                .state
+                .background
+                .routines
+                .entries()
+                .iter()
+                .find(|entry| entry.id == routine)
+                .unwrap()
+                .paused,
+            "restoring a profile never resumes its routines"
+        );
+        runtime.tick();
+        assert_eq!(
+            reconnects.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "role restoration must not auto-connect an unloaded saved session"
+        );
+    }
+
+    #[test]
+    fn failed_captain_demotion_cannot_commit_a_retired_profile_without_pausing_its_routines() {
+        let mut runtime = durable();
+        let database = runtime.database.clone().unwrap();
+        let home = runtime.state.current().id;
+        let profile = crate::captains::Captain::presets().remove(0);
+        let preview = runtime.state.captain_promote_preview(home, None).unwrap();
+        let receipt = runtime.command("maintainer", Command::new("captain.promote", json!({
+            "threadId":home,"record":profile.to_value(),"expectedVersion":preview["threadVersion"]
+        }))).unwrap();
+        let captain = receipt["result"]["captain"].as_u64().unwrap() as usize;
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime
+            .state
+            .background
+            .routines
+            .create(
+                captain,
+                home,
+                "Review".into(),
+                "Read status".into(),
+                crate::routines::Schedule::Every { minutes: 15 },
+                crate::routines::MissedPolicy::Skip,
+                chrono::Local::now(),
+            )
+            .unwrap();
+        runtime.state.persistence_scope = None;
+        runtime.persist(None, capture.finish()).unwrap();
+        let before_index = database.read("index.json").unwrap().unwrap();
+        let before_ledger = database.read("routines.json").unwrap().unwrap();
+        let preview = runtime
+            .state
+            .captain_lifecycle_preview(captain, "demote")
+            .unwrap();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime
+            .state
+            .captain_demote(captain, preview["captainVersion"].as_str().unwrap(), &[])
+            .unwrap();
+        database.fail("injected role persistence failure".into());
+        assert!(runtime.persist(None, capture.finish()).is_err());
+        assert!(database.read("index.json").is_err());
+        database.test_connection(|connection| {
+            assert_eq!(
+                crate::projection_store::read(connection, "index.json")
+                    .unwrap()
+                    .unwrap(),
+                before_index
+            );
+            let ledger: String = connection
+                .query_row(
+                    "SELECT payload FROM documents WHERE name='routines.json'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&ledger).unwrap(),
+                before_ledger
+            );
+        });
     }
 
     #[test]

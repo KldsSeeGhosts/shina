@@ -152,6 +152,8 @@ pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
 #[path = "captain_lifecycle.rs"]
 mod captain_lifecycle;
 pub use captain_lifecycle::CaptainPhase;
+#[path = "captain_roles.rs"]
+mod captain_roles;
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
 mod handoff_tests;
@@ -799,6 +801,8 @@ pub struct Thread {
     pub harness_state: Value,
     pub project: Option<ProjectId>,
     pub worktree_path: Option<String>,
+    /// Project-less role changes retain their original working directory.
+    pub(crate) scratch_directory: Option<String>,
     pub branch: Option<String>,
     pub base_branch: Option<String>,
     pub env_mode: Option<ThreadEnvMode>,
@@ -1334,6 +1338,7 @@ impl Thread {
             harness_state: json!({}),
             project: None,
             worktree_path: None,
+            scratch_directory: None,
             branch: None,
             base_branch: None,
             env_mode: None,
@@ -5441,6 +5446,9 @@ impl State {
                     return Err("Thread and project machines do not match.".into());
                 }
                 Ok(project.path.clone())
+            }
+            None if thread.scratch_directory.is_some() => {
+                Ok(PathBuf::from(thread.scratch_directory.as_ref().unwrap()))
             }
             None if thread.captain_home => Ok(self
                 .data_dir
@@ -13695,6 +13703,19 @@ impl State {
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned);
+                    thread.scratch_directory = match record.get("scratchDirectory") {
+                        None => None,
+                        Some(value) => {
+                            let path = value.as_str()?;
+                            if path.is_empty() || path.len() > 32768 || path.chars().any(char::is_control)
+                                || self.client.is_none() && thread.machine == "local"
+                                    && !std::path::Path::new(path).is_absolute()
+                            {
+                                return None;
+                            }
+                            Some(path.to_owned())
+                        }
+                    };
                     thread.branch = record
                         .get("branch")
                         .and_then(Value::as_str)
@@ -14767,6 +14788,9 @@ impl Thread {
         }).as_object().unwrap().clone());
         if let Some(worktree_path) = &self.worktree_path {
             record["worktreePath"] = json!(worktree_path);
+        }
+        if let Some(directory) = &self.scratch_directory {
+            record["scratchDirectory"] = json!(directory);
         }
         if let Some(branch) = &self.branch {
             record["branch"] = json!(branch);

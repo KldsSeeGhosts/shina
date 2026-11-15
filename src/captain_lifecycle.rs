@@ -120,6 +120,8 @@ impl State {
             if thread.status.busy()
                 || thread.native.operating()
                 || thread.worktree_bootstrapping()
+                || thread.staged_handoff.is_some()
+                || thread.inflight_handoff.is_some()
                 || thread.configuring
                 || thread.initializing
                 || thread.session_started.is_some()
@@ -155,6 +157,9 @@ impl State {
             ("archive", CaptainPhase::Active) => {
                 blockers.extend(self.captain_archive_blockers(captain))
             }
+            ("demote", CaptainPhase::Active) => {
+                blockers.extend(self.captain_retirement_blockers(captain))
+            }
             ("unarchive", CaptainPhase::Archived) => {
                 if let Err(error) = self
                     .validate_captain_archives()
@@ -163,7 +168,7 @@ impl State {
                     blockers.push(error);
                 }
             }
-            ("archive" | "unarchive", _) => {
+            ("archive" | "unarchive" | "demote", _) => {
                 blockers.push("The Captain is not in the required lifecycle state.".into())
             }
             _ => return Err("Unsupported Captain lifecycle action.".into()),
@@ -197,6 +202,9 @@ impl State {
         expected_version: &str,
         crew_seen: &[usize],
     ) -> Result<Value, String> {
+        if !matches!(action, "archive" | "unarchive") {
+            return Err("Unsupported Captain archive action.".into());
+        }
         let preview = self.captain_lifecycle_preview(captain, action)?;
         if preview["captainVersion"] != expected_version || preview["crewSeen"] != json!(crew_seen)
         {
@@ -270,6 +278,7 @@ impl State {
                     thread.life.archived_at.get_or_insert(at);
                 }
                 thread.disconnect();
+                thread.prewarm_attempted = true;
             }
             self.captain_lifecycles.insert(
                 captain,
@@ -298,6 +307,9 @@ impl State {
             for thread in &mut self.threads {
                 if let Some(previous) = record.archived_threads.get(&thread.id) {
                     thread.life.archived_at = *previous;
+                    thread.prewarm_attempted = true;
+                } else if thread.captain_home && thread.captain == Some(captain) {
+                    thread.prewarm_attempted = true;
                 }
             }
             self.captain_lifecycles.remove(&captain);
@@ -397,8 +409,9 @@ impl State {
                     "parent":thread.parent,"crew":thread.crew_captain,
                     "home":thread.captain_home,"archivedAt":thread.life.archived_at,
                     "harness":thread.harness,"machine":thread.machine,
+                    "session":thread.session,"access":thread.native.access.id(),"options":thread.model_options,
                     "model":thread.selected_model,"thinking":thread.selected_thinking,
-                    "worktree":thread.worktree_path})
+                    "worktree":thread.worktree_path,"scratchDirectory":thread.scratch_directory})
             })
             .collect();
         let documents: Vec<_> = captain_state::DOCUMENT_NAMES
@@ -552,16 +565,9 @@ impl State {
                     return Err("An inactive Captain still owns active role records.".into());
                 }
                 if record.phase == CaptainPhase::Retired
-                    && !record.former_home.is_some_and(|home| {
-                        self.threads.iter().any(|thread| {
-                            thread.id == home
-                                && !thread.delegated
-                                && !thread.captain_home
-                                && thread.crew_captain.is_none()
-                        })
-                    })
+                    && !record.former_home.is_some_and(|home| home > 0)
                 {
-                    return Err("A retired Captain has no surviving former home.".into());
+                    return Err("A retired Captain has no former home identity.".into());
                 }
             }
         }
