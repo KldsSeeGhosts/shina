@@ -64,6 +64,21 @@ fn unit_quote(value: &str) -> String {
     )
 }
 
+fn windows_task_arguments(executable: &str, arguments: &[&str]) -> String {
+    let arguments = arguments
+        .iter()
+        .map(|argument| format!("'{}'", argument.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Start-Process -Wait waits for the entire descendant tree, including an
+    // updater trying to restart this task. The launcher already waits for the
+    // server, so wait for that one process and preserve its exit code.
+    format!(
+        "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"$p = Start-Process -FilePath '{}' -ArgumentList {arguments} -WindowStyle Hidden -PassThru; $p.WaitForExit(); exit $p.ExitCode\"",
+        executable.replace('\'', "''")
+    )
+}
+
 impl Service {
     fn launcher_pid(&self) -> Option<u32> {
         fs::read_to_string(self.directory.join("service-launcher.pid"))
@@ -73,12 +88,23 @@ impl Service {
             .ok()
     }
 
-    /// IgnoreNew can discard /Run until the PowerShell task action has exited, even
-    /// after both Shina processes have gone. COM state numbers do not depend on locale.
+    /// Upgrade the legacy tree-wide wait without changing task grants or settings.
+    /// IgnoreNew can discard /Run until the old action exits, even after both Shina
+    /// processes have gone. COM state numbers do not depend on locale.
     fn wait_windows_task_idle(&self) -> Result<(), String> {
+        let arguments = windows_task_arguments(
+            &self.executable.to_string_lossy(),
+            &[
+                "--service-run",
+                &format!("\\\"{}\\\"", self.descriptor().display()),
+            ],
+        );
+        let legacy = arguments.replace("-PassThru; $p.WaitForExit();", "-PassThru -Wait;");
+        let name = self.name.replace('\'', "''");
         let script = format!(
-            "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $t=$s.GetFolder('\\').GetTask('{}'); $w=[Diagnostics.Stopwatch]::StartNew(); while ($t.State -eq 4 -or $t.State -eq 2) {{ if ($w.Elapsed.TotalSeconds -ge 15) {{ throw 'The previous service task did not exit within 15 seconds. No new start was requested.' }}; Start-Sleep -Milliseconds 100 }}; if ($t.State -ne 3) {{ throw 'The service task is not ready to start.' }}",
-            self.name.replace('\'', "''")
+            "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $f=$s.GetFolder('\\'); $t=$f.GetTask('{name}'); $d=$t.Definition; if ($d.Actions.Count -eq 1 -and $d.Actions.Item(1).Path -ieq 'powershell.exe' -and $d.Actions.Item(1).Arguments -ceq '{legacy}') {{ $d.Actions.Item(1).Arguments='{arguments}'; $null=$f.RegisterTaskDefinition('{name}',$d,4,$null,$null,3,$null) }}; $w=[Diagnostics.Stopwatch]::StartNew(); while ($t.State -eq 4 -or $t.State -eq 2) {{ if ($w.Elapsed.TotalSeconds -ge 15) {{ throw 'The previous service task did not exit within 15 seconds. No new start was requested.' }}; Start-Sleep -Milliseconds 100; $t=$f.GetTask('{name}') }}; if ($t.State -ne 3) {{ throw 'The service task is not ready to start.' }}",
+            legacy = legacy.replace('\'', "''"),
+            arguments = arguments.replace('\'', "''"),
         );
         self.run(
             "powershell.exe",
@@ -109,11 +135,8 @@ impl Service {
         let exe = self.executable.to_string_lossy();
         let descriptor = self.descriptor().to_string_lossy().into_owned();
         let log = self.log_path().to_string_lossy().into_owned();
-        let windows_arguments = format!(
-            "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"$p = Start-Process -FilePath '{}' -ArgumentList '--service-run', '\\\"{}\\\"' -WindowStyle Hidden -PassThru -Wait; exit $p.ExitCode\"",
-            exe.replace('\'', "''"),
-            descriptor.replace('\'', "''")
-        );
+        let windows_arguments =
+            windows_task_arguments(&exe, &["--service-run", &format!("\\\"{descriptor}\\\"")]);
         match self.platform {
             Platform::Linux => format!(
                 "[Unit]\nDescription=Shina always-on server\nStartLimitIntervalSec=300\nStartLimitBurst=5\n\n[Service]\nType=simple\nWorkingDirectory=%h\nExecStart={} --service-run {}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=90\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
@@ -673,5 +696,63 @@ mod tests {
     fn escaping_does_not_allow_unit_or_xml_injection() {
         assert_eq!(xml("<>&\""), "&lt;&gt;&amp;&quot;");
         assert_eq!(unit_quote("a%$\"\\b"), "\"a%%$$\\\"\\\\b\"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_task_waits_for_launcher_exit_not_its_descendants() {
+        use std::os::windows::process::CommandExt;
+
+        let directory =
+            std::env::temp_dir().join(format!("shina service wait-'{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let script = directory.join("launcher.ps1");
+        let descendant_pid = directory.join("descendant.pid");
+        fs::write(
+            &script,
+            format!(
+                "$child = Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('{}', [string]$child.Id); exit 7",
+                descendant_pid.to_string_lossy().replace('\'', "''")
+            ),
+        )
+        .unwrap();
+        let arguments = windows_task_arguments(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                &format!("\\\"{}\\\"", script.display()),
+            ],
+        );
+        let mut command = Command::new("powershell.exe");
+        command
+            .raw_arg(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Keep the job owner alive until after the assertion, then terminate
+        // the test's sleeping descendant even when an assertion fails.
+        let mut process = crate::process::Process::spawn(&mut command).unwrap();
+        let result = crate::process::wait_child(&mut process, Duration::from_secs(10));
+        assert_eq!(
+            result
+                .expect("the wrapper must not wait for the descendant")
+                .code(),
+            Some(7),
+            "the wrapper must preserve the launcher's exit code"
+        );
+        let pid: u32 = fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            crate::process::is_alive(pid),
+            "the descendant outlives the launcher and wrapper"
+        );
+        process.terminate();
+        process.reap(Duration::from_secs(2)).unwrap();
+        drop(process);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

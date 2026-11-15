@@ -527,6 +527,17 @@ async fn pair(
     if headers.contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if let Some(expected) = body.get("expectedServerId") {
+        let Some(expected) = expected
+            .as_str()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+        else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if expected != shared.discovery.server_id {
+            return StatusCode::CONFLICT.into_response();
+        }
+    }
     let mut pairing = shared.pairing.lock().expect("pairing");
     if pairing.is_peer() != (body["peer"] == true) {
         let _ = pairing.exchange(&shared.database, "", "", crate::lifecycle::now());
@@ -747,6 +758,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut provider_handoff = false;
     let mut workspace_search = false;
     let mut workspace_read_file = false;
+    let mut notification_feed = false;
+    let mut mobile_push = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -868,6 +881,14 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= u64::from(protocol::THREAD_TITLE_SEARCH_MINOR) {
                             capabilities.push(protocol::THREAD_TITLE_SEARCH);
                         }
+                        notification_feed = minor >= u64::from(protocol::NOTIFICATIONS_MINOR);
+                        if notification_feed {
+                            capabilities.push(protocol::NOTIFICATIONS);
+                        }
+                        mobile_push = minor >= u64::from(protocol::MOBILE_PUSH_MINOR);
+                        if mobile_push {
+                            capabilities.push(protocol::MOBILE_PUSH);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -881,6 +902,63 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     }
                 } else if !hello {
                     Err("Send hello before other requests.".into())
+                } else if matches!(method, "notifications.get" | "notifications.push.status") {
+                    if !mobile_push {
+                        Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())
+                    } else {
+                        let params = params.get("args").unwrap_or(params);
+                        let database = shared.database.clone();
+                        let event = params["eventId"].as_str().map(str::to_owned);
+                        let caller = device.clone();
+                        let lookup = method == "notifications.get";
+                        match tokio::task::spawn_blocking(move || {
+                            if lookup {
+                                database.notification_event(event.as_deref().unwrap_or(""))
+                            } else {
+                                database.push_status(&caller)
+                            }
+                        }).await {
+                            Ok(result) => result,
+                            Err(_) => Err("Notification reader stopped.".into()),
+                        }
+                    }
+                } else if method == "notifications.list" {
+                    let params = params.get("args").unwrap_or(params);
+                    if !notification_feed {
+                        Err(protocol::NOTIFICATIONS_UPDATE_REQUIRED.into())
+                    } else {
+                        let input = (|| -> Result<_, String> {
+                            let after = match params.get("afterSequence") {
+                                None | Some(Value::Null) => None,
+                                Some(value) => Some(value.as_u64()
+                                    .filter(|value| *value <= i64::MAX as u64)
+                                    .ok_or("Invalid notification cursor.")?),
+                            };
+                            let limit = match params.get("limit") {
+                                None => 50,
+                                Some(value) => value.as_u64()
+                                    .filter(|value| (1..=100).contains(value))
+                                    .ok_or("Notification limit must be between 1 and 100.")?
+                                    as usize,
+                            };
+                            Ok((after, limit))
+                        })();
+                        match input {
+                            Err(error) => Err(error),
+                            Ok((after, limit)) => {
+                                let database = shared.database.clone();
+                                match tokio::task::spawn_blocking(move ||
+                                    database.notification_page(after, limit)).await {
+                                    Ok(Ok(mut page)) => {
+                                        page["serverId"] = json!(shared.discovery.server_id);
+                                        Ok(page)
+                                    }
+                                    Ok(Err(error)) => Err(error),
+                                    Err(_) => Err("Notification reader stopped.".into()),
+                                }
+                            }
+                        }
+                    }
                 } else if method == "thread.subscribe" {
                     if !history_items { Err(protocol::HISTORY_UPDATE_REQUIRED.into()) }
                     else if let Some(thread) = params["threadId"].as_u64() {
@@ -1462,6 +1540,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             }
                         }
                     };
+                    if matches!(method, "notifications.push.register" | "notifications.push.unregister") && !mobile_push {
+                        if !send(&mut socket, protocol::response(id, Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into()))).await { break; }
+                        continue;
+                    }
                     if method == "thread.user-input.dismiss" && !question_dismiss {
                         if !send(&mut socket, protocol::response(id, Err(protocol::QUESTION_DISMISS_UPDATE_REQUIRED.into()))).await { break; }
                         continue;
@@ -1819,6 +1901,11 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
     )
     .map_err(|e| e.to_string())?;
     discovery.publish(&directory)?;
+    let push = network.spawn(crate::mobile_push::run(
+        remote.database.clone(),
+        discovery.server_id.clone(),
+        remote.shutdown.clone(),
+    ));
     while !*stop_state.borrow() && !server.is_finished() {
         let was_fenced = runtime.maintenance.fenced();
         let mut changed = false;
@@ -1878,6 +1965,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         server.abort();
     }
     cleanup.abort();
+    push.abort();
     Ok(())
 }
 
@@ -1906,6 +1994,7 @@ async fn identity(State(shared): State<Shared>, headers: HeaderMap) -> Response 
     }
     Json(
         json!({"serverId":shared.discovery.server_id,"label":machine_label(),
+        "protocolMajor":protocol::MAJOR,"protocolMinor":shared.discovery.protocol_minor,
         "peerDelegation":shared.discovery.protocol_minor >= 5}),
     )
     .into_response()
@@ -2191,6 +2280,168 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn mobile_pairing_checks_expected_identity_before_consuming_the_code() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("mobile-pairing-identity").await;
+            let code = fixture
+                .shared
+                .pairing
+                .lock()
+                .unwrap()
+                .create(crate::lifecycle::now())
+                .unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let http = crate::peer::http().unwrap();
+            let base = format!("http://{}", fixture.address);
+            let identity: Value = http
+                .get(format!("{base}/v1/identity"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(identity["serverId"], fixture.shared.discovery.server_id);
+            assert_eq!(identity["protocolMinor"], protocol::MINOR);
+            assert!(identity.get("bootstrapToken").is_none());
+            let mut body = json!({
+                "code":code,"deviceId":uuid::Uuid::new_v4(),
+                "expectedServerId":uuid::Uuid::new_v4()
+            });
+            assert_eq!(
+                http.post(format!("{base}/v1/pair"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+            body["expectedServerId"] = json!(false);
+            assert_eq!(
+                http.post(format!("{base}/v1/pair"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            body["expectedServerId"] = identity["serverId"].clone();
+            let response = http
+                .post(format!("{base}/v1/pair"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let paired: Value = response.json().await.unwrap();
+            assert_eq!(paired["serverId"], identity["serverId"]);
+            assert_eq!(
+                http.post(format!("{base}/v1/pair"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "the identity check must not make a redeemed code reusable"
+            );
+        });
+    }
+
+    #[test]
+    fn mobile_notifications_are_negotiated_bounded_and_unavailable_to_peers() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::new("mobile-notification-contract").await;
+            let profile = crate::store::directory().unwrap().join("mobile-reader");
+            let link = fixture.link(&profile).await;
+            let hello = crate::client::remote_rpc(&link, "hello", json!({}))
+                .await
+                .unwrap();
+            assert!(
+                hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|capability| capability == protocol::NOTIFICATIONS)
+            );
+            let page = crate::client::remote_rpc(&link, "notifications.list", json!({"limit":1}))
+                .await
+                .unwrap();
+            assert!(page["events"].as_array().unwrap().is_empty());
+            assert_eq!(page["serverId"], fixture.shared.discovery.server_id);
+            for params in [
+                json!({"limit":0}),
+                json!({"limit":101}),
+                json!({"limit":"50"}),
+                json!({"afterSequence":-1}),
+                json!({"afterSequence":"1"}),
+                json!({"afterSequence":u64::MAX}),
+            ] {
+                assert!(
+                    crate::client::remote_rpc(&link, "notifications.list", params)
+                        .await
+                        .is_err()
+                );
+            }
+            let peer = uuid::Uuid::new_v4().to_string();
+            fixture
+                .shared
+                .database
+                .issue_scoped_device(&peer, "synthetic-peer-token", &["read", "peer-delegate"])
+                .unwrap();
+            assert!(
+                fixture
+                    .shared
+                    .database
+                    .authorize(&peer, "notifications.list", &json!({}))
+                    .is_err()
+            );
+            let readonly = uuid::Uuid::new_v4().to_string();
+            fixture
+                .shared
+                .database
+                .issue_scoped_device(&readonly, "synthetic-readonly-token", &["read"])
+                .unwrap();
+            assert!(
+                fixture
+                    .shared
+                    .database
+                    .authorize(&readonly, "notifications.list", &json!({}))
+                    .is_ok()
+            );
+            for method in [
+                "notifications.push.register",
+                "notifications.push.unregister",
+            ] {
+                assert!(
+                    fixture
+                        .shared
+                        .database
+                        .authorize(&readonly, method, &json!({}))
+                        .is_err(),
+                    "{method} needs operate, not read"
+                );
+            }
+            let older = Fixture::with_minor(
+                "mobile-notification-old-server",
+                protocol::NOTIFICATIONS_MINOR - 1,
+            )
+            .await;
+            let old_link = older
+                .link(&crate::store::directory().unwrap().join("mobile-old-reader"))
+                .await;
+            let error = crate::client::remote_rpc(&old_link, "notifications.list", json!({}))
+                .await
+                .unwrap_err();
+            assert!(error.contains(protocol::NOTIFICATIONS_UPDATE_REQUIRED));
+        });
     }
 
     #[test]
@@ -2760,6 +3011,71 @@ mod tests {
                         .unwrap()
                 );
             }
+        });
+    }
+    #[test]
+    fn an_orphaned_startup_request_fails_and_an_explicit_retry_is_accepted() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let directory = crate::store::directory()
+                .unwrap()
+                .join("updates-orphaned-startup");
+            std::fs::create_dir_all(directory.join("updates")).unwrap();
+            crate::store::write_atomic(
+                &directory.join("updates/request.json"),
+                json!({"updateId":"orphaned-update","tag":"v0.18.0","startedAt":0})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+            let fixture = Fixture::configured("updates-orphaned-startup", 6, |rt| {
+                std::fs::write(rt.state.data_dir.join("fake-latest-release"), "v99.8.7").unwrap();
+                rt.updates.fake(FakeReleaseAndHelper { rollback: false });
+            })
+            .await;
+            let profile = crate::store::directory()
+                .unwrap()
+                .join("updates-orphaned-client");
+            let link = fixture.link(&profile).await;
+            let status = crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(status["state"], "failed");
+            assert_eq!(status["lastOutcome"]["updateId"], "orphaned-update");
+            assert_eq!(status["lastOutcome"]["success"], false);
+            assert!(
+                status["lastOutcome"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("interrupted")
+            );
+            assert!(
+                !directory.join("updates/request.json").exists(),
+                "the abandoned request was retired"
+            );
+            fixture
+                .local_command(
+                    "devices.grant",
+                    json!({"deviceId":link.device_id,"grant":"update"}),
+                )
+                .await;
+            let retry = crate::client::remote_rpc(&link, "server.requestUpdate", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(retry["status"], "accepted");
+            let id = retry["result"]["updateId"].as_str().unwrap().to_owned();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let final_status = loop {
+                let status = crate::client::remote_rpc(&link, "server.updateStatus", json!({}))
+                    .await
+                    .unwrap();
+                if status["lastOutcome"]["updateId"] == id {
+                    break status;
+                }
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert_eq!(final_status["lastOutcome"]["tag"], "v99.8.7");
+            assert_eq!(final_status["lastOutcome"]["success"], true);
         });
     }
     #[test]

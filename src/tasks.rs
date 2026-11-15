@@ -597,6 +597,8 @@ impl State {
                 thread.stop_task()?;
             }
             thread.disconnect();
+            thread.task_result = Some("cancelled");
+            thread.completion_notified = true;
             thread.recovering_task = false;
         }
         let task = &mut self.tasks[index];
@@ -1069,6 +1071,17 @@ impl State {
             if !thread.completion_notified
                 && let Some(result) = thread.task_result
             {
+                // A correction may still be local, queued by the provider, or
+                // running in its next turn. The previous turn cannot finish it.
+                if thread.pi.is_some()
+                    && thread.status != Status::Failed
+                    && (!thread.pending_injections.is_empty()
+                        || !matches!(result, "cancelled" | "failed")
+                            && (thread.status.busy() || !thread.native.follow_ups.is_empty()))
+                {
+                    thread.arm_task();
+                    continue;
+                }
                 thread.completion_notified = true;
                 let reply = thread
                     .messages
@@ -1143,6 +1156,11 @@ impl State {
                 .threads
                 .iter()
                 .position(|t| Some(&t.id) == routes.get(&task.parent_thread_id) && !t.archived())
+                .or_else(|| {
+                    self.threads
+                        .iter()
+                        .position(|t| t.id == task.parent_thread_id && !t.archived())
+                })
             else {
                 continue;
             };
@@ -1679,5 +1697,141 @@ mod tests {
         assert_eq!(state.tasks[0].state, TaskState::Interrupted);
         assert!(state.threads[1].pending_injections.is_empty());
         assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_queued_follow_up_is_not_finished_by_the_previous_turn() {
+        let mut state = state_with_task();
+        state.demo = true;
+        let (commands, _events) = fake_pi(&mut state.threads[0]);
+        let (_child_commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].status = Status::Running;
+        // The accepted brief and its first reply are part of the transcript.
+        for (role, text) in [
+            ("Shina", state.tasks[0].attempt_message.clone()),
+            ("Pi", "First reply".into()),
+        ] {
+            state.threads[1].messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role,
+                text,
+                images: Vec::new(),
+                context: None,
+            });
+        }
+        // A correction on an occupied child queues instead of restarting it.
+        state
+            .prepare_task_control(1, 1, "task_send", &json!({"message":"Extend it"}))
+            .unwrap();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        // Another injection's prompt acknowledgement is still in flight, so the
+        // correction cannot be sent when the current turn settles.
+        state.threads[1].injection_id = Some("2-41".into());
+        state.threads[1].apply(json!({"type":"agent_settled","aborted":false}));
+        state.poll_tasks(Instant::now());
+        assert_eq!(
+            state.tasks[0].state,
+            TaskState::Running,
+            "an unsent follow-up keeps the task open"
+        );
+        assert!(commands.try_recv().is_err());
+        // The correction is delivered and its own turn completes the task.
+        let sent = state.threads[1].pending_injections.pop_front().unwrap();
+        state.threads[1].injection_id = None;
+        for (role, text) in [("Shina", sent.text), ("Pi", "Extended reply".into())] {
+            state.threads[1].messages.push(Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role,
+                text,
+                images: Vec::new(),
+                context: None,
+            });
+        }
+        state.threads[1].arm_task();
+        state.threads[1].apply(json!({"type":"agent_settled","aborted":false}));
+        state.poll_tasks(Instant::now());
+        assert_eq!(state.tasks[0].state, TaskState::Completed);
+        assert_eq!(state.tasks[0].result_excerpt, "Extended reply");
+        let prompt = commands.try_recv().unwrap();
+        assert!(
+            prompt["message"]
+                .as_str()
+                .unwrap()
+                .contains("Extended reply")
+        );
+        assert!(
+            commands
+                .try_iter()
+                .all(|command| command["type"] != "prompt"),
+            "the result is delivered exactly once"
+        );
+    }
+
+    #[test]
+    fn a_stale_cancelled_turn_does_not_cancel_a_pending_correction() {
+        let mut state = state_with_task();
+        state.demo = true;
+        let (_commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].status = Status::Running;
+        state
+            .prepare_task_control(1, 1, "task_send", &json!({"message":"Correction"}))
+            .unwrap();
+        state.threads[1].injection_id = Some("earlier-prompt".into());
+        state.threads[1].apply(json!({"type":"agent_settled","aborted":true}));
+        state.poll_tasks(Instant::now());
+        assert_eq!(state.tasks[0].state, TaskState::Running);
+        assert!(state.threads[1].task_result.is_none());
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert!(state.threads[0].pending_injections.is_empty());
+    }
+
+    #[test]
+    fn a_dismissed_task_keeps_its_reason_when_the_settle_arrives_later() {
+        let mut state = state_with_task();
+        state.demo = true;
+        let id = state.tasks[0].id.clone();
+        state.dismiss_task(&id).unwrap();
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+        assert_eq!(
+            state.tasks[0].error_excerpt,
+            "The user dismissed this task."
+        );
+        // A stale completion from the stopped run must not overwrite the dismissal.
+        state.poll_tasks(Instant::now());
+        assert_eq!(
+            state.tasks[0].error_excerpt,
+            "The user dismissed this task."
+        );
+        assert!(state.tasks[0].result_excerpt.is_empty());
+    }
+
+    #[test]
+    fn an_archived_effective_home_routes_results_back_to_the_delegating_thread() {
+        let mut state = state_with_task();
+        state.demo = true;
+        state.captains = Captain::presets();
+        // The delegating thread is the captain's retired home; the current home
+        // is archived but still wins the activity ordering.
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        let mut home = Thread::new(state.next_id);
+        state.next_id += 1;
+        home.captain = Some(0);
+        home.captain_home = true;
+        home.updated = state.threads[0].updated.saturating_add(1);
+        home.life.archived_at = Some(1);
+        let home_id = home.id;
+        state.threads.push(home);
+        assert_eq!(state.effective_home(1), home_id);
+        state.tasks[0].finish(TaskState::Completed, "Orphaned result", "");
+        state.poll_tasks(Instant::now());
+        assert!(
+            state.threads[0]
+                .pending_injections
+                .iter()
+                .any(|i| i.text.contains("Orphaned result")),
+            "the result falls back to the delegating thread when its home is archived"
+        );
+        assert!(!state.tasks[0].delivered);
     }
 }

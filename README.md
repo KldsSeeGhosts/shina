@@ -178,6 +178,20 @@ cargo build --release
 .\target\release\shina.exe
 ```
 
+## Phone pairing
+
+On a host already running `serve --tailnet`, create a phone link with:
+
+```text
+shina pair --mobile <this-hosts-tailnet-name>
+```
+
+Settings > Machines has the same flow under "Pair a phone". Enter this computer's MagicDNS name or tailnet IP, then choose "Create phone link". Scan the QR in Shina's mobile client or copy the link. This prepares onboarding for the mobile client; it does not install a mobile app.
+
+The link expires after five minutes and works once. It carries the server UUID, the actual tailnet listener port and a one-time code in its fragment. Shina verifies that the host resolves to a tailnet address and answers as the local server before minting the code. A phone must check that identity before redeeming it. Public, LAN and loopback destinations are refused. Neither flow changes Tailscale, starts a service or copies provider credentials.
+
+The desktop keeps the QR in memory only and clears it on expiry or when hidden. Hiding a copied link does not revoke it; the server still enforces its single use and expiry. Treat the link as a temporary credential and do not paste it into logs or issue reports.
+
 ## Settings
 
 The sidebar gear opens a searchable, keyboard-accessible dialog with General, Threads, Harnesses, Machines, Memory, Updates and About sections. Theme stays in General. Machines contains linking, host codes, authorized devices and the update review. At 620 px the dialog fills the window and its Back control closes it.
@@ -367,7 +381,13 @@ The loopback MCP transport accepts fixed-length and chunked POST bodies and `Exp
 
 ## Validation
 
+Node.js 24 or newer is required for the portable mobile client and its live-server
+contract test. Install its locked development dependencies before the Rust suite:
+
 ```powershell
+npm ci --prefix packages/mobile-client --include=dev --ignore-scripts
+npm --prefix packages/mobile-client run typecheck
+npm --prefix packages/mobile-client test
 cargo fmt --check
 cargo build
 cargo test

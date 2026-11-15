@@ -3313,6 +3313,37 @@ fn scheduled_service_coordinated_update_waits_for_task_action_and_confirms_new_l
     let initial = profile.discovery();
     assert!(installed_cli(&["service", "stop"]).status.success());
 
+    // Existing installations still have the tree-wide wait in Task Scheduler.
+    // A normal start must upgrade that exact action without reinstalling the service.
+    let legacy = format!(
+        "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $f=$s.GetFolder('\\'); $d=$f.GetTask('{name}').Definition; $d.Actions.Item(1).Arguments=$d.Actions.Item(1).Arguments.Replace('-PassThru; $p.WaitForExit();','-PassThru -Wait;'); $null=$f.RegisterTaskDefinition('{name}',$d,4,$null,$null,3,$null)"
+    );
+    let registered = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &legacy])
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    assert!(installed_cli(&["service", "start"]).status.success());
+    let upgraded = format!(
+        "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $a=$s.GetFolder('\\').GetTask('{name}').Definition.Actions.Item(1).Arguments; if (-not $a.Contains('$p.WaitForExit();') -or $a.Contains('-PassThru -Wait;')) {{ throw 'Legacy task action was not upgraded' }}"
+    );
+    let upgraded = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &upgraded])
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(
+        upgraded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgraded.stderr)
+    );
+    assert!(installed_cli(&["service", "stop"]).status.success());
+
     // Keep the actual task action alive after the launcher exits. This makes the
     // release-binary race deterministic without touching any system setting.
     let unit = directory.join("service-task.xml");
@@ -5089,3 +5120,9 @@ fn sidebar_search_queries_full_transcripts_across_local_and_linked_servers_and_n
     host_a.stop();
     host_b.stop();
 }
+
+#[path = "support/mobile_contract.rs"]
+mod mobile_contract;
+
+#[path = "support/mobile_sdk_runtime.rs"]
+mod mobile_sdk_runtime;

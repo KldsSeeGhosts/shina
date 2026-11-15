@@ -57,6 +57,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libudev-dev libfontconfig1-dev libvulkan-dev
       - name: Check formatting
         run: cargo fmt --check
+      - name: Check the mobile client
+        run: |
+          npm ci --prefix packages/mobile-client --include=dev --ignore-scripts
+          npm --prefix packages/mobile-client run typecheck
+          npm --prefix packages/mobile-client test
+          npm --prefix packages/mobile-client run build
       - name: Run JS tests
         run: node --test tools/*.test.mjs
       - name: Run Rust tests

@@ -382,6 +382,9 @@ pub struct InstallLock(#[allow(dead_code)] fs::File);
 
 impl InstallLock {
     pub fn acquire(dir: &Path) -> Result<Self, String> {
+        Self::try_acquire(dir)?.ok_or_else(|| "Another Shina install is already running.".into())
+    }
+    pub fn try_acquire(dir: &Path) -> Result<Option<Self>, String> {
         fs::create_dir_all(dir).map_err(|e| format!("Could not create {}: {e}", dir.display()))?;
         let lock = dir.join("install.lock");
         let file = fs::OpenOptions::new()
@@ -391,8 +394,11 @@ impl InstallLock {
             .open(&lock)
             .map_err(|e| format!("Could not open {}: {e}", lock.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self(file)),
-            Err(_) => Err("Another Shina install is already running.".into()),
+            Ok(()) => Ok(Some(Self(file))),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(format!("Could not inspect {}: {error}", lock.display()))
+            }
         }
     }
 }
@@ -416,24 +422,35 @@ pub fn launch_child(exe: &Path, args: &[&str]) -> Result<std::process::Child, St
         .map_err(|e| format!("Could not start {}: {e}", exe.display()))
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn service_managed() -> bool {
+    cfg!(target_os = "linux")
+        && (env::var_os("INVOCATION_ID").is_some() || env::var_os("SHINA_BOOT_SERVICE").is_some())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn service_scope_command(exe: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--collect", "--quiet", "--"])
+        .arg(exe)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
 /// Start the update helper so that it outlives the server that started it. A service
 /// manager ends everything it started with the server: systemd kills the unit's control
 /// group, launchd kills the job's process group, and the Windows task action waits for
 /// every descendant. The helper therefore starts in its own scope, session or process tree.
 pub fn launch_detached(exe: &Path, args: &[&str]) -> Result<std::process::Child, String> {
     #[cfg(target_os = "linux")]
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        let mut command = Command::new("systemd-run");
-        command
-            .args(["--user", "--scope", "--collect", "--quiet", "--"])
-            .arg(exe)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if let Ok(child) = command.spawn() {
-            return Ok(child);
-        }
+    if service_managed() {
+        return service_scope_command(exe, args)
+            .spawn()
+            .map_err(|e| format!("Could not start {} outside the service: {e}", exe.display()));
     }
     #[cfg(windows)]
     if std::env::var_os("SHINA_BOOT_SERVICE").is_some() {
@@ -465,8 +482,11 @@ pub fn launch_detached(exe: &Path, args: &[&str]) -> Result<std::process::Child,
         // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
         unsafe {
             command.pre_exec(|| {
-                libc::setsid();
-                Ok(())
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
             });
         }
     }
@@ -1326,5 +1346,154 @@ mod tests {
             "the broken build becomes the recovery copy"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_service_helper_always_runs_in_its_own_scope() {
+        let command = service_scope_command(
+            Path::new(if cfg!(windows) {
+                "C:/shina.exe"
+            } else {
+                "/opt/shina"
+            }),
+            &["--coordinated-update"],
+        );
+        assert_eq!(command.get_program(), "systemd-run");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            &args[..5],
+            ["--user", "--scope", "--collect", "--quiet", "--"]
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--coordinated-update")
+        );
+        if !cfg!(target_os = "linux") {
+            assert!(!service_managed());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_service_launch_never_falls_back_to_an_ordinary_child() {
+        if env::var_os("SHINA_DETACH_FIXTURE").is_some() {
+            let dir = PathBuf::from(env::var_os("SHINA_DETACH_DIR").unwrap());
+            let script = dir.join("target.sh");
+            let result = launch_detached(&script, &[dir.to_str().unwrap()]);
+            fs::write(dir.join("result"), format!("{}", result.is_err())).unwrap();
+            if let Err(error) = &result {
+                fs::write(dir.join("error"), error).unwrap();
+            }
+            if let Ok(mut child) = result {
+                let _ = child.kill();
+            }
+            return;
+        }
+        let dir = temporary("service-detach");
+        let script = dir.join("target.sh");
+        write(&script, b"#!/bin/sh\necho ran > \"$1/ran\"\n");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let status = Command::new(env::current_exe().unwrap())
+            .args([
+                "install::tests::a_service_launch_never_falls_back_to_an_ordinary_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("SHINA_DETACH_FIXTURE", "1")
+            .env("SHINA_DETACH_DIR", &dir)
+            .env("SHINA_BOOT_SERVICE", "1")
+            .env("PATH", dir.join("no-such-path"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(dir.join("result")).unwrap(), "true");
+        let error = fs::read_to_string(dir.join("error")).unwrap();
+        assert!(error.contains("outside the service"), "{error}");
+        assert!(
+            !dir.join("ran").exists(),
+            "the ordinary-child fallback executed the target"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_helper_survives_its_parent_exiting() {
+        if env::var_os("SHINA_DETACH_FIXTURE").is_some() {
+            let dir = PathBuf::from(env::var_os("SHINA_DETACH_DIR").unwrap());
+            let script = dir.join("helper.sh");
+            let _child = launch_detached(&script, &[dir.to_str().unwrap()]).unwrap();
+            return;
+        }
+        let dir = temporary("detach-parent");
+        let script = dir.join("helper.sh");
+        write(&script, b"#!/bin/sh\necho $$ > \"$1/pid\"\nexec sleep 30\n");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut parent = Command::new(env::current_exe().unwrap())
+            .args([
+                "install::tests::a_detached_helper_survives_its_parent_exiting",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("SHINA_DETACH_FIXTURE", "1")
+            .env("SHINA_DETACH_DIR", &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let pid: i32 = loop {
+            if let Ok(text) = fs::read_to_string(dir.join("pid"))
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never wrote its pid"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        while parent.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture parent never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let group_of = |pid: i32| {
+            let output = Command::new("ps")
+                .args(["-o", "pgid=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            if output.status.success() {
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            } else {
+                None
+            }
+        };
+        let helper_group = group_of(pid);
+        let our_group = group_of(std::process::id() as i32);
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            helper_group,
+            Some(pid),
+            "the helper must be a live group leader after its parent exited"
+        );
+        assert_ne!(
+            helper_group, our_group,
+            "the helper no longer shares the parent process group"
+        );
     }
 }

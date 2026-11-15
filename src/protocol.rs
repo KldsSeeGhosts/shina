@@ -3,7 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 26;
+pub const MINOR: u32 = 28;
+pub const MOBILE_PUSH_MINOR: u32 = 28;
+pub const MOBILE_PUSH: &str = "mobile-push-v1";
+pub const MOBILE_PUSH_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to use mobile push notifications.";
+pub const NOTIFICATIONS_MINOR: u32 = 27;
+pub const NOTIFICATIONS: &str = "notification-feed-v1";
+pub const NOTIFICATIONS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to read mobile notifications.";
 pub const STAGED_ATTACHMENTS_MINOR: u32 = 21;
 pub const VCS_WORKTREES_MINOR: u32 = 20;
 pub const DRAFT_ROUTING_MINOR: u32 = 22;
@@ -199,6 +207,9 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "thread.find"
         | "threads.search"
         | "command.get"
+        | "notifications.list"
+        | "notifications.get"
+        | "notifications.push.status"
         | "server.status"
         | "blobs.read"
         | "filesystem.browse"
@@ -232,6 +243,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
             "peer-delegate"
         }
         "thread.send"
+        | "notifications.push.register"
+        | "notifications.push.unregister"
         | "thread.stop"
         | "thread.resume"
         | "thread.configure"
@@ -666,6 +679,9 @@ mod tests {
                 | "thread.find"
                 | "threads.search"
                 | "command.get"
+                | "notifications.list"
+                | "notifications.get"
+                | "notifications.push.status"
                 | "server.status"
                 | "blobs.read"
                 | "filesystem.browse"

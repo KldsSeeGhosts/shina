@@ -258,6 +258,8 @@ pub struct Machines {
     pub code: rune::TextEdit,
     pub peer_host: rune::TextEdit,
     pub peer_code: rune::TextEdit,
+    pub mobile_host: rune::TextEdit,
+    pub mobile_share: Option<crate::mobile_share::Share>,
     pub notice: Option<String>,
     /// The text of `notice` while it is the unreachable-machines notice, so it clears itself
     /// when the connections are ready again and never clears another message.
@@ -284,6 +286,7 @@ pub struct DraftRetarget {
 pub enum MachineResult {
     Linked(Link),
     Paired(Value),
+    MobilePaired(crate::mobile_pairing::PairLink),
     Unlinked(String),
     Devices(Value),
     Peers,
@@ -308,6 +311,8 @@ impl Default for Machines {
             code: Default::default(),
             peer_host: Default::default(),
             peer_code: Default::default(),
+            mobile_host: Default::default(),
+            mobile_share: None,
             notice: None,
             auto_notice: None,
             devices: Value::Null,
@@ -588,6 +593,10 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     let profile = crate::store::directory().ok_or("No Shina profile.")?;
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     match args.first().map(String::as_str) {
+        Some("pair") if args.len() == 3 && args[1] == "--mobile" => {
+            let link = runtime.block_on(crate::mobile_pairing::issue(&profile, &args[2]))?;
+            link.print()?;
+        }
         Some("pair") if args.len() == 1 || args.len() == 2 && args[1] == "--peer" => {
             let value = runtime.block_on(crate::client::local_rpc(&profile, "devices.pair", json!({"peer":args.len()==2})))?;
             println!("Pairing code: {}\nExpires in 5 minutes. Use once with shina {}link <host> <code>.", value["code"].as_str().ok_or("Missing pairing code.")?,if args.len()==2 {"peer "}else{""});
@@ -628,7 +637,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             }
             println!("Update grant changed.");
         }
-        _ => return Err("Usage: shina pair [--peer] | link <host[:port]> <code> | links | unlink <server-id-or-host> | devices [revoke <device-id> | grant <device-id> update | revoke-grant <device-id> update] | peer link <host> <code> | peer list | peer unlink <server-id-or-host>".into()),
+        _ => return Err("Usage: shina pair [--peer | --mobile <tailnet-host>] | link <host[:port]> <code> | links | unlink <server-id-or-host> | devices [revoke <device-id> | grant <device-id> update | revoke-grant <device-id> update] | peer link <host> <code> | peer list | peer unlink <server-id-or-host>".into()),
     }
     Ok(())
 }
@@ -659,5 +668,22 @@ mod tests {
             .len(),
             2
         );
+    }
+
+    #[test]
+    fn mobile_pairing_needs_exactly_one_host() {
+        for args in [
+            vec!["pair".into(), "--mobile".into()],
+            vec![
+                "pair".into(),
+                "--mobile".into(),
+                "host".into(),
+                "extra".into(),
+            ],
+            vec!["pair".into(), "--peer".into(), "extra".into()],
+        ] {
+            let error = cli(&args).unwrap_err();
+            assert!(error.contains("--mobile"), "{error}");
+        }
     }
 }

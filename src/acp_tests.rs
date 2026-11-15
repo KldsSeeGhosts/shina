@@ -238,6 +238,62 @@ fn standard_acp_steering_restarts_after_cancellation_but_stop_wins_the_race() {
 }
 
 #[test]
+fn an_aborted_settle_keeps_queued_followups_for_the_next_settled_turn() {
+    let mut client = Client::new(spec(SessionSource::New));
+    ready(&mut client);
+    client
+        .command(json!({"type":"prompt","id":"run","message":"work"}))
+        .unwrap();
+    client
+        .command(json!({"type":"prompt","id":"follow","message":"next"}))
+        .unwrap();
+    assert_eq!(client.queued.len(), 1);
+    client.command(json!({"type":"abort","id":"stop"})).unwrap();
+    let prompt = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "session/prompt")
+        .unwrap()
+        .clone();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":prompt["id"],"result":{"stopReason":"cancelled"}}))
+        .unwrap();
+    assert_eq!(client.queued.len(), 1);
+    assert_eq!(
+        client
+            .events
+            .iter()
+            .filter(|e| e["type"] == "agent_settled")
+            .count(),
+        1
+    );
+    let prompts = |client: &Client| {
+        client
+            .wire
+            .iter()
+            .filter(|r| r["method"] == "session/prompt")
+            .count()
+    };
+    assert_eq!(prompts(&client), 1);
+
+    // Stop followed by new work: the next settled turn drains the retained queue.
+    client
+        .command(json!({"type":"prompt","id":"new","message":"fresh"}))
+        .unwrap();
+    assert_eq!(prompts(&client), 2);
+    let new = client.wire.last().unwrap().clone();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":new["id"],"result":{"stopReason":"end_turn"}}))
+        .unwrap();
+    assert_eq!(prompts(&client), 3);
+    assert!(client.queued.is_empty());
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["prompt"][0]["text"],
+        "next"
+    );
+}
+
+#[test]
 fn typed_calls_preserve_acp_kind_and_diff_before_flattening() {
     use crate::work::ToolKind::*;
     for (native, expected) in [

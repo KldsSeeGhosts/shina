@@ -373,6 +373,10 @@ impl Artwork {
         (points * scale).round().max(1.0) as u32
     }
 
+    pub fn device_scale(&self) -> f32 {
+        f32::from_bits(self.scale.load(Ordering::Relaxed))
+    }
+
     /// The size in points closest to `points` that is a whole number of device pixels at this
     /// scale and zoom, which is the size of the buffer `device_size` asks for. Rune snaps each
     /// edge of a box to the device grid, so a slot this size keeps exactly that many pixels

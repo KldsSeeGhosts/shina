@@ -4,7 +4,12 @@ use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     sync::mpsc,
+    time::{Duration, Instant},
 };
+
+const HANDOFF_GRACE: Duration = Duration::from_secs(30);
+const HANDOFF_GRACE_MS: i64 = 30_000;
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,19 +75,40 @@ pub struct ServerUpdates {
     events: Option<mpsc::Receiver<(String, String)>>,
     host: Option<Box<dyn Host>>,
     pub capable: bool,
+    unheld_since: Option<Instant>,
+    last_probe: Option<Instant>,
+    diagnostic: Option<String>,
+    pending_failure: Option<Outcome>,
+}
+fn request_file(path: &Path) -> Result<Option<Value>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| "The pending update request is malformed.".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(crate::update::redact(&error.to_string())),
+    }
 }
 impl ServerUpdates {
     pub fn new(directory: &Path) -> Self {
         let outcome = read_outcome(directory);
-        let request: Value = std::fs::read(directory.join("updates/request.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or(Value::Null);
+        let path = directory.join("updates/request.json");
+        let (request, diagnostic) = match request_file(&path) {
+            Ok(request) => (request.unwrap_or(Value::Null), None),
+            Err(error) => (
+                Value::Null,
+                Some(format!(
+                    "{error} The update stays active; repair the request."
+                )),
+            ),
+        };
         let pending = request["updateId"]
             .as_str()
             .filter(|id| outcome.as_ref().is_none_or(|o| o.update_id != *id));
-        Self {
-            phase: if pending.is_some() {
+        let mut updates = Self {
+            phase: if diagnostic.is_some() {
+                "checking"
+            } else if pending.is_some() {
                 "restarting"
             } else if outcome.as_ref().is_some_and(|o| !o.success) {
                 "failed"
@@ -96,7 +122,125 @@ impl ServerUpdates {
             events: None,
             host: Some(Box::new(InstalledHost)),
             capable: self_update_target(directory).is_some(),
+            unheld_since: None,
+            last_probe: None,
+            diagnostic,
+            pending_failure: None,
+        };
+        updates.reconcile(directory, Instant::now());
+        updates
+    }
+    fn grace_expired(&mut self, request: &Value, path: &Path, now: Instant) -> bool {
+        let now_ms = crate::lifecycle::now() as i64;
+        let started_ms = request["startedAt"].as_i64().or_else(|| {
+            std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+        });
+        if let Some(started) = started_ms.filter(|s| *s <= now_ms)
+            && now_ms.saturating_sub(started) >= HANDOFF_GRACE_MS
+        {
+            return true;
         }
+        now.duration_since(*self.unheld_since.get_or_insert(now)) >= HANDOFF_GRACE
+    }
+    fn interrupted_reason(directory: &Path) -> &'static str {
+        if directory.join("update-validation").exists() {
+            "The updater was interrupted while restart validation was still pending. The \
+             validation hold is untouched. Retry the update explicitly."
+        } else {
+            "The updater was interrupted before the helper finished. Retry the update \
+             explicitly."
+        }
+    }
+    fn persist(&mut self, directory: &Path, outcome: Outcome) {
+        match save_outcome(directory, &outcome) {
+            Ok(()) => {
+                self.phase = if outcome.success { "idle" } else { "failed" }.into();
+                self.outcome = Some(outcome);
+                self.diagnostic = None;
+            }
+            Err(error) => {
+                self.diagnostic = Some(crate::update::redact(&error));
+                self.pending_failure = Some(outcome);
+            }
+        }
+    }
+    fn reconcile(&mut self, directory: &Path, now: Instant) {
+        if self.phase != "restarting" || self.id.is_none() {
+            return;
+        }
+        self.last_probe = Some(now);
+        let updates = directory.join("updates");
+        let _guard = match crate::install::InstallLock::try_acquire(&updates) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return,
+            Err(error) => {
+                self.diagnostic = Some(crate::update::redact(&error));
+                return;
+            }
+        };
+        if let Some(outcome) = read_outcome(directory)
+            && outcome.update_id.as_str() == self.id.as_deref().unwrap_or_default()
+        {
+            self.phase = if outcome.success { "idle" } else { "failed" }.into();
+            self.outcome = Some(outcome);
+            self.diagnostic = None;
+            return;
+        }
+        let path = updates.join("request.json");
+        let request = match request_file(&path) {
+            Ok(request) => request.unwrap_or(Value::Null),
+            Err(error) => {
+                self.diagnostic = Some(format!(
+                    "{error} The update stays active; repair the request."
+                ));
+                return;
+            }
+        };
+        if request["updateId"].is_string() && request["updateId"].as_str() != self.id.as_deref() {
+            if let Some(failure) = self.pending_failure.take() {
+                self.persist(directory, failure);
+            }
+            return;
+        }
+        let matching = request["updateId"].is_string();
+        if let Some(failure) = self.pending_failure.take() {
+            if matching && !self.grace_expired(&request, &path, now) {
+                self.pending_failure = Some(failure);
+                return;
+            }
+            self.persist(directory, failure);
+            return;
+        }
+        if !self.grace_expired(&request, &path, now) {
+            return;
+        }
+        let outcome = Outcome {
+            update_id: self.id.clone().unwrap_or_default(),
+            tag: request["tag"]
+                .as_str()
+                .filter(|tag| !tag.is_empty())
+                .unwrap_or(&self.tag)
+                .to_owned(),
+            success: false,
+            reason: Some(Self::interrupted_reason(directory).into()),
+        };
+        if let Err(error) = save_outcome(directory, &outcome) {
+            self.diagnostic = Some(crate::update::redact(&error));
+            return;
+        }
+        if let Ok(Some(current)) = request_file(&path)
+            && current["updateId"].as_str() == Some(outcome.update_id.as_str())
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.diagnostic = Some(crate::update::redact(&error.to_string()));
+        }
+        self.outcome = Some(outcome);
+        self.phase = "failed".into();
     }
     #[cfg(test)]
     pub fn fake(&mut self, host: impl Host + 'static) {
@@ -115,13 +259,18 @@ impl ServerUpdates {
             .filter(|p| matches!(*p, "draining" | "restarting"))
             .unwrap_or(&self.phase);
         json!({"runningVersion":env!("CARGO_PKG_VERSION"),"canSelfUpdate":self.capable,
-            "state":phase,"updateId":self.id,"tag":self.tag,"lastOutcome":self.outcome,"blocker":blocker})
+            "state":phase,"updateId":self.id,"tag":self.tag,"lastOutcome":self.outcome,"blocker":blocker,
+            "diagnostic":self.diagnostic})
     }
     /// Called only after the accepted receipt and audit row commit.
     pub fn start(&mut self, directory: PathBuf, id: String) {
         self.phase = "checking".into();
         self.id = Some(id.clone());
         self.tag.clear();
+        self.unheld_since = None;
+        self.last_probe = None;
+        self.diagnostic = None;
+        self.pending_failure = None;
         let (send, receive) = mpsc::channel();
         self.events = Some(receive);
         let Some(mut host) = self.host.take() else {
@@ -155,30 +304,77 @@ impl ServerUpdates {
     }
     pub fn poll(&mut self, directory: &Path) -> bool {
         let before = self.status(None, &Value::Null);
+        let mut disconnected = false;
         if let Some(events) = &self.events {
-            while let Ok((phase, detail)) = events.try_recv() {
-                if phase == "failed" {
-                    let outcome = Outcome {
-                        update_id: self.id.clone().unwrap_or_default(),
-                        tag: self.tag.clone(),
-                        success: false,
-                        reason: Some(crate::update::redact(&detail)),
-                    };
-                    let _ = save_outcome(directory, &outcome);
-                    self.outcome = Some(outcome);
-                } else if !detail.is_empty() {
-                    self.tag = detail;
+            loop {
+                match events.try_recv() {
+                    Ok((phase, detail)) => {
+                        if phase == "failed" {
+                            self.pending_failure = Some(Outcome {
+                                update_id: self.id.clone().unwrap_or_default(),
+                                tag: self.tag.clone(),
+                                success: false,
+                                reason: Some(crate::update::redact(&detail)),
+                            });
+                            self.phase = "restarting".into();
+                        } else {
+                            if !detail.is_empty() {
+                                self.tag = detail;
+                            }
+                            self.phase = phase;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
-                self.phase = phase;
             }
         }
-        if let Some(outcome) = read_outcome(directory) {
-            if self.id.as_deref().is_none_or(|id| id == outcome.update_id) {
-                if self.active() {
-                    self.phase = if outcome.success { "idle" } else { "failed" }.into();
-                }
-                self.outcome = Some(outcome);
+        if disconnected {
+            self.events = None;
+            if matches!(self.phase.as_str(), "checking" | "downloading" | "ready") {
+                self.phase = "restarting".into();
             }
+        }
+        if let Some(outcome) = read_outcome(directory)
+            && (!self.active() || self.id.is_some())
+            && self.id.as_deref().is_none_or(|id| id == outcome.update_id)
+        {
+            self.phase = if outcome.success { "idle" } else { "failed" }.into();
+            self.outcome = Some(outcome);
+            self.diagnostic = None;
+        }
+        let probe_due = self
+            .last_probe
+            .is_none_or(|probed| probed.elapsed() >= PROBE_INTERVAL);
+        if !probe_due {
+            return before != self.status(None, &Value::Null);
+        }
+        if self.phase == "checking" && self.id.is_none() {
+            self.last_probe = Some(Instant::now());
+            match request_file(&directory.join("updates/request.json")) {
+                Ok(Some(request)) => {
+                    if let Some(id) = request["updateId"].as_str() {
+                        self.id = Some(id.to_owned());
+                        self.tag = request["tag"].as_str().unwrap_or("").into();
+                        self.phase = "restarting".into();
+                        self.diagnostic = None;
+                    } else {
+                        self.diagnostic =
+                            Some("The pending update request is malformed.".to_owned());
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.diagnostic = Some(format!(
+                        "{error} The update stays active; repair the request."
+                    ));
+                }
+            }
+        } else {
+            self.reconcile(directory, Instant::now());
         }
         if !self.active() && self.host.is_none() {
             self.host = Some(Box::new(InstalledHost));
@@ -626,6 +822,606 @@ impl crate::model::State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tempdir(label: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("shina-fleet-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(path.join("updates")).unwrap();
+        path
+    }
+
+    fn write_request(dir: &Path, request: Value) {
+        crate::store::write_atomic(
+            &dir.join("updates/request.json"),
+            request.to_string().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    fn age_request(dir: &Path, seconds: u64) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("updates/request.json"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    fn probe_again(updates: &mut ServerUpdates) {
+        updates.last_probe = None;
+    }
+
+    fn past_grace(updates: &mut ServerUpdates) {
+        updates.unheld_since = Some(Instant::now() - HANDOFF_GRACE - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn an_orphaned_old_request_fails_at_startup_and_stays_terminal() {
+        let dir = tempdir("orphan");
+        write_request(&dir, json!({"updateId":"orphan-1","tag":"v0.19.0"}));
+        age_request(&dir, 120);
+        let mut updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "failed");
+        assert!(!updates.active());
+        let outcome = updates.outcome.clone().unwrap();
+        assert_eq!(outcome.update_id, "orphan-1");
+        assert_eq!(outcome.tag, "v0.19.0");
+        assert!(!outcome.success);
+        assert!(outcome.reason.unwrap().contains("interrupted"));
+        assert!(!dir.join("updates/request.json").exists());
+        let again = ServerUpdates::new(&dir);
+        assert_eq!(again.phase, "failed");
+        probe_again(&mut updates);
+        assert!(
+            !updates.poll(&dir),
+            "a terminal attempt reports no new change"
+        );
+        assert_eq!(updates.phase, "failed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_held_lock_keeps_an_old_request_restarting_until_the_helper_is_gone() {
+        let dir = tempdir("held");
+        write_request(
+            &dir,
+            json!({"updateId":"held-1","tag":"v0.19.0","startedAt":0}),
+        );
+        let guard = crate::install::InstallLock::acquire(&dir.join("updates")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "restarting");
+        assert!(updates.active());
+        assert!(updates.outcome.is_none());
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "restarting");
+        assert!(
+            read_outcome(&dir).is_none(),
+            "a live helper is never failed"
+        );
+        drop(guard);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "failed");
+        assert_eq!(
+            read_outcome(&dir).unwrap().update_id,
+            "held-1",
+            "the released abandoned request reconciles to a durable failure"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_request_survives_the_handoff_grace_then_fails() {
+        let dir = tempdir("fresh");
+        write_request(
+            &dir,
+            json!({"updateId":"fresh-1","tag":"v0.19.0","startedAt":crate::lifecycle::now()}),
+        );
+        let mut updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "restarting");
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(
+            updates.phase, "restarting",
+            "the helper may still be starting"
+        );
+        past_grace(&mut updates);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "failed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_future_or_invalid_start_time_cannot_hold_an_attempt_active_forever() {
+        for started_at in [
+            json!(crate::lifecycle::now() + 3_600_000),
+            json!("tomorrow"),
+        ] {
+            let dir = tempdir("future");
+            write_request(
+                &dir,
+                json!({"updateId":"future-1","tag":"v0.19.0","startedAt":started_at}),
+            );
+            let mut updates = ServerUpdates::new(&dir);
+            assert_eq!(updates.phase, "restarting");
+            past_grace(&mut updates);
+            probe_again(&mut updates);
+            updates.poll(&dir);
+            assert_eq!(updates.phase, "failed");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_pending_validation_hold_is_reported_and_left_untouched() {
+        let dir = tempdir("validation");
+        std::fs::write(dir.join("update-validation"), b"hold").unwrap();
+        write_request(
+            &dir,
+            json!({"updateId":"held-2","tag":"v0.19.0","startedAt":0}),
+        );
+        let updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "failed");
+        let reason = updates.outcome.unwrap().reason.unwrap();
+        assert!(reason.contains("validation"), "{reason}");
+        assert!(reason.contains("Retry"));
+        assert!(dir.join("update-validation").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_outcome_that_cannot_be_persisted_keeps_the_pending_request() {
+        let dir = tempdir("unsaved");
+        write_request(
+            &dir,
+            json!({"updateId":"unsaved-1","tag":"v0.19.0","startedAt":0}),
+        );
+        std::fs::create_dir(dir.join("updates/outcome.json")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "restarting");
+        assert!(updates.diagnostic.is_some());
+        assert!(dir.join("updates/request.json").exists());
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "restarting");
+        assert!(updates.outcome.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_outcome_for_another_attempt_never_completes_the_current_one() {
+        let dir = tempdir("stale");
+        save_outcome(
+            &dir,
+            &Outcome {
+                update_id: "older-attempt".into(),
+                tag: "v0.18.0".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
+        write_request(
+            &dir,
+            json!({"updateId":"current-1","tag":"v0.19.0","startedAt":crate::lifecycle::now()}),
+        );
+        let guard = crate::install::InstallLock::acquire(&dir.join("updates")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "restarting");
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "restarting");
+        save_outcome(
+            &dir,
+            &Outcome {
+                update_id: "current-1".into(),
+                tag: "v0.19.0".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "idle");
+        assert_eq!(updates.outcome.unwrap().update_id, "current-1");
+        drop(guard);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_success_written_inside_the_probe_window_is_never_overwritten() {
+        for remove_request in [false, true] {
+            let dir = tempdir("race");
+            write_request(
+                &dir,
+                json!({"updateId":"race-1","tag":"v0.19.0","startedAt":0}),
+            );
+            let guard = crate::install::InstallLock::acquire(&dir.join("updates")).unwrap();
+            let mut updates = ServerUpdates::new(&dir);
+            assert_eq!(updates.phase, "restarting");
+            save_outcome(
+                &dir,
+                &Outcome {
+                    update_id: "race-1".into(),
+                    tag: "v0.19.0".into(),
+                    success: true,
+                    reason: None,
+                },
+            )
+            .unwrap();
+            if remove_request {
+                std::fs::remove_file(dir.join("updates/request.json")).unwrap();
+            }
+            drop(guard);
+            updates.reconcile(&dir, Instant::now());
+            assert_eq!(updates.phase, "idle", "remove_request={remove_request}");
+            assert!(updates.outcome.unwrap().success);
+            assert!(read_outcome(&dir).unwrap().success);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_extreme_start_time_fails_immediately_instead_of_overflowing() {
+        let dir = tempdir("extreme");
+        write_request(
+            &dir,
+            json!({"updateId":"extreme-1","tag":"v0.19.0","startedAt":i64::MIN}),
+        );
+        let updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "failed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_request_preserves_the_active_state() {
+        let dir = tempdir("unreadable");
+        write_request(
+            &dir,
+            json!({"updateId":"unreadable-1","tag":"v0.19.0","startedAt":crate::lifecycle::now()}),
+        );
+        let mut updates = ServerUpdates::new(&dir);
+        assert_eq!(updates.phase, "restarting");
+        std::fs::remove_file(dir.join("updates/request.json")).unwrap();
+        std::fs::create_dir(dir.join("updates/request.json")).unwrap();
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "restarting");
+        assert!(updates.diagnostic.is_some());
+        assert!(read_outcome(&dir).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct PanicHost;
+    impl Host for PanicHost {
+        fn run(
+            &mut self,
+            _directory: &Path,
+            _id: &str,
+            _progress: &dyn Fn(&str, &str),
+        ) -> Result<Option<String>, String> {
+            panic!("worker gone");
+        }
+    }
+
+    struct HandoffThenPanic;
+    impl Host for HandoffThenPanic {
+        fn run(
+            &mut self,
+            directory: &Path,
+            id: &str,
+            progress: &dyn Fn(&str, &str),
+        ) -> Result<Option<String>, String> {
+            progress("downloading", "v0.19.0");
+            crate::store::write_atomic(
+                &directory.join("updates/request.json"),
+                json!({"updateId":id,"tag":"v0.19.0","startedAt":crate::lifecycle::now()})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            panic!("worker gone after handoff");
+        }
+    }
+
+    #[test]
+    fn a_worker_that_vanishes_mid_attempt_fails_and_can_be_retried() {
+        let dir = tempdir("panic");
+        let mut updates = ServerUpdates::new(&dir);
+        updates.fake(PanicHost);
+        updates.start(dir.clone(), "panic-1".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updates.events.is_some() {
+            updates.poll(&dir);
+            assert!(
+                Instant::now() < deadline,
+                "worker disconnect was not detected"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(updates.phase, "restarting");
+        past_grace(&mut updates);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "failed");
+        assert!(!updates.active());
+        let outcome = read_outcome(&dir).unwrap();
+        assert_eq!(outcome.update_id, "panic-1");
+        assert!(!outcome.success);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_worker_lost_after_helper_handoff_is_not_failed_while_the_helper_lives() {
+        let dir = tempdir("panic-handoff");
+        let guard = crate::install::InstallLock::acquire(&dir.join("updates")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        updates.fake(HandoffThenPanic);
+        updates.start(dir.clone(), "lost-worker".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updates.events.is_some() {
+            updates.poll(&dir);
+            assert!(
+                Instant::now() < deadline,
+                "worker disconnect was not detected"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(updates.phase, "restarting");
+        assert!(updates.outcome.is_none());
+        assert!(
+            read_outcome(&dir).is_none(),
+            "a live helper is never failed"
+        );
+        drop(guard);
+        past_grace(&mut updates);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "failed");
+        assert_eq!(read_outcome(&dir).unwrap().update_id, "lost-worker");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct ErrHost;
+    impl Host for ErrHost {
+        fn run(
+            &mut self,
+            _directory: &Path,
+            _id: &str,
+            _progress: &dyn Fn(&str, &str),
+        ) -> Result<Option<String>, String> {
+            Err("download exploded".into())
+        }
+    }
+
+    #[test]
+    fn a_worker_loss_stays_active_until_the_failure_is_durable() {
+        let dir = tempdir("unpersisted");
+        std::fs::create_dir(dir.join("updates/outcome.json")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        updates.fake(ErrHost);
+        updates.start(dir.clone(), "unpersisted-1".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updates.pending_failure.is_none() {
+            probe_again(&mut updates);
+            updates.poll(&dir);
+            assert!(Instant::now() < deadline, "worker failure was not received");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(updates.phase, "restarting");
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(
+            updates.phase, "restarting",
+            "no durable failure, still active"
+        );
+        assert!(updates.diagnostic.is_some());
+        std::fs::remove_dir(dir.join("updates/outcome.json")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updates.phase != "failed" {
+            probe_again(&mut updates);
+            updates.poll(&dir);
+            assert!(Instant::now() < deadline, "failure was never persisted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let outcome = read_outcome(&dir).unwrap();
+        assert_eq!(outcome.update_id, "unpersisted-1");
+        assert!(!outcome.success);
+        assert!(outcome.reason.unwrap().contains("download exploded"));
+        assert!(updates.diagnostic.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_known_failure_yields_to_a_live_helper_before_finalizing() {
+        let dir = tempdir("known-failure");
+        let guard = crate::install::InstallLock::acquire(&dir.join("updates")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        struct FailAfterRequest;
+        impl Host for FailAfterRequest {
+            fn run(
+                &mut self,
+                directory: &Path,
+                id: &str,
+                progress: &dyn Fn(&str, &str),
+            ) -> Result<Option<String>, String> {
+                progress("downloading", "v0.19.0");
+                crate::store::write_atomic(
+                    &directory.join("updates/request.json"),
+                    json!({"updateId":id,"tag":"v0.19.0","startedAt":crate::lifecycle::now()})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+                Err("validation exploded".into())
+            }
+        }
+        updates.fake(FailAfterRequest);
+        updates.start(dir.clone(), "known-1".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updates.events.is_some() {
+            probe_again(&mut updates);
+            updates.poll(&dir);
+            assert!(Instant::now() < deadline, "worker failure was not received");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(updates.phase, "restarting");
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "restarting");
+        assert!(
+            read_outcome(&dir).is_none(),
+            "a live helper is never overridden"
+        );
+        drop(guard);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(
+            updates.phase, "restarting",
+            "a matching request gets the helper grace"
+        );
+        assert!(read_outcome(&dir).is_none());
+        past_grace(&mut updates);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "failed");
+        let outcome = read_outcome(&dir).unwrap();
+        assert_eq!(outcome.update_id, "known-1");
+        assert!(outcome.reason.unwrap().contains("validation exploded"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_attempt_becomes_idle_when_its_outcome_succeeds() {
+        let dir = tempdir("late-success");
+        let mut updates = ServerUpdates::new(&dir);
+        updates.phase = "failed".into();
+        updates.id = Some("late-1".into());
+        updates.tag = "v0.19.0".into();
+        save_outcome(
+            &dir,
+            &Outcome {
+                update_id: "late-1".into(),
+                tag: "v0.19.0".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "idle");
+        assert!(updates.outcome.as_ref().unwrap().success);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_startup_request_that_cannot_be_read_stays_active_until_repaired() {
+        for kind in ["directory", "malformed"] {
+            for prior in [None, Some(true), Some(false)] {
+                let dir = tempdir(&format!("corrupt-{kind}-{}", prior.is_some()));
+                if let Some(success) = prior {
+                    save_outcome(
+                        &dir,
+                        &Outcome {
+                            update_id: "older-1".into(),
+                            tag: "v0.18.0".into(),
+                            success,
+                            reason: None,
+                        },
+                    )
+                    .unwrap();
+                }
+                let request = dir.join("updates/request.json");
+                if kind == "directory" {
+                    std::fs::create_dir(&request).unwrap();
+                } else {
+                    std::fs::write(&request, b"{ not json").unwrap();
+                }
+                let mut updates = ServerUpdates::new(&dir);
+                assert_eq!(updates.phase, "checking");
+                assert!(updates.active());
+                assert!(updates.diagnostic.is_some());
+                assert!(updates.id.is_none());
+                probe_again(&mut updates);
+                updates.poll(&dir);
+                assert!(
+                    updates.active(),
+                    "an unresolved request stays active over a stale outcome"
+                );
+                assert!(updates.diagnostic.is_some());
+                assert!(updates.id.is_none());
+                if kind == "directory" {
+                    std::fs::remove_dir(&request).unwrap();
+                }
+                std::fs::write(
+                    &request,
+                    json!({"updateId":"repaired-1","tag":"v0.19.0","startedAt":0}).to_string(),
+                )
+                .unwrap();
+                probe_again(&mut updates);
+                updates.poll(&dir);
+                assert_eq!(updates.phase, "restarting");
+                assert_eq!(updates.id.as_deref(), Some("repaired-1"));
+                probe_again(&mut updates);
+                updates.poll(&dir);
+                assert_eq!(updates.phase, "failed");
+                assert_eq!(read_outcome(&dir).unwrap().update_id, "repaired-1");
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    struct HelperStarted;
+    impl Host for HelperStarted {
+        fn run(
+            &mut self,
+            directory: &Path,
+            id: &str,
+            _progress: &dyn Fn(&str, &str),
+        ) -> Result<Option<String>, String> {
+            crate::store::write_atomic(
+                &directory.join("updates/request.json"),
+                json!({"updateId":id,"tag":"v0.19.0","startedAt":crate::lifecycle::now()})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Some("v0.19.0".into()))
+        }
+    }
+
+    #[test]
+    fn a_normal_restart_handoff_is_not_failed_by_the_worker_channel_closing() {
+        let dir = tempdir("handoff");
+        let guard = crate::install::InstallLock::acquire(&dir.join("updates")).unwrap();
+        let mut updates = ServerUpdates::new(&dir);
+        updates.fake(HelperStarted);
+        updates.start(dir.clone(), "handoff-1".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while updates.phase != "restarting" || updates.events.is_some() {
+            updates.poll(&dir);
+            assert!(Instant::now() < deadline, "handoff event never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(
+            updates.phase, "restarting",
+            "the held helper owns the request"
+        );
+        assert!(updates.outcome.is_none());
+        drop(guard);
+        past_grace(&mut updates);
+        probe_again(&mut updates);
+        updates.poll(&dir);
+        assert_eq!(updates.phase, "failed");
+        assert_eq!(read_outcome(&dir).unwrap().update_id, "handoff-1");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn local_restart_waits_for_remote_handoff_even_after_the_dialog_closes() {
         let mut state = crate::model::State::new(PathBuf::new(), false);

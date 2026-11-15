@@ -170,6 +170,8 @@ pub(crate) use remote_tasks::Preparation;
 pub use remote_tasks::{
     PeerOrigin, RemoteState, RemoteTask, wait_for_peer_thread, warm_repository_records,
 };
+#[path = "runtime_poll.rs"]
+mod runtime_poll;
 
 struct Injection {
     text: String,
@@ -3459,6 +3461,9 @@ impl Thread {
                 }
             }
             "agent_start" => {
+                if !self.completion_notified {
+                    self.arm_task();
+                }
                 self.mark_handoff_delivered();
                 if self.run_id.is_none() {
                     self.run_id = Some(uuid::Uuid::new_v4().to_string());
@@ -14530,204 +14535,24 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             tx.wake_after(Duration::ZERO);
         }
     }
-    let mut run_ended = false;
-    let mut crew_questions = Vec::new();
-    let mut background_failures = Vec::new();
-    let mut event_budget_exhausted = false;
     if changed {
         state.persistence_scope = None;
     }
-    let remote_children: std::collections::HashSet<_> = state
-        .tasks
-        .iter()
-        .filter(|t| t.remote.is_some())
-        .map(|t| t.child_thread_id)
-        .collect();
-    let mut connect_indices = Vec::new();
-    // Threads whose provider turn ended or reported a file change: their diff
-    // panels are marked stale below (KSG's workspace-mutation refresh bump).
-    let mut diff_notes = Vec::new();
-    for (index, thread) in state.threads.iter_mut().enumerate() {
-        if remote_children.contains(&thread.id) {
-            continue;
-        }
-        let effects_before = crate::outbox::captured_count();
-        let mut thread_changed = thread.poll_memory_command();
-        let was_bg_pending = thread.background_start_pending;
-        // Batch incoming deltas into one view update, with a bounded per-frame drain.
-        for event_index in 0..256 {
-            let event = thread.pi.as_ref().and_then(|pi| pi.events.try_recv().ok());
-            let Some(event) = event else { break };
-            if event_index == 255 {
-                // Even if this was the final event, reject this click conservatively.
-                event_budget_exhausted = true;
-                tx.wake_after(Duration::ZERO);
-            }
-            thread_changed = true;
-            thread.updated = crate::projects::now();
-            thread.life.updated_at = lifecycle::now();
-            match event {
-                Event::Record(record) => {
-                    state.background.observe_record(&record);
-                    let settled = record["type"] == "agent_settled";
-                    // A tool ending can grow `changes`; remember where they stood.
-                    let changes_before = (record["type"] == "tool_execution_end").then(|| {
-                        thread
-                            .tools
-                            .iter()
-                            .map(|tool| tool.changes.len())
-                            .sum::<usize>()
-                    });
-                    if matches!(
-                        record["type"].as_str(),
-                        Some("agent_start" | "message_start" | "agent_settled")
-                    ) || (record["type"] == "response"
-                        && record["command"] == "prompt"
-                        && record["success"] != false)
-                    {
-                        thread.background_start_pending = false;
-                    }
-                    if record["type"] == "extension_ui_request"
-                        && !thread.recovering_task
-                        && matches!(
-                            record["method"].as_str(),
-                            Some("input" | "editor" | "select")
-                        )
-                        && let Some(parent) = thread.parent
-                    {
-                        let token = record["id"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| record.to_string());
-                        if thread.forwarded_question.as_deref() != Some(token.as_str()) {
-                            thread.forwarded_question = Some(token);
-                            crew_questions.push((parent, format!(
-                            "Shina: crew #{} asks a question.\n{}\nAnswer with mcp__shina__task_send using thread_id {} and message containing your answer. For select, use one listed option exactly. Approval requests still require the user.",
-                            thread.id, record, thread.id
-                            )));
-                        }
-                    }
-                    run_ended |= settled;
-                    thread.apply(record);
-                    if settled
-                        || changes_before.is_some_and(|before| {
-                            thread
-                                .tools
-                                .iter()
-                                .map(|tool| tool.changes.len())
-                                .sum::<usize>()
-                                > before
-                        })
-                    {
-                        diff_notes.push(index);
-                    }
-                    if settled {
-                        thread.command("get_state", json!({}));
-                    }
-                    if !state.headless && index == state.active {
-                        thread.life.last_visited_at = Some(lifecycle::now());
-                    }
-                }
-                Event::Error(error) => {
-                    run_ended = true;
-                    diff_notes.push(index);
-                    thread.fail_session(error);
-                }
-                Event::Diagnostic(diagnostic) => thread.diagnostic(&diagnostic),
-                Event::Exited => {
-                    run_ended = true;
-                    diff_notes.push(index);
-                    if !matches!(thread.status, Status::Failed | Status::Paused) {
-                        thread.fail_session(
-                            "Pi stopped unexpectedly. Retry to resume the saved conversation."
-                                .into(),
-                        );
-                    }
-                }
-            }
-        }
-        thread.drive_session();
-        thread_changed |= thread.check_deadlines(Instant::now());
-        thread_changed |= thread.native_tick(Instant::now());
-        if let Some(deadline) = thread.native_deadline() {
-            tx.wake_after(deadline.saturating_duration_since(Instant::now()));
-        }
-        if !thread.offline_blocked
-            && thread.request.is_none()
-            && thread
-                .session_started
-                .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
-        {
-            thread.fail_session(
-                "Pi did not finish preparing the session. Retry to resume it.".into(),
-            );
-            thread_changed = true;
-        }
-        if was_bg_pending && thread.status == Status::Failed {
-            thread.background_start_pending = false;
-            thread_changed = true;
-            if index != state.active {
-                background_failures.push((
-                    thread.id,
-                    thread
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "Failed to send message.".into()),
-                ));
-            }
-        }
-        thread_changed |= thread.reclaim_idle(Instant::now());
-        // A quiet RPC stream must not freeze the visible work/thinking clocks.
-        if !state.headless && index == state.active && thread.status.busy() {
-            tx.wake_after(Duration::from_secs(1));
-            changed = true;
-        }
-        // A quiet session can become dispatchable without another provider record.
-        // Its intent must join this batch even when a different thread streamed.
-        thread_changed |= crate::outbox::captured_count() != effects_before;
-        if thread_changed {
-            changed = true;
-            if let Some(scope) = &mut state.persistence_scope {
-                scope.insert(thread.id);
-            }
-        }
-        if thread.pi.is_some() {
-            if let Some((_, deadline)) = thread.operation_deadline {
-                tx.wake_after(deadline.saturating_duration_since(Instant::now()));
-            }
-            if !thread.offline_blocked
-                && let Some(deadline) = thread.injection_retry_at
-            {
-                tx.wake_after(deadline.saturating_duration_since(Instant::now()));
-            }
-            let remaining = if thread.offline_blocked {
-                Duration::from_secs(2)
-            } else if let Some(started) = thread.session_started {
-                START_TIMEOUT.saturating_sub(started.elapsed())
-            } else if !thread.status.busy() && !thread.configuring {
-                IDLE_TIMEOUT.saturating_sub(thread.last_activity.elapsed())
-            } else {
-                IDLE_TIMEOUT
-            };
-            tx.wake_after(remaining);
-        }
-        if thread.pi.is_none()
-            && thread.queued_prompt.is_some()
-            && thread.status == Status::Running
-            && !thread.offline_blocked
-            && thread.session_started.is_none()
-        {
-            connect_indices.push(index);
-        }
+    let batch = runtime_poll::poll_threads(state);
+    for wake in batch.wakes {
+        tx.wake_after(wake);
     }
-    for index in connect_indices {
+    changed |= batch.changed;
+    for index in batch.connect_indices {
         state.connect_thread(index);
         changed = true;
     }
-    for index in diff_notes {
+    // Threads whose provider turn ended or reported a file change: their diff
+    // panels are marked stale below (KSG's workspace-mutation refresh bump).
+    for index in batch.diff_notes {
         state.diff_note_event(index);
     }
-    for (parent, question) in crew_questions {
+    for (parent, question) in batch.crew_questions {
         state.persistence_scope = None;
         let parent = state.effective_home(parent);
         if let Some(i) = state.threads.iter().position(|t| t.id == parent) {
@@ -14738,7 +14563,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     let mut global_changed = false;
-    for (thread_id, error) in background_failures {
+    for (thread_id, error) in batch.background_failures {
         if !state.handle_multi_model_async_failure(thread_id, &error) {
             state.notify_background_failure("local", thread_id, error);
         }
@@ -14797,7 +14622,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if state.restart_for_update {
         state.restart_for_update = false;
         let mut reply = String::new();
-        let approval = if event_budget_exhausted {
+        let approval = if batch.event_budget_exhausted {
             reply =
                 "Shina is still processing events. Click restart again when it finishes.".into();
             Err("Pending events".to_owned())
@@ -14853,7 +14678,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     state.last_lifecycle_clock = at;
-    if run_ended || at.saturating_sub(state.last_sweep) >= 60000 {
+    if batch.run_ended || at.saturating_sub(state.last_sweep) >= 60000 {
         if state.sweep_lifecycle(at) {
             state.persistence_scope = None;
             changed = true;

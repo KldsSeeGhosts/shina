@@ -957,6 +957,98 @@ fn automatic_compaction_stop_and_bounded_input_queues() {
 }
 
 #[test]
+fn idle_results_are_stale_neither_resettle_nor_dispatch_queued_followups() {
+    let mut client = client("full-access");
+    client
+        .command(json!({"type":"prompt","id":"p","message":"go"}))
+        .unwrap();
+    assert!(client.running);
+    client
+        .incoming(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    assert!(!client.running);
+    let settles = |client: &Client| {
+        client
+            .events
+            .iter()
+            .filter(|e| e["type"] == "agent_settled")
+            .count()
+    };
+    assert_eq!(settles(&client), 1);
+
+    // A duplicate result cannot settle twice or resurrect queued turns.
+    let events = client.events.len();
+    client
+        .incoming(json!({"type":"result","subtype":"success","is_error":false,
+        "queued_turn_count":2}))
+        .unwrap();
+    assert!(!client.running);
+    assert_eq!(client.events.len(), events);
+    assert_eq!(settles(&client), 1);
+
+    // An aborted turn's retained follow-up is not dispatched by a stale result.
+    client
+        .command(json!({"type":"prompt","id":"q","message":"again"}))
+        .unwrap();
+    client
+        .command(json!({"type":"prompt","id":"f","message":"later",
+        "streamingBehavior":"followUp"}))
+        .unwrap();
+    assert_eq!(client.queued.len(), 1);
+    client.command(json!({"type":"abort","id":"stop"})).unwrap();
+    client
+        .incoming(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    assert!(!client.running && client.queued.len() == 1);
+    client.events.clear();
+    client
+        .incoming(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    assert!(client.events.is_empty());
+    assert_eq!(client.queued.len(), 1);
+
+    // Startup failures still arrive as error results before ready.
+    let mut probe = Client::new(spec(SessionSource::New, "full-access"));
+    let error = probe
+        .incoming(json!({"type":"result","is_error":true,"result":"boom"}))
+        .unwrap_err();
+    assert!(error.contains("boom"));
+
+    // An open compaction can still be closed by a result while idle.
+    client.cancelling = false;
+    client.compacting = true;
+    client.events.clear();
+    client
+        .incoming(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    assert!(!client.compacting);
+}
+
+#[test]
+fn steering_during_an_in_flight_abort_does_not_clear_cancellation() {
+    let mut client = client("full-access");
+    client
+        .command(json!({"type":"prompt","id":"p","message":"go"}))
+        .unwrap();
+    client.command(json!({"type":"abort","id":"stop"})).unwrap();
+    assert!(client.cancelling);
+    client
+        .command(json!({"type":"prompt","id":"s","message":"redirect",
+        "streamingBehavior":"steer"}))
+        .unwrap();
+    assert!(client.cancelling);
+    client
+        .incoming(json!({"type":"result","subtype":"success","is_error":false}))
+        .unwrap();
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|e| e["type"] == "agent_settled" && e["aborted"] == true)
+    );
+}
+
+#[test]
 fn compaction_status_reports_failure_even_when_result_reports_success() {
     let mut client = client("full-access");
     client.command(json!({"type":"compact","id":"c"})).unwrap();

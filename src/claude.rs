@@ -778,6 +778,12 @@ impl Client {
             }
             "assistant" | "user" => self.message(&record, true),
             "result" => {
+                // Only in-flight input produces a result. A result while idle is a
+                // stale or duplicate terminal record. Before startup an error result
+                // still carries a startup failure.
+                if !self.running && !self.compacting && (self.ready || record["is_error"] != true) {
+                    return Ok(());
+                }
                 let mut error = if record["is_error"] == true {
                     Some(
                         self.redact(
@@ -1492,8 +1498,8 @@ impl Client {
             self.reject(&record, error);
             return Ok(());
         }
-        self.cancelling = false;
         if !was_running {
+            self.cancelling = false;
             self.turn_serial += 1;
             self.active_run_id = Some(
                 record["runId"]

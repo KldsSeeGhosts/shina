@@ -1372,6 +1372,18 @@ impl Client {
             .push(json!({"type":"queue_update","steering":[],"followUp":texts}));
     }
 
+    /// A turn recorded with a terminal status can never start or complete again.
+    /// A notification naming one is always a stale redelivery.
+    fn turn_terminal(&self, id: &str) -> bool {
+        self.turns.iter().any(|turn| {
+            turn["id"].as_str() == Some(id)
+                && matches!(
+                    turn["status"].as_str(),
+                    Some("completed" | "failed" | "interrupted")
+                )
+        })
+    }
+
     fn server_request(&mut self, method: &str, record: &Value) {
         if method == "mcpServer/elicitation/request" {
             let params = &record["params"];
@@ -1523,6 +1535,11 @@ impl Client {
     fn notification(&mut self, method: &str, params: &Value) -> Result<(), String> {
         match method {
             "turn/started" => {
+                if let Some(id) = params["turn"]["id"].as_str()
+                    && self.turn_terminal(id)
+                {
+                    return Ok(());
+                }
                 if !self.running {
                     self.events.push(json!({"type":"agent_start"}));
                 }
@@ -1656,10 +1673,13 @@ impl Client {
                     return Ok(());
                 }
                 let turn = &params["turn"];
-                if let Some(id) = turn["id"].as_str()
-                    && self.turn.as_deref().is_some_and(|active| active != id)
-                {
-                    return Err("Codex completed a different active turn.".into());
+                if let Some(id) = turn["id"].as_str() {
+                    if self.turn_terminal(id) {
+                        return Ok(());
+                    }
+                    if self.turn.as_deref().is_some_and(|active| active != id) {
+                        return Err("Codex completed a different active turn.".into());
+                    }
                 }
                 let failed = turn["status"] == "failed";
                 let aborted = self.cancelling || turn["status"] == "interrupted";

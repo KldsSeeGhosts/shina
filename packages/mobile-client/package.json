@@ -1,0 +1,32 @@
+{
+  "name": "@shina/mobile-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Portable Shina protocol client core: pairing, session, projection and history for React Native and other non-browser TypeScript runtimes.",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.2",
+    "@types/ws": "~8.18.2",
+    "typescript": "~5.9.3",
+    "ws": "~8.22.2"
+  }
+}

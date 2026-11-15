@@ -1,0 +1,162 @@
+{
+  "description": "Normalized golden Shina wire trace: hello, workspace snapshot, thread history snapshot page and a live stream event. Volatile values (uuids, epochs, timestamps, paths, ids) are normalized placeholders matching the server wire shape.",
+  "serverId": "00000000-0000-4000-8000-00000000aa01",
+  "deviceId": "00000000-0000-4000-8000-00000000bb02",
+  "hello": {
+    "jsonrpc": "2.0",
+    "id": "hello",
+    "result": {
+      "protocolMajor": 1,
+      "protocolMinor": 27,
+      "projectionSchema": 1,
+      "serverId": "00000000-0000-4000-8000-00000000aa01",
+      "instanceId": "instance-1",
+      "epoch": "epoch-1",
+      "binaryVersion": "test",
+      "deviceId": "00000000-0000-4000-8000-00000000bb02",
+      "serverTime": 1700000000000,
+      "canUpdate": true,
+      "canApprove": true,
+      "canOperate": true,
+      "capabilities": [
+        "local-commands",
+        "snapshot-subscriptions",
+        "projection-patches",
+        "blob-paging",
+        "durable-devices",
+        "history-items",
+        "deferred-work",
+        "filesystem-browse",
+        "run-control",
+        "composer-context-v1",
+        "file-attachments-v1",
+        "composer-requests-v1",
+        "question-contract-v1",
+        "notification-feed-v1"
+      ],
+      "limits": {
+        "controlBytes": 1048576,
+        "outstandingCommands": 32,
+        "pageBytes": 262144,
+        "fileAttachmentBytes": 52428800,
+        "historyLeaseCount": 4,
+        "historyLeaseBytes": 134217728,
+        "historyLeaseIdleSeconds": 30,
+        "threadReplayEvents": 128,
+        "threadReplayBytes": 1048576
+      }
+    }
+  },
+  "workspace": {
+    "jsonrpc": "2.0",
+    "method": "subscription.snapshot",
+    "params": {
+      "state": {
+        "index": { "active": 1, "projects": [] },
+        "threads": [
+          {
+            "id": 1,
+            "title": "Normalized thread",
+            "machine": "local",
+            "status": "idle",
+            "request_generation": "gen-1",
+            "request": null
+          }
+        ]
+      },
+      "seq": 7,
+      "epoch": "workspace-epoch-1",
+      "maintenance": null
+    }
+  },
+  "threadSnapshotPage": {
+    "kind": "snapshot",
+    "threadId": 1,
+    "streamEpoch": "stream-1",
+    "historyRevision": "rev-1",
+    "snapshotSequence": 3,
+    "hasMoreHistory": true,
+    "nextCursor": "cursor-older-1",
+    "fields": {
+      "harness_state": { "session": "session-1" }
+    },
+    "items": [
+      {
+        "sourceThreadId": 1,
+        "sourceItemId": "msg-1",
+        "field": "messages",
+        "ordinal": 0,
+        "position": 0,
+        "item": { "id": "msg-1", "role": "You", "text": "First prompt", "createdAt": 1700000000000 }
+      },
+      {
+        "sourceThreadId": 1,
+        "sourceItemId": "tool-1",
+        "field": "tools",
+        "ordinal": 0,
+        "position": 1,
+        "item": { "id": "tool-1", "tool": "read", "anchor": { "message": 0 }, "status": "done" }
+      },
+      {
+        "sourceThreadId": 1,
+        "sourceItemId": "msg-2",
+        "field": "messages",
+        "ordinal": 1,
+        "position": 2,
+        "item": { "id": "msg-2", "role": "assistant", "text": "Reply", "createdAt": 1700000001000 }
+      }
+    ]
+  },
+  "threadStreamEvent": {
+    "jsonrpc": "2.0",
+    "method": "thread.stream",
+    "params": {
+      "kind": "event",
+      "threadId": 1,
+      "sequence": 4,
+      "streamEpoch": "stream-1",
+      "historyRevision": "rev-2",
+      "events": [
+        {
+          "type": "item.updated",
+          "row": {
+            "sourceThreadId": 1,
+            "sourceItemId": "tool-1",
+            "field": "tools",
+            "ordinal": 0,
+            "position": 1,
+            "item": { "id": "tool-1", "tool": "read", "anchor": { "message": 0 }, "status": "done", "output": "ok" }
+          }
+        },
+        { "type": "minutiae.unknown", "opaque": { "x": 1 } }
+      ]
+    }
+  },
+  "notifications": {
+    "events": [
+      {
+        "id": "notif-1",
+        "seq": 41,
+        "kind": "approval",
+        "threadId": 1,
+        "createdAt": 1700000002000,
+        "runId": "run-1",
+        "requestId": "req-1",
+        "generation": "gen-1"
+      },
+      {
+        "id": "notif-2",
+        "seq": 42,
+        "kind": "run_completed",
+        "threadId": 1,
+        "createdAt": 1700000003000,
+        "runId": "run-1"
+      }
+    ],
+    "nextCursor": 42,
+    "hasMore": false,
+    "cursorExpired": false,
+    "oldestSeq": 1,
+    "serverId": "00000000-0000-4000-8000-00000000aa01"
+  }
+}

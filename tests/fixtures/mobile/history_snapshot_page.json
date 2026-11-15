@@ -1,0 +1,306 @@
+{
+  "fields": {
+    "id": 1,
+    "stats": null
+  },
+  "hasMoreHistory": true,
+  "historyRevision": "<historyRevision>",
+  "items": [
+    {
+      "field": "messages",
+      "item": {
+        "id": "a-34",
+        "images": [],
+        "role": "Pi",
+        "text": "Fixture reply 34"
+      },
+      "ordinal": 69,
+      "position": "<seq>",
+      "sourceItemId": "messages:a-34",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "u-35",
+        "images": [],
+        "role": "You",
+        "text": "Mobile turn 35"
+      },
+      "ordinal": 70,
+      "position": "<seq>",
+      "sourceItemId": "messages:u-35",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "tools",
+      "item": {
+        "anchor": {
+          "message": 71,
+          "offset": 0
+        },
+        "block": 0,
+        "changes": [],
+        "detail": "main.rs",
+        "done": true,
+        "duration_ms": null,
+        "exit_code": 0,
+        "failed": false,
+        "id": "tool-35",
+        "images": [],
+        "input": null,
+        "kind": null,
+        "name": "read",
+        "order": 1,
+        "output": "ok",
+        "parent_call": null,
+        "structured": null,
+        "subagents": []
+      },
+      "ordinal": 35,
+      "position": "<seq>",
+      "sourceItemId": "tools:tool-35",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "a-35",
+        "images": [],
+        "role": "Pi",
+        "text": "Fixture reply 35"
+      },
+      "ordinal": 71,
+      "position": "<seq>",
+      "sourceItemId": "messages:a-35",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "u-36",
+        "images": [],
+        "role": "You",
+        "text": "Mobile turn 36"
+      },
+      "ordinal": 72,
+      "position": "<seq>",
+      "sourceItemId": "messages:u-36",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "tools",
+      "item": {
+        "anchor": {
+          "message": 73,
+          "offset": 0
+        },
+        "block": 0,
+        "changes": [],
+        "detail": "main.rs",
+        "done": true,
+        "duration_ms": null,
+        "exit_code": 0,
+        "failed": false,
+        "id": "tool-36",
+        "images": [],
+        "input": null,
+        "kind": null,
+        "name": "read",
+        "order": 1,
+        "output": "ok",
+        "parent_call": null,
+        "structured": null,
+        "subagents": []
+      },
+      "ordinal": 36,
+      "position": "<seq>",
+      "sourceItemId": "tools:tool-36",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "a-36",
+        "images": [],
+        "role": "Pi",
+        "text": "Fixture reply 36"
+      },
+      "ordinal": 73,
+      "position": "<seq>",
+      "sourceItemId": "messages:a-36",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "u-37",
+        "images": [],
+        "role": "You",
+        "text": "Mobile turn 37"
+      },
+      "ordinal": 74,
+      "position": "<seq>",
+      "sourceItemId": "messages:u-37",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "tools",
+      "item": {
+        "anchor": {
+          "message": 75,
+          "offset": 0
+        },
+        "block": 0,
+        "changes": [],
+        "detail": "main.rs",
+        "done": true,
+        "duration_ms": null,
+        "exit_code": 0,
+        "failed": false,
+        "id": "tool-37",
+        "images": [],
+        "input": null,
+        "kind": null,
+        "name": "read",
+        "order": 1,
+        "output": "ok",
+        "parent_call": null,
+        "structured": null,
+        "subagents": []
+      },
+      "ordinal": 37,
+      "position": "<seq>",
+      "sourceItemId": "tools:tool-37",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "a-37",
+        "images": [],
+        "role": "Pi",
+        "text": "Fixture reply 37"
+      },
+      "ordinal": 75,
+      "position": "<seq>",
+      "sourceItemId": "messages:a-37",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "u-38",
+        "images": [],
+        "role": "You",
+        "text": "Mobile turn 38"
+      },
+      "ordinal": 76,
+      "position": "<seq>",
+      "sourceItemId": "messages:u-38",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "tools",
+      "item": {
+        "anchor": {
+          "message": 77,
+          "offset": 0
+        },
+        "block": 0,
+        "changes": [],
+        "detail": "main.rs",
+        "done": true,
+        "duration_ms": null,
+        "exit_code": 0,
+        "failed": false,
+        "id": "tool-38",
+        "images": [],
+        "input": null,
+        "kind": null,
+        "name": "read",
+        "order": 1,
+        "output": "ok",
+        "parent_call": null,
+        "structured": null,
+        "subagents": []
+      },
+      "ordinal": 38,
+      "position": "<seq>",
+      "sourceItemId": "tools:tool-38",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "a-38",
+        "images": [],
+        "role": "Pi",
+        "text": "Fixture reply 38"
+      },
+      "ordinal": 77,
+      "position": "<seq>",
+      "sourceItemId": "messages:a-38",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "u-39",
+        "images": [],
+        "role": "You",
+        "text": "Mobile turn 39"
+      },
+      "ordinal": 78,
+      "position": "<seq>",
+      "sourceItemId": "messages:u-39",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "tools",
+      "item": {
+        "anchor": {
+          "message": 79,
+          "offset": 0
+        },
+        "block": 0,
+        "changes": [],
+        "detail": "main.rs",
+        "done": true,
+        "duration_ms": null,
+        "exit_code": 0,
+        "failed": false,
+        "id": "tool-39",
+        "images": [],
+        "input": null,
+        "kind": null,
+        "name": "read",
+        "order": 1,
+        "output": "ok",
+        "parent_call": null,
+        "structured": null,
+        "subagents": []
+      },
+      "ordinal": 39,
+      "position": "<seq>",
+      "sourceItemId": "tools:tool-39",
+      "sourceThreadId": 1
+    },
+    {
+      "field": "messages",
+      "item": {
+        "id": "a-39",
+        "images": [],
+        "role": "Pi",
+        "text": "Fixture reply 39"
+      },
+      "ordinal": 79,
+      "position": "<seq>",
+      "sourceItemId": "messages:a-39",
+      "sourceThreadId": 1
+    }
+  ],
+  "nextCursor": "<nextCursor>",
+  "snapshotSequence": "<seq>",
+  "threadId": 1
+}

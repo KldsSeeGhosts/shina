@@ -33,6 +33,7 @@ struct Inner {
     connection: Connection,
     batch: Option<std::thread::ThreadId>,
     staged: BTreeMap<String, Value>,
+    staged_push: Vec<crate::mobile_push::Staged>,
     revocations: Vec<String>,
     failure: Option<String>,
     dispatch_fenced: bool,
@@ -115,7 +116,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 5 {
+        if version > 7 {
             return Err(error("This schema requires a newer Shina binary."));
         }
         connection
@@ -168,6 +169,20 @@ impl Database {
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
+        if version < 6 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/006.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
+        if version < 7 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/007.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
         let imported: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='legacy-import-v1')",
@@ -211,6 +226,7 @@ impl Database {
             connection,
             batch: None,
             staged: BTreeMap::new(),
+            staged_push: Vec::new(),
             revocations: Vec::new(),
             failure: None,
             dispatch_fenced: false,
@@ -430,6 +446,7 @@ impl Database {
             .map(|m| m.len())
             .unwrap_or(0);
         let revocations = std::mem::take(&mut inner.revocations);
+        let staged_push = std::mem::take(&mut inner.staged_push);
         let result = (|| {
             let tx = inner.connection.transaction().map_err(error)?;
             for id in revocations {
@@ -438,6 +455,14 @@ impl Database {
                     params![id, crate::lifecycle::now() as i64],
                 )
                 .map_err(error)?;
+                // Future sends to a revoked device die inside the same commit.
+                crate::mobile_push::device_revoked(&tx, &id, crate::lifecycle::now() as i64)?;
+            }
+            // Opt-in push registration changes staged by this command commit
+            // atomically with its receipt.
+            for staged in staged_push {
+                crate::mobile_push::apply_staged(&tx, staged, crate::lifecycle::now() as i64)
+                    .map_err(error)?;
             }
             for (name, value) in staged {
                 if matches!(name.as_str(), "index.json" | "server-inputs.json") {
@@ -533,6 +558,9 @@ impl Database {
             if let Some(index) = projection.as_object_mut().unwrap().remove("index") {
                 crate::projection_store::write(&tx, "workspace-index", &index)?;
             }
+            // Mobile notification edges compare the last committed workspace with
+            // this projection in the same transaction, before it is replaced.
+            crate::mobile_notifications::record(&tx, &projection)?;
             crate::projection_store::write(&tx, "workspace", &projection)?;
             tx.execute(
                 "INSERT INTO projection(id,seq,payload) VALUES(1,?1,'{\"schema\":2}')
@@ -620,6 +648,111 @@ impl Database {
             serde_json::from_str(&text).map_err(error)
         })
         .collect()
+    }
+
+    /// The durable mobile notification feed, paged by `seq`. `after` is the last
+    /// event the device already holds; `None` reads from the start. `limit` is
+    /// bounded: 0 means the 50-event default, anything larger clamps at 100.
+    /// Events carry routing ids only and are user-device readable, never peer data.
+    pub fn notification_page(&self, after: Option<u64>, limit: usize) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        crate::mobile_notifications::page(&inner.connection, after, limit).map_err(error)
+    }
+
+    /// One notification event by its opaque id, for push-tap navigation. A
+    /// missing or pruned id is a clear error, never fabricated data.
+    pub fn notification_event(&self, event_id: &str) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        crate::mobile_notifications::get(&inner.connection, event_id)
+    }
+
+    /// Stage an Expo push registration for the caller's own device. Must run
+    /// after `begin`: the write lands atomically inside `commit` with the
+    /// command's receipt. The result exposes status only, never the token.
+    pub fn stage_push_registration(&self, device: &str, args: &Value) -> Result<Value, String> {
+        let mut inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        if inner.batch != Some(std::thread::current().id()) {
+            return Err("Push registration must stage inside a runtime transaction.".into());
+        }
+        let staged = crate::mobile_push::registration(&inner.connection, device, args)?;
+        let crate::mobile_push::Staged::Register { platform, .. } = &staged else {
+            unreachable!();
+        };
+        let platform = platform.clone();
+        inner.staged_push.push(staged);
+        Ok(json!({"registered":true,"platform":platform}))
+    }
+
+    /// Stage push unregistration for the caller's own device. Commits with the
+    /// command's receipt and fences every unfinished job for the device.
+    pub fn stage_push_unregistration(&self, device: &str) -> Result<Value, String> {
+        let mut inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        if inner.batch != Some(std::thread::current().id()) {
+            return Err("Push registration must stage inside a runtime transaction.".into());
+        }
+        inner
+            .staged_push
+            .push(crate::mobile_push::Staged::Unregister {
+                device: device.into(),
+            });
+        Ok(json!({"registered":false}))
+    }
+
+    /// Opt-in push status for the caller's own device. Never exposes a token.
+    pub fn push_status(&self, device: &str) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        crate::mobile_push::status(&inner.connection, device)
+    }
+
+    pub(crate) fn push_prepare(&self, now: i64) -> Result<crate::mobile_push::Survey, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        crate::mobile_push::prepare(&inner.connection, now)
+    }
+
+    pub(crate) fn push_claim(
+        &self,
+        now: i64,
+        lease: &str,
+    ) -> Result<crate::mobile_push::ClaimedBatch, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        crate::mobile_push::claim(&inner.connection, now, lease)
+    }
+
+    pub(crate) fn push_settle(
+        &self,
+        now: i64,
+        lease: &str,
+        sends: &[crate::mobile_push::SendReport],
+        receipts: &[crate::mobile_push::ReceiptReport],
+    ) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        crate::mobile_push::settle(&inner.connection, now, lease, sends, receipts)
+    }
+
+    /// Test-only handle on the inner connection for assertions that must
+    /// observe tables the public API deliberately hides (push tokens, jobs).
+    #[cfg(test)]
+    pub(crate) fn test_connection<R>(&self, read: impl FnOnce(&Connection) -> R) -> R {
+        let inner = self.0.lock().expect("database");
+        read(&inner.connection)
     }
 
     pub fn scoped_state(&self, thread: u64) -> Result<Value, String> {
@@ -1007,14 +1140,15 @@ impl Database {
             inner.revocations.push(id.into());
             return Ok(());
         }
-        inner
-            .connection
-            .execute(
-                "UPDATE devices SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1",
-                params![id, crate::lifecycle::now() as i64],
-            )
-            .map(|_| ())
-            .map_err(error)
+        let tx = inner.connection.unchecked_transaction().map_err(error)?;
+        tx.execute(
+            "UPDATE devices SET revoked_at=COALESCE(revoked_at,?2) WHERE id=?1",
+            params![id, crate::lifecycle::now() as i64],
+        )
+        .map_err(error)?;
+        crate::mobile_push::device_revoked(&tx, id, crate::lifecycle::now() as i64)
+            .map_err(error)?;
+        tx.commit().map_err(error)
     }
 
     pub fn sequence(&self) -> Result<u64, String> {
@@ -1115,13 +1249,17 @@ impl Database {
         inner.failure = Some(message);
         inner.batch = None;
         inner.staged.clear();
+        inner.staged_push.clear();
         inner.revocations.clear();
         inner.history_events.clear();
     }
 
     pub fn finish_if_unchanged(&self) -> Result<bool, String> {
         let mut inner = self.0.lock().expect("database");
-        if !inner.revocations.is_empty() || !inner.history_events.is_empty() {
+        if !inner.revocations.is_empty()
+            || !inner.history_events.is_empty()
+            || !inner.staged_push.is_empty()
+        {
             return Ok(false);
         }
         for (name, value) in &inner.staged {
@@ -1587,6 +1725,250 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kind, "honcho");
+    }
+
+    #[test]
+    fn notification_migration_has_a_verified_schema_five_backup_and_no_spam() {
+        let directory = directory("notification-migration");
+        let old = Connection::open(directory.join("state.sqlite")).unwrap();
+        for migration in [
+            include_str!("migrations/001.sql"),
+            include_str!("migrations/002.sql"),
+            include_str!("migrations/003.sql"),
+            include_str!("migrations/004.sql"),
+            include_str!("migrations/005.sql"),
+        ] {
+            old.execute_batch(migration).unwrap();
+        }
+        // A committed workspace with a pending request and a finished run existed
+        // before the feed: the first migrated commit must not publish them.
+        crate::projection_store::write(
+            &old,
+            "workspace",
+            &json!({"threads":[
+                {"id":1,"status":"Completed","run_id":"old-run"},
+                {"id":2,"status":"Waiting","request":{"id":"req-1","method":"confirm"}}
+            ]}),
+        )
+        .unwrap();
+        drop(old);
+        let database = Database::open(&directory).unwrap();
+        let mut backed_up = false;
+        for entry in std::fs::read_dir(directory.join("backups")).unwrap() {
+            let file = entry.unwrap().path().join("state.sqlite");
+            if !file.is_file() {
+                continue;
+            }
+            let backup = Connection::open(file).unwrap();
+            let schema: u32 = backup
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            let integrity: String = backup
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            backed_up |= schema == 5 && integrity == "ok";
+        }
+        assert!(backed_up);
+        let version: u32 = database
+            .0
+            .lock()
+            .unwrap()
+            .connection
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        database
+            .commit(
+                1,
+                &json!({"threads":[
+                    {"id":1,"status":"Completed","run_id":"old-run"},
+                    {"id":2,"status":"Waiting","request":{"id":"req-1","method":"confirm"}}
+                ]}),
+                &json!([]),
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            database.notification_page(None, 0).unwrap()["events"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn notification_edges_share_the_state_commit_and_roll_back_with_it() {
+        let database = Database::open(&directory("notification-atomic")).unwrap();
+        database
+            .commit(
+                1,
+                &json!({"threads":[{"id":1,"status":"Running","run_id":"r1"}]}),
+                &json!([]),
+                None,
+                &[],
+            )
+            .unwrap();
+        database
+            .commit(
+                2,
+                &json!({"threads":[{"id":1,"status":"Waiting","run_id":"r1",
+                    "request":{"id":"req-1","method":"confirm","runtimeGeneration":"g1"},"generation":"g1"}]}),
+                &json!([]),
+                None,
+                &[],
+            )
+            .unwrap();
+        let page = database.notification_page(None, 50).unwrap();
+        let events = page["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "approval");
+        assert_eq!(events[0]["threadId"], 1);
+        assert_eq!(events[0]["requestId"], "req-1");
+        assert_eq!(events[0]["generation"], "g1");
+        assert!(
+            events[0]["id"]
+                .as_str()
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        );
+        assert!(events[0]["seq"].as_i64().unwrap() > 0);
+        assert!(events[0]["createdAt"].as_i64().unwrap() > 0);
+        // A failure inside the notification write aborts the whole state commit.
+        database
+            .0
+            .lock()
+            .unwrap()
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_notify BEFORE INSERT ON mobile_notification_events
+             BEGIN SELECT RAISE(ABORT,'fixture disk error'); END;",
+            )
+            .unwrap();
+        assert!(
+            database
+                .commit(
+                    3,
+                    &json!({"threads":[{"id":1,"status":"Completed","run_id":"r1","generation":"g1"}]}),
+                    &json!([]),
+                    None,
+                    &[],
+                )
+                .is_err()
+        );
+        let inner = database.0.lock().unwrap();
+        let status: String = inner
+            .connection
+            .query_row(
+                "SELECT json_extract(payload,'$.status') FROM projection_records
+                 WHERE document='workspace' AND scope='threads/1' AND key='$'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "Waiting", "the committed view kept its last state");
+        let count: i64 = inner
+            .connection
+            .query_row("SELECT count(*) FROM mobile_notification_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn notification_feed_dedupes_retains_and_pages_across_restarts() {
+        let directory = directory("notification-feed");
+        let database = Database::open(&directory).unwrap();
+        let running =
+            json!({"threads":[{"id":1,"status":"Running","run_id":"r1","generation":"g1"}]});
+        database.commit(1, &running, &json!([]), None, &[]).unwrap();
+        let waiting = json!({"threads":[{"id":1,"status":"Waiting","run_id":"r1","generation":"g1",
+            "request":{"id":"req-1","method":"confirm","runtimeGeneration":"g1"}}]});
+        database.commit(2, &waiting, &json!([]), None, &[]).unwrap();
+        // The identical transition committed again after a restart is not a new edge.
+        drop(database);
+        let database = Database::open(&directory).unwrap();
+        database.commit(3, &waiting, &json!([]), None, &[]).unwrap();
+        database
+            .commit(
+                4,
+                &json!({"threads":[{"id":1,"status":"Completed","run_id":"r1","generation":"g1"}]}),
+                &json!([]),
+                None,
+                &[],
+            )
+            .unwrap();
+        let events = database.notification_page(None, 10).unwrap()["events"].clone();
+        assert_eq!(events.as_array().unwrap().len(), 2);
+        assert_eq!(events[0]["kind"], "approval");
+        assert_eq!(events[1]["kind"], "run_completed");
+        assert_eq!(events[1]["runId"], "r1");
+        // Sequence survives restart and pruning without reuse.
+        let max_seq = events[1]["seq"].as_i64().unwrap();
+        {
+            let inner = database.0.lock().unwrap();
+            for i in 0..2100 {
+                inner
+                    .connection
+                    .execute(
+                        "INSERT INTO mobile_notification_events(id,kind,thread_id,source_key,created_at)
+                         VALUES(?1,'run_completed',1,?2,?3)",
+                        params![format!("fill-{i}"), format!("fill:{i}"), i],
+                    )
+                    .unwrap();
+            }
+        }
+        database
+            .commit(
+                5,
+                &json!({"threads":[{"id":1,"status":"Ready","run_id":"r1","generation":"g1"}]}),
+                &json!([]),
+                None,
+                &[],
+            )
+            .unwrap();
+        drop(database);
+        let database = Database::open(&directory).unwrap();
+        let count: i64 = database
+            .0
+            .lock()
+            .unwrap()
+            .connection
+            .query_row("SELECT count(*) FROM mobile_notification_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(count <= 2048);
+        let page = database.notification_page(Some(1), 100).unwrap();
+        assert_eq!(page["cursorExpired"], true);
+        assert!(page["oldestSeq"].as_i64().unwrap() > max_seq);
+        assert!(
+            database
+                .notification_page(Some(i64::MAX as u64), 50)
+                .is_err()
+        );
+        let high: i64 = database
+            .0
+            .lock()
+            .unwrap()
+            .connection
+            .query_row("SELECT MAX(seq) FROM mobile_notification_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // A new edge after pruning keeps the sequence monotonic.
+        database
+            .commit(
+                6,
+                &json!({"threads":[{"id":1,"status":"Failed","run_id":"r2","generation":"g1"}]}),
+                &json!([]),
+                None,
+                &[],
+            )
+            .unwrap();
+        let tail = database.notification_page(Some(high as u64), 100).unwrap();
+        let events = tail["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "run_failed");
+        assert!(events[0]["seq"].as_i64().unwrap() > max_seq + 2100);
     }
 
     #[test]

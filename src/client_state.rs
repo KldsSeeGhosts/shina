@@ -1252,6 +1252,7 @@ impl State {
         let changed = self.poll_client_background(tx)
             | self.updater.poll(Instant::now(), self.wake.clone())
             | self.refresh_machine_notice()
+            | self.tick_mobile_pairing(crate::lifecycle::now(), tx)
             | self.tick_composer_notices_at(Instant::now(), Some(tx));
         if self.background.quitting {
             return true;
@@ -1699,6 +1700,14 @@ impl State {
                         "Pairing code: {}. Expires in five minutes and works once.",
                         value["code"].as_str().unwrap_or("")
                     ))
+                }
+                Ok(crate::peer::MachineResult::MobilePaired(link)) => {
+                    if self.machines.dialog || self.settings_menu {
+                        match crate::mobile_share::Share::new(link) {
+                            Ok(share) => self.machines.mobile_share = Some(share),
+                            Err(error) => self.machines.notice = Some(error),
+                        }
+                    }
                 }
                 Ok(crate::peer::MachineResult::Unlinked(id)) => {
                     if self.machines.selected == id {
@@ -3352,6 +3361,25 @@ impl State {
             self.select_thread(index);
         }
     }
+    pub(super) fn tick_mobile_pairing(&mut self, now: u64, tx: &mut Tx) -> bool {
+        if !self.machines.dialog && !self.settings_menu {
+            return self.machines.mobile_share.take().is_some();
+        }
+        let Some(share) = &self.machines.mobile_share else {
+            return false;
+        };
+        if share.link.expired(now) {
+            self.machines.mobile_share = None;
+            self.machines.notice =
+                Some("The phone pairing link expired. Create a new link.".into());
+            return true;
+        }
+        tx.wake_after(Duration::from_millis(
+            share.link.expires_at().saturating_sub(now).min(1000),
+        ));
+        false
+    }
+
     pub fn machine_action(&mut self, action: &str, target: &str) {
         if self.demo {
             self.machines.notice =
@@ -3372,6 +3400,7 @@ impl State {
         let peer_code = self.machines.peer_code.text.clone();
         self.machines.peer_code.replace_text("");
         let host = self.machines.host.text.clone();
+        let mobile_host = self.machines.mobile_host.text.clone();
         let code = self.machines.code.text.clone();
         self.machines.code.replace_text("");
         let action = action.to_owned();
@@ -3387,6 +3416,9 @@ impl State {
                     runtime.block_on(async {
                         use crate::peer::MachineResult;
                         match action.as_str() {
+                            "pair-mobile" => crate::mobile_pairing::issue(&profile, &mobile_host)
+                                .await
+                                .map(MachineResult::MobilePaired),
                             "peer-link" => crate::client::local_rpc(
                                 &profile,
                                 "peer.link",
@@ -7496,6 +7528,31 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&bad_dir);
+    }
+
+    #[test]
+    fn phone_pairing_expires_without_saving_the_code_or_initializing_artwork() {
+        let mut state = State::headless(crate::store::directory().unwrap());
+        state.machines.dialog = true;
+        let now = crate::lifecycle::now();
+        let link = crate::mobile_pairing::PairLink::new(
+            "100.90.1.2",
+            crate::peer::PORT,
+            uuid::Uuid::nil(),
+            now + 300_000,
+            "012345ABCDEF",
+        )
+        .unwrap();
+        state.machines.mobile_share = Some(crate::mobile_share::Share::new(link).unwrap());
+        for saved in [state.ui_snapshot(), state.snapshot()] {
+            assert!(!saved.to_string().contains("012345ABCDEF"));
+            assert!(!saved.to_string().contains("shina://pair/v1"));
+        }
+        assert!(!state.tick_mobile_pairing(now, &mut Tx::default()));
+        assert!(state.machines.mobile_share.is_some());
+        assert!(state.tick_mobile_pairing(now + 300_000, &mut Tx::default()));
+        assert!(state.machines.mobile_share.is_none());
+        assert!(!state.artwork.is_initialized());
     }
 
     #[test]

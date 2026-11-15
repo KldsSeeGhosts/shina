@@ -1475,7 +1475,7 @@ fn start_coordinated_helper_id(update: &PreparedUpdate, id: &str) -> Result<(), 
     .map_err(|e| e.to_string())?;
     crate::store::write_atomic(
         &storage.root.join("request.json"),
-        serde_json::json!({"updateId":id,"tag":update.tag})
+        serde_json::json!({"updateId":id,"tag":update.tag,"startedAt":crate::lifecycle::now()})
             .to_string()
             .as_bytes(),
     )

@@ -1,0 +1,13 @@
+{
+  "fullAccessOverride": "provider_check",
+  "id": "<uuid>",
+  "message": "\n{\"command\":\"echo fixture\"}",
+  "method": "confirm",
+  "responseCapability": {
+    "supportsFeedback": true,
+    "type": "live"
+  },
+  "runtimeGeneration": "<uuid>",
+  "title": "Allow Claude Bash?",
+  "type": "extension_ui_request"
+}

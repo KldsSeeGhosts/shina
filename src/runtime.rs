@@ -113,8 +113,10 @@ impl RuntimeState {
                 .as_ref()
                 .unwrap()
                 .update_outcome(&json!(outcome))?;
-            runtime.updates.outcome = Some(outcome);
-            runtime.updates.phase = "failed".into();
+            if runtime.updates.id.is_none() {
+                runtime.updates.outcome = Some(outcome);
+                runtime.updates.phase = "failed".into();
+            }
         }
         let effects = capture.finish();
         runtime.persist(None, effects)?;
@@ -318,6 +320,10 @@ impl RuntimeState {
                         json!({"updateAccepted":true,"updateId":uuid::Uuid::new_v4(),"requestedAt":now}),
                     )
                 }
+            } else if command.method == "notifications.push.register" {
+                database.stage_push_registration(device, &command.params)
+            } else if command.method == "notifications.push.unregister" {
+                database.stage_push_unregistration(device)
             } else if command.method == "devices.revoke" {
                 command.params["deviceId"]
                     .as_str()
@@ -1017,6 +1023,65 @@ mod tests {
             id
         );
         runtime.shutdown().unwrap();
+    }
+    #[test]
+    fn startup_keeps_a_newer_active_attempt_while_closing_the_old_audit_row() {
+        let directory = crate::store::directory()
+            .unwrap()
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = crate::database::Database::open(&directory).unwrap();
+        db.issue_device("interrupted-device", "not-a-real-token")
+            .unwrap();
+        let old_id = uuid::Uuid::new_v4().to_string();
+        let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
+        connection.execute("INSERT INTO update_audit(update_id,device_id,requested_at,accepted,tag,outcome) VALUES(?1,'interrupted-device',1,1,'v99.0.0',?2)",
+            rusqlite::params![old_id,json!({"updateAccepted":true}).to_string()]).unwrap();
+        drop(connection);
+        drop(db);
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let updates_dir = directory.join("updates");
+        std::fs::create_dir_all(&updates_dir).unwrap();
+        crate::store::write_atomic(
+            &updates_dir.join("request.json"),
+            json!({"updateId":new_id,"tag":"v0.12.19","startedAt":crate::lifecycle::now()})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        let guard = crate::install::InstallLock::acquire(&updates_dir).unwrap();
+        let mut runtime =
+            RuntimeState::open(directory.clone(), std::sync::Arc::new(|| {})).unwrap();
+        assert_eq!(runtime.updates.phase, "restarting");
+        assert_eq!(runtime.updates.id.as_deref(), Some(new_id.as_str()));
+        assert_eq!(runtime.updates.tag, "v0.12.19");
+        assert!(
+            runtime
+                .database
+                .as_ref()
+                .unwrap()
+                .unfinished_update()
+                .unwrap()
+                .is_none(),
+            "the old audit row was terminalized"
+        );
+        drop(guard);
+        crate::fleet_update::save_outcome(
+            &directory,
+            &crate::fleet_update::Outcome {
+                update_id: new_id.clone(),
+                tag: "v0.12.19".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
+        runtime.updates.poll(&directory);
+        assert_eq!(runtime.updates.phase, "idle");
+        assert_eq!(runtime.updates.id.as_deref(), Some(new_id.as_str()));
+        assert!(runtime.updates.outcome.as_ref().unwrap().success);
+        runtime.shutdown().unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
     }
     #[test]
     fn outbox_pauses_during_drain_and_resumes_only_after_cancellation() {

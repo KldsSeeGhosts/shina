@@ -48,6 +48,10 @@ mod keybindings;
 mod lifecycle;
 mod maintenance;
 mod mcp;
+mod mobile_notifications;
+mod mobile_pairing;
+mod mobile_push;
+mod mobile_share;
 mod model;
 mod model_picker;
 mod model_selection;
@@ -983,6 +987,21 @@ fn captain_brief_demo(state: &mut State) {
     state.show_activity = true;
 }
 
+fn mobile_pairing_demo(state: &mut State) {
+    state.populate_demo();
+    state.machines.dialog = true;
+    state.machines.mobile_host.replace_text("studio-mac");
+    let link = mobile_pairing::PairLink::new(
+        "studio-mac",
+        peer::PORT,
+        uuid::Uuid::nil(),
+        lifecycle::now() + 300_000,
+        "012345ABCDEF",
+    )
+    .expect("synthetic pairing link");
+    state.machines.mobile_share = Some(mobile_share::Share::new(link).expect("synthetic QR"));
+}
+
 /// The "You" profile editor with a labelled example profile.
 fn settings_profile_demo(state: &mut State) {
     state.populate_demo();
@@ -1283,6 +1302,11 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 state.dark = true;
             }),
             ("settings-profile", settings_profile_demo),
+            ("mobile-pairing", mobile_pairing_demo),
+            ("mobile-pairing-dark", |state| {
+                mobile_pairing_demo(state);
+                state.dark = true;
+            }),
             ("settings-menu", |state| {
                 state.populate_demo();
                 state.settings_menu = true;

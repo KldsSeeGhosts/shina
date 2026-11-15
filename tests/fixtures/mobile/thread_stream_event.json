@@ -1,0 +1,41 @@
+{
+  "events": [
+    {
+      "row": {
+        "field": "messages",
+        "item": {
+          "id": "<uuid>",
+          "images": [],
+          "role": "You",
+          "text": "mobile-live-fixture"
+        },
+        "ordinal": 80,
+        "position": "<seq>",
+        "sourceItemId": "messages:<uuid>",
+        "sourceThreadId": 1
+      },
+      "type": "item.updated"
+    },
+    {
+      "row": {
+        "field": "work",
+        "item": {
+          "elapsed": null,
+          "start": 81,
+          "stopped": false,
+          "stopped_order": 0
+        },
+        "ordinal": 0,
+        "position": "<seq>",
+        "sourceItemId": "<uuid>",
+        "sourceThreadId": 1
+      },
+      "type": "item.updated"
+    }
+  ],
+  "historyRevision": "<historyRevision>",
+  "kind": "event",
+  "sequence": "<seq>",
+  "streamEpoch": "<streamEpoch>",
+  "threadId": 1
+}

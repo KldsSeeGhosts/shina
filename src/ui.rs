@@ -14342,6 +14342,100 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
         })
 }
 
+/// Ported from KSG Code's AuthorizedClientsSettings QR share panel. Shina uses
+/// its direct-tailnet link rather than KSG's hosted pairing endpoint.
+fn mobile_pairing_card(s: &State, p: Palette) -> El {
+    let mut card = col()
+        .key("mobile-pairing")
+        .w_full()
+        .gap(8.0)
+        .child(label("Pair a phone", BODY, p.ink))
+        .child(
+            label(
+                "The phone needs Tailscale and access to this computer's tailnet.",
+                SMALL,
+                p.muted,
+            )
+            .wrap(),
+        );
+    if let Some(share) = s
+        .machines
+        .mobile_share
+        .as_ref()
+        .filter(|share| !share.link.expired(crate::lifecycle::now()))
+    {
+        let (pixels, size) = share.pixels(s.artwork.device_scale());
+        card = card
+            .child(
+                row().w_full().center().child(
+                    el().key("mobile-pairing-qr")
+                        .role("img")
+                        .label("Phone pairing link. Scan with Shina on your phone.")
+                        .size(size, size)
+                        .pixels(&pixels),
+                ),
+            )
+            .child(
+                label(share.link.encode(), SMALL, p.ink)
+                    .key("mobile-pairing-link")
+                    .w_full()
+                    .wrap_anywhere()
+                    .selectable(true),
+            )
+            .child(label("One use. Expires after five minutes.", SMALL, p.muted).wrap())
+            .child(
+                row()
+                    .flex_wrap()
+                    .gap(8.0)
+                    .child(
+                        settings_ui::settings_button("mobile-pairing-copy", "Copy link", p, |_| {})
+                            .on_press_tx(|s: &mut State, tx| {
+                                if let Some(share) = &s.machines.mobile_share
+                                    && !share.link.expired(crate::lifecycle::now())
+                                {
+                                    tx.copy(share.link.encode());
+                                }
+                            }),
+                    )
+                    .child(settings_ui::settings_button(
+                        "mobile-pairing-hide",
+                        "Hide link",
+                        p,
+                        |s| s.machines.mobile_share = None,
+                    )),
+            );
+    } else {
+        card = card
+            .child(pixel_label("This computer's tailnet host", p.muted))
+            .child(
+                text_input(&s.machines.mobile_host, BODY)
+                    .key("mobile-pairing-host")
+                    .label("This computer's tailnet host")
+                    .placeholder("studio-mac", p.muted)
+                    .single_line()
+                    .w_full()
+                    .padding(8.0)
+                    .radius(6.0)
+                    .field_focus(&s.machines.mobile_host, p)
+                    .color(p.ink)
+                    .disabled(s.machines.pending.is_some())
+                    .on_edit(|s: &mut State| &mut s.machines.mobile_host),
+            )
+            .child(
+                settings_ui::settings_button(
+                    "mobile-pairing-create",
+                    "Create phone link",
+                    p,
+                    |s| s.machine_action("pair-mobile", ""),
+                )
+                .disabled(
+                    s.machines.pending.is_some() || s.machines.mobile_host.text.trim().is_empty(),
+                ),
+            );
+    }
+    card
+}
+
 /// Ported from KSG Code's settings/AddEnvironmentDialog and AuthorizedClientsSettings.
 fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     let busy = s.machines.pending.is_some();
@@ -14362,10 +14456,12 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                     s.settings_menu = false;
                     s.machines.code.replace_text("");
                     s.machines.peer_code.replace_text("");
+                    s.machines.mobile_share = None;
                     s.machines.notice = None;
                 })),
         );
     }
+    card = card.child(mobile_pairing_card(s, p)).child(rule(p));
     card=card.child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
         .child(pixel_label("Host",p.muted))
         .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
@@ -14631,6 +14727,7 @@ fn machine_dialog(s: &State, p: Palette) -> El {
             s.machines.dialog = false;
             s.machines.code.replace_text("");
             s.machines.peer_code.replace_text("");
+            s.machines.mobile_share = None;
             s.machines.notice = None;
         })
         .child(
@@ -16819,6 +16916,53 @@ pub(crate) mod tests {
                 clipboard.text().as_deref().map(|text| text.as_str()),
                 Some("- socket.open();\n  socket.on(\"reconnect\", reconnect);\n+ socket.open();")
             );
+        }
+    }
+
+    #[test]
+    fn phone_pairing_share_fits_copies_and_clears_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.machines.dialog = true;
+            rt.state.machines.mobile_host.replace_text("studio-mac");
+            rt.frame(0.0);
+            assert!(rt.presented("mobile-pairing-host").is_some());
+            assert!(rt.presented("mobile-pairing-create").is_some());
+            let link = crate::mobile_pairing::PairLink::new(
+                "studio-mac",
+                crate::peer::PORT,
+                uuid::Uuid::nil(),
+                crate::lifecycle::now() + 300_000,
+                "012345ABCDEF",
+            )
+            .unwrap();
+            let encoded = link.encode();
+            rt.state.machines.mobile_share = Some(crate::mobile_share::Share::new(link).unwrap());
+            let clipboard = rune::clipboard::memory();
+            rt.use_clipboard(&clipboard);
+            rt.invalidate();
+            rt.frame(0.25);
+            for key in [
+                "mobile-pairing-qr",
+                "mobile-pairing-link",
+                "mobile-pairing-copy",
+                "mobile-pairing-hide",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5);
+                assert!(rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5);
+            }
+            press(&mut rt, "mobile-pairing-copy");
+            assert_eq!(
+                clipboard.text().as_deref().map(|text| text.as_str()),
+                Some(encoded.as_str())
+            );
+            press(&mut rt, "mobile-pairing-hide");
+            assert!(rt.state.machines.mobile_share.is_none());
+            assert!(rt.find("mobile-pairing-qr").is_none());
+            assert!(rt.presented("mobile-pairing-create").is_some());
         }
     }
 

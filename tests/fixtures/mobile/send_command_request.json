@@ -1,0 +1,14 @@
+{
+  "id": "<uuid>",
+  "jsonrpc": "2.0",
+  "method": "thread.send",
+  "params": {
+    "args": {
+      "attachments": [],
+      "mode": "prompt",
+      "text": "history-stream-fixture",
+      "threadId": 1
+    },
+    "commandId": "<uuid>"
+  }
+}

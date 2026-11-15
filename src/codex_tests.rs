@@ -370,6 +370,79 @@ fn stopping_a_native_goal_pauses_it_and_unsolicited_turns_report_running() {
 }
 
 #[test]
+fn settled_turn_notifications_do_not_resettle_or_steal_a_new_turn() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    client.ready = true;
+    client.session = Some("fixture".into());
+    client
+        .command(json!({"type":"prompt","id":"a","message":"first"}))
+        .unwrap();
+    client
+        .notification("turn/started", &json!({"turn":{"id":"turn-a"}}))
+        .unwrap();
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn":{"id":"turn-a","status":"completed","items":[]}}),
+        )
+        .unwrap();
+    assert!(!client.running);
+    assert_eq!(client.turns.len(), 1);
+    let settles = |client: &Client| {
+        client
+            .events
+            .iter()
+            .filter(|r| r["type"] == "agent_settled")
+            .count()
+    };
+    assert_eq!(settles(&client), 1);
+
+    // A stale start for a settled turn is not a new run.
+    client
+        .notification("turn/started", &json!({"turn":{"id":"turn-a"}}))
+        .unwrap();
+    assert!(!client.running);
+    assert!(client.turn.is_none());
+
+    // A stale completion cannot settle the in-flight turn/start window.
+    client
+        .command(json!({"type":"prompt","id":"b","message":"second"}))
+        .unwrap();
+    assert!(client.running && client.turn.is_none());
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn":{"id":"turn-a","status":"completed","items":[]}}),
+        )
+        .unwrap();
+    assert!(client.running);
+    assert_eq!(settles(&client), 1);
+
+    // While the new turn runs, a delayed duplicate of the old completion is ignored.
+    client
+        .notification("turn/started", &json!({"turn":{"id":"turn-b"}}))
+        .unwrap();
+    client
+        .notification(
+            "turn/completed",
+            &json!({"turn":{"id":"turn-a","status":"completed","items":[]}}),
+        )
+        .unwrap();
+    assert_eq!(client.turn.as_deref(), Some("turn-b"));
+    assert_eq!(settles(&client), 1);
+
+    // A completion for a genuinely different live turn still fails.
+    assert!(
+        client
+            .notification(
+                "turn/completed",
+                &json!({"turn":{"id":"turn-c","status":"completed","items":[]}}),
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn native_working_directory_changes_invalidate_and_refresh_skills() {
     let mut client = Client::new(spec(SessionSource::New, "read-only"));
     client.ready = true;

@@ -1,0 +1,14 @@
+{
+  "id": "<uuid>",
+  "jsonrpc": "2.0",
+  "result": {
+    "commandId": "<uuid>",
+    "deviceId": "<uuid>",
+    "hash": "<hash>",
+    "result": {
+      "threadId": 1
+    },
+    "seq": "<seq>",
+    "status": "accepted"
+  }
+}

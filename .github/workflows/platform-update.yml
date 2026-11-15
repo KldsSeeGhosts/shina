@@ -68,6 +68,7 @@ jobs:
         if: inputs.checks
         run: |
           rustup component add rustfmt clippy
+          npm ci --prefix packages/mobile-client --include=dev --ignore-scripts
           cargo fmt --check
           cargo test --locked --quiet
           node --test tools/*.test.mjs
