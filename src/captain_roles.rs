@@ -701,4 +701,23 @@ mod tests {
             assert!(restored.restore_records(&snapshot, false).is_err());
         }
     }
+
+    #[test]
+    fn an_ordinary_new_draft_never_reuses_a_blank_independent_crew_root() {
+        let (mut state, _database) = fixture();
+        let crew = state.current().id;
+        state.current_mut().crew_captain = Some(0);
+        state.current_mut().captain = Some(0);
+        assert!(state.current().blank_draft());
+        state.create_thread_in(None, &[], &Value::Null);
+        assert_ne!(state.current().id, crew);
+        assert!(state.current().crew_captain.is_none());
+        let preserved = state
+            .threads
+            .iter()
+            .find(|thread| thread.id == crew)
+            .unwrap();
+        assert_eq!(preserved.crew_captain, Some(0));
+        assert_eq!(preserved.captain, Some(0));
+    }
 }

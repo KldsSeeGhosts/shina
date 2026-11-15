@@ -7386,6 +7386,7 @@ impl State {
             t.project == project
                 && !t.delegated
                 && !t.captain_home
+                && t.crew_captain.is_none()
                 && t.blank_draft()
                 && !occupied.contains(&t.id)
         });
