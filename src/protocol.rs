@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 28;
+pub const MINOR: u32 = 29;
+pub const CAPTAIN_STATE_MINOR: u32 = 29;
+pub const CAPTAIN_STATE: &str = "captain-state-v1";
+pub const CAPTAIN_STATE_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to manage captain crew state.";
 pub const MOBILE_PUSH_MINOR: u32 = 28;
 pub const MOBILE_PUSH: &str = "mobile-push-v1";
 pub const MOBILE_PUSH_UPDATE_REQUIRED: &str =
@@ -221,7 +225,10 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "vcs.listWorktrees"
         | "review.getBranchCommits"
         | "review.getDiffPreview"
-        | "review.getDiffFileContents" => "read",
+        | "review.getDiffFileContents"
+        | "captain.read"
+        | "captain.document.read"
+        | "captain.crew.list" => "read",
         "request.respond" | "thread.user-input.dismiss" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
@@ -298,7 +305,11 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "uploads.write"
         | "vcs.createWorktree"
         | "vcs.removeWorktree"
-        | "vcs.runSetup" => "operate",
+        | "vcs.runSetup"
+        | "captain.document.write"
+        | "captain.crew.join"
+        | "captain.crew.release"
+        | "captain.crew.move" => "operate",
         _ => return None,
     })
 }
@@ -693,7 +704,10 @@ mod tests {
                 | "vcs.listWorktrees"
                 | "review.getBranchCommits"
                 | "review.getDiffPreview"
-                | "review.getDiffFileContents" => "read",
+                | "review.getDiffFileContents"
+                | "captain.read"
+                | "captain.document.read"
+                | "captain.crew.list" => "read",
                 "request.respond" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"

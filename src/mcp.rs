@@ -24,7 +24,7 @@ pub const TOKEN_ENV: &str = "SHINA_MCP_TOKEN";
 
 /// What every harness is told about Shina. The Pi bridge adds it to the system prompt; other
 /// MCP clients receive it as the server's `instructions`.
-pub const INSTRUCTIONS: &str = "## Shina
+pub const INSTRUCTIONS: &str = concat!("## Shina
 
 You are running inside Shina, a native desktop workspace where the user chats with coding agents. \
 Each conversation is a Shina thread. A captain is the assistant with one continuous primary home, \
@@ -107,7 +107,8 @@ For select, send one listed option exactly. Confirmations always require the use
 the user's conversations and crew. list_threads defaults to the caller's project. Pass \
 allProjects:true to include other projects and project-less chats. Both list_threads and read_thread \
 accept machine from orchestrator_capabilities.peers. Ids belong to the named machine. \
-Read a thread before you answer a question about it.";
+Read a thread before you answer a question about it.",
+    "\n\nCaptain crew and planning state:\n- A crew membership is independent of a task attempt. Joining or leaving a crew does not erase a conversation, task history, or pull requests.\n- Use captain_read and captain_crew_list to inspect a Captain and its crew. Use captain_document_read and captain_document_write for AGENTS.md, CREW.md, NOTES.md, and DIGEST.md. Writes require the revision returned by a read; on a conflict, read again and preserve intervening changes.\n- Only the primary Captain home may change its coordination rules, plan, digest, or crew membership through agent tools. Crew threads may read CREW.md, NOTES.md and DIGEST.md but may not read the Captain's private AGENTS.md through those tools. User controls in Shina remain available separately.\n- Use captain_crew_join to recruit an eligible existing thread and captain_crew_release to release a crew thread. These do not authorize a tool or change repository permissions. Busy threads must be stopped before changing their membership.\n- Earlier Captain conversations are records, not active coordinators. Never use them to recruit crew or change Captain planning state. Resetting a Captain home preserves its crew and documents.\n");
 
 const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
 
@@ -395,6 +396,42 @@ pub fn tools() -> Value {
             "name":"propose_memory",
             "description":"Workers may stage a memory suggestion for their captain's next task completion message. This does not write captain memory.",
             "inputSchema":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":500}},"required":["text"],"additionalProperties":false}
+        },
+        {
+            "name":"captain_read",
+            "description":"Read a Captain's profile, workspace scope, lifecycle state, crew membership, document revisions and digest. Omit captain to inspect the caller's Captain. This does not wake a thread.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
+        },
+        {
+            "name":"captain_document_read",
+            "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]}},"required":["name"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
+        },
+        {
+            "name":"captain_document_write",
+            "description":"Replace one of the primary Captain's planning documents after reading it. Supply its current expectedRevision to prevent lost updates. Preserve existing user instructions. This writes Captain state, not repository files, and does not grant repository write access.",
+            "inputSchema":{"type":"object","properties":{"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]},"text":{"type":"string","maxLength":65536},"expectedRevision":{"type":"integer","minimum":0}},"required":["name","text","expectedRevision"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_list",
+            "description":"Read the independent threads in a Captain's crew, including their execution state, questions, machine placement and task references. Membership survives completed turns and Captain conversation resets. This does not wake a thread.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_join",
+            "description":"Recruit an existing idle root thread into the calling primary Captain's crew. The thread must be in the Captain's workspace scope and cannot be another Captain or an ordinary delegated subagent. Recruitment preserves its history, machine, model and task records. Use the user controls to move a thread already owned by another Captain.",
+            "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_release",
+            "description":"Release an idle thread from the calling primary Captain's crew without deleting its conversation, files or historical task records. A running or queued attempt must stop before its thread can leave. Released threads no longer send new crew reports to this Captain.",
+            "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
         }
     ]);
     tools
@@ -1137,6 +1174,59 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
             let parsed = crate::model::parse_delegation_target(&json!({ "target": target }))
                 .unwrap_or_else(|err| panic!("parser rejected {target}: {err}"));
             assert!(parsed.is_some());
+        }
+    }
+
+    #[test]
+    fn captain_tools_match_the_approved_contract() {
+        let expected = json!([
+            {
+                "name":"captain_read",
+                "description":"Read a Captain's profile, workspace scope, lifecycle state, crew membership, document revisions and digest. Omit captain to inspect the caller's Captain. This does not wake a thread.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name":"captain_document_read",
+                "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]}},"required":["name"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name":"captain_document_write",
+                "description":"Replace one of the primary Captain's planning documents after reading it. Supply its current expectedRevision to prevent lost updates. Preserve existing user instructions. This writes Captain state, not repository files, and does not grant repository write access.",
+                "inputSchema":{"type":"object","properties":{"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]},"text":{"type":"string","maxLength":65536},"expectedRevision":{"type":"integer","minimum":0}},"required":["name","text","expectedRevision"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_list",
+                "description":"Read the independent threads in a Captain's crew, including their execution state, questions, machine placement and task references. Membership survives completed turns and Captain conversation resets. This does not wake a thread.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_join",
+                "description":"Recruit an existing idle root thread into the calling primary Captain's crew. The thread must be in the Captain's workspace scope and cannot be another Captain or an ordinary delegated subagent. Recruitment preserves its history, machine, model and task records. Use the user controls to move a thread already owned by another Captain.",
+                "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_release",
+                "description":"Release an idle thread from the calling primary Captain's crew without deleting its conversation, files or historical task records. A running or queued attempt must stop before its thread can leave. Released threads no longer send new crew reports to this Captain.",
+                "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            }
+        ]);
+        let published = tools();
+        for tool in expected.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let found = published
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert_eq!(found, tool, "{name} drifted from the contract");
         }
     }
 }

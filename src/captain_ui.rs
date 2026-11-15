@@ -8,13 +8,13 @@
 //! active 8 %, hairlines at 10 % ink, motion of 0.18 s on `cubic-bezier(.23, 1, .32, 1)`.
 use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, motion, solid_button};
 use super::*;
-use crate::model::{BackgroundStatus, MemoryView, UserProfile};
+use crate::model::{BackgroundStatus, MemoryView, UserProfile, status_word};
 use crate::power::KeepAwake;
 use crate::routines::{RoutineView, Schedule};
 use rune::Transition;
 
 /// The Brief's width beside the chat, as KSG's right panel.
-const PANEL_WIDTH: f32 = 320.0;
+pub(super) const PANEL_WIDTH: f32 = 320.0;
 /// Below this window width (ui.rs's `narrow`) the Brief is a sheet over the chat.
 const SHEET_BELOW: f32 = 1050.0;
 /// Rows, chips and inputs share this corner.
@@ -71,7 +71,7 @@ fn close_brief(s: &mut State) {
 }
 
 /// A 24 px icon action, as KSG's `THREAD_DETAILS_PANEL_ICON_ACTION_CLASS` (`size-6 rounded-md`).
-fn icon_action(
+pub(super) fn icon_action(
     s: &State,
     key: String,
     title: &str,
@@ -166,7 +166,7 @@ fn section(key: &str, title: &str, meta: Option<String>, actions: Vec<El>, p: Pa
         .child(heading)
 }
 
-fn quiet_note(text: impl Into<String>, p: Palette) -> El {
+pub(super) fn quiet_note(text: impl Into<String>, p: Palette) -> El {
     label(text, META, p.muted).wrap().px(10.0).py(4.0)
 }
 
@@ -178,6 +178,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
     let Some(captain) = brief_captain(s) else {
         return el();
     };
+    let access = s.captain_access(captain);
     let profile = &s.captains[captain];
     let header = row()
         .key("captain-brief-header")
@@ -272,14 +273,23 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 )),
         );
     }
+    // A host without captain records or the protocol cannot know the new sections, so
+    // they stay hidden rather than drawing empty state.
+    let knowable = !matches!(
+        access,
+        crate::model::CaptainAccess::UpdateRequired | crate::model::CaptainAccess::NoRecords
+    );
     let sections = [
-        scope_section(s, p, captain),
-        memory_section(s, p, captain),
-        routines_section(s, p, captain),
-        earlier_section(s, p, captain),
-        reset_section(s, p, captain),
+        knowable.then(|| digest_section(s, p, captain)),
+        knowable.then(|| crew_section(s, p, captain)),
+        knowable.then(|| documents_section(s, p, captain)),
+        Some(scope_section(s, p, captain)),
+        Some(memory_section(s, p, captain)),
+        Some(routines_section(s, p, captain)),
+        Some(earlier_section(s, p, captain)),
+        Some(reset_section(s, p, captain)),
     ];
-    for section in sections {
+    for section in sections.into_iter().flatten() {
         body = body
             .child(el().h(1.0).mx(16.0).fill(hairline(p)))
             .child(section);
@@ -293,6 +303,15 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         .child(header)
         // The same closing rule as the chat header, so one line runs across the pane.
         .child(rule(p).key("brief-header-rule"))
+        .children(
+            super::crew_membership_ui::access_reason(access).map(|reason| {
+                label(reason, META, p.muted)
+                    .key("brief-captain-state-notice")
+                    .wrap()
+                    .px(16.0)
+                    .py(6.0)
+            }),
+        )
         .child(
             col()
                 .grow(1.0)
@@ -464,6 +483,425 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
     section
 }
 
+/// The digest row: a bounded twelve-line markdown preview of the captain's DIGEST.md and a
+/// button that opens the document tab. The document is only read on demand.
+fn digest_section(s: &State, p: Palette, captain: usize) -> El {
+    let meta = s
+        .captain_document_meta(captain)
+        .into_iter()
+        .find(|meta| meta.name == "DIGEST.md");
+    let empty = meta.as_ref().is_none_or(|meta| meta.bytes == 0);
+    let age = meta
+        .as_ref()
+        .filter(|meta| meta.bytes > 0)
+        .and_then(|meta| relative_time(meta.updated_at / 1000));
+    let expected = s.machines.selected.clone();
+    let open = ghost_button(s, "brief-digest-open".into(), "Open digest", p, move |s| {
+        if s.machines.selected == expected {
+            open_captain_document(s, captain, "DIGEST.md");
+        }
+    });
+    let mut section = section("brief-digest", "Digest", age, vec![open], p);
+    if empty {
+        section = section.child(
+            quiet_note(
+                format!(
+                    "No digest yet. {} writes a summary of its crew's work here.",
+                    s.captains
+                        .get(captain)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or("The captain")
+                ),
+                p,
+            )
+            .key("brief-digest-empty"),
+        );
+        return section;
+    }
+    let (_, _, text) = s.captain_document_body(captain, "DIGEST.md");
+    let preview: String = text.lines().take(12).collect::<Vec<_>>().join("\n");
+    section = section.child(
+        el().key("brief-digest-preview")
+            .px(10.0)
+            .py(4.0)
+            // Twelve lines at the reading size; long wrapped lines clip at the bound.
+            .max_h(12.0 * 16.0)
+            .clip_fade_linear(0.0, 0.0, 0.0, 16.0)
+            .child(super::markdown_ui::render_with_find(
+                &preview,
+                p,
+                s.dark,
+                false,
+                false,
+                false,
+                "brief-digest-markdown",
+                None,
+            )),
+    );
+    section
+}
+
+/// Open a Captain document's tab on the captain's home panel, closing the sheet first on
+/// a window too narrow to keep both visible. From an earlier conversation of that same
+/// Captain the tab opens on this thread's panel so it is actually visible and read only;
+/// the earlier view does not jump to the primary home.
+fn open_captain_document(s: &mut State, captain: usize, name: &str) {
+    if s.viewport_width < SHEET_BELOW {
+        close_brief(s);
+    }
+    let earlier = s.captain_access(captain) == crate::model::CaptainAccess::Earlier;
+    let key = if earlier {
+        s.panel_key()
+    } else {
+        match s.captain_home(captain) {
+            Some(home) => crate::right_panel::key(&s.machines.selected, home),
+            None => return,
+        }
+    };
+    s.right_panels.open_captain_document(&key, captain, name);
+}
+
+/// Planning documents, in the row style of Shina's `earlier_section` entries: a pressable
+/// row per file that opens its right-panel tab. Row order and contents follow the section
+/// structure of KSG's `ThreadDetailsSection`.
+fn documents_section(s: &State, p: Palette, captain: usize) -> El {
+    let mut rows = col().gap(2.0);
+    for name in ["NOTES.md", "AGENTS.md", "CREW.md"] {
+        let meta = s
+            .captain_document_meta(captain)
+            .into_iter()
+            .find(|meta| meta.name == name)
+            .unwrap_or(crate::model::CaptainDocumentMeta {
+                name: name.to_string(),
+                revision: 0,
+                updated_at: 0,
+                bytes: 0,
+            });
+        let title = super::captain_docs_ui::document_title(name);
+        let key = crate::model::DocumentDraftKey {
+            server: s.machines.selected.clone(),
+            captain,
+            name: name.to_string(),
+        };
+        let draft = s.captain_drafts.get(&key);
+        let saving =
+            draft.is_some_and(|d| matches!(d.state, crate::model::DraftState::Saving { .. }));
+        let dirty = draft.is_some_and(|d| {
+            !matches!(d.state, crate::model::DraftState::Saving { .. })
+                && d.text.text != d.base_text
+        });
+        let age = if meta.bytes == 0 {
+            "Empty".to_string()
+        } else {
+            relative_time(meta.updated_at / 1000).unwrap_or_default()
+        };
+        let glyph = if name == "AGENTS.md" { "lock" } else { "file" };
+        let help = super::captain_docs_ui::sharing_note(name);
+        let mut title_line = row()
+            .gap(6.0)
+            .center_y()
+            .min_w(0.0)
+            .child(label(title, ROW_TEXT, p.ink).truncate().min_w(0.0));
+        if name == "AGENTS.md" {
+            title_line = title_line.child(outlined(
+                el().h(16.0).px(5.0).center().radius(3.0).child(label(
+                    "Private",
+                    PIXEL_LABEL,
+                    p.muted,
+                )),
+                p,
+            ));
+        }
+        let mut file_line = row().gap(8.0).center_y().min_w(0.0).child(label(
+            name.to_string(),
+            PIXEL_LABEL,
+            p.faint,
+        ));
+        if dirty {
+            file_line = file_line.child(
+                el().size(6.0, 6.0)
+                    .fill(p.coral)
+                    .radius(0.0)
+                    .key(format!("brief-document-draft-{name}")),
+            );
+        }
+        if saving {
+            file_line = file_line.child(label("Saving", PIXEL_LABEL, p.muted));
+        }
+        file_line = file_line.child(
+            label(age.clone(), PIXEL_LABEL, p.muted)
+                .truncate()
+                .min_w(0.0),
+        );
+        let expected = s.machines.selected.clone();
+        rows = rows.child(
+            row()
+                .key(format!("brief-document-{name}"))
+                .role("button")
+                .label(match (dirty, saving) {
+                    (true, _) => format!("{title}, {name}, {age}, unsaved draft"),
+                    _ => format!("{title}, {name}, updated {age}"),
+                })
+                .help(help)
+                .cursor(rune::Cursor::Pointer)
+                .focusable(true)
+                .px(10.0)
+                .min_h(44.0)
+                .center_y()
+                .gap(8.0)
+                .radius(4.0)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .hover_motion(motion(), motion())
+                .on_press(move |s: &mut State| {
+                    if s.machines.selected == expected {
+                        open_captain_document(s, captain, name);
+                    }
+                })
+                .child(icon(glyph, p.muted))
+                .child(
+                    col()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(2.0)
+                        .child(title_line)
+                        .child(file_line),
+                ),
+        );
+    }
+    section("brief-documents", "Plan and rules", None, vec![], p).child(rows)
+}
+
+/// The canonical crew, in the row structure of Shina's `earlier_section`: a pressable row
+/// per member that opens the thread, a status mark, and a More menu with the real blockers.
+/// Pending membership changes show their in-flight word; membership itself always comes
+/// from the projection. Crew membership has no KSG equivalent.
+fn crew_section(s: &State, p: Palette, captain: usize) -> El {
+    let access = s.captain_access(captain);
+    let full = access == crate::model::CaptainAccess::Full;
+    if access == crate::model::CaptainAccess::NoRecords {
+        return section("brief-crew", "Crew", None, vec![], p)
+            .child(quiet_note(format!("Loading from {}.", machine_label(s)), p));
+    }
+    let mut rows = col().gap(2.0);
+    let mut members = s.captain_crew(captain);
+    // Pending joins on this server appear as crew rows without touching canonical
+    // membership; pending moves/releases keep their rows too.
+    let pending: Vec<(usize, crate::model::CrewKind)> = s
+        .crew_pending
+        .iter()
+        .filter(|((server, _), change)| *server == s.machines.selected && change.captain == captain)
+        .map(|(_, change)| (change.thread, change.kind))
+        .collect();
+    for (thread, kind) in &pending {
+        if matches!(kind, crate::model::CrewKind::Join) && !members.contains(thread) {
+            members.push(*thread);
+        }
+    }
+    members.sort_by(|a, b| {
+        let rank = |id: &usize| {
+            s.threads.iter().find(|t| t.id == *id).map_or(3, |thread| {
+                if thread.request.is_some() {
+                    0
+                } else if thread.status.busy() {
+                    1
+                } else {
+                    2
+                }
+            })
+        };
+        rank(a).cmp(&rank(b)).then_with(|| {
+            let ua = s
+                .threads
+                .iter()
+                .find(|t| t.id == *a)
+                .map_or(0, |t| t.updated);
+            let ub = s
+                .threads
+                .iter()
+                .find(|t| t.id == *b)
+                .map_or(0, |t| t.updated);
+            ub.cmp(&ua)
+        })
+    });
+    members.dedup();
+    let machines = s.peers.len() > 0;
+    for id in members.clone() {
+        let Some(index) = s.threads.iter().position(|t| t.id == id) else {
+            // The source thread can vanish (remote reset, archive) while its join is
+            // still pending; keep the command for its receipt and show a quiet row.
+            if pending.iter().any(|(thread, _)| *thread == id) {
+                rows = rows.child(
+                    label("Joining, but the thread is no longer here.", META, p.faint)
+                        .key(format!("brief-crew-{id}"))
+                        .px(10.0)
+                        .min_h(28.0),
+                );
+            }
+            continue;
+        };
+        let thread = &s.threads[index];
+        let title = if thread.title.is_empty() {
+            "Untitled".to_string()
+        } else {
+            thread.title.clone()
+        };
+        let pending_word = pending
+            .iter()
+            .find(|(thread, _)| *thread == id)
+            .map(|(_, kind)| match kind {
+                crate::model::CrewKind::Join => "Joining",
+                crate::model::CrewKind::Release => "Leaving",
+                crate::model::CrewKind::Move { .. } => "Moving",
+            });
+        let workspace = thread
+            .project
+            .and_then(|project| s.project(Some(project)))
+            .map(|project| project.name.clone())
+            .unwrap_or_default();
+        let mut meta = row().gap(8.0).center_y();
+        if let Some(word) = pending_word {
+            meta = meta.child(label(word, PIXEL_LABEL, p.muted));
+        } else {
+            meta = meta.child(label(
+                status_word(thread.status),
+                PIXEL_LABEL,
+                status_ink(thread.status, p),
+            ));
+        }
+        meta = meta.child(label(workspace, META, p.muted).truncate().min_w(0.0));
+        if machines && thread.machine != "local" {
+            meta = meta.child(label(thread.machine.clone(), META, p.faint));
+        }
+        let more_key = format!("brief-crew-more-{id}");
+        let open_server = s.machines.selected.clone();
+        let more_server = open_server.clone();
+        let mut row_ = row()
+            .key(format!("brief-crew-{id}"))
+            .role("button")
+            .label(format!("{title}, {}", status_word(thread.status)))
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .hover_group()
+            .px(10.0)
+            .min_h(44.0)
+            .center_y()
+            .gap(8.0)
+            .radius(4.0)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+            .on_press(move |s: &mut State| {
+                if s.machines.selected != open_server {
+                    return;
+                }
+                if s.viewport_width < SHEET_BELOW {
+                    close_brief(s);
+                }
+                if let Some(index) = s.threads.iter().position(|t| t.id == id) {
+                    s.select_thread(index);
+                }
+            })
+            .child(super::crew_ui::mark_slot(thread.status, p))
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(label(title.clone(), ROW_TEXT, p.ink).truncate())
+                    .child(el().px(14.0).child(meta)),
+            );
+        if let Some(_) = pending_word {
+            row_ = row_.child(
+                icon_action(
+                    s,
+                    more_key,
+                    &format!("Waiting for {} to confirm.", machine_label(s)),
+                    icon("more", p.faint),
+                    p,
+                    |_| {},
+                )
+                .disabled(true),
+            );
+        } else if full {
+            row_ = row_.child(
+                icon_action(
+                    s,
+                    more_key,
+                    &format!("Crew actions for {title}"),
+                    icon("more", p.muted),
+                    p,
+                    move |s| {
+                        if s.machines.selected == more_server {
+                            s.brief.more = Some(id);
+                        }
+                    },
+                )
+                .group_opacity(0.0, 1.0),
+            );
+        }
+        rows = rows.child(row_);
+    }
+    if members.is_empty() {
+        rows = rows.child(quiet_note(
+            if s.captain_scope(captain).is_empty() && s.remote_captain_scope(captain).is_empty() {
+                "No crew yet. Recruit an idle thread that has no workspace."
+            } else {
+                "No crew yet. Recruit an idle thread from this captain's workspaces."
+            },
+            p,
+        ));
+    }
+    if let Some(error) = s.crew_errors.get(&s.machines.selected) {
+        rows = rows.child(
+            quiet_note(error.clone(), p)
+                .key("brief-crew-error")
+                .color(p.danger),
+        );
+    }
+    let recruit_server = s.machines.selected.clone();
+    let actions = if full {
+        vec![ghost_button(
+            s,
+            "brief-crew-recruit".into(),
+            "Recruit...",
+            p,
+            move |s| {
+                if s.machines.selected != recruit_server
+                    || s.captain_access(captain) != crate::model::CaptainAccess::Full
+                {
+                    return;
+                }
+                s.brief.recruit = Some(crate::model::RecruitPicker {
+                    server: recruit_server.clone(),
+                    captain,
+                    query: rune::TextEdit::default(),
+                });
+            },
+        )]
+    } else {
+        vec![]
+    };
+    section(
+        "brief-crew",
+        "Crew",
+        Some(members.len().to_string()),
+        actions,
+        p,
+    )
+    .child(rows)
+}
+
+fn machine_label(s: &State) -> String {
+    if s.machines.selected == "local" {
+        return "this machine".into();
+    }
+    s.peers
+        .iter()
+        .find(|peer| peer.server_id == s.machines.selected)
+        .map(|peer| peer.label.clone())
+        .unwrap_or_else(|| s.machines.selected.clone())
+}
+
 /// Bytes the essential records take in context, and how many do not fit. memory.rs keeps
 /// whole records in stored order and skips any that would cross the budget.
 fn essential_usage(memories: &[MemoryView]) -> (usize, usize) {
@@ -541,8 +979,6 @@ fn budget_meter(memories: &[MemoryView], p: Palette) -> El {
     meter
 }
 
-/// Reserved for the memory backend's one-line status (another change adds
-/// `State::memory_backend_status`). Nothing is shown until it exists.
 /// One quiet line about learned memory (Honcho). Nothing shows while it is disabled.
 fn memory_backend_line(s: &State) -> Option<String> {
     use crate::model::MemoryBackendStatus as M;
@@ -1794,10 +2230,14 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
 
 /// Dialogs this module owns, mounted above everything else in the window.
 pub(super) fn dialogs(s: &State, p: Palette) -> Vec<El> {
-    [reset_dialog(s, p), profile_dialog(s, p)]
-        .into_iter()
-        .flatten()
-        .collect()
+    [
+        reset_dialog(s, p),
+        profile_dialog(s, p),
+        super::captain_docs_ui::discard_dialog(s, p),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 #[cfg(test)]
@@ -1825,6 +2265,14 @@ mod tests {
         rt.pointer_up(x, y);
         rt.frame(0.0);
     }
+    fn tap(rt: &mut Runtime<State>, key: rune::Key) {
+        rt.key(rune::KeyEvent {
+            key,
+            mods: Default::default(),
+        });
+        rt.frame(0.0);
+        rt.frame(1.0);
+    }
     /// Scroll the Brief to its end, as a wheel over the panel does.
     fn scroll_brief(rt: &mut Runtime<State>) {
         let (panel, _) = rt.presented("captain-brief").unwrap();
@@ -1836,6 +2284,26 @@ mod tests {
             && inner[1] >= outer[1] - 0.5
             && inner[0] + inner[2] <= outer[0] + outer[2] + 0.5
             && inner[1] + inner[3] <= outer[1] + outer[3] + 0.5
+    }
+
+    /// A store-backed captain home on a temp dir, so documents and crew really save.
+    fn store_runtime(width: f32) -> Runtime<State> {
+        let dir = std::env::temp_dir().join(format!(
+            "shina-brief-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = State::new(dir, false);
+        state.load_global_for_test();
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        Runtime::with_text(
+            state,
+            view,
+            (width, 840.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        )
     }
 
     /// A demo captain home with scope, memory and one routine, and the Brief open.
@@ -1929,6 +2397,7 @@ mod tests {
     fn memory_rows_pin_edit_and_delete_through_the_state_api() {
         for width in WIDTHS {
             let (mut rt, _) = brief_runtime(width);
+            scroll_brief(&mut rt);
             let memories = rt.state.memories(0);
             let release = memories.iter().find(|m| !m.essential).unwrap().id.clone();
             press(&mut rt, &format!("memory-pin-{release}"));
@@ -1948,6 +2417,7 @@ mod tests {
             );
             press(&mut rt, &format!("memory-delete-{release}"));
             assert_eq!(rt.state.memories(0).len(), 1, "{width}");
+            scroll_brief(&mut rt);
             press(&mut rt, "brief-memory-add");
             rt.state.brief.draft.replace_text("Use British spelling.");
             press(&mut rt, "save-memory");
@@ -2001,6 +2471,7 @@ mod tests {
         assert_eq!(next_run_words(1_000 + 50 * 3600, 1_000), "in 2d");
         for width in WIDTHS {
             let (mut rt, routine) = brief_runtime(width);
+            scroll_brief(&mut rt);
             press(&mut rt, &format!("routine-pause-{routine}"));
             assert!(rt.state.routines(0)[0].paused, "{width}");
             press(&mut rt, &format!("routine-pause-{routine}"));
@@ -2014,6 +2485,7 @@ mod tests {
     fn a_switch_is_on_at_the_right_in_coral_and_off_at_the_left_in_both_themes() {
         for dark in [false, true] {
             let (mut rt, routine) = brief_runtime(1280.0);
+            scroll_brief(&mut rt);
             rt.state.dark = dark;
             rt.invalidate();
             rt.frame(1.0);
@@ -2268,5 +2740,520 @@ mod tests {
                 assert!(rt.state.background_settings().keep_working, "{width}");
             }
         }
+    }
+    #[test]
+    fn digest_crew_and_document_rows_stay_inside_the_brief() {
+        for width in WIDTHS {
+            let (mut rt, _) = brief_runtime(width);
+            let (panel, _) = rt.presented("captain-brief").expect("brief is shown");
+            for key in [
+                "brief-digest",
+                "brief-digest-open",
+                "brief-crew",
+                "brief-crew-recruit",
+                "brief-documents",
+                "brief-document-NOTES.md",
+                "brief-document-AGENTS.md",
+                "brief-document-CREW.md",
+            ] {
+                // Rows below the fold mount as the panel scrolls; every mounted row
+                // must sit fully inside the Brief.
+                let mut rect = None;
+                for _ in 0..12 {
+                    if let Some((found, _)) = rt.presented(key) {
+                        rect = Some(found);
+                        break;
+                    }
+                    scroll_brief(&mut rt);
+                }
+                let rect = rect.unwrap_or_else(|| panic!("{key} at {width}"));
+                assert!(
+                    inside(panel, rect),
+                    "{key} at {width}: {rect:?} outside {panel:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_panel_covers_the_chat_up_to_1280_and_sits_inline_at_1920() {
+        // The panel is a sheet over the conversation wherever the chat column cannot
+        // spare 720 px for both (620 outright, 1280 with the Brief docked).
+        for width in [620.0, 1280.0] {
+            let mut rt = store_runtime(width);
+            rt.state.show_activity = true;
+            press(&mut rt, "brief-document-NOTES.md");
+            rt.frame(0.0);
+            let (doc, _) = rt
+                .presented("captain-doc-panel")
+                .unwrap_or_else(|| panic!("document open at {width}"));
+            let (main, _) = rt
+                .presented("chat-main")
+                .unwrap_or_else(|| panic!("chat at {width}"));
+            assert!(
+                doc[0] <= main[0] + 2.0 && doc[0] + doc[2] >= main[0] + main[2] - 2.0,
+                "{width}: doc {doc:?} does not cover chat {main:?}"
+            );
+        }
+        // At 960 and 1920 the column fits an inline panel and keeps its 360 px floor.
+        for width in [960.0, 1920.0] {
+            let mut rt = store_runtime(width);
+            rt.state.show_activity = true;
+            press(&mut rt, "brief-document-NOTES.md");
+            rt.frame(0.0);
+            let (doc, _) = rt
+                .presented("captain-doc-panel")
+                .unwrap_or_else(|| panic!("document open at {width}"));
+            let (main, _) = rt
+                .presented("chat-main")
+                .unwrap_or_else(|| panic!("chat at {width}"));
+            assert!(
+                doc[0] >= main[0] + main[2] - 1.0,
+                "{width}: doc {doc:?} should sit beside chat {main:?}"
+            );
+            assert!(
+                main[2] >= crate::right_panel::MIN_WIDTH - 0.5,
+                "{width}: chat main {main:?} narrower than the floor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_crew_member_thread_shows_the_crew_bar_with_open_and_leave() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        rt.state.set_captain_scope(0, vec![1]).unwrap();
+        let thread_id = rt.state.next_id;
+        rt.state.next_id += 1;
+        let mut member = Thread::new(thread_id);
+        member.title = "Crew member".into();
+        member.project = Some(1);
+        member.crew_captain = Some(0);
+        rt.state.threads.push(member);
+        rt.state.select_thread(rt.state.threads.len() - 1);
+        rt.frame(0.25);
+        let (bar, _) = rt.presented("crew-bar").expect("crew bar");
+        assert!(rt.presented("crew-bar-open-captain").is_some());
+        press(&mut rt, "crew-bar-more");
+        rt.frame(0.25);
+        for key in ["crew-menu-move", "crew-bar-leave"] {
+            let (rect, _) = rt.presented(key).unwrap_or_else(|| panic!("{key}"));
+            assert!(rect[1] >= bar[1], "{key} above the bar");
+        }
+        // Leave calls the same release path the Brief's menu uses.
+        press(&mut rt, "crew-bar-leave");
+        rt.frame(0.25);
+        assert_eq!(rt.state.threads.last().unwrap().crew_captain, None);
+        assert!(rt.presented("crew-bar").is_none());
+    }
+
+    #[test]
+    fn the_recruit_palette_groups_eligible_rows_and_shows_full_reasons() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        rt.state.show_activity = true;
+        rt.state.set_captain_scope(0, vec![1]).unwrap();
+        let next = rt.state.next_id;
+        let joinable = {
+            let mut t = Thread::new(next);
+            t.title = "Joinable thread".into();
+            t.project = Some(1);
+            t.session = Some("session".into());
+            t.never_sent = false;
+            rt.state.threads.push(t);
+            next
+        };
+        let out_of_scope = {
+            let mut t = Thread::new(next + 1);
+            t.title = "Outside thread".into();
+            t.project = Some(99);
+            t.session = Some("session".into());
+            t.never_sent = false;
+            rt.state.threads.push(t);
+            next + 1
+        };
+        rt.state.next_id += 2;
+        press(&mut rt, "brief-crew-recruit");
+        rt.frame(0.25);
+        assert!(rt.presented("crew-recruit-palette").is_some());
+        assert!(rt.presented("crew-recruit-can").is_some());
+        assert!(rt.presented("crew-recruit-cannot").is_some());
+        // The unavailable row keeps its whole reason instead of truncating to 34 px.
+        let (reason, _) = rt
+            .presented(&format!("crew-recruit-reason-{out_of_scope}"))
+            .expect("reason line");
+        assert!(reason[3] > 14.0, "reason wraps: {reason:?}");
+        assert!(rt.presented(&format!("crew-recruit-{joinable}")).is_some());
+        std::fs::remove_dir_all(&rt.state.data_dir).ok();
+    }
+
+    #[test]
+    fn a_saving_document_does_not_render_conflict_actions_for_its_new_revision() {
+        let mut rt = store_runtime(1280.0);
+        rt.state.show_activity = true;
+        press(&mut rt, "brief-document-NOTES.md");
+        press(&mut rt, "captain-doc-edit");
+        let key = crate::model::DocumentDraftKey {
+            server: "local".into(),
+            captain: 0,
+            name: "NOTES.md".into(),
+        };
+        let command_id = uuid::Uuid::new_v4();
+        let draft = rt.state.captain_drafts.get_mut(&key).unwrap();
+        draft.text.replace_text("Pending plan");
+        draft.state = crate::model::DraftState::Saving {
+            command: command_id,
+        };
+        rt.state.seed_captain_document(
+            0,
+            "NOTES.md",
+            crate::model::CaptainDocument {
+                text: "Pending plan".into(),
+                revision: 1,
+                updated_at: crate::lifecycle::now(),
+            },
+        );
+        rt.frame(1.0);
+        assert!(rt.presented("captain-doc-status").is_some());
+        assert!(rt.presented("captain-doc-text").is_some());
+        for action in [
+            "captain-doc-conflict",
+            "captain-doc-conflict-theirs",
+            "captain-doc-conflict-replace",
+            "captain-doc-conflict-discard",
+        ] {
+            assert!(rt.presented(action).is_none(), "{action} while Saving");
+        }
+        press(&mut rt, "captain-doc-cancel");
+        assert!(rt.state.doc_discard.is_none());
+        assert!(matches!(
+            rt.state.captain_drafts[&key].state,
+            crate::model::DraftState::Saving { command } if command == command_id
+        ));
+    }
+
+    #[test]
+    fn editing_a_document_saves_through_the_panel_and_conflicts_keep_the_draft() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        press(&mut rt, "open-brief");
+        rt.frame(1.0);
+        press(&mut rt, "brief-document-NOTES.md");
+        rt.frame(0.5);
+        press(&mut rt, "captain-doc-edit");
+        rt.frame(0.5);
+        let key = crate::model::DocumentDraftKey {
+            server: "local".into(),
+            captain: 0,
+            name: "NOTES.md".into(),
+        };
+        assert!(rt.state.captain_drafts.contains_key(&key));
+        assert!(rt.presented("captain-doc-text").is_some());
+        assert!(rt.presented("captain-doc-save").is_some());
+        rt.state
+            .captain_drafts
+            .get_mut(&key)
+            .unwrap()
+            .text
+            .replace_text("Ship .20 on Friday.\n");
+        press(&mut rt, "captain-doc-save");
+        rt.frame(0.0);
+        assert!(
+            !rt.state.captain_drafts.contains_key(&key),
+            "local save closes"
+        );
+        let doc = rt.state.captain_document_value(0, "NOTES.md").unwrap();
+        assert_eq!(doc["text"], "Ship .20 on Friday.\n");
+        assert_eq!(doc["revision"], 1);
+        press(&mut rt, "captain-doc-edit");
+        rt.state
+            .captain_drafts
+            .get_mut(&key)
+            .unwrap()
+            .text
+            .replace_text("Mine.");
+        rt.state
+            .captain_document_write(0, "NOTES.md", "Theirs.".into(), 1)
+            .unwrap();
+        press(&mut rt, "captain-doc-save");
+        assert!(matches!(
+            rt.state.captain_drafts[&key].state,
+            crate::model::DraftState::Conflict { .. }
+        ));
+        assert!(rt.presented("captain-doc-conflict").is_some());
+        press(&mut rt, "captain-doc-conflict-theirs");
+        press(&mut rt, "captain-doc-conflict-replace");
+        assert_eq!(
+            rt.state.captain_document_value(0, "NOTES.md").unwrap()["text"],
+            "Mine."
+        );
+    }
+
+    #[test]
+    fn the_recruit_search_return_only_joins_the_matching_row() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        rt.state.show_activity = true;
+        rt.state.set_captain_scope(0, vec![1]).unwrap();
+        let base = rt.state.next_id;
+        // The out-of-scope row sits first in thread order; it must stay disabled.
+        {
+            let mut t = Thread::new(base);
+            t.title = "Outside thread".into();
+            t.project = Some(99);
+            t.session = Some("session".into());
+            t.never_sent = false;
+            rt.state.threads.push(t);
+        }
+        for (offset, title) in [(1usize, "First thread"), (2usize, "Second thread")] {
+            let mut t = Thread::new(base + offset);
+            t.title = title.into();
+            t.project = Some(1);
+            t.session = Some("session".into());
+            t.never_sent = false;
+            rt.state.threads.push(t);
+        }
+        rt.state.next_id += 3;
+        press(&mut rt, "brief-crew-recruit");
+        rt.frame(0.25);
+        // Typing "Second" then Return joins only the matching row.
+        press(&mut rt, "crew-recruit-search");
+        assert!(
+            rt.state.brief.recruit.as_ref().unwrap().query.focused,
+            "search field focused"
+        );
+        rt.state.brief.recruit.as_mut().unwrap().query.text = "Second".into();
+        tap(&mut rt, rune::Key::Enter);
+        assert_eq!(
+            rt.state
+                .threads
+                .iter()
+                .find(|t| t.id == base + 1)
+                .unwrap()
+                .crew_captain,
+            None
+        );
+        assert_eq!(
+            rt.state
+                .threads
+                .iter()
+                .find(|t| t.id == base + 2)
+                .unwrap()
+                .crew_captain,
+            Some(0),
+            "Return must recruit the matching thread"
+        );
+        // A query that matches nothing queues nothing. The palette is still open
+        // from the successful join's replacement; focus its field and search.
+        rt.frame(0.5);
+        press(&mut rt, "brief-crew-recruit");
+        rt.frame(0.25);
+        press(&mut rt, "crew-recruit-search");
+        rt.state.brief.recruit.as_mut().unwrap().query.text = "zzz".into();
+        tap(&mut rt, rune::Key::Enter);
+        assert_eq!(
+            rt.state
+                .threads
+                .iter()
+                .find(|t| t.id == base + 1)
+                .unwrap()
+                .crew_captain,
+            None
+        );
+        // Down hands focus to the list and Return presses the first enabled row,
+        // skipping the disabled out-of-scope entry that sorts earlier. Escape
+        // closes the still-open palette first.
+        tap(&mut rt, rune::Key::Escape);
+        rt.frame(0.25);
+        press(&mut rt, "brief-crew-recruit");
+        rt.frame(0.25);
+        press(&mut rt, "crew-recruit-search");
+        tap(&mut rt, rune::Key::Down);
+        let focused = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.focused)
+            .and_then(|e| e.key);
+        assert_eq!(
+            focused.as_deref(),
+            Some(format!("crew-recruit-{}", base + 1).as_str()),
+            "Down lands on the first enabled row, skipping the disabled one"
+        );
+        tap(&mut rt, rune::Key::Enter);
+        assert_eq!(
+            rt.state
+                .threads
+                .iter()
+                .find(|t| t.id == base + 1)
+                .unwrap()
+                .crew_captain,
+            Some(0),
+            "Return must press the first enabled row, not the disabled one"
+        );
+        assert_eq!(
+            rt.state
+                .threads
+                .iter()
+                .find(|t| t.id == base)
+                .unwrap()
+                .crew_captain,
+            None
+        );
+        std::fs::remove_dir_all(&rt.state.data_dir).ok();
+    }
+
+    #[test]
+    fn a_pending_join_survives_its_source_thread_disappearing() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        rt.state.show_activity = true;
+        // The remote accepted the join command, then a projection removed the
+        // thread before the receipt; rendering must not panic on the gap.
+        let missing = rt.state.next_id + 50;
+        rt.state.crew_pending.insert(
+            ("local".into(), uuid::Uuid::new_v4()),
+            crate::model::CrewChange {
+                captain: 0,
+                thread: missing,
+                kind: crate::model::CrewKind::Join,
+            },
+        );
+        rt.frame(0.5);
+        scroll_brief(&mut rt);
+        rt.frame(0.5);
+        assert!(
+            rt.presented(&format!("brief-crew-{missing}")).is_some(),
+            "the pending join keeps a quiet row"
+        );
+        std::fs::remove_dir_all(&rt.state.data_dir).ok();
+    }
+
+    #[test]
+    fn an_earlier_conversation_reads_documents_on_its_own_panel() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        rt.state.show_activity = true;
+        // An earlier conversation of captain 0: same captain_home identity, not the
+        // current primary home.
+        let earlier_id = rt.state.next_id;
+        rt.state.next_id += 1;
+        {
+            let mut t = Thread::new(earlier_id);
+            t.title = "Earlier conversation".into();
+            t.captain_home = true;
+            t.captain = Some(0);
+            rt.state.threads.push(t);
+        }
+        let index = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == earlier_id)
+            .unwrap();
+        rt.state.select_thread(index);
+        rt.frame(0.5);
+        assert_eq!(
+            rt.state.captain_access(0),
+            crate::model::CaptainAccess::Earlier
+        );
+        scroll_brief(&mut rt);
+        press(&mut rt, "brief-document-NOTES.md");
+        rt.frame(0.5);
+        assert!(rt.presented("captain-doc-panel").is_some());
+        assert!(
+            rt.presented("captain-doc-edit").is_none(),
+            "an earlier view has no Edit"
+        );
+        // The tab lives on the earlier thread's panel, not the primary home's.
+        let panel = rt.state.panel_key();
+        assert!(
+            rt.state
+                .right_panels
+                .get(&panel)
+                .surfaces
+                .iter()
+                .any(|surface| matches!(
+                    surface,
+                    crate::right_panel::Surface::CaptainDocument { captain: 0, .. }
+                )),
+            "document surface opened on the earlier panel"
+        );
+        std::fs::remove_dir_all(&rt.state.data_dir).ok();
+    }
+
+    #[test]
+    fn the_move_picker_offers_in_scope_targets_and_blocks_the_rest() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        // Captain 1 gets a home and a scope the member fits; captain 2 stays scopeless.
+        rt.state.open_captain(1);
+        rt.state.set_captain_scope(1, vec![1]).unwrap();
+        rt.state.open_captain(0);
+        rt.state.set_captain_scope(0, vec![1]).unwrap();
+        let member_id = rt.state.next_id;
+        rt.state.next_id += 1;
+        let mut member = Thread::new(member_id);
+        member.title = "Worker".into();
+        member.project = Some(1);
+        member.crew_captain = Some(0);
+        member.session = Some("session".into());
+        member.never_sent = false;
+        rt.state.threads.push(member);
+        rt.frame(0.25);
+        rt.state.show_activity = true;
+        press(&mut rt, &format!("brief-crew-more-{member_id}"));
+        rt.frame(0.25);
+        press(&mut rt, "crew-menu-move");
+        rt.frame(0.25);
+        assert!(rt.presented("crew-move-picker").is_some());
+        assert!(
+            rt.presented("crew-move-0").is_none(),
+            "source is not a target"
+        );
+        // Captain 2 has no workspace that accepts the thread: its row is disabled.
+        let (row, _) = rt.presented("crew-move-2").expect("captain 2 row");
+        let _ = row;
+        press(&mut rt, "crew-move-1");
+        rt.frame(0.25);
+        assert_eq!(
+            rt.state
+                .threads
+                .iter()
+                .find(|t| t.id == member_id)
+                .unwrap()
+                .crew_captain,
+            Some(1)
+        );
+        std::fs::remove_dir_all(&rt.state.data_dir).ok();
+    }
+
+    #[test]
+    fn crew_rows_release_and_recruit_through_the_brief() {
+        let mut rt = store_runtime(1280.0);
+        rt.frame(0.25);
+        press(&mut rt, "open-brief");
+        rt.frame(1.0);
+        let thread_id = rt.state.next_id;
+        rt.state.next_id += 1;
+        rt.state.set_captain_scope(0, vec![1]).unwrap();
+        let mut recruit = Thread::new(thread_id);
+        recruit.title = "Recruitable thread".into();
+        recruit.project = Some(1);
+        recruit.session = Some("session".into());
+        recruit.never_sent = false;
+        rt.state.threads.push(recruit);
+        let ordinary = rt.state.threads.len() - 1;
+        press(&mut rt, "brief-crew-recruit");
+        rt.frame(0.25);
+        press(&mut rt, &format!("crew-recruit-{thread_id}"));
+        rt.frame(0.25);
+        assert_eq!(rt.state.threads[ordinary].crew_captain, Some(0));
+        assert!(rt.state.captain_crew(0).contains(&thread_id));
+        assert!(rt.presented(&format!("brief-crew-{thread_id}")).is_some());
+        press(&mut rt, &format!("brief-crew-more-{thread_id}"));
+        rt.frame(0.25);
+        press(&mut rt, "crew-menu-release");
+        rt.frame(0.25);
+        assert_eq!(rt.state.threads[ordinary].crew_captain, None);
     }
 }

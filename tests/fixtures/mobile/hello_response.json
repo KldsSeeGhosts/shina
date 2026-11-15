@@ -52,7 +52,8 @@
       "review-diff-v1",
       "thread-title-search-v1",
       "notification-feed-v1",
-      "mobile-push-v1"
+      "mobile-push-v1",
+      "captain-state-v1"
     ],
     "deviceId": "<uuid>",
     "epoch": "<epoch>",
@@ -70,7 +71,7 @@
     },
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 28,
+    "protocolMinor": 29,
     "serverId": "<serverId>",
     "serverTime": "<time>"
   }

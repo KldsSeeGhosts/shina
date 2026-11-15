@@ -48,6 +48,8 @@ pub(super) struct Task {
     pub title: String,
     pub brief: String,
     pub project_id: Option<ProjectId>,
+    #[serde(default)]
+    pub coordinator_captain: Option<usize>,
     pub machine: String,
     pub model_target: Option<Value>,
     pub state: TaskState,
@@ -69,7 +71,7 @@ pub(super) struct Task {
     #[serde(skip)]
     recovering: bool,
     #[serde(skip)]
-    hold_delivery: bool,
+    pub(super) hold_delivery: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -182,6 +184,7 @@ impl Task {
             title: thread.title.clone(),
             brief: brief.into(),
             project_id: thread.project,
+            coordinator_captain: thread.crew_captain,
             machine: thread.machine.clone(),
             model_target,
             prior_deliveries: Vec::new(),
@@ -197,6 +200,10 @@ impl Task {
             recovering: false,
             hold_delivery: false,
         }
+    }
+
+    pub(super) fn pending_deliveries(&self) -> bool {
+        !self.prior_deliveries.is_empty()
     }
 
     pub(super) fn finish(&mut self, state: TaskState, reply: &str, error: &str) {
@@ -347,6 +354,21 @@ impl Thread {
 }
 
 impl State {
+    pub(super) fn task_home(&self, task: &Task) -> Option<usize> {
+        let thread = self
+            .threads
+            .iter()
+            .find(|thread| thread.id == task.child_thread_id);
+        if task.coordinator_captain.is_some() {
+            return thread.and_then(|thread| {
+                thread
+                    .crew_captain
+                    .and_then(|captain| self.captain_home(captain))
+            });
+        }
+        Some(self.effective_home(task.parent_thread_id))
+    }
+
     pub(super) fn task_has_background_work(&self, thread: usize) -> bool {
         self.tasks.iter().any(|task| {
             task.child_thread_id == thread
@@ -354,7 +376,7 @@ impl State {
                     task.state,
                     TaskState::Queued | TaskState::Starting | TaskState::Running
                 )
-                || task.parent_thread_id == thread
+                || self.task_home(task) == Some(thread)
                     && (task.state.finished() && !task.delivered
                         || !task.prior_deliveries.is_empty())
         })
@@ -367,10 +389,7 @@ impl State {
     pub fn tasks_for(&self, parent_thread_id: usize) -> Vec<TaskView> {
         self.tasks
             .iter()
-            .filter(|task| {
-                task.parent_thread_id == parent_thread_id
-                    || self.effective_home(task.parent_thread_id) == parent_thread_id
-            })
+            .filter(|task| self.task_home(task) == Some(parent_thread_id))
             .map(|task| {
                 let thread = self
                     .threads
@@ -447,7 +466,7 @@ impl State {
             {
                 Some(AttentionKind::Failed)
             } else if self.tasks.iter().any(|task| {
-                self.effective_home(task.parent_thread_id) == thread.id
+                self.task_home(task) == Some(thread.id)
                     && (task.state.finished() && !task.delivered
                         || !task.prior_deliveries.is_empty())
             }) {
@@ -637,11 +656,21 @@ impl State {
             .filter(|t| self.effective_home(t.id) == parent_thread_id)
             .map(|t| t.id)
             .collect();
-        for task in self
+        let routed: Vec<(bool, bool)> = self
             .tasks
-            .iter_mut()
-            .filter(|task| parents.contains(&task.parent_thread_id))
-        {
+            .iter()
+            .map(|task| {
+                (
+                    self.task_home(task) == Some(parent_thread_id),
+                    task.coordinator_captain.is_some(),
+                )
+            })
+            .collect();
+        for (index, task) in self.tasks.iter_mut().enumerate() {
+            let (routed, captain_origin) = routed[index];
+            if !routed && (captain_origin || !parents.contains(&task.parent_thread_id)) {
+                continue;
+            }
             task.hold_delivery = false;
             for delivery in &mut task.prior_deliveries {
                 delivery.hold = false;
@@ -654,8 +683,7 @@ impl State {
             .tasks
             .iter()
             .filter(|task| {
-                self.effective_home(task.parent_thread_id) == self.effective_home(parent)
-                    && !task.state.finished()
+                self.task_home(task) == Some(self.effective_home(parent)) && !task.state.finished()
             })
             .count()
             >= UNFINISHED_LIMIT
@@ -670,8 +698,7 @@ impl State {
             self.tasks
                 .iter()
                 .filter(|other| {
-                    self.effective_home(other.parent_thread_id)
-                        == self.effective_home(task.parent_thread_id)
+                    self.task_home(other) == self.task_home(task)
                         && other.state == TaskState::Queued
                 })
                 .position(|other| other.id == task.id)
@@ -837,9 +864,7 @@ impl State {
                 .tasks
                 .iter()
                 .filter(|other| {
-                    self.effective_home(other.parent_thread_id)
-                        == self.effective_home(task.parent_thread_id)
-                        && self.task_occupies_slot(other)
+                    self.task_home(other) == self.task_home(task) && self.task_occupies_slot(other)
                 })
                 .count()
                 >= RUNNING_LIMIT
@@ -902,6 +927,21 @@ impl State {
             Some(value) => serde_json::from_value(value.clone())
                 .map_err(|error| format!("Invalid saved tasks: {error}."))?,
         };
+        if let Some(records) = index["tasks"].as_array() {
+            for (task, record) in tasks.iter_mut().zip(records.iter()) {
+                if record.get("coordinator_captain").is_none() {
+                    task.coordinator_captain = self
+                        .threads
+                        .iter()
+                        .find(|thread| {
+                            thread.id == task.parent_thread_id
+                                && thread.captain_home
+                                && thread.captain.is_some()
+                        })
+                        .and_then(|thread| thread.captain);
+                }
+            }
+        }
         let mut ids = std::collections::HashSet::new();
         let mut children = std::collections::HashSet::new();
         let mut deliveries = std::collections::HashSet::new();
@@ -951,11 +991,14 @@ impl State {
                     .any(|text| text.chars().count() > 500)
                 || task.state.finished() != task.finished_at.is_some()
                 || task.delivered && !task.state.finished()
+                || task
+                    .coordinator_captain
+                    .is_some_and(|captain| captain >= self.captains.len())
                 || !self.threads.iter().any(|t| {
                     t.id == task.child_thread_id
                         && t.parent == Some(task.parent_thread_id)
-                        && t.project == task.project_id
                         && t.machine == task.machine
+                        && t.project == task.project_id
                 })
                 || !self.threads.iter().any(|t| t.id == task.parent_thread_id)
             {
@@ -1031,16 +1074,8 @@ impl State {
 
     pub(super) fn poll_tasks(&mut self, now: Instant) -> bool {
         let mut changed = self.poll_remote_tasks();
-        let routes: std::collections::HashMap<_, _> = self
-            .tasks
-            .iter()
-            .map(|task| {
-                (
-                    task.parent_thread_id,
-                    self.effective_home(task.parent_thread_id),
-                )
-            })
-            .collect();
+        let routes: Vec<Option<usize>> =
+            self.tasks.iter().map(|task| self.task_home(task)).collect();
         for task in &mut self.tasks {
             if task.remote.is_some() {
                 continue;
@@ -1115,25 +1150,7 @@ impl State {
                 changed = true;
             }
         }
-        for task in &mut self.tasks {
-            let accepted: Vec<_> = self
-                .threads
-                .iter()
-                .filter(|t| {
-                    t.id == task.parent_thread_id
-                        || Some(&t.id) == routes.get(&task.parent_thread_id)
-                })
-                .flat_map(|t| t.accepted_deliveries.iter())
-                .collect();
-            let before = task.prior_deliveries.len();
-            task.prior_deliveries
-                .retain(|delivery| !accepted.contains(&&delivery.id));
-            changed |= before != task.prior_deliveries.len();
-            if !task.delivered && task.state.finished() && accepted.contains(&&task.delivery_id) {
-                task.delivered = true;
-                changed = true;
-            }
-        }
+        changed |= self.reconcile_task_acceptances();
         // Save outcomes before handing the result to another process.
         if changed {
             self.checkpoint();
@@ -1152,16 +1169,26 @@ impl State {
             if messages.is_empty() {
                 continue;
             }
-            let Some(parent) = self
-                .threads
-                .iter()
-                .position(|t| Some(&t.id) == routes.get(&task.parent_thread_id) && !t.archived())
-                .or_else(|| {
+            let captain_origin = task.coordinator_captain.is_some();
+            let Some(parent) = (if captain_origin {
+                routes[index].and_then(|home| {
                     self.threads
                         .iter()
-                        .position(|t| t.id == task.parent_thread_id && !t.archived())
+                        .position(|t| t.id == home && !t.archived())
                 })
-            else {
+            } else {
+                routes[index]
+                    .and_then(|home| {
+                        self.threads
+                            .iter()
+                            .position(|t| t.id == home && !t.archived())
+                    })
+                    .or_else(|| {
+                        self.threads
+                            .iter()
+                            .position(|t| t.id == task.parent_thread_id && !t.archived())
+                    })
+            }) else {
                 continue;
             };
             let mut enqueued = false;
@@ -1189,6 +1216,40 @@ impl State {
         }
         changed |= self.start_queued_tasks();
         changed | self.poll_legacy_tasks(now)
+    }
+
+    /// Settles delivery records against the acceptance evidence threads observed. Ordinary
+    /// tasks accept evidence from the current effective home or the original parent.
+    /// Captain-origin tasks accept evidence in every Captain-home thread, including earlier
+    /// homes after a reset, plus the original parent; evidence does not route delivery.
+    pub(super) fn reconcile_task_acceptances(&mut self) -> bool {
+        let routes: Vec<Option<usize>> =
+            self.tasks.iter().map(|task| self.task_home(task)).collect();
+        let mut changed = false;
+        for (index, task) in self.tasks.iter_mut().enumerate() {
+            let captain_origin = task.coordinator_captain.is_some();
+            let accepted: Vec<_> = self
+                .threads
+                .iter()
+                .filter(|t| {
+                    if captain_origin {
+                        t.captain_home || t.id == task.parent_thread_id
+                    } else {
+                        Some(t.id) == routes[index] || t.id == task.parent_thread_id
+                    }
+                })
+                .flat_map(|t| t.accepted_deliveries.iter())
+                .collect();
+            let before = task.prior_deliveries.len();
+            task.prior_deliveries
+                .retain(|delivery| !accepted.contains(&&delivery.id));
+            changed |= before != task.prior_deliveries.len();
+            if !task.delivered && task.state.finished() && accepted.contains(&&task.delivery_id) {
+                task.delivered = true;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// A task record for demo scenes and layout tests. It never starts a process: the child
@@ -1803,6 +1864,41 @@ mod tests {
             "The user dismissed this task."
         );
         assert!(state.tasks[0].result_excerpt.is_empty());
+    }
+
+    #[test]
+    fn captain_evidence_covers_earlier_homes_and_exact_attempts() {
+        let mut state = state_with_task();
+        state.demo = true;
+        state.captains = Captain::presets();
+        // The delegating thread is a retired captain home that still holds the evidence.
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        state.threads[1].crew_captain = Some(0);
+        state.tasks[0].coordinator_captain = Some(0);
+        state.tasks[0].finish(TaskState::Completed, "Done.", "");
+        let first_delivery = state.tasks[0].delivery_id.clone();
+        state.threads[0].pending_injections.push_back(Injection {
+            text: state.tasks[0].completion_message(),
+            shown: false,
+        });
+        state.threads[0].injection_id = Some("ack-1".into());
+        state.threads[0]
+            .observe_task_history(&json!({"type":"response","command":"prompt","id":"ack-1"}));
+        // A new attempt keeps the old delivery as evidence, with a fresh delivery id.
+        state.queue_task_attempt(0, "Retry it.").unwrap();
+        assert_ne!(state.tasks[0].delivery_id, first_delivery);
+        assert_eq!(state.tasks[0].prior_deliveries.len(), 1);
+        state.tasks[0].finish(TaskState::Completed, "Retried.", "");
+        assert!(state.reconcile_task_acceptances());
+        assert!(
+            state.tasks[0].prior_deliveries.is_empty(),
+            "the accepted earlier delivery settled"
+        );
+        assert!(
+            !state.tasks[0].delivered,
+            "earlier evidence cannot ack the newer attempt"
+        );
     }
 
     #[test]

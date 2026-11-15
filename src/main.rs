@@ -715,6 +715,7 @@ fn captain_workspace_demo(state: &mut State) {
             .unwrap();
         worker.parent = Some(7);
         worker.delegated = true;
+        worker.crew_captain = worker.captain;
     }
     let review = &mut state.threads[1];
     review.status = model::Status::Waiting;
@@ -755,6 +756,7 @@ fn captain_workspace_demo(state: &mut State) {
         worker.parent = Some(12);
         worker.delegated = true;
         worker.captain = Some(2);
+        worker.crew_captain = Some(2);
         worker.project = Some(1);
         if status == model::Status::Completed {
             worker.life.last_completed_at = Some(now - 60_000);
@@ -794,6 +796,7 @@ fn crew_tasks_demo(state: &mut State) {
         worker.parent = Some(7);
         worker.delegated = true;
         worker.captain = Some(0);
+        worker.crew_captain = Some(0);
         worker.project = Some(1);
         worker.life.latest_user_message_at = Some(now - 60_000);
         state.threads.push(worker);
@@ -985,6 +988,34 @@ fn captain_brief_demo(state: &mut State) {
         ..Default::default()
     });
     state.show_activity = true;
+}
+
+/// The same Brief with an example NOTES.md plan, its document open in reading state.
+fn captain_plan_demo(state: &mut State) {
+    captain_brief_demo(state);
+    let Some(captain) = state.current().captain else {
+        return;
+    };
+    let now = lifecycle::now();
+    state.seed_captain_document(
+        captain,
+        "NOTES.md",
+        model::CaptainDocument {
+            text: "Example plan. This file is only demo content.\n\n\
+                   - Example goal: keep the workspace tidy and the crew small.\n\
+                   - Example rule: every change ships with a regression test.\n\
+                   - Example note: the release branch is cut on Thursdays.\n"
+                .into(),
+            revision: 3,
+            updated_at: now.saturating_sub(2 * 3_600_000),
+        },
+    );
+    if let Some(home) = state.captain_home(captain) {
+        let key = right_panel::key(&state.machines.selected, home);
+        state
+            .right_panels
+            .open_captain_document(&key, captain, "NOTES.md");
+    }
 }
 
 fn mobile_pairing_demo(state: &mut State) {
@@ -1297,6 +1328,7 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 home.tools.clear();
             }),
             ("captain-brief", captain_brief_demo),
+            ("captain-plan", captain_plan_demo),
             ("captain-brief-dark", |state| {
                 captain_brief_demo(state);
                 state.dark = true;

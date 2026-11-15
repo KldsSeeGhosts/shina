@@ -889,6 +889,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if mobile_push {
                             capabilities.push(protocol::MOBILE_PUSH);
                         }
+                        if minor >= u64::from(protocol::CAPTAIN_STATE_MINOR) {
+                            capabilities.push(protocol::CAPTAIN_STATE);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),

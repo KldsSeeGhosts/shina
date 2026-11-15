@@ -1,6 +1,6 @@
 # Captains, scope and memory
 
-A Captain is the assistant, with a profile, one primary home conversation, an ordered workspace scope, and explicit memory. A Workspace is a registered project folder. `Project.captain` still selects that workspace's default captain. It does not restrict that captain to one workspace.
+A Captain is the assistant, with a profile, one primary home conversation, an ordered workspace scope, explicit memory, crew membership, and planning documents. A Workspace is a registered project folder. `Project.captain` still selects that workspace's default captain. It does not restrict that captain to one workspace.
 
 A Thread is a conversation backed by Pi or an ACP session. A captain's home is a thread, not a separate assistant for each project. A Task is a durable delegated brief, state, result and delivery record. Its worker has a separate thread and cannot delegate further. Resetting the captain's conversation does not erase its tasks.
 
@@ -31,6 +31,27 @@ Scope is an application routing limit, not an OS sandbox. The agent still has th
 Changing scope requires an idle home and disconnects its process. Relative Pi session paths first become absolute, so a new working folder does not lose the old session. Running workers keep their original project. The next captain prompt also reports the scope change for ACP sessions whose initial context was already delivered.
 
 `list_threads`, `list_captains`, and `orchestrator_capabilities` report scope as project records, including ids and paths.
+
+## Crew and planning documents
+
+Crew membership is separate from task execution. The Brief can recruit an eligible idle root thread, release a member, or move it to an in-scope Captain. Recruitment preserves the thread's history, model and workspace. Running work and unacknowledged delegated results block membership changes. Delegated subagents cannot be recruited as independent roots. Existing workers retain their task records when moved or released.
+
+Membership and saved documents survive a Captain conversation reset. Earlier conversations can read the documents but cannot edit them. Crew questions and approvals appear at their current Captain, not a former Captain inferred from an old parent link.
+
+The Brief opens these documents in right-panel tabs:
+
+- `NOTES.md` is the working plan, also readable by crew.
+- `AGENTS.md` contains private Captain rules. Crew agents cannot read it through Captain tools.
+- `CREW.md` contains shared crew rules.
+- `DIGEST.md` is the saved user-facing digest, opened through the Digest section.
+
+Each document accepts at most 64 KiB of UTF-8 without null characters. Writes check the revision read by the editor. Conflicts keep the draft and require an explicit choice. A linked-machine save stays pending until its exact server and command receipt arrives. A matching document projection alone does not confirm a save.
+
+Drafts belong to a machine, Captain and document. They survive tab, thread and machine navigation in memory, but do not survive quitting Shina. Closing a saving tab retains its pending draft. Offline or unsupported hosts cannot accept new document or crew changes; last-known documents remain readable.
+
+Agent tools are `captain_read`, `captain_document_read`, `captain_document_write`, `captain_crew_list`, `captain_crew_join` and `captain_crew_release`. Only the primary Captain home can mutate Captain state through these tools. The Captain receives bounded prefixes of its private rules and plan each turn. Local crew receives a bounded prefix of shared crew rules; full documents are available through reads. Repository read-only mode does not prevent the Captain from maintaining its planning documents.
+
+These operations require `captain-state-v1`, introduced at protocol minor 29. This increment does not add automatic structured reports from recruited root threads, an event-driven digest, or Captain promotion, archive, demotion and deletion. Propagating shared crew rules to peer-launched workers also remains follow-up work.
 
 ## Explicit memory
 

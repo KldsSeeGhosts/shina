@@ -180,7 +180,7 @@ fn task_clock(task: &TaskView) -> String {
 }
 
 /// A status mark centred in a fixed 14 px slot, so a check and a dot share one left edge.
-fn mark_slot(status: Status, p: Palette) -> El {
+pub(super) fn mark_slot(status: Status, p: Palette) -> El {
     el().size(14.0, 14.0)
         .center()
         .child(status_mark(status, p, 7.0))
@@ -755,10 +755,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
     let items: Vec<AttentionItem> = s
         .attention()
         .into_iter()
-        .filter(|item| {
-            item.parent_id == Some(t.id)
-                && matches!(item.kind, AttentionKind::Approval | AttentionKind::Question)
-        })
+        .filter(|item| needs_you_item(s, t.id, item))
         .collect();
     if items.is_empty() {
         return None;
@@ -929,6 +926,23 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
     )
 }
 
+/// One attention row's filter for `needs_you`: canonical crew membership overrides the
+/// historical parent link, so a moved or released worker's questions reach only its
+/// current captain. Ordinary delegation keeps the parent match.
+pub(crate) fn needs_you_item(s: &State, home: usize, item: &AttentionItem) -> bool {
+    if !matches!(item.kind, AttentionKind::Approval | AttentionKind::Question) {
+        return false;
+    }
+    let Some(child) = s.threads.iter().find(|thread| thread.id == item.thread_id) else {
+        return false;
+    };
+    if s.captain_provenanced(child) {
+        s.captain_member_at(child, home)
+    } else {
+        item.parent_id == Some(home)
+    }
+}
+
 /// "Delegated by <captain>", "Runs on its own" and "Open captain" above a worker's composer, ported
 /// from KSG Code's `ProviderSubagentBar` (`min-h-12 rounded-2xl py-2 ps-5 pe-2 text-sm`).
 pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
@@ -1078,6 +1092,104 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                     p.ink,
                 )),
         ),
+    )
+}
+
+/// The independent crew root's bar: which captain's crew it belongs to, and a button back
+/// to that captain's home. Delegated workers keep `parent_bar` instead.
+pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
+    let t = s.current();
+    if t.delegated || t.peer_origin.is_some() {
+        return None;
+    }
+    let captain = t.crew_captain?;
+    let profile = s.captains.get(captain)?;
+    let home = s.captain_home(captain);
+    let thread_id = t.id;
+    let open_server = s.machines.selected.clone();
+    let more_server = open_server.clone();
+    Some(
+        row()
+            .key("crew-bar")
+            .role("group")
+            .label(format!("In {}'s crew", profile.name))
+            .min_h(48.0)
+            .py(8.0)
+            .pl(20.0)
+            .pr(8.0)
+            .gap(12.0)
+            .center_y()
+            .radius(6.0)
+            .border(1.0, hairline(p))
+            .child(
+                row()
+                    .center_y()
+                    .gap(8.0)
+                    .min_w(0.0)
+                    .shrink()
+                    .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
+                    .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
+                    .child(
+                        label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+                            .key("crew-bar-name")
+                            .truncate()
+                            .shrink()
+                            .min_w(0.0),
+                    )
+                    .child(label("'s crew", TextStyle::new(14.0, 400.0), p.muted)),
+            )
+            .child(spacer())
+            .child(
+                row()
+                    .key("crew-bar-open-captain")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Open captain")
+                    .focusable(true)
+                    .center_y()
+                    .gap(6.0)
+                    .h(32.0)
+                    .px(10.0)
+                    .radius(ROW_RADIUS)
+                    .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(move |s: &mut State| {
+                        if s.machines.selected == open_server && home.is_some() {
+                            s.open_captain(captain);
+                        }
+                    })
+                    .child(icon("back", p.muted))
+                    .child(label("Open captain", TextStyle::new(13.0, 500.0), p.ink)),
+            )
+            .child({
+                let open = s.brief.more == Some(thread_id);
+                row()
+                    .key("crew-bar-more")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Crew actions")
+                    .focusable(true)
+                    .center_y()
+                    .h(32.0)
+                    .w(32.0)
+                    .center()
+                    .radius(ROW_RADIUS)
+                    .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(move |s: &mut State| {
+                        if s.machines.selected != more_server {
+                            return;
+                        }
+                        s.brief.more = if s.brief.more == Some(thread_id) {
+                            None
+                        } else {
+                            Some(thread_id)
+                        };
+                    })
+                    .child(icon("more", if open { p.ink } else { p.muted }))
+            }),
     )
 }
 

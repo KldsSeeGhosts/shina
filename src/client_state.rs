@@ -1309,6 +1309,12 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
+                && (self.captain_document_receipt(&server, command, value)
+                    || self.captain_crew_receipt(&server, command, value))
+            {
+                continue;
+            }
+            if let crate::client::Event::Receipt(command, value) = &event
                 && (command.method == "thread.send" || command.method == "thread.create")
                 && self.handle_multi_model_remote_receipt(&server, command, value)
             {
@@ -1838,6 +1844,7 @@ impl State {
         };
         let scope = self.project_scope;
         let additional = self.scope_additional.clone();
+        let old_homes = self.captain_homes.clone();
         let mut old = std::mem::take(&mut self.threads);
         // Validate server records without session restoration's navigation or draft creation.
         self.restore_records(&projection["index"], false)?;
@@ -1864,6 +1871,7 @@ impl State {
                 local.updated = thread.updated;
                 local.captain = thread.captain;
                 local.captain_home = thread.captain_home;
+                local.crew_captain = thread.crew_captain;
                 local.delegated = thread.delegated;
                 local.parent = thread.parent;
                 local.peer_origin = thread.peer_origin;
@@ -1885,6 +1893,19 @@ impl State {
             old.into_iter()
                 .filter(|t| t.client_draft || tabs.contains(&t.id)),
         );
+        self.refresh_captain_contexts();
+        // Document surfaces are client-local, so a remote reset must carry them to the
+        // new home's panel the way the local reset path does. File and diff surfaces,
+        // and surfaces on other machines' homes, stay where they are.
+        for (captain, old_home) in &old_homes {
+            let new_home = self.captain_home(*captain).unwrap_or(*old_home);
+            if new_home == *old_home {
+                continue;
+            }
+            let from = crate::right_panel::key(&self.machines.selected, *old_home);
+            let to = crate::right_panel::key(&self.machines.selected, new_home);
+            self.right_panels.carry_captain_documents(&from, &to);
+        }
         if first
             && let Some(drafts) = self.client_views["localUi"]["clientDrafts"]
                 .as_array()
@@ -2439,7 +2460,9 @@ impl State {
             self.captain_scopes.clear();
             self.captain_remote_scopes.clear();
             self.captain_homes.clear();
+            self.captain_books.clear();
             self.tasks.clear();
+            self.refresh_captain_contexts();
         }
         let restored_tabs: Vec<_> = self.machines.ui[server]["tabs"]
             .as_array()
@@ -4340,6 +4363,36 @@ impl State {
                 }
             }
             "captain.reset" => self.reset_captain_conversation(number("captain")?)?,
+            "captain.read" => {
+                return self.captain_read_value(number("captain")?, true);
+            }
+            "captain.document.read" => {
+                return self.captain_document_value(number("captain")?, &text("name")?);
+            }
+            "captain.document.write" => {
+                return self.captain_document_write(
+                    number("captain")?,
+                    &text("name")?,
+                    text("text")?,
+                    number("expectedRevision")? as u64,
+                );
+            }
+            "captain.crew.list" => {
+                let captain = number("captain")?;
+                self.require_captain(captain)?;
+                return Ok(self.captain_crew_value(captain));
+            }
+            "captain.crew.join" => {
+                self.captain_crew_join(number("captain")?, number("threadId")?)?
+            }
+            "captain.crew.release" => {
+                self.captain_crew_release(number("captain")?, number("threadId")?)?
+            }
+            "captain.crew.move" => self.captain_crew_move(
+                number("fromCaptain")?,
+                number("toCaptain")?,
+                number("threadId")?,
+            )?,
             "memory.put" => {
                 let captain = number("captain")?;
                 if let Some(id) = args["id"].as_str() {
@@ -4456,6 +4509,58 @@ mod tests {
         assert!(desktop.questionnaire_collapsed());
         desktop.cancel_questionnaire_advance();
         assert!(!desktop.questionnaire_collapsed());
+    }
+
+    #[test]
+    fn a_remote_reset_carries_captain_document_surfaces_to_the_new_home() {
+        let dir = std::env::temp_dir().join(format!(
+            "shina-client-reset-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut server = State::new(dir.clone(), false);
+        server.load_global_for_test();
+        server.captains = crate::captains::Captain::presets();
+        server.open_captain(0);
+        let mut state = State::new(PathBuf::new(), false);
+        state.apply_projection(server.projection()).unwrap();
+        let old_home = state.captain_home(0).unwrap();
+        let old_key = crate::right_panel::key(&state.machines.selected, old_home);
+        state
+            .right_panels
+            .open_captain_document(&old_key, 0, "NOTES.md");
+        state.right_panels.open_file(&old_key, "src/one.rs", None);
+        // The remote side resets its captain's conversation: the projection arrives
+        // with a new primary home.
+        server.reset_captain_conversation(0).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        let new_home = state.captain_home(0).unwrap();
+        assert_ne!(old_home, new_home);
+        let new_key = crate::right_panel::key(&state.machines.selected, new_home);
+        let moved: Vec<String> = state
+            .right_panels
+            .get(&new_key)
+            .surfaces
+            .iter()
+            .map(crate::right_panel::Surface::id)
+            .collect();
+        assert!(
+            moved.contains(&"captain-doc:0:NOTES.md".to_string()),
+            "{moved:?}"
+        );
+        // File surfaces stay on the retired home's panel.
+        let stayed: Vec<String> = state
+            .right_panels
+            .get(&old_key)
+            .surfaces
+            .iter()
+            .map(crate::right_panel::Surface::id)
+            .collect();
+        assert!(
+            stayed.iter().any(|id| id.contains("src/one.rs")),
+            "{stayed:?}"
+        );
+        assert!(!stayed.contains(&"captain-doc:0:NOTES.md".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -7607,5 +7712,48 @@ mod tests {
         assert!(old_cmd.params.get("startFromOrigin").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn captain_projection_updates_an_existing_thread_and_switching_clears_state() {
+        let mut server = State::new(
+            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+            false,
+        );
+        server.load_global_for_test();
+        server.captains = Captain::presets();
+        server.open_captain(0);
+        let member_id = server.next_id;
+        server.next_id += 1;
+        let mut member_thread = Thread::new(member_id);
+        member_thread.life.latest_user_message_at = Some(1);
+        member_thread.title = "Crew member".into();
+        server.threads.push(member_thread);
+        let mut state = State::new(PathBuf::new(), false);
+        state.apply_projection(server.projection()).unwrap();
+        server.captain_crew_join(0, member_id).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        let member = state.threads.iter().find(|t| t.id == member_id).unwrap();
+        assert_eq!(member.crew_captain, Some(0));
+        assert!(!member.captain_context.is_empty());
+        server.open_captain(1);
+        server.captain_crew_move(0, 1, member_id).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        let member = state.threads.iter().find(|t| t.id == member_id).unwrap();
+        assert_eq!(member.crew_captain, Some(1));
+        server.captain_crew_release(1, member_id).unwrap();
+        state.apply_projection(server.projection()).unwrap();
+        let member = state.threads.iter().find(|t| t.id == member_id).unwrap();
+        assert_eq!(member.crew_captain, None);
+        let mut client = crate::client::Client::new(state.data_dir.clone());
+        client.linked.insert(
+            "other".into(),
+            crate::client::Client::new(state.data_dir.clone()),
+        );
+        state.client = Some(client);
+        state.select_machine("other");
+        assert!(state.captain_books.is_empty());
+        assert!(state.captains.is_empty());
+        std::fs::remove_dir_all(&server.data_dir).ok();
     }
 }

@@ -1104,6 +1104,62 @@ mod tests {
             std::fs::remove_dir_all(state.data_dir).unwrap();
         }
     }
+    #[test]
+    fn captain_remote_delegation_assigns_membership_provenance_and_current_routing() {
+        let mut state = fixture();
+        state.tasks.clear();
+        state.threads.truncate(1);
+        state.captains = Captain::presets();
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        state.threads[0].project = None;
+        state.set_captain_scope(0, vec![]).unwrap();
+        let server = state.peers[0].server_id.clone();
+        state
+            .set_remote_captain_scope(
+                0,
+                vec![RemoteProject {
+                    server: server.clone(),
+                    project_id: 9,
+                }],
+            )
+            .unwrap();
+        let result = state.mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Remote crew work",
+                "target":{"environmentId":server,"projectId":9,"model":"fixture"}
+            }),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let child = state.threads.last().unwrap().id;
+        assert_eq!(state.threads.last().unwrap().crew_captain, Some(0));
+        let task = state
+            .tasks
+            .iter()
+            .find(|task| task.child_thread_id == child)
+            .unwrap();
+        assert_eq!(task.coordinator_captain, Some(0));
+        assert_eq!(state.task_home(task), Some(1));
+        let snapshot = state.snapshot();
+        let mut restored = State::headless(state.data_dir.clone());
+        restored.restore_global(&snapshot).unwrap();
+        let child_t = restored
+            .threads
+            .iter()
+            .find(|thread| thread.id == child)
+            .unwrap();
+        assert_eq!(child_t.crew_captain, Some(0));
+        let task = restored
+            .tasks
+            .iter()
+            .find(|task| task.child_thread_id == child)
+            .unwrap();
+        assert_eq!(task.coordinator_captain, Some(0));
+        assert_eq!(restored.task_home(task), restored.captain_home(0));
+        std::fs::remove_dir_all(&state.data_dir).ok();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2065,6 +2121,7 @@ impl State {
         self.next_id += 1;
         thread.parent = Some(parent);
         thread.captain = captain;
+        thread.crew_captain = captain;
         thread.delegated = true;
         // A local metadata-only thread keeps existing task keys and numeric IDs stable.
         thread.project = self.threads[caller].project;
@@ -2160,7 +2217,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()

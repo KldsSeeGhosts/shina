@@ -25,6 +25,8 @@ mod attachment_sqlite_preview;
 mod attachment_table_preview;
 #[path = "attachment_text_preview.rs"]
 mod attachment_text_preview;
+#[path = "captain_docs_ui.rs"]
+mod captain_docs_ui;
 #[path = "captain_ui.rs"]
 mod captain_ui;
 #[path = "citation_comment.rs"]
@@ -39,8 +41,10 @@ pub(crate) mod composer_press;
 pub(crate) mod composer_stash;
 #[path = "composer_ui.rs"]
 pub(crate) mod composer_ui;
+#[path = "crew_membership_ui.rs"]
+mod crew_membership_ui;
 #[path = "crew_ui.rs"]
-mod crew_ui;
+pub(crate) mod crew_ui;
 #[path = "diff_panel.rs"]
 pub(crate) mod diff_panel;
 #[path = "diff_tree.rs"]
@@ -987,11 +991,26 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // maximized panel covers it at any width.
         let panel = s.right_panel();
         let panel_open = panel.open && !panel.surfaces.is_empty();
-        let body_width = cx.layout_with("chat-body", |r| r[2]).unwrap_or_else(|| {
-            let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
-            cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
+        // A docked drawer (the Brief's 320 px or the activity tray) plus its 1 px divider
+        // comes off the same container the panel measures, in the measured path and the
+        // fallback alike, so a covering sheet and the inline clamp see the chat's width.
+        let docked_drawer = if brief && !narrow {
+            captain_ui::PANEL_WIDTH + 1.0
+        } else if s.show_activity && !brief {
+            300.0 + 1.0
+        } else {
+            0.0
+        };
+        let body_width = cx
+            .layout_with("chat-body", |r| r[2])
+            .map(|width| (width - docked_drawer).max(0.0))
+            .unwrap_or_else(|| {
+                let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+                cx.layout_with("workspace-root", move |r| {
+                    r[2] - 16.0 - sidebar - docked_drawer
+                })
                 .unwrap_or(900.0)
-        });
+            });
         let covering = panel_open && (panel.maximized || crate::right_panel::covers(body_width));
         let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
         if covering {
@@ -1170,6 +1189,38 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     for dialog in captain_ui::dialogs(s, p) {
         root = root.child(dialog);
+    }
+    if let Some(captain) = captain_ui::brief_captain(s) {
+        if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
+            root = root.child(menu);
+        }
+        if s.show_activity
+            && let Some(thread_id) = s.brief.more
+        {
+            root = root.child(
+                crew_membership_ui::more_menu(s, p, captain, thread_id)
+                    .anchored_fit(
+                        format!("brief-crew-more-{thread_id}"),
+                        rune::Side::Bottom,
+                        rune::Align::End,
+                        4.0,
+                    )
+                    .modal(true, |s: &mut State| s.brief.more = None),
+            );
+        }
+    }
+    if !s.show_activity
+        && let Some(captain) = s.current().crew_captain
+        && s.brief.more == Some(s.current().id)
+    {
+        root = root.child(
+            crew_membership_ui::crew_bar_menu(s, p, captain, s.current().id)
+                .anchored_fit("crew-bar-more", rune::Side::Bottom, rune::Align::End, 4.0)
+                .modal(true, |s: &mut State| s.brief.more = None),
+        );
+    }
+    if let Some(menu) = crew_membership_ui::move_picker(s, p) {
+        root = root.child(menu);
     }
     if let Some(pill) = crew_ui::attention_row(s, p) {
         root = root.child(pill);
@@ -4735,7 +4786,14 @@ fn captain_row(
     let crew: Vec<&Thread> = s
         .threads
         .iter()
-        .filter(|t| t.parent == Some(id) && t.archived() == s.show_archive)
+        .filter(|t| {
+            t.crew_captain == thread.captain
+                && t.crew_captain.is_some()
+                && thread
+                    .captain
+                    .is_some_and(|captain| s.captain_home(captain) == Some(id))
+                && t.archived() == s.show_archive
+        })
         .collect();
     let family = || std::iter::once(thread).chain(crew.iter().copied());
     let running: Vec<&Thread> = family().filter(|t| t.status == Status::Running).collect();
@@ -6510,6 +6568,9 @@ fn right_panel_title(surface: &crate::right_panel::Surface) -> String {
         crate::right_panel::Surface::Files => "Files".to_string(),
         crate::right_panel::Surface::File { path, .. } => base_name(path).to_string(),
         crate::right_panel::Surface::Attachment { name, .. } => base_name(name).to_string(),
+        crate::right_panel::Surface::CaptainDocument { name, .. } => {
+            captain_docs_ui::document_title(name).to_string()
+        }
     }
 }
 
@@ -6535,6 +6596,7 @@ fn right_panel_tab(
         crate::right_panel::Surface::Files => "folder",
         crate::right_panel::Surface::File { .. } => "file",
         crate::right_panel::Surface::Attachment { .. } => "paperclip",
+        crate::right_panel::Surface::CaptainDocument { .. } => "book",
     };
     // The close button sits in the icon slot only while it can be seen: on hover of the
     // tab, or on the active tab (KSG's `group-hover:visible / isActive && visible`).
@@ -6552,7 +6614,7 @@ fn right_panel_tab(
             .hover(p.selected)
             .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
             .on_press(move |s: &mut State| {
-                s.right_panels.close_surface(&thread_key, &surface_id);
+                s.request_close_surface(&thread_key, &surface_id);
             })
             .child(tool_icon("close", p.ink))
     };
@@ -6579,7 +6641,7 @@ fn right_panel_tab(
             .on_press_tx(move |s: &mut State, tx| {
                 // KSG: a middle click closes the tab; any other press activates it.
                 if tx.button() == rune::PointerButton::Middle {
-                    s.right_panels.close_surface(&key_for_press, &id_for_press);
+                    s.request_close_surface(&key_for_press, &id_for_press);
                 } else {
                     s.right_panels.activate(&key_for_press, &id_for_press);
                     tx.scroll_into_view_in("right-panel-tabs", tab_key.clone());
@@ -6784,6 +6846,10 @@ fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Optio
             )
             .truncate(),
         ),
+        Some(crate::right_panel::Surface::CaptainDocument { captain, name }) => (
+            format!("right-panel-body-captain-doc:{captain}:{name}"),
+            captain_docs_ui::document_panel(s, p, *captain, name),
+        ),
         None => ("right-panel-body-empty".to_string(), el()),
     };
     let panel_el = el()
@@ -6863,10 +6929,10 @@ fn right_panel_tab_menu(s: &State, p: Palette) -> El {
         menu_item(key, title, glyph, p).on_press(move |s: &mut State| {
             s.right_panel_menu = None;
             match action {
-                TabMenu::Close => s.right_panels.close_surface(&thread_key, &surface_id),
-                TabMenu::Others => s.right_panels.close_others(&thread_key, &surface_id),
-                TabMenu::ToRight => s.right_panels.close_to_right(&thread_key, &surface_id),
-                TabMenu::All => s.right_panels.close_all(&thread_key),
+                TabMenu::Close => s.request_close_surface(&thread_key, &surface_id),
+                TabMenu::Others => s.request_close_others(&thread_key, &surface_id),
+                TabMenu::ToRight => s.request_close_to_right(&thread_key, &surface_id),
+                TabMenu::All => s.request_close_all(&thread_key),
             }
         })
     };
@@ -7087,10 +7153,10 @@ fn thread_menu(s: &State, p: Palette) -> El {
         .box_shadow(hard_shadow(p))
         .anchored_fit("thread-actions", rune::Side::Bottom, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.thread_menu = false)
-        .child(thread_actions(s, s.current().id, p))
+        .child(thread_actions(s, s.current().id, p, "thread-actions"))
 }
 
-fn thread_actions(s: &State, id: usize, p: Palette) -> El {
+fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
     let Some(thread) = s.threads.iter().find(|t| t.id == id) else {
         return el();
     };
@@ -7304,6 +7370,117 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
                         s.discard_draft(id);
                     },
                 ),
+            );
+        }
+        // Crew membership on the thread's own machine: an idle member can move or leave,
+        // an ordinary root can join through the same picker the Brief uses. Hidden where
+        // membership cannot exist; disabled rows carry the real reason.
+        if let Some(owner) = thread.crew_captain {
+            let expected = s.machines.selected.clone();
+            let move_server = expected.clone();
+            let reason = crew_membership_ui::access_reason(s.captain_access(owner)).or_else(|| {
+                s.threads
+                    .iter()
+                    .position(|t| t.id == id)
+                    .and_then(|index| s.crew_idle(index).err())
+            });
+            let move_anchor = anchor.to_string();
+            actions = actions
+                .child(
+                    menu_item("menu-crew-move", "Move to another captain...", "switch", p)
+                        .label(match &reason {
+                            Some(reason) => format!("Move to another captain, {reason}"),
+                            None => "Move to another captain".to_string(),
+                        })
+                        .disabled(reason.is_some())
+                        .on_press(move |s: &mut State| {
+                            if s.machines.selected != move_server
+                                || s.captain_access(owner) != crate::model::CaptainAccess::Full
+                            {
+                                return;
+                            }
+                            s.row_menu = None;
+                            s.thread_menu = false;
+                            s.brief.moving = Some(crate::model::MovePicker {
+                                server: move_server.clone(),
+                                thread: id,
+                                mode: crate::model::MoveMode::Move { from: owner },
+                                anchor: move_anchor.clone(),
+                            });
+                        }),
+                )
+                .child(
+                    menu_item("menu-crew-release", "Release from crew", "close", p)
+                        .label(match &reason {
+                            Some(reason) => format!("Release from crew, {reason}"),
+                            None => "Release from crew".to_string(),
+                        })
+                        .disabled(reason.is_some())
+                        .on_press(move |s: &mut State| {
+                            s.row_menu = None;
+                            s.thread_menu = false;
+                            if let Err(error) = s.captain_crew_command(
+                                &expected,
+                                owner,
+                                id,
+                                crate::model::CrewKind::Release,
+                            ) {
+                                s.push_toast(
+                                    crate::model::ToastKind::Error,
+                                    "Could not release the thread",
+                                    Some(error),
+                                    None,
+                                    Some(6000),
+                                );
+                            }
+                        }),
+                );
+        } else if !s.captains.is_empty()
+            && !thread.captain_home
+            && thread.parent.is_none()
+            && thread.peer_origin.is_none()
+            && !thread.delegated
+            && !thread.archived()
+            && (0..s.captains.len()).any(|captain| {
+                !matches!(
+                    s.captain_access(captain),
+                    crate::model::CaptainAccess::UpdateRequired
+                        | crate::model::CaptainAccess::NoRecords
+                )
+            })
+        {
+            let reason = s
+                .threads
+                .iter()
+                .position(|t| t.id == id)
+                .and_then(|index| s.join_gate(index).err());
+            let join_anchor = anchor.to_string();
+            let join_server = s.machines.selected.clone();
+            actions = actions.child(
+                menu_item(
+                    "menu-crew-recruit",
+                    "Add to a captain's crew...",
+                    "switch",
+                    p,
+                )
+                .label(match &reason {
+                    Some(reason) => format!("Add to a captain's crew, {reason}"),
+                    None => "Add to a captain's crew".to_string(),
+                })
+                .disabled(reason.is_some())
+                .on_press(move |s: &mut State| {
+                    if s.machines.selected != join_server {
+                        return;
+                    }
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.brief.moving = Some(crate::model::MovePicker {
+                        server: join_server.clone(),
+                        thread: id,
+                        mode: crate::model::MoveMode::Join,
+                        anchor: join_anchor.clone(),
+                    });
+                }),
             );
         }
     }
@@ -7535,7 +7712,7 @@ fn row_menu(s: &State, p: Palette) -> El {
             if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
                 bulk_thread_actions(s, p)
             } else {
-                thread_actions(s, id, p)
+                thread_actions(s, id, p, &format!("thread-{id}"))
             },
         ),
         RowTarget::Project(id) => (
@@ -13176,6 +13353,7 @@ fn composer(
     // what the crew needs from the user, then what it is doing.
     for part in [
         crew_ui::parent_bar(s, p, lane),
+        crew_ui::crew_bar(s, p, lane),
         crew_ui::needs_you(s, p),
         crew_ui::crew_tray(s, p, lane),
     ]
@@ -17169,6 +17347,9 @@ pub(crate) mod tests {
         rt.state.show_activity = true;
         rt.frame(0.0);
         assert!(rt.presented(&format!("routine-delete-{id}")).is_some());
+        let (panel, _) = rt.presented("captain-brief").unwrap();
+        rt.wheel(panel[0] + panel[2] / 2.0, panel[1] + 200.0, -2000.0);
+        rt.frame(1.0);
         press(&mut rt, &format!("routine-pause-{id}"));
         assert!(rt.state.routines(0)[0].paused);
         press(&mut rt, &format!("routine-delete-{id}"));
@@ -23254,6 +23435,7 @@ pub(crate) mod tests {
         child.project = Some(1);
         child.delegated = true;
         child.captain = Some(2);
+        child.crew_captain = Some(2);
         child.life.pinned_at = Some(1);
         rt.state.threads.push(child);
         rt.frame(0.0);
@@ -23278,14 +23460,19 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         // Rosters start empty; these tests exercise the earlier named presets.
         rt.state.captains = crate::captains::Captain::presets();
+        // The worker was delegated by captain 1 and later moved into captain 0's crew:
+        // its historical provenance and its current membership are both real.
+        rt.state.open_captain(1);
+        let origin = rt.state.current().id;
         rt.state.open_captain(0);
         let parent = rt.state.current().id;
         let mut child = crate::model::Thread::new(3);
         child.title = "Cross captain child".into();
-        child.parent = Some(parent);
+        child.parent = Some(origin);
         child.project = Some(1);
         child.delegated = true;
         child.captain = Some(1);
+        child.crew_captain = Some(0);
         rt.state.threads.push(child);
         rt.frame(0.0);
         assert!(rt.presented("thread-3").is_some());
@@ -23318,6 +23505,7 @@ pub(crate) mod tests {
         let mut child = crate::model::Thread::new(99);
         child.parent = Some(rt.state.current().id);
         child.delegated = true;
+        child.crew_captain = Some(0);
         rt.state.threads.push(child);
         rt.frame(0.0);
         assert!(rt.presented("worker-alert-99").is_none());

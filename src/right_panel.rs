@@ -57,6 +57,10 @@ pub enum Surface {
         id: String,
         name: String,
     },
+    CaptainDocument {
+        captain: usize,
+        name: String,
+    },
 }
 
 impl Surface {
@@ -66,6 +70,9 @@ impl Surface {
             Self::Files => "files".to_string(),
             Self::File { path, .. } => format!("file:{path}"),
             Self::Attachment { id, .. } => format!("attachment:{id}"),
+            Self::CaptainDocument { captain, name } => {
+                format!("captain-doc:{captain}:{name}")
+            }
         }
     }
 }
@@ -172,6 +179,63 @@ impl RightPanels {
                     name: name.to_string(),
                 },
             );
+        });
+    }
+
+    /// Opens (or activates) a Captain document tab in a thread's panel.
+    pub fn open_captain_document(&mut self, thread: &str, captain: usize, name: &str) {
+        self.update_thread(thread, |current| {
+            upsert_surface(
+                current,
+                Surface::CaptainDocument {
+                    captain,
+                    name: name.to_string(),
+                },
+            );
+        });
+    }
+
+    /// Moves every Captain document surface between panel keys, keeping the active one
+    /// active. Called when a Captain's home is reset to a new conversation.
+    pub fn carry_captain_documents(&mut self, from: &str, to: &str) {
+        let source = self.threads.get(from).cloned().unwrap_or_default();
+        let documents: Vec<Surface> = source
+            .surfaces
+            .iter()
+            .filter(|surface| matches!(surface, Surface::CaptainDocument { .. }))
+            .cloned()
+            .collect();
+        if documents.is_empty() {
+            return;
+        }
+        let active_document = source
+            .active
+            .as_ref()
+            .filter(|id| documents.iter().any(|surface| surface.id() == **id))
+            .cloned();
+        self.update_thread(from, |current| {
+            current
+                .surfaces
+                .retain(|surface| !matches!(surface, Surface::CaptainDocument { .. }));
+            if active_document.is_some() {
+                current.active = current.surfaces.first().map(Surface::id);
+            }
+            current.open = !current.surfaces.is_empty() && current.open;
+        });
+        self.update_thread(to, |current| {
+            for surface in documents {
+                if !current
+                    .surfaces
+                    .iter()
+                    .any(|entry| entry.id() == surface.id())
+                {
+                    current.surfaces.push(surface);
+                }
+            }
+            if let Some(active) = active_document {
+                current.open = true;
+                current.active = Some(active);
+            }
         });
     }
 

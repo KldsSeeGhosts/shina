@@ -116,10 +116,34 @@ impl State {
     }
 
     pub(super) fn owns_child(&self, caller: usize, child: usize) -> bool {
-        self.threads[child].delegated
-            && self.threads[child]
-                .parent
-                .is_some_and(|parent| parent == caller || self.effective_home(parent) == caller)
+        let thread = &self.threads[child];
+        if !thread.delegated {
+            return false;
+        }
+        let captain_origin = self
+            .tasks
+            .iter()
+            .any(|task| task.child_thread_id == thread.id && task.coordinator_captain.is_some());
+        if captain_origin {
+            return thread
+                .crew_captain
+                .is_some_and(|captain| self.captain_home(captain) == Some(caller));
+        }
+        thread
+            .parent
+            .is_some_and(|parent| parent == caller || self.effective_home(parent) == caller)
+    }
+
+    pub(super) fn captain_worker(&self, child: &Thread, home: usize) -> bool {
+        let Some(captain) = self
+            .threads
+            .iter()
+            .find(|thread| thread.id == home)
+            .and_then(|thread| thread.captain)
+        else {
+            return false;
+        };
+        child.crew_captain == Some(captain) && self.captain_home(captain) == Some(home)
     }
 
     pub fn captain_scope(&self, captain: usize) -> Vec<ProjectId> {
@@ -234,6 +258,10 @@ impl State {
                     "Stop the captain's current turn before resetting its conversation.".into(),
                 );
             }
+        }
+        // Acceptance evidence on the old home survives the reset as durable task state.
+        self.reconcile_task_acceptances();
+        if let Some(index) = self.threads.iter().position(|t| Some(t.id) == old) {
             self.threads[index].disconnect();
         }
         let mut fresh = Thread::new(self.next_id);
@@ -251,6 +279,13 @@ impl State {
         let id = fresh.id;
         self.threads.push(fresh);
         self.captain_homes.insert(captain, id);
+        // Open Captain document tabs follow the captain to its new home; other surfaces stay.
+        if let Some(old) = old {
+            self.right_panels.carry_captain_documents(
+                &crate::right_panel::key(&self.machines.selected, old),
+                &crate::right_panel::key(&self.machines.selected, id),
+            );
+        }
         // Task ids, attempts, deliveries and historical parent links remain unchanged.
         // effective_home routes their control and completion to this fresh home.
         for project in &mut self.projects.entries {
@@ -259,6 +294,7 @@ impl State {
             }
         }
         self.sync_memory_links();
+        self.refresh_captain_contexts();
         if let Some(tab) = self.tabs.iter_mut().find(|tab| Some(**tab) == old) {
             *tab = id;
         }
