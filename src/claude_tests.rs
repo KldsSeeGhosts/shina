@@ -296,7 +296,7 @@ fn records(log: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn client(access: &str) -> Client {
+fn initialized_client(access: &str) -> Client {
     let mut client = Client::new(spec(SessionSource::New, access));
     client
         .initialized(
@@ -304,7 +304,41 @@ fn client(access: &str) -> Client {
         "commands":[],"models":[{"value":"default","supportedEffortLevels":["low","high"]}]}),
         )
         .unwrap();
+    client
+}
+
+/// Answers the session's `mcp_status` request with `servers`, as the CLI would report its
+/// resolved configuration.
+fn status_response(client: &mut Client, servers: Value) {
+    let id = client
+        .pending
+        .iter()
+        .find(|(_, pending)| pending.request["subtype"] == "mcp_status")
+        .map(|(id, _)| id.clone())
+        .expect("mcp_status request");
+    client
+        .incoming(
+            json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":id,"response":{"mcpServers":servers}}}),
+        )
+        .unwrap();
+}
+
+/// The CLI resolved exactly the inline `shina` entry the session launched with.
+fn bind(client: &mut Client) {
+    status_response(
+        client,
+        json!([{"name":"shina","status":"connected","config":{"type":"http",
+            "url":"http://127.0.0.1:12345/mcp",
+            "headers":{"Authorization":"Bearer fixture-thread-token"}}}]),
+    );
+}
+
+fn client(access: &str) -> Client {
+    let mut client = initialized_client(access);
+    bind(&mut client);
     client.events.clear();
+    client.wire.clear();
     client
         .capabilities
         .insert("interrupt_cancel_queued_v1".into());
@@ -396,7 +430,14 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
         "full-access",
         "read-only",
     ] {
-        for name in ["Read", "Edit", "Bash", "mcp__server__mutate", "UnknownTool"] {
+        for name in [
+            "Read",
+            "Edit",
+            "Bash",
+            "mcp__server__mutate",
+            "mcp__shina__list_threads",
+            "UnknownTool",
+        ] {
             let mut client = client(access);
             client
                 .server_request(
@@ -405,6 +446,7 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
                 )
                 .unwrap();
             // A CLI-forwarded ask requires consent even under bypass or an ask rule for Read.
+            // Authentic Shina tools are authorized server-side and need no dialog.
             let ask = access != "read-only" || name == "Read";
             assert_eq!(!client.approvals.is_empty(), ask, "{access} {name}");
             if ask {
@@ -412,7 +454,8 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
                     .command(json!({"type":"extension_ui_response","id":"p","confirmed":true}))
                     .unwrap();
             }
-            let expected = if access == "read-only" && name != "Read" {
+            let readonly_denied = !matches!(name, "Read") && !crate::mcp::is_tool(name);
+            let expected = if access == "read-only" && readonly_denied {
                 "deny"
             } else {
                 "allow"
@@ -425,15 +468,18 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
         }
     }
     let mut client = client("read-only");
-    for name in [
-        "Write",
-        "Bash",
-        "PowerShell",
-        "Task",
-        "Agent",
-        "Skill",
-        "mcp__shina__delegate_task",
-        "ExitPlanMode",
+    for (name, expected) in [
+        ("Write", "deny"),
+        ("Bash", "deny"),
+        ("PowerShell", "deny"),
+        ("Task", "deny"),
+        ("Agent", "deny"),
+        ("Skill", "deny"),
+        ("mcp__shina__delegate_task", "allow"),
+        ("mcp__shina__captain_crew_create", "allow"),
+        ("mcp__shina__exec_shell", "deny"),
+        ("mcp__shina_evil__delegate_task", "deny"),
+        ("ExitPlanMode", "deny"),
     ] {
         client
             .server_request(
@@ -444,10 +490,420 @@ fn permissions_for_every_mode_and_blocking_read_only_even_with_allow_rules() {
             .unwrap();
         assert_eq!(
             client.wire.last().unwrap()["response"]["response"]["hookSpecificOutput"]["permissionDecision"],
-            "deny"
+            expected,
+            "{name}"
         );
         assert!(client.approvals.is_empty());
     }
+}
+
+#[test]
+fn read_only_admits_only_exact_shina_tools_on_an_authenticated_endpoint() {
+    for (name, expected) in [
+        ("mcp__shina__orchestrator_capabilities", "allow"),
+        ("mcp__shina__list_threads", "allow"),
+        ("mcp__shina__captain_crew_send", "allow"),
+        ("mcp__shina__delegate_task", "allow"),
+        ("mcp__shina__exec_shell", "deny"),
+        ("mcp__shina_evil__list_threads", "deny"),
+        ("mcp__Shina__list_threads", "deny"),
+        ("mcp__shina2__delegate_task", "deny"),
+        ("mcp__server__mutate", "deny"),
+        ("Bash", "deny"),
+        ("Write", "deny"),
+        ("Task", "deny"),
+    ] {
+        let mut client = client("read-only");
+        client
+            .server_request(
+                &json!({"request_id":"p","request":{"subtype":"can_use_tool",
+            "tool_name":name,"tool_use_id":"call","input":{}}}),
+            )
+            .unwrap();
+        assert_eq!(
+            client.wire.last().unwrap()["response"]["response"]["behavior"],
+            expected,
+            "{name}"
+        );
+        assert!(client.approvals.is_empty(), "{name} needs no dialog");
+    }
+    // Without the thread-scoped authenticated endpoint, even exact names are foreign.
+    let mut start = spec(SessionSource::New, "read-only");
+    start.link = None;
+    let mut offline = Client::new(start);
+    offline
+        .initialized(
+            &json!({"hook_on_failure_supported":true,"hooks_applied":true,
+        "commands":[],"models":[]}),
+        )
+        .unwrap();
+    offline
+        .server_request(
+            &json!({"request_id":"p","request":{"subtype":"can_use_tool",
+        "tool_name":"mcp__shina__list_threads","tool_use_id":"call","input":{}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        offline.wire.last().unwrap()["response"]["response"]["behavior"],
+        "deny"
+    );
+    // Other access modes keep forwarding Shina tool requests to the user.
+    let mut client = client("approval-required");
+    client
+        .server_request(
+            &json!({"request_id":"p","request":{"subtype":"can_use_tool",
+        "tool_name":"mcp__shina__delegate_task","tool_use_id":"call","input":{}}}),
+        )
+        .unwrap();
+    assert!(!client.approvals.is_empty());
+    client
+        .command(json!({"type":"extension_ui_response","id":"p","confirmed":false}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["response"]["response"]["behavior"],
+        "deny"
+    );
+}
+
+#[test]
+fn read_only_denies_exact_shina_names_until_the_resolved_server_verifies() {
+    let deny = |client: &mut Client| {
+        client
+            .server_request(
+                &json!({"request_id":"p","request":{"subtype":"can_use_tool",
+            "tool_name":"mcp__shina__list_threads","tool_use_id":"call","input":{}}}),
+            )
+            .unwrap();
+        assert_eq!(
+            client.wire.last().unwrap()["response"]["response"]["behavior"],
+            "deny"
+        );
+        client
+            .server_request(
+                &json!({"request_id":"h","request":{"subtype":"hook_callback",
+            "callback_id":"shina-policy","input":{"hook_event_name":"PreToolUse",
+            "tool_name":"mcp__shina__delegate_task","tool_input":{},"tool_use_id":"call"}}}),
+            )
+            .unwrap();
+        assert_eq!(
+            client.wire.last().unwrap()["response"]["response"]["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+    };
+    // An expired status request cannot confirm the registration.
+    let mut expired = initialized_client("read-only");
+    expired
+        .pending
+        .retain(|_, pending| pending.request["subtype"] != "mcp_status");
+    expired.finish_binding(false);
+    deny(&mut expired);
+    // A foreign server claimed the shina name.
+    let mut client = initialized_client("read-only");
+    status_response(
+        &mut client,
+        json!([{"name":"shina","status":"connected","config":{"type":"http",
+            "url":"http://127.0.0.1:9/foreign",
+            "headers":{"Authorization":"Bearer foreign-token"}}}]),
+    );
+    deny(&mut client);
+    // Matching URL and headers on an unconnected or different transport do not qualify.
+    for (status, transport) in [("failed", "http"), ("connected", "stdio")] {
+        let mut client = initialized_client("read-only");
+        status_response(
+            &mut client,
+            json!([{"name":"shina","status":status,"config":{"type":transport,
+                "url":"http://127.0.0.1:12345/mcp",
+                "headers":{"Authorization":"Bearer fixture-thread-token"}}}]),
+        );
+        deny(&mut client);
+    }
+    // No shina server registered at all.
+    let mut client = initialized_client("read-only");
+    status_response(&mut client, json!([]));
+    deny(&mut client);
+    // Two servers answer to shina: the collision fails closed.
+    let mut client = initialized_client("read-only");
+    status_response(
+        &mut client,
+        json!([
+            {"name":"shina","status":"connected","config":{"type":"http",
+                "url":"http://127.0.0.1:12345/mcp",
+                "headers":{"Authorization":"Bearer fixture-thread-token"}}},
+            {"name":"shina","status":"connected","config":{"type":"http",
+                "url":"http://127.0.0.1:9/foreign",
+                "headers":{"Authorization":"Bearer foreign-token"}}},
+        ]),
+    );
+    deny(&mut client);
+    // The right URL under a different credential is not this thread's endpoint.
+    let mut client = initialized_client("read-only");
+    status_response(
+        &mut client,
+        json!([{"name":"shina","status":"connected","config":{"type":"http",
+            "url":"http://127.0.0.1:12345/mcp",
+            "headers":{"Authorization":"Bearer wrong-token"}}}]),
+    );
+    deny(&mut client);
+    // A failed status request admits nothing.
+    let mut client = initialized_client("read-only");
+    let id = client
+        .pending
+        .iter()
+        .find(|(_, pending)| pending.request["subtype"] == "mcp_status")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    client
+        .incoming(
+            json!({"type":"control_response","response":{"subtype":"error",
+        "request_id":id,"error":"mcp_status unavailable"}}),
+        )
+        .unwrap();
+    deny(&mut client);
+    // The verbatim env reference the session passed also verifies.
+    let mut client = initialized_client("read-only");
+    status_response(
+        &mut client,
+        json!([{"name":"shina","status":"connected","config":{"type":"http",
+            "url":"http://127.0.0.1:12345/mcp",
+            "headers":{"Authorization":"Bearer ${SHINA_MCP_TOKEN}"}}}]),
+    );
+    client
+        .server_request(
+            &json!({"request_id":"p","request":{"subtype":"can_use_tool",
+        "tool_name":"mcp__shina__list_threads","tool_use_id":"call","input":{}}}),
+        )
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["response"]["response"]["behavior"],
+        "allow"
+    );
+}
+
+#[test]
+fn read_only_tool_requests_wait_for_binding_and_fail_closed_on_cancel_or_timeout() {
+    let request = json!({"request_id":"racing-tool","request":{"subtype":"can_use_tool",
+        "tool_name":"mcp__shina__list_threads","tool_use_id":"call","input":{}}});
+    for outcome in ["verified", "foreign", "timeout", "cancel"] {
+        let mut client = initialized_client("read-only");
+        client.wire.clear();
+        client.server_request(&request).unwrap();
+        assert!(
+            client.wire.is_empty(),
+            "{outcome} answered before verification"
+        );
+        assert_eq!(client.binding_approvals.len(), 1);
+        match outcome {
+            "verified" => bind(&mut client),
+            "foreign" => status_response(&mut client, json!([])),
+            "timeout" => {
+                client
+                    .pending
+                    .retain(|_, pending| pending.request["subtype"] != "mcp_status");
+                client.finish_binding(false);
+            }
+            "cancel" => {
+                client.command(json!({"type":"abort","id":"stop"})).unwrap();
+                bind(&mut client);
+            }
+            _ => unreachable!(),
+        }
+        assert!(client.binding_approvals.is_empty());
+        let responses: Vec<_> = client
+            .wire
+            .iter()
+            .filter(|record| record["response"]["request_id"] == "racing-tool")
+            .collect();
+        assert_eq!(responses.len(), 1, "{outcome}");
+        assert_eq!(
+            responses[0]["response"]["response"]["behavior"],
+            if outcome == "verified" {
+                "allow"
+            } else {
+                "deny"
+            },
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn optional_usage_errors_do_not_change_verified_endpoint_state() {
+    let mut client = initialized_client("read-only");
+    bind(&mut client);
+    client.events.clear();
+    let id = client
+        .pending
+        .iter()
+        .find(|(_, pending)| pending.request["subtype"] == "get_usage")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    client
+        .incoming(
+            json!({"type":"control_response","response":{"subtype":"error",
+            "request_id":id,"error":"Usage unavailable"}}),
+        )
+        .unwrap();
+    assert!(client.shina_bound);
+    assert!(client.events.is_empty());
+}
+
+#[test]
+fn read_only_protocol_allows_authentic_shina_tools_and_denies_spoofs() {
+    let (mut thread, log) = fixture("read-only", &[]);
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.draft.replace_text("coordinate");
+    thread.send();
+    // Completion proves no authentic call waited on a user dialog.
+    pump(&mut thread, |t| t.status == Status::Completed);
+    let records = records(&log);
+    let decision = |name: &str| {
+        let record = records
+            .iter()
+            .filter(|record| record["type"] == "control_response")
+            .find(|record| record["response"]["request_id"] == format!("callback-{name}"))
+            .unwrap_or_else(|| panic!("no response for {name}"));
+        record["response"]["response"]["behavior"]
+            .as_str()
+            .or_else(|| {
+                record["response"]["response"]["hookSpecificOutput"]["permissionDecision"].as_str()
+            })
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(decision("mcp__shina__orchestrator_capabilities"), "allow");
+    assert_eq!(decision("mcp__shina__captain_crew_send"), "allow");
+    assert_eq!(decision("mcp__shina__exec_shell"), "deny");
+    assert_eq!(decision("mcp__shina_evil__list_threads"), "deny");
+}
+
+#[test]
+fn read_only_denies_exact_names_when_the_registered_server_is_foreign() {
+    for flag in ["--foreign-shina", "--unbound-shina"] {
+        let (mut thread, log) = fixture("read-only", &[flag]);
+        pump(&mut thread, |t| t.native.commands_loaded);
+        thread.draft.replace_text("coordinate");
+        thread.send();
+        pump(&mut thread, |t| t.status == Status::Completed);
+        let records = records(&log);
+        // The log appends across fixture runs; take only this launch's records.
+        let start = records
+            .iter()
+            .rposition(|record| record.get("argv").is_some())
+            .unwrap();
+        let decisions: Vec<&str> = records[start..]
+            .iter()
+            .filter(|record| record["type"] == "control_response")
+            .filter(|record| {
+                record["response"]["request_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("callback-"))
+            })
+            .map(|record| {
+                record["response"]["response"]["behavior"]
+                    .as_str()
+                    .or_else(|| {
+                        record["response"]["response"]["hookSpecificOutput"]["permissionDecision"]
+                            .as_str()
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            decisions,
+            ["deny", "deny", "deny", "deny"],
+            "{flag} bound a foreign or missing shina server yet admitted tools"
+        );
+    }
+}
+
+/// The fixture answers `mcp_status` with the endpoint it was launched with, asks for an
+/// authentic tool, receives `allow`, then issues a real `tools/call` the MCP server
+/// routes to `State::mcp_call` as this thread.
+#[test]
+fn read_only_dispatches_authentic_shina_calls_to_the_calling_thread() {
+    let server = crate::mcp::server(Arc::new(|| {})).unwrap();
+    let mut start = spec(SessionSource::New, "read-only");
+    start.link = Some(crate::backend::HostLink {
+        url: server.url.clone(),
+        token: server.token_for(31),
+        extension: PathBuf::new(),
+        access_mode: "read-only".into(),
+    });
+    let dir = crate::store::directory().unwrap();
+    let script = dir.join("fake_claude.py");
+    std::fs::write(&script, include_str!("../assets/tests/fake_claude.py")).unwrap();
+    let log = dir.join("claude-dispatch.jsonl");
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command
+        .arg("-u")
+        .arg(script)
+        .arg("--log")
+        .arg(&log)
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"));
+    let mut thread = Thread::new(31);
+    thread.harness = "claude".into();
+    thread.native.access = AccessMode::parse("read-only").unwrap();
+    thread.pi = Some(start_process(command, start, Arc::new(|| {})).unwrap());
+    let mut state = crate::model::State::new(dir.clone(), false);
+    state.load_global_for_test();
+    state.threads.push({
+        let mut caller = Thread::new(31);
+        caller.harness = "claude".into();
+        caller
+    });
+    pump(&mut thread, |t| t.native.commands_loaded);
+    thread.draft.replace_text("coordinate");
+    thread.send();
+    let end = Instant::now() + Duration::from_secs(15);
+    while thread.status != Status::Completed {
+        assert!(Instant::now() < end, "dispatch timeout {:?}", thread.error);
+        while let Some(request) = server.next_request() {
+            let result = state.mcp_call(request.thread, &request.tool, &request.args);
+            let _ = request.reply.send(result);
+        }
+        match thread
+            .pi
+            .as_ref()
+            .unwrap()
+            .events
+            .recv_timeout(Duration::from_millis(100))
+        {
+            Ok(Event::Record(record)) => thread.apply(record),
+            Ok(Event::Error(error)) => panic!("Claude fixture: {error}"),
+            _ => {}
+        }
+    }
+    let records = records(&log);
+    let dispatched = |name: &str| {
+        records
+            .iter()
+            .find(|record| record["callback"] == name)
+            .unwrap_or_else(|| panic!("no dispatch record for {name}"))
+    };
+    let capabilities = dispatched("mcp__shina__orchestrator_capabilities");
+    assert_eq!(capabilities["allowed"], true);
+    assert!(
+        capabilities["result"]
+            .as_str()
+            .unwrap()
+            .contains("\"caller\""),
+        "authenticated dispatch returned the caller's capabilities: {capabilities}"
+    );
+    // Invalid arguments still reach the real handler: the server, not the callback,
+    // rejects them. That distinguishes authenticated dispatch from a permission mock.
+    let crew = dispatched("mcp__shina__captain_crew_send");
+    assert_eq!(crew["allowed"], true);
+    assert!(
+        crew["result"].as_str().unwrap().contains("Captain home"),
+        "dispatch reached mcp_call's caller check: {crew}"
+    );
+    // Denied names are never dispatched to the endpoint.
+    let spoof = dispatched("mcp__shina_evil__list_threads");
+    assert_eq!(spoof["allowed"], false);
+    assert_eq!(spoof["result"], "");
+    let shell = dispatched("mcp__shina__exec_shell");
+    assert_eq!(shell["allowed"], false);
+    assert_eq!(shell["result"], "");
 }
 
 #[test]

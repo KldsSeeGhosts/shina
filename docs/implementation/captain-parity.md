@@ -47,8 +47,10 @@ changed-intent rejection, one worker prompt, a response-only wait change, and
 receipt replay after process restart and worker deletion. The focused test
 passes. On the integrated branch, `cargo test` passes with 1,910 unit tests
 and 99 server-runtime tests, with 12 opt-in unit tests ignored. `cargo build`
-and `cargo fmt --check` also pass. This slice is ready for its own pull request
-and CI run.
+and `cargo fmt --check` also pass. [PR #44](https://github.com/KldsSeeGhosts/shina/pull/44)
+passed its core checks and merged at
+`c6bcf9783756e9b414709602319f6c502d947bf9`. Main's platform publication runs
+separately from the PR gate.
 
 Issue #22 is now assigned to Devin SWE-2 on top of this implementation. It adds
 durable send/cancel receipts and attempt fences. Its implementation must retain
@@ -74,6 +76,23 @@ remaining checks and corrections:
 A Devin SWE-2 rework assignment covers endpoint identity, effective rights and
 protocol evidence. No frontend change is required for the current access-mode
 description.
+
+The reworked implementation `04f61ca9b70e0ebbab1e5480792b9e89905b34fe` now
+verifies the CLI's resolved `mcp_status` configuration against the expected
+thread endpoint and bearer header. Missing, duplicate or foreign registrations
+do not qualify. It retains unrelated MCP servers and reports provider-specific
+admission separately from server authority. It also rejects local delegation
+from earlier Captain homes.
+
+Root review added a startup-race fix. Exact Shina calls that arrive while
+endpoint verification is pending wait for that result instead of receiving a
+premature denial. Failure, timeout and cancellation deny held calls. The check
+requires a connected HTTP registration, and optional usage failures do not
+change the endpoint status. Unit tests cover these cases in addition to the
+worker's authenticated dispatch and live serve-process tests. On the integrated
+branch, `cargo test` passes with 1,921 unit tests and 100 server-runtime tests,
+with 12 opt-in tests ignored. `cargo build`, `cargo fmt --check` and
+`git diff --check` also pass. Publish this revision as its separate #18 PR.
 
 ### First review of #21
 
@@ -101,6 +120,15 @@ The remaining first-milestone work is #20, #22 and #23. Issue #32 covers the
 effective cross-harness contract alongside these fixes. The performance track
 is #24, then #25, then #26. Captain identity and repository ownership follow in
 #27 and #28 before remote crew and the common event inbox in #29 and #30.
+
+The #20 backend assignment uses Devin SWE-2. Its placement and
+receipt data must support a separate Claude Opus 5.5 medium UI assignment;
+backend completion alone cannot close that issue.
+
+Devin rate-limited the #20 and #22 assignments on November 16. Their existing
+worktrees and partial work remain intact. Resume those implementation threads
+with the same requested SWE-2 model after the reported reset; do not replace
+them with another provider or publish incomplete changes.
 
 Any frontend implementation or design decisions are assigned to Claude Opus
 5.5 medium. KSG Code remains the layout and interaction reference, with Shina's

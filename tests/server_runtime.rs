@@ -281,6 +281,93 @@ fn question_files_use_server_paths_and_document_text_in_the_native_answer() {
     profile.stop();
 }
 
+/// The whole serve path: the fixture answers `mcp_status` with the endpoint it was
+/// launched with, read-only admits exact authentic names on both permission paths, and
+/// the fixture's real `tools/call` reaches `State::mcp_call` for this thread. Spoofed
+/// and unadvertised names stay denied and never dispatch.
+#[test]
+fn read_only_claude_dispatches_verified_shina_tools_to_the_calling_thread() {
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("dispatch-hello"),
+    );
+    assert_eq!(
+        client.command(
+            "thread.configure",
+            json!({"threadId":1,"harness":"claude","access":"read-only"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"shina-dispatch-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+    let records: Vec<Value> =
+        fs::read_to_string(profile.root.join("Shina/chats/1/claude-requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let decision = |name: &str| {
+        let record = records
+            .iter()
+            .filter(|record| record["type"] == "control_response")
+            .find(|record| record["response"]["request_id"] == format!("callback-{name}"))
+            .unwrap_or_else(|| panic!("no response for {name}"));
+        record["response"]["response"]["behavior"]
+            .as_str()
+            .or_else(|| {
+                record["response"]["response"]["hookSpecificOutput"]["permissionDecision"].as_str()
+            })
+            .unwrap()
+            .to_owned()
+    };
+    // The session verified its resolved shina server before admitting any name.
+    assert!(
+        records
+            .iter()
+            .any(|record| record["request"]["subtype"] == "mcp_status"),
+        "no mcp_status verification request"
+    );
+    assert_eq!(decision("mcp__shina__orchestrator_capabilities"), "allow");
+    assert_eq!(decision("mcp__shina__list_threads"), "allow");
+    assert_eq!(decision("mcp__shina__exec_shell"), "deny");
+    assert_eq!(decision("mcp__shina_evil__list_threads"), "deny");
+    let dispatched = |name: &str| {
+        records
+            .iter()
+            .find(|record| record["dispatch"] == name)
+            .unwrap_or_else(|| panic!("no dispatch record for {name}"))
+    };
+    let capabilities = dispatched("mcp__shina__orchestrator_capabilities");
+    assert!(
+        capabilities["result"]
+            .as_str()
+            .unwrap()
+            .contains("\"caller\""),
+        "authenticated dispatch returned caller capabilities: {capabilities}"
+    );
+    let threads = dispatched("mcp__shina__list_threads");
+    assert!(
+        threads["result"].as_str().unwrap().contains("\"threads\""),
+        "authenticated dispatch returned the thread list: {threads}"
+    );
+    assert_eq!(dispatched("mcp__shina__exec_shell")["denied"], true);
+    assert_eq!(dispatched("mcp__shina_evil__list_threads")["denied"], true);
+    profile.stop();
+}
+
 #[test]
 fn choice_only_questions_use_native_option_ids_and_refuse_an_older_peer() {
     let mut profile = Profile::new();

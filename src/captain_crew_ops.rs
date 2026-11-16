@@ -1216,4 +1216,84 @@ mod tests {
             runtime.state.data_dir.join("second")
         );
     }
+
+    /// The server resolves coordination authority from the calling thread's role and the
+    /// Captain's current ownership, never from model-supplied identifiers. Read-only
+    /// harness policy can now admit crew tools; these rejections are what keeps them safe.
+    #[test]
+    fn crew_tools_reject_every_caller_that_is_not_the_current_primary_home() {
+        let (mut runtime, _) = fixture();
+        let home = runtime.state.captain_home(0).unwrap();
+        let ordinary = runtime
+            .state
+            .threads
+            .iter()
+            .find(|thread| thread.id != home && !thread.captain_home)
+            .map(|thread| thread.id)
+            .unwrap();
+        let push = |runtime: &mut RuntimeState, fill: &dyn Fn(&mut Thread)| -> usize {
+            let id = runtime.state.next_id;
+            runtime.state.next_id += 1;
+            let mut thread = Thread::new(id);
+            fill(&mut thread);
+            runtime.state.threads.push(thread);
+            id
+        };
+        let earlier = push(&mut runtime, &|thread| {
+            thread.captain_home = true;
+            thread.captain = Some(0);
+        });
+        let crew = push(&mut runtime, &|thread| {
+            thread.crew_captain = Some(0);
+        });
+        let worker = push(&mut runtime, &|thread| {
+            thread.delegated = true;
+            thread.parent = Some(home);
+        });
+        let remote = push(&mut runtime, &|thread| {
+            thread.delegated = true;
+            thread.peer_origin = Some(crate::model::remote_tasks::PeerOrigin {
+                device_id: "fixture-peer".into(),
+                server_id: "fixture-server".into(),
+                server_label: "Fixture".into(),
+                parent_thread_id: 1,
+                task_id: "task".into(),
+                captain: "Ember".into(),
+                memories: vec![],
+                result: None,
+                acknowledged: false,
+                attempt_message: String::new(),
+                cancelled_commands: vec![],
+                reply_after_position: 0,
+            });
+        });
+        let create = |runtime: &mut RuntimeState, caller: usize| {
+            runtime.state.mcp_call(
+                caller,
+                "captain_crew_create",
+                &json!({"requestId":uuid::Uuid::new_v4(),"prompt":"Unauthorized crew work"}),
+            )
+        };
+        for caller in [crew, worker, remote, ordinary] {
+            assert_eq!(
+                create(&mut runtime, caller).unwrap_err(),
+                "Only a Captain home may control independent crew."
+            );
+        }
+        // An earlier home of the same Captain is a record, not a coordinator.
+        assert_eq!(
+            create(&mut runtime, earlier).unwrap_err(),
+            "Only the Captain's current primary home may start a crew operation."
+        );
+        // A demoted Captain's revoked scope blocks even its surviving home.
+        runtime.state.captain_lifecycles.insert(
+            0,
+            captain_lifecycle::CaptainLifecycle {
+                phase: CaptainPhase::Retired,
+                ..Default::default()
+            },
+        );
+        let error = create(&mut runtime, home).unwrap_err();
+        assert!(error.contains("demoted"), "{error}");
+    }
 }

@@ -8038,6 +8038,62 @@ impl State {
                 .map(crate::peer::Peer::summary)
                 .collect::<Vec<_>>()
         );
+        // Effective coordination rights, identical for Pi, Claude, Codex and ACP callers:
+        // the server resolves them from the calling thread, never model-supplied ids.
+        // Each `may_*` mirrors the matching handler's ownership and lifecycle gates; it
+        // does not promise call-specific validation (prompt, target or capacity) succeeds.
+        let (captain, primary_home) = self.captain_actor(caller_index);
+        let owner_active = self.require_active_thread_owner(caller.id).is_ok();
+        let local = caller.peer_origin.is_none();
+        // How the caller's harness treats `mcp__shina__` names before they reach this
+        // server. Stated per adapter because admission policy is not uniform: Pi's bridge
+        // and Claude's policy gate by name, Codex leaves it to its approval mode, and ACP
+        // agents own their own prompts.
+        let admission = match caller.harness.as_str() {
+            "pi" => {
+                "The Pi bridge admits this thread's own mcp__shina__ tools without a prompt in read-only and full-access; in other modes it auto-admits tools marked readOnlyHint and asks before the rest."
+            }
+            "claude" => {
+                "In read-only, exact advertised mcp__shina__ names run without a prompt only after the session verifies its registered shina server is this thread's token-scoped endpoint; foreign or lookalike names stay denied. Other access modes run them through the normal permission flow."
+            }
+            "codex" => {
+                "The thread's required shina MCP server runs under Codex's approval policy for this access mode; Shina adds no per-name gate."
+            }
+            _ => {
+                "MCP admission is the agent's own permission policy on this harness; Shina cannot report whether a call prompts or is refused."
+            }
+        };
+        capabilities["caller"] = json!({
+            "role": if caller.delegated {
+                "worker"
+            } else if caller.captain_home {
+                if primary_home { "captain_home" } else { "earlier_home" }
+            } else if captain.is_some() {
+                "crew"
+            } else {
+                "thread"
+            },
+            "captain": captain,
+            "primary_home": primary_home,
+            "access": caller.native.access.id(),
+            "may_delegate": owner_active
+                && local
+                && !caller.delegated
+                && (!caller.captain_home || primary_home),
+            "may_control_crew": self.client.is_none()
+                && owner_active
+                && local
+                && !caller.delegated
+                && primary_home,
+            "may_write_captain_documents": owner_active
+                && local
+                && primary_home
+                && self.require_captain_capability().is_ok(),
+            "shina_tools": {
+                "endpoint": caller.host.is_some(),
+                "admission": admission,
+            },
+        });
         capabilities
     }
 
@@ -8292,6 +8348,17 @@ impl State {
                 if self.threads[caller_index].delegated {
                     return Err(
                         "Delegated threads cannot delegate further. Do the work in this thread."
+                            .into(),
+                    );
+                }
+                // Earlier Captain homes are records, not coordinators; the remote path
+                // already refuses them, and local delegation is no different.
+                if self.threads[caller_index].captain_home
+                    && self.effective_home(self.threads[caller_index].id)
+                        != self.threads[caller_index].id
+                {
+                    return Err(
+                        "Open the captain's primary home to delegate new work. This is an earlier conversation."
                             .into(),
                     );
                 }
@@ -18199,6 +18266,120 @@ mod tests {
         assert_eq!(capabilities["runtime"]["host_supported"], true);
         assert_eq!(capabilities["constraints"]["direct_providers"], false);
         assert_eq!(capabilities["constraints"]["remote_hosts"], true);
+    }
+
+    #[test]
+    fn orchestrator_capabilities_reports_the_callers_coordination_rights() {
+        let mut state = State::new(".".into(), false);
+        state.load_global_for_test();
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        let home = state.captain_home(0).expect("primary home");
+        let push = |state: &mut State, fill: &dyn Fn(&mut Thread)| -> usize {
+            let id = state.next_id;
+            state.next_id += 1;
+            let mut thread = Thread::new(id);
+            fill(&mut thread);
+            state.threads.push(thread);
+            id
+        };
+        let earlier = push(&mut state, &|thread| {
+            thread.captain_home = true;
+            thread.captain = Some(0);
+        });
+        let crew = push(&mut state, &|thread| {
+            thread.crew_captain = Some(0);
+        });
+        let worker = push(&mut state, &|thread| {
+            thread.delegated = true;
+            thread.parent = Some(home);
+        });
+        let caller = |state: &mut State, id: usize| {
+            state
+                .mcp_call(id, "orchestrator_capabilities", &json!({}))
+                .unwrap()["caller"]
+                .clone()
+        };
+        let thread = caller(&mut state, 1);
+        assert_eq!(thread["role"], "thread");
+        assert_eq!(thread["captain"], Value::Null);
+        assert_eq!(thread["may_delegate"], true);
+        assert_eq!(thread["may_control_crew"], false);
+        assert_eq!(thread["may_write_captain_documents"], false);
+        let primary = caller(&mut state, home);
+        assert_eq!(primary["role"], "captain_home");
+        assert_eq!(primary["primary_home"], true);
+        assert_eq!(primary["captain"], 0);
+        assert_eq!(primary["access"], "read-only");
+        assert_eq!(primary["may_delegate"], true);
+        assert_eq!(primary["may_control_crew"], true);
+        assert_eq!(primary["may_write_captain_documents"], true);
+        let earlier = caller(&mut state, earlier);
+        assert_eq!(earlier["role"], "earlier_home");
+        assert_eq!(earlier["primary_home"], false);
+        assert_eq!(earlier["may_delegate"], false);
+        assert_eq!(earlier["may_control_crew"], false);
+        assert_eq!(earlier["may_write_captain_documents"], false);
+        let crew = caller(&mut state, crew);
+        assert_eq!(crew["role"], "crew");
+        assert_eq!(crew["captain"], 0);
+        assert_eq!(crew["may_delegate"], true);
+        assert_eq!(crew["may_control_crew"], false);
+        assert_eq!(crew["may_write_captain_documents"], false);
+        let worker = caller(&mut state, worker);
+        assert_eq!(worker["role"], "worker");
+        assert_eq!(worker["may_delegate"], false);
+        assert_eq!(worker["may_control_crew"], false);
+        assert_eq!(worker["may_write_captain_documents"], false);
+        // The endpoint flag reports whether this server holds a thread-scoped link; the
+        // admission text is harness-specific and never claims a prompt-free guarantee
+        // the adapter cannot give.
+        assert_eq!(primary["shina_tools"]["endpoint"], false);
+        assert!(primary["shina_tools"]["admission"].is_string());
+        // Archived and retired Captains leave surviving homes as records: every write
+        // gate the handlers enforce reports false, matching the later denial.
+        for (phase, word) in [
+            (CaptainPhase::Archived, "archived"),
+            (CaptainPhase::Retired, "retired"),
+        ] {
+            state.captain_lifecycles.insert(
+                0,
+                captain_lifecycle::CaptainLifecycle {
+                    phase,
+                    ..Default::default()
+                },
+            );
+            let inactive = caller(&mut state, home);
+            assert_eq!(inactive["may_delegate"], false, "{word}");
+            assert_eq!(inactive["may_control_crew"], false, "{word}");
+            assert_eq!(inactive["may_write_captain_documents"], false, "{word}");
+        }
+    }
+
+    #[test]
+    fn earlier_captain_homes_cannot_delegate_work() {
+        let mut state = State::new(".".into(), false);
+        state.load_global_for_test();
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        let id = state.next_id;
+        state.next_id += 1;
+        let mut earlier = Thread::new(id);
+        earlier.captain_home = true;
+        earlier.captain = Some(0);
+        state.threads.push(earlier);
+        let error = state
+            .mcp_call(id, "delegate_task", &json!({"prompt":"Start work"}))
+            .unwrap_err();
+        assert!(error.contains("earlier conversation"), "{error}");
+        let error = state
+            .mcp_call(
+                id,
+                "delegate_task",
+                &json!({"prompt":"Start work","target":{"machine":"fixture-peer"}}),
+            )
+            .unwrap_err();
+        assert!(error.contains("earlier conversation"), "{error}");
     }
 
     #[test]

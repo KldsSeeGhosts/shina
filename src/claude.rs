@@ -235,6 +235,10 @@ struct Client {
     wire: Vec<Value>,
     events: Vec<Value>,
     usage_limits: Value,
+    /// Set only after `mcp_status` proves the resolved `shina` server is this thread's
+    /// token-scoped endpoint; read-only's exact-name admission fails closed without it.
+    shina_bound: bool,
+    binding_approvals: Vec<Approval>,
     active_run_id: Option<String>,
     settled_run_id: Option<String>,
     turn_serial: u64,
@@ -284,6 +288,8 @@ impl Client {
             wire: vec![],
             events: vec![],
             usage_limits: Value::Null,
+            shina_bound: false,
+            binding_approvals: vec![],
             active_run_id: None,
             settled_run_id: None,
             turn_serial: 0,
@@ -293,7 +299,60 @@ impl Client {
     }
 
     fn access(&self) -> &str {
-        &self.start.link.as_ref().expect("MCP required").access_mode
+        // Sessions without the thread-scoped MCP endpoint get the strictest policy.
+        self.start
+            .link
+            .as_ref()
+            .map_or("read-only", |link| link.access_mode.as_str())
+    }
+
+    /// Whether `name` is an authentic Shina coordination tool: an exact `mcp__shina__<tool>`
+    /// name the server advertises, and only after `mcp_status` proved the CLI's resolved
+    /// `shina` server is this thread's token-authenticated endpoint. A foreign or
+    /// unverifiable `shina` registration fails closed, as do spoofed names.
+    fn shina_tool(&self, name: &str) -> bool {
+        self.shina_bound && crate::mcp::is_tool(name)
+    }
+
+    fn finish_binding(&mut self, bound: bool) {
+        self.shina_bound = bound;
+        self.update("shinaEndpoint", json!({"bound":bound}));
+        for approval in std::mem::take(&mut self.binding_approvals) {
+            self.answer(approval, bound && !self.cancelling, None);
+        }
+    }
+
+    /// The resolved `shina` MCP server must be exactly the inline `--mcp-config` entry this
+    /// session launched with: one server named `shina`, this thread's loopback URL, and the
+    /// bearer header the CLI saw, verbatim or already env-expanded. CLI 2.1.325 resolves
+    /// dynamic `--mcp-config` entries over same-named user, project and local servers, and
+    /// namespaces plugin servers as `plugin:<name>:<server>`; managed policy sources are not
+    /// enumerable here, so identity is checked rather than assumed.
+    fn verify_binding(&self, data: &Value) -> bool {
+        let Some(link) = &self.start.link else {
+            return false;
+        };
+        let servers: Vec<&Value> = data["mcpServers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|server| server["name"] == "shina")
+            .collect();
+        let [server] = servers.as_slice() else {
+            return false;
+        };
+        if server["status"] != "connected" || server["config"]["type"] != "http" {
+            return false;
+        }
+        if server["config"]["url"].as_str() != Some(link.url.as_str()) {
+            return false;
+        }
+        let resolved = format!("Bearer {}", link.token);
+        let literal = format!("Bearer ${{{}}}", crate::mcp::TOKEN_ENV);
+        matches!(
+            server["config"]["headers"]["Authorization"].as_str(),
+            Some(header) if header == resolved || header == literal
+        )
     }
 
     fn launch(&self, command: &mut Command) {
@@ -584,6 +643,15 @@ impl Client {
             json!({"subtype":"get_usage","skipBehaviors":true}),
             json!({"type":"get_usage"}),
         );
+        // Name alone cannot prove which server a `mcp__shina__*` call would reach. The
+        // resolved registration must echo this thread's endpoint before read-only may
+        // admit those names without a dialog.
+        if self.start.link.is_some() {
+            self.request(
+                json!({"subtype":"mcp_status"}),
+                json!({"type":"mcp_status_check"}),
+            );
+        }
         Ok(())
     }
 
@@ -663,6 +731,10 @@ impl Client {
                             "Claude could not apply the plan's permission mode: {error}"
                         ));
                     }
+                    if pending.request["subtype"] == "mcp_status" {
+                        self.finish_binding(false);
+                        return Ok(());
+                    }
                     if matches!(
                         pending.request["subtype"].as_str(),
                         Some("get_context_usage" | "get_usage")
@@ -673,6 +745,10 @@ impl Client {
                     return Ok(());
                 }
                 let data = &response["response"];
+                if pending.request["subtype"] == "mcp_status" {
+                    self.finish_binding(self.verify_binding(data));
+                    return Ok(());
+                }
                 match pending.request["subtype"].as_str().unwrap_or("") {
                     "initialize" => self.initialized(data)?,
                     "get_usage" => {
@@ -1081,7 +1157,7 @@ impl Client {
                 .cloned()
                 .unwrap_or_default(),
         };
-        if self.cancelling || self.approvals.len() >= 32 {
+        if self.cancelling || self.approvals.len() + self.binding_approvals.len() >= 32 {
             self.answer(approval, false, None);
         } else if name == "ExitPlanMode" {
             let plan = input["plan"].as_str().unwrap_or("").to_owned();
@@ -1123,7 +1199,22 @@ impl Client {
                 self.approvals.insert(id.into(), approval);
             }
         } else if self.access() == "read-only" && !read_tool(&name) {
-            self.answer(approval, false, None);
+            // Read-only separates editing the checkout from coordinating authorized
+            // Shina work. Exact mcp__shina__ names on this thread's token-scoped
+            // endpoint proceed; the server authorizes each call by caller role.
+            if !self.shina_bound
+                && crate::mcp::is_tool(&name)
+                && self
+                    .pending
+                    .values()
+                    .any(|pending| pending.request["subtype"] == "mcp_status")
+            {
+                // A tool request can race the startup status response. Wait for that
+                // response instead of denying an authentic call permanently.
+                self.binding_approvals.push(approval);
+            } else {
+                self.answer(approval, self.shina_tool(&name), None);
+            }
         } else if !hook && self.planning && !read_tool(&name) && name != "TodoWrite" {
             // Native plan-file edits need no callback. Other Plan-mode writes
             // must not inherit Full access or Auto-accept edits before approval.
@@ -1185,7 +1276,9 @@ impl Client {
     }
 
     fn answer(&mut self, approval: Approval, allow: bool, updated: Option<Value>) {
-        let message = if approval.name == "ExitPlanMode" {
+        let message = if allow {
+            "Shina allowed this tool call."
+        } else if approval.name == "ExitPlanMode" {
             "Shina captured your proposed plan. Stop and wait for the user's feedback or implementation request."
         } else {
             "Shina refused this tool call. Do not bypass this decision."
@@ -1301,7 +1394,10 @@ impl Client {
                     }
                 } else {
                     let decision = crate::approval::decision(&record)?;
-                    let decision = if self.access() == "read-only" && !read_tool(&approval.name) {
+                    let decision = if self.access() == "read-only"
+                        && !read_tool(&approval.name)
+                        && !self.shina_tool(&approval.name)
+                    {
                         "decline"
                     } else {
                         decision
@@ -1433,6 +1529,9 @@ impl Client {
                 self.cancelling = self.running;
                 for (_, approval) in std::mem::take(&mut self.approvals) {
                     self.answer_decision(approval, "cancel", None);
+                }
+                for approval in std::mem::take(&mut self.binding_approvals) {
+                    self.answer(approval, false, None);
                 }
                 self.request(json!({"subtype":"interrupt","cancel_queued":true}), record);
                 if !self.running {
@@ -2466,12 +2565,18 @@ fn run_mode(
                 return Err("Claude stopped reading commands.".into());
             }
             let now = Instant::now();
+            let mut status_expired = false;
             client.pending.retain(|_, p| {
-                !(matches!(
+                let droppable = matches!(
                     p.request["subtype"].as_str(),
-                    Some("get_context_usage" | "get_usage")
-                ) && now >= p.deadline)
+                    Some("get_context_usage" | "get_usage" | "mcp_status")
+                ) && now >= p.deadline;
+                status_expired |= droppable && p.request["subtype"] == "mcp_status";
+                !droppable
             });
+            if status_expired {
+                client.finish_binding(false);
+            }
             if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Claude did not acknowledge an operation within 30 seconds.".into());
             }
