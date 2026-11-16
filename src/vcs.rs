@@ -317,7 +317,7 @@ pub(crate) fn git_error(
 }
 
 pub(crate) fn configure_git_command(cmd: &mut Command, cwd: &Path, ctx: &GitContext) {
-    cmd.current_dir(cwd)
+    cmd.current_dir(child_process_path(cwd))
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .env("GIT_ASKPASS", "")
@@ -431,6 +431,54 @@ pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Removes the Windows `\\?\` verbatim prefix from a byte string when a plain
+/// equivalent exists: `\\?\C:\x` becomes `C:\x` and `\\?\UNC\server\share\x`
+/// becomes `\\server\share\x`. Other verbatim device paths have no plain form and
+/// are returned unchanged. Operates on raw bytes so it can be tested off Windows.
+#[cfg(any(windows, test))]
+fn strip_verbatim_prefix_bytes(raw: &[u8]) -> Vec<u8> {
+    fn is_sep(b: u8) -> bool {
+        b == b'\\' || b == b'/'
+    }
+    let rest = match raw {
+        [a, b, b'?', c, tail @ ..] if is_sep(*a) && is_sep(*b) && is_sep(*c) => tail,
+        _ => return raw.to_vec(),
+    };
+    // \\?\C:\... -> C:\...
+    if rest.len() >= 3 && rest[0].is_ascii_alphabetic() && rest[1] == b':' && is_sep(rest[2]) {
+        return rest.to_vec();
+    }
+    // \\?\UNC\server\share\... -> \\server\share\...
+    if rest.len() > 4 && rest[..4].eq_ignore_ascii_case(b"UNC\\") {
+        let tail = &rest[4..];
+        if tail.iter().any(|&b| b == b'\\') {
+            let mut out = Vec::with_capacity(tail.len() + 2);
+            out.extend_from_slice(b"\\\\");
+            out.extend_from_slice(tail);
+            return out;
+        }
+    }
+    raw.to_vec()
+}
+
+/// Form of `path` handed to child processes such as Git, sh and PowerShell.
+/// `std::fs::canonicalize` yields `\\?\` verbatim paths on Windows, which Git for
+/// Windows cannot open as a working directory or `--git-dir`; map them to the
+/// plain drive or UNC form. Verbatim device paths without a plain equivalent and
+/// every non-Windows path are returned unchanged.
+#[cfg(windows)]
+pub(crate) fn child_process_path(path: &Path) -> PathBuf {
+    let stripped = strip_verbatim_prefix_bytes(path.as_os_str().as_encoded_bytes());
+    // SAFETY: the transform only removes or rewrites an ASCII verbatim prefix,
+    // which preserves the platform encoding invariants of `OsStr`.
+    PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(stripped) })
+}
+
+#[cfg(not(windows))]
+pub(crate) fn child_process_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn has_only_normal_or_root_components(path: &Path) -> bool {
@@ -702,7 +750,7 @@ fn execute_worktree_list(
     git_dir: Option<&Path>,
     ctx: &GitContext,
 ) -> Result<String, String> {
-    let git_dir_str = git_dir.map(|p| p.to_string_lossy().into_owned());
+    let git_dir_str = git_dir.map(|p| child_process_path(p).to_string_lossy().into_owned());
     let mut args_z: Vec<&str> = Vec::new();
     if let Some(gd) = git_dir_str.as_deref() {
         args_z.extend(["--git-dir", gd]);
@@ -878,7 +926,9 @@ pub fn list_branches_with(
     });
 
     let fetch_cwd = fetch_cwd_for_common_dir(&git_common_dir);
-    let git_dir_str = git_common_dir.to_string_lossy().into_owned();
+    let git_dir_str = child_process_path(&git_common_dir)
+        .to_string_lossy()
+        .into_owned();
 
     let refs_out = run_git_checked(
         "GitVcsDriver.listRefs.snapshotRefs",
@@ -1533,7 +1583,7 @@ pub fn status_with(input: &VcsStatusInput, ctx: &GitContext) -> Result<VcsStatus
     let common_dir = read_git_common_dir(&cwd, ctx)?;
     let (default_branch, has_primary_remote) = if let Some(common) = common_dir.as_deref() {
         let fetch_cwd = fetch_cwd_for_common_dir(common);
-        let gd = common.to_string_lossy().into_owned();
+        let gd = child_process_path(common).to_string_lossy().into_owned();
         let def_out = run_git_raw(
             "GitVcsDriver.statusDetails.defaultBranch",
             fetch_cwd,
@@ -1995,6 +2045,9 @@ pub fn create_worktree_with(
         read_config_value(&cwd, "checkout.workers", ctx).unwrap_or_else(|| "0".to_owned());
     let workers_arg = format!("checkout.workers={checkout_workers}");
     let worktree_path_str = worktree_path.to_string_lossy().into_owned();
+    let worktree_path_arg = child_process_path(&worktree_path)
+        .to_string_lossy()
+        .into_owned();
 
     let add_res = run_git_checked(
         "GitVcsDriver.createWorktree",
@@ -2005,7 +2058,7 @@ pub fn create_worktree_with(
             "worktree",
             "add",
             "--",
-            &worktree_path_str,
+            &worktree_path_arg,
             checkout_ref,
         ],
         WORKTREE_TIMEOUT,
@@ -2084,7 +2137,7 @@ pub fn remove_worktree_with(
             normalize_lexical(&cwd.join(p))
         }
     };
-    let target_str = target.to_string_lossy().into_owned();
+    let target_str = child_process_path(&target).to_string_lossy().into_owned();
     let force = input.force == Some(true);
 
     let mut args = vec![
@@ -2536,7 +2589,7 @@ pub fn run_setup(input: &VcsRunSetupInput) -> Result<VcsRunSetupResult, String> 
 
     let started = Instant::now();
     let mut cmd = setup_shell_command(&script.command);
-    cmd.current_dir(&worktree_path)
+    cmd.current_dir(child_process_path(&worktree_path))
         .env("T3CODE_PROJECT_ROOT", &project_cwd)
         .env("T3CODE_WORKTREE_PATH", &worktree_path)
         .env("COLORTERM", "")
@@ -2755,7 +2808,7 @@ mod tests {
                 .arg("-c")
                 .arg("user.email=test@example.com")
                 .args(args)
-                .current_dir(cwd)
+                .current_dir(child_process_path(cwd))
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .env("GIT_CONFIG_GLOBAL", &self.empty_config)
                 .env("GIT_CONFIG_SYSTEM", &self.empty_config);
@@ -2806,7 +2859,8 @@ mod tests {
         env.git(&bare, &["init", "--bare", "-b", "main", "--quiet"]);
 
         let repo = env.init_repo("repo");
-        env.git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let bare_arg = child_process_path(&bare).to_string_lossy().into_owned();
+        env.git(&repo, &["remote", "add", "origin", &bare_arg]);
         env.git(&repo, &["push", "-u", "origin", "main", "--quiet"]);
         env.git(
             &repo,
@@ -2819,15 +2873,8 @@ mod tests {
 
         // Create a remote-only branch via a second clone so it appears in origin/*
         let peer = env._root.path.join("peer");
-        env.git(
-            &env._root.path,
-            &[
-                "clone",
-                "--quiet",
-                bare.to_str().unwrap(),
-                peer.to_str().unwrap(),
-            ],
-        );
+        let peer_arg = child_process_path(&peer).to_string_lossy().into_owned();
+        env.git(&env._root.path, &["clone", "--quiet", &bare_arg, &peer_arg]);
         env.git(&peer, &["checkout", "-b", "remote-only", "--quiet"]);
         std::fs::write(peer.join("remote.txt"), "r\n").unwrap();
         env.git(&peer, &["add", "remote.txt"]);
@@ -3081,20 +3128,14 @@ mod tests {
         env.git(&bare, &["init", "--bare", "-b", "main", "--quiet"]);
 
         let repo = env.init_repo("repo");
-        env.git(&repo, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let bare_arg = child_process_path(&bare).to_string_lossy().into_owned();
+        env.git(&repo, &["remote", "add", "origin", &bare_arg]);
         env.git(&repo, &["push", "-u", "origin", "main", "--quiet"]);
 
         // Advance remote from a peer clone without fetching in `repo`.
         let peer = env._root.path.join("peer");
-        env.git(
-            &env._root.path,
-            &[
-                "clone",
-                "--quiet",
-                bare.to_str().unwrap(),
-                peer.to_str().unwrap(),
-            ],
-        );
+        let peer_arg = child_process_path(&peer).to_string_lossy().into_owned();
+        env.git(&env._root.path, &["clone", "--quiet", &bare_arg, &peer_arg]);
         std::fs::write(peer.join("ahead.txt"), "from origin\n").unwrap();
         env.git(&peer, &["add", "ahead.txt"]);
         env.git(&peer, &["commit", "-m", "advance remote", "--quiet"]);
@@ -3262,15 +3303,23 @@ mod tests {
         assert_eq!(resolved, "feature/dup-1");
 
         // Setup script from t3.json (lenient JSON) runs in worktree with expected env and bounded tail.
+        // The runner uses sh on Unix and PowerShell on Windows, so env reads need per-shell syntax.
+        #[cfg(not(windows))]
+        let setup_command = "echo root=$T3CODE_PROJECT_ROOT; echo wt=$T3CODE_WORKTREE_PATH; pwd";
+        #[cfg(windows)]
+        let setup_command =
+            "echo root=$env:T3CODE_PROJECT_ROOT; echo wt=$env:T3CODE_WORKTREE_PATH; pwd";
         std::fs::write(
             repo.join("t3.json"),
-            r#"{
+            format!(
+                r#"{{
                 // trailing comment supported via lenient json
                 "scripts": [
-                    { "name": "Dev", "command": "echo dev" },
-                    { "name": "Setup", "command": "echo root=$T3CODE_PROJECT_ROOT; echo wt=$T3CODE_WORKTREE_PATH; pwd", "runOnWorktreeCreate": true }
+                    {{ "name": "Dev", "command": "echo dev" }},
+                    {{ "name": "Setup", "command": "{setup_command}", "runOnWorktreeCreate": true }}
                 ]
-            }"#,
+            }}"#
+            ),
         )
         .unwrap();
         let wt_base = env.worktrees_dir();
@@ -3339,5 +3388,49 @@ mod tests {
         tail.push(b"012345");
         tail.push(b"6789abcd");
         assert_eq!(tail.into_string(), "6789abcd");
+    }
+
+    /// Windows regression coverage: `std::fs::canonicalize` returns `\\?\` verbatim
+    /// paths there, and Git for Windows rejects them as cwd and `--git-dir`.
+    /// `child_process_path` must map them to the plain form without touching
+    /// verbatim device paths that have no plain equivalent.
+    #[test]
+    fn verbatim_prefix_stripped_only_when_plain_form_exists() {
+        let strip = |raw: &[u8]| String::from_utf8(strip_verbatim_prefix_bytes(raw)).unwrap();
+
+        // \\?\C:\dir\... -> C:\dir\...
+        assert_eq!(
+            strip(b"\\\\?\\C:\\Users\\u\\repo\\.git"),
+            "C:\\Users\\u\\repo\\.git"
+        );
+        // Lowercase drive letter and forward slashes are handled too.
+        assert_eq!(strip(b"//?/d:/work/wt"), "d:/work/wt");
+        // \\?\UNC\server\share\... -> \\server\share\...
+        assert_eq!(
+            strip(b"\\\\?\\UNC\\fileserver\\share\\repo"),
+            "\\\\fileserver\\share\\repo"
+        );
+
+        // Paths with no plain form are returned byte for byte.
+        for unchanged in [
+            "\\\\?\\GLOBALROOT\\Device\\Harddisk0\\repo",
+            "\\\\?\\Volume{guid}\\repo",
+            "\\\\?\\C:",
+            "\\\\?\\UNC\\server",
+            "\\\\.\\pipe\\shina",
+            "\\\\server\\share\\repo",
+            "C:\\Users\\u\\repo",
+            "/tmp/shina/repo",
+            "relative\\path",
+        ] {
+            assert_eq!(strip(unchanged.as_bytes()), unchanged);
+        }
+
+        // Off Windows, paths pass through untouched.
+        #[cfg(not(windows))]
+        assert_eq!(
+            child_process_path(Path::new("/tmp/shina/repo")),
+            PathBuf::from("/tmp/shina/repo")
+        );
     }
 }

@@ -47,7 +47,7 @@ fn normalize(value: &Value, root: &std::path::Path) -> Value {
     let root = std::fs::canonicalize(root)
         .unwrap_or_else(|_| root.to_path_buf())
         .to_string_lossy()
-        .replace('\\', "/");
+        .into_owned();
     fn walk(value: &Value, key: &str, root: &str) -> Value {
         match value {
             Value::Object(map) => map
@@ -86,6 +86,9 @@ fn normalize(value: &Value, root: &std::path::Path) -> Value {
                     && is_uuid(suffix)
                 {
                     return json!(format!("{prefix}:<uuid>"));
+                }
+                if let Some(suffix) = text.strip_prefix(root) {
+                    return json!(format!("<root>{}", suffix.replace('\\', "/")));
                 }
                 json!(text.replace(root, "<root>"))
             }
@@ -128,10 +131,10 @@ fn assert_golden(name: &str, actual: &Value) {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/mobile")
         .join(format!("{name}.json"));
-    let actual = format!("{}\n", serde_json::to_string_pretty(actual).unwrap());
-    if fs::read_to_string(&fixture).is_ok_and(|expected| expected == actual) {
+    if fs::read_to_string(&fixture).is_ok_and(|expected| golden_matches(&expected, actual)) {
         return;
     }
+    let actual = format!("{}\n", serde_json::to_string_pretty(actual).unwrap());
     let dump = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mobile-golden");
     fs::create_dir_all(&dump).unwrap();
     fs::write(dump.join(format!("{name}.json")), &actual).unwrap();
@@ -139,6 +142,36 @@ fn assert_golden(name: &str, actual: &Value) {
         "golden fixture {name} does not match the normalized wire shape; actual JSON is in {}",
         dump.display()
     );
+}
+
+fn golden_matches(expected: &str, actual: &Value) -> bool {
+    serde_json::from_str::<Value>(expected).is_ok_and(|expected| expected == *actual)
+}
+
+#[test]
+fn goldens_ignore_checkout_line_endings_but_keep_the_exact_json_shape() {
+    let actual = json!({"answer":"line 1\nline 2","flag":true});
+    let expected = serde_json::to_string_pretty(&actual).unwrap();
+    assert!(golden_matches(&expected.replace('\n', "\r\n"), &actual));
+    assert!(!golden_matches(
+        &expected,
+        &json!({"answer":"line 1\nline 2"})
+    ));
+    assert!(!golden_matches(
+        &expected,
+        &json!({"answer":"changed","flag":true})
+    ));
+    assert!(!golden_matches("invalid JSON", &actual));
+}
+
+#[test]
+fn golden_paths_normalize_only_the_profile_prefix_and_its_separators() {
+    let root = std::env::temp_dir().canonicalize().unwrap();
+    let input = json!({"path":root.join("Shina").join("attachments").join("file.bin"),
+        "text":r"Keep\these\backslashes"});
+    let normalized = normalize(&input, &root);
+    assert_eq!(normalized["path"], "<root>/Shina/attachments/file.bin");
+    assert_eq!(normalized["text"], input["text"]);
 }
 
 /// Walk a fragmented thread.history/thread.subscribe response into a whole page.
@@ -602,7 +635,18 @@ fn mobile_scoped_history_pages_replays_and_gap_falls_back() {
     while live.is_none() {
         assert!(Instant::now() < deadline, "no thread.stream event arrived");
         let value = mobile.read();
-        if value["method"] == "thread.stream" && value["params"]["kind"] == "event" {
+        // Catalog refresh events may legitimately arrive before the sent message.
+        if value["method"] == "thread.stream"
+            && value["params"]["kind"] == "event"
+            && value["params"]["threadId"] == 1
+            && value["params"]["events"].as_array().is_some_and(|events| {
+                events.iter().any(|row| {
+                    row["row"]["field"] == "messages"
+                        && row["row"]["item"]["role"] == "You"
+                        && row["row"]["item"]["text"] == "mobile-live-fixture"
+                })
+            })
+        {
             live = Some(value["params"].clone());
         }
     }

@@ -25,6 +25,12 @@ mod attachment_sqlite_preview;
 mod attachment_table_preview;
 #[path = "attachment_text_preview.rs"]
 mod attachment_text_preview;
+#[path = "captain_activity_ui.rs"]
+mod captain_activity_ui;
+#[path = "captain_docs_ui.rs"]
+mod captain_docs_ui;
+#[path = "captain_lifecycle_ui.rs"]
+mod captain_lifecycle_ui;
 #[path = "captain_ui.rs"]
 mod captain_ui;
 #[path = "citation_comment.rs"]
@@ -39,8 +45,12 @@ pub(crate) mod composer_press;
 pub(crate) mod composer_stash;
 #[path = "composer_ui.rs"]
 pub(crate) mod composer_ui;
+#[path = "crew_membership_ui.rs"]
+mod crew_membership_ui;
+#[path = "crew_questions_ui.rs"]
+mod crew_questions_ui;
 #[path = "crew_ui.rs"]
-mod crew_ui;
+pub(crate) mod crew_ui;
 #[path = "diff_panel.rs"]
 pub(crate) mod diff_panel;
 #[path = "diff_tree.rs"]
@@ -928,6 +938,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // A captain home shows its Brief instead of session details: beside the chat, or as a
     // sheet over it on a narrow window.
     let brief = s.show_activity && captain_ui::brief_captain(s).is_some();
+    let brief_record = s.brief.record.as_ref().is_some_and(|(server, captain)| {
+        *server == s.machines.selected
+            && s.captain_phase(*captain) == crate::model::CaptainPhase::Retired
+    });
+    let brief_sheet = narrow || brief_record;
     if s.show_activity && !brief && (narrow || s.activity_full) {
         pane = pane.child(activity(s, p, true));
     } else {
@@ -943,7 +958,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 // Scrolled messages are cut under the header, so give them a boundary.
                 .child(rule(p).key("chat-header-rule")),
         );
-        let main = if captain_ui::is_earlier(s) {
+        let main = if s.current().captain_home
+            && s.current().captain.is_some_and(|captain| {
+                s.captain_phase(captain) == crate::model::CaptainPhase::Archived
+            }) {
+            main.child(conversation(s, p, wide, main_width))
+                .child(captain_lifecycle_ui::archived_bar(s, p, wide, main_width))
+        } else if captain_ui::is_earlier(s) {
             main.child(conversation(s, p, wide, main_width))
                 .child(captain_ui::earlier_bar(s, p, wide, main_width))
         } else if s.current().messages.is_empty()
@@ -987,11 +1008,26 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // maximized panel covers it at any width.
         let panel = s.right_panel();
         let panel_open = panel.open && !panel.surfaces.is_empty();
-        let body_width = cx.layout_with("chat-body", |r| r[2]).unwrap_or_else(|| {
-            let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
-            cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
+        // A docked drawer (the Brief's 320 px or the activity tray) plus its 1 px divider
+        // comes off the same container the panel measures, in the measured path and the
+        // fallback alike, so a covering sheet and the inline clamp see the chat's width.
+        let docked_drawer = if brief && !brief_sheet {
+            captain_ui::PANEL_WIDTH + 1.0
+        } else if s.show_activity && !brief {
+            300.0 + 1.0
+        } else {
+            0.0
+        };
+        let body_width = cx
+            .layout_with("chat-body", |r| r[2])
+            .map(|width| (width - docked_drawer).max(0.0))
+            .unwrap_or_else(|| {
+                let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+                cx.layout_with("workspace-root", move |r| {
+                    r[2] - 16.0 - sidebar - docked_drawer
+                })
                 .unwrap_or(900.0)
-        });
+            });
         let covering = panel_open && (panel.maximized || crate::right_panel::covers(body_width));
         let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
         if covering {
@@ -1009,7 +1045,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             body = body.child(right_panel(s, p, zoom, strip_h, Some(max)).w(width));
         }
         context_popover_shown = true;
-        if brief && !narrow {
+        if brief && !brief_sheet {
             body = body
                 .child(el().w(1.0).h_full().fill(p.line))
                 .child(captain_ui::brief_side(s, p));
@@ -1074,7 +1110,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             root = root.child(action);
         }
     }
-    if brief && narrow {
+    if brief && brief_sheet {
         let top = chrome.height.max(40.0 * zoom) / zoom;
         root = root.child(captain_ui::brief_sheet(s, p, top));
     }
@@ -1170,6 +1206,38 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     for dialog in captain_ui::dialogs(s, p) {
         root = root.child(dialog);
+    }
+    if let Some(captain) = captain_ui::brief_captain(s) {
+        if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
+            root = root.child(menu);
+        }
+        if s.show_activity
+            && let Some(thread_id) = s.brief.more
+        {
+            root = root.child(
+                crew_membership_ui::more_menu(s, p, captain, thread_id)
+                    .anchored_fit(
+                        format!("brief-crew-more-{thread_id}"),
+                        rune::Side::Bottom,
+                        rune::Align::End,
+                        4.0,
+                    )
+                    .modal(true, |s: &mut State| s.brief.more = None),
+            );
+        }
+    }
+    if !s.show_activity
+        && let Some(captain) = s.current().crew_captain
+        && s.brief.more == Some(s.current().id)
+    {
+        root = root.child(
+            crew_membership_ui::crew_bar_menu(s, p, captain, s.current().id)
+                .anchored_fit("crew-bar-more", rune::Side::Bottom, rune::Align::End, 4.0)
+                .modal(true, |s: &mut State| s.brief.more = None),
+        );
+    }
+    if let Some(menu) = crew_membership_ui::move_picker(s, p) {
+        root = root.child(menu);
     }
     if let Some(pill) = crew_ui::attention_row(s, p) {
         root = root.child(pill);
@@ -3876,6 +3944,61 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             content = content.child(crew);
         }
     }
+    if s.show_archive {
+        let query = s.search.text.trim().to_lowercase();
+        let former: Vec<_> = s
+            .captains
+            .iter()
+            .enumerate()
+            .filter(|(captain, profile)| {
+                s.captain_phase(*captain) == crate::model::CaptainPhase::Retired
+                    && (query.is_empty() || profile.name.to_lowercase().contains(&query))
+            })
+            .collect();
+        if !former.is_empty() {
+            content = content.child(section_title("Former captains", p).key("former-captains"));
+            for (captain, profile) in former {
+                // KSG has no retired Captain record. Reuse its sidebar row layout, with
+                // Shina's resting portrait and a read-only Brief rather than a new thread.
+                let server = s.machines.selected.clone();
+                let pixels = s
+                    .artwork
+                    .face_pixels(profile.portrait, face_for(Status::Ready), 40.0);
+                content = content.child(
+                    row()
+                        .key(format!("former-captain-{captain}"))
+                        .role("button")
+                        .label(format!("{}, former captain", profile.name))
+                        .focusable(true)
+                        .cursor(rune::Cursor::Pointer)
+                        .min_h(56.0)
+                        .px(8.0)
+                        .gap(10.0)
+                        .center_y()
+                        .radius(4.0)
+                        .hover(p.row)
+                        .child(pixel_portrait(s, &pixels, 40.0, p))
+                        .child(
+                            col()
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .gap(4.0)
+                                .child(label(&profile.name, CAPTAIN_NAME, p.ink).truncate())
+                                .child(pixel_text("Demoted", p.muted)),
+                        )
+                        .on_press(move |s: &mut State| {
+                            if s.machines.selected == server
+                                && s.captain_phase(captain) == crate::model::CaptainPhase::Retired
+                            {
+                                s.brief.record = Some((server.clone(), captain));
+                                s.show_activity = true;
+                                s.activity_full = false;
+                            }
+                        }),
+                );
+            }
+        }
+    }
     let all: Vec<_> = entries.iter().filter(|entry| !entry.captain).collect();
     let visible: Vec<_> = all.iter().copied().filter(|entry| entry.visible).collect();
     let dragging = s.drag_thread.is_some();
@@ -4735,7 +4858,14 @@ fn captain_row(
     let crew: Vec<&Thread> = s
         .threads
         .iter()
-        .filter(|t| t.parent == Some(id) && t.archived() == s.show_archive)
+        .filter(|t| {
+            t.crew_captain == thread.captain
+                && t.crew_captain.is_some()
+                && thread
+                    .captain
+                    .is_some_and(|captain| s.captain_home(captain) == Some(id))
+                && t.archived() == s.show_archive
+        })
         .collect();
     let family = || std::iter::once(thread).chain(crew.iter().copied());
     let running: Vec<&Thread> = family().filter(|t| t.status == Status::Running).collect();
@@ -4774,13 +4904,21 @@ fn captain_row(
     let timer = (status == Status::Running)
         .then(|| running.iter().filter_map(|t| t.started).min())
         .flatten();
-    let status_ink = status_ink(status, p);
+    let archived = thread
+        .captain
+        .is_some_and(|captain| s.captain_phase(captain) == crate::model::CaptainPhase::Archived);
+    let status_label = if archived { "Archived" } else { status.label() };
+    let status_ink = if archived {
+        p.muted
+    } else {
+        status_ink(status, p)
+    };
     let mut status_line = row()
         .key(format!("captain-status-{id}"))
         .h(18.0)
         .gap(8.0)
         .center_y()
-        .child(pixel_text(status.label(), status_ink).key(format!("captain-state-{id}")));
+        .child(pixel_text(status_label, status_ink).key(format!("captain-state-{id}")));
     if !detail.is_empty() {
         status_line = status_line.child(
             label(detail.clone(), CAPTAIN_STATUS, p.muted)
@@ -4790,7 +4928,7 @@ fn captain_row(
                 .min_w(workspace_floor(
                     sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
                     // The status word, three gaps, the machine icon and the timer slot.
-                    status.label().chars().count() as f32 * 6.6
+                    status_label.chars().count() as f32 * 6.6
                         + 24.0
                         + if multiple_machines(s) { ICON } else { 0.0 }
                         + if timer.is_some() { TIMER_SLOT } else { 0.0 },
@@ -4799,7 +4937,7 @@ fn captain_row(
                 .beside_tag(
                     multiple_machines(s),
                     sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                    status.label().chars().count() as f32 * 6.6
+                    status_label.chars().count() as f32 * 6.6
                         + 24.0
                         + ICON
                         + if timer.is_some() { TIMER_SLOT } else { 0.0 },
@@ -4816,7 +4954,7 @@ fn captain_row(
             CAPTAIN_STATUS,
             room_for_machine_name(
                 sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                status.label().chars().count() as f32 * 6.6
+                status_label.chars().count() as f32 * 6.6
                     + 24.0
                     + ICON
                     + if timer.is_some() { TIMER_SLOT } else { 0.0 },
@@ -6003,6 +6141,29 @@ const PICKER_CELL: f32 = 48.0;
 fn captain_editor(s: &State, p: Palette, height: f32) -> El {
     let editor = s.captain_editor.as_ref().unwrap();
     let editing = editor.editing.is_some();
+    let promotion = editor.promotion.as_ref();
+    let pending = promotion.is_some_and(|promotion| promotion.pending.is_some());
+    let restore = promotion.is_some_and(|promotion| promotion.restore.is_some());
+    let profile_locked = pending || restore;
+    let promotion_reason = promotion.and_then(|promotion| {
+        s.captain_promotion_unavailable(&editor.server, promotion.thread)
+            .or_else(|| pending.then(|| "Waiting for the machine to confirm.".into()))
+            .or_else(|| {
+                promotion
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview["blockers"].as_array())
+                    .and_then(|blockers| blockers.first())
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                promotion
+                    .preview
+                    .is_none()
+                    .then(|| "Waiting for the promotion preview.".into())
+            })
+    });
     let profile = editor.profile();
     let field = field_fill(s, p);
     // The portrait grid is ported from KSG Code's `ProjectIconPickerDialog` emoji grid: square
@@ -6030,6 +6191,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         crate::visuals::PORTRAIT_NAMES[portrait]
                     ))
                     .checked(selected)
+                    .disabled(profile_locked)
                     .focusable(true)
                     .size(PICKER_CELL, PICKER_CELL)
                     .center()
@@ -6056,7 +6218,10 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         }
         portraits = portraits.child(line);
     }
-    let captain_project = s.captain_project.unwrap_or(s.current().project);
+    let captain_project = promotion.map_or_else(
+        || s.captain_project.unwrap_or(s.current().project),
+        |promotion| promotion.project,
+    );
     let mut body = col()
         .key("captain-form-body")
         .gap(12.0)
@@ -6068,14 +6233,14 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child({
             // Ported from KSG Code's BranchToolbarEnvironmentSelector. A captain's host
             // is immutable after creation, unlike an unsent conversation draft.
-            if machine_options(s).len() > 1 {
+            if machine_options(s).len() > 1 || promotion.is_some() {
                 let mut lives = col()
                     .key("captain-machine-row")
                     .gap(5.0)
                     .child(pixel_label("Lives on", p.muted))
                     .child(
                         menu_item(
-                            "captain-machine-choice",
+                            if promotion.is_some() { "captain-promote-machine" } else { "captain-machine-choice" },
                             &s.machine_label(&editor.server),
                             if editor.server == "local" {
                                 "monitor"
@@ -6084,15 +6249,15 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                             },
                             p,
                         )
-                        .disabled(editing)
+                        .disabled(editing || promotion.is_some())
                         .on_press(|s: &mut State| {
                             let editor = s.captain_editor.as_mut().unwrap();
-                            if editor.editing.is_none() {
+                            if editor.editing.is_none() && editor.promotion.is_none() {
                                 editor.machine_picker = !editor.machine_picker;
                             }
                         }),
                     );
-                if editor.machine_picker && !editing {
+                if editor.machine_picker && !editing && promotion.is_none() {
                     for server in machine_options(s) {
                         if !s.machine_connected(&server) {
                             continue;
@@ -6121,7 +6286,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .child(pixel_label("Workspace", p.muted))
                 .child(
                     row()
-                        .key("captain-project-choice")
+                        .key(if promotion.is_some() { "captain-promote-workspace" } else { "captain-project-choice" })
                         .role("button")
                         .cursor(rune::Cursor::Pointer)
                         .label(format!(
@@ -6130,7 +6295,8 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                                 .map(|p| p.name.as_str())
                                 .unwrap_or("No workspace")
                         ))
-                        .focusable(!editing)
+                        .focusable(!editing && promotion.is_none())
+                        .disabled(promotion.is_some())
                         // The same height as the text inputs below it.
                         .h(37.0)
                         .px(8.0)
@@ -6143,7 +6309,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .on_press(move |s: &mut State| {
                             if s.captain_editor
                                 .as_ref()
-                                .is_some_and(|e| e.editing.is_none())
+                                .is_some_and(|e| e.editing.is_none() && e.promotion.is_none())
                             {
                                 s.open_picker(ProjectPicker::NewThread);
                             }
@@ -6189,6 +6355,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     .radius(4.0)
                     .fill(field)
                     .field_focus(&editor.name, p)
+                    .disabled(profile_locked)
                     .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().name),
             ),
         )
@@ -6209,6 +6376,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .radius(4.0)
                         .fill(field)
                         .field_focus(&editor.role, p)
+                        .disabled(profile_locked)
                         .on_edit(|s: &mut State| &mut s.captain_editor.as_mut().unwrap().role),
                 ),
         )
@@ -6230,6 +6398,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .radius(4.0)
                         .fill(field)
                         .field_focus(&editor.instructions, p)
+                        .disabled(profile_locked)
                         .on_edit(|s: &mut State| {
                             &mut s.captain_editor.as_mut().unwrap().instructions
                         }),
@@ -6237,24 +6406,97 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         )
         .child(
             label(
-                "The captain and its crew use these instructions and Pi's configured CPA model.",
+                if promotion.is_some() {
+                    "Promotion keeps this thread's model and access mode. Private captain instructions stay with the captain."
+                } else {
+                    "The captain and its crew use these instructions and Pi's configured CPA model."
+                },
                 SMALL,
                 p.muted,
             )
             .wrap(),
         );
-    if let Some(error) = &editor.error {
-        body = body.child(label(error, SMALL, p.danger).wrap());
+    if let Some(promotion) = promotion {
+        // KSG has no Captain role. This adapts the existing captain editor and its
+        // ProjectIconPickerDialog layout with the approved role-change summary.
+        body = body.child(
+            col().key("captain-promote-summary").gap(6.0)
+                .child(pixel_label("What stays", p.muted))
+                .child(label("The conversation, its model, access mode, workspace, machine, tasks and pull requests.", BODY, p.muted).wrap())
+                .child(pixel_label("What changes", p.muted))
+                .child(label("It moves to Captains and gets a Brief. Its scope starts as this workspace.", BODY, p.muted).wrap()),
+        );
+        if let Some(captain) = promotion.restore_candidate {
+            let server = editor.server.clone();
+            let thread = promotion.thread;
+            body = body.child(
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(
+                        captain_ui::switch(
+                            s,
+                            "captain-promote-restore",
+                            "Restore the former captain's profile",
+                            restore,
+                            p,
+                            move |s| {
+                                if s.machines.selected == server
+                                    && s.captain_editor
+                                        .as_ref()
+                                        .and_then(|editor| editor.promotion.as_ref())
+                                        .is_some_and(|promotion| promotion.thread == thread)
+                                    && let Err(error) = s.set_captain_promotion_restore(!restore)
+                                    && let Some(editor) = s.captain_editor.as_mut()
+                                {
+                                    editor.error = Some(error);
+                                }
+                            },
+                        )
+                        .disabled(pending),
+                    )
+                    .child(
+                        label(
+                            format!(
+                                "Restore {}'s profile, plan, rules and memory",
+                                s.captains[captain].name
+                            ),
+                            SMALL,
+                            p.muted,
+                        )
+                        .wrap()
+                        .grow(1.0)
+                        .min_w(0.0),
+                    ),
+            );
+        }
     }
-    let title = if editing {
-        "Edit captain"
+    if let Some(error) = editor.error.as_ref().or(promotion_reason.as_ref()) {
+        body = body.child(
+            label(error, SMALL, p.danger)
+                .key("captain-editor-reason")
+                .role("alert")
+                .wrap(),
+        );
+    }
+    let title = if let Some(promotion) = promotion {
+        format!("Make \"{}\" a captain", promotion.title)
+    } else if editing {
+        "Edit captain".into()
     } else {
-        "New captain"
+        "New captain".into()
+    };
+    let save_label = if promotion.is_some() {
+        "Make captain"
+    } else if editing {
+        "Save changes"
+    } else {
+        "Create captain"
     };
     let card = col()
         .key("captain-editor")
         .role("dialog")
-        .label(title)
+        .label(&title)
         .w(480.0)
         .max_h((height - 32.0).max(240.0))
         .padding(18.0)
@@ -6272,7 +6514,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .child(
                     col()
                         .gap(3.0)
-                        .child(label(title, DIALOG_TITLE, p.ink))
+                        .child(label(&title, DIALOG_TITLE, p.ink).wrap())
                         .child(label(
                             "Name it, pick a portrait, and say what it should focus on.",
                             SMALL,
@@ -6297,33 +6539,17 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .child(secondary_button("cancel-captain", "Cancel", p, |s| {
                     s.cancel_captain_flow()
                 }))
-                .child(if profile.validate().is_ok() {
-                    primary_button(
-                        "save-captain",
-                        if editing {
-                            "Save changes"
-                        } else {
-                            "Create captain"
-                        },
-                        p,
-                        |s| s.save_captain(),
-                    )
-                } else {
-                    button(
-                        "save-captain",
-                        if editing {
-                            "Save changes"
-                        } else {
-                            "Create captain"
-                        },
-                        p,
-                        |_| {},
-                    )
-                    .h(32.0)
-                    .px(14.0)
-                    .opacity(0.5)
-                    .disabled(true)
-                }),
+                .child(
+                    if profile.validate().is_ok() && promotion_reason.is_none() {
+                        primary_button("save-captain", save_label, p, |s| s.save_captain())
+                    } else {
+                        button("save-captain", save_label, p, |_| {})
+                            .h(32.0)
+                            .px(14.0)
+                            .opacity(0.5)
+                            .disabled(true)
+                    },
+                ),
         );
     el().key("captain-editor-backdrop")
         .instant_changes()
@@ -6510,6 +6736,9 @@ fn right_panel_title(surface: &crate::right_panel::Surface) -> String {
         crate::right_panel::Surface::Files => "Files".to_string(),
         crate::right_panel::Surface::File { path, .. } => base_name(path).to_string(),
         crate::right_panel::Surface::Attachment { name, .. } => base_name(name).to_string(),
+        crate::right_panel::Surface::CaptainDocument { name, .. } => {
+            captain_docs_ui::document_title(name).to_string()
+        }
     }
 }
 
@@ -6535,6 +6764,7 @@ fn right_panel_tab(
         crate::right_panel::Surface::Files => "folder",
         crate::right_panel::Surface::File { .. } => "file",
         crate::right_panel::Surface::Attachment { .. } => "paperclip",
+        crate::right_panel::Surface::CaptainDocument { .. } => "book",
     };
     // The close button sits in the icon slot only while it can be seen: on hover of the
     // tab, or on the active tab (KSG's `group-hover:visible / isActive && visible`).
@@ -6552,7 +6782,7 @@ fn right_panel_tab(
             .hover(p.selected)
             .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
             .on_press(move |s: &mut State| {
-                s.right_panels.close_surface(&thread_key, &surface_id);
+                s.request_close_surface(&thread_key, &surface_id);
             })
             .child(tool_icon("close", p.ink))
     };
@@ -6579,7 +6809,7 @@ fn right_panel_tab(
             .on_press_tx(move |s: &mut State, tx| {
                 // KSG: a middle click closes the tab; any other press activates it.
                 if tx.button() == rune::PointerButton::Middle {
-                    s.right_panels.close_surface(&key_for_press, &id_for_press);
+                    s.request_close_surface(&key_for_press, &id_for_press);
                 } else {
                     s.right_panels.activate(&key_for_press, &id_for_press);
                     tx.scroll_into_view_in("right-panel-tabs", tab_key.clone());
@@ -6784,6 +7014,10 @@ fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Optio
             )
             .truncate(),
         ),
+        Some(crate::right_panel::Surface::CaptainDocument { captain, name }) => (
+            format!("right-panel-body-captain-doc:{captain}:{name}"),
+            captain_docs_ui::document_panel(s, p, *captain, name),
+        ),
         None => ("right-panel-body-empty".to_string(), el()),
     };
     let panel_el = el()
@@ -6863,10 +7097,10 @@ fn right_panel_tab_menu(s: &State, p: Palette) -> El {
         menu_item(key, title, glyph, p).on_press(move |s: &mut State| {
             s.right_panel_menu = None;
             match action {
-                TabMenu::Close => s.right_panels.close_surface(&thread_key, &surface_id),
-                TabMenu::Others => s.right_panels.close_others(&thread_key, &surface_id),
-                TabMenu::ToRight => s.right_panels.close_to_right(&thread_key, &surface_id),
-                TabMenu::All => s.right_panels.close_all(&thread_key),
+                TabMenu::Close => s.request_close_surface(&thread_key, &surface_id),
+                TabMenu::Others => s.request_close_others(&thread_key, &surface_id),
+                TabMenu::ToRight => s.request_close_to_right(&thread_key, &surface_id),
+                TabMenu::All => s.request_close_all(&thread_key),
             }
         })
     };
@@ -7087,10 +7321,10 @@ fn thread_menu(s: &State, p: Palette) -> El {
         .box_shadow(hard_shadow(p))
         .anchored_fit("thread-actions", rune::Side::Bottom, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.thread_menu = false)
-        .child(thread_actions(s, s.current().id, p))
+        .child(thread_actions(s, s.current().id, p, "thread-actions"))
 }
 
-fn thread_actions(s: &State, id: usize, p: Palette) -> El {
+fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
     let Some(thread) = s.threads.iter().find(|t| t.id == id) else {
         return el();
     };
@@ -7207,6 +7441,35 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
             );
         }
     }
+    if !thread.captain_home
+        && !thread.client_draft
+        && !thread.delegated
+        && thread.parent.is_none()
+        && thread.peer_origin.is_none()
+    {
+        let server = s.machines.selected.clone();
+        let reason = s.captain_promotion_unavailable(&server, id);
+        let item = menu_item("menu-promote-captain", "Make this a captain...", "grid", p)
+            .disabled(reason.is_some());
+        let item = if let Some(reason) = reason {
+            item.description(reason)
+        } else {
+            item
+        };
+        actions = actions.child(item.on_press(move |s: &mut State| {
+            s.row_menu = None;
+            s.thread_menu = false;
+            if let Err(error) = s.begin_captain_promotion(&server, id) {
+                s.push_toast(
+                    crate::model::ToastKind::Error,
+                    "Could not make the thread a captain",
+                    Some(error),
+                    None,
+                    Some(6000),
+                );
+            }
+        }));
+    }
     actions = actions
         .child(rule(p))
         .child(
@@ -7306,6 +7569,117 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
                 ),
             );
         }
+        // Crew membership on the thread's own machine: an idle member can move or leave,
+        // an ordinary root can join through the same picker the Brief uses. Hidden where
+        // membership cannot exist; disabled rows carry the real reason.
+        if let Some(owner) = thread.crew_captain {
+            let expected = s.machines.selected.clone();
+            let move_server = expected.clone();
+            let reason = crew_membership_ui::access_reason(s.captain_access(owner)).or_else(|| {
+                s.threads
+                    .iter()
+                    .position(|t| t.id == id)
+                    .and_then(|index| s.crew_idle(index).err())
+            });
+            let move_anchor = anchor.to_string();
+            actions = actions
+                .child(
+                    menu_item("menu-crew-move", "Move to another captain...", "switch", p)
+                        .label(match &reason {
+                            Some(reason) => format!("Move to another captain, {reason}"),
+                            None => "Move to another captain".to_string(),
+                        })
+                        .disabled(reason.is_some())
+                        .on_press(move |s: &mut State| {
+                            if s.machines.selected != move_server
+                                || s.captain_access(owner) != crate::model::CaptainAccess::Full
+                            {
+                                return;
+                            }
+                            s.row_menu = None;
+                            s.thread_menu = false;
+                            s.brief.moving = Some(crate::model::MovePicker {
+                                server: move_server.clone(),
+                                thread: id,
+                                mode: crate::model::MoveMode::Move { from: owner },
+                                anchor: move_anchor.clone(),
+                            });
+                        }),
+                )
+                .child(
+                    menu_item("menu-crew-release", "Release from crew", "close", p)
+                        .label(match &reason {
+                            Some(reason) => format!("Release from crew, {reason}"),
+                            None => "Release from crew".to_string(),
+                        })
+                        .disabled(reason.is_some())
+                        .on_press(move |s: &mut State| {
+                            s.row_menu = None;
+                            s.thread_menu = false;
+                            if let Err(error) = s.captain_crew_command(
+                                &expected,
+                                owner,
+                                id,
+                                crate::model::CrewKind::Release,
+                            ) {
+                                s.push_toast(
+                                    crate::model::ToastKind::Error,
+                                    "Could not release the thread",
+                                    Some(error),
+                                    None,
+                                    Some(6000),
+                                );
+                            }
+                        }),
+                );
+        } else if !s.captains.is_empty()
+            && !thread.captain_home
+            && thread.parent.is_none()
+            && thread.peer_origin.is_none()
+            && !thread.delegated
+            && !thread.archived()
+            && (0..s.captains.len()).any(|captain| {
+                !matches!(
+                    s.captain_access(captain),
+                    crate::model::CaptainAccess::UpdateRequired
+                        | crate::model::CaptainAccess::NoRecords
+                )
+            })
+        {
+            let reason = s
+                .threads
+                .iter()
+                .position(|t| t.id == id)
+                .and_then(|index| s.join_gate(index).err());
+            let join_anchor = anchor.to_string();
+            let join_server = s.machines.selected.clone();
+            actions = actions.child(
+                menu_item(
+                    "menu-crew-recruit",
+                    "Add to a captain's crew...",
+                    "switch",
+                    p,
+                )
+                .label(match &reason {
+                    Some(reason) => format!("Add to a captain's crew, {reason}"),
+                    None => "Add to a captain's crew".to_string(),
+                })
+                .disabled(reason.is_some())
+                .on_press(move |s: &mut State| {
+                    if s.machines.selected != join_server {
+                        return;
+                    }
+                    s.row_menu = None;
+                    s.thread_menu = false;
+                    s.brief.moving = Some(crate::model::MovePicker {
+                        server: join_server.clone(),
+                        thread: id,
+                        mode: crate::model::MoveMode::Join,
+                        anchor: join_anchor.clone(),
+                    });
+                }),
+            );
+        }
     }
     actions = actions
         .child(rule(p))
@@ -7331,27 +7705,77 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
                 },
             ),
         );
-    let archive = menu_item(
-        "menu-archive-thread",
-        if thread.archived() {
-            "Restore thread"
-        } else {
-            "Archive thread"
-        },
-        "archive",
-        p,
-    );
-    actions = actions.child(if s.lifecycle_busy(id) || thread.machine != "local" {
-        archive
-            .disabled(true)
-            .child(label("Working", SMALL, p.muted))
+    let primary_captain = thread
+        .captain
+        .filter(|&captain| thread.captain_home && s.captain_home(captain) == Some(id));
+    if let Some(captain) = primary_captain {
+        use crate::model::{CaptainLifecycleAction as Action, CaptainPhase};
+        let archived = s.captain_phase(captain) == CaptainPhase::Archived;
+        actions = actions.child(captain_lifecycle_menu_item(
+            s,
+            p,
+            captain,
+            if archived {
+                Action::Unarchive
+            } else {
+                Action::Archive
+            },
+            if archived {
+                "menu-unarchive-captain"
+            } else {
+                "menu-archive-captain"
+            },
+            if archived {
+                "Unarchive captain"
+            } else {
+                "Archive captain..."
+            },
+            "archive",
+            false,
+        ));
+        if !archived {
+            actions = actions.child(captain_lifecycle_menu_item(
+                s,
+                p,
+                captain,
+                Action::Demote,
+                "menu-demote-captain",
+                "Make it an ordinary thread...",
+                "thread",
+                false,
+            ));
+        }
     } else {
-        archive.on_press(move |s: &mut State| {
-            s.row_menu = None;
-            s.thread_menu = false;
-            s.archive_thread(id);
-        })
-    });
+        let grouped_archive = thread
+            .crew_captain
+            .filter(|&captain| s.captain_phase(captain) == crate::model::CaptainPhase::Archived);
+        let archive = menu_item(
+            "menu-archive-thread",
+            if thread.archived() {
+                "Restore thread"
+            } else {
+                "Archive thread"
+            },
+            "archive",
+            p,
+        );
+        actions = actions.child(if let Some(captain) = grouped_archive {
+            archive.disabled(true).description(format!(
+                "Archived with {}. Unarchive the captain to restore it.",
+                s.captains[captain].name
+            ))
+        } else if s.lifecycle_busy(id) || thread.machine != "local" {
+            archive
+                .disabled(true)
+                .child(label("Working", SMALL, p.muted))
+        } else {
+            archive.on_press(move |s: &mut State| {
+                s.row_menu = None;
+                s.thread_menu = false;
+                s.archive_thread(id);
+            })
+        });
+    }
     if s.is_captain_home(thread)
         && let Some(captain) = thread.captain
     {
@@ -7365,10 +7789,64 @@ fn thread_actions(s: &State, id: usize, p: Palette) -> El {
             ),
         );
     }
-    actions.child(rule(p)).child(
-        danger_menu_item("menu-delete-thread", "Delete thread...", "trash", p)
-            .on_press(move |s: &mut State| s.request_delete(id)),
-    )
+    actions = actions.child(rule(p));
+    if let Some(captain) = primary_captain {
+        actions.child(captain_lifecycle_menu_item(
+            s,
+            p,
+            captain,
+            crate::model::CaptainLifecycleAction::Delete,
+            "menu-delete-captain",
+            "Delete captain...",
+            "trash",
+            true,
+        ))
+    } else {
+        actions.child(
+            danger_menu_item("menu-delete-thread", "Delete thread...", "trash", p)
+                .on_press(move |s: &mut State| s.request_delete(id)),
+        )
+    }
+}
+
+/// Captain group actions have no KSG equivalent. Their menu rows reuse KSG's Sidebar
+/// archive/delete entries and open the shared alert-dialog confirmation.
+fn captain_lifecycle_menu_item(
+    s: &State,
+    p: Palette,
+    captain: usize,
+    action: crate::model::CaptainLifecycleAction,
+    key: &str,
+    title: &str,
+    glyph: &str,
+    danger: bool,
+) -> El {
+    let server = s.machines.selected.clone();
+    let reason = s.captain_lifecycle_unavailable(&server, captain, action);
+    let item = if danger {
+        danger_menu_item(key, title, glyph, p)
+    } else {
+        menu_item(key, title, glyph, p)
+    };
+    let item = item.disabled(reason.is_some());
+    let item = if let Some(reason) = reason {
+        item.description(reason)
+    } else {
+        item
+    };
+    item.on_press(move |s: &mut State| {
+        s.row_menu = None;
+        s.thread_menu = false;
+        if let Err(error) = s.open_captain_lifecycle(&server, captain, action) {
+            s.push_toast(
+                crate::model::ToastKind::Error,
+                "Could not open the captain action",
+                Some(error),
+                None,
+                Some(6000),
+            );
+        }
+    })
 }
 
 fn snooze_menu(s: &State, p: Palette) -> El {
@@ -7535,7 +8013,7 @@ fn row_menu(s: &State, p: Palette) -> El {
             if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
                 bulk_thread_actions(s, p)
             } else {
-                thread_actions(s, id, p)
+                thread_actions(s, id, p, &format!("thread-{id}"))
             },
         ),
         RowTarget::Project(id) => (
@@ -9864,6 +10342,11 @@ fn build_user_or_system_row(
             );
         }
         row().justify_end().child(user)
+    } else if let Some(report) = (message.role == "Shina")
+        .then(|| crew_ui::report_message(s, p, &message.text))
+        .flatten()
+    {
+        report
     } else if let Some(completion) = s
         .is_captain_home(t)
         .then(|| crew_ui::parse_completion(message.display_text()))
@@ -11031,9 +11514,12 @@ fn image_preview(
         let clock = s.attachment_poster_clock.get().wrapping_add(1);
         s.attachment_poster_clock.set(clock);
         let mut posters = s.attachment_video_posters.borrow_mut();
-        let (player, accessed) = posters
-            .entry(image.id.clone())
-            .or_insert_with(|| (rune::Player::file(path), clock));
+        let (player, accessed) = posters.entry(image.id.clone()).or_insert_with(|| {
+            (
+                rune::Player::file(attachment_preview::player_path(&path)),
+                clock,
+            )
+        });
         *accessed = clock;
         let player = player.clone();
         if player.time() == 0.0
@@ -13007,7 +13493,12 @@ fn composer(
                             ))
                 })
         });
+    let crew_blocker = t
+        .crew_draft
+        .as_ref()
+        .and_then(|_| s.crew_draft_unavailable());
     let can_send = !s.demo
+        && crew_blocker.is_none()
         && s.attachment_send_block_reason().is_none()
         && s.machines.draft_retarget.is_none()
         && (s.client.is_none() || s.machine_connected(&s.machines.selected))
@@ -13176,6 +13667,7 @@ fn composer(
     // what the crew needs from the user, then what it is doing.
     for part in [
         crew_ui::parent_bar(s, p, lane),
+        crew_ui::crew_bar(s, p, lane),
         crew_ui::needs_you(s, p),
         crew_ui::crew_tray(s, p, lane),
     ]
@@ -13688,12 +14180,86 @@ fn composer(
         composer_ui::controls(s, p, lane - 20.0, false, locked)
     };
     area = area.child(footer);
+    if let Some(reason) = crew_blocker.as_ref().or(t.crew_draft_notice.as_ref()) {
+        area = area.child(
+            label(
+                reason,
+                SMALL,
+                if crew_blocker.is_some() {
+                    p.brass
+                } else {
+                    p.muted
+                },
+            )
+            .key("composer-crew-status")
+            .role("status")
+            .px(10.0)
+            .pb(4.0)
+            .wrap(),
+        );
+    }
     col()
         .key("composer-lane")
         .w_full()
         .px(lane_gutter(pane_width))
         .items_center()
         .child(area)
+}
+
+/// KSG has no crew binding. This adapts its ComposerAttachmentStrip chip and remove
+/// action within the ordinary composer footer, without adding another draft editor.
+fn crew_draft_chip(s: &State, p: Palette, width: f32) -> El {
+    let Some(target) = &s.current().crew_draft else {
+        return el();
+    };
+    let server = target.server.clone();
+    let captain = target.captain;
+    let thread = s.current().id;
+    let pending = s.current().client_creating.is_some();
+    let text = format!(
+        "{} {}'s crew",
+        if pending { "Joining" } else { "Joins" },
+        target.name
+    );
+    let blocked = s.crew_draft_unavailable().is_some();
+    row()
+        .key("composer-crew-chip")
+        .role("group")
+        .label(&text)
+        .help(format!(
+            "An independent thread in {}'s crew. It runs on its own and reports each finished turn to {}.",
+            target.name, target.name
+        ))
+        .w(width)
+        .min_w(0.0)
+        .h(24.0)
+        .px(4.0)
+        .gap(4.0)
+        .center_y()
+        .radius(4.0)
+        .border(1.0, if blocked { p.brass } else { p.line })
+        .child(pixel_text(&text, if blocked { p.brass } else { p.muted }).truncate().grow(1.0).min_w(0.0))
+        .child(
+            icon_button(
+                "composer-crew-chip-remove",
+                &format!("Don't add to {}'s crew", target.name),
+                "close",
+                p,
+                move |s| {
+                    if s.machines.selected == server && s.current().id == thread
+                        && s.current().client_creating.is_none()
+                        && s.current().crew_draft.as_ref().is_some_and(|target| {
+                            target.server == server && target.captain == captain
+                        })
+                    {
+                        s.current_mut().crew_draft = None;
+                        s.current_mut().crew_draft_notice = None;
+                    }
+                },
+            )
+            .size(18.0, 18.0)
+            .disabled(pending),
+        )
 }
 
 /// Ported from KSG Code's BranchToolbarEnvironmentSelector and ComposerControl size="xs".
@@ -17169,6 +17735,9 @@ pub(crate) mod tests {
         rt.state.show_activity = true;
         rt.frame(0.0);
         assert!(rt.presented(&format!("routine-delete-{id}")).is_some());
+        let (panel, _) = rt.presented("captain-brief").unwrap();
+        rt.wheel(panel[0] + panel[2] / 2.0, panel[1] + 200.0, -2000.0);
+        rt.frame(1.0);
         press(&mut rt, &format!("routine-pause-{id}"));
         assert!(rt.state.routines(0)[0].paused);
         press(&mut rt, &format!("routine-delete-{id}"));
@@ -21592,10 +22161,196 @@ pub(crate) mod tests {
             "menu-settle-thread",
             "menu-snooze-thread",
             "menu-auto-settle",
+            "menu-archive-thread",
+            "menu-delete-thread",
         ] {
             assert!(rt.find(key).is_none());
         }
+        for key in [
+            "menu-archive-captain",
+            "menu-demote-captain",
+            "menu-delete-captain",
+        ] {
+            assert!(rt.find(key).is_some(), "missing {key}");
+        }
         assert!(rt.find(&format!("thread-{home}")).is_some());
+    }
+
+    #[test]
+    fn earlier_captain_home_keeps_ordinary_thread_archive_and_delete_actions() {
+        let mut rt = runtime(1280.0);
+        rt.state.captains = crate::captains::Captain::presets();
+        rt.state.open_captain(0);
+        let earlier = rt.state.current().id;
+        rt.state.reset_captain_conversation(0).unwrap();
+        let index = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == earlier)
+            .unwrap();
+        rt.state.select_thread(index);
+        rt.frame(0.0);
+        press(&mut rt, "thread-actions");
+        assert!(rt.find("menu-archive-thread").is_some());
+        assert!(rt.find("menu-delete-thread").is_some());
+        for key in [
+            "menu-archive-captain",
+            "menu-unarchive-captain",
+            "menu-demote-captain",
+            "menu-delete-captain",
+        ] {
+            assert!(rt.find(key).is_none(), "earlier home offers {key}");
+        }
+    }
+
+    #[test]
+    fn archived_captain_hides_composer_and_uses_group_restore_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state = State::headless(
+                std::env::temp_dir().join(format!("shina-archived-ui-{}", uuid::Uuid::new_v4())),
+            );
+            rt.state.demo = true;
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain(0);
+            let home = rt.state.current().id;
+            let database = crate::database::Database::open(&rt.state.data_dir).unwrap();
+            database.begin().unwrap();
+            let preview = rt.state.captain_lifecycle_preview(0, "archive").unwrap();
+            rt.state
+                .captain_archive_command(
+                    0,
+                    "archive",
+                    preview["captainVersion"].as_str().unwrap(),
+                    &[],
+                )
+                .unwrap();
+            database
+                .commit(1, &rt.state.projection(), &json!([]), None, &[])
+                .unwrap();
+            rt.state.show_archive = true;
+            rt.state.compact_sidebar = width < 760.0;
+            rt.frame(0.0);
+            rt.frame(1.0);
+            for key in ["captain-archived-bar", "captain-archived-unarchive"] {
+                let (rect, _) = rt.presented(key).unwrap_or_else(|| panic!("missing {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[1] >= 0.0
+                        && rect[0] + rect[2] <= width + 0.5
+                        && rect[1] + rect[3] <= 720.5,
+                    "{key} outside {width}: {rect:?}"
+                );
+            }
+            assert!(rt.presented("composer-input").is_none());
+            assert_eq!(rt.state.current().id, home);
+            press(&mut rt, "thread-actions");
+            assert!(rt.find("menu-unarchive-captain").is_some());
+            assert!(rt.find("menu-archive-thread").is_none());
+            assert!(rt.find("menu-delete-thread").is_none());
+        }
+    }
+
+    #[test]
+    fn crew_draft_chip_fits_and_removes_only_the_binding() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().client_draft = true;
+            rt.state
+                .current_mut()
+                .draft
+                .replace_text("Keep this first input");
+            rt.state.current_mut().crew_draft = Some(crate::model::CrewDraftTarget {
+                server: "local".into(),
+                captain: 0,
+                name: "Ember".into(),
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+            for key in ["composer-crew-chip", "composer-crew-chip-remove"] {
+                let (rect, _) = rt.presented(key).unwrap_or_else(|| panic!("missing {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[1] >= 0.0
+                        && rect[0] + rect[2] <= width + 0.5
+                        && rect[1] + rect[3] <= 720.5,
+                    "{key} outside {width}: {rect:?}"
+                );
+            }
+            press(&mut rt, "composer-crew-chip-remove");
+            assert!(rt.state.current().crew_draft.is_none());
+            assert_eq!(rt.state.current().draft.text, "Keep this first input");
+            assert!(rt.presented("composer-crew-chip").is_none());
+        }
+    }
+
+    #[test]
+    fn promotion_editor_keeps_placement_and_fits_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.current_mut().title = "Review the parser".into();
+            rt.state.current_mut().session = Some("existing-session".into());
+            let thread = rt.state.current().id;
+            let (client, mut commands) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            *client.info.lock().unwrap() =
+                json!({"capabilities":[crate::protocol::CAPTAIN_PROMOTE]});
+            rt.state.client = Some(client);
+            rt.state.begin_captain_promotion("local", thread).unwrap();
+            let command = commands.try_recv().unwrap();
+            assert_eq!(command.method, "captain.promote.preview");
+            assert!(rt.state.captain_promotion_receipt(
+                "local",
+                &command,
+                &json!({
+                    "result":{"status":"accepted","result":{
+                        "threadVersion":"reviewed-version","blockers":[],"permissionsChanged":false
+                    }}
+                })
+            ));
+            rt.frame(0.0);
+            rt.frame(1.0);
+            for key in [
+                "captain-editor",
+                "captain-promote-machine",
+                "captain-promote-workspace",
+                "save-captain",
+                "cancel-captain",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: missing {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[1] >= 0.0
+                        && rect[0] + rect[2] <= width + 0.5
+                        && rect[1] + rect[3] <= 720.5,
+                    "{width}: {key} outside viewport {rect:?}"
+                );
+            }
+            rt.update(|_, tx| tx.scroll_into_view("captain-promote-summary"));
+            rt.frame(1.0);
+            let (summary, _) = rt.presented("captain-promote-summary").unwrap();
+            assert!(
+                summary[1] >= 0.0 && summary[1] + summary[3] <= 720.5,
+                "{width}: promotion summary cannot be revealed: {summary:?}"
+            );
+            press(&mut rt, "save-captain");
+            let command = commands.try_recv().unwrap();
+            assert_eq!(command.method, "captain.promote");
+            assert_eq!(command.params["threadId"], thread);
+            assert_eq!(command.params["expectedVersion"], "reviewed-version");
+            assert!(
+                rt.state.captain_editor.is_some(),
+                "wait for the exact receipt"
+            );
+            assert_eq!(
+                rt.state.current().session.as_deref(),
+                Some("existing-session")
+            );
+        }
     }
 
     #[test]
@@ -23254,6 +24009,7 @@ pub(crate) mod tests {
         child.project = Some(1);
         child.delegated = true;
         child.captain = Some(2);
+        child.crew_captain = Some(2);
         child.life.pinned_at = Some(1);
         rt.state.threads.push(child);
         rt.frame(0.0);
@@ -23278,32 +24034,42 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         // Rosters start empty; these tests exercise the earlier named presets.
         rt.state.captains = crate::captains::Captain::presets();
+        // The worker was delegated by captain 1 and later moved into captain 0's crew:
+        // its historical provenance and its current membership are both real.
+        rt.state.open_captain(1);
+        let origin = rt.state.current().id;
         rt.state.open_captain(0);
         let parent = rt.state.current().id;
-        let mut child = crate::model::Thread::new(3);
+        let worker_id = rt.state.next_id;
+        rt.state.next_id += 1;
+        assert_ne!(worker_id, origin);
+        assert_ne!(worker_id, parent);
+        let mut child = crate::model::Thread::new(worker_id);
         child.title = "Cross captain child".into();
-        child.parent = Some(parent);
+        child.parent = Some(origin);
         child.project = Some(1);
         child.delegated = true;
-        child.captain = Some(1);
+        child.captain = Some(0);
+        child.crew_captain = Some(0);
         rt.state.threads.push(child);
         rt.frame(0.0);
-        assert!(rt.presented("thread-3").is_some());
+        let worker_key = format!("thread-{worker_id}");
+        assert!(rt.presented(&worker_key).is_some());
         rt.state.threads.last_mut().unwrap().life.archived_at = Some(1);
         rt.state.show_archive = true;
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
         let (home, _) = rt.presented(&format!("thread-{parent}")).unwrap();
-        let (worker, _) = rt.presented("thread-3").unwrap();
+        let (worker, _) = rt.presented(&worker_key).unwrap();
         assert!(worker[0] >= home[0] + 24.0 && worker[1] > home[1]);
         assert!(
             !rt.state
                 .sidebar_threads()
                 .iter()
-                .any(|i| rt.state.threads[*i].id == 3)
+                .any(|i| rt.state.threads[*i].id == worker_id)
         );
-        press(&mut rt, "thread-3");
+        press(&mut rt, &worker_key);
         press(&mut rt, "thread-actions");
         press(&mut rt, "menu-archive-thread");
         assert!(!rt.state.current().archived());
@@ -23318,6 +24084,7 @@ pub(crate) mod tests {
         let mut child = crate::model::Thread::new(99);
         child.parent = Some(rt.state.current().id);
         child.delegated = true;
+        child.crew_captain = Some(0);
         rt.state.threads.push(child);
         rt.frame(0.0);
         assert!(rt.presented("worker-alert-99").is_none());

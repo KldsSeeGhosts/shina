@@ -180,7 +180,7 @@ fn task_clock(task: &TaskView) -> String {
 }
 
 /// A status mark centred in a fixed 14 px slot, so a check and a dot share one left edge.
-fn mark_slot(status: Status, p: Palette) -> El {
+pub(super) fn mark_slot(status: Status, p: Palette) -> El {
     el().size(14.0, 14.0)
         .center()
         .child(status_mark(status, p, 7.0))
@@ -490,6 +490,117 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
     )
 }
 
+/// KSG has no crew report record. Adapt its result row geometry, reading the saved
+/// record by exact delivery ID rather than interpreting a worker's prose as status.
+pub(super) fn report_message(s: &State, p: Palette, text: &str) -> Option<El> {
+    use crate::model::crew_reports::{CrewOutcome, QuestionRecipient};
+    let header = text
+        .strip_prefix(crate::model::INJECTION_PREFIX)?
+        .split_once('\n')?
+        .0;
+    let id = header.strip_prefix("[delivery ")?.strip_suffix(']')?;
+    let captain = s
+        .current()
+        .captain
+        .filter(|_| s.is_captain_home(s.current()))?;
+    let report = s
+        .crew_reports()
+        .iter()
+        .find(|report| report.id == id && report.captain == captain)?;
+    let (word, status) = match report.outcome {
+        CrewOutcome::Completed => ("Reported done", Status::Completed),
+        CrewOutcome::Failed => ("Reported failed", Status::Failed),
+        CrewOutcome::Cancelled => ("Reported cancelled", Status::Ready),
+        CrewOutcome::Progress => ("Reported progress", Status::Running),
+        CrewOutcome::Blocked => ("Reported blocked", Status::Waiting),
+    };
+    let thread = report.thread_id;
+    let mut body = col().gap(8.0).pl(CARD_INDENT).child(
+        label(truncate(&report.summary, 6000), body_style(false), p.ink)
+            .wrap()
+            .selectable(true),
+    );
+    if !report.error.is_empty() {
+        body = body.child(
+            label(truncate(&report.error, 2000), SMALL, p.danger)
+                .wrap()
+                .selectable(true),
+        );
+    }
+    for artifact in report.artifacts.iter().take(16) {
+        body = body.child(
+            col()
+                .gap(2.0)
+                .child(label(&artifact.label, SMALL, p.muted).wrap())
+                .child(
+                    label(
+                        format!(
+                            "Unverified reference on {}: {}",
+                            s.machine_label(&s.machines.selected),
+                            artifact.reference
+                        ),
+                        SMALL,
+                        p.faint,
+                    )
+                    .wrap_anywhere()
+                    .selectable(true),
+                ),
+        );
+    }
+    if let Some(question) = &report.question {
+        let answer = s
+            .crew_answers()
+            .iter()
+            .find(|answer| answer.report_id == report.id);
+        let state = match answer {
+            None => "Open",
+            Some(answer) if !answer.delivered => "Answer saved, waiting for the source thread",
+            Some(_) => "Answer accepted by the source thread",
+        };
+        body = body.child(
+            label(
+                format!(
+                    "Asked {}: {}. {state}",
+                    match question.recipient {
+                        QuestionRecipient::User => "you",
+                        QuestionRecipient::Captain => &s.captains[captain].name,
+                    },
+                    question.text
+                ),
+                SMALL,
+                p.brass,
+            )
+            .wrap(),
+        );
+    }
+    Some(
+        col()
+            .key(format!("crew-report-{}", report.id))
+            .gap(6.0)
+            .child(
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(mark_slot(status, p))
+                    .child(pixel_text(word, status_ink(status, p)))
+                    .child(
+                        label(&report.title, ACTIVITY, p.muted)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(ghost_button(
+                        s,
+                        format!("crew-report-{}-open", report.id),
+                        "Open thread",
+                        p,
+                        move |s| open_thread(s, thread),
+                    )),
+            )
+            .child(body),
+    )
+}
+
 /// A brief or follow-up Shina delivered to a worker: `(is_follow_up, parent id, text)`.
 pub(super) fn parse_brief(text: &str) -> Option<(bool, usize, &str)> {
     let (first, body) = text.split_once(
@@ -755,12 +866,10 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
     let items: Vec<AttentionItem> = s
         .attention()
         .into_iter()
-        .filter(|item| {
-            item.parent_id == Some(t.id)
-                && matches!(item.kind, AttentionKind::Approval | AttentionKind::Question)
-        })
+        .filter(|item| needs_you_item(s, t.id, item))
         .collect();
-    if items.is_empty() {
+    let report_cards = super::crew_questions_ui::cards(s, p);
+    if items.is_empty() && report_cards.is_none() {
         return None;
     }
     let mut stack = col().gap(8.0);
@@ -916,6 +1025,9 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                 ),
         );
     }
+    if let Some(cards) = report_cards {
+        stack = stack.child(cards);
+    }
     Some(
         col()
             .key("needs-you")
@@ -927,6 +1039,23 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
             })
             .child(stack),
     )
+}
+
+/// One attention row's filter for `needs_you`: canonical crew membership overrides the
+/// historical parent link, so a moved or released worker's questions reach only its
+/// current captain. Ordinary delegation keeps the parent match.
+pub(crate) fn needs_you_item(s: &State, home: usize, item: &AttentionItem) -> bool {
+    if !matches!(item.kind, AttentionKind::Approval | AttentionKind::Question) {
+        return false;
+    }
+    let Some(child) = s.threads.iter().find(|thread| thread.id == item.thread_id) else {
+        return false;
+    };
+    if s.captain_provenanced(child) {
+        s.captain_member_at(child, home)
+    } else {
+        item.parent_id == Some(home)
+    }
 }
 
 /// "Delegated by <captain>", "Runs on its own" and "Open captain" above a worker's composer, ported
@@ -1078,6 +1207,104 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                     p.ink,
                 )),
         ),
+    )
+}
+
+/// The independent crew root's bar: which captain's crew it belongs to, and a button back
+/// to that captain's home. Delegated workers keep `parent_bar` instead.
+pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
+    let t = s.current();
+    if t.delegated || t.peer_origin.is_some() {
+        return None;
+    }
+    let captain = t.crew_captain?;
+    let profile = s.captains.get(captain)?;
+    let home = s.captain_home(captain);
+    let thread_id = t.id;
+    let open_server = s.machines.selected.clone();
+    let more_server = open_server.clone();
+    Some(
+        row()
+            .key("crew-bar")
+            .role("group")
+            .label(format!("In {}'s crew", profile.name))
+            .min_h(48.0)
+            .py(8.0)
+            .pl(20.0)
+            .pr(8.0)
+            .gap(12.0)
+            .center_y()
+            .radius(6.0)
+            .border(1.0, hairline(p))
+            .child(
+                row()
+                    .center_y()
+                    .gap(8.0)
+                    .min_w(0.0)
+                    .shrink()
+                    .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
+                    .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
+                    .child(
+                        label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+                            .key("crew-bar-name")
+                            .truncate()
+                            .shrink()
+                            .min_w(0.0),
+                    )
+                    .child(label("'s crew", TextStyle::new(14.0, 400.0), p.muted)),
+            )
+            .child(spacer())
+            .child(
+                row()
+                    .key("crew-bar-open-captain")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Open captain")
+                    .focusable(true)
+                    .center_y()
+                    .gap(6.0)
+                    .h(32.0)
+                    .px(10.0)
+                    .radius(ROW_RADIUS)
+                    .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(move |s: &mut State| {
+                        if s.machines.selected == open_server && home.is_some() {
+                            s.open_captain(captain);
+                        }
+                    })
+                    .child(icon("back", p.muted))
+                    .child(label("Open captain", TextStyle::new(13.0, 500.0), p.ink)),
+            )
+            .child({
+                let open = s.brief.more == Some(thread_id);
+                row()
+                    .key("crew-bar-more")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Crew actions")
+                    .focusable(true)
+                    .center_y()
+                    .h(32.0)
+                    .w(32.0)
+                    .center()
+                    .radius(ROW_RADIUS)
+                    .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(move |s: &mut State| {
+                        if s.machines.selected != more_server {
+                            return;
+                        }
+                        s.brief.more = if s.brief.more == Some(thread_id) {
+                            None
+                        } else {
+                            Some(thread_id)
+                        };
+                    })
+                    .child(icon("more", if open { p.ink } else { p.muted }))
+            }),
     )
 }
 
@@ -1296,6 +1523,57 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_rows_require_the_exact_saved_delivery_and_captain() {
+        let mut state = State::headless(
+            std::env::temp_dir().join(format!("shina-report-row-{}", uuid::Uuid::new_v4())),
+        );
+        state.load_global_for_test();
+        state.demo = true;
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        let id = state.next_id;
+        state.next_id += 1;
+        let mut worker = Thread::new(id);
+        worker.crew_captain = Some(0);
+        worker.captain = Some(0);
+        worker.run_id = Some("report-row-run".into());
+        state.threads.push(worker);
+        state.demo = false;
+        let report = state
+            .mcp_call(
+                id,
+                "captain_crew_report",
+                &json!({
+                    "requestId": uuid::Uuid::new_v4().to_string(),
+                    "outcome":"blocked", "summary":"Needs a decision",
+                    "question":{"text":"Which branch?", "recipient":"user"}
+                }),
+            )
+            .unwrap();
+        let text = format!(
+            "{}[delivery {}]\nCrew report",
+            crate::model::INJECTION_PREFIX,
+            report["reportId"].as_str().unwrap()
+        );
+        let palette = super::palette(false);
+        assert!(report_message(&state, palette, &text).is_some());
+        assert!(report_message(&state, palette, "Crew report").is_none());
+        assert!(
+            report_message(
+                &state,
+                palette,
+                &format!(
+                    "{}[delivery unknown]\nCrew report",
+                    crate::model::INJECTION_PREFIX
+                )
+            )
+            .is_none()
+        );
+        state.open_captain(1);
+        assert!(report_message(&state, palette, &text).is_none());
+    }
 
     #[test]
     fn completion_messages_parse_with_multiline_replies() {

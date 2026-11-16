@@ -165,6 +165,25 @@ pub(super) fn without_diff(text: &str) -> &str {
         .unwrap_or(text)
 }
 
+pub(super) fn without_generated(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        let stripped = without_diff(rest);
+        let stripped = stripped
+            .strip_prefix(crate::model::captain_state::CAPTAIN_CONTEXT_PREFIX)
+            .and_then(|inner| {
+                inner
+                    .split_once(crate::model::captain_state::CAPTAIN_CONTEXT_SUFFIX)
+                    .map(|(_, prompt)| prompt)
+            })
+            .unwrap_or(stripped);
+        if stripped == rest {
+            return rest;
+        }
+        rest = stripped;
+    }
+}
+
 fn validate_text(text: &str) -> Result<(), String> {
     if normalized(text).is_empty() || text.chars().count() > 500 || text.contains('\0') {
         return Err(
@@ -312,7 +331,7 @@ impl State {
         ) {
             return result.map(|id| id.to_string());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         validate_text(&text)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
@@ -356,7 +375,7 @@ impl State {
         {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         validate_text(&text)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
@@ -385,7 +404,7 @@ impl State {
         if let Some(result) = self.remote("memory.remove", json!({"captain":captain,"id":id})) {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
         let memories = book
@@ -413,7 +432,7 @@ impl State {
         ) {
             return result.map(|_| ());
         }
-        self.require_captain(captain)?;
+        self.require_active_captain(captain)?;
         let mut book = self.memory.lock().expect("captain memory");
         book.writable()?;
         let memory = book
@@ -464,7 +483,7 @@ impl State {
                     book: self.memory.clone(),
                     captain,
                     writable: thread.captain_home && Some(thread.id) == self.captain_home(captain),
-                    worker: thread.delegated,
+                    worker: thread.delegated || thread.crew_captain.is_some(),
                     scope: self.scope_prompt(captain),
                     peer: backend
                         .as_ref()
@@ -580,6 +599,24 @@ impl State {
                 .as_ref()
                 .is_some_and(crate::store::Store::healthy);
         (error, healthy)
+    }
+
+    pub(super) fn captain_memory_delete_ready(&self) -> Result<(), String> {
+        let book = self.memory.lock().expect("captain memory");
+        book.writable()?;
+        if book.store.as_ref().is_none_or(|store| !store.healthy()) {
+            return Err("Captain memory storage is unavailable. Nothing was deleted.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_captain_curated_memory(&self, captain: usize) -> Result<(), String> {
+        {
+            let mut book = self.memory.lock().expect("captain memory");
+            book.writable()?;
+            book.data.captains.remove(&captain);
+        }
+        self.flush_memory()
     }
 
     pub(super) fn memory_call(
@@ -749,7 +786,9 @@ impl Thread {
         self.memory
             .as_ref()
             .map(|link| {
-                let role = if link.worker {
+                let role = if self.crew_captain.is_some() && !self.delegated {
+                    "You are an independent crew thread. Keep this workstream's conversation and execution state separate from the Captain. You may read shared Captain memory and propose_memory for the Captain to review. Only the primary Captain home may write that memory."
+                } else if link.worker {
                     "You are a delegated worker. Complete your task yourself in its selected workspace. \
                      Do not delegate further. You may propose_memory for the captain to review."
                 } else if link.writable {

@@ -20,7 +20,7 @@ use std::{
 /// The label shown when a thread uses whatever model Pi is configured with.
 pub const DEFAULT_MODEL: &str = "Default model";
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
-const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
+pub(crate) const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 struct ContextAssetDownload {
     machine: String,
@@ -109,6 +109,13 @@ mod approval_send;
 #[cfg(test)]
 #[path = "approval_send_tests.rs"]
 mod approval_send_tests;
+#[path = "crew_question_state.rs"]
+pub(crate) mod crew_question_state;
+#[path = "crew_questions.rs"]
+pub(crate) mod crew_questions;
+pub use crew_question_state::CrewQuestionDraft;
+#[path = "crew_reports.rs"]
+pub(crate) mod crew_reports;
 #[path = "question_answers.rs"]
 mod question_answers;
 #[cfg(test)]
@@ -142,6 +149,34 @@ use queued_edit::queue_revision;
 #[cfg(test)]
 pub use run_control::StopPhase;
 pub use run_control::{StopControl, TurnCapabilities};
+#[path = "captain_event_policy.rs"]
+mod captain_event_policy;
+#[path = "captain_state.rs"]
+mod captain_state;
+pub use captain_event_policy::ReportPolicy;
+#[path = "captain_policy_client.rs"]
+mod captain_policy_client;
+pub use captain_policy_client::CaptainPolicyChange;
+#[path = "captain_digest.rs"]
+mod captain_digest;
+pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
+#[path = "captain_lifecycle.rs"]
+mod captain_lifecycle;
+pub use captain_lifecycle::CaptainPhase;
+#[path = "captain_crew_draft.rs"]
+mod captain_crew_draft;
+#[path = "captain_crew_ops.rs"]
+mod captain_crew_ops;
+pub use captain_crew_draft::CrewDraftTarget;
+#[path = "captain_delete.rs"]
+mod captain_delete;
+#[path = "captain_lifecycle_state.rs"]
+mod captain_lifecycle_state;
+#[path = "captain_promotion_state.rs"]
+mod captain_promotion_state;
+pub use captain_promotion_state::PromotionChange;
+#[path = "captain_roles.rs"]
+mod captain_roles;
 #[cfg(test)]
 #[path = "handoff_tests.rs"]
 mod handoff_tests;
@@ -215,7 +250,16 @@ pub enum ToastKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastAction {
-    OpenThread { server: String, thread_id: usize },
+    OpenThread {
+        server: String,
+        thread_id: usize,
+    },
+    ReviewCaptainPromotion {
+        server: String,
+        thread_id: usize,
+        profile: Captain,
+        restore: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -493,6 +537,8 @@ pub enum ProjectPicker {
 /// Nothing here is persisted; committed values go through the State memory and scope APIs.
 #[derive(Default)]
 pub struct BriefUi {
+    /// Expanded activity groups, scoped to their owning machine and Captain.
+    pub activity_open: std::collections::BTreeSet<(String, usize, &'static str)>,
     /// The memory whose text is being edited inline, and its draft.
     pub editing: Option<String>,
     pub edit: TextEdit,
@@ -508,8 +554,187 @@ pub struct BriefUi {
     pub profile_name: TextEdit,
     pub profile_zone: TextEdit,
     pub profile_preferences: TextEdit,
+    /// The recruit palette, bound to the machine and captain it was opened for.
+    pub recruit: Option<RecruitPicker>,
+    /// The move/join picker for a thread.
+    pub moving: Option<MovePicker>,
+    /// A crew row's More menu: the member thread it was opened for.
+    pub more: Option<usize>,
+    /// The open lifecycle confirmation (archive, unarchive, demote or delete),
+    /// bound to the machine and Captain it was opened for.
+    pub lifecycle: Option<CaptainLifecycleDialog>,
+    /// A retired Captain record (server, captain) opened read-only from the
+    /// Archive's Former captains rows. UI-only identity; never persisted.
+    pub record: Option<(String, usize)>,
     /// Demo scenes only: a stand-in for the live background status.
     pub demo_status: Option<background::BackgroundStatus>,
+}
+
+/// A Captain document draft's identity: server, Captain and one of the four document names.
+/// Keys stay bound to the machine the draft was started on; they are never copied across hosts.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DocumentDraftKey {
+    pub server: String,
+    pub captain: usize,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum DraftState {
+    Editing,
+    Saving { command: uuid::Uuid },
+    Rejected { message: String },
+    Conflict { theirs_revision: u64 },
+}
+
+/// An open Captain document draft. `base_*` is the revision the user started from; `text` is
+/// the user's edit. Only an exact accepted receipt removes a Saving draft.
+pub struct DocumentDraft {
+    pub base_revision: u64,
+    pub base_text: String,
+    pub text: TextEdit,
+    pub state: DraftState,
+    /// The projection revision whose text the user is previewing; None when the
+    /// their-version view is closed. "Replace with mine" only fires on what was seen.
+    pub show_theirs: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrewKind {
+    Join,
+    Release,
+    Move { to: usize },
+}
+
+/// A crew change queued on a linked machine, awaiting its exact command receipt.
+#[derive(Clone, Copy, Debug)]
+pub struct CrewChange {
+    pub captain: usize,
+    pub thread: usize,
+    pub kind: CrewKind,
+}
+
+/// The result of a user-invoked crew command: applied locally, or queued with a command id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrewMutation {
+    Saved,
+    Pending(uuid::Uuid),
+}
+
+/// A close operation parked behind the dirty-draft confirmation.
+#[derive(Clone, Debug)]
+pub struct DocDiscard {
+    pub panel: String,
+    pub surface: String,
+    /// The draft's own identity: confirming always drops this draft, on this server,
+    /// whatever machine the user has selected since.
+    pub key: DocumentDraftKey,
+    pub kind: DiscardKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DiscardKind {
+    /// Drop the draft only: the Cancel footer and "Discard mine" leave the tab open.
+    Discard,
+    Close,
+    Others,
+    ToRight,
+    All,
+}
+
+/// What a move picker does on selection: move an existing member, or join a root thread.
+#[derive(Clone, Copy, Debug)]
+pub enum MoveMode {
+    Move { from: usize },
+    Join,
+}
+
+#[derive(Clone)]
+pub struct RecruitPicker {
+    pub server: String,
+    pub captain: usize,
+    pub query: TextEdit,
+}
+
+#[derive(Clone)]
+pub struct MovePicker {
+    pub server: String,
+    pub thread: usize,
+    pub mode: MoveMode,
+    /// The element key the picker hangs from.
+    pub anchor: String,
+}
+
+/// The Captain lifecycle actions the shared confirmation dialog can ask for.
+/// `action` is the backend's preview/command verb; `method` is the wire command;
+/// `capability` is the negotiated feature string that must be present to offer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptainLifecycleAction {
+    Archive,
+    Unarchive,
+    Demote,
+    Delete,
+}
+
+impl CaptainLifecycleAction {
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Unarchive => "unarchive",
+            Self::Demote => "demote",
+            Self::Delete => "delete",
+        }
+    }
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Archive => "captain.archive",
+            Self::Unarchive => "captain.unarchive",
+            Self::Demote => "captain.demote",
+            Self::Delete => "captain.delete",
+        }
+    }
+    pub fn capability(&self) -> &'static str {
+        match self {
+            Self::Archive | Self::Unarchive => crate::protocol::CAPTAIN_ARCHIVE,
+            Self::Demote => crate::protocol::CAPTAIN_RETIRE,
+            Self::Delete => crate::protocol::CAPTAIN_DELETE,
+        }
+    }
+}
+
+/// The shared Captain archive/unarchive/demote/delete confirmation, bound to the
+/// machine and Captain it was opened for. `pending` is whichever command is in
+/// flight: first the `captain.lifecycle.preview` read, then the mutation itself.
+/// `preview` is the backend's own read shape (`captainVersion`, `crewSeen`,
+/// `affectedThreads`, `blockers`, and the delete extras); the dialog renders from
+/// it and the confirm sends its `captainVersion`/`crewSeen` back unchanged.
+#[derive(Clone)]
+pub struct CaptainLifecycleDialog {
+    pub server: String,
+    pub captain: usize,
+    pub action: CaptainLifecycleAction,
+    pub preview: Option<Value>,
+    pub pending: Option<uuid::Uuid>,
+    pub error: Option<String>,
+    pub confirm_name: TextEdit,
+    pub keep_conversations: bool,
+}
+
+impl CaptainLifecycleDialog {
+    /// The backend refused the last confirmation because the Captain changed
+    /// under the open dialog. The list must be re-reviewed before a fresh press.
+    pub fn conflict(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Captain changed since version"))
+    }
+}
+
+/// A lifecycle mutation queued on a machine, awaiting its exact command receipt.
+#[derive(Clone, Copy, Debug)]
+pub struct LifecycleChange {
+    pub captain: usize,
+    pub action: CaptainLifecycleAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -646,6 +871,9 @@ pub struct Thread {
     resume_command: Option<uuid::Uuid>,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
+    /// Client-only binding for an atomic first input into an independent crew root.
+    pub crew_draft: Option<CrewDraftTarget>,
+    pub crew_draft_notice: Option<String>,
     pub(crate) client_creating: Option<uuid::Uuid>,
     pub(crate) client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
@@ -688,6 +916,8 @@ pub struct Thread {
     pub harness_state: Value,
     pub project: Option<ProjectId>,
     pub worktree_path: Option<String>,
+    /// Project-less role changes retain their original working directory.
+    pub(crate) scratch_directory: Option<String>,
     pub branch: Option<String>,
     pub base_branch: Option<String>,
     pub env_mode: Option<ThreadEnvMode>,
@@ -766,6 +996,8 @@ pub struct Thread {
     pub elapsed: Option<u64>,
     pub captain: Option<usize>,
     pub captain_home: bool,
+    pub crew_captain: Option<usize>,
+    pub captain_context: String,
     /// Started by another thread through the Shina MCP. Delegated threads cannot delegate.
     pub delegated: bool,
     pub parent: Option<usize>,
@@ -806,6 +1038,10 @@ pub struct Thread {
     completion_notified: bool,
     forwarded_question: Option<String>,
     accepted_deliveries: Vec<String>,
+    crew_report_run: Option<crew_reports::CrewRun>,
+    crew_report_policy: ReportPolicy,
+    crew_report_outbox: Vec<crew_reports::CrewReport>,
+    crew_report_last_run: Option<String>,
     recovering_task: bool,
     task_history: Option<Value>,
     memory: Option<memory::MemoryLink>,
@@ -1208,6 +1444,8 @@ impl Thread {
             request_generation: uuid::Uuid::new_v4().to_string(),
             server_owned: false,
             client_draft: false,
+            crew_draft: None,
+            crew_draft_notice: None,
             client_creating: None,
             client_promoted: None,
             recovery_command: None,
@@ -1218,6 +1456,7 @@ impl Thread {
             harness_state: json!({}),
             project: None,
             worktree_path: None,
+            scratch_directory: None,
             branch: None,
             base_branch: None,
             env_mode: None,
@@ -1285,6 +1524,8 @@ impl Thread {
             elapsed: None,
             captain: None,
             captain_home: false,
+            crew_captain: None,
+            captain_context: String::new(),
             delegated: false,
             parent: None,
             host: None,
@@ -1323,6 +1564,10 @@ impl Thread {
             completion_notified: true,
             forwarded_question: None,
             accepted_deliveries: Vec::new(),
+            crew_report_run: None,
+            crew_report_policy: ReportPolicy::React,
+            crew_report_outbox: Vec::new(),
+            crew_report_last_run: None,
             recovering_task: false,
             task_history: None,
             memory: None,
@@ -2377,6 +2622,7 @@ impl Thread {
     }
 
     fn arm_task(&mut self) {
+        self.arm_crew_report();
         if self.delegated {
             self.task_result = None;
             self.completion_notified = false;
@@ -2384,6 +2630,7 @@ impl Thread {
     }
 
     fn complete_task(&mut self, result: &'static str) {
+        self.complete_crew_report(result);
         if self.delegated && !self.completion_notified && self.task_result.is_none() {
             self.task_result = Some(result);
         }
@@ -2679,6 +2926,10 @@ impl Thread {
         {
             let user_text = record["message"].as_str().unwrap_or_default().to_owned();
             record["message"] = json!(crate::handoff::with_inline_context(package, &user_text));
+        }
+        if !self.captain_context.is_empty() {
+            let user_text = record["message"].as_str().unwrap_or_default().to_owned();
+            record["message"] = json!(format!("{}{user_text}", self.captain_context));
         }
         if self.command("prompt", record) {
             self.pending_prompt = Some((format!("{}-{}", self.id, self.serial), prompt, index));
@@ -3468,6 +3719,7 @@ impl Thread {
                 if self.run_id.is_none() {
                     self.run_id = Some(uuid::Uuid::new_v4().to_string());
                 }
+                self.arm_crew_report();
                 self.prompt_suggestion = None;
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
@@ -4031,6 +4283,8 @@ struct DeletedRecords {
     tasks: Vec<Task>,
     homes: Vec<(usize, usize)>,
     projects: Vec<(ProjectId, usize)>,
+    reports: Vec<crew_reports::CrewReport>,
+    answers: Vec<crew_questions::CrewAnswer>,
 }
 
 struct RequestedTabRestore {
@@ -4264,6 +4518,29 @@ pub struct State {
     captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
     captain_remote_scopes: std::collections::BTreeMap<usize, Vec<RemoteProject>>,
     captain_homes: std::collections::BTreeMap<usize, usize>,
+    captain_books: std::collections::BTreeMap<usize, captain_state::CaptainBook>,
+    captain_lifecycles: std::collections::BTreeMap<usize, captain_lifecycle::CaptainLifecycle>,
+    captain_report_policies: std::collections::BTreeMap<usize, ReportPolicy>,
+    captain_reports: Vec<crew_reports::CrewReport>,
+    captain_question_answers: Vec<crew_questions::CrewAnswer>,
+    /// In-memory Captain document drafts, keyed by server, captain and document name. Never
+    /// persisted: an unsaved draft quits with the app (separate follow-up).
+    pub captain_drafts: std::collections::BTreeMap<DocumentDraftKey, DocumentDraft>,
+    /// Crew changes queued on linked machines, awaiting their exact command receipts.
+    pub crew_pending: std::collections::BTreeMap<(String, uuid::Uuid), CrewChange>,
+    /// Lifecycle mutations queued on a machine, awaiting their exact command
+    /// receipts. Entries stay Waiting across a link drop; nothing retries them.
+    pub lifecycle_pending: std::collections::BTreeMap<(String, uuid::Uuid), LifecycleChange>,
+    pub promotion_pending: std::collections::BTreeMap<(String, uuid::Uuid), PromotionChange>,
+    pub captain_policy_pending:
+        std::collections::BTreeMap<(String, uuid::Uuid), CaptainPolicyChange>,
+    pub captain_policy_errors: std::collections::BTreeMap<(String, usize), String>,
+    pub crew_question_drafts: std::collections::BTreeMap<(String, String), CrewQuestionDraft>,
+    pub crew_questions_captain_open: bool,
+    /// A dirty-draft close parked behind the discard confirmation.
+    pub doc_discard: Option<DocDiscard>,
+    /// Crew change rejections per machine: an error from one host must not render on another.
+    pub crew_errors: std::collections::BTreeMap<String, String>,
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
@@ -4538,6 +4815,21 @@ impl State {
             captain_scopes: Default::default(),
             captain_remote_scopes: Default::default(),
             captain_homes: Default::default(),
+            captain_books: Default::default(),
+            captain_lifecycles: Default::default(),
+            captain_report_policies: Default::default(),
+            captain_reports: Vec::new(),
+            captain_question_answers: Vec::new(),
+            captain_drafts: Default::default(),
+            crew_pending: Default::default(),
+            lifecycle_pending: Default::default(),
+            promotion_pending: Default::default(),
+            captain_policy_pending: Default::default(),
+            captain_policy_errors: Default::default(),
+            crew_question_drafts: Default::default(),
+            crew_questions_captain_open: false,
+            doc_discard: None,
+            crew_errors: Default::default(),
             memory: Arc::default(),
             captain_editor: None,
             brief: BriefUi::default(),
@@ -4604,8 +4896,7 @@ impl State {
     /// The key the current thread's right-panel state lives under: machine plus thread id, so
     /// the same numeric id on two hosts stays separate.
     pub fn panel_key(&self) -> String {
-        let t = self.current();
-        crate::right_panel::key(&t.machine, t.id)
+        crate::right_panel::key(&self.machines.selected, self.current().id)
     }
     /// The current thread's panel state; a default (closed, empty) one when it has none.
     pub fn right_panel(&self) -> crate::right_panel::ThreadPanel {
@@ -4643,7 +4934,7 @@ impl State {
         let Some(surface) = self.right_panels.active_surface(&key) else {
             return false;
         };
-        self.right_panels.close_surface(&key, &surface.id());
+        self.request_close_surface(&key, &surface.id());
         true
     }
     pub fn expire_undo(&mut self) -> bool {
@@ -4688,6 +4979,7 @@ impl State {
         self.tab_epoch += 1;
         self.requested_tab = None;
         self.requested_tab_restore = None;
+        self.brief.record = None;
         self.focus_thread(index);
     }
     /// Focus an existing tab. Background reducers must not open tabs.
@@ -5292,6 +5584,9 @@ impl State {
                 }
                 Ok(project.path.clone())
             }
+            None if thread.scratch_directory.is_some() => {
+                Ok(PathBuf::from(thread.scratch_directory.as_ref().unwrap()))
+            }
             None if thread.captain_home => Ok(self
                 .data_dir
                 .join("captains")
@@ -5337,11 +5632,15 @@ impl State {
             .enumerate()
             .filter(|(_, t)| {
                 t.archived() == self.show_archive
+                    && t.crew_captain.is_none()
                     && (!t.delegated
                         || t.parent.is_some_and(|id| {
                             self.threads
                                 .iter()
                                 .any(|parent| parent.id == id && !parent.captain_home)
+                        })
+                        || self.tasks.iter().any(|task| {
+                            task.child_thread_id == t.id && task.coordinator_captain.is_some()
                         }))
                     && !self.is_captain_home(t)
                     && (!t.is_draft() || self.draft_listed(t))
@@ -5382,10 +5681,7 @@ impl State {
             .filter(|(_, home)| {
                 let children = || {
                     self.threads.iter().filter(|child| {
-                        child
-                            .parent
-                            .is_some_and(|parent| self.effective_home(parent) == home.id)
-                            && child.archived() == self.show_archive
+                        self.captain_worker(child, home.id) && child.archived() == self.show_archive
                     })
                 };
                 let own_match =
@@ -5653,9 +5949,7 @@ impl State {
             .iter()
             .enumerate()
             .filter(|(_, child)| {
-                child
-                    .parent
-                    .is_some_and(|parent| self.effective_home(parent) == home)
+                self.captain_worker(child, home)
                     && child.archived() == self.show_archive
                     && (self.thread_search_matches(parent) || self.thread_search_matches(child))
             })
@@ -5667,10 +5961,7 @@ impl State {
         self.threads
             .iter()
             .filter(|child| {
-                child
-                    .parent
-                    .is_some_and(|parent| self.effective_home(parent) == home)
-                    && child.archived() == self.show_archive
+                self.captain_worker(child, home) && child.archived() == self.show_archive
             })
             .count()
     }
@@ -5986,6 +6277,23 @@ impl State {
         }
         lifecycle::section(&t.life, at)
     }
+    fn connection_instructions(&self, index: usize) -> Option<String> {
+        if self.threads[index].crew_captain.is_some() {
+            let prompt = self.threads[index].memory_prompt();
+            (!prompt.is_empty()).then_some(prompt)
+        } else {
+            self.threads[index]
+                .captain
+                .and_then(|id| self.captains.get(id))
+                .map(|captain| {
+                    format!(
+                        "{}\n\n{}",
+                        captain.prompt(),
+                        self.threads[index].memory_prompt()
+                    )
+                })
+        }
+    }
     pub fn row_pending(&self, t: &Thread) -> bool {
         t.request.is_some()
             || t.status == Status::Waiting
@@ -5995,7 +6303,21 @@ impl State {
             })
     }
     pub fn selected_row(&self) -> usize {
-        self.effective_home(self.current().parent.unwrap_or(self.current().id))
+        let current = self.current();
+        if let Some(captain) = current.crew_captain {
+            return self.captain_home(captain).unwrap_or(current.id);
+        }
+        if current.delegated
+            && self.tasks.iter().any(|task| {
+                task.child_thread_id == current.id && task.coordinator_captain.is_some()
+            })
+        {
+            return current.id;
+        }
+        current
+            .parent
+            .map(|parent| self.effective_home(parent))
+            .unwrap_or(current.id)
     }
     pub fn visible_sidebar_threads(&self) -> Vec<usize> {
         let mut settled = 0;
@@ -6194,6 +6516,13 @@ impl State {
         self.delete_with_undo(ids, Action::Delete);
     }
     fn delete_with_undo(&mut self, ids: std::collections::HashSet<usize>, action: Action) {
+        if let Some(error) = ids
+            .iter()
+            .find_map(|id| self.require_active_thread_owner(*id).err())
+        {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         self.deleted_threads.clear();
         self.deleted_records = Some(DeletedRecords {
             tasks: self
@@ -6202,6 +6531,18 @@ impl State {
                 .filter(|task| {
                     ids.contains(&task.parent_thread_id) || ids.contains(&task.child_thread_id)
                 })
+                .cloned()
+                .collect(),
+            reports: self
+                .captain_reports
+                .iter()
+                .filter(|report| ids.contains(&report.thread_id))
+                .cloned()
+                .collect(),
+            answers: self
+                .captain_question_answers
+                .iter()
+                .filter(|answer| ids.contains(&answer.thread_id))
                 .cloned()
                 .collect(),
             homes: self
@@ -6236,6 +6577,13 @@ impl State {
     /// Removes threads and their records, then selects the survivor and saves. The caller
     /// handles undo and tab refusals.
     fn remove_threads(&mut self, ids: &std::collections::HashSet<usize>) {
+        if let Some(error) = ids
+            .iter()
+            .find_map(|id| self.require_active_thread_owner(*id).err())
+        {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         let current = self.current().id;
         let local_only = self.client.is_some()
             && self
@@ -6266,6 +6614,7 @@ impl State {
         for thread in &mut self.threads {
             if ids.contains(&thread.id) {
                 panel_keys.push(crate::right_panel::key(&thread.machine, thread.id));
+                thread.crew_report_run = None;
                 let _ = thread.stop_task();
                 thread.disconnect();
                 if let Some(parent) = thread.parent.filter(|id| !ids.contains(id)) {
@@ -6302,6 +6651,33 @@ impl State {
         self.tasks.retain(|task| {
             !ids.contains(&task.parent_thread_id) && !ids.contains(&task.child_thread_id)
         });
+        let removed_reports: std::collections::HashSet<String> = self
+            .captain_reports
+            .iter()
+            .filter(|report| ids.contains(&report.thread_id))
+            .map(|report| report.id.clone())
+            .collect();
+        self.captain_reports
+            .retain(|report| !ids.contains(&report.thread_id));
+        let removed_answers: std::collections::HashSet<String> = self
+            .captain_question_answers
+            .iter()
+            .filter(|answer| ids.contains(&answer.thread_id))
+            .map(|answer| answer.id.clone())
+            .collect();
+        self.captain_question_answers
+            .retain(|answer| !ids.contains(&answer.thread_id));
+        let removed_deliveries: std::collections::HashSet<&str> = removed_reports
+            .iter()
+            .map(String::as_str)
+            .chain(removed_answers.iter().map(String::as_str))
+            .collect();
+        for thread in &mut self.threads {
+            thread.pending_injections.retain(|injection| {
+                !tasks::delivery_id(&injection.text)
+                    .is_some_and(|id| removed_deliveries.contains(id))
+            });
+        }
         self.tabs.retain(|id| !ids.contains(id));
         for project in &mut self.projects.entries {
             if project.captain_thread.is_some_and(|id| ids.contains(&id)) {
@@ -6413,6 +6789,10 @@ impl State {
         else {
             return;
         };
+        if let Err(error) = self.require_active_thread_owner(id) {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         if self.lifecycle_busy(id) {
             self.lifecycle_error = Some("Stop this thread and its crew before archiving.".into());
             return;
@@ -6726,6 +7106,27 @@ impl State {
             self.forward("thread.undo", json!({"expected":self.undo}));
             return;
         }
+        let inactive_owner = self
+            .undo
+            .as_ref()
+            .and_then(|notice| {
+                notice
+                    .entries
+                    .iter()
+                    .find_map(|entry| self.require_active_thread_owner(entry.id).err())
+            })
+            .or_else(|| {
+                self.deleted_threads.iter().find_map(|thread| {
+                    thread
+                        .crew_captain
+                        .or_else(|| thread.captain_home.then_some(thread.captain).flatten())
+                        .and_then(|captain| self.require_active_captain(captain).err())
+                })
+            });
+        if let Some(error) = inactive_owner {
+            self.lifecycle_error = Some(error);
+            return;
+        }
         let Some(notice) = self.undo.take().filter(|n| n.expires > at) else {
             return;
         };
@@ -6738,6 +7139,23 @@ impl State {
                         && self.threads.iter().any(|t| t.id == task.child_thread_id)
                     {
                         self.tasks.push(task);
+                    }
+                }
+                for report in records.reports {
+                    if self.threads.iter().any(|t| t.id == report.thread_id)
+                        && !self.captain_reports.iter().any(|r| r.id == report.id)
+                    {
+                        self.captain_reports.push(report);
+                    }
+                }
+                for answer in records.answers {
+                    if self.threads.iter().any(|t| t.id == answer.thread_id)
+                        && !self
+                            .captain_question_answers
+                            .iter()
+                            .any(|a| a.id == answer.id)
+                    {
+                        self.captain_question_answers.push(answer);
                     }
                 }
                 for (captain, home) in records.homes {
@@ -7103,6 +7521,7 @@ impl State {
             t.project == project
                 && !t.delegated
                 && !t.captain_home
+                && t.crew_captain.is_none()
                 && t.blank_draft()
                 && !occupied.contains(&t.id)
         });
@@ -7145,7 +7564,19 @@ impl State {
             self.captain_picker = false;
             return;
         }
-        if captain >= self.captains.len() {
+        if self.require_captain(captain).is_err() {
+            return;
+        }
+        if self.captain_phase(captain) != CaptainPhase::Active {
+            self.captain_project = None;
+            self.projects.captain_target = None;
+            if let Some(index) = self
+                .captain_home(captain)
+                .and_then(|home| self.threads.iter().position(|thread| thread.id == home))
+            {
+                self.select_thread(index);
+            }
+            self.captain_picker = false;
             return;
         }
         let explicit = self.captain_project.take();
@@ -7176,12 +7607,11 @@ impl State {
             .project(project_id)
             .map(|p| p.machine.clone())
             .unwrap_or_else(|| "local".into());
-        if let Some(index) = self
+        if self
             .captain_home(captain)
             .and_then(|home| self.threads.iter().position(|t| t.id == home))
+            .is_none()
         {
-            self.threads[index].life.archived_at = None;
-        } else {
             let mut thread = Thread::new(self.next_id);
             thread.harness = self.default_harness.clone();
             self.next_id += 1;
@@ -7293,6 +7723,18 @@ impl State {
     }
 
     pub fn save_captain(&mut self) {
+        if self
+            .captain_editor
+            .as_ref()
+            .is_some_and(|editor| editor.promotion.is_some())
+        {
+            if let Err(error) = self.save_captain_promotion()
+                && let Some(editor) = self.captain_editor.as_mut()
+            {
+                editor.error = Some(error);
+            }
+            return;
+        }
         if self.client.is_some() {
             if let Some(editor) = &self.captain_editor {
                 if editor.server != self.machines.selected {
@@ -7317,6 +7759,7 @@ impl State {
         let error = profile
             .validate()
             .err()
+            .or_else(|| editing.and_then(|id| self.require_active_captain(id).err()))
             .or_else(|| {
                 self.captains
                     .iter()
@@ -7373,14 +7816,10 @@ impl State {
             .unwrap_or(Status::Ready)
     }
     pub fn home_status(&self, home: usize) -> Status {
+        let group = self.home_group_ids(home);
         self.threads
             .iter()
-            .filter(|t| {
-                !t.archived()
-                    && (t.id == home
-                        || t.parent
-                            .is_some_and(|parent| self.effective_home(parent) == home))
-            })
+            .filter(|t| !t.archived() && group.contains(&t.id))
             .filter(|t| t.id == home || t.request.as_ref().is_none_or(|r| r["method"] == "confirm"))
             .map(|t| t.status)
             .max_by_key(|s| s.urgency())
@@ -7604,6 +8043,13 @@ impl State {
         {
             return;
         }
+        if self
+            .require_active_thread_owner(self.threads[index].id)
+            .is_err()
+            || self.threads[index].archived()
+        {
+            return;
+        }
         self.threads[index].server_owned = self.headless || self.persist_transcripts;
         let path = match self.thread_directory(index) {
             Ok(path) => path,
@@ -7654,16 +8100,8 @@ impl State {
         let wake = self.wake.clone();
         let thread_id = self.threads[index].id;
         self.sync_memory_links();
-        let instructions = self.threads[index]
-            .captain
-            .and_then(|id| self.captains.get(id))
-            .map(|captain| {
-                format!(
-                    "{}\n\n{}",
-                    captain.prompt(),
-                    self.threads[index].memory_prompt()
-                )
-            });
+        self.refresh_captain_contexts();
+        let instructions = self.connection_instructions(index);
         if matches!(
             self.threads[index].harness.as_str(),
             "pi" | "codex" | "claude"
@@ -7709,7 +8147,37 @@ impl State {
         thread.connect_with_instructions(path, wake, instructions);
     }
     /// Answers a Shina MCP tool call on the UI thread. `caller` is the calling thread's id.
-    fn mcp_call(&mut self, caller: usize, tool: &str, args: &Value) -> Result<Value, String> {
+    pub(crate) fn mcp_call(
+        &mut self,
+        caller: usize,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        if matches!(
+            tool,
+            "captain_crew_create" | "captain_crew_send" | "captain_crew_stop"
+        ) {
+            return self.captain_crew_tool(caller, tool, args);
+        }
+        if !matches!(
+            tool,
+            "list_routines"
+                | "list_memories"
+                | "search_memories"
+                | "orchestrator_capabilities"
+                | "list_threads"
+                | "list_captains"
+                | "read_thread"
+                | "task_status"
+                | "captain_read"
+                | "captain_document_read"
+                | "captain_crew_list"
+                | "captain_reports_list"
+                | "captain_crew_report"
+                | "captain_question_answer"
+        ) {
+            self.require_active_thread_owner(caller)?;
+        }
         if self
             .threads
             .iter()
@@ -7778,6 +8246,7 @@ impl State {
                     .captains
                     .iter()
                     .enumerate()
+                    .filter(|(captain, _)| self.captain_phase(*captain) != CaptainPhase::Deleted)
                     .map(|(i, c)| {
                         json!({
                             "name": c.name,
@@ -7786,6 +8255,7 @@ impl State {
                             "scope": self.scope_value(Some(i)),
                             "earlier_conversations": self.earlier_conversations(i),
                             "role": c.role,
+                            "lifecycle":self.captain_phase(i),
                             "status": status_word(self.captain_status(i)),
                             "assigned": self.threads.iter().any(|t| t.captain_home && t.captain == Some(i)),
                         })
@@ -7904,6 +8374,7 @@ impl State {
                     .take(45)
                     .collect();
                 thread.captain = captain;
+                thread.crew_captain = captain;
                 thread.delegated = true;
                 thread.native.access = match self.threads[caller_index].native.access {
                     AccessMode::ReadOnly => AccessMode::default(),
@@ -8036,11 +8507,20 @@ impl State {
                     &json!({"thread_id":self.threads[index].id}),
                 )
             }
+            "captain_read"
+            | "captain_document_read"
+            | "captain_document_write"
+            | "captain_crew_list"
+            | "captain_crew_join"
+            | "captain_crew_release"
+            | "captain_reports_list"
+            | "captain_crew_report"
+            | "captain_question_answer" => self.captain_mcp(caller_index, tool, args),
             _ => Err(format!("Shina has no tool named {tool}.")),
         }
     }
 
-    fn mcp_request(&mut self, request: crate::mcp::Request) {
+    pub(crate) fn mcp_request(&mut self, request: crate::mcp::Request) {
         if request.tool == "delegate_task"
             && let Some(preparation) = self.prepare_remote_delegation(request.thread, &request.args)
         {
@@ -8108,10 +8588,10 @@ impl State {
                 });
             }
             Ok((_, value)) => {
-                let _ = request.reply.send(Ok(value));
+                let _ = crate::outbox::reply(&request.reply, Ok(value));
             }
             Err(error) => {
-                let _ = request.reply.send(Err(error));
+                let _ = crate::outbox::reply(&request.reply, Err(error));
             }
         }
     }
@@ -8172,7 +8652,7 @@ impl State {
                     .is_ok_and(|value| value["status"] == "interrupted")
                 || now >= waiter.deadline
             {
-                let _ = waiter.reply.send(result);
+                let _ = crate::outbox::reply(&waiter.reply, result);
             } else {
                 self.task_waiters.push(waiter);
             }
@@ -9322,6 +9802,64 @@ impl State {
             return;
         };
         match action {
+            ToastAction::ReviewCaptainPromotion {
+                server,
+                thread_id,
+                profile,
+                restore,
+            } => {
+                if self.machines.selected != server {
+                    self.select_machine(&server);
+                }
+                if self.machines.selected != server {
+                    return;
+                }
+                match self.begin_captain_promotion(&server, thread_id) {
+                    Ok(()) => {
+                        let current_restore = self
+                            .captain_editor
+                            .as_ref()
+                            .and_then(|editor| editor.promotion.as_ref())
+                            .and_then(|promotion| promotion.restore);
+                        if current_restore != restore {
+                            let candidate = self
+                                .captain_editor
+                                .as_ref()
+                                .and_then(|editor| editor.promotion.as_ref())
+                                .and_then(|promotion| promotion.restore_candidate);
+                            if restore.is_none() || candidate == restore {
+                                if let Err(error) =
+                                    self.set_captain_promotion_restore(restore.is_some())
+                                    && let Some(editor) = self.captain_editor.as_mut()
+                                {
+                                    editor.error = Some(error);
+                                }
+                            } else if let Some(editor) = self.captain_editor.as_mut() {
+                                editor.error = Some("The former captain changed. Review the profile before confirming.".into());
+                            }
+                        }
+                        if restore.is_none()
+                            && let Some(editor) = self.captain_editor.as_mut()
+                            && editor
+                                .promotion
+                                .as_ref()
+                                .is_some_and(|promotion| promotion.restore.is_none())
+                        {
+                            editor.name.replace_text(profile.name);
+                            editor.role.replace_text(profile.role);
+                            editor.instructions.replace_text(profile.instructions);
+                            editor.portrait = profile.portrait;
+                        }
+                    }
+                    Err(error) => self.push_toast(
+                        ToastKind::Error,
+                        "Could not reopen promotion",
+                        Some(error),
+                        None,
+                        Some(6000),
+                    ),
+                }
+            }
             ToastAction::OpenThread { server, thread_id } => {
                 if self.client.is_some() {
                     if server != self.machines.selected {
@@ -12091,6 +12629,10 @@ impl State {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
+        if let Err(error) = self.require_active_thread_owner(self.current().id) {
+            self.current_mut().error = Some(error);
+            return false;
+        }
         // KSG's useComposerSend refuses while readPendingEnvironmentChange is
         // set: the draft is still being addressed to its new machine.
         if self.machines.draft_retarget.is_some() {
@@ -12109,6 +12651,14 @@ impl State {
         }
         if self.current().resume_pending() || self.current().responding_request.is_some() {
             return false;
+        }
+        if self.current().crew_draft.is_some() {
+            if background || approval_redirect {
+                self.current_mut().crew_draft_notice =
+                    Some("Send this crew thread normally before starting background work.".into());
+                return false;
+            }
+            return self.send_crew_draft();
         }
         if self.current().queued_edit.is_some() {
             let target_server_id = self.machine_identity(&self.machines.selected);
@@ -12899,6 +13449,7 @@ impl State {
         if self.runtime_enabled
             && !self.demo
             && !thread.archived()
+            && self.require_active_thread_owner(thread.id).is_ok()
             && thread.pi.is_none()
             && !thread.prewarm_attempted
             && thread.status != Status::Failed
@@ -13246,6 +13797,12 @@ impl State {
             return Err("Duplicate project ids.".into());
         }
         if let Some(threads) = index["threads"].as_array() {
+            let missing_crew: std::collections::HashSet<usize> = threads
+                .iter()
+                .filter(|record| record.get("crewCaptain").is_none())
+                .filter_map(|record| record["id"].as_u64())
+                .filter_map(|id| usize::try_from(id).ok())
+                .collect();
             let restored: Vec<Thread> = threads
                 .iter()
                 .filter_map(|record| {
@@ -13372,6 +13929,19 @@ impl State {
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned);
+                    thread.scratch_directory = match record.get("scratchDirectory") {
+                        None => None,
+                        Some(value) => {
+                            let path = value.as_str()?;
+                            if path.is_empty() || path.len() > 32768 || path.chars().any(char::is_control)
+                                || self.client.is_none() && thread.machine == "local"
+                                    && !std::path::Path::new(path).is_absolute()
+                            {
+                                return None;
+                            }
+                            Some(path.to_owned())
+                        }
+                    };
                     thread.branch = record
                         .get("branch")
                         .and_then(Value::as_str)
@@ -13426,6 +13996,21 @@ impl State {
                         Some(id)
                     };
                     thread.captain_home = record["captainHome"] == true;
+                    thread.crew_captain = match record.get("crewCaptain") {
+                        None => None,
+                        Some(value) if value.is_null() => None,
+                        Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
+                    };
+                    if let Some(outbox) = record.get("crewReportOutbox") {
+                        thread.crew_report_outbox = serde_json::from_value(outbox.clone()).ok()?;
+                    }
+                    if let Some(last) = record.get("crewReportLastRun") {
+                        thread.crew_report_last_run = if last.is_null() {
+                            None
+                        } else {
+                            Some(last.as_str()?.to_owned())
+                        };
+                    }
                     thread.delegated = record["delegated"] == true;
                     thread.peer_origin = record
                         .get("peerOrigin")
@@ -13443,6 +14028,17 @@ impl State {
                 })
                 .collect();
             let ids: std::collections::HashSet<_> = restored.iter().map(|t| t.id).collect();
+            let proven: std::collections::HashSet<(usize, usize)> = index["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|record| {
+                    let captain = usize::try_from(record["coordinator_captain"].as_u64()?).ok()?;
+                    let parent = usize::try_from(record["parent_thread_id"].as_u64()?).ok()?;
+                    let child = usize::try_from(record["child_thread_id"].as_u64()?).ok()?;
+                    (captain < captains.len()).then_some((parent, child))
+                })
+                .collect();
             let parents_valid = restored.iter().all(|thread| {
                 (!thread.captain_home || thread.captain.is_some() && !thread.delegated)
                     && thread.delegated == (thread.parent.is_some() || thread.peer_origin.is_some())
@@ -13452,10 +14048,20 @@ impl State {
                             && restored.iter().any(|t| {
                                 t.id == parent
                                     && !t.delegated
-                                    && (t.project == thread.project
-                                        || t.captain_home && t.captain == thread.captain)
                                     && t.machine == thread.machine
+                                    && (t.project == thread.project
+                                        || proven.contains(&(parent, thread.id))
+                                        || (t.captain_home
+                                            && t.captain.is_some()
+                                            && t.captain == thread.captain
+                                            && missing_crew.contains(&thread.id)))
                             })
+                    })
+                    && thread.crew_captain.is_none_or(|captain| {
+                        captain < captains.len()
+                            && !thread.captain_home
+                            && thread.peer_origin.is_none()
+                            && thread.captain == Some(captain)
                     })
             });
             if restored.len() != threads.len() || ids.len() != restored.len() || !parents_valid {
@@ -13484,6 +14090,29 @@ impl State {
             )?;
             let next_project = next_counter(&index["nextProjectId"], maximum_project_id)?;
             self.threads = restored;
+            let inferred: std::collections::HashMap<usize, usize> = self
+                .threads
+                .iter()
+                .filter(|thread| {
+                    thread.delegated
+                        && thread.peer_origin.is_none()
+                        && missing_crew.contains(&thread.id)
+                        && thread.parent.is_some_and(|parent| {
+                            self.threads.iter().any(|t| {
+                                t.id == parent
+                                    && t.captain_home
+                                    && t.captain == thread.captain
+                                    && t.captain.is_some()
+                            })
+                        })
+                })
+                .filter_map(|thread| thread.captain.map(|captain| (thread.id, captain)))
+                .collect();
+            for thread in &mut self.threads {
+                if let Some(captain) = inferred.get(&thread.id) {
+                    thread.crew_captain = Some(*captain);
+                }
+            }
             // v0.8 kept home flags but hid all except the project's default. Every
             // flagged home is now an independent coordinator, with its original id.
             for thread in &mut self.threads {
@@ -13498,8 +14127,16 @@ impl State {
                 }
             }
             self.captains = captains;
+            // A different machine's records must not consult the old lifecycle map.
+            self.captain_lifecycles.clear();
+            self.captain_report_policies.clear();
             self.projects.entries = projects;
             self.restore_captain_records(index, &project_remap)?;
+            self.captain_books = self.restore_captain_books(index)?;
+            self.restore_crew_reports(index)?;
+            self.restore_crew_answers(index)?;
+            self.restore_captain_lifecycles(index)?;
+            self.restore_captain_report_policies(index)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             if restore_session {
@@ -13563,6 +14200,9 @@ impl State {
             self.capture_opened_draft();
         }
         self.restore_tasks(index, &project_remap)?;
+        self.validate_captain_archives()?;
+        self.sync_memory_links();
+        self.refresh_captain_contexts();
         if self.persist_transcripts && !self.headless && self.client.is_none() {
             self.restore_persisted_history(&index["threadViews"])?;
         }
@@ -14132,9 +14772,14 @@ impl State {
             "captainScopes":self.captain_scopes,
             "captainRemoteScopes":self.captain_remote_scopes,
             "captainHomes":self.captain_homes,
+            "captainBooks":self.captain_book_value(),
+            "captainLifecycles":self.captain_lifecycles,
+            "captainReportPolicies":self.captain_report_policies,
+            "captainReports":self.captain_reports,
+            "captainQuestionAnswers":self.captain_question_answers,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
-                self.headless || self.persist_transcripts || !thread.blank_draft() || thread.id == self.current().id || self.tabs.contains(&thread.id)
+                self.headless || self.persist_transcripts || !thread.blank_draft() || thread.crew_captain.is_some() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(Thread::stored_metadata).collect::<Vec<_>>()
         });
         index["commandReceipts"] = json!(self.command_receipts);
@@ -14356,7 +15001,9 @@ impl Thread {
             "neverSent":self.never_sent && self.life.latest_user_message_at.is_none(),
             "forkSource":self.native.fork_source, "forkEntry":self.native.fork_entry,
             "previousSession":self.native.previous_session,"accessMode":self.native.access.id(),
-            "captain":self.captain, "captainHome":self.captain_home, "delegated":self.delegated,"parent":self.parent
+            "captain":self.captain, "captainHome":self.captain_home, "crewCaptain":self.crew_captain,
+            "delegated":self.delegated,"parent":self.parent,
+            "crewReportOutbox":self.crew_report_outbox,"crewReportLastRun":self.crew_report_last_run
         });
         record.as_object_mut().unwrap().extend(json!({
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
@@ -14370,6 +15017,9 @@ impl Thread {
         }).as_object().unwrap().clone());
         if let Some(worktree_path) = &self.worktree_path {
             record["worktreePath"] = json!(worktree_path);
+        }
+        if let Some(directory) = &self.scratch_directory {
+            record["scratchDirectory"] = json!(directory);
         }
         if let Some(branch) = &self.branch {
             record["branch"] = json!(branch);
@@ -14920,7 +15570,7 @@ pub fn snap_zoom(zoom: f32) -> f32 {
 }
 
 /// The words the Shina MCP uses for a thread's status.
-fn status_word(status: Status) -> &'static str {
+pub(crate) fn status_word(status: Status) -> &'static str {
     match status {
         Status::Ready => "idle",
         Status::Running => "working",
@@ -14956,7 +15606,7 @@ fn content_text(content: &Value) -> String {
             })
             .unwrap_or_default()
     };
-    memory::without_diff(&without_ansi(&text)).into()
+    memory::without_generated(&without_ansi(&text)).into()
 }
 /// Pi extensions colour their messages for a terminal. Drop the escape sequences (CSI such
 /// as `ESC[38;2;144;144;144m`, OSC up to BEL or `ESC\`, and two-byte escapes) so they do not
@@ -15246,6 +15896,7 @@ mod tests {
         );
         state.threads[0].parent = Some(7);
         state.threads[0].delegated = true;
+        state.threads[0].crew_captain = Some(0);
         state.threads[0].messages.push(Message {
             id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
@@ -15281,6 +15932,7 @@ mod tests {
         for index in [0, 1] {
             state.threads[index].parent = Some(7);
             state.threads[index].delegated = true;
+            state.threads[index].crew_captain = Some(0);
         }
         // Thread 2 has an unread result; thread 1 has been read.
         state.threads[0].life.last_completed_at = Some(1);
@@ -15315,6 +15967,7 @@ mod tests {
         state.populate_demo();
         state.threads[0].parent = Some(7);
         state.threads[0].delegated = true;
+        state.threads[0].crew_captain = Some(0);
         state.select_thread(6);
         state.settle_thread(1);
         assert!(state.threads[0].life.settled());
@@ -15341,6 +15994,7 @@ mod tests {
         state.populate_demo();
         state.threads[0].parent = Some(7);
         state.threads[0].delegated = true;
+        state.threads[0].crew_captain = Some(0);
         state.threads[0].life.archived_at = Some(1);
         state.search.replace_text("duplicate listener");
         state.show_archive = true;
@@ -15408,6 +16062,7 @@ mod tests {
             old.next_id += 1;
             crew.project = home.project;
             crew.captain = home.captain;
+            crew.crew_captain = home.captain;
             crew.parent = Some(id);
             crew.delegated = true;
             crew.session = Some(format!("original-crew-{id}.jsonl"));
@@ -17829,11 +18484,13 @@ mod tests {
         state.current_mut().status = Status::Completed;
         state.new_thread();
         state.current_mut().captain = Some(0);
+        state.current_mut().crew_captain = Some(0);
         state.current_mut().delegated = true;
         state.current_mut().parent = Some(home);
         state.current_mut().status = Status::Running;
         state.new_thread();
         state.current_mut().captain = Some(0);
+        state.current_mut().crew_captain = Some(0);
         state.current_mut().delegated = true;
         state.current_mut().parent = Some(home);
         state.current_mut().status = Status::Waiting;
@@ -21679,9 +22336,17 @@ mod tests {
         let empty_cfg_ok = root_ok.join("empty.gitconfig");
         std::fs::write(&empty_cfg_ok, "").unwrap();
         let repo_ok = init_temp_git_repo(&root_ok, &empty_cfg_ok);
+        let setup_command = if cfg!(windows) {
+            "Write-Output line1; Set-Content -LiteralPath setup.marker -Value setup-done"
+        } else {
+            "echo line1 && echo setup-done > setup.marker"
+        };
         std::fs::write(
             repo_ok.join("t3.json"),
-            r#"{"scripts":[{"name":"Setup","command":"echo line1 && echo setup-done > setup.marker","runOnWorktreeCreate":true}]}"#,
+            json!({"scripts":[{
+                "name":"Setup", "command":setup_command, "runOnWorktreeCreate":true
+            }]})
+            .to_string(),
         )
         .unwrap();
         {
@@ -21791,10 +22456,17 @@ mod tests {
         std::fs::write(&empty_cfg_fail, "").unwrap();
         let repo_fail = init_temp_git_repo(&root_fail, &empty_cfg_fail);
         let gate_file = root_fail.join("allow_pass");
-        let cmd_str = format!(
-            "if [ -f '{}' ]; then echo retry-ok; else echo failing-tail; exit 2; fi",
-            gate_file.display()
-        );
+        let cmd_str = if cfg!(windows) {
+            format!(
+                "if (Test-Path -LiteralPath '{}') {{ Write-Output retry-ok }} else {{ Write-Output failing-tail; exit 2 }}",
+                gate_file.to_string_lossy().replace('\'', "''")
+            )
+        } else {
+            format!(
+                "if [ -f '{}' ]; then echo retry-ok; else echo failing-tail; exit 2; fi",
+                gate_file.display()
+            )
+        };
         std::fs::write(
             repo_fail.join("t3.json"),
             json!({

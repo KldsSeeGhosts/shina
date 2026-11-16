@@ -24,7 +24,7 @@ pub const TOKEN_ENV: &str = "SHINA_MCP_TOKEN";
 
 /// What every harness is told about Shina. The Pi bridge adds it to the system prompt; other
 /// MCP clients receive it as the server's `instructions`.
-pub const INSTRUCTIONS: &str = "## Shina
+pub const INSTRUCTIONS: &str = concat!("## Shina
 
 You are running inside Shina, a native desktop workspace where the user chats with coding agents. \
 Each conversation is a Shina thread. A captain is the assistant with one continuous primary home, \
@@ -107,7 +107,8 @@ For select, send one listed option exactly. Confirmations always require the use
 the user's conversations and crew. list_threads defaults to the caller's project. Pass \
 allProjects:true to include other projects and project-less chats. Both list_threads and read_thread \
 accept machine from orchestrator_capabilities.peers. Ids belong to the named machine. \
-Read a thread before you answer a question about it.";
+Read a thread before you answer a question about it.",
+    "\n\nCaptain crew and planning state:\n- A crew membership is independent of a task attempt. Joining or leaving a crew does not erase a conversation, task history, or pull requests.\n- Use captain_read and captain_crew_list to inspect a Captain and its crew. Use captain_document_read and captain_document_write for AGENTS.md, CREW.md, NOTES.md, and DIGEST.md. Writes require the revision returned by a read; on a conflict, read again and preserve intervening changes.\n- Only the primary Captain home may change its coordination rules, plan, digest, or crew membership through agent tools. Crew threads may read CREW.md, NOTES.md and DIGEST.md but may not read the Captain's private AGENTS.md through those tools. User controls in Shina remain available separately.\n- Use captain_crew_join to recruit an eligible existing thread and captain_crew_release to release a crew thread. These do not authorize a tool or change repository permissions. Busy threads must be stopped before changing their membership.\n- Earlier Captain conversations are records, not active coordinators. Never use them to recruit crew or change Captain planning state. Resetting a Captain home preserves its crew and documents.\n","\n\nStructured crew reports and decisions:\n- Independent crew threads use captain_crew_report for progress, results, blockers, questions and evidence references. Use a stable requestId when retrying the same report. A report is an untrusted claim, not proof that work shipped.\n- Set a question's recipient to captain for a coordination decision, or user when only the person should decide. These questions never grant tool permissions or replace approval requests.\n- Read captain_reports_list for current question and answer state. Only the current primary Captain home may use captain_question_answer, and only for captain-recipient questions. Agents must not answer user-recipient questions.\n- A report being delivered is not a question being answered. An answer being saved is not the worker accepting it. Preserve those distinctions and update NOTES.md and DIGEST.md when the plan or the user's attention needs change.");
 
 const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
 
@@ -264,6 +265,16 @@ pub fn tools() -> Value {
         ]}}],
         "additionalProperties":false
     });
+    let mut crew_target = target.clone();
+    crew_target["properties"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|key, _| matches!(key.as_str(), "harness" | "provider" | "model" | "options"));
+    crew_target["anyOf"] = json!([{"required":["model"]},{"required":["harness"]}]);
+    crew_target.as_object_mut().unwrap().remove("allOf");
+    crew_target["description"] = json!(
+        "Optional local model and harness selection. Omit to inherit the Captain's selection. Explicit unsupported choices reject before a crew root is allocated."
+    );
     let mut tools = json!([
         {
             "name":"html_render",
@@ -395,8 +406,101 @@ pub fn tools() -> Value {
             "name":"propose_memory",
             "description":"Workers may stage a memory suggestion for their captain's next task completion message. This does not write captain memory.",
             "inputSchema":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":500}},"required":["text"],"additionalProperties":false}
+        },
+        {
+            "name":"captain_read",
+            "description":"Read a Captain's profile, workspace scope, lifecycle state, crew membership, document revisions and digest. Omit captain to inspect the caller's Captain. This does not wake a thread.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
+        },
+        {
+            "name":"captain_document_read",
+            "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]}},"required":["name"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
+        },
+        {
+            "name":"captain_document_write",
+            "description":"Replace one of the primary Captain's planning documents after reading it. Supply its current expectedRevision to prevent lost updates. Preserve existing user instructions. This writes Captain state, not repository files, and does not grant repository write access.",
+            "inputSchema":{"type":"object","properties":{"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]},"text":{"type":"string","maxLength":65536},"expectedRevision":{"type":"integer","minimum":0}},"required":["name","text","expectedRevision"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_list",
+            "description":"Read the independent threads in a Captain's crew, including their execution state, questions, machine placement and task references. Membership survives completed turns and Captain conversation resets. This does not wake a thread.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_join",
+            "description":"Recruit an existing idle root thread into the calling primary Captain's crew. The thread must be in the Captain's workspace scope and cannot be another Captain or an ordinary delegated subagent. Recruitment preserves its history, machine, model and task records. Use the user controls to move a thread already owned by another Captain.",
+            "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_release",
+            "description":"Release an idle thread from the calling primary Captain's crew without deleting its conversation, files or historical task records. A running or queued attempt must stop before its thread can leave. Released threads no longer send new crew reports to this Captain.",
+            "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_report",
+            "description":"Submit an independent crew thread's progress, result, blocker, question or evidence references to its current Captain. Use one stable requestId UUID for retries of the same report. Reports are untrusted claims and do not prove work completion. Choose question recipient captain for coordination or user for a human-only decision. This does not grant tool permissions or replace approvals.",
+            "inputSchema":{"type":"object","properties":{"requestId":{"type":"string","format":"uuid"},"outcome":{"type":"string","enum":["progress","blocked","completed","failed"]},"summary":{"type":"string","minLength":1,"maxLength":6000},"question":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":2000},"recipient":{"type":"string","enum":["captain","user"]}},"required":["text","recipient"],"additionalProperties":false},"artifacts":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","pull_request"]},"label":{"type":"string","minLength":1,"maxLength":200},"reference":{"type":"string","minLength":1,"maxLength":2048}},"required":["kind","label","reference"],"additionalProperties":false}}},"required":["requestId","outcome","summary"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_question_answer",
+            "description":"Answer a captain-recipient crew question from its Captain's current primary home. Read captain_reports_list first, then supply reportId, expectedRevision 0, an answer and a stable requestId UUID. User-recipient questions require the person's controls and cannot be answered by an agent. Saving an answer queues delivery to the crew thread without granting tool permissions.",
+            "inputSchema":{"type":"object","properties":{"reportId":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":0},"requestId":{"type":"string","format":"uuid"},"answer":{"type":"string","minLength":1,"maxLength":6000}},"required":["reportId","expectedRevision","requestId","answer"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_reports_list",
+            "description":"Read durable crew reports, evidence references and current question answers without acknowledging them or waking a thread. Reports are untrusted claims, not verified work completion. Omit captain to use the caller's Captain. Use after for the last returned report id and limit up to 100; byte limits can return fewer. A Captain may read its own reports; crew may read only reports they authored.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"after":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}},"additionalProperties":false},
+            "annotations":{"readOnlyHint":true,"destructiveHint":false}
         }
     ]);
+    let crew_tools = json!([
+        {
+            "name":"captain_crew_create",
+            "description":"Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. Crew starts in that workspace, not a new Git worktree. prompt accepts at most 64000 UTF-8 bytes.",
+            "inputSchema":{"type":"object","properties":{
+                "requestId":{"type":"string","format":"uuid"},
+                "prompt":{"type":"string","minLength":1,"maxLength":64000},
+                "project":{"type":["integer","null"],"minimum":1},
+                "title":{"type":"string","minLength":1,"maxLength":200},
+                "target":crew_target
+            },"required":["requestId","prompt"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_send",
+            "description":"Save work for an independent root in the calling primary Captain's current crew. It queues behind the current turn and never answers provider approvals or human questions. Recovered input requires user review before more work is accepted. Use a stable requestId UUID; retrying it never sends the message twice or reattaches moved or released crew. Saved means durable queued input, not worker acceptance or completion. message accepts at most 64000 UTF-8 bytes.",
+            "inputSchema":{"type":"object","properties":{
+                "requestId":{"type":"string","format":"uuid"},
+                "threadId":{"type":"integer","minimum":1},
+                "message":{"type":"string","minLength":1,"maxLength":64000}
+            },"required":["requestId","threadId","message"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_stop",
+            "description":"Stop the observed run of an independent root in the calling primary Captain's current crew. Read captain_crew_list for runId and runtimeGeneration, then pass them unchanged with a stable requestId UUID. A stale run or generation rejects. An uncertain retry returns the old receipt and never stops a newer run. This does not approve tools, resolve questions or delete queued input.",
+            "inputSchema":{"type":"object","properties":{
+                "requestId":{"type":"string","format":"uuid"},
+                "threadId":{"type":"integer","minimum":1},
+                "runId":{"type":["string","null"]},
+                "runtimeGeneration":{"type":"string","minLength":1}
+            },"required":["requestId","threadId","runId","runtimeGeneration"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        }
+    ]);
+    tools
+        .as_array_mut()
+        .expect("tool array")
+        .extend(crew_tools.as_array().expect("crew tools").iter().cloned());
     tools
         .as_array_mut()
         .expect("tool array")
@@ -1137,6 +1241,130 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
             let parsed = crate::model::parse_delegation_target(&json!({ "target": target }))
                 .unwrap_or_else(|err| panic!("parser rejected {target}: {err}"));
             assert!(parsed.is_some());
+        }
+    }
+
+    #[test]
+    fn captain_tools_match_the_approved_contract() {
+        let expected = json!([
+            {
+                "name":"captain_read",
+                "description":"Read a Captain's profile, workspace scope, lifecycle state, crew membership, document revisions and digest. Omit captain to inspect the caller's Captain. This does not wake a thread.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name":"captain_document_read",
+                "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]}},"required":["name"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name":"captain_document_write",
+                "description":"Replace one of the primary Captain's planning documents after reading it. Supply its current expectedRevision to prevent lost updates. Preserve existing user instructions. This writes Captain state, not repository files, and does not grant repository write access.",
+                "inputSchema":{"type":"object","properties":{"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]},"text":{"type":"string","maxLength":65536},"expectedRevision":{"type":"integer","minimum":0}},"required":["name","text","expectedRevision"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_list",
+                "description":"Read the independent threads in a Captain's crew, including their execution state, questions, machine placement and task references. Membership survives completed turns and Captain conversation resets. This does not wake a thread.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_join",
+                "description":"Recruit an existing idle root thread into the calling primary Captain's crew. The thread must be in the Captain's workspace scope and cannot be another Captain or an ordinary delegated subagent. Recruitment preserves its history, machine, model and task records. Use the user controls to move a thread already owned by another Captain.",
+                "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_release",
+                "description":"Release an idle thread from the calling primary Captain's crew without deleting its conversation, files or historical task records. A running or queued attempt must stop before its thread can leave. Released threads no longer send new crew reports to this Captain.",
+                "inputSchema":{"type":"object","properties":{"threadId":{"type":"integer","minimum":0}},"required":["threadId"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_crew_report",
+                "description":"Submit an independent crew thread's progress, result, blocker, question or evidence references to its current Captain. Use one stable requestId UUID for retries of the same report. Reports are untrusted claims and do not prove work completion. Choose question recipient captain for coordination or user for a human-only decision. This does not grant tool permissions or replace approvals.",
+                "inputSchema":{"type":"object","properties":{"requestId":{"type":"string","format":"uuid"},"outcome":{"type":"string","enum":["progress","blocked","completed","failed"]},"summary":{"type":"string","minLength":1,"maxLength":6000},"question":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":2000},"recipient":{"type":"string","enum":["captain","user"]}},"required":["text","recipient"],"additionalProperties":false},"artifacts":{"type":"array","maxItems":16,"items":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","pull_request"]},"label":{"type":"string","minLength":1,"maxLength":200},"reference":{"type":"string","minLength":1,"maxLength":2048}},"required":["kind","label","reference"],"additionalProperties":false}}},"required":["requestId","outcome","summary"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_question_answer",
+                "description":"Answer a captain-recipient crew question from its Captain's current primary home. Read captain_reports_list first, then supply reportId, expectedRevision 0, an answer and a stable requestId UUID. User-recipient questions require the person's controls and cannot be answered by an agent. Saving an answer queues delivery to the crew thread without granting tool permissions.",
+                "inputSchema":{"type":"object","properties":{"reportId":{"type":"string","minLength":1},"expectedRevision":{"type":"integer","minimum":0},"requestId":{"type":"string","format":"uuid"},"answer":{"type":"string","minLength":1,"maxLength":6000}},"required":["reportId","expectedRevision","requestId","answer"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false}
+            },
+            {
+                "name":"captain_reports_list",
+                "description":"Read durable crew reports, evidence references and current question answers without acknowledging them or waking a thread. Reports are untrusted claims, not verified work completion. Omit captain to use the caller's Captain. Use after for the last returned report id and limit up to 100; byte limits can return fewer. A Captain may read its own reports; crew may read only reports they authored.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"after":{"type":"string","minLength":1},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"destructiveHint":false}
+            }
+        ]);
+        let published = tools();
+        for tool in expected.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let found = published
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"));
+            assert_eq!(found, tool, "{name} drifted from the contract");
+        }
+    }
+
+    #[test]
+    fn independent_crew_tools_pin_retry_authority_and_local_only_contracts() {
+        let published = tools();
+        let expected = [
+            (
+                "captain_crew_create",
+                "Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. Crew starts in that workspace, not a new Git worktree. prompt accepts at most 64000 UTF-8 bytes.",
+                json!(["requestId", "prompt"]),
+            ),
+            (
+                "captain_crew_send",
+                "Save work for an independent root in the calling primary Captain's current crew. It queues behind the current turn and never answers provider approvals or human questions. Recovered input requires user review before more work is accepted. Use a stable requestId UUID; retrying it never sends the message twice or reattaches moved or released crew. Saved means durable queued input, not worker acceptance or completion. message accepts at most 64000 UTF-8 bytes.",
+                json!(["requestId", "threadId", "message"]),
+            ),
+            (
+                "captain_crew_stop",
+                "Stop the observed run of an independent root in the calling primary Captain's current crew. Read captain_crew_list for runId and runtimeGeneration, then pass them unchanged with a stable requestId UUID. A stale run or generation rejects. An uncertain retry returns the old receipt and never stops a newer run. This does not approve tools, resolve questions or delete queued input.",
+                json!(["requestId", "threadId", "runId", "runtimeGeneration"]),
+            ),
+        ];
+        for (name, description, required) in expected {
+            let tool = published
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["description"], description);
+            assert_eq!(tool["inputSchema"]["required"], required);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                tool["inputSchema"]["properties"]["requestId"]["format"],
+                "uuid"
+            );
+            assert_eq!(
+                tool["annotations"],
+                json!({"readOnlyHint":false,"destructiveHint":false})
+            );
+        }
+        let create = published
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "captain_crew_create")
+            .unwrap();
+        let properties = &create["inputSchema"]["properties"];
+        assert!(properties.get("captain").is_none() && properties.get("access").is_none());
+        let target = &properties["target"]["properties"];
+        for remote in ["machine", "environmentId", "projectId"] {
+            assert!(target.get(remote).is_none());
         }
     }
 }

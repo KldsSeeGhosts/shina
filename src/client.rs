@@ -1800,10 +1800,13 @@ pub(crate) fn downgrade_composer_context_command(
     mut command: Command,
     has_composer_context: bool,
 ) -> Command {
-    if has_composer_context || !matches!(command.method.as_str(), "thread.send" | "queue.update") {
+    if has_composer_context {
         return command;
     }
-    if let Some(obj) = command.params.as_object_mut() {
+    let Some(scope) = attachment_scope(&command.method, &mut command.params) else {
+        return command;
+    };
+    if let Some(obj) = scope.as_object_mut() {
         let context = obj.remove("context").filter(|v| !v.is_null());
         if let Some(text) = obj.get("text").and_then(Value::as_str).map(str::to_owned)
             && !crate::composer_context::collect_composer_context_references(&text).is_empty()
@@ -1852,19 +1855,44 @@ pub(crate) struct AttachmentPeer<'a> {
     pub local_upload: Option<&'a crate::peer::Link>,
 }
 
+/// The value that owns a command's `text`, `attachments`, `draft` and
+/// `context`: the params themselves for message commands, `params.input` for
+/// crew control commands whose rich input is nested. Other methods, and crew
+/// commands with a missing or malformed `input`, have no payload scope.
+fn attachment_scope<'a>(method: &str, params: &'a mut Value) -> Option<&'a mut Value> {
+    match method {
+        "thread.send" | "queue.update" => Some(params),
+        "captain.crew.create" | "captain.crew.send" => {
+            params.get_mut("input").filter(|input| input.is_object())
+        }
+        _ => None,
+    }
+}
+
+/// The read-only counterpart to `attachment_scope`, for the source command.
+fn attachment_scope_ref<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
+    match method {
+        "thread.send" | "queue.update" => Some(params),
+        "captain.crew.create" | "captain.crew.send" => {
+            params.get("input").filter(|input| input.is_object())
+        }
+        _ => None,
+    }
+}
+
+/// The attachments array inside a command's payload scope, or `None` for
+/// methods that carry none and for malformed nested input. The server's claim
+/// replay selects the same scope when it rebuilds claimed paths.
+pub(crate) fn command_attachments<'a>(method: &str, params: &'a Value) -> Option<&'a Vec<Value>> {
+    attachment_scope_ref(method, params)?["attachments"].as_array()
+}
+
 pub(crate) async fn uploaded_command_capabilities(
     command: &Command,
     remote: Option<&crate::peer::Link>,
     peer: AttachmentPeer<'_>,
 ) -> Result<Command, String> {
-    let AttachmentPeer {
-        files: files_supported,
-        staged: staged_supported,
-        limits: limits_supported,
-        pasted_text,
-        environment: local_environment,
-        local_upload,
-    } = peer;
+    let pasted_text = peer.pasted_text;
     let mut prepared = command.clone();
     if !pasted_text {
         fn strip(value: &mut Value) {
@@ -1892,11 +1920,40 @@ pub(crate) async fn uploaded_command_capabilities(
         }
         strip(&mut prepared.params);
     }
-    if !matches!(command.method.as_str(), "thread.send" | "queue.update") {
+    let Some(scope) = attachment_scope(&command.method, &mut prepared.params) else {
         return Ok(prepared);
+    };
+    let source = attachment_scope_ref(&command.method, &command.params);
+    let staged_ids = upload_scope_attachments(scope, source, command, remote, &peer).await?;
+    if !staged_ids.is_empty() {
+        prepared.params["stagedUploadIds"] = json!(staged_ids);
     }
+    Ok(prepared)
+}
+
+/// Run the shared attachment pipeline over one payload scope: the params of a
+/// `thread.send` or `queue.update`, or the nested `input` of a
+/// `captain.crew.create`/`captain.crew.send`. Returns the staged upload lease
+/// ids; the caller writes them at the command params root, where the server
+/// expects `stagedUploadIds`. `source_scope` is the same scope in the untouched
+/// command so recovery snapshots keep their logical attachment ids.
+async fn upload_scope_attachments(
+    prepared: &mut Value,
+    source_scope: Option<&Value>,
+    command: &Command,
+    remote: Option<&crate::peer::Link>,
+    peer: &AttachmentPeer<'_>,
+) -> Result<Vec<String>, String> {
+    let AttachmentPeer {
+        files: files_supported,
+        staged: staged_supported,
+        limits: limits_supported,
+        environment: local_environment,
+        local_upload,
+        ..
+    } = *peer;
     if !limits_supported {
-        let images: Vec<_> = prepared.params["attachments"]
+        let images: Vec<_> = prepared["attachments"]
             .as_array()
             .into_iter()
             .flatten()
@@ -1913,12 +1970,16 @@ pub(crate) async fn uploaded_command_capabilities(
             return Err(error);
         }
     }
-    let source_ids: Vec<_> = command.params["attachments"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|attachment| attachment["id"].as_str().map(str::to_owned))
-        .collect();
+    let source_ids: Vec<_> = source_scope
+        .map(|source| {
+            source["attachments"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|attachment| attachment["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let target = remote
         .map(|link| link.server_id.as_str())
         .or(local_environment);
@@ -1928,11 +1989,7 @@ pub(crate) async fn uploaded_command_capabilities(
     let mut replacements = std::collections::HashMap::new();
     let mut staged_ids = Vec::new();
     let mut ready_ids = std::collections::HashSet::new();
-    for value in prepared.params["attachments"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
+    for value in prepared["attachments"].as_array().into_iter().flatten() {
         let Some(id) = value["id"].as_str() else {
             continue;
         };
@@ -1973,21 +2030,18 @@ pub(crate) async fn uploaded_command_capabilities(
         }
         replacements.insert(id.to_owned(), normalized);
     }
-    rewrite_uploaded_attachments(&mut prepared.params, &replacements);
+    rewrite_uploaded_attachments(prepared, &replacements);
     let should_stage = staged_supported && upload_endpoint.is_some();
     if remote.is_none() && !should_stage {
-        if !staged_ids.is_empty() {
-            prepared.params["stagedUploadIds"] = json!(staged_ids);
-        }
-        return Ok(prepared);
+        return Ok(staged_ids);
     }
     let remote_transfer = remote.is_some();
     let remote = upload_endpoint
         .or(remote)
         .ok_or("The attachment upload connection is unavailable. Reconnect before sending.")?;
-    let scope = prepared.params.clone();
-    let Some(attachments) = prepared.params["attachments"].as_array_mut() else {
-        return Ok(prepared);
+    let snapshot = prepared.clone();
+    let Some(attachments) = prepared["attachments"].as_array_mut() else {
+        return Ok(staged_ids);
     };
     let http = crate::peer::http()?;
     let address = remote.address()?;
@@ -2012,10 +2066,10 @@ pub(crate) async fn uploaded_command_capabilities(
                 .as_str()
                 .is_some_and(crate::attachments::safe_file_id);
         let mentioned_path = ordinary
-            && scope["draft"]["attachments"]
+            && snapshot["draft"]["attachments"]
                 .as_array()
                 .is_some_and(|files| !files.iter().any(|file| file["id"] == attachment["id"]))
-            && !scope["context"]["records"]
+            && !snapshot["context"]["records"]
                 .as_array()
                 .is_some_and(|records| {
                     records.iter().any(|record| {
@@ -2029,10 +2083,10 @@ pub(crate) async fn uploaded_command_capabilities(
             return Err(protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED.into());
         }
         if ordinary
-            && scope["draft"]["attachments"]
+            && snapshot["draft"]["attachments"]
                 .as_array()
                 .is_some_and(|files| !files.iter().any(|file| file["id"] == attachment["id"]))
-            && !scope["context"]["records"]
+            && !snapshot["context"]["records"]
                 .as_array()
                 .is_some_and(|records| {
                     records.iter().any(|record| {
@@ -2129,11 +2183,8 @@ pub(crate) async fn uploaded_command_capabilities(
         }
         replacements.insert(original_id, attachment.clone());
     }
-    rewrite_uploaded_attachments(&mut prepared.params, &replacements);
-    if !staged_ids.is_empty() {
-        prepared.params["stagedUploadIds"] = json!(staged_ids);
-    }
-    Ok(prepared)
+    rewrite_uploaded_attachments(prepared, &replacements);
+    Ok(staged_ids)
 }
 
 fn local_upload_link(
@@ -2762,5 +2813,133 @@ mod tests {
             .unwrap();
         assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 1);
         assert!(cache.histories.is_empty());
+    }
+
+    #[test]
+    fn crew_commands_prepare_nested_input_attachments_like_top_level_sends() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let logical = format!("file-{}", "a".repeat(64));
+            let stored = format!("file-{}.bin", "b".repeat(64));
+            let attachment = json!({
+                "id":logical,"asset_id":stored,"name":"notes.txt","mime":"text/plain",
+                "width":0,"height":0,"bytes":3,"path":null
+            });
+            let record = json!({"kind":"file","attachmentId":logical,"contextId":"ctx-1","name":"notes.txt"});
+            for method in ["captain.crew.create", "captain.crew.send"] {
+                let command = Command::new(
+                    method,
+                    json!({"captain":0,"threadId":7,"input":{
+                        "text":"Read the note","attachments":[attachment.clone()],
+                        "context":{"version":1,"records":[record.clone()]},
+                        "draft":{"attachments":[attachment.clone()],"context":[record.clone()]}
+                    }}),
+                );
+                let prepared =
+                    uploaded_command_capabilities(&command, None, AttachmentPeer::default())
+                        .await
+                        .unwrap();
+                assert_eq!(prepared.command_id, command.command_id);
+                assert_eq!(prepared.method, command.method);
+                let input = &prepared.params["input"];
+                assert_eq!(input["attachments"][0]["id"], stored);
+                assert!(input["attachments"][0].get("asset_id").is_none());
+                assert!(input["attachments"][0].get("uploaded").is_none());
+                assert_eq!(input["context"]["records"][0]["attachmentId"], stored);
+                assert_eq!(input["draft"]["attachments"][0]["id"], stored);
+                assert_eq!(input["draft"]["context"][0]["attachmentId"], stored);
+                assert!(
+                    prepared.params.get("stagedUploadIds").is_none(),
+                    "the staged lease envelope is written only with verified ids"
+                );
+                assert_eq!(
+                    command.params["input"]["attachments"][0]["id"], logical,
+                    "the pending command snapshot keeps its recovery identity"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn crew_commands_keep_unverifiable_upload_markers_out_and_refuse_missing_capabilities() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let stored = format!("file-{}.bin", "c".repeat(64));
+            let uploaded = json!({
+                "id":format!("file-{}", "d".repeat(64)),"name":"notes.txt","mime":"text/plain",
+                "width":0,"height":0,"bytes":3,"path":null,
+                "uploaded":{"environment_id":"other","lease_id":uuid::Uuid::new_v4().to_string(),
+                    "attachment_id":stored}
+            });
+            let command = Command::new(
+                "captain.crew.send",
+                json!({"captain":0,"threadId":7,"input":{
+                    "text":"Read the note","attachments":[uploaded.clone()]}}),
+            );
+            // A marker for another environment is dropped; it is never trusted.
+            let prepared = uploaded_command_capabilities(
+                &command,
+                None,
+                AttachmentPeer {
+                    staged: true,
+                    environment: Some("local"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let nested = &prepared.params["input"]["attachments"][0];
+            assert_eq!(nested["id"], uploaded["id"]);
+            assert!(nested.get("uploaded").is_none());
+            assert!(prepared.params.get("stagedUploadIds").is_none());
+            // An ordinary file on a peer without the file contract is refused
+            // before any upload request leaves the machine.
+            let link = crate::peer::Link {
+                server_id: "server".into(),
+                host: "127.0.0.1:9".into(),
+                device_id: uuid::Uuid::new_v4().to_string(),
+                token: "token".into(),
+                enabled: true,
+            };
+            let command = Command::new(
+                "captain.crew.create",
+                json!({"captain":0,"input":{"text":"Read the note","attachments":[json!({
+                    "id":stored,"name":"notes.txt","mime":"text/plain",
+                    "width":0,"height":0,"bytes":3,"path":null})]}}),
+            );
+            let error =
+                uploaded_command_capabilities(&command, Some(&link), AttachmentPeer::default())
+                    .await
+                    .unwrap_err();
+            assert_eq!(error, protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED);
+            assert_eq!(
+                command.params["input"]["attachments"][0]["id"], stored,
+                "a refused command keeps its source attachments"
+            );
+        });
+    }
+
+    #[test]
+    fn crew_commands_with_malformed_input_pass_through_untouched() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for params in [
+                json!({"captain":0}),
+                json!({"captain":0,"input":"not-an-object"}),
+                json!({"captain":0,"input":null}),
+            ] {
+                let command = Command::new("captain.crew.create", params);
+                let prepared =
+                    uploaded_command_capabilities(&command, None, AttachmentPeer::default())
+                        .await
+                        .unwrap();
+                assert_eq!(prepared.params, command.params);
+            }
+            let stop = Command::new(
+                "captain.crew.stop",
+                json!({"captain":0,"threadId":7,"runId":null,"runtimeGeneration":"g"}),
+            );
+            let prepared = uploaded_command_capabilities(&stop, None, AttachmentPeer::default())
+                .await
+                .unwrap();
+            assert_eq!(prepared.params, stop.params);
+        });
     }
 }

@@ -3,7 +3,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 28;
+pub const MINOR: u32 = 35;
+pub const CAPTAIN_EVENTS_MINOR: u32 = 35;
+pub const CAPTAIN_EVENTS: &str = "captain-events-v1";
+pub const CAPTAIN_EVENTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to change Captain report policies.";
+pub const CAPTAIN_CREW_CONTROL_MINOR: u32 = 34;
+pub const CAPTAIN_CREW_CONTROL: &str = "captain-crew-control-v1";
+pub const CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to create and control independent crew.";
+pub const CAPTAIN_DELETE_MINOR: u32 = 33;
+pub const CAPTAIN_DELETE: &str = "captain-delete-v1";
+pub const CAPTAIN_DELETE_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to delete Captain profiles.";
+pub const CAPTAIN_ROLES_MINOR: u32 = 32;
+pub const CAPTAIN_PROMOTE: &str = "captain-promote-v1";
+pub const CAPTAIN_RETIRE: &str = "captain-retire-v1";
+pub const CAPTAIN_ROLES_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to change Captain roles.";
+pub const CAPTAIN_ARCHIVE_MINOR: u32 = 31;
+pub const CAPTAIN_ARCHIVE: &str = "captain-archive-v1";
+pub const CAPTAIN_ARCHIVE_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to archive Captain groups.";
+pub const CAPTAIN_STATE_MINOR: u32 = 29;
+pub const CAPTAIN_STATE: &str = "captain-state-v1";
+pub const CAPTAIN_STATE_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to manage captain crew state.";
+pub const CAPTAIN_REPORTS_MINOR: u32 = 30;
+pub const CAPTAIN_REPORTS: &str = "captain-reports-v1";
+pub const CAPTAIN_REPORTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to answer crew questions.";
 pub const MOBILE_PUSH_MINOR: u32 = 28;
 pub const MOBILE_PUSH: &str = "mobile-push-v1";
 pub const MOBILE_PUSH_UPDATE_REQUIRED: &str =
@@ -221,8 +250,14 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "vcs.listWorktrees"
         | "review.getBranchCommits"
         | "review.getDiffPreview"
-        | "review.getDiffFileContents" => "read",
-        "request.respond" | "thread.user-input.dismiss" => "approve",
+        | "review.getDiffFileContents"
+        | "captain.read"
+        | "captain.document.read"
+        | "captain.crew.list"
+        | "captain.reports.list"
+        | "captain.promote.preview"
+        | "captain.lifecycle.preview" => "read",
+        "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
         "server.updateStatus" | "server.requestUpdate" => "update",
         "devices.list"
         | "peer.link"
@@ -298,7 +333,20 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "uploads.write"
         | "vcs.createWorktree"
         | "vcs.removeWorktree"
-        | "vcs.runSetup" => "operate",
+        | "vcs.runSetup"
+        | "captain.document.write"
+        | "captain.crew.join"
+        | "captain.crew.release"
+        | "captain.crew.move"
+        | "captain.crew.create"
+        | "captain.crew.send"
+        | "captain.crew.stop"
+        | "captain.reportPolicy"
+        | "captain.archive"
+        | "captain.unarchive"
+        | "captain.promote"
+        | "captain.demote"
+        | "captain.delete" => "operate",
         _ => return None,
     })
 }
@@ -693,8 +741,14 @@ mod tests {
                 | "vcs.listWorktrees"
                 | "review.getBranchCommits"
                 | "review.getDiffPreview"
-                | "review.getDiffFileContents" => "read",
-                "request.respond" => "approve",
+                | "review.getDiffFileContents"
+                | "captain.read"
+                | "captain.document.read"
+                | "captain.crew.list"
+                | "captain.reports.list"
+                | "captain.promote.preview"
+                | "captain.lifecycle.preview" => "read",
+                "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus" | "server.requestUpdate" => "update",
                 "devices.list"
                 | "peer.link"

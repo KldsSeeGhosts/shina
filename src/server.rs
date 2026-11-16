@@ -340,6 +340,15 @@ async fn release_staged_attachment(
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
+/// The owned blob path `staged_uploads::claim` produced for a file id, so a
+/// replayed command rewrites to byte-identical params. `store_uploaded_file`
+/// canonicalizes the attachments directory; a literal join would hash
+/// differently on hosts where the profile path contains a symlink.
+fn claimed_file_path(directory: &std::path::Path, id: &str) -> std::path::PathBuf {
+    let attachments = directory.join("attachments");
+    attachments.canonicalize().unwrap_or(attachments).join(id)
+}
+
 fn rewrite_claimed_paths(value: &mut Value, replacements: &HashMap<String, Value>) {
     if let Some(id) = value["id"].as_str()
         && !value["mime"].is_null()
@@ -760,6 +769,12 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut workspace_read_file = false;
     let mut notification_feed = false;
     let mut mobile_push = false;
+    let mut captain_reports = false;
+    let mut captain_archive = false;
+    let mut captain_roles = false;
+    let mut captain_delete = false;
+    let mut captain_crew_control = false;
+    let mut captain_events = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -889,6 +904,28 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if mobile_push {
                             capabilities.push(protocol::MOBILE_PUSH);
                         }
+                        if minor >= u64::from(protocol::CAPTAIN_STATE_MINOR) {
+                            capabilities.push(protocol::CAPTAIN_STATE);
+                        }
+                        captain_reports = minor >= u64::from(protocol::CAPTAIN_REPORTS_MINOR);
+                        if captain_reports {
+                            capabilities.push(protocol::CAPTAIN_REPORTS);
+                        }
+                        captain_archive = minor >= u64::from(protocol::CAPTAIN_ARCHIVE_MINOR);
+                        if captain_archive {
+                            capabilities.push(protocol::CAPTAIN_ARCHIVE);
+                        }
+                        captain_roles = minor >= u64::from(protocol::CAPTAIN_ROLES_MINOR);
+                        if captain_roles {
+                            capabilities.push(protocol::CAPTAIN_PROMOTE);
+                            capabilities.push(protocol::CAPTAIN_RETIRE);
+                        }
+                        captain_delete = minor >= u64::from(protocol::CAPTAIN_DELETE_MINOR);
+                        if captain_delete { capabilities.push(protocol::CAPTAIN_DELETE); }
+                        captain_crew_control = minor >= u64::from(protocol::CAPTAIN_CREW_CONTROL_MINOR);
+                        if captain_crew_control { capabilities.push(protocol::CAPTAIN_CREW_CONTROL); }
+                        captain_events = minor >= u64::from(protocol::CAPTAIN_EVENTS_MINOR);
+                        if captain_events { capabilities.push(protocol::CAPTAIN_EVENTS); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -902,6 +939,21 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     }
                 } else if !hello {
                     Err("Send hello before other requests.".into())
+                } else if method == "captain.reportPolicy" && !captain_events {
+                    Err(protocol::CAPTAIN_EVENTS_UPDATE_REQUIRED.into())
+                } else if matches!(method, "captain.reports.list" | "captain.report.answer") && !captain_reports {
+                    Err(protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED.into())
+                } else if matches!(method, "captain.lifecycle.preview" | "captain.archive" | "captain.unarchive") && !captain_archive {
+                    Err(protocol::CAPTAIN_ARCHIVE_UPDATE_REQUIRED.into())
+                } else if (matches!(method, "captain.promote.preview" | "captain.promote" | "captain.demote")
+                    || method == "captain.lifecycle.preview"
+                        && params.get("args").unwrap_or(params)["action"] == "demote") && !captain_roles {
+                    Err(protocol::CAPTAIN_ROLES_UPDATE_REQUIRED.into())
+                } else if (method == "captain.delete" || method == "captain.lifecycle.preview"
+                    && params.get("args").unwrap_or(params)["action"] == "delete") && !captain_delete {
+                    Err(protocol::CAPTAIN_DELETE_UPDATE_REQUIRED.into())
+                } else if matches!(method, "captain.crew.create" | "captain.crew.send" | "captain.crew.stop") && !captain_crew_control {
+                    Err(protocol::CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED.into())
                 } else if matches!(method, "notifications.get" | "notifications.push.status") {
                     if !mobile_push {
                         Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())
@@ -1637,11 +1689,14 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                                 }
                             }
                             if already_received {
-                                for value in command.params["attachments"].as_array().into_iter().flatten() {
+                                for value in crate::client::command_attachments(&command.method, &command.params)
+                                    .into_iter()
+                                    .flatten()
+                                {
                                     let id = value["id"].as_str().ok_or("Invalid attachment identity.")?;
                                     let mut value = value.clone();
                                     if crate::attachments::safe_file_id(id) {
-                                        value["path"] = json!(directory.join("attachments").join(id));
+                                        value["path"] = json!(claimed_file_path(&directory, id));
                                     }
                                     replacements.insert(id.to_owned(), value);
                                 }
@@ -2352,6 +2407,230 @@ mod tests {
                 StatusCode::FORBIDDEN,
                 "the identity check must not make a redeemed code reusable"
             );
+        });
+    }
+
+    #[test]
+    fn captain_reports_require_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-reports-old", protocol::CAPTAIN_REPORTS_MINOR - 1)
+                    .await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-report-reader"),
+                )
+                .await;
+            for method in ["captain.reports.list", "captain.report.answer"] {
+                let error = crate::client::remote_rpc(&link, method, json!({"captain":0}))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error, protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED);
+            }
+        });
+    }
+
+    #[test]
+    fn captain_archive_requires_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-archive-old", protocol::CAPTAIN_ARCHIVE_MINOR - 1)
+                    .await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-archive-reader"),
+                )
+                .await;
+            for method in [
+                "captain.lifecycle.preview",
+                "captain.archive",
+                "captain.unarchive",
+            ] {
+                assert_eq!(
+                    crate::client::remote_rpc(&link, method, json!({"captain":0}))
+                        .await
+                        .unwrap_err(),
+                    protocol::CAPTAIN_ARCHIVE_UPDATE_REQUIRED
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn captain_roles_require_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-roles-old", protocol::CAPTAIN_ROLES_MINOR - 1).await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-roles-reader"),
+                )
+                .await;
+            for method in [
+                "captain.promote.preview",
+                "captain.promote",
+                "captain.demote",
+                "captain.lifecycle.preview",
+            ] {
+                assert_eq!(
+                    crate::client::remote_rpc(
+                        &link,
+                        method,
+                        json!({"captain":0,"action":"demote"})
+                    )
+                    .await
+                    .unwrap_err(),
+                    protocol::CAPTAIN_ROLES_UPDATE_REQUIRED
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn captain_delete_requires_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-delete-old", protocol::CAPTAIN_DELETE_MINOR - 1).await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-delete-reader"),
+                )
+                .await;
+            for method in ["captain.delete", "captain.lifecycle.preview"] {
+                assert_eq!(
+                    crate::client::remote_rpc(
+                        &link,
+                        method,
+                        json!({"captain":0,"action":"delete"})
+                    )
+                    .await
+                    .unwrap_err(),
+                    protocol::CAPTAIN_DELETE_UPDATE_REQUIRED
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn captain_event_policy_requires_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-policy-old", protocol::CAPTAIN_EVENTS_MINOR - 1).await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-policy-reader"),
+                )
+                .await;
+            assert_eq!(
+                crate::client::remote_rpc(
+                    &link,
+                    "captain.reportPolicy",
+                    json!({"captain":0,"policy":"context","expectedPolicy":"react"})
+                )
+                .await
+                .unwrap_err(),
+                protocol::CAPTAIN_EVENTS_UPDATE_REQUIRED
+            );
+        });
+    }
+
+    #[test]
+    fn independent_crew_control_requires_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("captain-crew-old", protocol::CAPTAIN_CREW_CONTROL_MINOR - 1)
+                    .await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("captain-crew-reader"),
+                )
+                .await;
+            for method in [
+                "captain.crew.create",
+                "captain.crew.send",
+                "captain.crew.stop",
+            ] {
+                assert_eq!(
+                    crate::client::remote_rpc(&link, method, json!({"captain":0}))
+                        .await
+                        .unwrap_err(),
+                    protocol::CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn crew_create_staged_claim_replay_rebuilds_nested_attachment_paths() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture = Fixture::configured("crew-staged-claim", protocol::MINOR, |runtime| {
+                runtime.state.test_connect_pi = Some(Box::new(|_, _| {
+                    Some(crate::backend::Pi::test_connection().0)
+                }));
+            })
+            .await;
+            let profile = crate::store::directory()
+                .unwrap()
+                .join("crew-staged-claim-client");
+            let link = fixture.link(&profile).await;
+            let put = crate::client::remote_rpc(&link, "captain.put", json!({
+                "record":{"name":"Quartermaster","role":"Keeper","instructions":"Guard the harbor.","portrait":1}
+            }))
+            .await
+            .unwrap();
+            assert_eq!(put["status"], "accepted", "{put}");
+            let opened = crate::client::remote_rpc(
+                &link,
+                "captain.open",
+                json!({"captain":0,"project":null}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(opened["status"], "accepted", "{opened}");
+            // A lease already verified by the sender; the wire shape carries
+            // the claimed attachment id inside the nested crew input.
+            let lease = uuid::Uuid::new_v4().to_string();
+            let mut staged = crate::staged_uploads::publish(
+                &fixture.shared.directory,
+                &lease,
+                &link.device_id,
+                "notes.txt",
+                Some("text/plain"),
+                b"crew staged bytes",
+            )
+            .unwrap();
+            staged
+                .as_object_mut()
+                .unwrap()
+                .remove("stagedUploadId");
+            let command = Command::new(
+                "captain.crew.create",
+                json!({"captain":0,"title":"Scout",
+                    "input":{"text":"Read the note","attachments":[staged]},
+                    "stagedUploadIds":[lease]}),
+            );
+            let first = crate::client::remote_command(&link, command.clone())
+                .await
+                .unwrap();
+            assert_eq!(first["status"], "accepted", "{first}");
+            // The replay's claim must rebuild paths from input.attachments,
+            // not params.attachments, or the receipt hash no longer matches.
+            let replay = crate::client::remote_command(&link, command)
+                .await
+                .unwrap();
+            assert_eq!(replay, first);
         });
     }
 
@@ -3341,7 +3620,13 @@ mod tests {
             assert_eq!(b.shared.snapshots.borrow()["state"]["index"]["threads"][0]["title"],"Before sleep");
             b.listen().await;
             wait_until(||desktop.commands_for(&link_b.server_id).unwrap().connected()).await;
-            assert!(profile.join("linked-views").join(&link_b.server_id).join("view.json").is_file());
+            // Hello marks the link connected before the asynchronous cache writer
+            // finishes. Wait for durable projection evidence, not that handshake.
+            let cached = profile.join("linked-views").join(&link_b.server_id).join("view.json");
+            wait_until(|| crate::store::load(&cached).ok().flatten().is_some_and(|view| {
+                view["schemaVersion"] == 1
+                    && view["state"]["index"]["threads"][0]["title"] == "Before sleep"
+            })).await;
             // Shutdown of a linked client never stops either server.
             desktop.shutdown();
             assert!(!b.stop.load(Ordering::Acquire));

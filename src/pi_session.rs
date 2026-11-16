@@ -1383,6 +1383,10 @@ impl Thread {
         !self.native.sends.is_empty()
     }
 
+    pub(super) fn has_recoverable_native_inputs(&self) -> bool {
+        !self.native.queued_inputs.is_empty() || !self.native.recovery.is_empty()
+    }
+
     pub(super) fn pending_inputs_value(&self) -> Value {
         let mut values: Vec<_> = self.native.sends.iter().chain(&self.native.queued_inputs).chain(&self.native.recovery).map(|s| json!({
             "text":s.prompt.text,"images":s.prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),"after":s.after,"draft":s.prompt.draft,"context":s.prompt.context

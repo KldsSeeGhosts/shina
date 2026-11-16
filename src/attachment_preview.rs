@@ -151,6 +151,38 @@ fn kind(name: &str, mime: &str) -> Kind {
     Kind::Unsupported
 }
 
+/// Windows Media Foundation opens the clip path through `MFCreateSourceReaderFromURL`
+/// and treats a `\\?\` verbatim prefix as a network path, so a canonicalized file fails
+/// with "network path not found" (0x80070035). Hand the player the ordinary drive or
+/// UNC form; on other platforms the path is passed through untouched.
+pub(super) fn player_path(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            let rest = path.components().skip(1);
+            match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => {
+                    let mut out = std::path::PathBuf::from(format!("{}:\\", drive as char));
+                    out.extend(rest);
+                    return out;
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut unc = std::ffi::OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    let mut out = std::path::PathBuf::from(unc);
+                    out.extend(rest);
+                    return out;
+                }
+                _ => {}
+            }
+        }
+    }
+    path.to_path_buf()
+}
+
 /// KSG `font-mono text-xs`: a body cell's text.
 const TABLE_CELL: TextStyle = TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono);
 /// KSG `font-medium`: a header cell's text, in the interface face like KSG's
@@ -369,9 +401,9 @@ impl Preview {
         match kind(&attachment.name, &attachment.mime) {
             Kind::Video | Kind::Audio => {
                 let player = if kind(&attachment.name, &attachment.mime) == Kind::Audio {
-                    rune::Player::audio(path)
+                    rune::Player::audio(player_path(&path))
                 } else {
-                    rune::Player::file(path)
+                    rune::Player::file(player_path(&path))
                 };
                 player.set_muted(false);
                 player.set_waker(wake);
@@ -2696,5 +2728,35 @@ mod tests {
             kind("file.bin", "application/octet-stream"),
             Kind::Unsupported
         );
+    }
+
+    #[test]
+    fn player_path_passes_ordinary_paths_through() {
+        let path = std::path::Path::new("media").join("clip.mp4");
+        assert_eq!(player_path(&path), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn player_path_strips_verbatim_prefixes_for_media_foundation() {
+        let verbatim = std::path::Path::new(r"\\?\C:\Temp\clip.mp4");
+        assert_eq!(
+            player_path(verbatim),
+            std::path::PathBuf::from(r"C:\Temp\clip.mp4")
+        );
+        let verbatim_unc = std::path::Path::new(r"\\?\UNC\server\share\clip.mp4");
+        assert_eq!(
+            player_path(verbatim_unc),
+            std::path::PathBuf::from(r"\\server\share\clip.mp4")
+        );
+        // Ordinary drive and UNC paths must not change.
+        let drive = std::path::Path::new(r"C:\Temp\clip.mp4");
+        assert_eq!(player_path(drive), drive);
+        let unc = std::path::Path::new(r"\\server\share\clip.mp4");
+        assert_eq!(player_path(unc), unc);
+        for special in [r"\\.\pipe\media", r"\\?\Volume{1234}\clip.mp4"] {
+            let path = std::path::Path::new(special);
+            assert_eq!(player_path(path), path);
+        }
     }
 }
