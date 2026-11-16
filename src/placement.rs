@@ -820,6 +820,12 @@ impl State {
                 }
                 match script_check {
                     Some(Ok(Some((script_name, script_command)))) => {
+                        // A cancelled reservation can retain its checkout,
+                        // but must not start a new setup process. A later
+                        // explicit work request will adopt it and run setup.
+                        if !self.placement_wanted(&self.threads[index]) {
+                            return;
+                        }
                         let thread = &mut self.threads[index];
                         thread.worktree_setup = Some(WorktreeSetupState {
                             phase: WorktreeSetupPhase::Running,

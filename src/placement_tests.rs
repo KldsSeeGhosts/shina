@@ -730,6 +730,14 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
         return;
     }
     let fixture = Fixture::new("cancel-provisioning");
+    std::fs::write(
+        fixture.repo.join(crate::vcs::T3_PROJECT_FILE_NAME),
+        json!({"scripts":[{"name":"setup","command":"exit 0","runOnWorktreeCreate":true}]})
+            .to_string(),
+    )
+    .unwrap();
+    fixture.git(&fixture.repo, &["add", crate::vcs::T3_PROJECT_FILE_NAME]);
+    fixture.git(&fixture.repo, &["commit", "-m", "setup", "--quiet"]);
     let (mut target, connects) = fixture.state();
     target.catalog.default_model = Some(crate::session::AgentModel {
         provider: "cpa".into(),
@@ -760,11 +768,18 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
         )
         .unwrap();
     assert_eq!(target.threads[1].task_result, Some("cancelled"));
-    poll_until_ready(&mut target, 20);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !target.placement_rxs.is_empty() {
+        target.poll_placements();
+        assert!(Instant::now() < deadline, "provisioning never finished");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(
         child_placement(&target, 1).phase,
-        placement::PlacementPhase::Ready
+        placement::PlacementPhase::Pending
     );
+    assert_eq!(fixture.worktree_dirs().len(), 2);
+    assert!(target.threads[1].worktree_setup.is_none());
     assert!(target.threads[1].pending_injections.is_empty());
     assert!(target.threads[1].pi.is_none());
     assert!(connects.lock().unwrap().is_empty());
