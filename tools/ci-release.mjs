@@ -156,7 +156,7 @@ function publish(directory, version, platform) {
     if (!existing) {
       gh(["release", "create", tag, "--repo", repo, "--draft", "--target", sha,
         "--title", `Shina ${version}`, "--notes",
-        `Personal development update from main.\n\nSource commit: ${sha}\n\nWindows, Apple-silicon Mac and portable Linux builds arrive independently. This fast build does not run test or lint gates unless requested manually. Restart from Shina's update button to install on Windows or Mac.`]);
+        `Personal development update from main.\n\nSource commit: ${sha}\n\nFormatting, JavaScript, mobile and full Rust tests passed before publication. Windows, Apple-silicon Mac and portable Linux builds arrive independently after that gate. Restart from Shina's update button to install on Windows or Mac.`]);
     }
     const uploaded = existing?.assets.find((asset) => asset.name === assetName);
     if (!uploaded) {

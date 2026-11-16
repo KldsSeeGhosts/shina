@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       checks:
-        description: Also run tests, formatting and Clippy
+        description: Also run platform-specific tests and Clippy
         type: boolean
         default: false
 
@@ -27,12 +27,10 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  core:
-    name: Core gate
+  checks:
+    name: Formatting, JavaScript and mobile
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    permissions:
-      contents: read
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -40,11 +38,32 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-      - name: Install Rust
+          cache: npm
+          cache-dependency-path: packages/mobile-client/package-lock.json
+      - name: Check JavaScript
+        run: node --test tools/*.test.mjs
+      - name: Check the mobile client
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
-          rustup component add rustfmt
+          npm ci --prefix packages/mobile-client --include=dev --ignore-scripts
+          npm --prefix packages/mobile-client run typecheck
+          npm --prefix packages/mobile-client test
+          npm --prefix packages/mobile-client run build
+      - name: Check Rust formatting
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          cargo +"$RUST_TOOLCHAIN" fmt --check
+
+  rust:
+    name: Rust test build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: core-cache
         with:
@@ -52,36 +71,28 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: core-v1-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: core-v1-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: core-v1-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-
-      - name: Install Linux build libraries
+      - name: Install build prerequisites
         run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libwayland-dev libxkbcommon-dev libx11-dev libxi-dev libxcursor-dev libxrandr-dev libudev-dev libfontconfig1-dev libvulkan-dev
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Check the mobile client
-        run: |
-          npm ci --prefix packages/mobile-client --include=dev --ignore-scripts
-          npm --prefix packages/mobile-client run typecheck
-          npm --prefix packages/mobile-client test
-          npm --prefix packages/mobile-client run build
-      - name: Run JS tests
-        run: node --test tools/*.test.mjs
-      - name: Run server integration tests
-        run: cargo test --locked --quiet --test server_runtime
-      - name: Run Rust unit tests
-        run: cargo test --locked --quiet --bin shina
-      - name: Preserve normalized mobile fixture failures
-        if: failure()
+      - name: Build and bundle all Rust test executables once
+        run: node tools/ci-tests.mjs build
+      - name: Transfer exact test executables
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mobile-golden-${{ github.run_id }}-${{ github.run_attempt }}
-          path: target/tmp/mobile-golden/*.json
-          if-no-files-found: ignore
-          retention-days: 3
+          name: rust-test-executables
+          path: target/ci-tests.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      # PR caches cannot help main or other PRs. Do not let copies of
+      # gigabyte build trees evict the default branch's shared baseline.
       - name: Save compiled core dependencies even when a test fails
-        if: ${{ !cancelled() && steps.core-cache.outcome == 'success' && steps.core-cache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.core-cache.outcome == 'success' && steps.core-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -89,11 +100,67 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.core-cache.outputs.cache-primary-key }}
+
+  rust-tests:
+    name: Rust ${{ matrix.suite }} tests
+    needs: rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/mobile-client/package-lock.json
+      - name: Install test runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libwayland-client0 libxkbcommon0 libx11-6 libxi6 libxcursor1 libxrandr2 libudev1 libfontconfig1 libvulkan1
+      - name: Install live SDK fixture dependencies
+        if: matrix.suite == 'integration'
+        run: npm ci --prefix packages/mobile-client --include=dev --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rust-test-executables
+          path: target
+      - name: Run the exact compiled test suite
+        env:
+          TEST_SUITE: ${{ matrix.suite }}
+        run: |
+          tar -xzf target/ci-tests.tar.gz
+          node tools/ci-tests.mjs run "$TEST_SUITE"
+      - name: Preserve normalized mobile fixture failures
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobile-golden-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/tmp/mobile-golden/*.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+  core:
+    name: Core gate
+    needs: [checks, rust, rust-tests]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every check to pass
+        env:
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          BUILD_RESULT: ${{ needs.rust.result }}
+          TESTS_RESULT: ${{ needs.rust-tests.result }}
+        run: test "$CHECKS_RESULT" = success && test "$BUILD_RESULT" = success && test "$TESTS_RESULT" = success
+
   windows:
     if: github.event_name != 'pull_request'
-    permissions:
-      actions: read
-      contents: write
     uses: ./.github/workflows/platform-update.yml
     with:
       platform: windows-x86_64
@@ -101,9 +168,6 @@ jobs:
       checks: ${{ inputs.checks || false }}
   macos:
     if: github.event_name != 'pull_request'
-    permissions:
-      actions: read
-      contents: write
     uses: ./.github/workflows/platform-update.yml
     with:
       platform: macos-aarch64
@@ -111,11 +175,36 @@ jobs:
       checks: ${{ inputs.checks || false }}
   linux:
     if: github.event_name != 'pull_request'
-    permissions:
-      actions: read
-      contents: write
     uses: ./.github/workflows/platform-update.yml
     with:
       platform: linux-x86_64
       runner: ubuntu-24.04
       checks: ${{ inputs.checks || false }}
+
+  publish-windows:
+    needs: [core, windows]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/publish-update.yml
+    with:
+      platform: windows-x86_64
+      version: ${{ needs.windows.outputs.version }}
+  publish-macos:
+    needs: [core, macos]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/publish-update.yml
+    with:
+      platform: macos-aarch64
+      version: ${{ needs.macos.outputs.version }}
+  publish-linux:
+    needs: [core, linux]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/publish-update.yml
+    with:
+      platform: linux-x86_64
+      version: ${{ needs.linux.outputs.version }}
