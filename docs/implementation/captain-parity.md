@@ -21,6 +21,28 @@ restart behavior and negative authorization cases. Keep private Captain
 instructions out of worker context. Preserve the difference between a saved
 operation, provider acceptance and completed work.
 
+### First review of #21
+
+Candidate `14accf5829141bd67838d70941b07099f72580c7` is not integrated.
+Its focused unit tests pass according to the worker, but the review found
+blocking gaps:
+
+- The origin read handler does not receive the authenticated caller's device.
+  It compares a supplied `workerDeviceId` against a saved outbound credential
+  identifier. That identifier does not prove who sent the read request.
+- The target callback requires an outbound link to the origin. Ordinary
+  home-to-target delegation creates only the opposite link, so the supported
+  one-way setup cannot read documents through this implementation.
+- A page budget smaller than a UTF-8 character can return an empty page with
+  the same continuation offset.
+- The manifest reports the prefix budget as coverage, although the truncation
+  marker consumes part of that budget.
+
+A Devin SWE-2 rework assignment covers these findings, revision/retry behavior,
+and a live two-server integration test through the worker's actual MCP path.
+The original handler-level tests did not exercise the transport or a foreign
+authenticated peer. Do not close #21 based on that candidate.
+
 The remaining first-milestone work is #20, #22 and #23. Issue #32 covers the
 effective cross-harness contract alongside these fixes. The performance track
 is #24, then #25, then #26. Captain identity and repository ownership follow in
