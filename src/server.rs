@@ -775,6 +775,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut captain_delete = false;
     let mut captain_crew_control = false;
     let mut captain_events = false;
+    let mut provider_updates = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -926,6 +927,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if captain_crew_control { capabilities.push(protocol::CAPTAIN_CREW_CONTROL); }
                         captain_events = minor >= u64::from(protocol::CAPTAIN_EVENTS_MINOR);
                         if captain_events { capabilities.push(protocol::CAPTAIN_EVENTS); }
+                        provider_updates = minor >= u64::from(protocol::PROVIDER_UPDATES_MINOR);
+                        if provider_updates { capabilities.push(protocol::PROVIDER_UPDATES); }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -939,6 +942,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     }
                 } else if !hello {
                     Err("Send hello before other requests.".into())
+                } else if matches!(method, "providers.refresh" | "providers.update") && !provider_updates {
+                    Err(protocol::PROVIDER_UPDATES_UPDATE_REQUIRED.into())
                 } else if method == "captain.reportPolicy" && !captain_events {
                     Err(protocol::CAPTAIN_EVENTS_UPDATE_REQUIRED.into())
                 } else if matches!(method, "captain.reports.list" | "captain.report.answer") && !captain_reports {
@@ -1581,8 +1586,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if !send(&mut socket, protocol::response(id, Err("Change update grants on the target machine itself.".into()))).await { break; }
                         continue;
                     }
-                    let mut command = if matches!(method, "command.get" | "server.status" | "server.updateStatus") {
-                        Command::new(method, params.clone())
+                    let mut command = if matches!(method, "command.get" | "server.status" | "server.updateStatus" | "providers.refresh") {
+                        Command::new(method, params.get("args").unwrap_or(params).clone())
                     } else {
                         match serde_json::from_value::<Command>(json!({"commandId":params["commandId"],"method":method,"params":params["args"]})) {
                             Ok(command) => command,
@@ -2541,6 +2546,29 @@ mod tests {
                 .unwrap_err(),
                 protocol::CAPTAIN_EVENTS_UPDATE_REQUIRED
             );
+        });
+    }
+
+    #[test]
+    fn provider_updates_require_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let fixture =
+                Fixture::with_minor("providers-old", protocol::PROVIDER_UPDATES_MINOR - 1).await;
+            let link = fixture
+                .link(
+                    &crate::store::directory()
+                        .unwrap()
+                        .join("providers-old-reader"),
+                )
+                .await;
+            for method in ["providers.refresh", "providers.update"] {
+                assert_eq!(
+                    crate::client::remote_rpc(&link, method, json!({}))
+                        .await
+                        .unwrap_err(),
+                    protocol::PROVIDER_UPDATES_UPDATE_REQUIRED
+                );
+            }
         });
     }
 

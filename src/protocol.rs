@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 35;
+pub const MINOR: u32 = 36;
+pub const PROVIDER_UPDATES_MINOR: u32 = 36;
+pub const PROVIDER_UPDATES: &str = "provider-updates-v1";
+pub const PROVIDER_UPDATES_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to update providers.";
 pub const CAPTAIN_EVENTS_MINOR: u32 = 35;
 pub const CAPTAIN_EVENTS: &str = "captain-events-v1";
 pub const CAPTAIN_EVENTS_UPDATE_REQUIRED: &str =
@@ -258,7 +262,10 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.promote.preview"
         | "captain.lifecycle.preview" => "read",
         "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
-        "server.updateStatus" | "server.requestUpdate" => "update",
+        "server.updateStatus"
+        | "server.requestUpdate"
+        | "providers.refresh"
+        | "providers.update" => "update",
         "devices.list"
         | "peer.link"
         | "peer.list"
@@ -682,6 +689,8 @@ mod tests {
             "devices.revokeGrant",
             "server.updateStatus",
             "server.requestUpdate",
+            "providers.refresh",
+            "providers.update",
             "command.get",
             "peer.link",
             "peer.list",
@@ -749,7 +758,10 @@ mod tests {
                 | "captain.promote.preview"
                 | "captain.lifecycle.preview" => "read",
                 "request.respond" | "captain.report.answer" => "approve",
-                "server.updateStatus" | "server.requestUpdate" => "update",
+                "server.updateStatus"
+                | "server.requestUpdate"
+                | "providers.refresh"
+                | "providers.update" => "update",
                 "devices.list"
                 | "peer.link"
                 | "peer.list"

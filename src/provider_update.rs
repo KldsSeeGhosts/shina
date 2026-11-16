@@ -86,12 +86,6 @@ pub struct UpdateRecord {
     pub output: Option<String>,
 }
 
-impl UpdateRecord {
-    fn finished(&self) -> bool {
-        matches!(self.status.as_str(), "succeeded" | "unchanged" | "failed")
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
@@ -167,7 +161,7 @@ pub trait Prober: Send + Sync {
 }
 
 /// The running update command. `poll()` owns it; it never blocks the caller.
-trait RunningUpdate: Send {
+pub(crate) trait RunningUpdate: Send {
     /// Latest meaningful output line, sampled by `poll`.
     fn progress(&mut self) -> Option<String>;
     /// Finished result, or None while still running.
@@ -182,7 +176,7 @@ pub struct CommandResult {
     pub stderr_tail: String,
 }
 
-trait Runner: Send + Sync {
+pub(crate) trait Runner: Send + Sync {
     fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String>;
 }
 
@@ -536,6 +530,39 @@ fn slash_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+fn receive_worker<T>(receiver: &mpsc::Receiver<T>) -> Result<Option<T>, ()> {
+    match receiver.try_recv() {
+        Ok(value) => Ok(Some(value)),
+        Err(mpsc::TryRecvError::Empty) => Ok(None),
+        Err(mpsc::TryRecvError::Disconnected) => Err(()),
+    }
+}
+
+fn same_updated_install(strategy: &Strategy, previous_real: &Path, fresh: &Detected) -> bool {
+    if fresh.strategy.as_ref() != Some(strategy) {
+        return false;
+    }
+    let Some(real) = &fresh.real else {
+        return false;
+    };
+    match strategy {
+        Strategy::NpmGlobal { .. } => real == previous_real,
+        // Reproof already checked this brew's prefix and the same formula/cask.
+        // Its canonical executable is expected to move to the new version's keg.
+        Strategy::Homebrew { .. } => true,
+        Strategy::ClaudeNative { .. } => {
+            let root = |path: &Path| {
+                slash_path(path)
+                    .split_once("/.local/share/claude/versions/")
+                    .map(|(root, _)| root.to_owned())
+            };
+            root(previous_real)
+                .zip(root(real))
+                .is_some_and(|(old, new)| old == new)
+        }
+    }
+}
+
 /// Case-folded form for pattern matching only. Never build a path from it:
 /// case-sensitive installs would point at the wrong location.
 fn match_key(text: &str) -> String {
@@ -736,8 +763,28 @@ fn find_tool(name: &str, overrides: Option<&Overrides>) -> Option<Vec<String>> {
 /// `brew --prefix` proofs, so it only ever runs on a background thread or in
 /// tests, never inside `poll()` on the reducer thread.
 fn detect(driver: Driver, prober: &dyn Prober, overrides: Option<&Overrides>) -> Detected {
-    if std::env::var_os(driver.env_override()).is_some() {
+    if let Some(command) = std::env::var_os(driver.env_override()) {
+        let launch = overrides
+            .is_none()
+            .then(|| crate::harness::executable(&command.to_string_lossy()).ok())
+            .flatten();
+        let resolved = launch
+            .as_ref()
+            .map(|(exe, script)| script.as_ref().unwrap_or(exe).clone());
+        let real = resolved.as_ref().and_then(|path| path.canonicalize().ok());
+        let script_prefix = launch.and_then(|(exe, script)| {
+            script.map(|script| {
+                vec![
+                    exe.to_string_lossy().into_owned(),
+                    script.to_string_lossy().into_owned(),
+                ]
+            })
+        });
         return Detected {
+            installed: resolved.is_some(),
+            resolved,
+            real,
+            script_prefix,
             disabled_reason: Some(format!(
                 "Set by {}. Update it where it was installed.",
                 driver.env_override()
@@ -1089,6 +1136,7 @@ impl ProviderUpdates {
     }
 
     /// Wire the root's gate hooks (contract 4.6).
+    #[cfg(test)]
     pub fn set_hooks(&mut self, hooks: Hooks) {
         self.hooks = hooks;
     }
@@ -1176,7 +1224,7 @@ impl ProviderUpdates {
                                 output: if with_output { r.output.clone() } else { None },
                             })
                     });
-                match detection {
+                let mut status = match detection {
                     Some(outcome) => {
                         let detected = &outcome.detected;
                         let advisory = match (&outcome.version, &outcome.latest) {
@@ -1227,7 +1275,12 @@ impl ProviderUpdates {
                         checked_at: None,
                         update: record,
                     },
+                };
+                if let Some(failure) = &self.failure {
+                    status.strategy = None;
+                    status.disabled_reason = Some(failure.clone());
                 }
+                status
             })
             .collect()
     }
@@ -1478,12 +1531,14 @@ impl ProviderUpdates {
             }
             Phase::Reproving => {
                 let done = if let Some(Job::Reprove(rx)) = self.jobs.get(&driver) {
-                    rx.try_recv().ok()
+                    receive_worker(rx)
                 } else {
-                    None
+                    Err(())
                 };
-                let Some(fresh) = done else {
-                    return false;
+                let fresh = match done {
+                    Ok(Some(fresh)) => fresh,
+                    Ok(None) => return false,
+                    Err(()) => return self.worker_stopped(driver),
                 };
                 self.jobs.remove(&driver);
                 // Same strategy and same canonical install, or nothing runs.
@@ -1525,12 +1580,14 @@ impl ProviderUpdates {
             }
             Phase::CheckingLatest => {
                 let done = if let Some(Job::Latest(rx)) = self.jobs.get(&driver) {
-                    rx.try_recv().ok()
+                    receive_worker(rx)
                 } else {
-                    None
+                    Err(())
                 };
-                let Some(done) = done else {
-                    return false;
+                let done = match done {
+                    Ok(Some(done)) => done,
+                    Ok(None) => return false,
+                    Err(()) => return self.worker_stopped(driver),
                 };
                 self.jobs.remove(&driver);
                 self.latest_cache.insert(
@@ -1642,12 +1699,14 @@ impl ProviderUpdates {
             }
             Phase::Verifying => {
                 let done = if let Some(Job::Verify(rx)) = self.jobs.get(&driver) {
-                    rx.try_recv().ok()
+                    receive_worker(rx)
                 } else {
-                    None
+                    Err(())
                 };
-                let Some((fresh, version)) = done else {
-                    return false;
+                let (fresh, version) = match done {
+                    Ok(Some(done)) => done,
+                    Ok(None) => return false,
+                    Err(()) => return self.worker_stopped(driver),
                 };
                 self.jobs.remove(&driver);
                 let lock_key = self.active[&driver].lock_key.clone();
@@ -1656,9 +1715,7 @@ impl ProviderUpdates {
                 let target = self.active[&driver].record.target_version.clone();
                 // The update must have landed in the same owned location it was
                 // proven for; a different path means something else answered.
-                let same = fresh.strategy.as_ref().map(Strategy::lock_key)
-                    == Some(lock_key.clone())
-                    && fresh.real.as_ref() == Some(&real_path);
+                let same = same_updated_install(&strategy, &real_path, &fresh);
                 if !same {
                     self.settle(
                         driver,
@@ -1700,6 +1757,17 @@ impl ProviderUpdates {
                 true
             }
         }
+    }
+
+    fn worker_stopped(&mut self, driver: Driver) -> bool {
+        self.jobs.remove(&driver);
+        self.settle(
+            driver,
+            "failed",
+            "The provider update worker stopped unexpectedly. Refresh and retry explicitly.".into(),
+            None,
+        );
+        true
     }
 
     fn finish_latest_check(&mut self, driver: Driver, latest: Option<String>) {
@@ -1970,7 +2038,13 @@ fn classify_inner(
     });
     if let Some(prefix) = prefix
         && !paths.iter().any(|p| {
-            is_nix(p) || is_mise(p) || is_volta(p) || is_pnpm(p) || is_bun(p) || is_vite_plus(p)
+            is_nix(p)
+                || is_mise(p)
+                || is_volta(p)
+                || is_pnpm(p)
+                || is_bun(p)
+                || is_vite_plus(p)
+                || is_macports(p)
         })
     {
         if let Some(npm) = find_tool("npm", overrides) {

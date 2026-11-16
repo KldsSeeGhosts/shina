@@ -911,7 +911,13 @@ impl State {
             else {
                 continue;
             };
-            if self.threads[child].status.busy() || self.threads[child].phase == "Stopping" {
+            if self.threads[child].status.busy()
+                || self.threads[child].phase == "Stopping"
+                || (self.threads[child].machine == "local"
+                    && self
+                        .provider_update_drivers
+                        .contains(&self.threads[child].harness))
+            {
                 continue;
             }
             self.tasks[index].state = TaskState::Starting;

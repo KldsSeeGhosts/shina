@@ -176,10 +176,14 @@ impl State {
             return;
         }
         let cwd = self.working_directory();
-        self.codex_catalog
-            .refresh("codex", cwd.clone(), self.wake.clone(), force);
-        self.claude_catalog
-            .refresh("claude", cwd, self.wake.clone(), force);
+        if !self.provider_update_drivers.contains("codex") {
+            self.codex_catalog
+                .refresh("codex", cwd.clone(), self.wake.clone(), force);
+        }
+        if !self.provider_update_drivers.contains("claude") {
+            self.claude_catalog
+                .refresh("claude", cwd, self.wake.clone(), force);
+        }
         self.apply_native_catalogs();
     }
 

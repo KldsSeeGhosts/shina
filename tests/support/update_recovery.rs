@@ -217,6 +217,7 @@ fn recover_update_runs_from_the_profile_argument_not_the_environment() {
 }
 
 fn write_journal(profile: &Profile, update_id: &str, phase: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
     let updates = profile.root.join("Shina/updates");
     let backup = profile.root.join("Shina/backups/before-update-test");
     fs::create_dir_all(&backup).unwrap();
@@ -224,7 +225,10 @@ fn write_journal(profile: &Profile, update_id: &str, phase: &str) -> PathBuf {
     fs::write(
         updates.join("update-journal.json"),
         json!({"updateId":update_id,"tag":"v9.9.9","service":"Shina-recovery-fixture",
-            "backup":backup,"at":unix_now(),"phase":phase})
+            "backup":backup,"at":unix_now(),"phase":phase,
+            "previousSha256":format!("{:x}",Sha256::digest(b"previous binary")),
+            "replacementSha256":format!("{:x}",Sha256::digest(b"new binary")),
+            "previousVersion":env!("CARGO_PKG_VERSION")})
         .to_string(),
     )
     .unwrap();
@@ -319,6 +323,61 @@ fn a_replaced_but_held_update_starts_once_and_keeps_its_journal() {
             .join("Shina/updates/update-journal.json")
             .is_file()
     );
+    profile.stop();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_repeated_recovery_keeps_the_restored_binary_and_new_user_data() {
+    let mut profile = Profile::new();
+    fake_manager_bin(&profile);
+    let (app, previous) = write_service_missing_bundle(&profile);
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::write(app.join("Contents/MacOS/shina"), b"previous binary").unwrap();
+    fs::write(previous.join("Contents/MacOS/shina"), b"new binary").unwrap();
+    fs::write(
+        profile.root.join("Shina/notes.json"),
+        b"post-recovery user data",
+    )
+    .unwrap();
+    write_watch(&profile, "watch-repeat", unix_now());
+    write_journal(&profile, "watch-repeat", "Restored");
+    let output = recover(&profile, "watch-repeat");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
+    assert_eq!(
+        fs::read(app.join("Contents/MacOS/shina")).unwrap(),
+        b"previous binary"
+    );
+    assert_eq!(
+        fs::read(profile.root.join("Shina/notes.json")).unwrap(),
+        b"post-recovery user data"
+    );
+    let outcome: Value =
+        serde_json::from_slice(&fs::read(profile.root.join("Shina/updates/outcome.json")).unwrap())
+            .unwrap();
+    assert_eq!(outcome["updateId"], "watch-repeat");
+    assert_eq!(outcome["success"], false);
+    profile.stop();
+}
+
+#[test]
+fn a_corrupt_journal_or_a_hold_without_a_journal_never_guesses_a_backup() {
+    let mut profile = Profile::new();
+    fake_manager_bin(&profile);
+    write_service(&profile);
+    write_watch(&profile, "watch-corrupt", unix_now());
+    fs::write(profile.root.join("Shina/update-validation"), b"hold").unwrap();
+    let journal = profile.root.join("Shina/updates/update-journal.json");
+    fs::write(&journal, b"{broken").unwrap();
+    let output = recover(&profile, "watch-corrupt");
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&journal).unwrap(), b"{broken");
+    fs::remove_file(&journal).unwrap();
+    let output = recover(&profile, "watch-corrupt");
+    assert!(!output.status.success());
+    assert!(profile.root.join("Shina/update-validation").exists());
+    assert!(!profile.root.join("calls.log").exists());
     profile.stop();
 }
 

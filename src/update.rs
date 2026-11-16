@@ -1509,7 +1509,7 @@ fn watch_helper_path(directory: &Path) -> PathBuf {
 /// so a rejected job never leaves a record that recover-update would act on. No service
 /// installed means no watch and no error.
 pub fn register_update_watch(directory: &Path, update_id: &str, tag: &str) -> Result<(), String> {
-    let Some(service) = crate::service::Service::load()? else {
+    let Some(service) = crate::service::Service::load_from(directory)? else {
         return Ok(());
     };
     fs::create_dir_all(directory.join("updates")).map_err(|e| e.to_string())?;
@@ -1541,23 +1541,25 @@ pub fn register_update_watch(directory: &Path, update_id: &str, tag: &str) -> Re
     Ok(())
 }
 
-/// Removes the watch job and its record for `service`. A missing job or record is not
-/// an error; a failed job removal keeps the record so a later pass can retry.
+/// Disarms the watch before removing its job. Booting out a LaunchAgent can
+/// terminate the process calling this function.
 pub fn unregister_update_watch_for(
     service: &crate::service::Service,
     directory: &Path,
 ) -> Result<(), String> {
-    service.unregister_update_watch()?;
     match fs::remove_file(watch_path(directory)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
-    }
+    }?;
+    // launchctl bootout may terminate this very recovery process. Remove its
+    // authority record first, so successful cleanup cannot leave it armed.
+    service.unregister_update_watch()
 }
 
 /// Removes the watch job and its record, resolving the installed service itself.
 pub fn unregister_update_watch(directory: &Path) -> Result<(), String> {
-    if let Some(service) = crate::service::Service::load()? {
+    if let Some(service) = crate::service::Service::load_from(directory)? {
         unregister_update_watch_for(&service, directory)?;
     } else {
         match fs::remove_file(watch_path(directory)) {
@@ -1576,39 +1578,36 @@ pub fn unregister_update_watch(directory: &Path) -> Result<(), String> {
 /// the interrupted update's recovery intent.
 pub fn disarm_update_watch(directory: &Path) {
     let _ = fs::remove_file(watch_path(directory));
-    clear_journal(directory);
+    // An explicit stop cancels automatic starts, not the matched rollback evidence.
+    if !directory.join("update-validation").exists() {
+        clear_journal(directory);
+    }
     let _ = unregister_update_watch(directory);
 }
 
-/// The installed executable is missing (a swap was interrupted after the old binary
-/// moved out). Restore the known-working previous copy so the service can start at
-/// all; returns true when an executable is present afterwards. State is untouched:
-/// the pre-update backup stays reserved for the validation rollback that owns it.
-pub fn restore_missing_install(service: &crate::service::Service) -> Result<bool, String> {
-    if service.executable.is_file() {
-        return Ok(true);
-    }
-    let target = service_target(service)?;
-    restore_previous_target(&target, &service.executable)?;
-    Ok(service.executable.is_file()
-        || matches!(target, InstalledTarget::MacBundle { ref app } if app.exists()))
-}
-
-/// A registered watch whose helper lock is free is stale once a service comes up: the
-/// server is back, so the watch's only remaining job is to go away. Called by the
-/// service launcher before it spawns the server.
+/// After readiness, a matching outcome and free helper lock allow watch cleanup.
+/// A ready server alone cannot disarm an update registered before its handoff.
 pub fn remove_stale_update_watch(directory: &Path) {
-    if update_watch(directory).is_none() {
+    let Some(watch) = update_watch(directory) else {
         return;
-    }
+    };
     // A surviving journal means the update still owes validation or rollback: a
     // server holding the profile in the dispatch hold is not proof the update
     // finished, so the watch stays.
-    if update_journal(directory).is_some() {
+    if !matches!(read_update_journal(directory), Ok(None)) {
+        return;
+    }
+    if !crate::fleet_update::read_outcome(directory)
+        .is_some_and(|outcome| outcome.update_id == watch.update_id)
+    {
         return;
     }
     match install::InstallLock::try_acquire(&directory.join("updates")) {
         Ok(Some(_lock)) => {
+            if !update_watch(directory).is_some_and(|current| current.update_id == watch.update_id)
+            {
+                return;
+            }
             let _ = unregister_update_watch(directory);
         }
         // Lock held: a live helper still owns the handoff. Lock unreadable: leave the
@@ -1635,6 +1634,9 @@ pub struct UpdateJournal {
     /// The pre-update backup `restore_backup` replays. Restoring the old binary
     /// requires this state: a touched schema must never meet the old build.
     pub backup: PathBuf,
+    pub previous_sha256: String,
+    pub replacement_sha256: String,
+    pub previous_version: String,
     /// Unix seconds when the journal was written; informational.
     pub at: u64,
     pub phase: JournalPhase,
@@ -1646,6 +1648,8 @@ pub enum JournalPhase {
     Replaced,
     /// Start or validation failed; rollback to the backup is in flight.
     RollingBack,
+    /// Both the previous executable and its database have been restored.
+    Restored,
 }
 
 fn journal_path(directory: &Path) -> PathBuf {
@@ -1654,7 +1658,17 @@ fn journal_path(directory: &Path) -> PathBuf {
 
 /// The interrupted update's journal, if one survived. A corrupt file counts as none.
 pub fn update_journal(directory: &Path) -> Option<UpdateJournal> {
-    serde_json::from_slice(&fs::read(journal_path(directory)).ok()?).ok()
+    read_update_journal(directory).ok().flatten()
+}
+
+pub fn read_update_journal(directory: &Path) -> Result<Option<UpdateJournal>, String> {
+    match fs::read(journal_path(directory)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            "The update recovery journal is malformed. Recovery remains fenced.".into()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn save_journal(directory: &Path, journal: &UpdateJournal) -> Result<(), String> {
@@ -1680,30 +1694,9 @@ fn journal_for<'a>(
 ) -> Option<&'a UpdateJournal> {
     journal.as_ref().filter(|journal| {
         journal.update_id == watch.update_id
-            && journal.service.as_deref().unwrap_or(service.name.as_str()) == service.name
+            && journal.service.as_deref() == Some(service.name.as_str())
+            && journal.tag == watch.tag
     })
-}
-
-/// The newest `backups/before-update-*` directory, the fallback when the journal is
-/// corrupt but a hold proves a backup was taken.
-fn latest_backup(directory: &Path) -> Option<PathBuf> {
-    let backups = directory.join("backups");
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for entry in fs::read_dir(&backups).ok()?.flatten() {
-        let path = entry.path();
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("before-update-")
-        {
-            continue;
-        }
-        let modified = entry.metadata().and_then(|m| m.modified()).ok()?;
-        if best.as_ref().is_none_or(|(time, _)| modified > *time) {
-            best = Some((modified, path));
-        }
-    }
-    best.map(|(_, path)| path)
 }
 
 fn service_target(service: &crate::service::Service) -> Result<InstalledTarget, String> {
@@ -1726,31 +1719,55 @@ fn service_target(service: &crate::service::Service) -> Result<InstalledTarget, 
 }
 
 /// Whether the backup copy a swap leaves behind exists.
-fn previous_copy_exists(target: &InstalledTarget) -> bool {
+fn previous_executable(target: &InstalledTarget) -> PathBuf {
     match target {
-        InstalledTarget::Windows { exe } => exe
-            .parent()
-            .is_some_and(|dir| dir.join("shina.old.exe").is_file()),
+        InstalledTarget::Windows { exe } => exe.parent().unwrap().join("shina.old.exe"),
         InstalledTarget::MacBundle { app } => app
             .parent()
-            .is_some_and(|dir| dir.join("Shina-app.previous").is_dir()),
-        InstalledTarget::Linux { exe } => exe.with_file_name("shina.previous").is_file(),
+            .unwrap()
+            .join("Shina-app.previous/Contents/MacOS/shina"),
+        InstalledTarget::Linux { exe } => exe.with_file_name("shina.previous"),
     }
 }
 
-/// Puts the previous binary back when the swap actually ran (a previous copy exists)
-/// or the installed path is missing. When neither holds, the installed binary was
-/// never swapped and already matches state, so nothing is restored.
-fn restore_service_binary(service: &crate::service::Service) -> Result<(), String> {
-    let target = service_target(service)?;
-    let present = match &target {
-        InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => exe.is_file(),
-        InstalledTarget::MacBundle { app } => app.exists(),
-    };
-    if present && !previous_copy_exists(&target) {
+pub fn recovery_install_is_previous(
+    service: &crate::service::Service,
+    journal: &UpdateJournal,
+) -> Result<bool, String> {
+    if !service.executable.exists() {
+        return Ok(false);
+    }
+    let digest = file_sha256(&service.executable)?;
+    if digest == journal.previous_sha256 {
+        return Ok(true);
+    }
+    if digest != journal.replacement_sha256 {
+        return Err(
+            "The Shina installation changed after this update. Recovery will not replace it."
+                .into(),
+        );
+    }
+    Ok(false)
+}
+
+/// Hashes prevent a repeated rollback from exchanging the previous bundle back out,
+/// and prevent an older update's leftover backup from becoming the rollback target.
+fn restore_service_binary(
+    service: &crate::service::Service,
+    journal: &UpdateJournal,
+) -> Result<(), String> {
+    if recovery_install_is_previous(service, journal)? {
         return Ok(());
     }
-    restore_previous_target(&target, &service.executable)
+    let target = service_target(service)?;
+    if file_sha256(&previous_executable(&target))? != journal.previous_sha256 {
+        return Err("The previous executable does not match this update's database backup.".into());
+    }
+    restore_previous_target(&target, &service.executable)?;
+    if !recovery_install_is_previous(service, journal)? {
+        return Err("The restored executable could not be verified.".into());
+    }
+    Ok(())
 }
 
 /// Stops a held server if one owns the profile, restores the previous binary when the
@@ -1764,8 +1781,22 @@ fn restore_service_binary(service: &crate::service::Service) -> Result<(), Strin
 pub fn restore_interrupted_update(
     service: &crate::service::Service,
     directory: &Path,
-    backup: Option<&Path>,
+    journal: &mut UpdateJournal,
 ) -> Result<(), String> {
+    let backup_root = directory
+        .join("backups")
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let backup = journal.backup.canonicalize().map_err(|e| e.to_string())?;
+    if backup == backup_root || !backup.starts_with(&backup_root) {
+        return Err("This update's backup is outside its profile.".into());
+    }
+    recovery_install_is_previous(service, journal)?;
+    let restored = journal.phase == JournalPhase::Restored;
+    if !restored {
+        journal.phase = JournalPhase::RollingBack;
+        save_journal(directory, journal)?;
+    }
     if crate::server_lock::Owner::acquire(directory).is_err() {
         // A live server still owns state, probably in the dispatch hold. Stop it
         // through RPC so shutdown hooks run, then wait for ownership to release.
@@ -1790,15 +1821,19 @@ pub fn restore_interrupted_update(
     service.stop()?;
     {
         let _owner = crate::server_lock::Owner::acquire(directory)?;
-        restore_service_binary(service)?;
-        match backup {
-            Some(backup) => crate::maintenance::restore_backup(directory, backup)?,
-            None if directory.join("update-validation").exists() => {
-                return Err("The update journal and its backup are missing; cannot prove the database matches the restored build.".into());
-            }
-            None => {}
+        restore_service_binary(service, journal)?;
+        if !restored {
+            crate::maintenance::restore_backup(directory, &backup)?;
+            journal.phase = JournalPhase::Restored;
+            save_journal(directory, journal)?;
         }
-        let _ = fs::remove_file(directory.join("update-validation"));
+        record_recovered_outcome(directory, &journal.update_id, &journal.tag, false,
+            Some("The update helper stopped before validation. The previous executable and its matching state were restored.".into()))?;
+        match fs::remove_file(directory.join("update-validation")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
     }
     clear_journal(directory);
     Ok(())
@@ -1823,24 +1858,55 @@ pub fn reconcile_held_service(
     directory: &Path,
     watch: &UpdateWatch,
 ) -> Result<HeldRecovery, String> {
-    let journal = journal_for(&update_journal(directory), watch, service).cloned();
-    let tag = journal
-        .as_ref()
-        .map(|journal| journal.tag.clone())
-        .unwrap_or_else(|| watch.tag.clone());
-    let backup = journal
-        .as_ref()
-        .map(|journal| journal.backup.clone())
-        .or_else(|| latest_backup(directory));
-    if readiness(directory, &tag).is_ok()
+    let mut journal = journal_for(&read_update_journal(directory)?, watch, service)
+        .cloned()
+        .ok_or("This update's matching recovery journal is missing. Dispatch remains held.")?;
+    recovery_install_is_previous(service, &journal)?;
+    if journal.phase == JournalPhase::Replaced
+        && readiness(directory, &journal.tag).is_ok()
         && crate::maintenance::rpc(directory, "server.validateRestart", serde_json::json!({}))
             .is_ok()
     {
+        record_recovered_outcome(directory, &watch.update_id, &watch.tag, true, None)?;
         clear_journal(directory);
         return Ok(HeldRecovery::Validated);
     }
-    restore_interrupted_update(service, directory, backup.as_deref())?;
+    restore_interrupted_update(service, directory, &mut journal)?;
     Ok(HeldRecovery::RolledBack)
+}
+
+pub fn record_recovered_outcome(
+    directory: &Path,
+    update_id: &str,
+    tag: &str,
+    success: bool,
+    reason: Option<String>,
+) -> Result<(), String> {
+    crate::fleet_update::save_outcome(
+        directory,
+        &crate::fleet_update::Outcome {
+            update_id: update_id.into(),
+            tag: tag.into(),
+            success,
+            reason: reason.clone(),
+        },
+    )?;
+    if let Some(reason) = reason {
+        Storage::at(directory.join("updates")).save_failure(tag, &reason)?;
+    }
+    let request = request_for_recovery(directory)?;
+    if request["updateId"] == update_id {
+        fs::remove_file(directory.join("updates/request.json")).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn request_for_recovery(directory: &Path) -> Result<Value, String> {
+    match fs::read(directory.join("updates/request.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Starts the service on every update-helper exit path that did not complete
@@ -2292,6 +2358,19 @@ impl HelperSteps for CoordinatedUpdate {
                     .map(|watch| watch.service)
                     .or_else(|| self.service.as_ref().map(|service| service.name.clone())),
                 backup: backup.clone(),
+                previous_sha256: file_sha256(&match &self.update.target {
+                    InstalledTarget::MacBundle { app } => app.join("Contents/MacOS/shina"),
+                    InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => {
+                        exe.clone()
+                    }
+                })?,
+                replacement_sha256: file_sha256(&match &self.update.target {
+                    InstalledTarget::MacBundle { .. } => {
+                        self.update.prepared.join("Contents/MacOS/shina")
+                    }
+                    _ => self.update.prepared.clone(),
+                })?,
+                previous_version: env!("CARGO_PKG_VERSION").into(),
                 at: unix_now(),
                 phase: JournalPhase::Replaced,
             },
@@ -2358,7 +2437,7 @@ impl HelperSteps for CoordinatedUpdate {
         // RollingBack phase to complete rather than a Replaced one to revalidate.
         if let Some(mut journal) = update_journal(&self.directory) {
             journal.phase = JournalPhase::RollingBack;
-            let _ = save_journal(&self.directory, &journal);
+            save_journal(&self.directory, &journal)?;
         }
         // Validation mode never dispatched routines or mutations. Refuse restoration if
         // a newer process still owns state. Never run the old binary on the new schema.
@@ -4394,6 +4473,16 @@ mod tests {
     fn a_held_install_lock_keeps_a_stale_watch_for_the_live_helper() {
         let directory = crate::store::directory().unwrap().join("watch-locked");
         write_watch(&directory, "id-2", 1_700_000_000);
+        crate::fleet_update::save_outcome(
+            &directory,
+            &crate::fleet_update::Outcome {
+                update_id: "id-2".into(),
+                tag: "v9.9.9".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
         let _lock = install::InstallLock::acquire(&directory.join("updates")).unwrap();
         remove_stale_update_watch(&directory);
         assert!(
@@ -4415,6 +4504,9 @@ mod tests {
                 tag: "v9.9.9".into(),
                 service: Some("Shina-test".into()),
                 backup: backup.clone(),
+                previous_sha256: bytes_sha256(b"previous binary"),
+                replacement_sha256: bytes_sha256(b"new binary"),
+                previous_version: env!("CARGO_PKG_VERSION").into(),
                 at: 1_700_000_000,
                 phase,
             },
@@ -4430,6 +4522,16 @@ mod tests {
             .join("watch-journal-gate");
         write_watch(&directory, "id-3", 1_700_000_000);
         write_journal(&directory, "id-3", JournalPhase::Replaced);
+        crate::fleet_update::save_outcome(
+            &directory,
+            &crate::fleet_update::Outcome {
+                update_id: "id-3".into(),
+                tag: "v9.9.9".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
         // No lock is held here: only the journal keeps the watch from being treated
         // as stale, because a held server still owes validation or rollback.
         remove_stale_update_watch(&directory);
@@ -4462,6 +4564,9 @@ mod tests {
             tag: "v9.9.9".into(),
             service: Some("Shina-test".into()),
             backup: PathBuf::from("/backups/x"),
+            previous_sha256: bytes_sha256(b"previous binary"),
+            replacement_sha256: bytes_sha256(b"new binary"),
+            previous_version: env!("CARGO_PKG_VERSION").into(),
             at: 0,
             phase: JournalPhase::Replaced,
         };
@@ -4471,7 +4576,7 @@ mod tests {
         assert!(journal_for(&Some(journal.clone()), &watch, &service).is_none());
         journal.service = Some("Shina-test".into());
         assert!(journal_for(&Some(journal), &watch, &service).is_some());
-        // A legacy journal without a service name belongs to the loaded service.
+        // A journal without a matching service has no recovery authority.
         let legacy = UpdateJournal {
             service: None,
             ..UpdateJournal {
@@ -4479,11 +4584,67 @@ mod tests {
                 tag: "v9.9.9".into(),
                 service: None,
                 backup: PathBuf::from("/backups/x"),
+                previous_sha256: bytes_sha256(b"previous binary"),
+                replacement_sha256: bytes_sha256(b"new binary"),
+                previous_version: env!("CARGO_PKG_VERSION").into(),
                 at: 0,
                 phase: JournalPhase::Replaced,
             }
         };
-        assert!(journal_for(&Some(legacy), &watch, &service).is_some());
+        assert!(journal_for(&Some(legacy), &watch, &service).is_none());
+    }
+
+    #[test]
+    fn rollback_uses_this_updates_hash_and_is_safe_to_repeat() {
+        let directory = crate::store::directory().unwrap().join("rollback-hashes");
+        fs::create_dir_all(&directory).unwrap();
+        let exe = directory.join("shina.exe");
+        let previous = directory.join("shina.old.exe");
+        fs::write(&exe, b"old").unwrap();
+        fs::write(&previous, b"ancient").unwrap();
+        let service = crate::service::Service {
+            platform: crate::service::Platform::Windows,
+            name: "Shina-test".into(),
+            executable: exe.clone(),
+            directory: directory.clone(),
+            unit: directory.join("unit"),
+            home: directory.clone(),
+            environment: Default::default(),
+        };
+        let journal = UpdateJournal {
+            update_id: "hash-test".into(),
+            tag: "v9.9.9".into(),
+            service: Some(service.name.clone()),
+            backup: directory.join("backups/exact"),
+            previous_sha256: bytes_sha256(b"old"),
+            replacement_sha256: bytes_sha256(b"new"),
+            previous_version: env!("CARGO_PKG_VERSION").into(),
+            at: 0,
+            phase: JournalPhase::RollingBack,
+        };
+        // A journal written before the swap must not restore a previous release's backup.
+        restore_service_binary(&service, &journal).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        fs::write(&exe, b"new").unwrap();
+        assert!(restore_service_binary(&service, &journal).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        fs::write(&previous, b"old").unwrap();
+        restore_service_binary(&service, &journal).unwrap();
+        restore_service_binary(&service, &journal).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        fs::write(&exe, b"unrelated installation").unwrap();
+        assert!(restore_service_binary(&service, &journal).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"unrelated installation");
+    }
+
+    #[test]
+    fn a_ready_server_without_an_outcome_cannot_disarm_a_newly_registered_update() {
+        let directory = crate::store::directory()
+            .unwrap()
+            .join("watch-before-handoff");
+        write_watch(&directory, "new-attempt", 1_700_000_000);
+        remove_stale_update_watch(&directory);
+        assert!(update_watch(&directory).is_some());
     }
 
     #[test]

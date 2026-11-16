@@ -1378,6 +1378,10 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
             }),
             ("update-machines", |state| {state.populate_demo();state.demo_fleet();}),
             ("update-machines-dark", |state| {state.populate_demo();state.dark=true;state.demo_fleet();}),
+            ("update-everything-dialog", |state| {state.populate_demo();state.demo_update_scene("update-everything-dialog");}),
+            ("update-capsule-running", |state| {state.populate_demo();state.demo_update_scene("update-capsule-running");}),
+            ("update-capsule-failed", |state| {state.populate_demo();state.demo_update_scene("update-capsule-failed");}),
+            ("provider-update-pill", |state| {state.populate_demo();state.demo_update_scene("provider-update-pill");}),
             ("settings-threads", |state| {
                 state.populate_demo(); state.open_settings(); state.settings.section=1;
             }),

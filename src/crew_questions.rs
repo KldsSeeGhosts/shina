@@ -651,6 +651,12 @@ mod tests {
             std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
             false,
         );
+        // Several states coexist in restore tests. Each needs its own writer;
+        // sharing one profile lets their asynchronous checkpoints overwrite it.
+        state.data_dir = crate::store::directory()
+            .unwrap()
+            .join(format!("crew-question-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state.data_dir).unwrap();
         state.load_global_for_test();
         state.captains = Captain::presets();
         state.captain_reports.clear();

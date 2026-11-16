@@ -10,6 +10,8 @@ use std::{
     sync::{Mutex, OnceLock},
     time::Duration,
 };
+#[path = "provider_runtime.rs"]
+mod provider_runtime;
 
 /// UI resources are absent in the headless runtime. Only a view dereference builds them.
 pub struct UiResource<T> {
@@ -65,6 +67,8 @@ pub struct RuntimeState {
     last_projection: Value,
     pub maintenance: crate::maintenance::Maintenance,
     pub updates: crate::fleet_update::ServerUpdates,
+    pub providers: crate::provider_update::ProviderUpdates,
+    provider_starts: Vec<provider_runtime::ProviderStart>,
     validation_hold: bool,
     pub database: Option<crate::database::Database>,
     failure: Option<String>,
@@ -96,6 +100,7 @@ impl RuntimeState {
             runtime.last_projection = previous;
         }
         runtime.database = Some(database);
+        runtime.reconcile_provider_intents()?;
         if let Some(outcome) = &runtime.updates.outcome {
             runtime
                 .database
@@ -130,9 +135,17 @@ impl RuntimeState {
         runtime.persist(None, effects)?;
         Ok(runtime)
     }
-    pub fn from_state(state: State) -> Self {
+    pub fn from_state(mut state: State) -> Self {
+        let providers = crate::provider_update::ProviderUpdates::new(&state.data_dir);
+        for driver in ["codex", "claude"] {
+            if !providers.admits(driver) {
+                state.hold_provider(driver);
+            }
+        }
         Self {
             updates: crate::fleet_update::ServerUpdates::new(&state.data_dir),
+            providers,
+            provider_starts: Vec::new(),
             validation_hold: state.data_dir.join("update-validation").exists(),
             seq: state.server_sequence(),
             last_projection: state.projection(),
@@ -257,6 +270,17 @@ impl RuntimeState {
                 &self.maintenance.status(),
             ));
         }
+        if command.method == "providers.refresh" {
+            if !command
+                .params
+                .as_object()
+                .is_some_and(|args| args.is_empty())
+            {
+                return Err("providers.refresh accepts no arguments.".into());
+            }
+            self.providers.refresh(true);
+            return Ok(json!({"providers":self.provider_statuses()}));
+        }
         if let Some(result) = self.maintenance_command(&command) {
             return result;
         }
@@ -315,6 +339,8 @@ impl RuntimeState {
                         "Server is draining for an update. Retry after restart or cancellation."
                             .into(),
                     )
+                } else if self.providers.active() || !self.provider_starts.is_empty() {
+                    Err("A provider is updating. Retry when it finishes.".into())
                 } else if let Some(blocker) = self.state.update_restart_blocker() {
                     Err(blocker.into())
                 } else if !self.updates.capable {
@@ -328,6 +354,8 @@ impl RuntimeState {
                         json!({"updateAccepted":true,"updateId":uuid::Uuid::new_v4(),"requestedAt":now}),
                     )
                 }
+            } else if command.method == "providers.update" {
+                self.validate_provider_update(&command.params)
             } else if command.method == "notifications.push.register" {
                 database.stage_push_registration(device, &command.params)
             } else if command.method == "notifications.push.unregister" {
@@ -359,6 +387,9 @@ impl RuntimeState {
             }
             self.state.record_command(receipt.clone(), None);
             self.persist(Some(&receipt), capture.finish())?;
+            if command.method == "providers.update" && receipt.result["updateAccepted"] == true {
+                self.start_provider_update(&receipt.result);
+            }
             if command.method == "server.requestUpdate" && receipt.result["updateAccepted"] == true
             {
                 self.updates.start(
@@ -392,7 +423,12 @@ impl RuntimeState {
         self.state
             .record_command(receipt.clone(), Some(command.clone()));
         self.state.checkpoint_and_flush()?;
-        match self.state.execute_command(&command) {
+        let result = if command.method == "providers.update" {
+            self.validate_provider_update(&command.params)
+        } else {
+            self.state.execute_command(&command)
+        };
+        match result {
             Ok(result) => {
                 receipt.status = ReceiptStatus::Accepted;
                 receipt.result = result;
@@ -404,6 +440,9 @@ impl RuntimeState {
         }
         self.state.record_command(receipt.clone(), None);
         self.state.checkpoint_and_flush()?;
+        if command.method == "providers.update" && receipt.result["updateAccepted"] == true {
+            self.start_provider_update(&receipt.result);
+        }
         self.last_projection = self.state.projection();
         serde_json::to_value(receipt).map_err(|e| e.to_string())
     }
@@ -427,7 +466,19 @@ impl RuntimeState {
             // Only the previous committed state may cause a remote effect.
             self.state.dispatch_peer_work();
         }
-        let update_changed = self.updates.poll(&self.state.data_dir) | prepared_changed;
+        let provider_changed = if self.failure().is_none() {
+            match self.poll_provider_updates() {
+                Ok(changed) => changed,
+                Err(error) => {
+                    self.failure = Some(error);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let update_changed =
+            self.updates.poll(&self.state.data_dir) | prepared_changed | provider_changed;
         if update_changed && let Err(error) = self.record_update() {
             self.failure = Some(error);
         }
@@ -488,11 +539,13 @@ impl RuntimeState {
                 || before != self.maintenance.status();
         }
         let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
-            | self.state.collect_recovered_inputs();
+            | self.state.collect_recovered_inputs()
+            | provider_changed;
         if !changed {
             return prepared_changed || before != self.maintenance.status();
         }
-        let projection = self.state.projection();
+        let mut projection = self.state.projection();
+        projection["providers"] = self.provider_statuses();
         if projection == self.last_projection {
             return prepared_changed || before != self.maintenance.status();
         }
@@ -511,6 +564,7 @@ impl RuntimeState {
             .updates
             .status(self.state.update_restart_blocker(), &maintenance);
         state["updateNotice"] = json!(self.updates.outcome);
+        state["providers"] = self.provider_statuses();
         value["state"] = state;
         value
     }
@@ -660,6 +714,7 @@ impl RuntimeState {
                     &self.maintenance.status(),
                 );
                 projection["updateNotice"] = json!(self.updates.outcome);
+                projection["providers"] = self.provider_statuses();
             }
             let previous_threads = if projection["_partial"] == true {
                 json!(
@@ -2166,7 +2221,11 @@ mod tests {
         crate::outbox::send(&sender, json!({"type":"prompt", "id":"paused"})).unwrap();
         rt.persist(None, capture.finish()).unwrap();
         assert!(receiver.try_recv().is_err());
-        assert!(!rt.tick());
+        // Metadata discovery can publish during the drain. It must not dispatch
+        // the committed prompt or change the maintenance fence.
+        let before = rt.maintenance.status()["phase"].clone();
+        rt.tick();
+        assert_eq!(rt.maintenance.status()["phase"], before);
         assert!(receiver.try_recv().is_err());
         rt.command("maintainer", Command::new("server.cancelRestart", prepared))
             .unwrap();

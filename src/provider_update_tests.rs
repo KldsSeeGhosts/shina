@@ -1285,3 +1285,132 @@ fn captured_output_is_secret_redacted() {
         record.message
     );
 }
+
+#[cfg(unix)]
+fn version_directory_update(driver: Driver) {
+    let fixture = testkit::Fixture::new();
+    let prefix = fixture.dir.join("MixedCasePrefix");
+    let (old, new) = if driver == Driver::Codex {
+        (
+            fixture.native("MixedCasePrefix/Cellar/codex/2.0.0/bin/codex"),
+            fixture.native("MixedCasePrefix/Cellar/codex/2.1.0/bin/codex"),
+        )
+    } else {
+        (
+            fixture.native("Home/.local/share/claude/versions/2.0.0/claude"),
+            fixture.native("Home/.local/share/claude/versions/2.1.0/claude"),
+        )
+    };
+    fixture.native("MixedCasePrefix/bin/brew");
+    let launcher = fixture.dir.join(format!("launch/{}", driver.id()));
+    std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(old, &launcher).unwrap();
+    let probe_launcher = launcher.clone();
+    let mut prober = prober(move |argv| {
+        let stdout = if argv.last().is_some_and(|arg| arg == "--prefix") {
+            prefix.to_string_lossy().into_owned()
+        } else if argv.iter().any(|arg| arg == "info") {
+            r#"{"formulae":[{"versions":{"stable":"2.1.0"}}]}"#.into()
+        } else if probe_launcher
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .contains("/2.1.0/")
+        {
+            "2.1.0".into()
+        } else {
+            "2.0.0".into()
+        };
+        ProbeResult {
+            exit_code: Some(0),
+            stdout,
+            ..Default::default()
+        }
+    });
+    prober.http = Some("2.1.0".into());
+    struct MoveLauncher {
+        launcher: PathBuf,
+        replacement: String,
+    }
+    impl Runner for MoveLauncher {
+        fn start(&self, _argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            std::fs::remove_file(&self.launcher).unwrap();
+            std::os::unix::fs::symlink(&self.replacement, &self.launcher).unwrap();
+            testkit::FakeRunner::script(vec![ok_update()]).start(_argv)
+        }
+    }
+    let mut service = testkit::service(
+        &fixture.dir,
+        HashMap::from([(driver, vec![launcher.to_string_lossy().into_owned()])]),
+        prober,
+        MoveLauncher {
+            launcher,
+            replacement: new,
+        },
+    );
+    detected(&mut service);
+    service
+        .request(driver.id(), "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    testkit::settle(&mut service, Duration::from_secs(5));
+    assert_eq!(
+        status(&service, driver.id()).update.unwrap().status,
+        "succeeded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn brew_update_accepts_a_new_version_keg_under_the_same_owned_prefix() {
+    version_directory_update(Driver::Codex);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_claude_update_accepts_a_new_version_under_the_same_installation() {
+    version_directory_update(Driver::Claude);
+}
+
+#[test]
+fn disconnected_probe_workers_fail_instead_of_holding_the_driver_forever() {
+    let fixture = testkit::Fixture::new();
+    for (index, phase) in [Phase::Reproving, Phase::CheckingLatest, Phase::Verifying]
+        .into_iter()
+        .enumerate()
+    {
+        let mut service = npm_service(
+            &fixture,
+            &format!("worker-stopped-{index}"),
+            CommandResult::default(),
+        );
+        detected(&mut service);
+        service
+            .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+            .unwrap();
+        service.active.get_mut(&Driver::Claude).unwrap().phase = phase;
+        let job = match phase {
+            Phase::Reproving => {
+                let (sender, receiver) = mpsc::channel();
+                drop(sender);
+                Job::Reprove(receiver)
+            }
+            Phase::CheckingLatest => {
+                let (sender, receiver) = mpsc::channel();
+                drop(sender);
+                Job::Latest(receiver)
+            }
+            _ => {
+                let (sender, receiver) = mpsc::channel();
+                drop(sender);
+                Job::Verify(receiver)
+            }
+        };
+        service.jobs.insert(Driver::Claude, job);
+        service.poll();
+        assert!(!service.active());
+        let record = status(&service, "claude").update.unwrap();
+        assert_eq!(record.status, "failed");
+        assert!(record.message.contains("worker stopped"));
+        assert!(service.admits("claude"));
+    }
+}

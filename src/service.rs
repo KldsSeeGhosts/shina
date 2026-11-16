@@ -394,7 +394,7 @@ impl Service {
         start_boundary: &str,
     ) -> String {
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><Description>Restarts the Shina service if an update helper did not finish</Description></RegistrationInfo>\n<Triggers><TimeTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>PT45M</Duration></Repetition></TimeTrigger></Triggers>\n<Principals><Principal id=\"User\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><ExecutionTimeLimit>PT10M</ExecutionTimeLimit><Hidden>true</Hidden></Settings>\n<Actions Context=\"User\"><Exec><Command>{}</Command><Arguments>service recover-update \"{}\" --profile \"{}\"</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><Description>Restarts the Shina service if an update helper did not finish</Description></RegistrationInfo>\n<Triggers><TimeTrigger><Repetition><Interval>PT1M</Interval><Duration>PT45M</Duration></Repetition><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\n<Principals><Principal id=\"User\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT10M</ExecutionTimeLimit><Hidden>true</Hidden></Settings>\n<Actions Context=\"User\"><Exec><Command>{}</Command><Arguments>service recover-update \"{}\" --profile \"{}\"</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
             xml(start_boundary),
             xml(self
                 .environment
@@ -436,16 +436,24 @@ impl Service {
                 fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                 let (service, timer) = self.watch_units(helper, update_id, profile);
                 crate::store::write_atomic(
-                    &dir.join("shina-update-watch.service"),
+                    &dir.join(format!("{}.service", self.watch_name())),
                     service.as_bytes(),
                 )
                 .map_err(|e| e.to_string())?;
-                crate::store::write_atomic(&dir.join("shina-update-watch.timer"), timer.as_bytes())
-                    .map_err(|e| e.to_string())?;
+                crate::store::write_atomic(
+                    &dir.join(format!("{}.timer", self.watch_name())),
+                    timer.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
                 self.run("systemctl", &["--user", "daemon-reload"])?;
                 self.run(
                     "systemctl",
-                    &["--user", "enable", "--now", "shina-update-watch.timer"],
+                    &[
+                        "--user",
+                        "enable",
+                        "--now",
+                        &format!("{}.timer", self.watch_name()),
+                    ],
                 )?;
             }
             Platform::Mac => {
@@ -499,9 +507,17 @@ impl Service {
             Platform::Linux => {
                 let _ = self.run(
                     "systemctl",
-                    &["--user", "disable", "--now", "shina-update-watch.timer"],
+                    &[
+                        "--user",
+                        "disable",
+                        "--now",
+                        &format!("{}.timer", self.watch_name()),
+                    ],
                 );
-                for name in ["shina-update-watch.timer", "shina-update-watch.service"] {
+                for name in [
+                    format!("{}.timer", self.watch_name()),
+                    format!("{}.service", self.watch_name()),
+                ] {
                     match fs::remove_file(self.watch_unit_dir().join(name)) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -622,12 +638,18 @@ pub fn recover_update(update_id: &str, profile: Option<&Path>) -> Result<Recover
     let Some(service) = Service::load_from(&directory)? else {
         return Err("No Shina server service is installed.".into());
     };
+    if service
+        .directory
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        != directory.canonicalize().map_err(|e| e.to_string())?
+    {
+        return Ok(RecoverStep::Stale);
+    }
     // Exact identity fence before any side effect: the record's update id must be the
     // invoked id and the record's service must be this service.
     let Some(watch) = crate::update::update_watch(&directory) else {
-        // The record is the source of truth. With none, no update expects protection,
-        // so only the stale job is worth removing.
-        let _ = service.unregister_update_watch();
+        // A job without a record has no authority to start or remove anything.
         return Ok(RecoverStep::Stale);
     };
     if watch.update_id != update_id || watch.service != service.name {
@@ -638,10 +660,23 @@ pub fn recover_update(update_id: &str, profile: Option<&Path>) -> Result<Recover
     let Some(_lock) = crate::install::InstallLock::try_acquire(&directory.join("updates"))? else {
         return Ok(RecoverStep::HelperWorking);
     };
-    let journal = crate::update::update_journal(&directory).filter(|journal| {
-        journal.update_id == update_id
-            && journal.service.as_deref().unwrap_or(service.name.as_str()) == service.name
-    });
+    // Registration and operator stop use this same lock. Recheck after acquiring it.
+    if !crate::update::update_watch(&directory).is_some_and(|current| {
+        current.update_id == watch.update_id
+            && current.service == watch.service
+            && current.registered_at == watch.registered_at
+            && current.tag == watch.tag
+    }) {
+        return Ok(RecoverStep::Stale);
+    }
+    let mut journal = crate::update::read_update_journal(&directory)?;
+    if journal.as_ref().is_some_and(|journal| {
+        journal.update_id != watch.update_id
+            || journal.service.as_deref() != Some(service.name.as_str())
+            || journal.tag != watch.tag
+    }) {
+        return Ok(RecoverStep::Stale);
+    }
     let held = directory.join("update-validation").exists();
     if crate::server_lock::Owner::acquire(&directory).is_err() {
         if held {
@@ -659,6 +694,28 @@ pub fn recover_update(update_id: &str, profile: Option<&Path>) -> Result<Recover
             };
         }
         if service_ready(&directory) {
+            let running = crate::server_auth::Discovery::read(&directory)?.binary_version;
+            let previous = if let Some(journal) = &journal {
+                let previous = crate::update::recovery_install_is_previous(&service, journal)?;
+                if previous && running != journal.previous_version {
+                    return Ok(RecoverStep::NotReady);
+                }
+                previous
+            } else {
+                false
+            };
+            let outcome = crate::fleet_update::read_outcome(&directory);
+            if journal.is_some()
+                || outcome
+                    .as_ref()
+                    .is_none_or(|outcome| outcome.update_id != update_id)
+            {
+                let success = !previous && running == watch.tag.trim_start_matches('v');
+                crate::update::record_recovered_outcome(
+                    &directory, update_id, &watch.tag, success,
+                    (!success).then(|| "The update helper stopped before the target version was validated. The service is running its previous version.".into()),
+                )?;
+            }
             crate::update::clear_journal(&directory);
             crate::update::unregister_update_watch_for(&service, &directory)?;
             return Ok(RecoverStep::Healthy);
@@ -669,14 +726,19 @@ pub fn recover_update(update_id: &str, profile: Option<&Path>) -> Result<Recover
         .duration_since(std::time::UNIX_EPOCH)
         .map(|now| now.as_secs())
         .unwrap_or(0)
-        >= watch.registered_at + crate::update::WATCH_EXPIRY.as_secs();
+        >= watch
+            .registered_at
+            .saturating_add(crate::update::WATCH_EXPIRY.as_secs());
+    if held && journal.is_none() {
+        return Err("The update dispatch hold has no matching recovery journal. The service remains stopped rather than opening an unverified database.".into());
+    }
     if expired {
         // The watch is about to remove itself, so finish any owed rollback first:
         // an unvalidated binary must never be left holding dispatch.
-        if journal.is_some() || held {
-            let backup = journal.as_ref().map(|journal| journal.backup.clone());
-            let _ =
-                crate::update::restore_interrupted_update(&service, &directory, backup.as_deref());
+        if let Some(journal) = &mut journal {
+            crate::update::restore_interrupted_update(&service, &directory, journal)?;
+            // The matching previous build is safe to start even though the update failed.
+            service.start()?;
         }
         if crate::fleet_update::read_outcome(&directory)
             .map(|outcome| outcome.update_id)
@@ -699,24 +761,32 @@ pub fn recover_update(update_id: &str, profile: Option<&Path>) -> Result<Recover
         crate::update::unregister_update_watch_for(&service, &directory)?;
         return Ok(RecoverStep::Expired);
     }
-    if let Some(journal) = &journal {
-        let rollback_in_flight = journal.phase == crate::update::JournalPhase::RollingBack;
+    if let Some(journal) = &mut journal {
+        let previous = crate::update::recovery_install_is_previous(&service, journal)?;
+        let rollback_in_flight = journal.phase != crate::update::JournalPhase::Replaced;
         // A swap interrupted between the old binary moving out and the new one
         // landing leaves no executable to start. In both cases the matched binary
         // and database go back together before any start.
-        if rollback_in_flight || !service.executable.is_file() {
-            crate::update::restore_interrupted_update(&service, &directory, Some(&journal.backup))?;
+        if rollback_in_flight || previous || !service.executable.is_file() {
+            crate::update::restore_interrupted_update(&service, &directory, journal)?;
             service.start()?;
             return Ok(RecoverStep::Started);
         }
         // Replaced and unowned with an executable in place: start it. If the hold
         // marker exists the server holds dispatch until the next tick validates it.
+        if !held {
+            crate::store::write_atomic(
+                &directory.join("update-validation"),
+                b"hold until update recovery validates readiness",
+            )
+            .map_err(|e| e.to_string())?;
+        }
         service.start()?;
         return Ok(RecoverStep::Started);
     }
-    // No journal: no destructive step was ever recorded, so restoring a missing
-    // executable from the previous copy cannot strand mismatched state.
-    crate::update::restore_missing_install(&service)?;
+    if !service.executable.is_file() {
+        return Err("The service executable is missing and no matching update journal can prove a safe rollback.".into());
+    }
     service.start()?;
     Ok(RecoverStep::Started)
 }
@@ -854,8 +924,9 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         // An explicit operator stop overrides a registered update watch; the helper's
         // own internal Service::stop() mid-update does not come through this path.
         "stop" => {
-            crate::update::disarm_update_watch(&service.directory);
+            let _lock = crate::install::InstallLock::acquire(&service.directory.join("updates"))?;
             service.stop()?;
+            crate::update::disarm_update_watch(&service.directory);
         }
         "status" => {
             let state = match service.platform {
@@ -881,9 +952,10 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             );
         }
         "uninstall" => {
+            let _lock = crate::install::InstallLock::acquire(&service.directory.join("updates"))?;
             // A deleted service must not leave a watch job invoking recover-update.
-            crate::update::disarm_update_watch(&service.directory);
             service.stop()?;
+            crate::update::disarm_update_watch(&service.directory);
             match service.platform {
                 Platform::Linux => {
                     service.run(
@@ -1063,6 +1135,145 @@ fn launch_server(service: &Service, log: &fs::File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opt-in native service-manager check. It creates only a uniquely named
+    /// temporary watch, never an installed server service.
+    #[test]
+    #[ignore = "requires SHINA_NATIVE_WATCH_BINARY and a signed-in user service manager"]
+    fn native_update_watch_registers_runs_and_cleans_its_explicit_profile() {
+        let binary = PathBuf::from(
+            std::env::var_os("SHINA_NATIVE_WATCH_BINARY")
+                .expect("set SHINA_NATIVE_WATCH_BINARY to this commit's normal Shina executable"),
+        );
+        assert!(binary.is_file());
+        let root = crate::store::directory().unwrap().join("native-watch");
+        let profile = root.join("Shina");
+        fs::create_dir_all(&profile).unwrap();
+        let name = format!("Shina-native-watch-qa-{}", uuid::Uuid::new_v4());
+        let mut service = Service::current(Some(name)).unwrap();
+        service.directory = profile.clone();
+        service.executable = binary.clone();
+        fs::write(
+            profile.join("service.json"),
+            serde_json::to_vec(&service).unwrap(),
+        )
+        .unwrap();
+        let mut command = Command::new(&binary);
+        command
+            .arg("serve")
+            .env("XDG_DATA_HOME", &root)
+            .env("LOCALAPPDATA", &root)
+            .env("SHINA_PI_CLI", root.join("no-provider"))
+            .env("SHINA_CODEX_CLI", root.join("no-provider"))
+            .env("SHINA_CLAUDE_CLI", root.join("no-provider"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(fs::File::create(root.join("server.log")).unwrap());
+        let child = crate::process::Process::spawn(&mut command).unwrap();
+        struct Cleanup {
+            service: Service,
+            profile: PathBuf,
+            child: crate::process::Process,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = crate::update::unregister_update_watch_for(&self.service, &self.profile);
+                self.child.terminate();
+                let _ = self.child.reap(Duration::from_secs(3));
+            }
+        }
+        let cleanup = Cleanup {
+            service,
+            profile,
+            child,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !service_ready(&cleanup.profile) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "temporary server did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::update::register_update_watch(&cleanup.profile, &id, env!("CARGO_PKG_VERSION"))
+            .unwrap();
+        match cleanup.service.platform {
+            Platform::Mac => {
+                let target = format!(
+                    "{}/{}",
+                    cleanup.service.domain().unwrap(),
+                    cleanup.service.watch_name()
+                );
+                assert!(
+                    cleanup
+                        .service
+                        .run("launchctl", &["print", &target])
+                        .is_ok()
+                );
+                cleanup
+                    .service
+                    .run("launchctl", &["kickstart", &target])
+                    .unwrap();
+            }
+            Platform::Linux => {
+                cleanup
+                    .service
+                    .run(
+                        "systemctl",
+                        &[
+                            "--user",
+                            "is-active",
+                            &format!("{}.timer", cleanup.service.watch_name()),
+                        ],
+                    )
+                    .unwrap();
+                cleanup
+                    .service
+                    .run(
+                        "systemctl",
+                        &[
+                            "--user",
+                            "start",
+                            &format!("{}.service", cleanup.service.watch_name()),
+                        ],
+                    )
+                    .unwrap();
+            }
+            Platform::Windows => {
+                let task = format!("{}-update-watch", cleanup.service.name);
+                cleanup
+                    .service
+                    .run("schtasks.exe", &["/Query", "/TN", &task, "/XML"])
+                    .unwrap();
+                cleanup
+                    .service
+                    .run("schtasks.exe", &["/Run", "/TN", &task])
+                    .unwrap();
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let outcome = crate::fleet_update::read_outcome(&cleanup.profile);
+            if outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.update_id == id && outcome.success)
+                && crate::update::update_watch(&cleanup.profile).is_none()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native watch did not run against its pinned profile"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            service_ready(&cleanup.profile),
+            "watch stopped an already healthy server"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn scheduled_tasks_use_the_current_token_sid_not_environment_account_names() {

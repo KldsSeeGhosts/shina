@@ -436,7 +436,7 @@ fn should_probe(connected: bool, phase: crate::client::ConnectionPhase) -> bool 
 
 /// KSG's `provider-updates-v1` capability, advertised by machines at protocol minor 36.
 /// The matching `protocol::PROVIDER_UPDATES` constant is wired by the protocol owner.
-const PROVIDER_UPDATES: &str = "provider-updates-v1";
+use crate::protocol::PROVIDER_UPDATES;
 
 /// KSG `updateEverything.logic`'s run phases. Provider installs on every machine run
 /// first, servers follow once they settle, and this app installs last behind a countdown.

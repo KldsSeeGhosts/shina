@@ -1324,7 +1324,8 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
-                && (self.captain_lifecycle_receipt(&server, command, value)
+                && (self.fleet_receipt(&server, command, value)
+                    || self.captain_lifecycle_receipt(&server, command, value)
                     || self.captain_policy_receipt(&server, command, value)
                     || self.captain_promotion_receipt(&server, command, value)
                     || self.crew_question_receipt(&server, command, value)
@@ -1529,9 +1530,11 @@ impl State {
                         let (method, params) = match saved {
                             Ok(()) => ("server.clientReady", params),
                             Err(error) => {
-                                self.restart_notice = Some(format!(
+                                let reason = format!(
                                     "Update cancelled because drafts could not save: {error}"
-                                ));
+                                );
+                                self.record_fleet_restart_result(&reason);
+                                self.restart_notice = Some(reason);
                                 ("server.cancelRestart", params)
                             }
                         };
@@ -1544,12 +1547,15 @@ impl State {
                     } else if method == "server.stopping" {
                         self.restart_notice = Some("The local server stopped. Start it with shina service start or shina serve.".into());
                     } else {
-                        self.restart_notice =
-                            Some("Update drain cancelled. Normal operation resumed.".into());
+                        let reason = "Update drain cancelled. Normal operation resumed.";
+                        self.record_fleet_restart_result(reason);
+                        self.restart_notice = Some(reason.into());
                     }
                 }
                 crate::client::Event::Rpc { tag, result } => {
-                    if let Some(req_id) = tag
+                    if self.fleet_rpc(&server, &tag, &result) {
+                        // Machine-pinned provider refresh belongs to the update flow.
+                    } else if let Some(req_id) = tag
                         .strip_prefix("find:")
                         .and_then(|s| s.parse::<u64>().ok())
                         && server == self.thread_find.server
@@ -1830,8 +1836,12 @@ impl State {
         changed |= self.poll_fleet();
         if self.restart_for_update {
             self.restart_for_update = false;
-            if let Err(error) = self.prepared_exit(true, None) {
-                self.restart_notice = Some(error);
+            let mut reason = String::new();
+            if let Err(error) = self.prepared_exit(true, Some(&mut reason)) {
+                let reason = if reason.is_empty() { error } else { reason };
+                self.record_fleet_restart_result(&reason);
+                self.restart_notice = Some(reason);
+                changed = true;
             }
         }
         if let Some(wait) = self.updater.remaining(Instant::now()) {

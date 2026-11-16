@@ -596,6 +596,8 @@ impl Profile {
             .env("XDG_DATA_HOME", &self.root)
             .env("PI_CODING_AGENT_DIR", self.root.join("enrollment"))
             .env("SHINA_PI_CLI", self.root.join("fake_pi.js"))
+            .env("SHINA_CODEX_CLI", self.root.join("no-real-codex"))
+            .env("SHINA_CLAUDE_CLI", self.root.join("no-real-claude"))
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -668,6 +670,8 @@ impl Profile {
             .env("XDG_DATA_HOME", &self.root)
             .env("PI_CODING_AGENT_DIR", self.root.join("enrollment"))
             .env("SHINA_PI_CLI", self.root.join("fake_pi.js"))
+            .env("SHINA_CODEX_CLI", self.root.join("no-real-codex"))
+            .env("SHINA_CLAUDE_CLI", self.root.join("no-real-claude"))
             .current_dir(&self.root)
             .stdin(Stdio::null());
         #[cfg(windows)]

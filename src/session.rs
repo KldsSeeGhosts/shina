@@ -261,6 +261,16 @@ pub struct NativeCatalog {
 }
 
 impl NativeCatalog {
+    pub(crate) fn stop_for_update(&mut self) -> Option<crate::backend::ShutdownFence> {
+        let fence = self.pi.take().map(|pi| pi.stop_fence());
+        self.started = None;
+        // The first post-update read must discover the new executable's metadata.
+        self.attempted = false;
+        self.loaded = None;
+        self.last_attempt = None;
+        fence
+    }
+
     pub fn snapshot(&self) -> Value {
         serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
             "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading(),
