@@ -383,6 +383,15 @@ impl ServerUpdates {
     }
 }
 
+/// The first release whose update helper leaves the service's process group, control group
+/// or task tree. Older targets start the helper inside the service, so the service manager
+/// kills it as soon as the server stops for the restart. The update never installs and the
+/// service stays stopped, because it exited cleanly. Those targets must be updated from a
+/// shell on the machine, outside the service.
+const DETACHED_HELPER_SINCE: &str = "0.12.28";
+const OLD_HELPER_SKIP: &str =
+    "its updater would stop with its service. Run shina update --yes on that machine";
+
 /// Ported from KSG Code's updateEverything.logic collectServerUpdateTargets.
 pub fn skip_reason(online: bool, hello: &Value, status: &Value, target: &str) -> Option<String> {
     if !online {
@@ -399,6 +408,12 @@ pub fn skip_reason(online: bool, hello: &Value, status: &Value, target: &str) ->
     }
     if status["canSelfUpdate"] != true {
         return Some("cannot self-update".into());
+    }
+    if crate::update::is_newer(
+        DETACHED_HELPER_SINCE,
+        status["runningVersion"].as_str().unwrap_or(""),
+    ) {
+        return Some(OLD_HELPER_SKIP.into());
     }
     if let Some(blocker) = status["blocker"].as_str() {
         return Some(format!("busy: {blocker}"));
@@ -661,10 +676,12 @@ impl crate::model::State {
                                 .unwrap_or("Update refused.")
                                 .into(),
                         };
+                        // The link was not offline, the probe reached the network and failed.
+                        // The reason says how, for example a stopped server.
                         row.state = if requested {
                             format!("failed: {reason}")
                         } else {
-                            format!("skipped: offline, {reason}")
+                            format!("skipped: {reason}")
                         };
                         row.failed = requested;
                     }
@@ -1457,6 +1474,58 @@ mod tests {
         assert!(should_probe(false, Error));
         assert!(should_probe(false, Reconnecting));
         assert!(!should_probe(false, Offline));
+    }
+    #[test]
+    fn a_target_whose_helper_dies_with_its_service_is_never_asked_to_update() {
+        // 0.12.19 services killed their own update helper when the server stopped, which
+        // left serverseesghosts, kidsseemac and kidsseembp stopped on the old release.
+        let hello = json!({"protocolMinor":35,"canUpdate":true});
+        let status = |version: &str| json!({"runningVersion":version,"canSelfUpdate":true,"state":"idle","blocker":null});
+        assert_eq!(
+            skip_reason(true, &hello, &status("0.12.19"), "v0.12.28").as_deref(),
+            Some(OLD_HELPER_SKIP)
+        );
+        assert_eq!(
+            skip_reason(true, &hello, &status("0.12.28"), "v0.12.29"),
+            None
+        );
+        assert_eq!(
+            skip_reason(true, &hello, &status("0.12.19"), "v0.12.19"),
+            None,
+            "an up-to-date row is not a skip"
+        );
+    }
+    #[test]
+    fn a_failed_probe_reports_its_reason_instead_of_calling_the_machine_offline() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (send, receive) = mpsc::channel();
+        state.fleet = Fleet {
+            open: true,
+            events: Some(receive),
+            sender: Some(send.clone()),
+            ..Default::default()
+        };
+        for name in ["Local", "studio"] {
+            state.fleet.rows.push(Row {
+                server: name.into(),
+                name: name.into(),
+                current: "0.12.19".into(),
+                target: "0.12.28".into(),
+                state: "checking".into(),
+                eligible: false,
+                failed: false,
+                update_id: None,
+                prior_outcome: None,
+                attempted: false,
+                link: None,
+            });
+        }
+        let reason = "Shina server is not running there. The machine refused the connection.";
+        send.send((1, Err(reason.into()), false)).unwrap();
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[1].state, format!("skipped: {reason}"));
+        assert!(!state.fleet.rows[1].eligible);
+        assert!(!state.fleet.rows[1].failed);
     }
     #[test]
     fn old_protocol_version_metadata_still_enables_the_review_and_offline_is_never_eligible() {
