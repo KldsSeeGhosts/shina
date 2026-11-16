@@ -4177,17 +4177,23 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             })
             .child(content),
     );
-    if let Some(row) = update_row(s, p) {
+    // The provider pill sits above the footer control (KSG `SidebarProviderUpdatePill`).
+    if let Some(view) = &s.fleet.pill {
+        side = side.child(provider_pill(view, p));
+    }
+    if s.fleet_run_visible() {
+        let view = s.describe_capsule();
+        side = side.child(update_capsule(&view, p));
+        if s.fleet.popover {
+            side = side.child(capsule_popover(s, p));
+        }
+    } else if let Some(summary) = s.update_everything_summary() {
+        side = side.child(update_everything_button(&summary, p));
+    } else if let Some(row) = update_row(s, p) {
         side = side.child(row);
     }
-    if s.fleet_available() {
-        side = side.child(
-            button("update-all-machines", "Update all machines", p, |s| {
-                s.open_fleet()
-            })
-            .mx(8.0)
-            .my(4.0),
-        );
+    if let Some(notice) = &s.fleet.result_notice {
+        side = side.child(update_result_notice(notice, p));
     }
     for (server, view) in &s.machines.views {
         let outcome = &view["updateNotice"];
@@ -4665,6 +4671,281 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
             Some(button)
         }
     }
+}
+
+/// The single footer control while any server or provider can update, KSG
+/// `useUpdateEverything`'s trigger: 30 px, `sea_bg`, `sea` icon and summary.
+fn update_everything_button(summary: &str, p: Palette) -> El {
+    row()
+        .key("update-all-machines")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(summary.to_owned())
+        .h(30.0)
+        .mx(8.0)
+        .mb(8.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(6.0)
+        .fill(p.sea_bg)
+        .focusable(true)
+        .hover(p.selected)
+        .on_press(|s: &mut State| s.open_fleet())
+        .child(icon("send", p.sea))
+        .child(label(summary, TextStyle::new(12.5, 520.0), p.sea))
+}
+
+/// The run capsule that replaces the footer control, KSG `SidebarUpdateCapsule`.
+fn update_capsule(view: &crate::fleet_update::CapsuleView, p: Palette) -> El {
+    use crate::fleet_update::{CapsuleAction, CapsuleTone};
+    let border = match view.tone {
+        CapsuleTone::Slow => p.brass,
+        CapsuleTone::Failed => p.danger,
+        CapsuleTone::Default => p.line,
+    };
+    let label_color = match view.tone {
+        CapsuleTone::Failed => p.danger,
+        _ => p.ink,
+    };
+    let mut content = row()
+        .grow(1.0)
+        .min_w(0.0)
+        .center_y()
+        .gap(4.0)
+        .child(label(&view.label, TextStyle::new(12.0, 400.0), label_color).truncate());
+    if let Some(elapsed) = &view.elapsed {
+        content = content.child(pixel_text(elapsed, p.brass));
+    }
+    let action = match view.action {
+        CapsuleAction::Later => Some("Later"),
+        CapsuleAction::Retry => Some("Retry"),
+        CapsuleAction::Dismiss => Some("Dismiss"),
+        CapsuleAction::None => None,
+    };
+    let mut capsule = row()
+        .key("update-capsule")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(
+            [Some(view.label.as_str()), view.elapsed.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .h(32.0)
+        .mx(8.0)
+        .mb(8.0)
+        .pl(10.0)
+        .center_y()
+        .radius(4.0)
+        .fill(p.card)
+        .border(1.0, border)
+        .focusable(true)
+        .on_press(|s: &mut State| s.fleet.popover = !s.fleet.popover)
+        .child(content);
+    if let Some(title) = action {
+        capsule = capsule.child(
+            row()
+                .key("update-capsule-action")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(title.to_owned())
+                .h(32.0)
+                .px(8.0)
+                .center_y()
+                .focusable(true)
+                .on_press(|s: &mut State| s.capsule_action())
+                .child(label(title, TextStyle::new(12.0, 400.0), p.sea)),
+        );
+    } else {
+        capsule = capsule.child(el().size(32.0, 32.0).center().child(icon(
+            if view.tone == CapsuleTone::Failed {
+                "alert"
+            } else {
+                "send"
+            },
+            if view.tone == CapsuleTone::Failed {
+                p.danger
+            } else {
+                p.sea
+            },
+        )));
+    }
+    capsule
+}
+
+/// The capsule's popover, anchored above and end-aligned (KSG `updateEverythingRun`
+/// rows): This app first, then one row per machine with its status word.
+fn capsule_popover(s: &State, p: Palette) -> El {
+    let mut list = col().w(280.0).gap(0.0);
+    let local_status = s.capsule_local_status();
+    if local_status.is_some() || s.fleet.postponed_local {
+        let mut app_row = row().h(28.0).center_y().gap(8.0).child(
+            label("This app", TextStyle::new(12.0, 500.0), p.ink)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+        if s.fleet.postponed_local && s.fleet.local_version.is_none() {
+            app_row = app_row.child(secondary_button(
+                "capsule-restart",
+                "Restart to update",
+                p,
+                |s| s.restart_postponed_update(),
+            ));
+        } else if let Some(status) = &local_status {
+            app_row = app_row.child(pixel_text(status, p.muted));
+        }
+        list = list.child(app_row);
+    }
+    let all_settled = s.fleet.rows.iter().all(|row| row.result.is_some());
+    let any_failure = s.fleet.rows.iter().any(|row| row.result == Some(false));
+    let any_server_failure =
+        s.fleet.rows.iter().any(|row| {
+            row.result == Some(false) && row.server_target.is_some() && !row.server_updated
+        });
+    for (index, machine) in s.fleet.rows.iter().enumerate() {
+        let status = s.run_status(machine);
+        let mut machine_row = row().h(28.0).center_y().gap(8.0).child(
+            label(&machine.name, TextStyle::new(12.0, 500.0), p.ink)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+        let word = crate::fleet_update::status_word(status);
+        if matches!(status, "providers" | "downloading" | "restarting") {
+            machine_row = machine_row.child(pixel_text(
+                format!(
+                    "{word} {}",
+                    crate::fleet_update::format_update_elapsed(machine.started_at.elapsed())
+                ),
+                p.muted,
+            ));
+        } else {
+            machine_row = machine_row.child(pixel_text(
+                word,
+                if status == "failed" {
+                    p.danger
+                } else {
+                    p.muted
+                },
+            ));
+        }
+        list = list.child(machine_row);
+        if let Some(failure) = machine.provider_failure.as_ref().or_else(|| {
+            machine
+                .state
+                .strip_prefix("failed: ")
+                .map(|_| &machine.state)
+        }) {
+            let text = failure.strip_prefix("failed: ").unwrap_or(failure);
+            list = list.child(
+                label(text, TextStyle::new(12.0, 400.0), p.muted)
+                    .wrap()
+                    .pb(4.0)
+                    .key(format!("capsule-failure-{index}")),
+            );
+        }
+    }
+    if all_settled && any_failure {
+        let mut actions = row().gap(4.0).pt(4.0);
+        if any_server_failure {
+            actions = actions.child(secondary_button("capsule-retry", "Retry", p, |s| {
+                s.capsule_action()
+            }));
+        }
+        actions = actions.child(button("capsule-dismiss", "Dismiss", p, |s| {
+            s.dismiss_settled_machines()
+        }));
+        list = list.child(actions);
+    }
+    list.padding(4.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .radius(4.0)
+        .box_shadow(hard_shadow(p))
+        .anchored_fit("update-capsule", rune::Side::Top, rune::Align::End, 4.0)
+}
+
+/// `provider-update-pill`: the local machine's provider update notice above the
+/// footer (KSG `SidebarProviderUpdatePill`).
+fn provider_pill(view: &crate::fleet_update::ProviderPillView, p: Palette) -> El {
+    use crate::fleet_update::PillTone;
+    let (border, text, status) = match view.tone {
+        PillTone::Loading | PillTone::Success => (p.line, p.ink, p.sea),
+        PillTone::Warning => (p.brass, p.brass, p.brass),
+        PillTone::Error => (p.danger, p.danger, p.danger),
+    };
+    let mut pill = row()
+        .key("provider-update-pill")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(view.title.clone())
+        .min_h(28.0)
+        .mx(8.0)
+        .mb(4.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(4.0)
+        .fill(p.card)
+        .border(1.0, border)
+        .focusable(true)
+        .on_press(|s: &mut State| {
+            s.open_settings();
+            s.settings.section = 2;
+        })
+        .child(el().size(8.0, 8.0).fill(status).a11y_hidden())
+        .child(
+            label(&view.title, TextStyle::new(12.0, 500.0), text)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    if view.dismissible {
+        pill = pill.child(icon_button(
+            "dismiss-provider-pill",
+            "Dismiss provider update notice",
+            "close",
+            p,
+            |s| s.dismiss_provider_pill(),
+        ));
+    }
+    pill
+}
+
+/// `update-result`: the one notice after a run settles, KSG
+/// `getUpdateEverythingToastView`; dismissible.
+fn update_result_notice(notice: &crate::fleet_update::ResultNotice, p: Palette) -> El {
+    let color = if notice.success { p.sea } else { p.danger };
+    let mut card = col()
+        .gap(2.0)
+        .grow(1.0)
+        .min_w(0.0)
+        .child(label(&notice.title, SMALL, color).wrap());
+    for line in &notice.lines {
+        card = card.child(label(line, TextStyle::new(12.0, 400.0), p.muted).wrap());
+    }
+    row()
+        .key("update-result")
+        .gap(4.0)
+        .mx(8.0)
+        .mb(8.0)
+        .px(8.0)
+        .py(4.0)
+        .radius(4.0)
+        .fill(p.card)
+        .border(1.0, if notice.success { p.line } else { p.danger })
+        .child(card)
+        .child(icon_button(
+            "dismiss-update-result",
+            "Dismiss update result",
+            "close",
+            p,
+            |s| s.dismiss_result_notice(),
+        ))
 }
 
 /// A sidebar section label: Departure Mono, uppercase, muted. Counts and buttons follow it.
@@ -29463,6 +29744,114 @@ pub(crate) mod tests {
                     "{width}: checkbox overflowed row or list: cb={cb_rect:?} row={row_rect:?} list={list_rect:?}"
                 );
             }
+        }
+    }
+
+    /// The one-button update surfaces: everything button, capsule (with Later),
+    /// provider pill and the result notice all stay inside the window at every
+    /// supported width (KSG `updateEverything` contract keys).
+    #[test]
+    fn the_everything_update_surfaces_fit_all_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+            let (mut remote, _calls) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            *remote.info.lock().unwrap() = serde_json::json!({
+                "binaryVersion": "0.1.0", "protocolMinor": 36, "canUpdate": true,
+                "capabilities": ["provider-updates-v1"]
+            });
+            remote.remote = Some(crate::peer::Link {
+                server_id: "remote".into(),
+                host: "studio".into(),
+                device_id: "fixture".into(),
+                token: "not-real".into(),
+                enabled: true,
+            });
+            client.linked.insert("remote".into(), remote);
+            rt.state.client = Some(client);
+            rt.state.machines.views.insert(
+                "remote".into(),
+                serde_json::json!({
+                    "updateStatus": {"runningVersion": "0.1.0", "state": "idle", "canSelfUpdate": true},
+                    "providers": [{
+                        "driver": "codex", "name": "Codex", "installed": true,
+                        "version": "0.48.0", "latestVersion": "0.50.0",
+                        "advisory": "behind", "strategy": "npm-global"
+                    }]
+                }),
+            );
+            rt.state.updater = crate::update::Updater::test_ready(crate::update::PreparedUpdate {
+                tag: "v99.0.0".into(),
+                target: crate::install::InstalledTarget::Windows {
+                    exe: "shina.exe".into(),
+                },
+                asset: "shina.exe".into(),
+                size: 1,
+                sha256: "0".repeat(64),
+                download: "download.exe".into(),
+                prepared: "prepared.exe".into(),
+            });
+            rt.state.fleet.pill = Some(crate::fleet_update::ProviderPillView {
+                key: "fixture".into(),
+                tone: crate::fleet_update::PillTone::Error,
+                title: "Codex v0.50.0 update failed".into(),
+                dismissible: true,
+            });
+            rt.state.fleet.result_notice = Some(crate::fleet_update::ResultNotice {
+                success: false,
+                title: "Update failed".into(),
+                lines: vec!["studio Codex: exit 1".into()],
+            });
+            rt.frame(0.0);
+            for key in [
+                "update-all-machines",
+                "provider-update-pill",
+                "update-result",
+            ] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
+                    "{width} {key}: {rect:?}"
+                );
+                assert!(
+                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
+                    "{width} {key}: {rect:?}"
+                );
+            }
+            // A running countdown replaces the footer control with the capsule and
+            // its Later action.
+            rt.state.fleet.running = true;
+            rt.state.fleet.phase = crate::fleet_update::RunPhase::Countdown;
+            rt.state.fleet.restart_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            rt.state.fleet.rows.push(crate::fleet_update::Row {
+                server: "local".into(),
+                name: "Local".into(),
+                state: "restarting".into(),
+                ..Default::default()
+            });
+            rt.invalidate();
+            rt.frame(0.0);
+            for key in ["update-capsule", "update-capsule-action"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[0] + rect[2] <= width + 0.5
+                        && rect[1] >= 0.0
+                        && rect[1] + rect[3] <= 720.5,
+                    "{width} {key}: {rect:?}"
+                );
+            }
+            assert!(rt.presented("update-all-machines").is_none());
+            // The popover opens above the capsule and stays in the window.
+            press(&mut rt, "update-capsule");
+            assert!(rt.state.fleet.popover);
         }
     }
 }
