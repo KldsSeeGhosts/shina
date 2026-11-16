@@ -610,19 +610,16 @@ pub enum RecoverStep {
     Stale,
 }
 
-/// The profile is owned and a server both exists and answers. An `Owner::acquire`
-/// failure alone is not proof of health: a locked or unreadable owner database fails
-/// the same way without any running server.
+/// The profile is owned and its authenticated server answers. An `Owner::acquire`
+/// failure alone is not proof of health. Do not require an OS process handle here:
+/// Windows can deny the least-privilege watch access to a server started by an
+/// elevated shell even though the same user's authenticated RPC succeeds.
 fn service_ready(directory: &Path) -> bool {
     if crate::server_lock::Owner::acquire(directory).is_ok() {
         return false;
     }
-    let Ok(discovery) = crate::server_auth::Discovery::read(directory) else {
-        return false;
-    };
-    if !crate::process::is_alive(discovery.pid) {
-        return false;
-    }
+    // local_rpc checks the profile's discovery, credentials, server and instance
+    // identity. A response proves liveness without crossing a privilege boundary.
     crate::maintenance::rpc(directory, "server.status", serde_json::json!({})).is_ok()
 }
 
@@ -1135,6 +1132,14 @@ fn launch_server(service: &Service, log: &fs::File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_owned_profile_without_an_authenticated_server_is_not_ready() {
+        let directory = crate::store::directory().unwrap();
+        assert!(!service_ready(&directory));
+        let _owner = crate::server_lock::Owner::acquire(&directory).unwrap();
+        assert!(!service_ready(&directory));
+    }
 
     /// Opt-in native service-manager check. It creates only a uniquely named
     /// temporary watch, never an installed server service.
