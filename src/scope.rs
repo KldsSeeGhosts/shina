@@ -690,7 +690,11 @@ mod tests {
         );
         restored.demo = true;
         restored
-            .mcp_call(primary, "task_cancel", &json!({"thread_id":worker}))
+            .mcp_call(
+                primary,
+                "task_cancel",
+                &json!({"thread_id":worker,"client_request_id":"cancel-worker"}),
+            )
             .unwrap();
         restored.poll_tasks(Instant::now());
         assert!(

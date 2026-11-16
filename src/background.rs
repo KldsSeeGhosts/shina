@@ -639,6 +639,7 @@ impl State {
                             self.threads[index].pending_injections.push_back(Injection {
                                 text: message,
                                 shown: false,
+                                steer: None,
                             });
                             if self.threads[index].pi.is_none() {
                                 self.connect_thread(index);
@@ -924,6 +925,7 @@ mod tests {
         state.current_mut().pending_injections.push_back(Injection {
             text: messages[0].1.clone(),
             shown: false,
+            steer: None,
         });
         assert!(state.current_mut().flush_injection());
         let prompt = commands.try_recv().unwrap();

@@ -131,7 +131,8 @@ pub async fn wait_for_peer_thread(
         let mut status = json!({"threadId":thread["id"],
             "finished":record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
-            "documentRequest":document_request,"status":thread["status"]});
+            "documentRequest":document_request,"status":thread["status"],
+            "attemptId":record["peerOrigin"]["attemptId"]});
         status["result"] = record["peerOrigin"]["result"].clone();
         status["revision"] = json!(crate::protocol::revision(&status));
         Ok(status)
@@ -253,6 +254,12 @@ pub struct PeerOrigin {
     pub acknowledged: bool,
     #[serde(default)]
     pub attempt_message: String,
+    /// The attempt identity the home last committed through the peer contract.
+    /// Fenced stops and fenced sends compare against it before they may apply.
+    /// Threads launched before the fence contract have no marker and keep the
+    /// legacy unconditional semantics.
+    #[serde(default)]
+    pub attempt_id: Option<String>,
     #[serde(default)]
     pub cancelled_commands: Vec<uuid::Uuid>,
     #[serde(default)]
@@ -715,7 +722,9 @@ mod tests {
             "peer.thread.launch",
             accepted(json!({"threadId":17})),
         );
-        state.queue_remote_send(0, "Continue the work").unwrap();
+        state
+            .queue_remote_send(0, "Continue the work", "follow_up")
+            .unwrap();
         let send = state.tasks[0]
             .remote
             .as_ref()
@@ -739,7 +748,7 @@ mod tests {
             .text = "SHARED-THREE".into();
         assert!(
             state
-                .queue_remote_send(0, "Do not replace the pending command")
+                .queue_remote_send(0, "Do not replace the pending command", "follow_up")
                 .is_err()
         );
         assert_eq!(
@@ -773,7 +782,7 @@ mod tests {
             remote.request = Some(json!({"kind":"select","requestId":"q","generation":"g",
                 "payload":{"options":["yes","no"]}}));
         }
-        state.queue_remote_send(0, "yes").unwrap();
+        state.queue_remote_send(0, "yes", "follow_up").unwrap();
         let answer = &state.tasks[0]
             .remote
             .as_ref()
@@ -797,7 +806,7 @@ mod tests {
             .mcp_call(
                 1,
                 "task_send",
-                &json!({"thread_id":worker,"message":"New work"}),
+                &json!({"thread_id":worker,"message":"New work","client_request_id":"followup-work"}),
             )
             .unwrap();
         let followup = state.tasks[0]
@@ -932,6 +941,151 @@ mod tests {
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
+    /// A peer worker bound to the fixture's delegated task and peer device.
+    fn peer_worker(state: &mut State) -> usize {
+        let mut origin: PeerOrigin = serde_json::from_value(
+            state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .launch_command
+                .params["origin"]
+                .clone(),
+        )
+        .unwrap();
+        origin.device_id = "fixture-peer".into();
+        let child = state.threads[1].id;
+        state.threads[1].peer_origin = Some(origin);
+        state.threads[1].status = Status::Running;
+        child
+    }
+
+    #[test]
+    fn a_delayed_stop_for_an_older_attempt_never_stops_newer_work() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt_a = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        // Wire reorder: the send that opened attempt B arrived before the
+        // delayed stop a caller fenced to attempt A.
+        state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"New attempt brief",
+                        "delivery":"attempt","attemptId":"attempt-b"}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            state.threads[1]
+                .peer_origin
+                .as_ref()
+                .unwrap()
+                .attempt_id
+                .as_deref(),
+            Some("attempt-b")
+        );
+        let error = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.stop",
+                    json!({"threadId":child,"attemptId":attempt_a}),
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("Attempt changed"), "{error}");
+        assert!(
+            state.threads[1].task_result.is_none(),
+            "attempt B must survive the stale stop"
+        );
+        assert!(!state.threads[1].native.queue_held);
+        // A stop fenced to the live attempt still lands.
+        state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.stop",
+                    json!({"threadId":child,"attemptId":"attempt-b"}),
+                ),
+            )
+            .unwrap();
+        assert!(state.threads[1].task_result.is_some());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn fenced_sends_reject_stale_attempts_and_unsupported_delivery() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let error = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"Stale input",
+                        "delivery":"follow_up","attemptId":"never-current"}),
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("Attempt changed"), "{error}");
+        let error = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"Bad mode","delivery":"teleport"}),
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("Unknown peer delivery mode"), "{error}");
+        // A send naming the live attempt joins it.
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"Live input",
+                        "delivery":"follow_up","attemptId":attempt}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert!(state.threads[1].pending_injections[0].steer.is_none());
+        // Steering pins the live run and reports when the attempt cannot take it.
+        state.threads[1].run_id = Some("run-live".into());
+        state.threads[1].harness = "pi".into();
+        state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"Steer this run",
+                        "delivery":"steer","attemptId":attempt}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            state.threads[1].pending_injections[1].steer.as_deref(),
+            Some("run-live")
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
     #[test]
     fn transcript_pages_continue_unicode_without_losing_text() {
         let mut state = fixture();
@@ -1025,7 +1179,11 @@ mod tests {
         let child = state.tasks[0].child_thread_id;
         assert!(
             state
-                .mcp_call(1, "task_send", &json!({"thread_id":child,"message":"yes"}))
+                .mcp_call(
+                    1,
+                    "task_send",
+                    &json!({"thread_id":child,"message":"yes","client_request_id":"answer-confirm"})
+                )
                 .unwrap_err()
                 .contains("Confirmations")
         );
@@ -1152,7 +1310,10 @@ mod tests {
         state.threads[1].status = Status::Running;
         for (tool, args) in [
             ("delegate_task", json!({"prompt":"Nested"})),
-            ("task_cancel", json!({"thread_id":1})),
+            (
+                "task_cancel",
+                json!({"thread_id":1,"client_request_id":"ro-cancel"}),
+            ),
             ("create_routine", json!({})),
             ("remember", json!({"text":"No"})),
         ] {
@@ -1291,7 +1452,11 @@ mod tests {
         assert!(!state.tasks[0].state.finished());
         let child = state.tasks[0].child_thread_id;
         state
-            .mcp_call(1, "task_cancel", &json!({"thread_id":child}))
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":child,"client_request_id":"cancel-child"}),
+            )
             .unwrap();
         let stop = state.tasks[0]
             .remote
@@ -1817,7 +1982,8 @@ mod tests {
             "peer.thread.launch",
             accepted(json!({"threadId":17})),
         );
-        home.queue_remote_send(0, "An explicit new turn").unwrap();
+        home.queue_remote_send(0, "An explicit new turn", "follow_up")
+            .unwrap();
         let remote = home.tasks[0].remote.as_ref().unwrap();
         let mut command = remote.send_command.as_ref().unwrap().clone();
         assert_eq!(command.params["documentReads"], true);
@@ -2110,7 +2276,7 @@ mod tests {
             "peer.thread.launch",
             accepted(json!({"threadId":17})),
         );
-        state.queue_remote_send(0, "More work").unwrap();
+        state.queue_remote_send(0, "More work", "follow_up").unwrap();
         let message = state.tasks[0]
             .remote
             .as_ref()
@@ -2168,6 +2334,10 @@ pub struct RemoteTask {
     pub launch_command: Command,
     pub stop_owed: bool,
     pub stop_command_id: Option<uuid::Uuid>,
+    /// The attempt the caller observed when it owed this stop. A target that
+    /// accepted a later attempt rejects the stop instead of ending newer work.
+    #[serde(default)]
+    pub stop_attempt_id: Option<String>,
     pub last_error: Option<String>,
     pub next_retry_at: u64,
     pub retry_attempt: u32,
@@ -3042,6 +3212,7 @@ impl State {
                 launch_command: Command::new("peer.thread.launch", json!({})),
                 stop_owed: false,
                 stop_command_id: None,
+                stop_attempt_id: None,
                 last_error: None,
                 next_retry_at: 0,
                 retry_attempt: 0,
@@ -3084,7 +3255,7 @@ impl State {
             .collect();
         for index in indices {
             let task = &mut self.tasks[index];
-            task.owe_remote_stop();
+            task.owe_remote_stop(None);
             if !task.state.finished() {
                 task.finish(TaskState::Cancelled, "", "The user stopped this thread.");
             }
@@ -3321,6 +3492,7 @@ impl State {
             result: None,
             acknowledged: false,
             attempt_message: String::new(),
+            attempt_id: Some(task.attempt_id.clone()),
             cancelled_commands: Vec::new(),
             reply_after_position: 0,
             // This server services the reads its workers may send; the launch
@@ -3366,6 +3538,7 @@ impl State {
             launch_command: launch,
             stop_owed: false,
             stop_command_id: None,
+            stop_attempt_id: None,
             last_error: None,
             next_retry_at: 0,
             retry_attempt: 0,
@@ -3401,7 +3574,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PEER_TASK_FENCES],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
@@ -3445,6 +3618,10 @@ impl State {
                 || origin.task_id.len() > 256
                 || origin.server_label.len() > 256
                 || origin.captain.len() > 256
+                || origin
+                    .attempt_id
+                    .as_deref()
+                    .is_some_and(|attempt| !tasks::valid_id(attempt))
                 || origin.memories.iter().any(|m| m.text.chars().count() > 500)
                 || serde_json::to_vec(&origin.memories)
                     .map_err(|_| "Invalid memories.")?
@@ -3510,6 +3687,7 @@ impl State {
             thread.pending_injections.push_back(Injection {
                 text: brief.into(),
                 shown: false,
+                steer: None,
             });
             let id = thread.id;
             self.next_id += 1;
@@ -3606,6 +3784,23 @@ impl State {
                 Ok(json!({"result":result,"acknowledged":true}))
             }
             "peer.thread.stop" => {
+                // A stop fenced to an observed attempt must not land on newer
+                // work. Threads that predate attempt tracking keep the legacy
+                // unconditional semantics; the home negotiates the fence
+                // contract before it relies on it.
+                if let Some(observed) = args["attemptId"].as_str()
+                    && let Some(current) = self.threads[index]
+                        .peer_origin
+                        .as_ref()
+                        .expect("origin")
+                        .attempt_id
+                        .as_deref()
+                    && current != observed
+                {
+                    return Err(format!(
+                        "Attempt changed: {observed} is no longer the current attempt ({current})."
+                    ));
+                }
                 if let Ok(id) = serde_json::from_value::<uuid::Uuid>(args["sendCommandId"].clone())
                 {
                     let origin = self.threads[index].peer_origin.as_mut().expect("origin");
@@ -3647,6 +3842,18 @@ impl State {
                 {
                     return Ok(json!({"threadId":self.threads[index].id,"cancelled":true}));
                 }
+                let delivery = args["delivery"].as_str();
+                if let Some(delivery) = delivery
+                    && !matches!(delivery, "follow_up" | "steer" | "attempt")
+                {
+                    return Err(format!("Unknown peer delivery mode {delivery}."));
+                }
+                let attempt = args["attemptId"].as_str();
+                if let Some(attempt) = attempt
+                    && !tasks::valid_id(attempt)
+                {
+                    return Err("Invalid peer attempt identity.".into());
+                }
                 let message = args["message"]
                     .as_str()
                     .filter(|s| !s.trim().is_empty() && s.len() <= 64 * 1024)
@@ -3656,8 +3863,41 @@ impl State {
                     .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
                     .transpose()?;
                 let thread = &mut self.threads[index];
-                if let Some(reads) = document_reads {
-                    thread.peer_origin.as_mut().expect("origin").document_reads = reads;
+                {
+                    let origin = thread.peer_origin.as_mut().expect("origin");
+                    if let Some(reads) = document_reads {
+                        origin.document_reads = reads;
+                    }
+                    match delivery {
+                        // A new attempt is authoritative: the home allocated
+                        // this identity before dispatching the send.
+                        Some("attempt") => {
+                            if let Some(attempt) = attempt {
+                                origin.attempt_id = Some(attempt.into());
+                            }
+                        }
+                        // Follow-up and steering inputs name the attempt they
+                        // observed. A target that moved on refuses them rather
+                        // than attaching them to newer work.
+                        _ => {
+                            if let (Some(current), Some(observed)) =
+                                (origin.attempt_id.as_deref(), attempt)
+                                && current != observed
+                            {
+                                return Err(format!(
+                                    "Attempt changed: {observed} is no longer the current attempt ({current})."
+                                ));
+                            }
+                            if let Some(observed) = attempt
+                                && origin.attempt_id.is_none()
+                            {
+                                origin.attempt_id = Some(observed.into());
+                            }
+                        }
+                    }
+                }
+                if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
+                    return Err("This attempt cannot accept steering.".into());
                 }
                 if thread
                     .peer_origin
@@ -3675,9 +3915,15 @@ impl State {
                     .expect("origin")
                     .reply_after_position = thread.messages.len();
                 thread.arm_task();
+                let steer = if delivery == Some("steer") {
+                    thread.run_id.clone()
+                } else {
+                    None
+                };
                 thread.pending_injections.push_back(Injection {
                     text: message.into(),
                     shown: false,
+                    steer,
                 });
                 self.connect_thread(index);
                 Ok(json!({"threadId":self.threads[index].id}))
@@ -3807,23 +4053,34 @@ impl State {
         Ok(message)
     }
 
-    pub(super) fn queue_remote_send(&mut self, task: usize, message: &str) -> Result<(), String> {
+    pub(super) fn queue_remote_send(
+        &mut self,
+        task: usize,
+        message: &str,
+        delivery: &str,
+    ) -> Result<(), String> {
         let document_reads = self.tasks[task]
             .remote
             .as_ref()
             .is_some_and(|remote| self.peer_document_reads_supported(&remote.server_id));
-        let message = if self.tasks[task]
+        let request_pending = self.tasks[task]
             .remote
             .as_ref()
             .expect("remote task")
             .request
-            .is_none()
-        {
-            self.remote_task_message_with_reads(task, message, document_reads)?
-        } else {
+            .is_some();
+        if request_pending && delivery != "follow_up" {
+            return Err(
+                "This attempt cannot accept steering while a request awaits an answer.".into(),
+            );
+        }
+        let message = if request_pending {
             // input/editor/select responses must retain their exact value.
             message.to_owned()
+        } else {
+            self.remote_task_message_with_reads(task, message, document_reads)?
         };
+        let attempt_id = self.tasks[task].attempt_id.clone();
         let remote = self.tasks[task].remote.as_mut().expect("remote task");
         if remote.send_command.is_some() {
             return Err("A remote follow-up is still awaiting acknowledgement.".into());
@@ -3833,7 +4090,8 @@ impl State {
         }
         remote.send_command = Some(Command::new(
             "peer.thread.send",
-            json!({"threadId":remote.thread_id,"message":message}),
+            json!({"threadId":remote.thread_id,"message":message,
+                "delivery":delivery,"attemptId":attempt_id}),
         ));
         if remote.request.is_none() {
             remote.send_command.as_mut().expect("send command").params["documentReads"] =
@@ -3951,7 +4209,8 @@ impl State {
                 Command {
                     command_id: remote.stop_command_id.expect("owed stop id"),
                     method: "peer.thread.stop".into(),
-                    params: json!({"threadId":remote.thread_id,"sendCommandId":remote.send_command.as_ref().map(|command|command.command_id)}),
+                    params: json!({"threadId":remote.thread_id,"sendCommandId":remote.send_command.as_ref().map(|command|command.command_id),
+                        "attemptId":remote.stop_attempt_id}),
                 }
             } else if let Some(reply) = remote.document_replies.front() {
                 reply.clone()
@@ -4077,7 +4336,7 @@ impl State {
                 && child.stop_serial > remote.child_stop_serial
             {
                 remote.child_stop_serial = child.stop_serial;
-                task.owe_remote_stop();
+                task.owe_remote_stop(None);
                 if !task.state.finished() {
                     task.finish(
                         TaskState::Cancelled,
@@ -4172,6 +4431,7 @@ impl State {
                         "peer.thread.stop" => {
                             remote.stop_owed = false;
                             remote.stop_command_id = None;
+                            remote.stop_attempt_id = None;
                             if task.state == TaskState::Cancelled {
                                 remote.state = RemoteState::Done;
                             }
@@ -4314,6 +4574,17 @@ impl State {
                         remote.next_retry_at = lifecycle::now() + 30_000;
                         continue;
                     }
+                    if method == "peer.thread.stop" && error.contains("Attempt changed") {
+                        // The owed stop named an attempt the target already
+                        // left behind. Clearing it is a decision, not a retry:
+                        // the newer work the caller did not observe stays live.
+                        remote.stop_owed = false;
+                        remote.stop_command_id = None;
+                        remote.stop_attempt_id = None;
+                        remote.last_error = Some(error);
+                        remote.next_retry_at = 0;
+                        continue;
+                    }
                     if method == "peer.thread.send"
                         && (error.contains("generation changed")
                             || error.contains("Request expired"))
@@ -4331,6 +4602,16 @@ impl State {
                     {
                         remote.document_replies.pop_front();
                         remote.wait_revision = None;
+                        remote.next_retry_at = 0;
+                        continue;
+                    }
+                    if method == "peer.thread.send"
+                        && (error.contains("Attempt changed")
+                            || error.contains("cannot accept steering")
+                            || error.contains("Unknown peer delivery mode"))
+                    {
+                        remote.send_command = None;
+                        remote.last_error = Some(error);
                         remote.next_retry_at = 0;
                         continue;
                     }
@@ -4402,7 +4683,7 @@ impl State {
             {
                 remote.parent_stop_serial = parent.stop_serial;
                 if !remote.stop_owed {
-                    task.owe_remote_stop();
+                    task.owe_remote_stop(None);
                     if !task.state.finished() {
                         task.finish(TaskState::Cancelled, "", "The parent stopped.");
                     }

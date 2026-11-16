@@ -22,6 +22,7 @@
       "history-items",
       "peer-tasks-v2",
       "thread-read-v2",
+      "peer-task-fences-v1",
       "remote-project-scope-v1",
       "composer-transactions",
       "run-control",
@@ -80,7 +81,7 @@
     },
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 37,
+    "protocolMinor": 38,
     "serverId": "<serverId>",
     "serverTime": "<time>"
   }

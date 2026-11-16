@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 37;
+pub const MINOR: u32 = 38;
 pub const CAPTAIN_PEER_DOCUMENTS_MINOR: u32 = 37;
 pub const CAPTAIN_PEER_DOCUMENTS: &str = "captain-peer-documents-v1";
+pub const PEER_TASK_FENCES_MINOR: u32 = 38;
 pub const PROVIDER_UPDATES_MINOR: u32 = 36;
 pub const PROVIDER_UPDATES: &str = "provider-updates-v1";
 pub const PROVIDER_UPDATES_UPDATE_REQUIRED: &str =
@@ -190,6 +191,13 @@ pub const HISTORY_LEASE_GONE_CODE: i64 = -32010;
 pub const HISTORY_UPDATE_REQUIRED_CODE: i64 = -32012;
 pub const PEER_TASKS: &str = "peer-tasks-v2";
 pub const THREAD_READ: &str = "thread-read-v2";
+/// Fenced task control: attemptId on peer.thread.stop, delivery+attemptId on
+/// peer.thread.send, and attemptId inside peer.thread.wait status. A peer
+/// without this contract never receives fenced params; the caller gets an
+/// update-required error instead of silently unfenced semantics.
+pub const PEER_TASK_FENCES: &str = "peer-task-fences-v1";
+pub const PEER_TASK_FENCES_UPDATE_REQUIRED: &str =
+    "Update required on the target machine before it can honor attempt-fenced task control.";
 pub const REMOTE_PROJECT_SCOPE: &str = "remote-project-scope-v1";
 /// The answering server can open its scratch project (`project.ensureScratch`),
 /// which a manual draft retarget uses when no logical project matches there.

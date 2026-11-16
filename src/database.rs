@@ -784,6 +784,43 @@ impl Database {
         Ok(())
     }
 
+    /// Keyed task_send and task_cancel calls commit their caller-scoped receipt
+    /// in the same batch as the queued input or the owed stop.
+    pub fn stage_task_control_receipt(
+        &self,
+        owner: &str,
+        command: &crate::protocol::Command,
+        result: Value,
+    ) -> Result<(), String> {
+        if !matches!(command.method.as_str(), "task_send" | "task_cancel") {
+            return Err("Unsupported task control receipt.".into());
+        }
+        self.require_batch()?;
+        let hash = command.hash();
+        if let Some(existing) = self.delegate_tool_receipt(owner, command.command_id)? {
+            if existing.hash != hash {
+                return Err(
+                    "client_request_id was already used with different send or cancel arguments."
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_tool_receipts
+            .push(Receipt {
+                command_id: command.command_id,
+                device_id: owner.into(),
+                hash,
+                status: crate::protocol::ReceiptStatus::Accepted,
+                result,
+                seq: 0,
+            });
+        Ok(())
+    }
+
     pub fn stage_history(&self, events: Vec<Value>) {
         self.0
             .lock()
