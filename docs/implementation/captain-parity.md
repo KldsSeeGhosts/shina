@@ -5,6 +5,17 @@ not one implementation task. Preserve the existing runtime, durable delivery,
 Captain lifecycle, reports and generated digest while implementing its child
 issues.
 
+## Publication cadence
+
+Push each reviewed, issue-sized implementation with its regression tests and
+open a pull request immediately. Run CI on each slice instead of waiting for
+the whole audit. Keep incomplete or rejected candidates out of those pull
+requests. Fix CI failures before publishing dependent work as complete.
+
+The existing workflow runs the core gate on pull requests. Merges to main
+also build and publish platform updates after the core gate and each
+platform's build pass.
+
 ## First batch
 
 The first batch starts with independent backend fixes. Implementation and review
@@ -36,8 +47,8 @@ changed-intent rejection, one worker prompt, a response-only wait change, and
 receipt replay after process restart and worker deletion. The focused test
 passes. On the integrated branch, `cargo test` passes with 1,910 unit tests
 and 99 server-runtime tests, with 12 opt-in unit tests ignored. `cargo build`
-and `cargo fmt --check` also pass. This implementation is local and has not
-been pushed or published.
+and `cargo fmt --check` also pass. This slice is ready for its own pull request
+and CI run.
 
 Issue #22 is now assigned to Devin SWE-2 on top of this implementation. It adds
 durable send/cancel receipts and attempt fences. Its implementation must retain
