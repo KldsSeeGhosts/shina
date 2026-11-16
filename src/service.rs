@@ -287,15 +287,22 @@ impl Service {
         }
     }
     fn run(&self, program: &str, args: &[&str]) -> Result<String, String> {
+        // Tests point this at stub systemctl/launchctl binaries: the login-shell PATH
+        // reconciliation in main() would otherwise hide them behind the real tools.
+        let program = std::env::var_os("SHINA_SERVICE_BIN_DIR")
+            .map(|dir| PathBuf::from(dir).join(program))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from(program));
         let output = crate::process::output(
-            Command::new(program).args(args).stdin(Stdio::null()),
+            Command::new(&program).args(args).stdin(Stdio::null()),
             Duration::from_secs(30),
             64 * 1024,
         )
         .map_err(|e| e.to_string())?;
         if !output.status.success() {
             return Err(format!(
-                "{program} failed with {}. No elevation was requested.\n{}",
+                "{} failed with {}. No elevation was requested.\n{}",
+                program.display(),
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             ));
@@ -339,6 +346,177 @@ impl Service {
         }
         Ok(())
     }
+    /// The update-watch job name on Windows and the LaunchAgent label on macOS. Linux
+    /// uses the fixed `shina-update-watch` unit pair instead, matching the contract.
+    fn watch_name(&self) -> String {
+        format!("{}.update-watch", self.name)
+    }
+    /// macOS: a LaunchAgent that runs recover-update every 60 seconds. No RunAtLoad:
+    /// the watch must not fire simply because the user logged in.
+    fn watch_plist(&self, update_id: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>service</string><string>recover-update</string><string>{}</string></array>\n<key>StartInterval</key><integer>{}</integer>\n<key>ProcessType</key><string>Background</string>\n</dict></plist>\n",
+            xml(&self.watch_name()),
+            xml(&self.executable.to_string_lossy()),
+            xml(update_id),
+            crate::update::WATCH_INTERVAL_SECS
+        )
+    }
+    /// Linux: a oneshot service plus the 60 second user timer that retriggers it.
+    fn watch_units(&self, update_id: &str) -> (String, String) {
+        let service = format!(
+            "[Unit]\nDescription=Shina update recovery after a restart handoff\n\n[Service]\nType=oneshot\nExecStart={} service recover-update {}\n",
+            unit_quote(&self.executable.to_string_lossy()),
+            unit_quote(update_id)
+        );
+        let timer = format!(
+            "[Unit]\nDescription=Shina update recovery watch\n\n[Timer]\nOnActiveSec={}\nOnUnitActiveSec={}\n\n[Install]\nWantedBy=timers.target\n",
+            crate::update::WATCH_INTERVAL_SECS,
+            crate::update::WATCH_INTERVAL_SECS
+        );
+        (service, timer)
+    }
+    /// Windows: a one-time task repeating every minute for 45 minutes.
+    fn watch_task_xml(&self, update_id: &str, start_boundary: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><Description>Restarts the Shina service if an update helper did not finish</Description></RegistrationInfo>\n<Triggers><TimeTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT1M</Interval><Duration>PT45M</Duration></Repetition></TimeTrigger></Triggers>\n<Principals><Principal id=\"User\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><ExecutionTimeLimit>PT10M</ExecutionTimeLimit><Hidden>true</Hidden></Settings>\n<Actions Context=\"User\"><Exec><Command>{}</Command><Arguments>service recover-update \"{}\"</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
+            xml(start_boundary),
+            xml(self
+                .environment
+                .get("SHINA_SERVICE_USER")
+                .map(String::as_str)
+                .unwrap_or("")),
+            xml(&self.executable.to_string_lossy()),
+            xml(update_id),
+            xml(&self.home.to_string_lossy())
+        )
+    }
+    fn watch_unit_dir(&self) -> PathBuf {
+        self.home.join(".config").join("systemd").join("user")
+    }
+    fn watch_plist_path(&self) -> PathBuf {
+        self.home
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{}.plist", self.watch_name()))
+    }
+    fn watch_task_path(&self) -> PathBuf {
+        self.directory.join("update-watch.xml")
+    }
+    /// Registers the per-user watch: one recover-update run a minute for 45 minutes.
+    /// Re-registering replaces the job. The service manager definitions themselves are
+    /// unchanged, so crash-loop limits still apply and nothing races a binary swap.
+    pub fn register_update_watch(&self, update_id: &str) -> Result<(), String> {
+        match self.platform {
+            Platform::Linux => {
+                let dir = self.watch_unit_dir();
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let (service, timer) = self.watch_units(update_id);
+                crate::store::write_atomic(
+                    &dir.join("shina-update-watch.service"),
+                    service.as_bytes(),
+                )
+                .map_err(|e| e.to_string())?;
+                crate::store::write_atomic(&dir.join("shina-update-watch.timer"), timer.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                self.run("systemctl", &["--user", "daemon-reload"])?;
+                self.run(
+                    "systemctl",
+                    &["--user", "enable", "--now", "shina-update-watch.timer"],
+                )?;
+            }
+            Platform::Mac => {
+                let plist = self.watch_plist_path();
+                if let Some(parent) = plist.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                crate::store::write_atomic(&plist, self.watch_plist(update_id).as_bytes())
+                    .map_err(|e| e.to_string())?;
+                let domain = self.domain()?;
+                let target = format!("{domain}/{}", self.watch_name());
+                // A leftover watch for a previous update is replaced, never duplicated.
+                let _ = self.run("launchctl", &["bootout", &target]);
+                self.run(
+                    "launchctl",
+                    &["bootstrap", &domain, &plist.to_string_lossy()],
+                )?;
+            }
+            Platform::Windows => {
+                let start = (chrono::Local::now() + chrono::Duration::minutes(1))
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string();
+                let rendered = self.watch_task_xml(update_id, &start);
+                let bytes: Vec<u8> = std::iter::once(0xfeffu16)
+                    .chain(rendered.encode_utf16())
+                    .flat_map(u16::to_le_bytes)
+                    .collect();
+                crate::store::write_atomic(&self.watch_task_path(), &bytes)
+                    .map_err(|e| e.to_string())?;
+                self.run(
+                    "schtasks.exe",
+                    &[
+                        "/Create",
+                        "/TN",
+                        &format!("{}-update-watch", self.name),
+                        "/XML",
+                        &self.watch_task_path().to_string_lossy(),
+                        "/F",
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+    /// Removes the watch. Missing jobs or files are not errors.
+    pub fn unregister_update_watch(&self) -> Result<(), String> {
+        match self.platform {
+            Platform::Linux => {
+                let _ = self.run(
+                    "systemctl",
+                    &["--user", "disable", "--now", "shina-update-watch.timer"],
+                );
+                for name in ["shina-update-watch.timer", "shina-update-watch.service"] {
+                    match fs::remove_file(self.watch_unit_dir().join(name)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.to_string()),
+                    }
+                }
+                let _ = self.run("systemctl", &["--user", "daemon-reload"]);
+            }
+            Platform::Mac => {
+                let _ = self.run(
+                    "launchctl",
+                    &[
+                        "bootout",
+                        &format!("{}/{}", self.domain()?, self.watch_name()),
+                    ],
+                );
+                match fs::remove_file(self.watch_plist_path()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Platform::Windows => {
+                let _ = self.run(
+                    "schtasks.exe",
+                    &[
+                        "/Delete",
+                        "/TN",
+                        &format!("{}-update-watch", self.name),
+                        "/F",
+                    ],
+                );
+                match fs::remove_file(self.watch_task_path()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
     /// Authenticate and ask the runtime to shut down before stopping its manager.
     pub fn stop(&self) -> Result<(), String> {
         if crate::server_lock::Owner::acquire(&self.directory).is_err() {
@@ -369,8 +547,91 @@ impl Service {
     }
 }
 
+/// What one `service recover-update` pass decided. The watch's own logging is the
+/// only reader, so the variant names double as its audit trail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverStep {
+    /// The update helper still holds the install lock. The watch waits quietly.
+    HelperWorking,
+    /// A server owns the profile, so the service came back. The watch was removed.
+    Healthy,
+    /// The service was stopped and no helper was running. Started through the manager.
+    Started,
+    /// The 45 minute watch window ended with no return: a failed outcome was recorded
+    /// if the helper left none, and the watch was removed.
+    Expired,
+}
+
+/// One pass of the update watch (design contract 9.2). The per-user job that the
+/// server registered at the restart handoff runs this every minute until the watch
+/// removes itself: while the helper works, while the service stays down inside the
+/// window it keeps starting the service, and at 45 minutes it records an honest
+/// failure instead of pretending the update landed.
+pub fn recover_update(update_id: &str) -> Result<RecoverStep, String> {
+    let directory = crate::store::directory().ok_or("No data directory.")?;
+    let Some(service) = Service::load()? else {
+        return Err("No Shina server service is installed.".into());
+    };
+    // A held install lock means the helper is alive and owns the handoff, including a
+    // deliberate mid-update stop. The watch must not fight it.
+    let Some(_lock) = crate::install::InstallLock::try_acquire(&directory.join("updates"))? else {
+        return Ok(RecoverStep::HelperWorking);
+    };
+    if crate::server_lock::Owner::acquire(&directory).is_err() {
+        crate::update::unregister_update_watch(&directory)?;
+        return Ok(RecoverStep::Healthy);
+    }
+    let watch = crate::update::update_watch(&directory);
+    let expired = match &watch {
+        Some(watch) => {
+            let deadline = watch.registered_at + crate::update::WATCH_EXPIRY.as_secs();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|now| now.as_secs())
+                .unwrap_or(0)
+                >= deadline
+        }
+        // A watch job without its record is stale; remove it like an expired one.
+        None => true,
+    };
+    if expired {
+        if let Some(watch) = &watch
+            && watch.update_id == update_id
+            && crate::fleet_update::read_outcome(&directory)
+                .map(|outcome| outcome.update_id)
+                .as_deref()
+                != Some(update_id)
+        {
+            crate::fleet_update::save_outcome(
+                &directory,
+                &crate::fleet_update::Outcome {
+                    update_id: update_id.into(),
+                    tag: watch.tag.clone(),
+                    success: false,
+                    reason: Some(
+                        "The service did not come back after the update. Start it with `shina service start`."
+                            .into(),
+                    ),
+                },
+            )?;
+        }
+        crate::update::unregister_update_watch(&directory)?;
+        return Ok(RecoverStep::Expired);
+    }
+    service.start()?;
+    Ok(RecoverStep::Started)
+}
+
 pub fn cli(args: &[String]) -> Result<(), String> {
     let action = args.first().map(String::as_str).unwrap_or("status");
+    if action == "recover-update" {
+        let update_id = args
+            .get(1)
+            .ok_or("Usage: shina service recover-update <updateId>")?;
+        let step = recover_update(update_id)?;
+        println!("{step:?}");
+        return Ok(());
+    }
     let mut name = None;
     let mut linger = false;
     let mut tailnet = false;
@@ -474,7 +735,12 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     };
     match action {
         "start" => service.start()?,
-        "stop" => service.stop()?,
+        // An explicit operator stop overrides a registered update watch; the helper's
+        // own internal Service::stop() mid-update does not come through this path.
+        "stop" => {
+            let _ = crate::update::unregister_update_watch(&service.directory);
+            service.stop()?;
+        }
         "status" => {
             let state = match service.platform {
                 Platform::Linux => service.run(
@@ -499,6 +765,8 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             );
         }
         "uninstall" => {
+            // A deleted service must not leave a watch job invoking recover-update.
+            let _ = crate::update::unregister_update_watch(&service.directory);
             service.stop()?;
             match service.platform {
                 Platform::Linux => {
@@ -550,6 +818,10 @@ pub fn launch(path: &Path) -> Result<(), String> {
         other => other.map_err(|e| e.to_string())?,
     };
     let service: Service = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    // A healthy start makes a registered update watch stale: either the helper
+    // restarted the service or the watch did. If the helper lock is still held the
+    // update is mid-flight and the watch stays as its second line.
+    crate::update::remove_stale_update_watch(&service.directory);
     let log_path = service.log_path();
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -729,6 +1001,58 @@ mod tests {
     fn escaping_does_not_allow_unit_or_xml_injection() {
         assert_eq!(xml("<>&\""), "&lt;&gt;&amp;&quot;");
         assert_eq!(unit_quote("a%$\"\\b"), "\"a%%$$\\\"\\\\b\"");
+    }
+
+    #[test]
+    fn update_watch_jobs_match_the_contract_per_platform() {
+        let id = "3f4f9d2e-7c2b-4f2d-9a0d-1f3e2c4b5a6d";
+        let mac = fixture(Platform::Mac);
+        let plist = mac.watch_plist(id);
+        assert!(plist.contains("<key>StartInterval</key><integer>60</integer>"));
+        assert!(
+            !plist.contains("RunAtLoad"),
+            "the watch must not fire at login"
+        );
+        assert!(plist.contains("<string>Shina-test.update-watch</string>"));
+        assert!(plist.contains(&format!("<string>{id}</string>")));
+        assert!(plist.contains("<string>recover-update</string>"));
+
+        let linux = fixture(Platform::Linux);
+        let (service, timer) = linux.watch_units(id);
+        assert!(service.contains("Type=oneshot"));
+        assert!(service.contains(&format!(
+            "ExecStart=\"/opt/Shina/shina\" service recover-update \"{id}\""
+        )));
+        assert!(timer.contains("OnActiveSec=60"));
+        assert!(timer.contains("OnUnitActiveSec=60"));
+        assert!(timer.contains("WantedBy=timers.target"));
+
+        let windows = fixture(Platform::Windows);
+        let task = windows.watch_task_xml(id, "2026-11-16T12:34:56");
+        assert!(task.contains("<StartBoundary>2026-11-16T12:34:56</StartBoundary>"));
+        assert!(task.contains("<Interval>PT1M</Interval>"));
+        assert!(task.contains("<Duration>PT45M</Duration>"));
+        assert!(task.contains("IgnoreNew"));
+        assert!(task.contains(&format!("recover-update \"{id}\"")));
+        assert!(task.contains("<UserId>HOST\\tester</UserId>"));
+    }
+
+    #[test]
+    fn update_watch_paths_follow_the_service_owner() {
+        let service = fixture(Platform::Linux);
+        assert_eq!(service.watch_name(), "Shina-test.update-watch");
+        assert_eq!(
+            service.watch_unit_dir(),
+            Path::new("/home/test/.config/systemd/user")
+        );
+        assert_eq!(
+            service.watch_plist_path(),
+            Path::new("/home/test/Library/LaunchAgents/Shina-test.update-watch.plist")
+        );
+        assert_eq!(
+            service.watch_task_path(),
+            Path::new("/data/Shina/update-watch.xml")
+        );
     }
 
     #[cfg(windows)]

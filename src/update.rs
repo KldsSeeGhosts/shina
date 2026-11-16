@@ -1454,6 +1454,110 @@ fn coordinated_path() -> PathBuf {
     })
 }
 
+/// The per-user update watch (design contract 9.2): a service-manager job the server
+/// registers at the restart handoff and that runs `shina service recover-update
+/// <updateId>` once a minute for up to 45 minutes. It is the second line when the
+/// detached helper is killed or crashes after the service was stopped: the helper's
+/// exit-path restart is the first.
+pub const WATCH_INTERVAL_SECS: u64 = 60;
+pub const WATCH_EXPIRY: Duration = Duration::from_secs(45 * 60);
+
+/// The durable record of a registered watch. `service` pins the job name so recovery
+/// still finds the job if `service.json` changed while the update ran.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWatch {
+    pub update_id: String,
+    pub tag: String,
+    pub service: String,
+    /// Unix seconds when the watch was registered; the 45 minute expiry counts from it.
+    pub registered_at: u64,
+}
+
+fn watch_path(directory: &Path) -> PathBuf {
+    directory.join("updates").join("update-watch.json")
+}
+
+/// The registered watch, if one survived. A corrupt file counts as none.
+pub fn update_watch(directory: &Path) -> Option<UpdateWatch> {
+    serde_json::from_slice(&fs::read(watch_path(directory)).ok()?).ok()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .unwrap_or(0)
+}
+
+/// Registers the watch with the service manager. Idempotent: re-registering replaces the
+/// job for the same service. No service installed means no watch and no error.
+pub fn register_update_watch(directory: &Path, update_id: &str, tag: &str) -> Result<(), String> {
+    let Some(service) = crate::service::Service::load()? else {
+        return Ok(());
+    };
+    fs::create_dir_all(directory.join("updates")).map_err(|e| e.to_string())?;
+    let watch = UpdateWatch {
+        update_id: update_id.into(),
+        tag: tag.into(),
+        service: service.name.clone(),
+        registered_at: unix_now(),
+    };
+    crate::store::write_atomic(
+        &watch_path(directory),
+        &serde_json::to_vec(&watch).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    service.register_update_watch(update_id)
+}
+
+/// Removes the watch job and its record. A missing job or record is not an error.
+pub fn unregister_update_watch(directory: &Path) -> Result<(), String> {
+    if let Some(service) = crate::service::Service::load()? {
+        service.unregister_update_watch()?;
+    }
+    match fs::remove_file(watch_path(directory)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// A registered watch whose helper lock is free is stale once a service comes up: the
+/// server is back, so the watch's only remaining job is to go away. Called by the
+/// service launcher before it spawns the server.
+pub fn remove_stale_update_watch(directory: &Path) {
+    if update_watch(directory).is_none() {
+        return;
+    }
+    match install::InstallLock::try_acquire(&directory.join("updates")) {
+        Ok(Some(_lock)) => {
+            let _ = unregister_update_watch(directory);
+        }
+        // Lock held: a live helper still owns the handoff. Lock unreadable: leave the
+        // watch, a failed unregister would cost the second line for nothing.
+        _ => {}
+    }
+}
+
+/// Starts the service on every update-helper exit path that did not complete
+/// successfully, including a panic. A killed helper never drops: the watch covers that.
+struct ServiceGuard<F: FnMut()> {
+    restart: Option<F>,
+}
+impl<F: FnMut()> ServiceGuard<F> {
+    fn disarm(&mut self) {
+        self.restart = None;
+    }
+}
+impl<F: FnMut()> Drop for ServiceGuard<F> {
+    fn drop(&mut self) {
+        if let Some(restart) = &mut self.restart {
+            restart();
+        }
+    }
+}
+
 pub fn start_coordinated_helper(update: &PreparedUpdate) -> Result<(), String> {
     start_coordinated_helper_id(update, &uuid::Uuid::new_v4().to_string())
 }
@@ -1485,8 +1589,20 @@ fn start_coordinated_helper_id(update: &PreparedUpdate, id: &str) -> Result<(), 
         fs::remove_file(&handshake).map_err(|e| e.to_string())?;
     }
     drop(_lock);
+    // The watch is registered before the helper starts, so it exists before anything
+    // drains or stops the service. A service manager that rejects the job fails the
+    // update closed here, while nothing has been interrupted yet.
+    let directory = crate::store::directory().ok_or("No profile.")?;
+    register_update_watch(&directory, id, &update.tag)?;
     let mut child = install::launch_detached(&helper, &["--coordinated-update"])?;
-    install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT)
+    match install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A helper that never acknowledged owns no handoff; disarm its watch.
+            let _ = unregister_update_watch(&directory);
+            Err(error)
+        }
+    }
 }
 
 pub fn cli_update(args: &[String]) -> Result<(), String> {
@@ -1964,7 +2080,14 @@ pub fn coordinated_helper() -> Result<(), String> {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let mut result = (|| {
+    // First line of the stopped-service guarantee: this helper restarts the service on
+    // every unsuccessful exit path, panic included. The update watch registered below
+    // is the independent second line for a kill or a crash this process cannot catch.
+    let mut service_guard = ServiceGuard { restart: None };
+    // False until the drain commit returns: a watch armed by a helper that never
+    // interrupted anything is stale and is removed on the way out.
+    let mut committed = false;
+    let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let update = PreparedUpdate::from_value(
             &serde_json::from_slice::<Value>(
                 &fs::read(storage.manifest()).map_err(|e| e.to_string())?,
@@ -1996,6 +2119,11 @@ pub fn coordinated_helper() -> Result<(), String> {
         {
             return Err("Service points to another executable. Reconcile it with shina service install first.".into());
         }
+        if let Some(service) = service.clone() {
+            service_guard.restart = Some(move || {
+                let _ = service.start();
+            });
+        }
         fs::write(storage.root.join("coordinated-started"), b"ready").map_err(|e| e.to_string())?;
         step = "Prepare restart";
         let live = crate::server_lock::Owner::acquire(&directory).is_err();
@@ -2019,6 +2147,8 @@ pub fn coordinated_helper() -> Result<(), String> {
             replaced: false,
         };
         step = "Commit restart";
+        // The update watch was registered by start_coordinated_helper before this
+        // process existed. From the first real interruption on, both lines matter.
         let prepare = (|| {
             if let Some(pid) = prepared["serverPid"]
                 .as_u64()
@@ -2069,11 +2199,18 @@ pub fn coordinated_helper() -> Result<(), String> {
             Ok::<_, String>(())
         })();
         if let Err(error) = prepare {
-            if live {
-                let _ = crate::maintenance::rpc(&directory, "server.cancelRestart", prepared);
+            // A confirmed cancellation means nothing was interrupted: the service
+            // keeps running (or was already down), so neither restart line applies.
+            // If the commit may have reached the server anyway, stay armed.
+            if !live || crate::maintenance::rpc(&directory, "server.cancelRestart", prepared).is_ok() {
+                service_guard.disarm();
+            } else {
+                // The commit may still have reached the server: keep both lines.
+                committed = true;
             }
             return Err(error);
         }
+        committed = true;
         step = "Update sequence";
         let result = helper_sequence(&mut host);
         if let Err(error) = &result {
@@ -2088,13 +2225,27 @@ pub fn coordinated_helper() -> Result<(), String> {
             }
         }
         if result.is_ok() {
+            // The service was verified ready: the watch is no longer needed and the
+            // guard must not start an already verified service on the way out.
+            let _ = unregister_update_watch(&directory);
+            service_guard.disarm();
             let _ = fs::remove_file(storage.manifest());
             let _ = fs::remove_file(storage.failed_release());
         }
         result
-    })().map_err(|error| {
+    }))
+    .unwrap_or_else(|_| {
+        Err("The update helper stopped unexpectedly. The service was asked to start again.".into())
+    })
+    .map_err(|error| {
         if step == "Update sequence" { error } else { format!("{step} failed: {error}") }
     });
+    if !committed {
+        // The helper never interrupted anything: an update that failed this early
+        // must not wake a service the operator left stopped on purpose.
+        let _ = unregister_update_watch(&directory);
+        service_guard.disarm();
+    }
     if let Some(tag) = &failed_tag {
         crate::fleet_update::save_outcome(
             &directory,
@@ -3853,5 +4004,79 @@ mod tests {
             fs::read(destination.join("Shina.app/Contents/MacOS/shina")).unwrap(),
             b"offline fixture"
         );
+    }
+
+    fn write_watch(directory: &Path, update_id: &str, registered_at: u64) {
+        fs::create_dir_all(directory.join("updates")).unwrap();
+        crate::store::write_atomic(
+            &watch_path(directory),
+            serde_json::to_vec(&UpdateWatch {
+                update_id: update_id.into(),
+                tag: "v9.9.9".into(),
+                service: "Shina-test".into(),
+                registered_at,
+            })
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn update_watch_round_trips_and_unregister_tolerates_a_missing_record() {
+        let directory = crate::store::directory().unwrap().join("watch-roundtrip");
+        fs::create_dir_all(&directory).unwrap();
+        assert!(update_watch(&directory).is_none());
+        write_watch(&directory, "id-1", 1_700_000_000);
+        let watch = update_watch(&directory).unwrap();
+        assert_eq!(watch.update_id, "id-1");
+        assert_eq!(watch.tag, "v9.9.9");
+        assert_eq!(watch.registered_at, 1_700_000_000);
+        // No service.json exists in a test profile, so unregistration removes only
+        // the durable record and touches no platform job.
+        unregister_update_watch(&directory).unwrap();
+        assert!(update_watch(&directory).is_none());
+        unregister_update_watch(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_held_install_lock_keeps_a_stale_watch_for_the_live_helper() {
+        let directory = crate::store::directory().unwrap().join("watch-locked");
+        write_watch(&directory, "id-2", 1_700_000_000);
+        let _lock = install::InstallLock::acquire(&directory.join("updates")).unwrap();
+        remove_stale_update_watch(&directory);
+        assert!(
+            update_watch(&directory).is_some(),
+            "a live helper's watch must survive a service start"
+        );
+        drop(_lock);
+        remove_stale_update_watch(&directory);
+        assert!(update_watch(&directory).is_none());
+    }
+
+    #[test]
+    fn the_service_guard_starts_the_service_on_drop_unless_disarmed() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let starts = Rc::new(Cell::new(0));
+        {
+            let starts = starts.clone();
+            let mut guard = ServiceGuard {
+                restart: Some(move || {
+                    starts.set(starts.get() + 1);
+                }),
+            };
+            guard.disarm();
+        }
+        assert_eq!(starts.get(), 0);
+        {
+            let starts = starts.clone();
+            let _guard = ServiceGuard {
+                restart: Some(move || {
+                    starts.set(starts.get() + 1);
+                }),
+            };
+        }
+        assert_eq!(starts.get(), 1);
     }
 }
