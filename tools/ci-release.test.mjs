@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -115,9 +116,12 @@ test("parallel checks and builds cannot publish until every required gate passes
   assert.match(updates, /pull_request:\n    branches: \[main\]/);
   assert.match(updates, /group: shina-updates-\$\{\{ github\.event\.pull_request\.number \|\| 'main' \}\}/);
   assert.match(updates, /Preserve normalized mobile fixture failures\n        if: failure\(\)[\s\S]*?path: target\/tmp\/mobile-golden\/\*\.json/);
-  for (const platformName of ["windows", "macos", "linux"]) {
+  for (const platformName of ["windows", "linux"]) {
     assert.match(updates, new RegExp(`\\n  ${platformName}:\\n    if: github.event_name != 'pull_request'\\n`));
-    assert.match(updates, new RegExp(`\\n  publish-${platformName}:\\n    needs: \\[core, ${platformName}\\]`));
+  }
+  assert.match(updates, /macos:\n[\s\S]*?if: github.event_name != 'pull_request' \|\| contains\(github.event.pull_request.labels\.\*\.name, 'validate-macos'\)/);
+  for (const platformName of ["windows", "macos", "linux"]) {
+    assert.match(updates, new RegExp(`\\n  publish-${platformName}:\\n    if: github.event_name != 'pull_request'\\n    needs: \\[core, ${platformName}\\]`));
     assert.match(updates, new RegExp(`version: \\$\\{\\{ needs\\.${platformName}\\.outputs\\.version \\}\\}`));
   }
   // Build jobs start independently, and each publish waits only for its own
@@ -134,6 +138,59 @@ test("parallel checks and builds cannot publish until every required gate passes
   assert.match(publish, /cancel-in-progress: false\n      queue: max/);
   assert.doesNotMatch(publish, /sleep |while true|gh api/);
   assert.match(publish, /node tools\/ci-release\.mjs publish "\$BUILD_VERSION" "\$BUILD_PLATFORM"/);
+});
+
+test("the Intel Mac runner builds and packages the explicit Apple-silicon target", () => {
+  const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
+  const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
+  const packaging = readFileSync(new URL("./package-macos.sh", import.meta.url), "utf8");
+  assert.match(updates, /runner: macos-15-intel\n      target: aarch64-apple-darwin/);
+  assert.match(platform, /rustup target add "\$BUILD_TARGET"/);
+  assert.match(platform, /args\+=\(--target "\$BUILD_TARGET"\)/);
+  assert.match(platform, /cargo build --locked --profile dev-release "\$\{args\[@\]\}"/);
+  assert.match(platform, /runner\.arch/);
+  assert.match(platform, /SHINA_PACKAGE_ARCH: aarch64/);
+  assert.match(platform, /binary="target\/\$BUILD_TARGET\/dev-release\/shina"/);
+  assert.match(packaging, /lipo -archs "\$binary"/);
+  assert.doesNotMatch(packaging, /uname -m/);
+});
+
+test("Mac packaging follows the executable architecture and rejects a mismatched release", {
+  skip: process.platform !== "darwin",
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "shina-cross-package-"));
+  try {
+    mkdirSync(join(root, "tools"));
+    mkdirSync(join(root, "assets"));
+    for (const name of ["package-macos.sh", "install-macos.sh"]) {
+      cpSync(new URL(`./${name}`, import.meta.url), join(root, "tools", name));
+    }
+    cpSync(new URL("../assets/macos", import.meta.url), join(root, "assets/macos"), { recursive: true });
+    writeFileSync(join(root, "Cargo.toml"), '[package]\nname = "shina"\nversion = "0.12.41"\n');
+    writeFileSync(join(root, "fixture.c"), "int main(void) { return 0; }\n");
+    for (const [cpu, arch] of [["arm64", "aarch64"], ["x86_64", "x86_64"]]) {
+      const binary = join(root, `fixture-${cpu}`);
+      execFileSync("xcrun", ["clang", "-arch", cpu, join(root, "fixture.c"), "-o", binary]);
+      const env = { ...process.env, SHINA_SOURCE_REVISION: "a".repeat(40), SHINA_PACKAGE_ARCH: arch };
+      execFileSync("sh", [join(root, "tools/package-macos.sh"), binary], { env, stdio: "pipe" });
+      const archive = join(root, `target/release-package/Shina-macos-${arch}.zip`);
+      const before = readFileSync(archive);
+      assert.ok(before.length > 0);
+      const extracted = join(root, `extracted-${arch}`);
+      execFileSync("/usr/bin/ditto", ["-x", "-k", archive, extracted]);
+      assert.equal(execFileSync("/usr/bin/lipo", ["-archs",
+        join(extracted, "Shina.app/Contents/MacOS/shina")], { encoding: "utf8" }).trim(), cpu);
+      const wrong = spawnSync("sh", [join(root, "tools/package-macos.sh"), binary], {
+        env: { ...env, SHINA_PACKAGE_ARCH: arch === "aarch64" ? "x86_64" : "aarch64" },
+        encoding: "utf8",
+      });
+      assert.notEqual(wrong.status, 0);
+      assert.match(wrong.stderr, /Expected Mac release architecture/);
+      assert.deepEqual(readFileSync(archive), before, "a wrong-architecture build never replaces the valid package");
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("core cache survives failures without PR snapshots evicting main, and reruns reuse commit keys", () => {
