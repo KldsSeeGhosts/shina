@@ -308,7 +308,7 @@ pub fn tools() -> Value {
         "type":"object",
         "description":"The worker's checkout placement. Omit for the default: an isolated Git worktree on its own branch, or the shared project checkout when the workspace is not a Git repository. shared runs read-only in the project checkout and sees its uncommitted changes. existing selects a registered worktree by path or branch. isolated accepts one base from baseBranch, baseCommit or upstreamThreadId; startFromOrigin applies to a base branch.",
         "properties":{
-            "mode":{"enum":["shared","isolated","existing"]},
+            "mode":{"enum":["default","shared","isolated","existing"]},
             "baseBranch":{"type":"string","minLength":1,"description":"The branch the new worktree starts from."},
             "baseCommit":{"type":"string","minLength":1,"description":"The commit the new worktree starts from."},
             "upstreamThreadId":{"type":"integer","minimum":1,"description":"A ready crew or delegated thread whose worktree branch becomes the base."},

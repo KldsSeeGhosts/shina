@@ -3377,7 +3377,7 @@ impl State {
         if brief.len() > 64 * 1024 {
             return Err("The brief and shared crew context exceed the peer's 64 KiB limit. Shorten the brief or crew rules.".into());
         }
-        let placement_spec = placement::spec_from_args(args)?;
+        let mut placement_spec = placement::spec_from_args(args)?;
         let placement_mode = placement_spec
             .as_ref()
             .map(|spec| placement::validate_spec(spec))
@@ -3402,6 +3402,31 @@ impl State {
                 peer.label,
                 crate::protocol::PLACEMENT
             ));
+        }
+        if let Some(spec) = placement_spec.as_mut()
+            && let Some(upstream_id) = spec.upstream_thread_id
+        {
+            // Tool callers know the home's task ids, not the target's private
+            // thread ids. Never forward a home id that could name unrelated
+            // work on the executor.
+            let upstream = self.tasks.iter()
+                .find(|task| task.child_thread_id == upstream_id)
+                .and_then(|task| task.remote.as_ref())
+                .filter(|remote| remote.server_id == peer.server_id
+                    && remote.project["id"] == project["id"])
+                .ok_or("placement.upstreamThreadId must name a delegated task on the same peer project.")?;
+            if upstream
+                .placement
+                .as_ref()
+                .is_none_or(|placement| placement["phase"] != "ready")
+            {
+                return Err("The upstream task's placement is not ready yet.".into());
+            }
+            spec.upstream_thread_id = Some(
+                upstream
+                    .thread_id
+                    .ok_or("The upstream task has no acknowledged peer thread yet.")?,
+            );
         }
         let launch = Command::new(
             "peer.thread.launch",
@@ -3618,7 +3643,7 @@ impl State {
                 thread.native.access = AccessMode::ReadOnly;
             }
             let pending = resolved.phase == placement::PlacementPhase::Pending;
-            if matches!(resolved.mode, placement::PlacementMode::Existing) {
+            if resolved.uses_worktree() {
                 thread.worktree_path = resolved.checkout.clone();
                 thread.branch = resolved.branch.clone();
                 thread.env_mode = Some(ThreadEnvMode::Worktree);
@@ -3815,7 +3840,7 @@ impl State {
                     // the reservation provisions, then deliver both in order.
                     // finish_placement_ready skips its attempt injection while
                     // pending_injections is non-empty.
-                    if !previous_attempt.is_empty() {
+                    if thread.pending_injections.is_empty() && !previous_attempt.is_empty() {
                         thread.pending_injections.push_back(Injection {
                             text: previous_attempt,
                             shown: false,

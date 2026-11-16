@@ -139,7 +139,13 @@ impl ThreadPlacement {
     /// A shared placement never grants write access to a real project
     /// checkout. A private scratch directory stays unrestricted.
     pub fn read_only(&self) -> bool {
-        self.mode == PlacementMode::Shared && self.primary_checkout
+        self.mode == PlacementMode::Shared && (self.primary_checkout || self.repository.is_some())
+    }
+    pub fn uses_worktree(&self) -> bool {
+        self.mode == PlacementMode::Existing
+            || self.mode == PlacementMode::Shared
+                && !self.primary_checkout
+                && self.repository.is_some()
     }
     pub fn value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
@@ -291,6 +297,7 @@ pub(crate) struct IsolatedPlan {
     checkout: PathBuf,
     branch: String,
     base: PlannedBase,
+    base_branch: Option<String>,
     start_from_origin: bool,
     worktrees_dir: PathBuf,
 }
@@ -353,6 +360,21 @@ impl State {
         let requested = validate_spec(&spec)?;
         let project = self.project(thread.project);
         let project_path = project.map(|p| p.path.clone());
+        // A reader of a local parent's tree must see that parent's checkout,
+        // including uncommitted changes in an existing worktree.
+        let shared_worktree = if thread.peer_origin.is_none() {
+            thread
+                .parent
+                .or_else(|| thread.crew_captain.and_then(|id| self.captain_home(id)))
+                .and_then(|parent| self.threads.iter().find(|t| t.id == parent))
+                .filter(|parent| {
+                    parent.project == thread.project && parent.machine == thread.machine
+                })
+                .and_then(|parent| parent.worktree_path.as_deref())
+                .map(PathBuf::from)
+        } else {
+            None
+        };
         let mut git_error = None;
         let common_dir = match project_path
             .as_deref()
@@ -366,6 +388,7 @@ impl State {
             None => None,
         };
         let is_repo = common_dir.is_some();
+        let shared_worktree = shared_worktree.filter(|_| is_repo);
         let mut record = ThreadPlacement {
             requested: PlacementRequest::from_mode(requested),
             mode: PlacementMode::Shared,
@@ -387,11 +410,12 @@ impl State {
             record.capability = capability;
             match &project_path {
                 Some(path) => {
-                    record.checkout = Some(path.to_string_lossy().into_owned());
-                    record.primary_checkout = true;
+                    let checkout = shared_worktree.as_ref().unwrap_or(path);
+                    record.checkout = Some(checkout.to_string_lossy().into_owned());
+                    record.primary_checkout = shared_worktree.is_none();
                     if is_repo {
-                        record.repository = record.checkout.clone();
-                        let (branch, head) = self.shared_checkout_info(path, ctx);
+                        record.repository = Some(path.to_string_lossy().into_owned());
+                        let (branch, head) = self.shared_checkout_info(checkout, ctx);
                         record.branch = branch;
                         record.base_commit = head;
                     }
@@ -511,22 +535,18 @@ impl State {
                         upstream_placement.branch.clone().map(|branch| (id, branch))
                     }
                 };
-                if let Some(commit) = nonempty(spec.base_commit.as_ref()) {
-                    crate::vcs::run_git_checked(
-                        "Placement.baseCommit",
-                        path,
-                        &[
-                            "rev-parse",
-                            "--verify",
-                            "--quiet",
-                            &format!("{commit}^{{commit}}"),
-                        ],
-                        crate::vcs::SHORT_TIMEOUT,
-                        "placement.baseCommit must name a commit in this repository.",
-                        ctx,
-                    )?;
-                }
                 let branch = planned_branch_name(seed, nonempty(spec.branch.as_ref()));
+                crate::vcs::run_git_checked(
+                    "Placement.branchName",
+                    path,
+                    &["check-ref-format", "--branch", &branch],
+                    crate::vcs::SHORT_TIMEOUT,
+                    "placement.branch must be a valid Git branch name.",
+                    ctx,
+                )?;
+                if crate::vcs::branch_exists(path, &branch, ctx) {
+                    return Err("The new placement branch already exists. Choose another branch, or use an existing placement.".into());
+                }
                 let common = common_dir.expect("repo checked above");
                 let checkout = crate::vcs::build_worktree_path(
                     &self.data_dir.join("worktrees"),
@@ -549,6 +569,29 @@ impl State {
                 if let Some(commit) = nonempty(spec.base_commit.as_ref()) {
                     record.base_commit = Some(commit.to_owned());
                 }
+                if record.base_branch.is_none() && record.base_commit.is_none() {
+                    record.base_branch = default_base_branch(path, ctx)?;
+                }
+                let base = record
+                    .base_commit
+                    .as_deref()
+                    .or(record.base_branch.as_deref())
+                    .ok_or("Could not resolve a default base branch. Pass placement.baseBranch.")?;
+                let resolved = crate::vcs::run_git_checked(
+                    "Placement.baseCommit",
+                    path,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--end-of-options",
+                        &format!("{base}^{{commit}}"),
+                    ],
+                    crate::vcs::SHORT_TIMEOUT,
+                    "The placement base must name a commit in this repository.",
+                    ctx,
+                )?;
+                record.base_commit = Some(resolved.stdout.trim().to_owned());
             }
             PlacementMode::Existing => {
                 let selector = nonempty(spec.worktree.as_ref()).expect("validated above");
@@ -613,6 +656,15 @@ impl State {
     }
 
     fn placement_provision_job(&self, index: usize) -> Option<IsolatedPlan> {
+        // Setup owns this pending placement until its runner finishes. Starting
+        // another adoption job here would launch the setup script again.
+        if self.threads[index]
+            .worktree_setup
+            .as_ref()
+            .is_some_and(|setup| setup.phase == WorktreeSetupPhase::Running)
+        {
+            return None;
+        }
         let placement = self.threads[index].placement.as_ref()?;
         if placement.phase != PlacementPhase::Pending
             || placement.mode != PlacementMode::Isolated
@@ -620,7 +672,11 @@ impl State {
         {
             return None;
         }
-        let base = if let Some(branch) = &placement.base_branch {
+        let base = if !placement.start_from_origin
+            && let Some(commit) = &placement.base_commit
+        {
+            PlannedBase::Commit(commit.clone())
+        } else if let Some(branch) = &placement.base_branch {
             if placement.upstream_thread_id.is_some() {
                 PlannedBase::UpstreamBranch(branch.clone())
             } else {
@@ -636,6 +692,7 @@ impl State {
             checkout: PathBuf::from(placement.checkout.as_ref()?),
             branch: placement.branch.clone()?,
             base,
+            base_branch: placement.base_branch.clone(),
             start_from_origin: placement.start_from_origin,
             worktrees_dir: self.data_dir.join("worktrees"),
         })
@@ -649,10 +706,11 @@ impl State {
             return false;
         }
         if thread.peer_origin.is_some() {
-            return thread
-                .peer_origin
-                .as_ref()
-                .is_some_and(|origin| origin.result.is_none());
+            return thread.task_result.is_none()
+                && thread
+                    .peer_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.result.is_none());
         }
         if thread.delegated {
             return self.tasks.iter().any(|task| {
@@ -795,6 +853,11 @@ impl State {
     pub(super) fn finish_placement_ready(&mut self, index: usize) {
         if let Some(placement) = self.threads[index].placement.as_mut() {
             placement.phase = PlacementPhase::Ready;
+        }
+        // A stop may have committed while Git or setup was running. Completing
+        // the reservation must not revive that cancelled work.
+        if !self.placement_wanted(&self.threads[index]) {
+            return;
         }
         let thread = &self.threads[index];
         if thread.peer_origin.is_some() {
@@ -976,7 +1039,7 @@ pub(crate) fn provision_isolated(
     }
     let (start_ref, base_branch) = match &plan.base {
         PlannedBase::UpstreamBranch(branch) => (branch.clone(), Some(branch.clone())),
-        PlannedBase::Commit(commit) => (commit.clone(), None),
+        PlannedBase::Commit(commit) => (commit.clone(), plan.base_branch.clone()),
         PlannedBase::Branch(branch) => (branch.clone(), Some(branch.clone())),
         PlannedBase::DefaultBranch => {
             let branch = default_base_branch(&plan.repo, ctx)?

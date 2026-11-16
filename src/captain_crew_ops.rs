@@ -315,7 +315,7 @@ impl State {
             thread.native.access = AccessMode::ReadOnly;
         }
         let pending = placement.phase == placement::PlacementPhase::Pending;
-        if matches!(placement.mode, placement::PlacementMode::Existing) {
+        if placement.uses_worktree() {
             thread.worktree_path = placement.checkout.clone();
             thread.branch = placement.branch.clone();
             thread.env_mode = Some(ThreadEnvMode::Worktree);

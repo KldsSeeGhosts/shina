@@ -312,6 +312,167 @@ fn shared_reader_gets_parent_checkout_and_stays_read_only() {
 }
 
 #[test]
+fn a_shared_reader_uses_its_parents_dirty_worktree_without_write_access() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("parent-worktree");
+    let parent_checkout = fixture.root.join("parent-checkout");
+    fixture.git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "parent-branch",
+            &parent_checkout.to_string_lossy(),
+            "main",
+        ],
+    );
+    std::fs::write(
+        parent_checkout.join("README.md"),
+        "parent's unsaved changes\n",
+    )
+    .unwrap();
+    let (mut state, connects) = fixture.state();
+    state.threads[0].worktree_path = Some(parent_checkout.to_string_lossy().into_owned());
+    state.threads[0].branch = Some("parent-branch".into());
+    state.threads[0].env_mode = Some(ThreadEnvMode::Worktree);
+    state
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Read my current changes", "placement":{"mode":"shared"}
+            }),
+        )
+        .unwrap();
+    let placement = child_placement(&state, 1);
+    assert_eq!(placement.branch.as_deref(), Some("parent-branch"));
+    assert!(!placement.primary_checkout);
+    assert!(placement.read_only());
+    assert_eq!(state.threads[1].native.access, AccessMode::ReadOnly);
+    let connected = connects.lock().unwrap();
+    assert_eq!(connected.len(), 1);
+    assert_eq!(
+        crate::vcs::real_location(Path::new(&connected[0].1)),
+        crate::vcs::real_location(&parent_checkout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&connected[0].1).join("README.md")).unwrap(),
+        "parent's unsaved changes\n"
+    );
+    assert_eq!(
+        fixture
+            .git(&parent_checkout, &["status", "--porcelain"])
+            .trim(),
+        "M README.md"
+    );
+    assert_eq!(
+        fixture
+            .git(&fixture.repo, &["status", "--porcelain"])
+            .trim(),
+        ""
+    );
+}
+
+#[test]
+fn the_reserved_base_commit_does_not_follow_a_branch_that_moves_before_provisioning() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("pinned-base");
+    let (mut state, _) = fixture.state();
+    let base = fixture
+        .git(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    state
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Build from this base", "placement":{"mode":"isolated","baseBranch":"main"}
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        child_placement(&state, 1).base_commit.as_deref(),
+        Some(base.as_str())
+    );
+    fixture.git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "move main", "--quiet"],
+    );
+    let next = fixture
+        .git(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(base, next);
+    poll_until_ready(&mut state, 15);
+    let placement = child_placement(&state, 1);
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    assert_eq!(placement.base_commit.as_deref(), Some(base.as_str()));
+    let checkout = Path::new(placement.checkout.as_ref().unwrap());
+    assert_eq!(fixture.git(checkout, &["rev-parse", "HEAD"]).trim(), base);
+}
+
+#[test]
+fn remote_upstream_selection_maps_the_home_task_to_its_acknowledged_target() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("upstream-map");
+    fixture.add_origin();
+    let mut home = fixture.parent_state(&[
+        crate::protocol::PEER_TASKS,
+        crate::protocol::THREAD_READ,
+        crate::protocol::PLACEMENT,
+    ]);
+    let upstream = home
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Build upstream", "target":{"machine":"Target","model":"fixture"}
+            }),
+        )
+        .unwrap()["thread_id"]
+        .as_u64()
+        .unwrap() as usize;
+    let target_id = 999;
+    let remote = home.tasks[0].remote.as_mut().unwrap();
+    remote.thread_id = Some(target_id);
+    remote.placement.as_mut().unwrap()["phase"] = json!("ready");
+    let dependent = home
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Build dependent", "target":{"machine":"Target","model":"fixture"},
+                "placement":{"mode":"isolated","upstreamThreadId":upstream}
+            }),
+        )
+        .unwrap();
+    assert!(dependent["thread_id"].is_number());
+    assert_eq!(
+        home.tasks[1].remote.as_ref().unwrap().launch_command.params["placement"]["upstreamThreadId"],
+        target_id
+    );
+    let unrelated = home
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Not a home task", "target":{"machine":"Target","model":"fixture"},
+                "placement":{"mode":"isolated","upstreamThreadId":target_id}
+            }),
+        )
+        .unwrap_err();
+    assert!(unrelated.contains("same peer project"), "{unrelated}");
+}
+
+#[test]
 fn retry_after_provisioning_failure_reuses_the_same_reservation() {
     if !crate::vcs::git_available() {
         return;
@@ -479,6 +640,134 @@ fn setup_failure_starts_no_provider_and_leaves_the_parent_intact() {
             .trim(),
         "A  staged.txt"
     );
+}
+
+#[test]
+fn a_placement_runs_setup_once_without_reprovisioning_during_setup() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("setup-once");
+    std::fs::write(
+        fixture.repo.join(crate::vcs::T3_PROJECT_FILE_NAME),
+        json!({"scripts":[{"name":"setup","command":"exit 0","runOnWorktreeCreate":true}]})
+            .to_string(),
+    )
+    .unwrap();
+    fixture.git(&fixture.repo, &["add", crate::vcs::T3_PROJECT_FILE_NAME]);
+    fixture.git(&fixture.repo, &["commit", "-m", "setup", "--quiet"]);
+    let (mut state, connects) = fixture.state();
+    state
+        .mcp_call(1, "delegate_task", &json!({"prompt":"Write it"}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while state.threads[1].worktree_setup.is_none() {
+        state.poll_placements();
+        assert!(Instant::now() < deadline, "setup never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Do not drain setup yet. Its runner may already have finished, but the
+    // placement is still pending and setup still owns it until we read that result.
+    for _ in 0..3 {
+        state.poll_placements();
+        assert!(state.placement_rxs.is_empty());
+        assert_eq!(state.threads[1].worktree_setup_seq, 1);
+    }
+    assert!(connects.lock().unwrap().is_empty());
+    poll_until_ready(&mut state, 15);
+    assert_eq!(
+        child_placement(&state, 1).phase,
+        placement::PlacementPhase::Ready
+    );
+    assert_eq!(state.threads[1].worktree_setup_seq, 1);
+    assert_eq!(connects.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn interrupted_placement_setup_waits_for_an_explicit_retry_after_restart() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("interrupted-setup");
+    let (mut state, _) = fixture.state();
+    state
+        .mcp_call(1, "delegate_task", &json!({"prompt":"Write it"}))
+        .unwrap();
+    state.threads[1].worktree_setup = Some(WorktreeSetupState {
+        phase: WorktreeSetupPhase::Running,
+        script_name: Some("setup".into()),
+        script_command: Some("exit 0".into()),
+        error: None,
+        output: String::new(),
+        exit_code: None,
+        timed_out: false,
+        duration_ms: 0,
+        skipped: false,
+    });
+    let saved = state.snapshot();
+    let (mut restored, connects) = fixture.state();
+    restored.restore_global(&saved).unwrap();
+    assert_eq!(
+        child_placement(&restored, 1).phase,
+        placement::PlacementPhase::Failed
+    );
+    assert!(
+        child_placement(&restored, 1)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("interrupted")
+    );
+    restored.poll_placements();
+    assert!(restored.placement_rxs.is_empty());
+    assert!(connects.lock().unwrap().is_empty());
+    assert_eq!(fixture.worktree_dirs().len(), 1);
+}
+
+#[test]
+fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("cancel-provisioning");
+    let (mut target, connects) = fixture.state();
+    target.catalog.default_model = Some(crate::session::AgentModel {
+        provider: "cpa".into(),
+        id: "fixture".into(),
+        name: "Fixture".into(),
+        ..Default::default()
+    });
+    let result = target
+        .execute_peer_command(
+            "parent-device",
+            &Command::new(
+                "peer.thread.launch",
+                json!({
+                    "projectId":1, "harness":"pi", "provider":"cpa", "model":"fixture",
+                    "brief":"Do not revive this work", "origin":peer_origin(),
+                    "placement":{"mode":"isolated"}
+                }),
+            ),
+        )
+        .unwrap();
+    let child_id = result["threadId"].as_u64().unwrap() as usize;
+    target.poll_placements();
+    assert_eq!(target.placement_rxs.len(), 1);
+    target
+        .execute_peer_command(
+            "parent-device",
+            &Command::new("peer.thread.stop", json!({"threadId":child_id})),
+        )
+        .unwrap();
+    assert_eq!(target.threads[1].task_result, Some("cancelled"));
+    poll_until_ready(&mut target, 20);
+    assert_eq!(
+        child_placement(&target, 1).phase,
+        placement::PlacementPhase::Ready
+    );
+    assert!(target.threads[1].pending_injections.is_empty());
+    assert!(target.threads[1].pi.is_none());
+    assert!(connects.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -659,6 +948,18 @@ fn peer_launch_provisions_on_the_target_executor() {
         )
         .unwrap();
     assert_eq!(sent["queued"], json!(true));
+    let sent = target
+        .execute_peer_command(
+            "fixture-peer",
+            &Command::new(
+                "peer.thread.send",
+                json!({
+                    "threadId":child_id, "message":"Second follow-up"
+                }),
+            ),
+        )
+        .unwrap();
+    assert_eq!(sent["queued"], true);
     poll_until_ready(&mut target, 15);
     let index = target
         .threads
@@ -674,9 +975,10 @@ fn peer_launch_provisions_on_the_target_executor() {
     assert_eq!(fixture.worktree_dirs().len(), 2);
     // Brief then follow-up, delivered in order once the provider started.
     let injections = &target.threads[index].pending_injections;
-    assert_eq!(injections.len(), 2);
+    assert_eq!(injections.len(), 3);
     assert!(injections[0].text.contains("Do the delegated work"));
     assert!(injections[1].text.contains("Follow-up work"));
+    assert!(injections[2].text.contains("Second follow-up"));
     let connected = connects.lock().unwrap().clone();
     assert_eq!(connected.len(), 1);
     assert_eq!(connected[0].0, child_id);

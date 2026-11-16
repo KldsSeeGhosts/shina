@@ -8537,7 +8537,7 @@ impl State {
                     // and never gains write access to it.
                     thread.native.access = AccessMode::ReadOnly;
                 }
-                if matches!(placement.mode, placement::PlacementMode::Existing) {
+                if placement.uses_worktree() {
                     thread.worktree_path = placement.checkout.clone();
                     thread.branch = placement.branch.clone();
                     thread.env_mode = Some(ThreadEnvMode::Worktree);
@@ -14162,6 +14162,10 @@ impl State {
                                 "Worktree setup was interrupted before restart. Retry or skip to continue."
                                     .into(),
                             );
+                            if let Some(placement) = thread.placement.as_mut() {
+                                placement.phase = placement::PlacementPhase::Failed;
+                                placement.error = s.error.clone();
+                            }
                             thread.worktree_setup_output_open = true;
                         }
                         thread.worktree_setup = setup;

@@ -898,6 +898,218 @@ fn remote_captain_documents_use_the_worker_mcp_endpoint_over_one_way_pairing() {
     target.stop();
 }
 
+#[test]
+fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    let repository = target.root.join("repository");
+    fs::create_dir_all(&repository).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-b", "main", "--quiet"]);
+    fs::write(repository.join("README.md"), "committed base\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "fixture base", "--quiet"]);
+    let base = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fs::write(repository.join("README.md"), "staged parent changes\n").unwrap();
+    git(&["add", "README.md"]);
+    fs::write(
+        repository.join("parent-only.txt"),
+        "untracked parent changes\n",
+    )
+    .unwrap();
+    let original_status = git(&["status", "--porcelain"]);
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let mut executor = target.client(uuid::Uuid::new_v4());
+    let project = executor.command(
+        "project.put",
+        json!({"path":repository}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(project["result"]["status"], "accepted", "{project}");
+    let project = project["result"]["result"]["projectId"].clone();
+    let discovery = target.discovery();
+    let pairing = target.cli(&["pair", "--peer"]);
+    assert!(pairing.status.success());
+    let pairing = String::from_utf8(pairing.stdout).unwrap();
+    let code = pairing
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let linked = home.cli(&[
+        "peer",
+        "link",
+        &format!("127.0.0.1:{}", discovery["port"]),
+        code,
+    ]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let mut owner = home.client(uuid::Uuid::new_v4());
+    owner.until(|state| {
+        state["peers"].as_array().is_some_and(|peers| {
+            peers.iter().any(|peer| {
+                peer["serverId"] == discovery["serverId"]
+                    && peer["capabilities"]["contracts"]
+                        .as_array()
+                        .is_some_and(|contracts| {
+                            contracts
+                                .iter()
+                                .any(|contract| contract == protocol::PLACEMENT)
+                        })
+                    && peer["capabilities"]["models"]
+                        .as_array()
+                        .is_some_and(|models| models.iter().any(|model| model["id"] == "fixture"))
+            })
+        })
+    });
+    let captain = owner.command(
+        "captain.put",
+        json!({"record":{"name":"Placement captain","role":"","instructions":"","portrait":0}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(captain["result"]["status"], "accepted", "{captain}");
+    let opened = owner.command("captain.open", json!({"captain":0}), uuid::Uuid::new_v4());
+    assert_eq!(opened["result"]["status"], "accepted", "{opened}");
+    let parent = opened["result"]["result"]["threadId"].clone();
+    let scope = owner.command(
+        "captain.scope",
+        json!({
+            "captain":0, "projects":[],
+            "remoteProjects":[{"server":discovery["serverId"],"projectId":project}]
+        }),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(scope["result"]["status"], "accepted", "{scope}");
+    let mut homes = Vec::new();
+    for brief in ["placement-writer-one", "placement-writer-two"] {
+        let args = json!({
+            "prompt":brief, "client_request_id":brief,
+            "target":{"environmentId":discovery["serverId"],"projectId":project,"model":"fixture"},
+            "placement":{"mode":"isolated","baseCommit":base}
+        });
+        let accepted = owner.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+        let child = accepted["result"]["result"]["thread_id"].clone();
+        assert!(child.is_number(), "{accepted}");
+        let replay = owner.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(replay["result"]["result"]["thread_id"], child);
+        homes.push(child);
+    }
+    executor.until(|state| {
+        let Some(threads) = state["index"]["threads"].as_array() else {
+            return false;
+        };
+        let workers: Vec<_> = threads
+            .iter()
+            .filter(|thread| thread["peerOrigin"].is_object())
+            .collect();
+        workers.len() == 2
+            && workers.iter().all(|thread| {
+                thread["placement"]["phase"] == "ready"
+                    && thread["placement"]["checkout"]
+                        .as_str()
+                        .is_some_and(|checkout| {
+                            fs::read_to_string(
+                                PathBuf::from(checkout).join("fixture-prompts.jsonl"),
+                            )
+                            .ok()
+                            .is_some_and(|text| {
+                                text.ends_with('\n') && text.contains("placement-writer-")
+                            })
+                        })
+            })
+    });
+    let workers: Vec<_> = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|thread| thread["peerOrigin"].is_object())
+        .collect();
+    let first = workers[0]["placement"].clone();
+    let second = workers[1]["placement"].clone();
+    assert_ne!(first["checkout"], second["checkout"]);
+    assert_ne!(first["branch"], second["branch"]);
+    for worker in &workers {
+        let placement = &worker["placement"];
+        assert_eq!(placement["mode"], "isolated");
+        assert_eq!(placement["baseCommit"], base);
+        let checkout = PathBuf::from(placement["checkout"].as_str().unwrap());
+        assert_ne!(checkout, repository);
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "committed base\n"
+        );
+        assert!(!checkout.join("parent-only.txt").exists());
+        assert_eq!(
+            executor.snapshot["directories"][worker["id"].as_u64().unwrap().to_string()],
+            placement["checkout"]
+        );
+    }
+    owner.until(|state| {
+        state["index"]["tasks"].as_array().is_some_and(|tasks| {
+            tasks.len() == 2
+                && tasks
+                    .iter()
+                    .all(|task| task["remote"]["placement"]["phase"] == "ready")
+        })
+    });
+    for task in owner.snapshot["index"]["tasks"].as_array().unwrap() {
+        let placement = &task["remote"]["placement"];
+        assert!(placement == &first || placement == &second);
+        assert!(homes.contains(&task["child_thread_id"]));
+    }
+    assert_eq!(git(&["status", "--porcelain"]), original_status);
+    assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]).trim(), "main");
+    assert_eq!(
+        git(&["worktree", "list", "--porcelain"])
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        3
+    );
+    assert!(!repository.join("fixture-prompts.jsonl").exists());
+    drop(owner);
+    drop(executor);
+    home.stop();
+    target.stop();
+}
+
 #[cfg(unix)]
 struct PausedProcess(u32);
 #[cfg(unix)]
