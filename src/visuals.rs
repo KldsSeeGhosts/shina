@@ -205,9 +205,15 @@ impl Strip {
         }
         let frames: Vec<Vec<u8>> = (0..clip.frames() as u32)
             .map(|i| {
-                image::imageops::crop_imm(&sheet, i * size, 0, size, size)
-                    .to_image()
-                    .into_raw()
+                // Copy contiguous RGBA rows instead of visiting every pixel through
+                // GenericImageView, which is costly in unoptimized test builds.
+                let row_bytes = size as usize * 4;
+                let start = i as usize * row_bytes;
+                let mut frame = Vec::with_capacity(row_bytes * size as usize);
+                for row in sheet.as_raw().chunks_exact(sheet.width() as usize * 4) {
+                    frame.extend_from_slice(&row[start..start + row_bytes]);
+                }
+                frame
             })
             .collect();
         let cell = crate::crisp::upscale(size, size, &frames[0]);
@@ -300,7 +306,7 @@ pub struct Artwork {
     /// Head crops for tiles of 24 px and below, where the full bust is too small to read.
     small: [Set; PORTRAITS],
     /// Animation strips for full busts. A captain without all four stays static.
-    motion: [Option<Motion>; PORTRAITS],
+    motion: [Option<Arc<Motion>>; PORTRAITS],
     /// KSG Code's Antigravity provider mark, a bitmap rather than an SVG.
     pub antigravity: Image,
     /// Device pixels per point, as the view last saw them (the window's scale times the app's
@@ -332,7 +338,7 @@ impl Artwork {
         let (Ok(crew), Ok(small), Ok(motion)) = (
             <[Set; PORTRAITS]>::try_from(crew),
             <[Set; PORTRAITS]>::try_from(small),
-            <[Option<Motion>; PORTRAITS]>::try_from(motion),
+            <[Option<Arc<Motion>>; PORTRAITS]>::try_from(motion),
         ) else {
             unreachable!("one set per portrait");
         };
@@ -457,7 +463,7 @@ impl Artwork {
 
     /// A captain's animation strips, if its set has them.
     pub fn motion(&self, captain: usize) -> Option<&Motion> {
-        self.motion.get(captain)?.as_ref()
+        self.motion.get(captain)?.as_deref()
     }
 }
 
@@ -472,9 +478,10 @@ fn sprite_root(workspace: &Path) -> Option<PathBuf> {
         })
 }
 
-fn portraits(captain: usize, root: Option<&Path>) -> (Set, Set, Option<Motion>) {
+fn portraits(captain: usize, root: Option<&Path>) -> (Set, Set, Option<Arc<Motion>>) {
     if let Some((set, small, folder)) = root.and_then(|root| load_set(root, captain)) {
-        return (set, small, load_motion(&folder));
+        // User-provided files must be read again for each new app state.
+        return (set, small, load_motion(&folder, captain));
     }
     let (set, small) = embedded(captain);
     (set, small, embedded_motion(captain))
@@ -482,18 +489,34 @@ fn portraits(captain: usize, root: Option<&Path>) -> (Set, Set, Option<Motion>) 
 
 /// All four strips from a drop-in folder, or none: a partial set would animate some states
 /// and not others.
-fn load_motion(folder: &Path) -> Option<Motion> {
-    let strips: Vec<Strip> = Clip::ALL
+fn load_motion(folder: &Path, captain: usize) -> Option<Arc<Motion>> {
+    let pngs: Vec<Vec<u8>> = Clip::ALL
         .iter()
-        .map(|clip| {
-            let png = std::fs::read(folder.join(format!("{}.strip.png", clip.file()))).ok()?;
-            Strip::decode(&png, *clip)
-        })
+        .map(|clip| std::fs::read(folder.join(format!("{}.strip.png", clip.file()))).ok())
         .collect::<Option<_>>()?;
-    Motion::try_from(strips).ok()
+    // A dev checkout contains the embedded files too. Compare fresh bytes so
+    // unchanged files reuse their decodes, without hiding edits to custom art.
+    if pngs
+        .iter()
+        .zip(embedded_motion_pngs(captain))
+        .all(|(disk, embedded)| disk == embedded)
+    {
+        return embedded_motion(captain);
+    }
+    decode_motion(pngs.iter().map(Vec::as_slice)).map(Arc::new)
 }
 
-fn embedded_motion(captain: usize) -> Option<Motion> {
+fn embedded_motion(captain: usize) -> Option<Arc<Motion>> {
+    // Only embedded bytes are immutable. Do not share Artwork itself: window
+    // scale, scaled buffers and portrait playback belong to each app state.
+    static MOTION: [OnceLock<Option<Arc<Motion>>>; PORTRAITS] =
+        [const { OnceLock::new() }; PORTRAITS];
+    MOTION[captain.min(PORTRAITS - 1)]
+        .get_or_init(|| decode_motion(embedded_motion_pngs(captain)).map(Arc::new))
+        .clone()
+}
+
+fn embedded_motion_pngs(captain: usize) -> [&'static [u8]; 4] {
     macro_rules! strips {
         ($name:literal) => {
             [
@@ -505,7 +528,7 @@ fn embedded_motion(captain: usize) -> Option<Motion> {
             ]
         };
     }
-    let pngs = match captain {
+    match captain {
         0 => strips!("ember"),
         1 => strips!("juniper"),
         2 => strips!("sable"),
@@ -518,7 +541,10 @@ fn embedded_motion(captain: usize) -> Option<Motion> {
         9 => strips!("otto"),
         10 => strips!("bolt"),
         _ => strips!("kit"),
-    };
+    }
+}
+
+fn decode_motion<'a>(pngs: impl IntoIterator<Item = &'a [u8]>) -> Option<Motion> {
     let strips: Vec<Strip> = Clip::ALL
         .iter()
         .zip(pngs)
@@ -540,14 +566,25 @@ fn load_set(root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
         }
         let mut images = Vec::with_capacity(Face::COUNT);
         let mut crops = Vec::with_capacity(Face::COUNT);
-        for name in FACE_FILES {
+        let (embedded_faces, embedded_crops) = embedded(captain);
+        for (face, name) in FACE_FILES.iter().enumerate() {
             let bytes = std::fs::read(folder.join(format!("{name}.png"))).ok()?;
-            let image = Art::new(bytes);
+            let image = if bytes.as_slice() == embedded_faces[face].png.as_ref() {
+                embedded_faces[face].clone()
+            } else {
+                Art::new(bytes)
+            };
             image.decoded()?;
             // An optional `<Face>.small.png` head crop; otherwise small tiles use the bust.
             let crop = std::fs::read(folder.join(format!("{name}.small.png")))
                 .ok()
-                .map(Art::new)
+                .map(|bytes| {
+                    if bytes.as_slice() == embedded_crops[face].png.as_ref() {
+                        embedded_crops[face].clone()
+                    } else {
+                        Art::new(bytes)
+                    }
+                })
                 .filter(|crop| crop.decoded().is_some())
                 .unwrap_or_else(|| image.clone());
             images.push(image);
@@ -561,6 +598,13 @@ fn load_set(root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
 }
 
 fn embedded(captain: usize) -> (Set, Set) {
+    static FACES: [OnceLock<(Set, Set)>; PORTRAITS] = [const { OnceLock::new() }; PORTRAITS];
+    FACES[captain.min(PORTRAITS - 1)]
+        .get_or_init(|| embedded_faces(captain))
+        .clone()
+}
+
+fn embedded_faces(captain: usize) -> (Set, Set) {
     macro_rules! set {
         ($name:literal) => {
             (
@@ -668,6 +712,111 @@ pub fn portrait_backdrop(portrait: usize) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_decodes_are_shared_but_window_scale_and_buffers_are_not() {
+        let first = Artwork::load(Path::new(""));
+        let second = Artwork::load(Path::new(""));
+        assert!(!Arc::ptr_eq(&first, &second));
+        for captain in 0..PORTRAITS {
+            assert!(Arc::ptr_eq(
+                first.motion[captain].as_ref().unwrap(),
+                second.motion[captain].as_ref().unwrap()
+            ));
+            for face in 0..Face::COUNT {
+                assert!(Arc::ptr_eq(
+                    &first.crew[captain][face].decoded,
+                    &second.crew[captain][face].decoded
+                ));
+                assert!(Arc::ptr_eq(
+                    &first.small[captain][face].decoded,
+                    &second.small[captain][face].decoded
+                ));
+            }
+        }
+        first.set_scale(2.0);
+        first.face_pixels(0, Face::Normal, 40.0);
+        assert_eq!(first.device_size(40.0), 80);
+        assert_eq!(second.device_size(40.0), 40);
+        assert_eq!(second.cached(), 0);
+        second.set_scale(3.0);
+        assert_eq!(first.cached(), 1);
+        assert_eq!(first.device_size(40.0), 80);
+    }
+
+    #[test]
+    fn strip_row_copies_match_pixel_crops_and_reject_invalid_dimensions() {
+        let encode = |image: &image::RgbaImage| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+            png.into_inner()
+        };
+        for clip in Clip::ALL {
+            let sheet = image::RgbaImage::from_fn(7 * clip.frames() as u32, 7, |x, y| {
+                image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+            });
+            let decoded = Strip::decode(&encode(&sheet), clip).unwrap();
+            assert_eq!(decoded.frames.len(), clip.frames());
+            for (index, frame) in decoded.frames.iter().enumerate() {
+                assert_eq!(
+                    *frame,
+                    image::imageops::crop_imm(&sheet, index as u32 * 7, 0, 7, 7)
+                        .to_image()
+                        .into_raw()
+                );
+            }
+            let invalid = image::RgbaImage::new(sheet.width() + 1, 7);
+            assert!(Strip::decode(&encode(&invalid), clip).is_none());
+        }
+        assert!(Strip::decode(b"invalid PNG", Clip::Idle).is_none());
+    }
+
+    #[test]
+    fn custom_portraits_reload_without_poisoning_embedded_decodes() {
+        let root = std::env::temp_dir().join(format!("shina-art-{}", uuid::Uuid::new_v4()));
+        let folder = root.join(CAPTAIN_KEYS[0]);
+        std::fs::create_dir_all(&folder).unwrap();
+        let (faces, _) = embedded(0);
+        for (name, face) in FACE_FILES.iter().zip(&faces) {
+            std::fs::write(folder.join(format!("{name}.png")), &face.png).unwrap();
+        }
+        let (before, _, _) = portraits(0, Some(&root));
+        std::fs::write(folder.join("Normal.png"), &faces[Face::Happy.index()].png).unwrap();
+        let (after, _, _) = portraits(0, Some(&root));
+        assert_eq!(before[0].png, faces[0].png);
+        assert_eq!(after[0].png, faces[Face::Happy.index()].png);
+        assert!(!Arc::ptr_eq(&before[0].decoded, &after[0].decoded));
+        assert_eq!(embedded(0).0[0].png, faces[0].png);
+        // Only this test's UUID-named temporary sprite folder is removed.
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_disk_motion_reuses_embedded_data_but_edits_and_missing_clips_reload() {
+        let folder = std::env::temp_dir().join(format!("shina-motion-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        for (clip, png) in Clip::ALL.iter().zip(embedded_motion_pngs(0)) {
+            std::fs::write(folder.join(format!("{}.strip.png", clip.file())), png).unwrap();
+        }
+        let original = load_motion(&folder, 0).unwrap();
+        assert!(Arc::ptr_eq(&original, &embedded_motion(0).unwrap()));
+        let clip = Clip::Idle;
+        let mut sheet = image::load_from_memory(embedded_motion_pngs(0)[clip.index()])
+            .unwrap()
+            .to_rgba8();
+        sheet.put_pixel(0, 0, image::Rgba([1, 2, 3, 255]));
+        sheet
+            .save(folder.join(format!("{}.strip.png", clip.file())))
+            .unwrap();
+        let changed = load_motion(&folder, 0).unwrap();
+        assert!(!Arc::ptr_eq(&original, &changed));
+        assert_eq!(&changed[clip.index()].frames[0][..4], &[1, 2, 3, 255]);
+        assert_ne!(&original[clip.index()].frames[0][..4], &[1, 2, 3, 255]);
+        std::fs::remove_file(folder.join(format!("{}.strip.png", Clip::Happy.file()))).unwrap();
+        assert!(load_motion(&folder, 0).is_none());
+        // Only this test's UUID-named temporary sprite folder is removed.
+        std::fs::remove_dir_all(folder).unwrap();
+    }
 
     #[test]
     fn the_upper_bust_lands_on_whole_device_pixels_at_one_and_two_x() {
