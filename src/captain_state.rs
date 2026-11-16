@@ -1063,7 +1063,7 @@ impl State {
         self.crew_scope_check(to, index)
     }
 
-    fn require_captain_capability(&self) -> Result<(), String> {
+    pub(crate) fn require_captain_capability(&self) -> Result<(), String> {
         let Some(client) = &self.client else {
             return Ok(());
         };

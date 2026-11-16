@@ -21,6 +21,31 @@ use std::{
 pub const PROTOCOL: &str = "2025-06-18";
 pub const URL_ENV: &str = "SHINA_MCP_URL";
 pub const TOKEN_ENV: &str = "SHINA_MCP_TOKEN";
+/// The tool name prefix harnesses register this server's tools under.
+pub const TOOL_PREFIX: &str = "mcp__shina__";
+
+/// Whether `prefixed` names a Shina tool this server actually exposes. Harness permission
+/// policies use it to admit only exact `mcp__shina__<tool>` names on a thread's
+/// token-scoped endpoint; lookalike names and foreign MCP tools stay denied. The server
+/// still authorizes every call against the calling thread's role and ownership.
+pub fn is_tool(prefixed: &str) -> bool {
+    let Some(name) = prefixed.strip_prefix(TOOL_PREFIX) else {
+        return false;
+    };
+    tool_names().contains(name)
+}
+
+fn tool_names() -> &'static std::collections::BTreeSet<String> {
+    static NAMES: OnceLock<std::collections::BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        tools()
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    })
+}
 
 /// What every harness is told about Shina. The Pi bridge adds it to the system prompt; other
 /// MCP clients receive it as the server's `instructions`.
@@ -860,6 +885,29 @@ fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shina_tool_allowlist_accepts_exact_advertised_names_only() {
+        for tool in tools().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(is_tool(&format!("{TOOL_PREFIX}{name}")), "{name}");
+        }
+        for name in [
+            "mcp__shina__",
+            "mcp__shina__exec_shell",
+            "mcp__shina__Bash",
+            "mcp__shina__delegate_task ",
+            " mcp__shina__delegate_task",
+            "mcp__Shina__list_threads",
+            "mcp__shina_evil__list_threads",
+            "mcp__shina2__delegate_task",
+            "mcp__server__list_threads",
+            "shina__list_threads",
+            "Bash",
+        ] {
+            assert!(!is_tool(name), "{name}");
+        }
+    }
 
     #[test]
     fn refuses_every_origin_even_with_the_correct_bearer_token() {

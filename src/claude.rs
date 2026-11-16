@@ -235,6 +235,9 @@ struct Client {
     wire: Vec<Value>,
     events: Vec<Value>,
     usage_limits: Value,
+    /// Set only after `mcp_status` proves the resolved `shina` server is this thread's
+    /// token-scoped endpoint; read-only's exact-name admission fails closed without it.
+    shina_bound: bool,
     active_run_id: Option<String>,
     settled_run_id: Option<String>,
     turn_serial: u64,
@@ -284,6 +287,7 @@ impl Client {
             wire: vec![],
             events: vec![],
             usage_limits: Value::Null,
+            shina_bound: false,
             active_run_id: None,
             settled_run_id: None,
             turn_serial: 0,
@@ -293,7 +297,49 @@ impl Client {
     }
 
     fn access(&self) -> &str {
-        &self.start.link.as_ref().expect("MCP required").access_mode
+        // Sessions without the thread-scoped MCP endpoint get the strictest policy.
+        self.start
+            .link
+            .as_ref()
+            .map_or("read-only", |link| link.access_mode.as_str())
+    }
+
+    /// Whether `name` is an authentic Shina coordination tool: an exact `mcp__shina__<tool>`
+    /// name the server advertises, and only after `mcp_status` proved the CLI's resolved
+    /// `shina` server is this thread's token-authenticated endpoint. A foreign or
+    /// unverifiable `shina` registration fails closed, as do spoofed names.
+    fn shina_tool(&self, name: &str) -> bool {
+        self.shina_bound && crate::mcp::is_tool(name)
+    }
+
+    /// The resolved `shina` MCP server must be exactly the inline `--mcp-config` entry this
+    /// session launched with: one server named `shina`, this thread's loopback URL, and the
+    /// bearer header the CLI saw, verbatim or already env-expanded. CLI 2.1.325 resolves
+    /// dynamic `--mcp-config` entries over same-named user, project and local servers, and
+    /// namespaces plugin servers as `plugin:<name>:<server>`; managed policy sources are not
+    /// enumerable here, so identity is checked rather than assumed.
+    fn verify_binding(&self, data: &Value) -> bool {
+        let Some(link) = &self.start.link else {
+            return false;
+        };
+        let servers: Vec<&Value> = data["mcpServers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|server| server["name"] == "shina")
+            .collect();
+        let [server] = servers.as_slice() else {
+            return false;
+        };
+        if server["config"]["url"].as_str() != Some(link.url.as_str()) {
+            return false;
+        }
+        let resolved = format!("Bearer {}", link.token);
+        let literal = format!("Bearer ${{{}}}", crate::mcp::TOKEN_ENV);
+        matches!(
+            server["config"]["headers"]["Authorization"].as_str(),
+            Some(header) if header == resolved || header == literal
+        )
     }
 
     fn launch(&self, command: &mut Command) {
@@ -584,6 +630,15 @@ impl Client {
             json!({"subtype":"get_usage","skipBehaviors":true}),
             json!({"type":"get_usage"}),
         );
+        // Name alone cannot prove which server a `mcp__shina__*` call would reach. The
+        // resolved registration must echo this thread's endpoint before read-only may
+        // admit those names without a dialog.
+        if self.start.link.is_some() {
+            self.request(
+                json!({"subtype":"mcp_status"}),
+                json!({"type":"mcp_status_check"}),
+            );
+        }
         Ok(())
     }
 
@@ -665,14 +720,21 @@ impl Client {
                     }
                     if matches!(
                         pending.request["subtype"].as_str(),
-                        Some("get_context_usage" | "get_usage")
+                        Some("get_context_usage" | "get_usage" | "mcp_status")
                     ) {
+                        // Without a verified binding every `mcp__shina__` name is foreign.
+                        self.update("shinaEndpoint", json!({"bound":false}));
                         return Ok(());
                     }
                     self.reject(&pending.original, error);
                     return Ok(());
                 }
                 let data = &response["response"];
+                if pending.request["subtype"] == "mcp_status" {
+                    self.shina_bound = self.verify_binding(data);
+                    self.update("shinaEndpoint", json!({"bound":self.shina_bound}));
+                    return Ok(());
+                }
                 match pending.request["subtype"].as_str().unwrap_or("") {
                     "initialize" => self.initialized(data)?,
                     "get_usage" => {
@@ -1123,7 +1185,10 @@ impl Client {
                 self.approvals.insert(id.into(), approval);
             }
         } else if self.access() == "read-only" && !read_tool(&name) {
-            self.answer(approval, false, None);
+            // Read-only separates editing the checkout from coordinating authorized
+            // Shina work. Exact mcp__shina__ names on this thread's token-scoped
+            // endpoint proceed; the server authorizes each call by caller role.
+            self.answer(approval, self.shina_tool(&name), None);
         } else if !hook && self.planning && !read_tool(&name) && name != "TodoWrite" {
             // Native plan-file edits need no callback. Other Plan-mode writes
             // must not inherit Full access or Auto-accept edits before approval.
@@ -1301,7 +1366,10 @@ impl Client {
                     }
                 } else {
                     let decision = crate::approval::decision(&record)?;
-                    let decision = if self.access() == "read-only" && !read_tool(&approval.name) {
+                    let decision = if self.access() == "read-only"
+                        && !read_tool(&approval.name)
+                        && !self.shina_tool(&approval.name)
+                    {
                         "decline"
                     } else {
                         decision
@@ -2466,12 +2534,18 @@ fn run_mode(
                 return Err("Claude stopped reading commands.".into());
             }
             let now = Instant::now();
+            let mut status_expired = false;
             client.pending.retain(|_, p| {
-                !(matches!(
+                let droppable = matches!(
                     p.request["subtype"].as_str(),
-                    Some("get_context_usage" | "get_usage")
-                ) && now >= p.deadline)
+                    Some("get_context_usage" | "get_usage" | "mcp_status")
+                ) && now >= p.deadline;
+                status_expired |= droppable && p.request["subtype"] == "mcp_status";
+                !droppable
             });
+            if status_expired {
+                client.update("shinaEndpoint", json!({"bound":false}));
+            }
             if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Claude did not acknowledge an operation within 30 seconds.".into());
             }
