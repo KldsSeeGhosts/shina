@@ -34,7 +34,7 @@ struct Inner {
     batch: Option<std::thread::ThreadId>,
     staged: BTreeMap<String, Value>,
     staged_push: Vec<crate::mobile_push::Staged>,
-    staged_captain_receipts: Vec<Receipt>,
+    staged_tool_receipts: Vec<Receipt>,
     revocations: Vec<String>,
     failure: Option<String>,
     dispatch_fenced: bool,
@@ -228,7 +228,7 @@ impl Database {
             batch: None,
             staged: BTreeMap::new(),
             staged_push: Vec::new(),
-            staged_captain_receipts: Vec::new(),
+            staged_tool_receipts: Vec::new(),
             revocations: Vec::new(),
             failure: None,
             dispatch_fenced: false,
@@ -444,7 +444,7 @@ impl Database {
             return Err(error.clone());
         }
         let staged = std::mem::take(&mut inner.staged);
-        let captain_receipts = std::mem::take(&mut inner.staged_captain_receipts);
+        let tool_receipts = std::mem::take(&mut inner.staged_tool_receipts);
         let history_events = std::mem::take(&mut inner.history_events);
         let metrics_path = if cfg!(debug_assertions) {
             std::env::var_os("SHINA_TEST_STORAGE_METRICS").map(PathBuf::from)
@@ -494,7 +494,7 @@ impl Database {
                     sync_honcho(&tx, &value)?;
                 }
             }
-            for mut tool_receipt in captain_receipts {
+            for mut tool_receipt in tool_receipts {
                 tool_receipt.seq = seq;
                 put_receipt(&tx, &tool_receipt)?;
             }
@@ -681,7 +681,7 @@ impl Database {
             }
             if inner.batch == Some(std::thread::current().id())
                 && let Some(receipt) = inner
-                    .staged_captain_receipts
+                    .staged_tool_receipts
                     .iter()
                     .find(|receipt| receipt.device_id == owner && receipt.command_id == id)
             {
@@ -714,10 +714,68 @@ impl Database {
         self.0
             .lock()
             .expect("database")
-            .staged_captain_receipts
+            .staged_tool_receipts
             .push(Receipt {
                 command_id: command.command_id,
                 device_id: format!("mcp/captain/{captain}"),
+                hash,
+                status: crate::protocol::ReceiptStatus::Accepted,
+                result,
+                seq: 0,
+            });
+        Ok(())
+    }
+
+    /// Local and remote delegation share this caller-scoped durable retry
+    /// contract under an `mcp/delegate/…` audit owner.
+    pub fn delegate_tool_receipt(
+        &self,
+        owner: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<Receipt>, String> {
+        {
+            let inner = self.0.lock().expect("database");
+            if let Some(error) = &inner.failure {
+                return Err(error.clone());
+            }
+            if inner.batch == Some(std::thread::current().id())
+                && let Some(receipt) = inner
+                    .staged_tool_receipts
+                    .iter()
+                    .find(|receipt| receipt.device_id == owner && receipt.command_id == id)
+            {
+                return Ok(Some(receipt.clone()));
+            }
+        }
+        self.receipt(owner, id)
+    }
+
+    pub fn stage_delegate_tool_receipt(
+        &self,
+        owner: &str,
+        command: &crate::protocol::Command,
+        result: Value,
+    ) -> Result<(), String> {
+        if command.method != "task.delegate" {
+            return Err("Unsupported delegate tool receipt.".into());
+        }
+        self.require_batch()?;
+        let hash = command.hash();
+        if let Some(existing) = self.delegate_tool_receipt(owner, command.command_id)? {
+            if existing.hash != hash {
+                return Err(
+                    "client_request_id was already used with a different brief or target.".into(),
+                );
+            }
+            return Ok(());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_tool_receipts
+            .push(Receipt {
+                command_id: command.command_id,
+                device_id: owner.into(),
                 hash,
                 status: crate::protocol::ReceiptStatus::Accepted,
                 result,
@@ -1357,7 +1415,7 @@ impl Database {
         inner.batch = None;
         inner.staged.clear();
         inner.staged_push.clear();
-        inner.staged_captain_receipts.clear();
+        inner.staged_tool_receipts.clear();
         inner.revocations.clear();
         inner.history_events.clear();
     }
@@ -1367,7 +1425,7 @@ impl Database {
         if !inner.revocations.is_empty()
             || !inner.history_events.is_empty()
             || !inner.staged_push.is_empty()
-            || !inner.staged_captain_receipts.is_empty()
+            || !inner.staged_tool_receipts.is_empty()
         {
             return Ok(false);
         }

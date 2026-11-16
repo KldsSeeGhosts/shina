@@ -87,7 +87,10 @@ target.machine is an alias accepting its id, host or label. Read peers[].capabil
 target.projectId, an id on that machine explicitly included in the captain's scope. \
 workspace remains an alias for a target-owned id or opaque path. Do not translate paths between machines. \
 Omit the explicit project only when the caller's Git origin matches exactly one project there. \
-Choose the peer's advertised harness and model, and reuse client_request_id with identical arguments when retrying an uncertain launch. \
+Choose the peer's advertised harness and model. On the local machine and on peers alike, reuse \
+client_request_id with identical arguments when retrying an uncertain launch; an identical retry \
+returns the original task and thread instead of starting new work, while a changed brief, target \
+or workspace under a used key fails. \
 - After delegating, end your turn to await results. Shina wakes you with each child's final \
 status, reply and error, even if you are idle or disconnected. If you are busy, results queue \
 after your current work. These messages are labeled Shina, not user instructions.
@@ -98,6 +101,7 @@ Uncertain tasks become interrupted and require the user to resume or dismiss the
 results wait for the parent's next user turn or an explicit user resume, never a boot-time turn.
 - `delegate_task` and `mcp__shina__task_status` accept `wait_seconds` from 0 to 600, default 0. \
 A nonzero wait returns when the child finishes or the timeout passes. Do not poll in a loop. \
+wait_seconds is a response option outside client_request_id's keyed intent; a retry may change it. \
 `task_status` and `list_threads` report each thread's effective model and \
 reasoning under `selection`; `read_thread` returns it under `thread.selection`.
 - `mcp__shina__task_cancel` stops a child you delegated. `mcp__shina__task_send` sends it \
@@ -344,14 +348,14 @@ pub fn tools() -> Value {
         },
         {
             "name": "delegate_task",
-            "description": "Delegate independent work to a new child with a complete brief and no parent history. For a linked machine, discover projects in orchestrator_capabilities.peers[].capabilities.projects, then pass target.environmentId and target.projectId from the captain's scope. Omit projectId for a unique Git origin match. Optionally pass target from orchestrator_capabilities; omit it to inherit the caller's selection. Unknown ids or levels are rejected before a child starts and are never silently substituted or clamped. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
+            "description": "Delegate independent work to a new child with a complete brief and no parent history. For a linked machine, discover projects in orchestrator_capabilities.peers[].capabilities.projects, then pass target.environmentId and target.projectId from the captain's scope. Omit projectId for a unique Git origin match. Optionally pass target from orchestrator_capabilities; omit it to inherit the caller's selection. Unknown ids or levels are rejected before a child starts and are never silently substituted or clamped. With client_request_id, an identical retry returns the original task and thread instead of starting new work, even at capacity or after completion, deletion, reset or restart. Returns at once unless wait_seconds is set. End your turn to await Shina's completion wake-up. Children cannot delegate.",
             "inputSchema": {"type":"object","properties":{
                 "prompt": {"type":"string","description":"The complete task brief for the new thread."},
                 "title": {"type":"string","description":"A short thread title. Defaults to the start of the prompt."},
                 "captain": {"type":"string","description":"Optional assertion of the calling captain's name. Crew inherits the coordinator's project and profile."},
                 "workspace": {"oneOf":[{"type":"integer"},{"type":"string"}],"description":"Local project id or path in the caller's scope. Required with several local scoped workspaces. For remote work this is a legacy alias for an explicitly scoped target-owned id or opaque path; prefer target.projectId."},
                 "target": target,
-                "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Stable retry key for remote delegation. Reuse it with the identical brief and target after an uncertain response."},
+                "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Stable retry key for local and remote delegation, scoped to the calling Captain or thread. Reuse it with identical arguments after an uncertain response; a changed brief, target or workspace fails. wait_seconds is a response option outside the keyed intent."},
                 "wait_seconds": wait
             },"required":["prompt"],"allOf":[{"not":{"required":["workspace","target"],"properties":{"target":{"required":["projectId"]}}}}]}
         },

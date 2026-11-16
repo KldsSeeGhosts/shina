@@ -537,6 +537,104 @@ fn call_fixture_tool(workspace: &std::path::Path, tool: &str, args: Value) -> Va
     let response: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
     response
 }
+
+#[test]
+fn local_delegate_mcp_retries_keep_one_worker_after_restart_and_deletion() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let workspace = profile.root.join("Shina/chats/1");
+    let connect_parent = |client: &mut Client| {
+        let sent = client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"Initialize the coordinator fixture",
+                "attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(sent["result"]["status"], "accepted", "{sent}");
+        client.until(|state| state["threads"][0]["status"] == "Completed");
+    };
+    connect_parent(&mut client);
+    let args = json!({"prompt":"One keyed worker","title":"Keyed worker",
+        "client_request_id":"local-mcp-retry"});
+    let accepted = |args: Value| {
+        let response = call_fixture_tool(&workspace, "delegate_task", args);
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    let first = accepted(args.clone());
+    let child = first["thread_id"].as_u64().unwrap();
+    let worker_directory = profile.root.join(format!("Shina/chats/{child}"));
+    // Discarding the first response's contents does not require another launch.
+    let retry = accepted(args.clone());
+    assert_eq!(retry["thread_id"], child);
+    assert_eq!(retry["task_id"], first["task_id"]);
+    assert_eq!(retry["replayed"], true);
+    let mut changed = args.clone();
+    changed["prompt"] = json!("Different work under the same key");
+    let rejected = call_fixture_tool(&workspace, "delegate_task", changed);
+    assert_eq!(rejected["result"]["isError"], true, "{rejected}");
+    assert!(
+        rejected.to_string().contains("different brief or target"),
+        "{rejected}"
+    );
+    client.until(|state| {
+        state["index"]["tasks"].as_array().is_some_and(|tasks| {
+            tasks.len() == 1 && tasks[0]["state"] == "completed" && tasks[0]["delivered"] == true
+        })
+    });
+    let prompts_before = fs::read(worker_directory.join("fixture-prompts.jsonl")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&prompts_before).lines().count(), 1);
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    connect_parent(&mut client);
+    let mut waited = args.clone();
+    waited["wait_seconds"] = json!(1);
+    let restarted = accepted(waited);
+    assert_eq!(restarted["thread_id"], child);
+    assert_eq!(restarted["task_id"], first["task_id"]);
+    assert_eq!(
+        fs::read(worker_directory.join("fixture-prompts.jsonl")).unwrap(),
+        prompts_before,
+        "a retry must not submit another provider prompt"
+    );
+    let deleted = client.command(
+        "thread.delete",
+        json!({"threadId":child}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(deleted["result"]["status"], "accepted", "{deleted}");
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    });
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    connect_parent(&mut client);
+    let gone = accepted(args);
+    assert_eq!(gone["thread_id"], child);
+    assert_eq!(gone["task_id"], first["task_id"]);
+    assert_eq!(gone["exists"], false);
+    assert_eq!(gone["replayed"], true);
+    client.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("check-no-recreation"),
+    );
+    assert!(
+        client.snapshot["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[cfg(unix)]
 struct PausedProcess(u32);
 #[cfg(unix)]
