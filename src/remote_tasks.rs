@@ -1410,6 +1410,395 @@ mod tests {
         assert_eq!(restored.task_home(task), restored.captain_home(0));
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
+
+    /// A launched remote worker bound to its task on the origin, with the
+    /// origin's own device credential proving the launch relationship.
+    fn captain_remote_worker() -> (State, Value) {
+        let mut state = captain_fixture();
+        state
+            .mcp_call(1, "delegate_task", &captain_launch_args())
+            .unwrap();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":17})),
+        );
+        let peer = &state.peers[0];
+        let directory = state.data_dir.join("peers").join(&peer.server_id);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("credential.json"),
+            serde_json::to_string(&json!({
+                "serverId":peer.server_id,"host":peer.host,
+                "deviceId":"origin-device","token":"t"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let args = json!({
+            "taskId":state.tasks[0].id,"threadId":17,
+            "workerDeviceId":"origin-device","name":"CREW.md",
+        });
+        (state, args)
+    }
+
+    #[test]
+    fn peer_document_read_serves_a_tail_beyond_the_context_prefix_with_its_revision() {
+        let (mut state, mut args) = captain_remote_worker();
+        let mut text = "x".repeat(10_000);
+        text.push_str("SENTINEL-TAIL-RULE");
+        {
+            let document = state
+                .captain_books
+                .get_mut(&0)
+                .unwrap()
+                .documents
+                .get_mut("CREW.md")
+                .unwrap();
+            document.text = text.clone();
+            document.revision = 7;
+        }
+        args["offset"] = json!(8192);
+        args["maxBytes"] = json!(4096);
+        let page = state.peer_captain_document_read(&args).unwrap();
+        assert_eq!(page["revision"], 7);
+        assert_eq!(page["bytes"], text.len());
+        assert_eq!(
+            page["hash"],
+            super::super::captain_state::document_hash(&text)
+        );
+        let chunk = page["text"].as_str().unwrap();
+        assert!(chunk.ends_with("SENTINEL-TAIL-RULE"), "{chunk}");
+        assert_eq!(chunk.len(), text.len() - 8192);
+        assert_eq!(page["truncated"], false);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_read_pages_the_full_document_and_pins_revisions() {
+        let (mut state, args) = captain_remote_worker();
+        let text: String = (0..super::super::captain_state::DOCUMENT_MAX_BYTES)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        {
+            let document = state
+                .captain_books
+                .get_mut(&0)
+                .unwrap()
+                .documents
+                .get_mut("CREW.md")
+                .unwrap();
+            document.text = text.clone();
+            document.revision = 3;
+        }
+        let mut collected = String::new();
+        let mut offset = 0usize;
+        for _ in 0..10 {
+            let mut page_args = args.clone();
+            page_args["offset"] = json!(offset);
+            page_args["maxBytes"] = json!(10_000);
+            page_args["expectedRevision"] = json!(3);
+            let page = state.peer_captain_document_read(&page_args).unwrap();
+            assert_eq!(page["revision"], 3);
+            let chunk = page["text"].as_str().unwrap();
+            assert!(chunk.len() <= 10_000);
+            collected.push_str(chunk);
+            if page["truncated"].as_bool().unwrap() {
+                offset = page["nextOffset"].as_u64().unwrap() as usize;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(collected, text);
+        // A changed revision is distinguishable from a transport failure.
+        let mut stale = args.clone();
+        stale["expectedRevision"] = json!(2);
+        let error = state.peer_captain_document_read(&stale).unwrap_err();
+        assert!(error.contains("changed since revision 2"), "{error}");
+        let mut past = args.clone();
+        past["offset"] = json!(text.len() + 1);
+        assert_eq!(
+            state.peer_captain_document_read(&past).unwrap_err(),
+            "offset exceeds the document size."
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_read_denies_private_and_unknown_documents() {
+        let (state, args) = captain_remote_worker();
+        let mut private = args.clone();
+        private["name"] = json!("AGENTS.md");
+        let error = state.peer_captain_document_read(&private).unwrap_err();
+        assert!(error.contains("private"), "{error}");
+        let mut unknown = args.clone();
+        unknown["name"] = json!("SECRET.md");
+        assert_eq!(
+            state.peer_captain_document_read(&unknown).unwrap_err(),
+            "Unknown Captain document 'SECRET.md'."
+        );
+        for name in ["NOTES.md", "DIGEST.md"] {
+            let mut shared = args.clone();
+            shared["name"] = json!(name);
+            assert!(
+                state.peer_captain_document_read(&shared).is_ok(),
+                "{name} must remain crew-readable"
+            );
+        }
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_read_binds_the_authenticated_task_worker_and_membership() {
+        let (mut state, args) = captain_remote_worker();
+        let page = state.peer_captain_document_read(&args).unwrap();
+        assert_eq!(page["text"], "SHARED-ONE");
+        // A second Captain's documents are unreachable: no argument can name
+        // a Captain, and identity derives from the task alone.
+        state.captain_books.entry(1).or_default().documents.insert(
+            "CREW.md".into(),
+            super::super::captain_state::CaptainDocument {
+                text: "OTHER-CREW".into(),
+                revision: 1,
+                updated_at: 0,
+            },
+        );
+        let page = state.peer_captain_document_read(&args).unwrap();
+        assert_eq!(page["captain"], 0);
+        assert_eq!(page["text"], "SHARED-ONE");
+        // Model-supplied ids cannot pick another worker, task or device.
+        let mut foreign = args.clone();
+        foreign["threadId"] = json!(18);
+        assert_eq!(
+            state.peer_captain_document_read(&foreign).unwrap_err(),
+            "Permission denied. threadId is not this task's worker."
+        );
+        let mut wrong_task = args.clone();
+        wrong_task["taskId"] = json!("forged-task");
+        assert_eq!(
+            state.peer_captain_document_read(&wrong_task).unwrap_err(),
+            "Permission denied. The worker's task is unknown to this server."
+        );
+        let mut wrong_device = args.clone();
+        wrong_device["workerDeviceId"] = json!("stolen-device");
+        assert_eq!(
+            state.peer_captain_document_read(&wrong_device).unwrap_err(),
+            "Permission denied. This peer did not launch that worker."
+        );
+        let child = state.tasks[0].child_thread_id;
+        state
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == child)
+            .unwrap()
+            .crew_captain = None;
+        assert_eq!(
+            state.peer_captain_document_read(&args).unwrap_err(),
+            "The worker is no longer in the originating Captain's crew."
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_read_denies_revoked_unlinked_and_deleted_workers() {
+        let (mut state, args) = captain_remote_worker();
+        state.tasks[0].remote.as_mut().unwrap().state = RemoteState::Revoked;
+        assert_eq!(
+            state.peer_captain_document_read(&args).unwrap_err(),
+            "This worker's Captain document access was revoked."
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+
+        let (mut state, args) = captain_remote_worker();
+        state.peers.clear();
+        assert_eq!(
+            state.peer_captain_document_read(&args).unwrap_err(),
+            "The peer link to this worker's server was removed."
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+
+        let (mut state, args) = captain_remote_worker();
+        state.captain_lifecycles.insert(
+            0,
+            super::super::captain_lifecycle::CaptainLifecycle {
+                phase: CaptainPhase::Deleted,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.peer_captain_document_read(&args).unwrap_err(),
+            "The originating Captain was deleted."
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_plan_uses_the_launch_origin_not_model_ids() {
+        let mut state = fixture();
+        state.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        let mut worker = Thread::new(state.next_id);
+        state.next_id += 1;
+        worker.peer_origin = Some(PeerOrigin {
+            device_id: "origin-device".into(),
+            server_id: state.peers[0].server_id.clone(),
+            server_label: "Target".into(),
+            parent_thread_id: 1,
+            task_id: "task-1".into(),
+            captain: "Boss".into(),
+            memories: vec![],
+            result: None,
+            acknowledged: false,
+            attempt_message: String::new(),
+            cancelled_commands: vec![],
+            reply_after_position: 0,
+        });
+        let id = worker.id;
+        state.threads.push(worker);
+        let (peer, params) = state
+            .peer_document_plan(
+                id,
+                &json!({"name":"CREW.md","captain":7,"taskId":"forged","offset":128}),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.server_id, state.peers[0].server_id);
+        assert_eq!(params["taskId"], "task-1");
+        assert_eq!(params["workerDeviceId"], "origin-device");
+        assert_eq!(params["threadId"], id);
+        assert_eq!(params["name"], "CREW.md");
+        assert_eq!(params["offset"], 128);
+        assert!(params.get("captain").is_none());
+        // An ordinary caller falls through to local tool handling.
+        assert!(
+            state
+                .peer_document_plan(1, &json!({"name":"CREW.md"}))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_plan_reports_unlinked_and_old_origins() {
+        let mut state = fixture();
+        let mut worker = Thread::new(state.next_id);
+        state.next_id += 1;
+        worker.peer_origin = Some(PeerOrigin {
+            device_id: "origin-device".into(),
+            server_id: state.peers[0].server_id.clone(),
+            server_label: "Target".into(),
+            parent_thread_id: 1,
+            task_id: "task-1".into(),
+            captain: "Boss".into(),
+            memories: vec![],
+            result: None,
+            acknowledged: false,
+            attempt_message: String::new(),
+            cancelled_commands: vec![],
+            reply_after_position: 0,
+        });
+        let id = worker.id;
+        state.threads.push(worker);
+        let error = state
+            .peer_document_plan(id, &json!({"name":"CREW.md"}))
+            .unwrap_err();
+        assert!(error.starts_with("Update required on Target."), "{error}");
+        state.peers.clear();
+        let error = state
+            .peer_document_plan(id, &json!({"name":"CREW.md"}))
+            .unwrap_err();
+        assert!(error.contains("is not linked to this machine"), "{error}");
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn crew_context_manifest_carries_revision_hash_and_coverage() {
+        let mut state = captain_fixture();
+        state.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        let text = format!("{}TAIL", "x".repeat(10_000));
+        state
+            .captain_books
+            .get_mut(&0)
+            .unwrap()
+            .documents
+            .get_mut("CREW.md")
+            .unwrap()
+            .text = text.clone();
+        state
+            .mcp_call(1, "delegate_task", &captain_launch_args())
+            .unwrap();
+        let brief = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .launch_command
+            .params["brief"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(brief.contains("Use captain_document_read"), "{brief}");
+        assert!(brief.contains("revision 1"), "{brief}");
+        assert!(brief.contains("sha256:"), "{brief}");
+        assert!(
+            brief.contains(&super::super::captain_state::document_hash(&text)[..16]),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("this context covers the first 8192 bytes"),
+            "{brief}"
+        );
+        assert!(brief.contains("private to the Captain"), "{brief}");
+        assert!(!brief.contains("PRIVATE-RULES"), "{brief}");
+        assert!(!brief.contains("TAIL"), "{brief}");
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn crew_context_never_names_an_unusable_document_tool() {
+        let mut state = captain_fixture();
+        // The fixture peer advertises no contracts: an old target.
+        state
+            .captain_books
+            .get_mut(&0)
+            .unwrap()
+            .documents
+            .get_mut("CREW.md")
+            .unwrap()
+            .text = "x".repeat(10_000);
+        state
+            .mcp_call(1, "delegate_task", &captain_launch_args())
+            .unwrap();
+        let brief = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .launch_command
+            .params["brief"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!brief.contains("captain_document_read"), "{brief}");
+        assert!(brief.contains("not readable from this worker"), "{brief}");
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":17})),
+        );
+        state.queue_remote_send(0, "More work").unwrap();
+        let message = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .send_command
+            .as_ref()
+            .unwrap()
+            .params["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(!message.contains("captain_document_read"), "{message}");
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2101,6 +2490,249 @@ impl State {
         true
     }
 
+    /// Whether the target's advertised contract set can carry a worker's
+    /// shared-document reads back to this origin.
+    pub(super) fn peer_document_reads_supported(&self, server_id: &str) -> bool {
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .and_then(|db| db.peers().ok())
+            .unwrap_or_else(|| self.peers.clone());
+        peers
+            .iter()
+            .find(|p| p.server_id == server_id)
+            .and_then(|peer| peer.capabilities["contracts"].as_array())
+            .is_some_and(|contracts| {
+                contracts
+                    .iter()
+                    .any(|contract| contract == crate::protocol::CAPTAIN_PEER_DOCUMENTS)
+            })
+    }
+
+    /// Build the authenticated read plan for a peer-launched worker's
+    /// captain_document_read call. The launch origin, never a model-supplied
+    /// id, selects the peer, task and worker identity the origin must verify.
+    fn peer_document_plan(
+        &self,
+        caller: usize,
+        args: &Value,
+    ) -> Result<Option<(crate::peer::Peer, Value)>, String> {
+        let Some(origin) = self
+            .threads
+            .iter()
+            .find(|thread| thread.id == caller)
+            .and_then(|thread| thread.peer_origin.as_ref())
+        else {
+            return Ok(None);
+        };
+        let name = args["name"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 64)
+            .ok_or("name is required. Use CREW.md, NOTES.md or DIGEST.md.")?;
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .and_then(|db| db.peers().ok())
+            .unwrap_or_else(|| self.peers.clone());
+        let peer = peers
+            .iter()
+            .find(|p| p.server_id == origin.server_id)
+            .cloned()
+            .ok_or(format!(
+                "The originating server {} is not linked to this machine.",
+                origin.server_label
+            ))?;
+        if !peer.capabilities["contracts"]
+            .as_array()
+            .is_some_and(|contracts| {
+                contracts
+                    .iter()
+                    .any(|contract| contract == crate::protocol::CAPTAIN_PEER_DOCUMENTS)
+            })
+        {
+            return Err(format!(
+                "Update required on {}. Missing {}.",
+                peer.label,
+                crate::protocol::CAPTAIN_PEER_DOCUMENTS
+            ));
+        }
+        let mut params = json!({
+            "taskId": origin.task_id,
+            "threadId": caller,
+            "workerDeviceId": origin.device_id,
+            "name": name,
+        });
+        for key in ["offset", "maxBytes", "expectedRevision"] {
+            if let Some(value) = args.get(key) {
+                params[key] = value.clone();
+            }
+        }
+        Ok(Some((peer, params)))
+    }
+
+    /// Forward a peer-launched worker's captain_document_read to the
+    /// originating Captain's server as a bounded, revision-pinned page.
+    pub(super) fn peer_document_request(&self, request: &crate::mcp::Request) -> bool {
+        if request.tool != "captain_document_read" {
+            return false;
+        }
+        let Some((peer, params)) = (match self.peer_document_plan(request.thread, &request.args) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = request.reply.send(Err(error));
+                return true;
+            }
+        }) else {
+            return false;
+        };
+        let profile = self.data_dir.clone();
+        let reply = request.reply.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let link = peer.credential(&profile)?;
+                let receipt = peer_runtime().block_on(crate::client::remote_rpc(
+                    &link,
+                    "peer.captain.document.read",
+                    params,
+                ))?;
+                if receipt["status"] != "accepted" {
+                    return Err(receipt["result"]["error"]
+                        .as_str()
+                        .unwrap_or("Captain document read rejected.")
+                        .to_owned());
+                }
+                let page = receipt["result"].clone();
+                if !page["text"].is_string() || !page["revision"].is_u64() {
+                    return Err(format!(
+                        "Update required on {}. The document contract is incompatible.",
+                        peer.label
+                    ));
+                }
+                Ok(page)
+            })();
+            if let Err(error) = &result
+                && error.starts_with("Authentication denied")
+                && let Some(db) = crate::database::for_path(&profile.join("index.json"))
+            {
+                let mut denied = peer.clone();
+                denied.last_error = Some(error.clone());
+                let _ = db.update_peer_status(&denied);
+            }
+            let _ = reply.send(result.map_err(|error| {
+                format!("Cannot read Captain documents on {}: {error}", peer.label)
+            }));
+        });
+        true
+    }
+
+    /// Serve one bounded page of an authorized shared document to the peer
+    /// that launched a worker. Identity comes from this server's task and
+    /// credential records, never from model-supplied ids.
+    pub(super) fn peer_captain_document_read(&self, args: &Value) -> Result<Value, String> {
+        let task_id = args["taskId"].as_str().ok_or("taskId is required.")?;
+        let thread_id = args["threadId"]
+            .as_u64()
+            .and_then(|id| usize::try_from(id).ok())
+            .ok_or("threadId is required.")?;
+        let worker_device = args["workerDeviceId"]
+            .as_str()
+            .ok_or("workerDeviceId is required.")?;
+        let task = self
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .ok_or("Permission denied. The worker's task is unknown to this server.")?;
+        let remote = task
+            .remote
+            .as_ref()
+            .ok_or("Permission denied. That task does not run on a linked server.")?;
+        if remote.state == RemoteState::Revoked {
+            return Err("This worker's Captain document access was revoked.".into());
+        }
+        let peer = crate::database::for_path(&self.data_dir.join("index.json"))
+            .and_then(|db| db.peers().ok())
+            .unwrap_or_else(|| self.peers.clone())
+            .into_iter()
+            .find(|peer| peer.server_id == remote.server_id)
+            .ok_or("The peer link to this worker's server was removed.")?;
+        // The launch authenticated this server's device on the target. The
+        // worker that proves knowledge of that device id is the worker that
+        // peer launched, not a caller asserting an owner id.
+        if peer
+            .credential(&self.data_dir)
+            .map(|link| link.device_id)
+            .ok()
+            .as_deref()
+            != Some(worker_device)
+        {
+            return Err("Permission denied. This peer did not launch that worker.".into());
+        }
+        if remote.thread_id != Some(thread_id) {
+            return Err("Permission denied. threadId is not this task's worker.".into());
+        }
+        let captain = task
+            .coordinator_captain
+            .ok_or("Permission denied. This worker has no originating Captain.")?;
+        if self.captain_phase(captain) == CaptainPhase::Deleted {
+            return Err("The originating Captain was deleted.".into());
+        }
+        if self
+            .threads
+            .iter()
+            .find(|thread| thread.id == task.child_thread_id)
+            .is_none_or(|thread| thread.crew_captain != Some(captain))
+        {
+            return Err("The worker is no longer in the originating Captain's crew.".into());
+        }
+        let name = args["name"]
+            .as_str()
+            .ok_or("name is required. Use CREW.md, NOTES.md or DIGEST.md.")?;
+        match name {
+            "AGENTS.md" => {
+                return Err("Captain document 'AGENTS.md' is private to the Captain. Remote workers cannot read it.".into());
+            }
+            "CREW.md" | "NOTES.md" | "DIGEST.md" => {}
+            _ => return Err(format!("Unknown Captain document '{name}'.")),
+        }
+        let (revision, updated_at, text) = self.captain_document_body(captain, name);
+        if let Some(expected) = args.get("expectedRevision") {
+            let expected = expected
+                .as_u64()
+                .ok_or("expectedRevision must be a nonnegative integer.")?;
+            if expected != revision {
+                return Err(format!(
+                    "Captain document '{name}' changed since revision {expected}."
+                ));
+            }
+        }
+        let bytes = text.len();
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+        if offset > bytes {
+            return Err("offset exceeds the document size.".into());
+        }
+        let max = args["maxBytes"]
+            .as_u64()
+            .unwrap_or(16 * 1024)
+            .clamp(1, 32 * 1024) as usize;
+        let mut start = offset;
+        while !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = start.saturating_add(max).min(bytes);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = end < bytes;
+        Ok(json!({
+            "captain": captain,
+            "name": name,
+            "revision": revision,
+            "hash": super::captain_state::document_hash(text),
+            "updatedAt": updated_at,
+            "bytes": bytes,
+            "offset": start,
+            "text": &text[start..end],
+            "nextOffset": truncated.then_some(end),
+            "truncated": truncated,
+        }))
+    }
+
     #[cfg(test)]
     pub fn demo_remote_task(&mut self, child: usize, label: &str, state: RemoteState) {
         let server_id = uuid::Uuid::new_v4().to_string();
@@ -2412,7 +3044,18 @@ impl State {
             // Keep the delivery marker first. The context is part of this
             // immutable command, not a prefix removed by history recovery.
             brief.push_str("\n\n");
-            brief.push_str(&self.crew_turn_context(captain));
+            brief.push_str(
+                &self.crew_turn_context(
+                    captain,
+                    peer.capabilities["contracts"]
+                        .as_array()
+                        .is_some_and(|contracts| {
+                            contracts
+                                .iter()
+                                .any(|contract| contract == crate::protocol::CAPTAIN_PEER_DOCUMENTS)
+                        }),
+                ),
+            );
         }
         if brief.len() > 64 * 1024 {
             return Err("The brief and shared crew context exceed the peer's 64 KiB limit. Shorten the brief or crew rules.".into());
@@ -2465,7 +3108,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
@@ -2583,6 +3226,9 @@ impl State {
         }
         if command.method == "peer.thread.list" {
             return self.readable_threads(None, &args["read"]);
+        }
+        if command.method == "peer.captain.document.read" {
+            return self.peer_captain_document_read(&args);
         }
         let index = self
             .threads
@@ -2746,8 +3392,12 @@ impl State {
             .and_then(|thread| thread.crew_captain);
         let mut message = message.to_owned();
         if let Some(captain) = captain {
+            let reads = self.tasks[task]
+                .remote
+                .as_ref()
+                .is_some_and(|remote| self.peer_document_reads_supported(&remote.server_id));
             message.push_str("\n\n");
-            message.push_str(&self.crew_turn_context(captain));
+            message.push_str(&self.crew_turn_context(captain, reads));
         }
         if message.len() > 64 * 1024 {
             return Err("The message and shared crew context exceed the peer's 64 KiB limit. Shorten the message or crew rules.".into());

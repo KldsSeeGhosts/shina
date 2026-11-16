@@ -8647,6 +8647,9 @@ impl State {
         {
             return;
         }
+        if request.tool == "captain_document_read" && self.peer_document_request(&request) {
+            return;
+        }
         if matches!(request.tool.as_str(), "html_render" | "html_preview") {
             let Some(thread) = self.threads.iter().find(|t| t.id == request.thread) else {
                 let _ = request

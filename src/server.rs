@@ -929,6 +929,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if captain_events { capabilities.push(protocol::CAPTAIN_EVENTS); }
                         provider_updates = minor >= u64::from(protocol::PROVIDER_UPDATES_MINOR);
                         if provider_updates { capabilities.push(protocol::PROVIDER_UPDATES); }
+                        if minor >= u64::from(protocol::CAPTAIN_PEER_DOCUMENTS_MINOR) {
+                            capabilities.push(protocol::CAPTAIN_PEER_DOCUMENTS);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
