@@ -139,7 +139,8 @@ fn assert_golden(name: &str, actual: &Value) {
     fs::create_dir_all(&dump).unwrap();
     fs::write(dump.join(format!("{name}.json")), &actual).unwrap();
     panic!(
-        "golden fixture {name} does not match the normalized wire shape; actual JSON is in {}",
+        "golden fixture {name} does not match the normalized wire shape; actual JSON is in {}\n\
+         Actual normalized JSON:\n{actual}",
         dump.display()
     );
 }
