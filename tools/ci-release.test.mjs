@@ -122,5 +122,11 @@ test("CI workflows run Core gate in parallel with builds and gate publish on it"
   assert.match(platform, /gh api --paginate "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{GITHUB_RUN_ID\}\/jobs\?per_page=100"/);
   assert.match(platform, /select\(\.name == "Core gate"\)/);
   assert.match(platform, /sleep 15/);
-  assert.match(platform, /1800/);
+  const coreMinutes = Number(updates.match(/\n  core:[\s\S]*?timeout-minutes: (\d+)/)?.[1]);
+  const publishMinutes = Number(platform.match(/\n  publish:[\s\S]*?timeout-minutes: (\d+)/)?.[1]);
+  const waitSeconds = Number(platform.match(/deadline=\$\(\(SECONDS \+ (\d+)\)\)/)?.[1]);
+  assert.equal(coreMinutes, 45);
+  assert.equal(waitSeconds, coreMinutes * 60);
+  assert.ok(publishMinutes >= coreMinutes + 10, "Publishing needs time after the core wait to upload assets");
+  assert.match(platform, /Timed out waiting 45 minutes for Core gate/);
 });

@@ -101,7 +101,7 @@ jobs:
     name: Publish ${{ inputs.platform }}
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 55
     permissions:
       actions: read
       contents: write
@@ -115,7 +115,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          deadline=$((SECONDS + 1800))
+          deadline=$((SECONDS + 2700))
           while true; do
             job_json=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" --jq '.jobs[] | select(.name == "Core gate")')
             if [ -n "$job_json" ]; then
@@ -133,7 +133,7 @@ jobs:
               echo "Core gate job not yet visible"
             fi
             if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "Timed out waiting 30 minutes for Core gate" >&2
+              echo "Timed out waiting 45 minutes for Core gate" >&2
               exit 1
             fi
             sleep 15
