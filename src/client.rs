@@ -2502,6 +2502,15 @@ async fn remote_request_outcome(
         {
             return Err("older protocol".into());
         }
+        if matches!(
+            command.method.as_str(),
+            "providers.refresh" | "providers.update"
+        ) && !hello["capabilities"]
+            .as_array()
+            .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::PROVIDER_UPDATES))
+        {
+            return Err(protocol::PROVIDER_UPDATES_UPDATE_REQUIRED.into());
+        }
         socket
             .send(wire_command(&command))
             .await

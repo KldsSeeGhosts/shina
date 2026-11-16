@@ -638,6 +638,35 @@ impl Database {
             .transpose()
     }
 
+    /// Only the latest committed provider intent per driver matters at startup.
+    /// An accepted receipt with no runner record is interrupted, never redispatched.
+    pub(crate) fn provider_update_intents(&self) -> Result<Vec<Value>, String> {
+        let inner = self.0.lock().expect("database");
+        let mut statement = inner
+            .connection
+            .prepare(
+                "SELECT payload FROM command_receipts
+                 WHERE json_extract(payload,'$.result.providerUpdate') = 1
+                 AND json_extract(payload,'$.status') = 'accepted'
+                 ORDER BY json_extract(payload,'$.seq') DESC",
+            )
+            .map_err(error)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut results = Vec::new();
+        for row in statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(error)?
+        {
+            let receipt: Receipt = serde_json::from_str(&row.map_err(error)?).map_err(error)?;
+            if let Some(driver) = receipt.result["driver"].as_str()
+                && seen.insert(driver.to_owned())
+            {
+                results.push(receipt.result);
+            }
+        }
+        Ok(results)
+    }
+
     /// An audit namespace, never a registered device or an authentication grant.
     pub fn captain_tool_receipt(
         &self,
@@ -1479,7 +1508,12 @@ mod tests {
         database
             .issue_scoped_device("update-only", "test-secret", &["update"])
             .unwrap();
-        for method in ["server.updateStatus", "server.requestUpdate"] {
+        for method in [
+            "server.updateStatus",
+            "server.requestUpdate",
+            "providers.refresh",
+            "providers.update",
+        ] {
             database
                 .authorize("update-only", method, &json!({}))
                 .unwrap();

@@ -434,6 +434,62 @@ fn should_probe(connected: bool, phase: crate::client::ConnectionPhase) -> bool 
     connected || phase != crate::client::ConnectionPhase::Offline
 }
 
+/// KSG's `provider-updates-v1` capability, advertised by machines at protocol minor 36.
+/// The matching `protocol::PROVIDER_UPDATES` constant is wired by the protocol owner.
+use crate::protocol::PROVIDER_UPDATES;
+/// An unreceipted `providers.update` may be one of two serialized provider updates at
+/// 30 minutes each; confirmation waits up to 65 minutes before the send expires.
+const PROVIDER_CONFIRM_MS: i64 = 65 * 60_000;
+/// How often a pending `providers.update` is looked up by its exact command id.
+const PROVIDER_LOOKUP_INTERVAL: Duration = Duration::from_secs(10);
+/// A `providers.refresh` answer stops counting after a minute, so the dialog's
+/// "Checking for more..." always ends.
+const REFRESH_DEADLINE: Duration = Duration::from_secs(60);
+const PROVIDER_CONFIRM_TIMEOUT: &str =
+    "Timed out waiting for provider confirmation. Check versions before retrying.";
+
+/// KSG `updateEverything.logic`'s run phases. Provider installs on every machine run
+/// first, servers follow once they settle, and this app installs last behind a countdown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RunPhase {
+    #[default]
+    Idle,
+    Providers,
+    Servers,
+    Countdown,
+    Installing,
+}
+
+/// One driver update inside a run, KSG's `ServerProviderUpdateState` mirror on this side.
+/// `succeeded` and `unchanged` are terminal; only the server's own record with the exact
+/// accepted `updateId` settles a run, like the server rows' `updateId` rule.
+#[derive(Clone)]
+pub struct ProviderRun {
+    pub driver: String,
+    pub name: String,
+    pub target: String,
+    pub update_id: Option<String>,
+    /// Epoch milliseconds of the send. A receipt lost in transport is never resent; the
+    /// exact command is looked up with `command.get` instead.
+    pub requested_ms: i64,
+    pub outcome: Option<String>,
+    pub message: Option<String>,
+}
+impl ProviderRun {
+    fn settled(&self) -> bool {
+        self.outcome.is_some()
+    }
+}
+
+/// A server that accepted its update and restarted before this app did. It survives in
+/// `updates/everything.json` so a relaunched app keeps following it without resending.
+#[derive(Clone)]
+pub struct HandedOff {
+    pub target: String,
+    pub update_id: String,
+    pub started_ms: i64,
+}
+
 #[derive(Clone)]
 pub struct Row {
     pub server: String,
@@ -445,9 +501,70 @@ pub struct Row {
     pub failed: bool,
     pub update_id: Option<String>,
     pub prior_outcome: Option<String>,
+    /// The machine's in-flight `updateStatus.updateId` before our request; a
+    /// transport-loss adoption must not claim it.
+    pub prior_status_id: Option<String>,
+    /// The machine answered the request and refused. A definitive refusal is never
+    /// erased by adopting a different attempt seen in the projection.
+    pub refused: bool,
     pub attempted: bool,
     pub link: Option<crate::peer::Link>,
+    /// Provider display names this machine can one-click update, as the dialog lists them.
+    pub providers: Vec<String>,
+    /// The providers array from the last `providers.refresh` answer, when the projection
+    /// has not caught up yet.
+    pub providers_view: Option<Value>,
+    /// The machine answers `providers.*` (capability, grant and a connected link).
+    pub provider_capable: bool,
+    /// The release its server installs, when the server updates in this run.
+    pub server_target: Option<String>,
+    /// Its server settled on the target; provider failures can still fail the machine.
+    pub server_updated: bool,
+    pub provider_runs: Vec<ProviderRun>,
+    /// "<machine> <Name>: <message>" lines from provider records that were not `succeeded`.
+    pub provider_failure: Option<String>,
+    pub handed_off: Option<HandedOff>,
+    /// Run start for the elapsed readout; servers reset it when the server phase begins.
+    pub started_at: Instant,
+    /// `Some(true)` is KSG's `done`, `Some(false)` is `failed` (`failed` mirrors it).
+    pub result: Option<bool>,
 }
+impl Row {
+    fn updates_providers(&self) -> bool {
+        !self.provider_runs.is_empty()
+    }
+    /// KSG's machine with no server target: it settles once its providers do.
+    fn provider_only(&self) -> bool {
+        self.server_target.is_none() && self.updates_providers()
+    }
+}
+
+/// The one notice shown after a run, KSG `getUpdateEverythingToastView` in `sea` or
+/// `danger`: a title plus one line per failure and the still-restarting sentence.
+#[derive(Clone)]
+pub struct ResultNotice {
+    pub success: bool,
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+/// A `providers.update` sent through a connected machine's command channel; the receipt
+/// arrives later as an `Event::Receipt` matched by `command_id`.
+struct ProviderSend {
+    server: String,
+    driver: String,
+    /// The fleet row this send belongs to; `usize::MAX` for Settings sends.
+    row: usize,
+    /// The exact `targetVersion` sent; combined with `hash` a looked-up record is
+    /// provably our command.
+    /// `Command::hash` of the sent method and body.
+    hash: String,
+    /// Epoch milliseconds of the send; the confirmation deadline counts from it.
+    requested_ms: i64,
+    /// When the last `command.get` lookup was issued, for throttling.
+    lookup_at: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct Fleet {
     pub open: bool,
@@ -457,33 +574,225 @@ pub struct Fleet {
     sender: Option<mpsc::Sender<(usize, Result<Value, String>, bool)>>,
     pending_handoffs: usize,
     local_started: bool,
+    /// KSG `UpdateEverythingRun.localVersion`: the tag this app installs, when it does.
+    pub local_version: Option<String>,
+    pub phase: RunPhase,
+    pub restart_at: Option<Instant>,
+    /// `providers.refresh` answers still in flight; the dialog reads "Checking for more...".
+    pub refreshing: usize,
+    /// Which machines still owe a refresh answer and since when; each entry clears on
+    /// its answer, on disconnect or after `REFRESH_DEADLINE`.
+    refresh_pending: std::collections::HashMap<String, Instant>,
+    provider_sends: Vec<(uuid::Uuid, ProviderSend)>,
+    /// Send errors and refused receipts for Settings sends, keyed (server, driver).
+    /// Cleared by the next explicit press on that row.
+    pub provider_send_errors: std::collections::HashMap<(String, String), String>,
+    /// The durable `updates/everything.json` was read (or found absent) once per launch.
+    restored: bool,
+    wake_deadline: Option<Instant>,
+    /// The result notice under the capsule (KSG `showUpdateEverythingResult`).
+    pub result_notice: Option<ResultNotice>,
+    /// The capsule's anchored popover is open.
+    pub popover: bool,
+    /// The dialog's "N skipped" disclosure is open.
+    pub skipped_open: bool,
+    /// Provider pill views dismissed by key until their status changes.
+    pub pill_dismissed: std::collections::HashSet<String>,
+    /// Only provider results finished after this instant (epoch ms) may show in the pill.
+    pill_visible_after: Option<i64>,
+    /// The visible success pill and when it appeared, for its 3 s dismissal.
+    pill_shown: Option<(String, Instant)>,
+    /// The current provider pill view, refreshed by `poll_provider_pill`.
+    pub pill: Option<ProviderPillView>,
+    /// `Later` was pressed during the countdown; the popover offers "Restart to update".
+    pub postponed_local: bool,
 }
-
 impl crate::model::State {
-    pub fn fleet_available(&self) -> bool {
+    /// KSG's `hello.capabilities` + `canUpdate` gate for provider rows on a machine.
+    /// Older machines get no provider row and no skip line for providers.
+    fn provider_capable(&self, server: &str) -> bool {
+        if server == "local" {
+            if let Some(client) = &self.client {
+                return client.connected_ready()
+                    && client.has_capability(PROVIDER_UPDATES)
+                    && client.info.lock().expect("connection info")["canUpdate"] == true;
+            }
+            // Embedded mode has no provider backend status integration: the rows
+            // stay visible but one-click updates need the Shina server.
+            return false;
+        }
+        self.machine_connected(server)
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.supports_capability(server, PROVIDER_UPDATES))
+            && self
+                .client
+                .as_ref()
+                .and_then(|client| client.linked.get(server))
+                .is_some_and(|remote| {
+                    remote.info.lock().expect("connection info")["canUpdate"] == true
+                })
+    }
+    /// The providers a machine reports. During a run this is always the live
+    /// projection, never the frozen refresh snapshot. For planning, the refresh
+    /// snapshot wins only while its `checkedAt` is at least as new as the
+    /// projection's for the same server.
+    pub fn machine_providers(&self, server: &str) -> Vec<Value> {
+        let projection = self
+            .machines
+            .views
+            .get(server)
+            .and_then(|view| view["providers"].as_array())
+            .cloned()
+            .unwrap_or_default();
+        if self.fleet.phase != RunPhase::Idle {
+            return projection;
+        }
+        if let Some(row) = self.fleet.rows.iter().find(|row| row.server == server)
+            && let Some(list) = row.providers_view.as_ref().and_then(Value::as_array)
+        {
+            let checked = |providers: &[Value]| {
+                providers
+                    .iter()
+                    .filter_map(|provider| provider["checkedAt"].as_i64())
+                    .max()
+                    .unwrap_or(0)
+            };
+            if checked(list) >= checked(&projection) {
+                return list.clone();
+            }
+        }
+        projection
+    }
+    /// Drivers whose update is one click on this machine: behind a known latest with a
+    /// proven strategy and no active record, KSG `isProviderUpdateCandidate`.
+    /// Each entry is (driver, display name, target version).
+    pub fn provider_candidates(&self, server: &str) -> Vec<(String, String, String)> {
+        self.machine_providers(server)
+            .iter()
+            .filter(|provider| {
+                provider["installed"] == true
+                    && provider["advisory"].as_str() == Some("behind")
+                    && provider["strategy"].is_string()
+                    && provider["latestVersion"].is_string()
+                    && !matches!(
+                        provider["update"]["status"].as_str(),
+                        Some("queued" | "running")
+                    )
+            })
+            .map(|provider| {
+                (
+                    provider["driver"].as_str().unwrap_or("").to_owned(),
+                    provider["name"]
+                        .as_str()
+                        .or_else(|| provider["driver"].as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    provider["latestVersion"].as_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect()
+    }
+    /// Every one-click provider update over every connected, capable machine; each
+    /// entry is (server, driver, display name, target version).
+    pub(crate) fn all_provider_candidates(&self) -> Vec<(String, String, String, String)> {
+        let mut machines: Vec<String> = self
+            .fleet
+            .rows
+            .iter()
+            .filter(|row| row.provider_capable)
+            .map(|row| row.server.clone())
+            .collect();
+        for server in self.machines.views.keys() {
+            if !machines.iter().any(|known| known == server) && self.provider_capable(server) {
+                machines.push(server.clone());
+            }
+        }
+        let mut all = Vec::new();
+        for server in machines {
+            for (driver, name, target) in self.provider_candidates(&server) {
+                all.push((server.clone(), driver, name, target));
+            }
+        }
+        all
+    }
+    /// Machines whose server this run can move to the target release (KSG
+    /// `collectServerUpdateTargets` on the client side).
+    fn server_update_targets(&self) -> usize {
         let target = self
             .updater
             .prepared_update()
-            .map(|u| u.tag.as_str())
-            .unwrap_or(env!("CARGO_PKG_VERSION"));
-        self.client.as_ref().is_some_and(|client| {
-            client.linked.values().any(|remote| {
-                remote
-                    .version()
-                    .is_some_and(|version| crate::update::is_newer(target, &version))
-            })
-        }) || self.machines.views.iter().any(|(id, view)| {
-            id != "local"
-                && crate::update::is_newer(
-                    target,
-                    view["updateStatus"]["runningVersion"]
-                        .as_str()
-                        .unwrap_or(target),
-                )
-        })
+            .map(|u| u.tag.clone())
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
+        let mut counted: std::collections::HashSet<String> = Default::default();
+        if let Some(client) = &self.client {
+            for (id, remote) in &client.linked {
+                let current = remote.version().unwrap_or_else(|| {
+                    self.machines
+                        .views
+                        .get(id)
+                        .and_then(|v| v["updateStatus"]["runningVersion"].as_str())
+                        .unwrap_or("")
+                        .to_owned()
+                });
+                if !crate::update::is_newer(&target, &current) {
+                    continue;
+                }
+                let hello = remote.info.lock().expect("connection info").clone();
+                let status = self
+                    .machines
+                    .views
+                    .get(id)
+                    .map(|view| view["updateStatus"].clone())
+                    .unwrap_or(Value::Null);
+                let online = remote.commands.connected();
+                if skip_reason(online, &hello, &status, &target).is_none() {
+                    counted.insert(id.clone());
+                }
+            }
+        }
+        // Only connected, eligible linked machines count; a stale cached view for a
+        // machine that is not linked right now must not join the summary.
+        counted.len()
     }
+    /// KSG `describeUpdateEverything`'s button summary, or None when nothing updates:
+    /// "Update this app, 2 servers and 3 providers".
+    pub fn update_everything_summary(&self) -> Option<String> {
+        let local = self.updater.prepared_update().is_some();
+        let servers = self.server_update_targets();
+        let providers = self.all_provider_candidates().len();
+        let mut parts = Vec::new();
+        if local {
+            parts.push("this app".to_owned());
+        }
+        parts.extend(count_label(servers, "server"));
+        parts.extend(count_label(providers, "provider"));
+        // The everything button only replaces the local update row when there is
+        // work beyond this app; a local-only update keeps `update_row`.
+        if servers == 0 && providers == 0 {
+            return None;
+        }
+        Some(format!("Update {}", join_list(&parts)))
+    }
+    /// The capsule takes over the footer while a run exists (KSG `SidebarUpdateCapsule`).
+    pub fn fleet_run_visible(&self) -> bool {
+        (!self.fleet.rows.is_empty()
+            && matches!(
+                self.fleet.phase,
+                RunPhase::Providers | RunPhase::Servers | RunPhase::Countdown
+            ))
+            || self.fleet.phase == RunPhase::Installing
+    }
+    #[cfg(test)]
+    pub fn fleet_available(&self) -> bool {
+        self.update_everything_summary().is_some()
+    }
+    /// KSG `useUpdateEverything`'s open: list every machine, then refresh provider
+    /// versions on each connected, capable one while the dialog reads "Checking for
+    /// more...".
     pub fn open_fleet(&mut self) {
-        if self.fleet.running {
+        if self.fleet.running || self.fleet_run_visible() {
             self.fleet.open = true;
             return;
         }
@@ -493,10 +802,24 @@ impl crate::model::State {
             .map(|u| u.tag.clone())
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
         let local_update = self.updater.prepared_update().is_some();
+        let restored = self.fleet.restored;
+        let pill_dismissed = std::mem::take(&mut self.fleet.pill_dismissed);
+        let pill_visible_after = self.fleet.pill_visible_after.take();
+        let pill = self.fleet.pill.take();
         self.fleet = Fleet {
             open: true,
+            restored,
+            pill_dismissed,
+            pill_visible_after,
+            pill,
             ..Default::default()
         };
+        let local_capable = self.provider_capable("local");
+        let local_providers = self
+            .provider_candidates("local")
+            .into_iter()
+            .map(|(_, name, _)| name)
+            .collect();
         self.fleet.rows.push(Row {
             server: "local".into(),
             name: "Local".into(),
@@ -510,15 +833,20 @@ impl crate::model::State {
                 "up to date".into()
             },
             eligible: local_update && self.update_restart_blocker().is_none(),
-            failed: false,
-            update_id: None,
-            prior_outcome: None,
-            attempted: false,
-            link: None,
+            provider_capable: local_capable,
+            providers: local_providers,
+            ..Default::default()
         });
         let (send, receive) = mpsc::channel();
         self.fleet.events = Some(receive);
         self.fleet.sender = Some(send.clone());
+        if local_capable && self.client.is_some() {
+            self.fleet
+                .refresh_pending
+                .insert("local".into(), Instant::now());
+            self.fleet.refreshing = self.fleet.refresh_pending.len();
+            self.refresh_providers("local");
+        }
         if let Some(client) = &self.client {
             for (id, remote) in &client.linked {
                 let Some(link) = remote.remote.clone() else {
@@ -535,6 +863,7 @@ impl crate::model::State {
                 });
                 let online =
                     should_probe(remote.commands.connected(), remote.connection_state().phase);
+                let capable = online && self.provider_capable(id);
                 self.fleet.rows.push(Row {
                     server: id.clone(),
                     name: link.host.clone(),
@@ -545,15 +874,18 @@ impl crate::model::State {
                     } else {
                         "skipped: offline".into()
                     },
-                    eligible: false,
-                    failed: false,
-                    update_id: None,
-                    prior_outcome: None,
-                    attempted: false,
                     link: Some(link.clone()),
+                    provider_capable: capable,
+                    ..Default::default()
                 });
                 if !online {
                     continue;
+                }
+                if capable {
+                    self.fleet
+                        .refresh_pending
+                        .insert(id.clone(), Instant::now());
+                    self.fleet.refreshing = self.fleet.refresh_pending.len();
                 }
                 let send = send.clone();
                 let wake = self.wake.clone();
@@ -561,11 +893,23 @@ impl crate::model::State {
                 std::thread::spawn(move || {
                     let result = tokio::runtime::Runtime::new().map_err(|e| e.to_string()).and_then(|rt| rt.block_on(async {
                         let hello = crate::client::remote_rpc(&link, "hello", json!({})).await?;
+                        let capable = hello["canUpdate"] == true
+                            && hello["capabilities"].as_array().is_some_and(|caps| {
+                                caps.iter().any(|cap| cap == PROVIDER_UPDATES)
+                            });
                         let status = if hello["canUpdate"] == true && hello["protocolMinor"].as_u64().unwrap_or(0) >= 6 {
                             crate::client::remote_rpc(&link, "server.updateStatus", json!({})).await?
                         } else { Value::Null };
                         let skipped = skip_reason(true, &hello, &status, &target);
-                        Ok(json!({"current":hello["binaryVersion"],"skip":skipped,"status":status}))
+                        let providers = if capable {
+                            crate::client::remote_rpc(&link, "providers.refresh", json!({}))
+                                .await
+                                .ok()
+                                .and_then(|value| value["providers"].as_array().cloned())
+                                .unwrap_or_default()
+                        } else { Vec::new() };
+                        Ok(json!({"current":hello["binaryVersion"],"skip":skipped,"status":status,
+                            "providerCapable":capable,"providers":providers}))
                     }));
                     let _ = send.send((index, result, false));
                     wake();
@@ -573,27 +917,405 @@ impl crate::model::State {
             }
         }
     }
+    /// An unreceipted `providers.refresh` for one machine. The answer lands on
+    /// `fleet_rpc`; the next projection carries the same statuses regardless.
+    fn refresh_providers(&self, server: &str) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let target = if server == "local" {
+            Some(client)
+        } else {
+            client.linked.get(server)
+        };
+        if let Some(target) = target {
+            target.call_rpc(
+                format!("fleet:refresh:{server}"),
+                "providers.refresh",
+                json!({}),
+            );
+        }
+    }
+    /// A receipted `providers.update` for one driver on one machine. The receipt lands
+    /// on `fleet_receipt` matched by `command_id`; a lost receipt is never resent, the
+    /// run adopts the record the projection reports instead.
+    fn send_provider_update(
+        &mut self,
+        server: &str,
+        driver: &str,
+        row: usize,
+        target: &str,
+    ) -> Result<(), String> {
+        let params = json!({"driver":driver,"targetVersion":target});
+        let hash = crate::protocol::Command::new("providers.update", params.clone()).hash();
+        let id = self
+            .client
+            .as_ref()
+            .and_then(|client| client.commands_for(server))
+            .ok_or_else(|| "This machine is disconnected.".to_owned())
+            .and_then(|commands| commands.send("providers.update", params))?;
+        self.fleet.provider_sends.push((
+            id,
+            ProviderSend {
+                server: server.into(),
+                driver: driver.into(),
+                row,
+                hash,
+                requested_ms: crate::lifecycle::now() as i64,
+                lookup_at: None,
+            },
+        ));
+        Ok(())
+    }
+    /// A `providers.update` for this driver is still waiting on its exact receipt or
+    /// the confirmation deadline; the Settings row stays gated until then.
+    pub fn provider_send_pending(&self, server: &str, driver: &str) -> bool {
+        self.fleet
+            .provider_sends
+            .iter()
+            .any(|(_, send)| send.server == server && send.driver == driver)
+    }
+    /// The Settings "Update" action outside a fleet run; the pill and the row show the
+    /// outcome from the projection, no run tracks it.
+    pub fn update_provider(&mut self, server: &str, driver: &str) {
+        // An explicit press clears the last error; an unreceipted send still gates a
+        // duplicate until its exact receipt or the confirmation deadline.
+        self.fleet
+            .provider_send_errors
+            .remove(&(server.to_owned(), driver.to_owned()));
+        if self.provider_send_pending(server, driver) {
+            return;
+        }
+        let Some((_, _, target)) = self
+            .provider_candidates(server)
+            .into_iter()
+            .find(|(d, _, _)| d == driver)
+        else {
+            return;
+        };
+        let row = self
+            .fleet
+            .rows
+            .iter()
+            .position(|row| row.server == server)
+            .unwrap_or(usize::MAX);
+        if let Err(error) = self.send_provider_update(server, driver, row, &target) {
+            self.fleet
+                .provider_send_errors
+                .insert((server.into(), driver.into()), error);
+        }
+    }
+    /// Every eligible provider update on every capable machine, for Settings' "Update
+    /// all" (KSG `ProviderUpdatesAction`).
+    pub fn update_all_providers(&mut self) {
+        for (server, driver, _, target) in self.all_provider_candidates() {
+            if self.provider_send_pending(&server, &driver) {
+                continue;
+            }
+            let row = self
+                .fleet
+                .rows
+                .iter()
+                .position(|row| row.server == server)
+                .unwrap_or(usize::MAX);
+            if let Err(error) = self.send_provider_update(&server, &driver, row, &target) {
+                self.fleet
+                    .provider_send_errors
+                    .insert((server, driver), error);
+            }
+        }
+    }
+    /// Receipts for `providers.*` reach here from the client event dispatch. Returns
+    /// true when the command belonged to the fleet, so the dispatch can skip it.
+    /// Root wires one line in `client_state`'s `Event::Receipt` handling:
+    /// `if self.fleet_receipt(&server, &command, &value) { continue; }` (or
+    /// `changed = true` and continue).
+    pub fn fleet_receipt(
+        &mut self,
+        server: &str,
+        command: &crate::protocol::Command,
+        value: &Value,
+    ) -> bool {
+        match command.method.as_str() {
+            "providers.update" => {
+                if let Some(index) = self.fleet.provider_sends.iter().position(|(id, send)| {
+                    *id == command.command_id
+                        && send.server == server
+                        && send.hash == command.hash()
+                }) {
+                    let (_, send) = self.fleet.provider_sends.remove(index);
+                    self.provider_receipt(&send, value);
+                }
+                true
+            }
+            "providers.refresh" => {
+                self.fleet.refresh_pending.remove(server);
+                self.fleet.refreshing = self.fleet.refresh_pending.len();
+                self.record_providers(server, &value["result"]["providers"]);
+                true
+            }
+            _ => false,
+        }
+    }
+    /// `Event::Rpc` answers whose tag starts `fleet:` (root dispatches the prefix
+    /// here). `providers.refresh` is an unreceipted read, so its answer lands on this
+    /// path. Returns true when the tag belonged to the fleet.
+    /// Root wires one arm in `client_state`'s event loop:
+    /// `crate::client::Event::Rpc { tag, result } if self.fleet_rpc(&server, tag, &result) => {}`.
+    pub fn fleet_rpc(&mut self, server: &str, tag: &str, result: &Result<Value, String>) -> bool {
+        let Some(kind) = tag.strip_prefix("fleet:") else {
+            return false;
+        };
+        if kind.strip_prefix("refresh:").is_some() {
+            self.fleet.refresh_pending.remove(server);
+            self.fleet.refreshing = self.fleet.refresh_pending.len();
+            if let Ok(value) = result {
+                self.record_providers(server, &value["providers"]);
+            }
+            return true;
+        }
+        // `fleet:receipt:<uuid>` answers a read-only `command.get` for a send whose
+        // live receipt was lost. The stored receipt must name the exact command id
+        // and carry the hash of the method and body we sent; anything else leaves
+        // the send uncertain until its confirmation deadline.
+        if let Some(id) = kind.strip_prefix("receipt:") {
+            let Ok(command_id) = uuid::Uuid::parse_str(id) else {
+                return true;
+            };
+            let Some(index) = self
+                .fleet
+                .provider_sends
+                .iter()
+                .position(|(send_id, _)| *send_id == command_id)
+            else {
+                return true;
+            };
+            if let Ok(receipt) = result {
+                let send = &self.fleet.provider_sends[index].1;
+                let ours = send.server == server
+                    && receipt["commandId"].as_str() == Some(id)
+                    && receipt["hash"].as_str() == Some(send.hash.as_str());
+                let status = receipt["status"].as_str().unwrap_or("");
+                if ours && matches!(status, "accepted" | "rejected" | "interrupted") {
+                    let (_, send) = self.fleet.provider_sends.remove(index);
+                    self.provider_receipt(&send, receipt);
+                }
+            }
+            return true;
+        }
+        false
+    }
+    /// The freshest provider list for a row: a `providers.refresh` answer until the
+    /// projection carries the same array.
+    fn record_providers(&mut self, server: &str, providers: &Value) {
+        let Some(list) = providers.as_array() else {
+            return;
+        };
+        let names: Vec<String> = list
+            .iter()
+            .filter(|provider| {
+                provider["installed"] == true
+                    && provider["advisory"].as_str() == Some("behind")
+                    && provider["strategy"].is_string()
+                    && provider["latestVersion"].is_string()
+                    && !matches!(
+                        provider["update"]["status"].as_str(),
+                        Some("queued" | "running")
+                    )
+            })
+            .map(|provider| {
+                provider["name"]
+                    .as_str()
+                    .or_else(|| provider["driver"].as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect();
+        if let Some(row) = self.fleet.rows.iter_mut().find(|row| row.server == server) {
+            row.providers_view = Some(Value::Array(list.clone()));
+            row.providers = names;
+        }
+    }
+    /// A `providers.update` receipt: the accepted id arms the run's projection watch,
+    /// a refusal settles the driver at once.
+    fn provider_receipt(&mut self, send: &ProviderSend, value: &Value) {
+        let receipt = if value["result"]["status"].is_string() {
+            &value["result"]
+        } else {
+            value
+        };
+        let accepted_id = receipt["result"]["updateId"]
+            .as_str()
+            .filter(|_| {
+                receipt["status"] == "accepted" && receipt["result"]["updateAccepted"] == true
+            })
+            .map(str::to_owned);
+        let refused = if accepted_id.is_none() {
+            Some(
+                value["error"]["message"]
+                    .as_str()
+                    .or_else(|| value["result"]["error"]["message"].as_str())
+                    .or_else(|| value["result"]["error"].as_str())
+                    .unwrap_or("Update refused.")
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        // Settings sends own no run row; their refusal lands inline on the row.
+        if send.row == usize::MAX {
+            let key = (send.server.clone(), send.driver.clone());
+            match refused {
+                Some(reason) => {
+                    self.fleet.provider_send_errors.insert(key, reason);
+                }
+                None => {
+                    self.fleet.provider_send_errors.remove(&key);
+                }
+            }
+            return;
+        }
+        let Some(row) = self.fleet.rows.get_mut(send.row) else {
+            return;
+        };
+        let Some(run) = row
+            .provider_runs
+            .iter_mut()
+            .find(|run| run.driver == send.driver && !run.settled())
+        else {
+            return;
+        };
+        match accepted_id {
+            Some(id) => run.update_id = Some(id),
+            None => {
+                run.outcome = Some("failed".into());
+                run.message = refused;
+            }
+        }
+    }
+    /// KSG `runUpdateEverything`'s confirm. The dialog closes and the capsule takes
+    /// over; providers run on every machine first.
     pub fn confirm_fleet(&mut self) {
         if self.demo {
             return;
         }
+        let now = Instant::now();
         self.fleet.running = true;
+        self.fleet.open = false;
         self.fleet.local_started = false;
         self.fleet.pending_handoffs = 0;
+        self.fleet.local_version = if self
+            .fleet
+            .rows
+            .first()
+            .is_some_and(|r| r.server == "local" && r.eligible)
+        {
+            self.updater.prepared_update().map(|u| u.tag.clone())
+        } else {
+            None
+        };
+        self.fleet.restart_at = None;
+        self.fleet.result_notice = None;
+        // Phase Providers: every eligible (machine, driver) in parallel.
+        let started_ms = crate::lifecycle::now() as i64;
+        let candidates: Vec<Vec<(String, String, String)>> = self
+            .fleet
+            .rows
+            .iter()
+            .map(|row| {
+                if row.provider_capable {
+                    self.provider_candidates(&row.server)
+                } else {
+                    Vec::new()
+                }
+                .into_iter()
+                .collect()
+            })
+            .collect();
+        for (index, row) in self.fleet.rows.iter_mut().enumerate() {
+            row.started_at = now;
+            row.provider_runs = candidates[index]
+                .iter()
+                .map(|(driver, name, target)| ProviderRun {
+                    driver: driver.clone(),
+                    name: name.clone(),
+                    target: target.clone(),
+                    update_id: None,
+                    requested_ms: started_ms,
+                    outcome: None,
+                    message: None,
+                })
+                .collect();
+            row.server_target = if row.server != "local" && row.eligible {
+                Some(row.target.clone())
+            } else {
+                None
+            };
+        }
+        // The run tracks participating machines only (KSG `run.machines`): the local
+        // row when it installs or updates providers, servers, and provider-only
+        // machines. Skipped and up-to-date rows leave with the dialog.
+        let local_version = self.fleet.local_version.is_some();
+        self.fleet.rows.retain(|row| {
+            row.server_target.is_some()
+                || !row.provider_runs.is_empty()
+                || (local_version && row.server == "local")
+        });
+        self.fleet.phase = if self
+            .fleet
+            .rows
+            .iter()
+            .any(|row| !row.provider_runs.is_empty())
+        {
+            RunPhase::Providers
+        } else {
+            RunPhase::Servers
+        };
+        let mut sends = Vec::new();
+        for (index, row) in self.fleet.rows.iter().enumerate() {
+            for run in &row.provider_runs {
+                sends.push((
+                    row.server.clone(),
+                    run.driver.clone(),
+                    index,
+                    run.target.clone(),
+                ));
+            }
+        }
+        for (server, driver, index, target) in sends {
+            if let Err(reason) = self.send_provider_update(&server, &driver, index, &target)
+                && let Some(run) = self.fleet.rows[index]
+                    .provider_runs
+                    .iter_mut()
+                    .find(|run| run.driver == driver && !run.settled())
+            {
+                run.outcome = Some("failed".into());
+                run.message = Some(reason);
+            }
+        }
+        if self.fleet.phase == RunPhase::Servers {
+            self.start_server_phase();
+        }
+    }
+    /// Phase Servers: each server waits only on the provider phase, not other servers
+    /// (KSG `runUpdateEverything`'s sequencing; there is no v1 staging).
+    fn start_server_phase(&mut self) {
+        let now = Instant::now();
         let indices: Vec<_> = self
             .fleet
             .rows
             .iter()
             .enumerate()
-            .filter(|(i, r)| *i != 0 && r.eligible)
+            .filter(|(_, r)| r.server != "local" && r.server_target.is_some() && r.result.is_none())
             .map(|(i, _)| i)
             .collect();
         for index in indices {
+            self.fleet.rows[index].started_at = now;
             self.start_fleet_row(index);
         }
     }
     pub fn start_fleet_row(&mut self, index: usize) {
-        if index == 0 {
+        if self.fleet.rows[index].server == "local" {
             self.restart_notice = None;
             if let Some(blocker) = self.update_restart_blocker() {
                 self.fleet.rows[0].state = format!("failed: {blocker}");
@@ -602,6 +1324,17 @@ impl crate::model::State {
                 self.fleet.rows[0].state = "restarting".into();
                 self.restart_for_update = true;
             }
+            return;
+        }
+        // A server that already runs the target settles without a request (KSG's retry
+        // of a machine whose host rejects a same-version update).
+        if let Some(target) = self.fleet.rows[index].server_target.clone()
+            && self.machine_runs_version(&self.fleet.rows[index].server, &target)
+        {
+            self.fleet.rows[index].result = Some(true);
+            self.fleet.rows[index].server_updated = true;
+            self.fleet.rows[index].failed = false;
+            self.fleet.rows[index].state = format!("updated to {target}");
             return;
         }
         let Some(link) = self.fleet.rows[index].link.clone() else {
@@ -613,14 +1346,23 @@ impl crate::model::State {
         self.fleet.pending_handoffs += 1;
         self.fleet.rows[index].state = "downloading".into();
         self.fleet.rows[index].failed = false;
+        self.fleet.rows[index].result = None;
         self.fleet.rows[index].update_id = None;
         self.fleet.rows[index].attempted = true;
-        self.fleet.rows[index].prior_outcome = self
+        let status_before = self
             .machines
             .views
             .get(&self.fleet.rows[index].server)
-            .and_then(|view| view["updateStatus"]["lastOutcome"]["updateId"].as_str())
+            .map(|view| view["updateStatus"].clone());
+        self.fleet.rows[index].prior_outcome = status_before
+            .as_ref()
+            .and_then(|status| status["lastOutcome"]["updateId"].as_str())
             .map(str::to_owned);
+        self.fleet.rows[index].prior_status_id = status_before
+            .as_ref()
+            .and_then(|status| status["updateId"].as_str())
+            .map(str::to_owned);
+        self.fleet.rows[index].refused = false;
         self.fleet.rows[index].eligible = false;
         let wake = self.wake.clone();
         std::thread::spawn(move || {
@@ -637,56 +1379,910 @@ impl crate::model::State {
             wake();
         });
     }
+    /// The machine's server already runs `target` (KSG `runsVersion`).
+    fn machine_runs_version(&self, server: &str, target: &str) -> bool {
+        let running = if server == "local" {
+            Some(env!("CARGO_PKG_VERSION"))
+        } else {
+            self.machines
+                .views
+                .get(server)
+                .and_then(|view| view["updateStatus"]["runningVersion"].as_str())
+        };
+        running
+            .is_some_and(|running| !running.is_empty() && !crate::update::is_newer(target, running))
+    }
+    /// `Later` cancels the countdown; the capsule popover then offers "Restart to
+    /// update" (KSG `postponeUpdateRestart` + `onRestart`).
+    pub fn postpone_update_restart(&mut self) {
+        if self.fleet.phase == RunPhase::Countdown {
+            self.fleet.phase = RunPhase::Servers;
+            self.fleet.restart_at = None;
+            self.fleet.local_version = None;
+            self.fleet.postponed_local = true;
+            // A local row that only waited to install leaves the run without being
+            // counted updated; settled provider results and failures stay. The
+            // postponed restart is still offered while the row is gone.
+            self.fleet.rows.retain(|row| {
+                row.server != "local" || row.result.is_some() || !row.provider_runs.is_empty()
+            });
+            if self.fleet.rows.is_empty() {
+                self.fleet.running = false;
+                self.fleet.phase = RunPhase::Idle;
+            }
+        }
+    }
+    /// The popover's "Restart to update" after a postponed countdown.
+    pub fn restart_postponed_update(&mut self) {
+        if self.fleet.local_version.is_none()
+            && self.update_restart_blocker().is_none()
+            && self.updater.prepared_update().is_some()
+        {
+            self.fleet.local_version = self.updater.prepared_update().map(|u| u.tag.clone());
+            self.fleet.postponed_local = false;
+            self.install_local_now();
+        }
+    }
+    /// Countdown zero: the durable result lands first, then the restart request. A
+    /// refused restart deletes the file in `record_fleet_restart_result`.
+    fn install_local_now(&mut self) {
+        if let Err(error) = self.save_update_everything() {
+            self.record_local_failure(format!(
+                "This app: Could not save update recovery state: {error}"
+            ));
+            self.fleet.phase = RunPhase::Servers;
+            self.fleet.local_version = None;
+            self.fleet.restart_at = None;
+            return;
+        }
+        self.fleet.phase = RunPhase::Installing;
+        self.fleet.restart_at = None;
+        self.restart_for_update = true;
+    }
+    /// `prepared_exit` refused the restart the capsule asked for. Root wires one line
+    /// in `client_state`'s restart check, after `restart_notice` is set:
+    /// `self.record_fleet_restart_result(&error)`. A coordinated-restart "error" is a
+    /// pending state, not a refusal.
+    pub fn record_fleet_restart_result(&mut self, error: &str) {
+        if self.fleet.phase != RunPhase::Installing
+            || error.starts_with("Coordinated restart requested")
+        {
+            return;
+        }
+        if let Err(error) = std::fs::remove_file(self.data_dir.join("updates/everything.json"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.storage_error = Some(format!(
+                "Could not clear the cancelled update's recovery record: {error}"
+            ));
+        }
+        self.record_local_failure(format!("This app: {error}"));
+        self.fleet.phase = RunPhase::Servers;
+        self.fleet.local_version = None;
+    }
+    fn record_local_failure(&mut self, failure: String) {
+        if let Some(row) = self.fleet.rows.first_mut()
+            && row.server == "local"
+        {
+            row.result = Some(false);
+            row.failed = true;
+            row.state = format!("failed: {}", failure.trim_start_matches("This app: "));
+        }
+        if let Some(notice) = &mut self.fleet.result_notice {
+            notice.lines.push(failure);
+            notice.success = false;
+        } else {
+            self.fleet.result_notice = Some(ResultNotice {
+                success: false,
+                title: "Update failed".into(),
+                lines: vec![failure],
+            });
+        }
+    }
+    /// The durable `<data>/updates/everything.json`, written right before this app's
+    /// restart and read once at the next launch (KSG `saveUpdateEverythingResult`).
+    fn save_update_everything(&self) -> Result<(), String> {
+        let updated_servers = self
+            .fleet
+            .rows
+            .iter()
+            .filter(|row| row.server_updated)
+            .count();
+        let updated_providers = self
+            .fleet
+            .rows
+            .iter()
+            .flat_map(|row| &row.provider_runs)
+            .filter(|run| run.outcome.as_deref() == Some("succeeded"))
+            .count();
+        let failures = self.run_failures();
+        let handed_off: Vec<Value> = self
+            .fleet
+            .rows
+            .iter()
+            .filter(|row| row.result.is_none() || row.state == "restarting")
+            .filter_map(|row| {
+                let handoff = row.handed_off.as_ref()?;
+                Some(json!({"server":row.server,"label":row.name,
+                    "targetVersion":handoff.target,"updateId":handoff.update_id,
+                    "startedAt":handoff.started_ms}))
+            })
+            .collect();
+        let saved = json!({"savedAt":crate::lifecycle::now(),
+            "localVersion":self.fleet.local_version,
+            "updatedServers":updated_servers,"updatedProviders":updated_providers,
+            "failures":failures,"handedOff":handed_off});
+        let path = self.data_dir.join("updates/everything.json");
+        std::fs::create_dir_all(path.parent().unwrap_or(&self.data_dir))
+            .map_err(|e| e.to_string())?;
+        crate::store::write_atomic(&path, saved.to_string().as_bytes()).map_err(|e| e.to_string())
+    }
+    /// One failure line per machine/provider result, for the saved file and the notice.
+    fn run_failures(&self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for row in &self.fleet.rows {
+            if let Some(failure) = &row.provider_failure {
+                failures.extend(failure.lines().map(str::to_owned));
+            }
+            if row.result == Some(false)
+                && let Some(reason) = row.state.strip_prefix("failed: ")
+                && Some(reason) != row.provider_failure.as_deref()
+            {
+                let name = if row.server == "local" {
+                    "This app"
+                } else {
+                    &row.name
+                };
+                failures.push(format!("{name}: {reason}"));
+            }
+        }
+        failures
+    }
+    /// Read and delete `everything.json` once per launch: show the saved result, then
+    /// rebuild a Servers-phase run that follows each handed-off machine until it reports
+    /// the target version, its outcome, or 32 minutes (KSG `followHandedOffServers`).
+    fn restore_update_everything(&mut self) {
+        self.fleet.restored = true;
+        let path = self.data_dir.join("updates/everything.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        let Ok(saved) = serde_json::from_slice::<Value>(&bytes) else {
+            return;
+        };
+        let now_ms = crate::lifecycle::now() as i64;
+        let saved_ms = saved["savedAt"].as_i64().unwrap_or(0);
+        if now_ms.saturating_sub(saved_ms) > 10 * 60 * 1000 {
+            return;
+        }
+        let mut failures: Vec<String> = saved["failures"]
+            .as_array()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let local_version = saved["localVersion"].as_str();
+        if let Some(version) = local_version
+            && env!("CARGO_PKG_VERSION") != version
+        {
+            failures.insert(
+                0,
+                format!(
+                    "Update did not apply. Shina is still on {}. Install {version} again \
+                     from the update button.",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+        }
+        let handed_off = saved["handedOff"].as_array().cloned().unwrap_or_default();
+        let restarting: Vec<String> = handed_off
+            .iter()
+            .filter_map(|server| server["label"].as_str().map(str::to_owned))
+            .collect();
+        let updated_servers = saved["updatedServers"].as_u64().unwrap_or(0) as usize;
+        let updated_providers = saved["updatedProviders"].as_u64().unwrap_or(0) as usize;
+        let local_updated = local_version.is_some_and(|v| v == env!("CARGO_PKG_VERSION"));
+        if local_updated || updated_servers + updated_providers > 0 || !failures.is_empty() {
+            let mut notice =
+                result_notice(local_updated, updated_servers, updated_providers, failures);
+            if !restarting.is_empty() {
+                notice.lines.push(format!(
+                    "{} {} still restarting.",
+                    join_list(&restarting),
+                    if restarting.len() == 1 { "is" } else { "are" }
+                ));
+            }
+            self.fleet.result_notice = Some(notice);
+        }
+        if handed_off.is_empty() {
+            return;
+        }
+        self.fleet.running = true;
+        self.fleet.phase = RunPhase::Servers;
+        for entry in &handed_off {
+            let server = entry["server"].as_str().unwrap_or("").to_owned();
+            let started_ms = entry["startedAt"].as_i64().unwrap_or(now_ms);
+            let elapsed = now_ms.saturating_sub(started_ms).max(0) as u64;
+            let name = entry["label"]
+                .as_str()
+                .unwrap_or(server.as_str())
+                .to_owned();
+            let target = entry["targetVersion"].as_str().unwrap_or("").to_owned();
+            self.fleet.rows.push(Row {
+                server,
+                name,
+                target: target.clone(),
+                state: "restarting".into(),
+                update_id: entry["updateId"].as_str().map(str::to_owned),
+                handed_off: Some(HandedOff {
+                    target,
+                    update_id: entry["updateId"].as_str().unwrap_or("").to_owned(),
+                    started_ms,
+                }),
+                started_at: Instant::now() - Duration::from_millis(elapsed.min(600_000)),
+                ..Default::default()
+            });
+        }
+    }
+    /// KSG `resolveUpdateRunMachineStatus`: result if set, then restarting for a handed
+    /// off machine, the provider phase word, the server's own state, else waiting.
+    pub fn run_status(&self, row: &Row) -> &'static str {
+        match row.result {
+            Some(true) => return "done",
+            Some(false) => return "failed",
+            None => {}
+        }
+        if row.failed {
+            return "failed";
+        }
+        if row.handed_off.is_some() || row.state == "restarting" {
+            return "restarting";
+        }
+        if self.fleet.phase == RunPhase::Providers && row.updates_providers() {
+            return "providers";
+        }
+        match row.state.as_str() {
+            "downloading" | "checking" | "ready" => "downloading",
+            _ => "waiting",
+        }
+    }
+    /// The capsule label, tone and action, KSG `describeUpdateCapsule`.
+    pub fn describe_capsule(&self) -> CapsuleView {
+        let now = Instant::now();
+        if self.fleet.phase == RunPhase::Countdown
+            && let Some(at) = self.fleet.restart_at
+        {
+            let seconds = (at.saturating_duration_since(now).as_secs() + 1).min(5);
+            return CapsuleView {
+                tone: CapsuleTone::Default,
+                label: format!("Restart in {seconds}s"),
+                elapsed: None,
+                action: CapsuleAction::Later,
+            };
+        }
+        if self.fleet.phase == RunPhase::Installing {
+            return CapsuleView {
+                tone: CapsuleTone::Default,
+                label: "Restarting...".into(),
+                elapsed: None,
+                action: CapsuleAction::None,
+            };
+        }
+        let statuses: Vec<(&Row, &'static str)> = self
+            .fleet
+            .rows
+            .iter()
+            .map(|row| (row, self.run_status(row)))
+            .collect();
+        let active: Vec<(&Row, &'static str)> = statuses
+            .iter()
+            .copied()
+            .filter(|(_, status)| matches!(*status, "providers" | "downloading" | "restarting"))
+            .collect();
+        if let Some((row, _)) = active
+            .iter()
+            .min_by_key(|(row, _)| row.started_at)
+            .filter(|(row, _)| now.duration_since(row.started_at) >= Duration::from_secs(180))
+        {
+            return CapsuleView {
+                tone: CapsuleTone::Slow,
+                label: row.name.clone(),
+                elapsed: Some(format_update_elapsed(now.duration_since(row.started_at))),
+                action: CapsuleAction::None,
+            };
+        }
+        let done = statuses
+            .iter()
+            .filter(|(_, status)| *status == "done")
+            .count();
+        if statuses
+            .iter()
+            .any(|(_, status)| !matches!(*status, "done" | "failed"))
+        {
+            return CapsuleView {
+                tone: CapsuleTone::Default,
+                label: format!("{done} of {} updated", self.fleet.rows.len()),
+                elapsed: None,
+                action: CapsuleAction::None,
+            };
+        }
+        if self.fleet.local_version.is_some()
+            && let crate::update::Status::Downloading { .. } = self.updater.status()
+        {
+            // The updater exposes no real progress, so the capsule says only
+            // "Downloading" rather than an invented percentage.
+            return CapsuleView {
+                tone: CapsuleTone::Default,
+                label: "Downloading".into(),
+                elapsed: None,
+                action: CapsuleAction::None,
+            };
+        }
+        let failed: Vec<&Row> = statuses
+            .iter()
+            .filter(|(_, status)| *status == "failed")
+            .map(|(row, _)| *row)
+            .collect();
+        if !failed.is_empty() {
+            let label = if failed.len() == 1 {
+                format!("{} failed", failed[0].name)
+            } else {
+                format!("{} failed", failed.len())
+            };
+            return CapsuleView {
+                tone: CapsuleTone::Failed,
+                label,
+                elapsed: None,
+                action: if failed
+                    .iter()
+                    .any(|row| row.server_target.is_some() && !row.server_updated)
+                {
+                    CapsuleAction::Retry
+                } else {
+                    CapsuleAction::Dismiss
+                },
+            };
+        }
+        CapsuleView {
+            tone: CapsuleTone::Default,
+            label: format!("{done} of {} updated", self.fleet.rows.len()),
+            elapsed: None,
+            action: CapsuleAction::None,
+        }
+    }
+    /// The capsule action button: Later cancels the countdown, Retry resends only
+    /// failed servers (providers are retried from Settings, as KSG does), Dismiss
+    /// drops settled machines.
+    pub fn capsule_action(&mut self) {
+        match self.describe_capsule().action {
+            CapsuleAction::Later => self.postpone_update_restart(),
+            CapsuleAction::Retry => {
+                let retry: Vec<usize> = self
+                    .fleet
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| {
+                        row.result == Some(false)
+                            && row.server_target.is_some()
+                            && !row.server_updated
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                for index in retry {
+                    self.fleet.rows[index].result = None;
+                    self.fleet.rows[index].failed = false;
+                    self.start_fleet_row(index);
+                }
+            }
+            CapsuleAction::Dismiss => self.dismiss_settled_machines(),
+            CapsuleAction::None => {}
+        }
+    }
+    /// KSG `dismissSettledUpdateRunMachines`; the capsule disappears when none remain
+    /// and no local install is pending.
+    pub fn dismiss_settled_machines(&mut self) {
+        self.fleet.rows.retain(|row| row.result.is_none());
+        if self.fleet.rows.is_empty() && self.fleet.local_version.is_none() {
+            self.fleet.running = false;
+            self.fleet.phase = RunPhase::Idle;
+        }
+        self.fleet.popover = false;
+    }
+    /// The local row's popover line, KSG `localStatusLabel`.
+    pub fn capsule_local_status(&self) -> Option<String> {
+        if self.fleet.local_version.is_none() && !self.fleet.postponed_local {
+            return None;
+        }
+        if self.fleet.phase == RunPhase::Countdown
+            && let Some(at) = self.fleet.restart_at
+        {
+            let seconds = (at.saturating_duration_since(Instant::now()).as_secs() + 1).min(5);
+            return Some(format!("restarts in {seconds}s"));
+        }
+        if self.fleet.phase == RunPhase::Installing {
+            return Some("restarting".into());
+        }
+        if self.fleet.local_version.is_some()
+            && let crate::update::Status::Downloading { .. } = self.updater.status()
+        {
+            return Some("downloading".into());
+        }
+        Some("restarts after the servers".into())
+    }
+    /// Recompute the provider pill from the local machine's providers (KSG reads the
+    /// primary server only). Runs in `poll_fleet`, so the 3 s success dismissal needs
+    /// no extra timer.
+    fn poll_provider_pill(&mut self) {
+        if self.fleet.pill_visible_after.is_none() {
+            let checked = self
+                .machine_providers("local")
+                .iter()
+                .filter_map(|provider| provider["checkedAt"].as_i64())
+                .max();
+            self.fleet.pill_visible_after = checked.or(Some(crate::lifecycle::now() as i64));
+        }
+        let visible_after = self.fleet.pill_visible_after.unwrap_or(0);
+        let providers = self.machine_providers("local");
+        let dismissed = |key: &str| self.fleet.pill_dismissed.contains(key);
+        let names = |list: &[&Value]| -> Vec<String> {
+            list.iter()
+                .map(|provider| {
+                    provider["name"]
+                        .as_str()
+                        .or_else(|| provider["driver"].as_str())
+                        .unwrap_or("")
+                        .to_owned()
+                })
+                .collect()
+        };
+        let key_of = |prefix: &str, list: &[&Value]| -> String {
+            let mut keys: Vec<String> = list
+                .iter()
+                .map(|provider| {
+                    format!(
+                        "{}:{}:{}",
+                        provider["driver"].as_str().unwrap_or(""),
+                        provider["update"]["finishedAt"].as_i64().unwrap_or(0),
+                        provider["update"]["message"].as_str().unwrap_or("")
+                    )
+                })
+                .collect();
+            keys.sort();
+            format!("{prefix}:{}", keys.join("|"))
+        };
+        let active: Vec<&Value> = providers
+            .iter()
+            .filter(|provider| {
+                matches!(
+                    provider["update"]["status"].as_str(),
+                    Some("queued" | "running")
+                )
+            })
+            .collect();
+        if !active.is_empty() {
+            let title = if active.len() == 1 {
+                format!("Updating {}", names(&active)[0])
+            } else {
+                format!("Updating {} providers", active.len())
+            };
+            self.fleet.pill = Some(ProviderPillView {
+                key: key_of("loading", &active),
+                tone: PillTone::Loading,
+                title,
+                dismissible: false,
+            });
+            return;
+        }
+        let terminal = |status: &str| -> Vec<&Value> {
+            providers
+                .iter()
+                .filter(|provider| {
+                    provider["update"]["status"].as_str() == Some(status)
+                        && provider["update"]["finishedAt"].as_i64().unwrap_or(0) > visible_after
+                })
+                .collect()
+        };
+        let failed = terminal("failed");
+        if !failed.is_empty() {
+            let key = key_of("failed", &failed);
+            if dismissed(&key) {
+                self.fleet.pill = None;
+                return;
+            }
+            let title = if failed.len() == 1 {
+                let version = failed[0]["update"]["targetVersion"]
+                    .as_str()
+                    .map(|v| format!(" v{v}"))
+                    .unwrap_or_default();
+                format!("{}{version} update failed", names(&failed)[0])
+            } else {
+                format!("{} provider updates failed", failed.len())
+            };
+            self.fleet.pill = Some(ProviderPillView {
+                key,
+                tone: PillTone::Error,
+                title,
+                dismissible: true,
+            });
+            return;
+        }
+        let unchanged = terminal("unchanged");
+        if !unchanged.is_empty() {
+            let key = key_of("unchanged", &unchanged);
+            if dismissed(&key) {
+                self.fleet.pill = None;
+                return;
+            }
+            let title = if unchanged.len() == 1 {
+                format!("{} still needs an update", names(&unchanged)[0])
+            } else {
+                format!("{} providers still need updates", unchanged.len())
+            };
+            self.fleet.pill = Some(ProviderPillView {
+                key,
+                tone: PillTone::Warning,
+                title,
+                dismissible: true,
+            });
+            return;
+        }
+        let succeeded = terminal("succeeded");
+        if !succeeded.is_empty() {
+            let key = key_of("succeeded", &succeeded);
+            if dismissed(&key) {
+                self.fleet.pill = None;
+                return;
+            }
+            let title = succeeded[0]["update"]["message"]
+                .as_str()
+                .unwrap_or("Provider updated")
+                .to_owned();
+            self.fleet.pill = Some(ProviderPillView {
+                key,
+                tone: PillTone::Success,
+                title,
+                dismissible: false,
+            });
+            return;
+        }
+        self.fleet.pill = None;
+    }
+    /// The `update-result` notice's dismiss; the notice does not come back.
+    pub fn dismiss_result_notice(&mut self) {
+        self.fleet.result_notice = None;
+    }
+    /// The pill's dismiss button ("Dismiss provider update notice"), keyed until the
+    /// status changes.
+    pub fn dismiss_provider_pill(&mut self) {
+        if let Some(view) = self.fleet.pill.take() {
+            self.fleet.pill_dismissed.insert(view.key);
+        }
+    }
+    /// A sleeper wake so the countdown, elapsed readouts, the 32 minute handoff limit
+    /// and the pill's 3 s dismissal refresh without a timer thread. `tx.wake_after`
+    /// lives in the poll callers, which fleet code cannot reach.
+    fn schedule_fleet_wake(&mut self, at: Instant) {
+        if let Some(deadline) = self.fleet.wake_deadline
+            && deadline > Instant::now()
+            && deadline <= at
+        {
+            return;
+        }
+        self.fleet.wake_deadline = Some(at);
+        let wake = self.wake.clone();
+        std::thread::spawn(move || {
+            let wait = at.saturating_duration_since(Instant::now());
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
+            }
+            wake();
+        });
+    }
     pub fn poll_fleet(&mut self) -> bool {
         let mut changed = false;
+        if !self.fleet.restored {
+            self.restore_update_everything();
+            changed = true;
+        }
+        let mut drained = Vec::new();
         if let Some(events) = &self.fleet.events {
-            while let Ok((index, result, requested)) = events.try_recv() {
-                changed = true;
-                let Some(row) = self.fleet.rows.get_mut(index) else {
-                    continue;
-                };
-                if requested {
-                    self.fleet.pending_handoffs = self.fleet.pending_handoffs.saturating_sub(1);
+            while let Ok(event) = events.try_recv() {
+                drained.push(event);
+            }
+        }
+        for (index, result, requested) in drained {
+            changed = true;
+            let Some(row) = self.fleet.rows.get_mut(index) else {
+                continue;
+            };
+            if requested {
+                self.fleet.pending_handoffs = self.fleet.pending_handoffs.saturating_sub(1);
+            }
+            match result {
+                Ok(value) if requested && value["status"] == "accepted" => {
+                    row.failed = false;
+                    row.update_id = value["result"]["updateId"].as_str().map(str::to_owned);
+                    row.state = "downloading".into();
                 }
-                match result {
-                    Ok(value) if requested && value["status"] == "accepted" => {
-                        row.failed = false;
-                        row.update_id = value["result"]["updateId"].as_str().map(str::to_owned);
-                        row.state = "downloading".into();
+                Ok(value) if !requested => {
+                    row.prior_outcome = value["status"]["lastOutcome"]["updateId"]
+                        .as_str()
+                        .map(str::to_owned);
+                    row.prior_status_id = value["status"]["updateId"].as_str().map(str::to_owned);
+                    row.current = value["current"].as_str().unwrap_or(&row.current).into();
+                    row.provider_capable = value["providerCapable"] == true;
+                    if let Some(list) = value["providers"].as_array() {
+                        row.providers_view = Some(Value::Array(list.clone()));
                     }
-                    Ok(value) if !requested => {
-                        row.prior_outcome = value["status"]["lastOutcome"]["updateId"]
+                    self.fleet.refresh_pending.remove(&row.server);
+                    self.fleet.refreshing = self.fleet.refresh_pending.len();
+                    row.state = if let Some(reason) = value["skip"].as_str() {
+                        format!("skipped: {reason}")
+                    } else if crate::update::is_newer(&row.target, &row.current) {
+                        row.eligible = true;
+                        "will update".into()
+                    } else {
+                        "up to date".into()
+                    };
+                    let server = row.server.clone();
+                    let providers = row.providers_view.clone();
+                    let _ = row;
+                    if let Some(providers) = providers {
+                        self.record_providers(&server, &providers);
+                    }
+                }
+                result => {
+                    if !requested {
+                        self.fleet.refresh_pending.remove(&row.server);
+                        self.fleet.refreshing = self.fleet.refresh_pending.len();
+                    }
+                    // An answered refusal is definitive; a transport error stays
+                    // uncertain so a later exact id may still adopt.
+                    let refused = matches!(&result, Ok(_));
+                    let reason = match result {
+                        Err(e) => e,
+                        Ok(v) => v["result"]["error"]
                             .as_str()
-                            .map(str::to_owned);
-                        row.current = value["current"].as_str().unwrap_or(&row.current).into();
-                        row.state = if let Some(reason) = value["skip"].as_str() {
-                            format!("skipped: {reason}")
-                        } else if crate::update::is_newer(&row.target, &row.current) {
-                            row.eligible = true;
-                            "will update".into()
-                        } else {
-                            "up to date".into()
-                        };
-                    }
-                    result => {
-                        let reason = match result {
-                            Err(e) => e,
-                            Ok(v) => v["result"]["error"]
-                                .as_str()
-                                .unwrap_or("Update refused.")
-                                .into(),
-                        };
-                        // The link was not offline, the probe reached the network and failed.
-                        // The reason says how, for example a stopped server.
-                        row.state = if requested {
-                            format!("failed: {reason}")
-                        } else {
-                            format!("skipped: {reason}")
-                        };
-                        row.failed = requested;
+                            .unwrap_or("Update refused.")
+                            .into(),
+                    };
+                    // The link was not offline, the probe reached the network and failed.
+                    // The reason says how, for example a stopped server.
+                    row.state = if requested {
+                        format!("failed: {reason}")
+                    } else {
+                        format!("skipped: {reason}")
+                    };
+                    row.failed = requested;
+                    if requested {
+                        row.result = Some(false);
+                        row.refused = refused;
                     }
                 }
             }
+        }
+        // Provider runs settle from the projection: the record with the accepted
+        // updateId reaching a terminal status. `succeeded` counts; `unchanged` and
+        // `failed` record "<machine> <Name>: <message>".
+        let now_ms = crate::lifecycle::now() as i64;
+        for index in 0..self.fleet.rows.len() {
+            let server = self.fleet.rows[index].server.clone();
+            let providers = self.machine_providers(&server);
+            for run_index in 0..self.fleet.rows[index].provider_runs.len() {
+                if self.fleet.rows[index].provider_runs[run_index].settled() {
+                    continue;
+                }
+                if now_ms
+                    .saturating_sub(self.fleet.rows[index].provider_runs[run_index].requested_ms)
+                    >= PROVIDER_CONFIRM_MS
+                {
+                    let run = &mut self.fleet.rows[index].provider_runs[run_index];
+                    run.outcome = Some("failed".into());
+                    run.message = Some(PROVIDER_CONFIRM_TIMEOUT.into());
+                    changed = true;
+                    continue;
+                }
+                let driver = self.fleet.rows[index].provider_runs[run_index]
+                    .driver
+                    .clone();
+                let record_update = providers
+                    .iter()
+                    .find(|provider| provider["driver"].as_str() == Some(driver.as_str()))
+                    .map(|provider| provider["update"].clone());
+                // No start-time adoption: only the exact accepted id, from the live
+                // receipt or a `command.get` lookup, marks this run's record.
+                let accepted = self.fleet.rows[index].provider_runs[run_index]
+                    .update_id
+                    .clone();
+                let Some(update) = record_update else {
+                    continue;
+                };
+                let status = update["status"].as_str().unwrap_or("");
+                match accepted.as_deref() == update["updateId"].as_str() {
+                    true if matches!(status, "succeeded" | "unchanged" | "failed") => {
+                        let run = &mut self.fleet.rows[index].provider_runs[run_index];
+                        run.outcome = Some(status.into());
+                        run.message = update["message"].as_str().map(str::to_owned);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            // Provider failures collect into the machine's provider_failure.
+            let failures: Vec<String> = self.fleet.rows[index]
+                .provider_runs
+                .iter()
+                .filter(|run| matches!(run.outcome.as_deref(), Some("unchanged" | "failed")))
+                .map(|run| {
+                    format!(
+                        "{} {}: {}",
+                        self.fleet.rows[index].name,
+                        run.name,
+                        run.message.as_deref().unwrap_or("update failed")
+                    )
+                })
+                .collect();
+            let joined = (!failures.is_empty()).then(|| failures.join("\n"));
+            if self.fleet.rows[index].provider_failure != joined {
+                self.fleet.rows[index].provider_failure = joined;
+                changed = true;
+            }
+            // A provider-only machine settles when its providers do.
+            if self.fleet.rows[index].provider_only()
+                && self.fleet.rows[index].result.is_none()
+                && self.fleet.rows[index]
+                    .provider_runs
+                    .iter()
+                    .all(ProviderRun::settled)
+            {
+                let failed = self.fleet.rows[index].provider_failure.is_some();
+                self.fleet.rows[index].result = Some(!failed);
+                self.fleet.rows[index].failed = failed;
+                self.fleet.rows[index].state = if failed {
+                    format!(
+                        "failed: {}",
+                        self.fleet.rows[index]
+                            .provider_failure
+                            .clone()
+                            .unwrap_or_default()
+                    )
+                } else {
+                    "done".into()
+                };
+                changed = true;
+            }
+        }
+        // Refresh answers stop counting on disconnect or after the deadline, so
+        // "Checking for more..." never sticks.
+        if !self.fleet.refresh_pending.is_empty() {
+            let now = Instant::now();
+            let pending: Vec<String> = self.fleet.refresh_pending.keys().cloned().collect();
+            for server in pending {
+                let connected = self
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.commands_for(&server))
+                    .is_some_and(|commands| commands.connected());
+                let stale = self
+                    .fleet
+                    .refresh_pending
+                    .get(&server)
+                    .is_some_and(|at| now.duration_since(*at) >= REFRESH_DEADLINE);
+                if !connected || stale {
+                    self.fleet.refresh_pending.remove(&server);
+                }
+            }
+            if self.fleet.refreshing != self.fleet.refresh_pending.len() {
+                self.fleet.refreshing = self.fleet.refresh_pending.len();
+                changed = true;
+            }
+            if let Some(oldest) = self.fleet.refresh_pending.values().min() {
+                self.schedule_fleet_wake(*oldest + REFRESH_DEADLINE);
+            }
+        }
+        // Unreceipted `providers.update` sends never resend. The exact command is
+        // looked up read-only by its id; a machine that cannot produce its receipt
+        // stays uncertain until the 65 minute confirmation deadline.
+        let connectivity: std::collections::BTreeMap<String, bool> = self
+            .fleet
+            .provider_sends
+            .iter()
+            .map(|(_, send)| send.server.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|server| {
+                let connected = self.machine_connected(&server);
+                (server, connected)
+            })
+            .collect();
+        let mut lookups = Vec::new();
+        let mut expired = Vec::new();
+        for (index, (id, send)) in self.fleet.provider_sends.iter_mut().enumerate() {
+            if now_ms.saturating_sub(send.requested_ms) >= PROVIDER_CONFIRM_MS {
+                expired.push(index);
+                continue;
+            }
+            if connectivity.get(&send.server).copied().unwrap_or(false)
+                && send
+                    .lookup_at
+                    .is_none_or(|at| at.elapsed() >= PROVIDER_LOOKUP_INTERVAL)
+            {
+                send.lookup_at = Some(Instant::now());
+                lookups.push((send.server.clone(), *id));
+            }
+        }
+        for index in expired.into_iter().rev() {
+            let (_, send) = self.fleet.provider_sends.remove(index);
+            changed = true;
+            if send.row == usize::MAX {
+                self.fleet.provider_send_errors.insert(
+                    (send.server.clone(), send.driver.clone()),
+                    PROVIDER_CONFIRM_TIMEOUT.to_owned(),
+                );
+                continue;
+            }
+            if let Some(run) = self.fleet.rows.get_mut(send.row).and_then(|row| {
+                row.provider_runs
+                    .iter_mut()
+                    .find(|run| run.driver == send.driver && !run.settled())
+            }) {
+                run.outcome = Some("failed".into());
+                run.message = Some(PROVIDER_CONFIRM_TIMEOUT.into());
+            }
+        }
+        for (server, id) in lookups {
+            let target = if server == "local" {
+                self.client.as_ref()
+            } else {
+                self.client
+                    .as_ref()
+                    .and_then(|client| client.linked.get(&server))
+            };
+            if let Some(target) = target {
+                target.call_rpc(
+                    format!("fleet:receipt:{id}"),
+                    "command.get",
+                    json!({"commandId": id}),
+                );
+            }
+        }
+        if let Some(deadline) = self
+            .fleet
+            .provider_sends
+            .iter()
+            .map(|(_, send)| send.requested_ms + PROVIDER_CONFIRM_MS)
+            .chain(
+                self.fleet
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.provider_runs)
+                    .filter(|run| !run.settled())
+                    .map(|run| run.requested_ms + PROVIDER_CONFIRM_MS),
+            )
+            .min()
+        {
+            let wait = (deadline - now_ms)
+                .min(PROVIDER_LOOKUP_INTERVAL.as_millis() as i64)
+                .clamp(1_000, 30_000) as u64;
+            self.schedule_fleet_wake(Instant::now() + Duration::from_millis(wait));
+        }
+        // Phase Providers ends when every run settles; servers wait only on it.
+        if self.fleet.phase == RunPhase::Providers
+            && self
+                .fleet
+                .rows
+                .iter()
+                .flat_map(|row| &row.provider_runs)
+                .all(ProviderRun::settled)
+        {
+            self.fleet.phase = RunPhase::Servers;
+            self.start_server_phase();
+            changed = true;
         }
         let offline: Vec<_> = self
             .fleet
@@ -695,22 +2291,36 @@ impl crate::model::State {
             .filter(|r| !self.machine_connected(&r.server))
             .map(|r| r.server.clone())
             .collect();
-        for row in self.fleet.rows.iter_mut().skip(1).filter(|r| r.attempted) {
+        for row in self
+            .fleet
+            .rows
+            .iter_mut()
+            .filter(|r| r.server != "local" && r.attempted)
+        {
             if let Some(view) = self.machines.views.get(&row.server) {
                 let status = &view["updateStatus"];
                 let outcome = &status["lastOutcome"];
                 if row.update_id.is_none() {
-                    // A transport loss is not proof of refusal. Observe a new target-side
-                    // attempt/outcome after reconnect, but never resend an update request.
+                    // A transport loss is not proof of refusal, but an answered
+                    // refusal is definitive: never adopt another client's attempt
+                    // over it. Any new attempt must also differ from the attempt
+                    // and the outcome this machine already reported.
+                    if row.refused {
+                        continue;
+                    }
+                    let is_new = |id: Option<&str>| {
+                        id.is_some_and(|id| {
+                            Some(id) != row.prior_outcome.as_deref()
+                                && Some(id) != row.prior_status_id.as_deref()
+                        })
+                    };
                     let next = if matches!(
                         status["state"].as_str(),
                         Some("checking" | "downloading" | "ready" | "draining" | "restarting")
                     ) {
-                        status["updateId"].as_str()
+                        status["updateId"].as_str().filter(|id| is_new(Some(*id)))
                     } else {
-                        outcome["updateId"]
-                            .as_str()
-                            .filter(|id| Some(*id) != row.prior_outcome.as_deref())
+                        outcome["updateId"].as_str().filter(|id| is_new(Some(*id)))
                     };
                     if let Some(id) = next {
                         row.update_id = Some(id.into());
@@ -731,9 +2341,12 @@ impl crate::model::State {
                                 "failed: No newer release is available for this machine yet."
                                     .into();
                             row.failed = true;
+                            row.result = Some(false);
                         } else {
                             row.state = format!("updated to {}", row.current);
                             row.failed = false;
+                            row.result = Some(true);
+                            row.server_updated = true;
                         }
                     } else {
                         row.state = format!(
@@ -741,15 +2354,26 @@ impl crate::model::State {
                             outcome["reason"].as_str().unwrap_or("Unknown failure")
                         );
                         row.failed = true;
+                        row.result = Some(false);
                     }
                 } else if matches!(status["state"].as_str(), Some("draining" | "restarting")) {
                     row.state = "restarting".into();
                     row.failed = false;
+                    if row.handed_off.is_none()
+                        && let Some(id) = row.update_id.clone()
+                    {
+                        row.handed_off = Some(HandedOff {
+                            target: row.target.clone(),
+                            update_id: id,
+                            started_ms: crate::lifecycle::now() as i64,
+                        });
+                    }
                 } else if offline.contains(&row.server) {
                     row.state =
                         "failed: Connection lost after acceptance. The target may still update."
                             .into();
                     row.failed = true;
+                    row.result = Some(false);
                 } else if matches!(
                     status["state"].as_str(),
                     Some("checking" | "downloading" | "ready")
@@ -760,34 +2384,300 @@ impl crate::model::State {
                 changed |= previous != row.state;
             }
         }
-        if self.fleet.running
-            && self.fleet.pending_handoffs == 0
-            && !self.fleet.local_started
-            && self
+        // Handed-off rows, including those restored after a desktop restart, settle on
+        // the outcome with the exact updateId, on a version match, or fail at
+        // 32 minutes. Nothing is re-requested.
+        for row in self
+            .fleet
+            .rows
+            .iter_mut()
+            .filter(|row| row.handed_off.is_some() && row.result.is_none())
+        {
+            let handoff = row.handed_off.clone().expect("handed off");
+            let settled = self.machines.views.get(&row.server).and_then(|view| {
+                let status = &view["updateStatus"];
+                let outcome = &status["lastOutcome"];
+                let running = status["runningVersion"].as_str().unwrap_or("");
+                if outcome["updateId"].as_str() == Some(handoff.update_id.as_str())
+                    && outcome["success"] == false
+                {
+                    return Some(Err(outcome["reason"]
+                        .as_str()
+                        .unwrap_or("Unknown failure")
+                        .to_owned()));
+                }
+                if outcome["updateId"].as_str() == Some(handoff.update_id.as_str())
+                    && outcome["success"] == true
+                    && crate::update::is_newer(&handoff.target, running)
+                {
+                    // The exact outcome won but the version is behind: not done.
+                    return None;
+                }
+                if !crate::update::is_newer(&handoff.target, running) && !running.is_empty() {
+                    return Some(Ok(()));
+                }
+                None
+            });
+            let deadline = handoff.started_ms + 32 * 60_000;
+            match settled {
+                Some(Ok(())) => {
+                    row.result = Some(true);
+                    row.server_updated = true;
+                    row.failed = false;
+                    row.state = format!("updated to {}", handoff.target);
+                    changed = true;
+                }
+                Some(Err(reason)) => {
+                    row.result = Some(false);
+                    row.failed = true;
+                    row.state = format!("failed: {reason}");
+                    changed = true;
+                }
+                None if crate::lifecycle::now() as i64 >= deadline => {
+                    row.result = Some(false);
+                    row.failed = true;
+                    row.state = "failed: Not back after 32 minutes".into();
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        if self
+            .fleet
+            .rows
+            .iter()
+            .any(|row| row.handed_off.is_some() && row.result.is_none())
+        {
+            let deadline = self
                 .fleet
                 .rows
                 .iter()
-                .skip(1)
-                .all(|row| !matches!(row.state.as_str(), "downloading" | "checking" | "ready"))
-        {
-            self.fleet.local_started = true;
-            if self.fleet.rows.first().is_some_and(|r| r.eligible) {
-                // Remote requests have all returned. The local restart stays last.
-                self.restart_for_update = true;
-                self.fleet.rows[0].state = "restarting".into();
+                .filter(|row| row.result.is_none())
+                .filter_map(|row| row.handed_off.as_ref())
+                .map(|handoff| handoff.started_ms + 32 * 60_000)
+                .min()
+                .unwrap_or(i64::MAX);
+            let wait = (deadline - crate::lifecycle::now() as i64).clamp(1_000, 30_000) as u64;
+            self.schedule_fleet_wake(Instant::now() + Duration::from_millis(wait));
+        }
+        // A settled server still carries its provider failure (KSG's machine result is
+        // failed when either side failed).
+        for row in &mut self.fleet.rows {
+            if row.result == Some(true) && row.provider_failure.is_some() {
+                row.result = Some(false);
+                row.failed = true;
                 changed = true;
             }
         }
-        if self.fleet.local_started
-            && let Some(reason) = &self.restart_notice
-            && let Some(row) = self.fleet.rows.first_mut()
+        // The local install waits for every server handoff, then counts down 5 s. A
+        // download still running delays the countdown (KSG `downloadLocal`).
+        let servers_pending = self.fleet.rows.iter().any(|row| {
+            row.server != "local"
+                && row.server_target.is_some()
+                && row.result.is_none()
+                && row.handed_off.is_none()
+        });
+        if self.fleet.phase == RunPhase::Servers
+            && self.fleet.local_version.is_some()
+            && !servers_pending
         {
-            let message = format!("failed: {reason}");
-            changed |= row.state != message;
-            row.state = message;
-            row.failed = true;
+            match self.updater.status() {
+                crate::update::Status::Ready { .. } => {
+                    self.fleet.phase = RunPhase::Countdown;
+                    self.fleet.restart_at = Some(Instant::now() + Duration::from_secs(5));
+                    if let Some(row) = self.fleet.rows.first_mut()
+                        && row.server == "local"
+                        && row.result.is_none()
+                    {
+                        row.state = "restarting".into();
+                    }
+                    changed = true;
+                }
+                crate::update::Status::Downloading { .. } | crate::update::Status::Checking => {
+                    self.schedule_fleet_wake(Instant::now() + Duration::from_secs(1));
+                }
+                _ => {
+                    if self
+                        .fleet
+                        .rows
+                        .first()
+                        .is_some_and(|row| row.server == "local" && row.result.is_none())
+                    {
+                        let notice = self
+                            .updater
+                            .notice()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "the update download did not finish".into());
+                        self.record_local_failure(format!("This app: {notice}"));
+                        self.fleet.local_version = None;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if self.fleet.phase == RunPhase::Countdown {
+            match self.fleet.restart_at {
+                Some(at) if Instant::now() >= at => self.install_local_now(),
+                Some(at) => {
+                    self.schedule_fleet_wake(at.min(Instant::now() + Duration::from_secs(1)))
+                }
+                None => {}
+            }
+            changed = true;
+        }
+        // An active machine refreshes its elapsed readout every 30 s.
+        if self.fleet.rows.iter().any(|row| {
+            matches!(
+                self.run_status(row),
+                "providers" | "downloading" | "restarting"
+            )
+        }) {
+            self.schedule_fleet_wake(Instant::now() + Duration::from_secs(30));
+        }
+        // KSG `closeFinishedUpdateRun`: in Servers with no local install, the run ends
+        // when every machine is done; the result notice appears then.
+        if self.fleet.phase == RunPhase::Servers
+            && self.fleet.local_version.is_none()
+            && self.fleet.running
+            && !self.fleet.rows.is_empty()
+            && self.fleet.rows.iter().all(|row| row.result == Some(true))
+        {
+            let updated_servers = self
+                .fleet
+                .rows
+                .iter()
+                .filter(|row| row.server_updated)
+                .count();
+            let updated_providers = self
+                .fleet
+                .rows
+                .iter()
+                .flat_map(|row| &row.provider_runs)
+                .filter(|run| run.outcome.as_deref() == Some("succeeded"))
+                .count();
+            self.fleet.result_notice = Some(result_notice(
+                false,
+                updated_servers,
+                updated_providers,
+                Vec::new(),
+            ));
+            self.fleet.running = false;
+            self.fleet.phase = RunPhase::Idle;
+            self.fleet.rows.clear();
+            changed = true;
+        }
+        // Runs ending with any failure stay for Retry or Dismiss; their notice shows
+        // once (KSG `showUpdateEverythingResult` at run end).
+        if self.fleet.phase == RunPhase::Servers
+            && self.fleet.local_version.is_none()
+            && self.fleet.running
+            && !self.fleet.rows.is_empty()
+            && self.fleet.rows.iter().all(|row| row.result.is_some())
+            && self.fleet.result_notice.is_none()
+        {
+            let updated_servers = self
+                .fleet
+                .rows
+                .iter()
+                .filter(|row| row.server_updated)
+                .count();
+            let updated_providers = self
+                .fleet
+                .rows
+                .iter()
+                .flat_map(|row| &row.provider_runs)
+                .filter(|run| run.outcome.as_deref() == Some("succeeded"))
+                .count();
+            self.fleet.result_notice = Some(result_notice(
+                false,
+                updated_servers,
+                updated_providers,
+                self.run_failures(),
+            ));
+            changed = true;
+        }
+        self.poll_provider_pill();
+        // The success pill dismisses itself 3 s after it appears.
+        if let Some(view) = &self.fleet.pill
+            && view.tone == PillTone::Success
+        {
+            match &self.fleet.pill_shown {
+                Some((key, at)) if *key == view.key => {
+                    if at.elapsed() >= Duration::from_secs(3) {
+                        let key = key.clone();
+                        self.fleet.pill = None;
+                        self.fleet.pill_dismissed.insert(key);
+                        self.fleet.pill_shown = None;
+                        changed = true;
+                    }
+                }
+                _ => {
+                    self.fleet.pill_shown = Some((view.key.clone(), Instant::now()));
+                    self.schedule_fleet_wake(Instant::now() + Duration::from_secs(3));
+                }
+            }
         }
         changed
+    }
+    /// Demo fixtures for `--snap` scenes (`update-everything-dialog`,
+    /// `update-capsule-running`, `update-capsule-failed`, `provider-update-pill`).
+    pub fn demo_update_scene(&mut self, scene: &str) {
+        self.demo_fleet();
+        match scene {
+            "update-everything-dialog" => {}
+            "update-capsule-running" => {
+                self.fleet.open = false;
+                self.fleet.running = true;
+                self.fleet.phase = RunPhase::Servers;
+                self.fleet.rows.retain(|row| {
+                    matches!(
+                        row.state.as_str(),
+                        "downloading" | "restarting" | "updated to 99.0.0" | "done"
+                    )
+                });
+                for row in &mut self.fleet.rows {
+                    row.started_at = Instant::now() - Duration::from_secs(50);
+                    if row.state == "updated to 99.0.0" {
+                        row.result = Some(true);
+                    }
+                    if row.state == "downloading" {
+                        row.server_target = Some(row.target.clone());
+                    }
+                }
+            }
+            "update-capsule-failed" => {
+                self.fleet.open = false;
+                self.fleet.running = true;
+                self.fleet.phase = RunPhase::Servers;
+                self.fleet.rows.retain(|row| {
+                    row.failed || row.state == "updated to 99.0.0" || row.state == "restarting"
+                });
+                for row in &mut self.fleet.rows {
+                    if row.failed {
+                        row.result = Some(false);
+                        row.server_target = Some(row.target.clone());
+                    } else if row.state.starts_with("updated") {
+                        row.result = Some(true);
+                    }
+                }
+            }
+            "provider-update-pill" => {
+                self.fleet.open = false;
+                if let Some(view) = self.machines.views.get_mut("local") {
+                    view["providers"] = json!([{
+                        "driver":"codex","name":"Codex","installed":true,
+                        "version":"0.48.0","latestVersion":"0.50.0","advisory":"behind",
+                        "strategy":"npm-global","disabledReason":null,"manualCommand":null,
+                        "installPath":"~/.npm-global","checkedAt":crate::lifecycle::now(),
+                        "update":{"updateId":"demo","status":"running",
+                                  "message":"Running npm install -g ...","startedAt":crate::lifecycle::now(),
+                                  "finishedAt":null,"fromVersion":"0.48.0","targetVersion":"0.50.0"}
+                    }]);
+                }
+                self.poll_provider_pill();
+            }
+            _ => {}
+        }
     }
     pub fn demo_fleet(&mut self) {
         self.fleet = Fleet {
@@ -827,15 +2717,155 @@ impl crate::model::State {
                 state: (*state).into(),
                 eligible: index == 0,
                 failed: state.starts_with("failed"),
-                update_id: None,
-                prior_outcome: None,
-                attempted: false,
-                link: None,
+                provider_capable: index < 2,
+                providers: if index == 0 {
+                    vec!["Codex".into(), "Claude".into()]
+                } else if index == 1 {
+                    vec!["Codex".into()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
             });
         }
     }
 }
 
+impl Default for Row {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            name: String::new(),
+            current: String::new(),
+            target: String::new(),
+            state: String::new(),
+            eligible: false,
+            failed: false,
+            update_id: None,
+            prior_outcome: None,
+            prior_status_id: None,
+            refused: false,
+            attempted: false,
+            link: None,
+            providers: Vec::new(),
+            providers_view: None,
+            provider_capable: false,
+            server_target: None,
+            server_updated: false,
+            provider_runs: Vec::new(),
+            provider_failure: None,
+            handed_off: None,
+            started_at: Instant::now(),
+            result: None,
+        }
+    }
+}
+
+/// KSG `joinList`: "a and b", "a, b, and c".
+fn join_list(parts: &[String]) -> String {
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].clone(),
+        _ => format!(
+            "{} and {}",
+            parts[..parts.len() - 1].join(", "),
+            parts[parts.len() - 1]
+        ),
+    }
+}
+fn count_label(count: usize, noun: &str) -> Option<String> {
+    (count > 0).then(|| format!("{count} {noun}{}", if count == 1 { "" } else { "s" }))
+}
+/// KSG `formatUpdateElapsed`: "<1m", "4m", "1h 5m".
+pub fn format_update_elapsed(elapsed: Duration) -> String {
+    let minutes = elapsed.as_secs() / 60;
+    if minutes < 1 {
+        "<1m".into()
+    } else if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    }
+}
+/// KSG `RUN_STATUS_LABELS` for the capsule popover.
+pub fn status_word(status: &str) -> &'static str {
+    match status {
+        "providers" => "updating providers",
+        "downloading" => "downloading",
+        "restarting" => "restarting",
+        "done" => "done",
+        "failed" => "failed",
+        _ => "waiting",
+    }
+}
+/// KSG `getUpdateEverythingToastView`: success title "Updated this app, 1 server and 3
+/// providers"; failure title "Update failed" or the same Updated line in `danger`.
+fn result_notice(
+    local_updated: bool,
+    updated_servers: usize,
+    updated_providers: usize,
+    failures: Vec<String>,
+) -> ResultNotice {
+    let mut parts = Vec::new();
+    if local_updated {
+        parts.push("this app".to_owned());
+    }
+    parts.extend(count_label(updated_servers, "server"));
+    parts.extend(count_label(updated_providers, "provider"));
+    if failures.is_empty() {
+        return ResultNotice {
+            success: true,
+            title: format!("Updated {}", join_list(&parts)),
+            lines: Vec::new(),
+        };
+    }
+    ResultNotice {
+        success: false,
+        title: if parts.is_empty() {
+            "Update failed".into()
+        } else {
+            format!("Updated {}", join_list(&parts))
+        },
+        lines: failures,
+    }
+}
+
+/// What the capsule's left side and action show, KSG `UpdateCapsuleView`.
+pub struct CapsuleView {
+    pub tone: CapsuleTone,
+    pub label: String,
+    /// "4m"-style elapsed after the label once a machine is slow (3 minutes).
+    pub elapsed: Option<String>,
+    pub action: CapsuleAction,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapsuleTone {
+    Default,
+    Slow,
+    Failed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapsuleAction {
+    None,
+    Later,
+    Retry,
+    Dismiss,
+}
+
+/// `getProviderUpdateSidebarPillView`'s reduced view for the sidebar pill.
+pub struct ProviderPillView {
+    pub key: String,
+    pub tone: PillTone,
+    pub title: String,
+    pub dismissible: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PillTone {
+    Loading,
+    Success,
+    Warning,
+    Error,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1442,13 +3472,26 @@ mod tests {
     #[test]
     fn local_restart_waits_for_remote_handoff_even_after_the_dialog_closes() {
         let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.updater = crate::update::Updater::test_ready(crate::update::PreparedUpdate {
+            tag: "v99.0.0".into(),
+            target: crate::install::InstalledTarget::Windows {
+                exe: "shina.exe".into(),
+            },
+            asset: "shina.exe".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            download: "download.exe".into(),
+            prepared: "prepared.exe".into(),
+        });
         state.demo_fleet();
         state.fleet.rows.truncate(2);
+        state.fleet.rows[0].server = "local".into();
         state.fleet.rows[0].eligible = true;
         state.fleet.rows[1].state = "downloading".into();
         state.fleet.rows[1].update_id = Some("accepted-update".into());
         state.fleet.rows[1].attempted = true;
         state.fleet.rows[1].server = "remote".into();
+        state.fleet.rows[1].server_target = Some("v99.0.0".into());
         let (mut client, _) = crate::client::Client::test_connected(state.data_dir.clone());
         let (remote, _) = crate::client::Client::test_connected(state.data_dir.clone());
         client.linked.insert("remote".into(), remote);
@@ -1459,13 +3502,28 @@ mod tests {
         );
         state.fleet.running = true;
         state.fleet.open = false;
+        state.fleet.phase = RunPhase::Servers;
+        state.fleet.local_version = Some("v99.0.0".into());
         state.poll_fleet();
         assert!(!state.restart_for_update);
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
         state.machines.views.get_mut("remote").unwrap()["updateStatus"]["state"] =
             json!("restarting");
         state.poll_fleet();
+        // The handoff is recorded and the local countdown begins; the app is still up.
+        assert_eq!(state.fleet.phase, RunPhase::Countdown);
+        assert!(!state.restart_for_update);
+        assert!(state.fleet.rows[1].handed_off.is_some());
+        state.fleet.restart_at = Some(Instant::now());
+        state.poll_fleet();
         assert!(state.restart_for_update);
         assert!(!state.fleet.open);
+        // The durable result is on disk before the restart request.
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(state.data_dir.join("updates/everything.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["handedOff"][0]["updateId"], "accepted-update");
     }
     #[test]
     fn a_refused_link_is_still_asked_for_its_update_status() {
@@ -1518,6 +3576,7 @@ mod tests {
                 prior_outcome: None,
                 attempted: false,
                 link: None,
+                ..Default::default()
             });
         }
         let reason = "Shina server is not running there. The machine refused the connection.";
@@ -1542,7 +3601,9 @@ mod tests {
         });
         client.linked.insert("old".into(), remote);
         state.client = Some(client);
-        assert!(state.fleet_available());
+        // Nothing on the link can update, so the footer keeps the local row only;
+        // Settings still opens the review and lists the machine as skipped.
+        assert!(!state.fleet_available());
         state.open_fleet();
         assert_eq!(state.fleet.rows[1].state, "skipped: offline");
         assert!(!state.fleet.rows[1].eligible);
@@ -1584,5 +3645,1056 @@ mod tests {
         state.client = Some(client);
         crate::model::poll(&mut state, 0.0, &mut rune::Tx::default());
         assert_eq!(state.fleet.rows[1].state, "updated to 99.0.0");
+    }
+
+    fn prepared(tag: &str) -> crate::update::PreparedUpdate {
+        crate::update::PreparedUpdate {
+            tag: tag.into(),
+            target: crate::install::InstalledTarget::Windows {
+                exe: "shina.exe".into(),
+            },
+            asset: "shina.exe".into(),
+            size: 1,
+            sha256: "0".repeat(64),
+            download: "download.exe".into(),
+            prepared: "prepared.exe".into(),
+        }
+    }
+    fn behind(driver: &str, name: &str, version: &str, latest: &str) -> Value {
+        json!({
+            "driver": driver, "name": name, "installed": true, "version": version,
+            "latestVersion": latest, "advisory": "behind", "strategy": "npm-global",
+            "disabledReason": null, "manualCommand": null
+        })
+    }
+    fn linked(
+        state: &mut crate::model::State,
+        server: &str,
+        version: &str,
+    ) -> tokio::sync::mpsc::Receiver<crate::protocol::Command> {
+        let (mut remote, calls) = crate::client::Client::test_connected(state.data_dir.clone());
+        *remote.info.lock().unwrap() = json!({
+            "binaryVersion": version, "protocolMinor": 36,
+            "canUpdate": true, "capabilities": [PROVIDER_UPDATES]
+        });
+        remote.remote = Some(crate::peer::Link {
+            server_id: server.into(),
+            host: server.into(),
+            device_id: "fixture".into(),
+            token: "not-real".into(),
+            enabled: true,
+        });
+        state
+            .client
+            .as_mut()
+            .expect("client")
+            .linked
+            .insert(server.into(), remote);
+        calls
+    }
+
+    #[test]
+    fn the_everything_summary_uses_oxford_commas_and_singular_forms() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
+        let _calls = linked(&mut state, "remote", "0.12.28");
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"providers":[
+                behind("codex","Codex","0.48.0","0.50.0"),
+                behind("claude","Claude","2.0.0","2.1.0")
+            ],"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}),
+        );
+        assert_eq!(
+            state.update_everything_summary().as_deref(),
+            Some("Update this app, 1 server and 2 providers")
+        );
+        let _calls2 = linked(&mut state, "second", "0.12.28");
+        state.machines.views.insert(
+            "second".into(),
+            json!({"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}),
+        );
+        assert_eq!(
+            state.update_everything_summary().as_deref(),
+            Some("Update this app, 2 servers and 2 providers")
+        );
+    }
+    #[test]
+    fn providers_settle_before_any_server_update_request() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "0.1.0");
+        let providers = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local".into(),
+            current: env!("CARGO_PKG_VERSION").into(),
+            target: "v99.0.0".into(),
+            state: "will update".into(),
+            eligible: false,
+            ..Default::default()
+        });
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            current: "0.1.0".into(),
+            target: "v99.0.0".into(),
+            state: "will update".into(),
+            eligible: true,
+            provider_capable: true,
+            providers: vec!["Codex".into()],
+            providers_view: Some(Value::Array(providers.clone())),
+            link: Some(crate::peer::Link {
+                server_id: "remote".into(),
+                host: "studio".into(),
+                device_id: "fixture".into(),
+                token: "not-real".into(),
+                enabled: true,
+            }),
+            ..Default::default()
+        });
+        let (send, receive) = mpsc::channel();
+        state.fleet.sender = Some(send);
+        state.fleet.events = Some(receive);
+        state.confirm_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Providers);
+        let sent = calls.try_recv().expect("providers.update is sent first");
+        assert_eq!(sent.method, "providers.update");
+        assert_eq!(sent.params["driver"], "codex");
+        // The server has not been asked yet; only the provider update ran.
+        let server_row = state
+            .fleet
+            .rows
+            .iter()
+            .find(|row| row.server == "remote")
+            .unwrap();
+        assert!(!server_row.attempted);
+        // The exact receipt arms the run's projection watch.
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
+        ));
+        // The live projection carries the accepted record's terminal status.
+        let request = state
+            .fleet
+            .rows
+            .iter()
+            .find(|row| row.server == "remote")
+            .unwrap()
+            .provider_runs[0]
+            .requested_ms;
+        let mut settled = providers.clone();
+        settled[0]["update"] = json!({
+            "updateId": "prov-1", "status": "succeeded", "startedAt": request + 1,
+            "finishedAt": request + 2, "fromVersion": "0.48.0", "targetVersion": "0.50.0",
+            "message": "npm install -g finished"
+        });
+        state
+            .machines
+            .views
+            .insert("remote".into(), json!({"providers": settled}));
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        let server_row = state
+            .fleet
+            .rows
+            .iter()
+            .find(|row| row.server == "remote")
+            .unwrap();
+        assert!(
+            server_row.attempted,
+            "the server update starts only after providers settle"
+        );
+    }
+    #[test]
+    fn a_provider_only_machine_settles_in_the_provider_phase() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local".into(),
+            state: "up to date".into(),
+            ..Default::default()
+        });
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            eligible: false,
+            provider_capable: true,
+            providers: vec!["Codex".into()],
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        let sent = calls.try_recv().expect("providers.update sent");
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
+        ));
+        let request = state
+            .fleet
+            .rows
+            .iter()
+            .find(|row| row.server == "remote")
+            .unwrap()
+            .provider_runs[0]
+            .requested_ms;
+        let mut settled = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        settled[0]["update"] = json!({
+            "updateId": "prov-1", "status": "succeeded", "startedAt": request + 1,
+            "finishedAt": request + 2, "targetVersion": "0.50.0", "message": "done"
+        });
+        state
+            .machines
+            .views
+            .insert("remote".into(), json!({"providers": settled}));
+        state.poll_fleet();
+        // The run finished; the notice counts the provider, not the machine's server.
+        assert!(!state.fleet.running);
+        let notice = state.fleet.result_notice.as_ref().expect("result notice");
+        assert!(notice.success);
+        assert_eq!(notice.title, "Updated 1 provider");
+    }
+    #[test]
+    fn a_provider_failure_marks_the_machine_and_stays_for_retry() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local".into(),
+            state: "up to date".into(),
+            ..Default::default()
+        });
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            provider_capable: true,
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        let sent = calls.try_recv().expect("providers.update sent");
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
+        ));
+        let request = state
+            .fleet
+            .rows
+            .iter()
+            .find(|row| row.server == "remote")
+            .unwrap()
+            .provider_runs[0]
+            .requested_ms;
+        let mut settled = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        settled[0]["update"] = json!({
+            "updateId": "prov-1", "status": "failed", "startedAt": request + 1,
+            "finishedAt": request + 2, "targetVersion": "0.50.0",
+            "message": "Update command exited with code 1: EACCES"
+        });
+        state
+            .machines
+            .views
+            .insert("remote".into(), json!({"providers": settled}));
+        state.poll_fleet();
+        let row = state
+            .fleet
+            .rows
+            .iter()
+            .find(|row| row.server == "remote")
+            .expect("a failed machine stays for retry or dismiss");
+        assert_eq!(row.result, Some(false));
+        assert_eq!(
+            row.provider_failure.as_deref(),
+            Some("studio Codex: Update command exited with code 1: EACCES")
+        );
+        let capsule = state.describe_capsule();
+        assert_eq!(capsule.tone, CapsuleTone::Failed);
+        assert_eq!(capsule.label, "studio failed");
+        // Provider failures retry from Settings, so the capsule offers only Dismiss.
+        assert_eq!(capsule.action, CapsuleAction::Dismiss);
+        let notice = state.fleet.result_notice.expect("failure notice");
+        assert!(!notice.success);
+        assert_eq!(notice.title, "Update failed");
+        assert_eq!(notice.lines.len(), 1);
+    }
+    #[test]
+    fn later_cancels_the_countdown_and_restart_to_update_resumes() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local".into(),
+            target: "v99.0.0".into(),
+            state: "will update".into(),
+            eligible: true,
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Countdown);
+        let capsule = state.describe_capsule();
+        assert_eq!(capsule.label, "Restart in 5s");
+        assert_eq!(capsule.action, CapsuleAction::Later);
+        state.postpone_update_restart();
+        assert!(state.fleet.postponed_local);
+        assert!(!state.restart_for_update);
+        // A run whose only row was the pending local install closes; the capsule's
+        // "Restart to update" remains available through the update row.
+        assert!(!state.fleet.running);
+        assert_eq!(state.fleet.phase, RunPhase::Idle);
+        state.restart_postponed_update();
+        assert!(state.restart_for_update);
+        assert!(state.data_dir.join("updates/everything.json").exists());
+    }
+    #[test]
+    fn a_refused_restart_removes_the_durable_result_and_records_the_failure() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local".into(),
+            target: "v99.0.0".into(),
+            state: "will update".into(),
+            eligible: true,
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        state.poll_fleet();
+        state.fleet.restart_at = Some(Instant::now());
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Installing);
+        let saved = state.data_dir.join("updates/everything.json");
+        assert!(saved.exists());
+        // A coordinated restart is progress, not a refusal.
+        state.record_fleet_restart_result("Coordinated restart requested by the app");
+        assert_eq!(state.fleet.phase, RunPhase::Installing);
+        state.record_fleet_restart_result("2 threads still have work");
+        assert!(!saved.exists());
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        assert!(state.fleet.local_version.is_none());
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+        let notice = state.fleet.result_notice.as_ref().expect("failure notice");
+        assert!(!notice.success);
+        assert_eq!(notice.lines, vec!["This app: 2 threads still have work"]);
+    }
+
+    #[test]
+    fn a_failed_recovery_record_write_never_requests_a_local_restart() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        std::fs::write(state.data_dir.join("updates"), b"not a directory").unwrap();
+        state.fleet.local_version = Some("v99.0.0".into());
+        state.fleet.running = true;
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            ..Default::default()
+        });
+        state.install_local_now();
+        assert!(!state.restart_for_update);
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        assert!(state.fleet.local_version.is_none());
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+        assert!(
+            state.fleet.result_notice.unwrap().lines[0]
+                .contains("Could not save update recovery state")
+        );
+    }
+    fn everything_json(state: &crate::model::State, saved: Value) {
+        let updates = state.data_dir.join("updates");
+        std::fs::create_dir_all(&updates).unwrap();
+        std::fs::write(updates.join("everything.json"), saved.to_string()).unwrap();
+    }
+    #[test]
+    fn the_durable_result_restores_once_and_never_resends() {
+        let now = crate::lifecycle::now() as i64;
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        everything_json(
+            &state,
+            json!({
+                "savedAt": now, "localVersion": env!("CARGO_PKG_VERSION"),
+                "updatedServers": 1, "updatedProviders": 2, "failures": [],
+                "handedOff": [{"server":"remote","label":"studio","targetVersion":"v99.0.0",
+                               "updateId":"u-1","startedAt":now}]
+            }),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        assert_eq!(state.fleet.rows.len(), 1);
+        assert_eq!(state.fleet.rows[0].state, "restarting");
+        assert!(
+            !state.data_dir.join("updates/everything.json").exists(),
+            "the file is read once and deleted"
+        );
+        let notice = state.fleet.result_notice.as_ref().expect("restore notice");
+        assert!(notice.success);
+        assert_eq!(notice.title, "Updated this app, 1 server and 2 providers");
+        assert_eq!(notice.lines, vec!["studio is still restarting."]);
+        // No new request is sent during recovery: only a projection outcome settles it.
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"runningVersion":"0.1.0","state":"idle",
+                "lastOutcome":{"updateId":"other","success":true}}}),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[0].result, None);
+        state.machines.views.get_mut("remote").unwrap()["updateStatus"]["lastOutcome"] =
+            json!({"updateId":"u-1","success":true,"tag":"v99.0.0"});
+        state.machines.views.get_mut("remote").unwrap()["updateStatus"]["runningVersion"] =
+            json!("99.0.0");
+        state.poll_fleet();
+        // The recovered handoff settled on the exact outcome and the run closed.
+        assert!(state.fleet.rows.is_empty());
+        assert!(!state.fleet.running);
+        let closed = state.fleet.result_notice.as_ref().expect("closing notice");
+        assert!(closed.success);
+        assert_eq!(closed.title, "Updated 1 server");
+    }
+    #[test]
+    fn a_handed_off_machine_fails_after_32_minutes() {
+        let now = crate::lifecycle::now() as i64;
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        everything_json(
+            &state,
+            json!({
+                "savedAt": now, "localVersion": env!("CARGO_PKG_VERSION"),
+                "updatedServers": 0, "updatedProviders": 0, "failures": [],
+                "handedOff": [{"server":"remote","label":"studio","targetVersion":"v99.0.0",
+                               "updateId":"u-1","startedAt":now - 33 * 60_000}]
+            }),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+        assert_eq!(
+            state.fleet.rows[0].state,
+            "failed: Not back after 32 minutes"
+        );
+    }
+    #[test]
+    fn a_stale_result_is_ignored_and_a_missed_update_reports_itself() {
+        let now = crate::lifecycle::now() as i64;
+        let mut stale = crate::model::State::new(PathBuf::new(), false);
+        everything_json(
+            &stale,
+            json!({"savedAt": now - 11 * 60_000, "localVersion": env!("CARGO_PKG_VERSION"),
+                   "updatedServers": 1, "updatedProviders": 0, "failures": [], "handedOff": []}),
+        );
+        stale.poll_fleet();
+        assert!(stale.fleet.rows.is_empty());
+        assert!(stale.fleet.result_notice.is_none());
+        let mut missed = crate::model::State::new(PathBuf::new(), false);
+        everything_json(
+            &missed,
+            json!({"savedAt": now, "localVersion": "v99.0.0",
+                   "updatedServers": 0, "updatedProviders": 0, "failures": [], "handedOff": []}),
+        );
+        missed.poll_fleet();
+        let notice = missed.fleet.result_notice.expect("did-not-apply notice");
+        assert!(!notice.success);
+        assert!(notice.lines[0].starts_with("Update did not apply."));
+    }
+    #[test]
+    fn capsule_labels_cover_the_contract_states() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.fleet.running = true;
+        state.fleet.phase = RunPhase::Countdown;
+        state.fleet.restart_at = Some(Instant::now() + Duration::from_secs(5));
+        assert_eq!(state.describe_capsule().label, "Restart in 5s");
+        state.fleet.phase = RunPhase::Installing;
+        assert_eq!(state.describe_capsule().label, "Restarting...");
+        state.fleet.phase = RunPhase::Servers;
+        state.fleet.rows.push(Row {
+            server: "a".into(),
+            name: "alpha".into(),
+            state: "downloading".into(),
+            server_target: Some("v1".into()),
+            attempted: true,
+            started_at: Instant::now(),
+            ..Default::default()
+        });
+        state.fleet.rows.push(Row {
+            server: "b".into(),
+            name: "beta".into(),
+            result: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(state.describe_capsule().label, "1 of 2 updated");
+        state.fleet.rows[0].started_at = Instant::now() - Duration::from_secs(240);
+        let slow = state.describe_capsule();
+        assert_eq!(slow.tone, CapsuleTone::Slow);
+        assert_eq!(slow.label, "alpha");
+        assert_eq!(slow.elapsed.as_deref(), Some("4m"));
+    }
+    #[test]
+    fn retry_resends_only_failed_server_machines() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.fleet.running = true;
+        state.fleet.phase = RunPhase::Servers;
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            result: Some(false),
+            failed: true,
+            server_target: Some("v99.0.0".into()),
+            link: Some(crate::peer::Link {
+                server_id: "remote".into(),
+                host: "studio".into(),
+                device_id: "fixture".into(),
+                token: "not-real".into(),
+                enabled: true,
+            }),
+            ..Default::default()
+        });
+        state.fleet.rows.push(Row {
+            server: "other".into(),
+            name: "other".into(),
+            result: Some(false),
+            failed: true,
+            provider_runs: vec![ProviderRun {
+                driver: "codex".into(),
+                name: "Codex".into(),
+                target: "0.50.0".into(),
+                update_id: None,
+                requested_ms: 0,
+                outcome: Some("failed".into()),
+                message: Some("nope".into()),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(state.describe_capsule().action, CapsuleAction::Retry);
+        let (send, _receive) = mpsc::channel();
+        state.fleet.sender = Some(send);
+        state.capsule_action();
+        assert!(state.fleet.rows[0].attempted && state.fleet.rows[0].result.is_none());
+        assert_eq!(
+            state.fleet.rows[1].result,
+            Some(false),
+            "providers stay settled"
+        );
+    }
+    /// Once a run is live the frozen refresh snapshot is ignored; only the
+    /// projection's `machines.views[server][providers]` settles a run.
+    #[test]
+    fn a_frozen_refresh_snapshot_never_settles_a_provider_run() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            provider_capable: true,
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        let sent = calls.try_recv().expect("providers.update sent");
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
+        ));
+        // The snapshot reports a terminal record but the projection does not.
+        let mut settled = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        settled[0]["update"] = json!({
+            "updateId": "prov-1", "status": "succeeded", "startedAt": 1,
+            "finishedAt": 2, "targetVersion": "0.50.0", "message": "done"
+        });
+        state.fleet.rows[0].providers_view = Some(Value::Array(settled));
+        assert_eq!(state.fleet.phase, RunPhase::Providers);
+        state.poll_fleet();
+        assert!(
+            !state.fleet.rows[0].provider_runs[0].settled(),
+            "a frozen snapshot must not settle a live run"
+        );
+        // The same record in the live projection settles it.
+        let mut providers = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        providers[0]["update"] = json!({
+            "updateId": "prov-1", "status": "succeeded", "startedAt": 1,
+            "finishedAt": 2, "targetVersion": "0.50.0", "message": "done"
+        });
+        state
+            .machines
+            .views
+            .insert("remote".into(), json!({"providers": providers}));
+        state.poll_fleet();
+        // The provider-only machine settled and the run closed.
+        assert!(!state.fleet.running);
+        let notice = state.fleet.result_notice.as_ref().expect("result notice");
+        assert!(notice.success);
+        assert_eq!(notice.title, "Updated 1 provider");
+    }
+    /// Later during the countdown drops a local row that only waited to install;
+    /// the run settles and the postponed restart stays available.
+    #[test]
+    fn later_lets_the_run_settle_and_keeps_restart_to_update() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
+        let (mut client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        let (remote, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        client.linked.insert("remote".into(), remote);
+        state.client = Some(client);
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local".into(),
+            target: "v99.0.0".into(),
+            state: "will update".into(),
+            eligible: true,
+            ..Default::default()
+        });
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            target: "v99.0.0".into(),
+            state: "will update".into(),
+            eligible: true,
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        // The remote handed off before the countdown started.
+        let remote = state
+            .fleet
+            .rows
+            .iter_mut()
+            .find(|row| row.server == "remote")
+            .unwrap();
+        remote.server_target = Some("v99.0.0".into());
+        remote.attempted = true;
+        remote.update_id = Some("u-1".into());
+        remote.state = "restarting".into();
+        remote.handed_off = Some(HandedOff {
+            target: "v99.0.0".into(),
+            update_id: "u-1".into(),
+            started_ms: crate::lifecycle::now() as i64,
+        });
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"runningVersion":"0.1.0","state":"restarting"}}),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Countdown);
+        state.postpone_update_restart();
+        assert!(state.fleet.postponed_local);
+        assert!(
+            state.fleet.rows.iter().all(|row| row.server != "local"),
+            "a pending local install row leaves the run"
+        );
+        assert!(!state.restart_for_update);
+        // The last server settles and the run completes with its notice.
+        state.machines.views.get_mut("remote").unwrap()["updateStatus"] = json!({
+            "runningVersion": "99.0.0", "state": "idle",
+            "lastOutcome": {"updateId":"u-1","success":true,"tag":"v99.0.0"}
+        });
+        state.poll_fleet();
+        assert!(!state.fleet.running);
+        assert_eq!(state.fleet.phase, RunPhase::Idle);
+        let notice = state.fleet.result_notice.as_ref().expect("closing notice");
+        assert!(notice.success);
+        assert_eq!(notice.title, "Updated 1 server");
+        // Restart to update is still available and now goes through.
+        state.restart_postponed_update();
+        assert!(state.restart_for_update);
+        assert_eq!(state.fleet.phase, RunPhase::Installing);
+    }
+    /// A machine with a provider failure and a server failure reports both.
+    #[test]
+    fn provider_and_server_failures_both_reach_the_notice() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "failed: connection lost".into(),
+            failed: true,
+            result: Some(false),
+            provider_failure: Some("studio Codex: exit 1".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.run_failures(),
+            vec![
+                "studio Codex: exit 1".to_owned(),
+                "studio: connection lost".to_owned()
+            ]
+        );
+        // When the provider failure is the only failure, no duplicated line appears.
+        state.fleet.rows[0].state = "failed: studio Codex: exit 1".into();
+        assert_eq!(
+            state.run_failures(),
+            vec!["studio Codex: exit 1".to_owned()]
+        );
+    }
+    /// A definitive refusal is never erased by adopting another client's attempt;
+    /// a transport loss still adopts, but never a prior attempt or outcome id.
+    #[test]
+    fn adoption_respects_refusals_and_prior_attempt_ids() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.demo_fleet();
+        state.fleet.rows.truncate(2);
+        let row = &mut state.fleet.rows[1];
+        row.server = "remote".into();
+        row.attempted = true;
+        row.refused = true;
+        row.result = Some(false);
+        row.failed = true;
+        row.state = "failed: Update refused.".into();
+        row.prior_outcome = Some("prev-outcome".into());
+        row.prior_status_id = Some("prev-attempt".into());
+        // Another client's live attempt does not clear the refusal.
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"state":"downloading","updateId":"other-attempt"}}),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[1].update_id, None);
+        assert_eq!(state.fleet.rows[1].state, "failed: Update refused.");
+        assert_eq!(state.fleet.rows[1].result, Some(false));
+        // A transport loss is uncertain: the prior attempt id is not adopted, but a
+        // genuinely new attempt is.
+        let row = &mut state.fleet.rows[1];
+        row.refused = false;
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"state":"downloading","updateId":"prev-attempt"}}),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[1].update_id, None);
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"state":"downloading","updateId":"new-attempt"}}),
+        );
+        state.poll_fleet();
+        assert_eq!(
+            state.fleet.rows[1].update_id.as_deref(),
+            Some("new-attempt")
+        );
+        // A prior outcome id is excluded too.
+        let row = &mut state.fleet.rows[1];
+        row.update_id = None;
+        row.state = "failed: connection lost".into();
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"state":"idle",
+                "lastOutcome":{"updateId":"prev-outcome","success":true}}}),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[1].update_id, None);
+    }
+    /// The footer counts only connected eligible linked machines; a cached view for
+    /// a machine that is not linked does not add a server.
+    #[test]
+    fn a_stale_unlinked_view_is_not_a_server_update_target() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let _calls = linked(&mut state, "remote", "0.12.28");
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}),
+        );
+        state.machines.views.insert(
+            "ghost".into(),
+            json!({"updateStatus":{"runningVersion":"0.0.1","state":"idle","canSelfUpdate":true}}),
+        );
+        assert_eq!(
+            state.update_everything_summary().as_deref(),
+            Some("Update this app and 1 server"),
+            "the unlinked ghost must not join the count"
+        );
+    }
+    /// Clock skew cannot fake adoption: a projection record with a later-looking
+    /// `startedAt` is ignored; the exact `command.get` receipt arms the run.
+    #[test]
+    fn a_skewed_record_is_ignored_until_command_get_confirms() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            provider_capable: true,
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        let sent = calls.try_recv().expect("providers.update sent");
+        let run_request = state.fleet.rows[0].provider_runs[0].requested_ms;
+        // A same-driver record that started long after our send (clock skew) is not
+        // adopted while the send's receipt is still missing.
+        let mut providers = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        providers[0]["update"] = json!({
+            "updateId": "old-or-foreign", "status": "running",
+            "startedAt": run_request + 10 * 60_000, "targetVersion": "0.50.0"
+        });
+        state
+            .machines
+            .views
+            .insert("remote".into(), json!({"providers": providers}));
+        state.poll_fleet();
+        assert_eq!(state.fleet.rows[0].provider_runs[0].update_id, None);
+        assert!(!state.fleet.rows[0].provider_runs[0].settled());
+        // A lookup answer for a different body does not confirm the send either.
+        let id = state.fleet.provider_sends[0].0;
+        let wrong = json!({"commandId":id.to_string(),"deviceId":"d","hash":"not-ours",
+            "status":"accepted","result":{"updateAccepted":true,"updateId":"foreign"},"seq":1});
+        assert!(state.fleet_rpc("remote", &format!("fleet:receipt:{id}"), &Ok(wrong)));
+        assert_eq!(state.fleet.rows[0].provider_runs[0].update_id, None);
+        assert_eq!(state.fleet.provider_sends.len(), 1);
+        // The exact receipt arms the run and the terminal record settles it.
+        let hash = crate::protocol::Command::new(
+            "providers.update",
+            json!({"driver":"codex","targetVersion":"0.50.0"}),
+        )
+        .hash();
+        let receipt = json!({"commandId":id.to_string(),"deviceId":"d","hash":hash,
+            "status":"accepted","result":{"updateAccepted":true,"updateId":"prov-9"},"seq":1});
+        assert!(state.fleet_rpc(
+            "another-machine",
+            &format!("fleet:receipt:{id}"),
+            &Ok(receipt.clone())
+        ));
+        assert_eq!(state.fleet.provider_sends.len(), 1);
+        assert_eq!(state.fleet.rows[0].provider_runs[0].update_id, None);
+        assert!(state.fleet_rpc("remote", &format!("fleet:receipt:{id}"), &Ok(receipt)));
+        assert!(state.fleet.provider_sends.is_empty());
+        assert_eq!(
+            state.fleet.rows[0].provider_runs[0].update_id.as_deref(),
+            Some("prov-9")
+        );
+        let mut providers = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
+        providers[0]["update"] = json!({
+            "updateId": "prov-9", "status": "succeeded", "startedAt": run_request - 60_000,
+            "finishedAt": run_request, "targetVersion": "0.50.0", "message": "done"
+        });
+        state
+            .machines
+            .views
+            .insert("remote".into(), json!({"providers": providers}));
+        state.poll_fleet();
+        assert!(!state.fleet.running);
+        let notice = state.fleet.result_notice.as_ref().expect("result notice");
+        assert!(notice.success);
+        assert_eq!(notice.title, "Updated 1 provider");
+        let _ = sent;
+    }
+    /// A send whose receipt never arrives and cannot be looked up expires at the
+    /// confirmation deadline with an honest message; nothing is retried.
+    #[test]
+    fn an_unconfirmed_send_expires_at_the_deadline() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let _calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            provider_capable: true,
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        state.fleet.provider_sends[0].1.requested_ms =
+            crate::lifecycle::now() as i64 - PROVIDER_CONFIRM_MS - 1;
+        state.poll_fleet();
+        assert!(state.fleet.provider_sends.is_empty());
+        let run = &state.fleet.rows[0].provider_runs[0];
+        assert_eq!(run.outcome.as_deref(), Some("failed"));
+        assert_eq!(run.message.as_deref(), Some(PROVIDER_CONFIRM_TIMEOUT));
+    }
+    #[test]
+    fn an_accepted_provider_without_terminal_projection_expires_without_resending() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            provider_capable: true,
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        let sent = calls.try_recv().expect("initial provider request");
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
+        ));
+        assert!(state.fleet.provider_sends.is_empty());
+        state.client.as_mut().unwrap().linked.remove("remote");
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Providers);
+        state.fleet.rows[0].provider_runs[0].requested_ms =
+            crate::lifecycle::now() as i64 - PROVIDER_CONFIRM_MS - 1;
+        state.poll_fleet();
+        let run = &state.fleet.rows[0].provider_runs[0];
+        assert_eq!(run.outcome.as_deref(), Some("failed"));
+        assert_eq!(run.message.as_deref(), Some(PROVIDER_CONFIRM_TIMEOUT));
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+        assert!(!state.fleet.result_notice.as_ref().unwrap().success);
+        assert!(calls.try_recv().is_err(), "never resend an accepted update");
+    }
+    /// A restored handoff keeps up to ten minutes of elapsed time, not sixty
+    /// seconds.
+    #[test]
+    fn a_restored_handoff_keeps_ten_minutes_of_elapsed() {
+        let now = crate::lifecycle::now() as i64;
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        everything_json(
+            &state,
+            json!({
+                "savedAt": now, "localVersion": env!("CARGO_PKG_VERSION"),
+                "updatedServers": 0, "updatedProviders": 0, "failures": [],
+                "handedOff": [{"server":"remote","label":"studio","targetVersion":"v99.0.0",
+                               "updateId":"u-1","startedAt":now - 5 * 60_000}]
+            }),
+        );
+        state.poll_fleet();
+        assert!(
+            state.fleet.rows[0].started_at.elapsed() >= Duration::from_secs(240),
+            "elapsed honored up to ten minutes: {:?}",
+            state.fleet.rows[0].started_at.elapsed()
+        );
+    }
+    /// A machine that drops off never stays "Checking for more..."; neither does a
+    /// refresh older than the deadline.
+    #[test]
+    fn refreshing_clears_on_disconnect_and_on_the_deadline() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state
+            .fleet
+            .refresh_pending
+            .insert("ghost".into(), Instant::now());
+        state
+            .fleet
+            .refresh_pending
+            .insert("local".into(), Instant::now());
+        state.fleet.refreshing = 2;
+        state.poll_fleet();
+        assert_eq!(
+            state.fleet.refreshing, 1,
+            "an unlinked machine stops counting"
+        );
+        state.fleet.refresh_pending.insert(
+            "local".into(),
+            Instant::now() - REFRESH_DEADLINE - Duration::from_secs(1),
+        );
+        state.poll_fleet();
+        assert_eq!(state.fleet.refreshing, 0, "the deadline ends the wait");
+        assert!(state.fleet.refresh_pending.is_empty());
+    }
+    /// Settings sends gate duplicates while unreceipted, surface refusals inline per
+    /// (server, driver) and clear on the next explicit press.
+    #[test]
+    fn settings_provider_sends_gate_duplicates_and_show_refusals_inline() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"providers":[behind("codex","Codex","0.48.0","0.50.0")]}),
+        );
+        state.update_provider("remote", "codex");
+        let sent = calls.try_recv().expect("providers.update sent");
+        assert!(state.provider_send_pending("remote", "codex"));
+        // A second press while unreceipted sends nothing.
+        state.update_provider("remote", "codex");
+        assert!(
+            calls.try_recv().is_err(),
+            "the pending send gates the duplicate"
+        );
+        // The refused receipt lands inline on the (server, driver) row.
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"result":{"error":{"message":"Stale version."}}}),
+        ));
+        assert_eq!(
+            state
+                .fleet
+                .provider_send_errors
+                .get(&("remote".to_owned(), "codex".to_owned()))
+                .map(String::as_str),
+            Some("Stale version.")
+        );
+        assert!(!state.provider_send_pending("remote", "codex"));
+        // The next explicit press clears the error and sends again.
+        state.update_provider("remote", "codex");
+        assert!(
+            state
+                .fleet
+                .provider_send_errors
+                .get(&("remote".to_owned(), "codex".to_owned()))
+                .is_none()
+        );
+        assert!(calls.try_recv().is_ok());
+    }
+    /// A send that cannot reach the machine reports inline instead of vanishing.
+    #[test]
+    fn a_disconnected_settings_send_reports_inline() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        // No client: the local server is not running (embedded mode).
+        assert!(!state.provider_capable("local"));
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        state.machines.views.insert(
+            "local".into(),
+            json!({"providers":[behind("codex","Codex","0.48.0","0.50.0")]}),
+        );
+        state.update_provider("local", "codex");
+        let error = state
+            .fleet
+            .provider_send_errors
+            .get(&("local".to_owned(), "codex".to_owned()))
+            .expect("inline error");
+        assert!(error.contains("disconnected"), "{error}");
+        assert!(!state.provider_send_pending("local", "codex"));
     }
 }

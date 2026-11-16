@@ -2,7 +2,9 @@
 
 A thread uses `pi` by default, `codex`, `claude`, or an ACP agent id. Choose Harness at the top of the model picker before the first send. Settings > Default harness cycles the default for new threads and captain homes, with Pi as the initial default. Workers inherit the parent's harness unless `delegate_task.target.harness` selects another. The choice stays fixed after sending. Older indexes without a `harness` field restore as Pi. Saved Codex, Claude and ACP sessions use opaque thread/session ids, not Pi session-file paths.
 
-Pi remains CPA-only. Codex, Claude and ACP agents use their own configured providers and authentication. Shina does not install agents, sign in, configure providers, read or copy credentials, or edit their authentication files. Configure and authenticate these CLIs outside Shina before using them. An authentication denial stops startup without retries.
+Pi remains CPA-only. Codex, Claude and ACP agents use their own configured providers and authentication. Shina does not install missing agents, sign in, configure providers, read or copy credentials, or edit their authentication files. Configure and authenticate these CLIs outside Shina before using them. An authentication denial stops startup without retries.
+
+Explicit update actions can upgrade an existing Codex or Claude installation when Shina proves its installer and location. Unrecognized installations and wrappers remain manual-only. Provider updates do not change CPA, provider configuration or authentication. Protocol minor 36 advertises `provider-updates-v1`; both `providers.refresh` and `providers.update` require the existing update grant. Running work blocks acceptance. After acceptance, new work waits while Shina stops idle provider processes, updates the executable and verifies its installed version. An interrupted update records failure rather than retrying an install at startup.
 
 ## Codex app-server
 

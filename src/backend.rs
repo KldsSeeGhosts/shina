@@ -46,6 +46,32 @@ pub struct Pi {
     commands: SyncSender<Value>,
     pub events: Receiver<Event>,
     stopped: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+    owner: Arc<SessionOwner>,
+}
+
+pub(crate) struct ShutdownFence {
+    finished: Arc<AtomicBool>,
+    owner: Arc<SessionOwner>,
+}
+impl ShutdownFence {
+    pub(crate) fn ready(&self) -> Result<bool, String> {
+        if self.owner.quarantined.load(Ordering::Acquire) {
+            return Err("The previous provider process could not be reaped. Restart Shina before updating this provider.".into());
+        }
+        Ok(self.finished.load(Ordering::Acquire))
+    }
+}
+
+/// Signals process cleanup without waiting on the reducer or the UI thread.
+struct Finished(Arc<AtomicBool>);
+impl Drop for Finished {
+    fn drop(&mut self) {
+        // A panic is not evidence that child-process cleanup completed.
+        if !thread::panicking() {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -134,6 +160,14 @@ struct Launch {
 }
 
 impl Pi {
+    pub(crate) fn stop_fence(&self) -> ShutdownFence {
+        self.stopped.store(true, Ordering::Release);
+        ShutdownFence {
+            finished: self.finished.clone(),
+            owner: self.owner.clone(),
+        }
+    }
+
     /// ACP, Codex and Claude share Pi's bounded connection, owner and shutdown registry.
     pub(crate) fn worker(
         wake: Waker,
@@ -153,6 +187,9 @@ impl Pi {
         let (events, output) = mpsc::sync_channel(256);
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finish = Finished(finished.clone());
+        let session_owner = owner.clone();
         let session_lock = session_key.map(|key| {
             let mut sessions = SESSIONS.lock().expect("session owners");
             sessions.retain(|_, owner| owner.strong_count() > 0);
@@ -164,6 +201,7 @@ impl Pi {
             lock
         });
         let worker = thread::spawn(move || {
+            let _finish = finish;
             let result = (|| {
                 let Some(_guard) = acquire_session(&owner.lock, &stop)? else {
                     return Ok(());
@@ -200,6 +238,8 @@ impl Pi {
             commands,
             events: output,
             stopped,
+            finished,
+            owner: session_owner,
         }
     }
     #[cfg(test)]
@@ -218,6 +258,8 @@ impl Pi {
                 commands,
                 events,
                 stopped: Arc::new(AtomicBool::new(false)),
+                finished: Arc::new(AtomicBool::new(true)),
+                owner: Arc::default(),
             },
             input,
             output,
@@ -274,6 +316,9 @@ impl Pi {
         let (events, output) = mpsc::sync_channel(256);
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+        let finish = Finished(finished.clone());
+        let session_owner = owner.clone();
         let session_lock = session.as_ref().map(|session| {
             let path = Path::new(session);
             let path = if path.is_absolute() {
@@ -296,6 +341,7 @@ impl Pi {
             .expect("test profile")
             .join("pi-sessions");
         let worker = thread::spawn(move || {
+            let _finish = finish;
             let _connection_guard = match acquire_session(&owner.lock, &stop) {
                 Ok(Some(guard)) => guard,
                 Ok(None) => return,
@@ -346,6 +392,8 @@ impl Pi {
             commands,
             events: output,
             stopped,
+            finished,
+            owner: session_owner,
         }
     }
 

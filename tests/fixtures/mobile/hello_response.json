@@ -60,7 +60,8 @@
       "captain-retire-v1",
       "captain-delete-v1",
       "captain-crew-control-v1",
-      "captain-events-v1"
+      "captain-events-v1",
+      "provider-updates-v1"
     ],
     "deviceId": "<uuid>",
     "epoch": "<epoch>",
@@ -78,7 +79,7 @@
     },
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 35,
+    "protocolMinor": 36,
     "serverId": "<serverId>",
     "serverTime": "<time>"
   }

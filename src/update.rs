@@ -538,7 +538,11 @@ fn relaunch_or_restore_with(
 /// Puts the previous app back over a replacement that cannot start. Windows keeps the old
 /// executable as `shina.old.exe`, macOS keeps the bundle as `Shina-app.previous`.
 pub fn restore_previous(update: &PreparedUpdate, running: &Path) -> Result<(), String> {
-    match &update.target {
+    restore_previous_target(&update.target, running)
+}
+
+fn restore_previous_target(target: &InstalledTarget, running: &Path) -> Result<(), String> {
+    match target {
         InstalledTarget::Windows { exe } => {
             let dir = exe
                 .parent()
@@ -1454,6 +1458,475 @@ fn coordinated_path() -> PathBuf {
     })
 }
 
+/// The per-user update watch (design contract 9.2): a service-manager job the server
+/// registers at the restart handoff and that runs `shina service recover-update
+/// <updateId>` once a minute for up to 45 minutes. It is the second line when the
+/// detached helper is killed or crashes after the service was stopped: the helper's
+/// exit-path restart is the first.
+pub const WATCH_INTERVAL_SECS: u64 = 60;
+pub const WATCH_EXPIRY: Duration = Duration::from_secs(45 * 60);
+
+/// The durable record of a registered watch. `service` pins the job name so recovery
+/// still finds the job if `service.json` changed while the update ran.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateWatch {
+    pub update_id: String,
+    pub tag: String,
+    pub service: String,
+    /// Unix seconds when the watch was registered; the 45 minute expiry counts from it.
+    pub registered_at: u64,
+}
+
+fn watch_path(directory: &Path) -> PathBuf {
+    directory.join("updates").join("update-watch.json")
+}
+
+/// The registered watch, if one survived. A corrupt file counts as none.
+pub fn update_watch(directory: &Path) -> Option<UpdateWatch> {
+    serde_json::from_slice(&fs::read(watch_path(directory)).ok()?).ok()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|time| time.as_secs())
+        .unwrap_or(0)
+}
+
+/// The stable copy the watch job runs. The job never executes the installed binary
+/// itself: mid-swap that path can be absent, and a watch that cannot start is no watch.
+fn watch_helper_path(directory: &Path) -> PathBuf {
+    directory.join("updates").join(if cfg!(windows) {
+        "watch-helper.exe"
+    } else {
+        "watch-helper"
+    })
+}
+
+/// Registers the watch with the service manager. The durable record, the stable helper
+/// copy and the manager job are committed together: any failure rolls all three back,
+/// so a rejected job never leaves a record that recover-update would act on. No service
+/// installed means no watch and no error.
+pub fn register_update_watch(directory: &Path, update_id: &str, tag: &str) -> Result<(), String> {
+    let Some(service) = crate::service::Service::load_from(directory)? else {
+        return Ok(());
+    };
+    fs::create_dir_all(directory.join("updates")).map_err(|e| e.to_string())?;
+    let helper = watch_helper_path(directory);
+    fs::copy(&service.executable, &helper)
+        .map_err(|e| format!("Could not copy the update watch helper: {e}"))?;
+    if file_sha256(&helper)? != file_sha256(&service.executable)? {
+        return Err("The update watch helper copy is incomplete.".into());
+    }
+    let watch = UpdateWatch {
+        update_id: update_id.into(),
+        tag: tag.into(),
+        service: service.name.clone(),
+        registered_at: unix_now(),
+    };
+    let result = (|| {
+        crate::store::write_atomic(
+            &watch_path(directory),
+            &serde_json::to_vec(&watch).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        service.register_update_watch(&helper, update_id, directory)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(watch_path(directory));
+        let _ = service.unregister_update_watch();
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Disarms the watch before removing its job. Booting out a LaunchAgent can
+/// terminate the process calling this function.
+pub fn unregister_update_watch_for(
+    service: &crate::service::Service,
+    directory: &Path,
+) -> Result<(), String> {
+    match fs::remove_file(watch_path(directory)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }?;
+    // launchctl bootout may terminate this very recovery process. Remove its
+    // authority record first, so successful cleanup cannot leave it armed.
+    service.unregister_update_watch()
+}
+
+/// Removes the watch job and its record, resolving the installed service itself.
+pub fn unregister_update_watch(directory: &Path) -> Result<(), String> {
+    if let Some(service) = crate::service::Service::load_from(directory)? {
+        unregister_update_watch_for(&service, directory)?;
+    } else {
+        match fs::remove_file(watch_path(directory)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+/// An operator's explicit stop or uninstall wins over any armed watch. The record
+/// goes first: a job the manager refuses to unload then sees a missing watch on its
+/// next pass and unloads itself as stale, so a failed unload can never leave a job
+/// that still starts the service. The journal goes too: intentional stop discards
+/// the interrupted update's recovery intent.
+pub fn disarm_update_watch(directory: &Path) {
+    let _ = fs::remove_file(watch_path(directory));
+    // An explicit stop cancels automatic starts, not the matched rollback evidence.
+    if !directory.join("update-validation").exists() {
+        clear_journal(directory);
+    }
+    let _ = unregister_update_watch(directory);
+}
+
+/// After readiness, a matching outcome and free helper lock allow watch cleanup.
+/// A ready server alone cannot disarm an update registered before its handoff.
+pub fn remove_stale_update_watch(directory: &Path) {
+    let Some(watch) = update_watch(directory) else {
+        return;
+    };
+    // A surviving journal means the update still owes validation or rollback: a
+    // server holding the profile in the dispatch hold is not proof the update
+    // finished, so the watch stays.
+    if !matches!(read_update_journal(directory), Ok(None)) {
+        return;
+    }
+    if !crate::fleet_update::read_outcome(directory)
+        .is_some_and(|outcome| outcome.update_id == watch.update_id)
+    {
+        return;
+    }
+    match install::InstallLock::try_acquire(&directory.join("updates")) {
+        Ok(Some(_lock)) => {
+            if !update_watch(directory).is_some_and(|current| current.update_id == watch.update_id)
+            {
+                return;
+            }
+            let _ = unregister_update_watch(directory);
+        }
+        // Lock held: a live helper still owns the handoff. Lock unreadable: leave the
+        // watch, a failed unregister would cost the second line for nothing.
+        _ => {}
+    }
+}
+
+/// The durable record of where an update's destructive steps stand. Written after the
+/// state backup and before the dispatch hold and the binary swap, so a killed helper
+/// always leaves the watch enough to finish: validate a server that answers, or put
+/// the matched binary and database back together. Never cleared just because a
+/// process owns the profile.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateJournal {
+    /// The watch's update id; a journal only answers to its own watch.
+    pub update_id: String,
+    /// The release the helper was installing; recovery validates against it.
+    pub tag: String,
+    /// The service the journal belongs to, when the update managed one.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// The pre-update backup `restore_backup` replays. Restoring the old binary
+    /// requires this state: a touched schema must never meet the old build.
+    pub backup: PathBuf,
+    pub previous_sha256: String,
+    pub replacement_sha256: String,
+    pub previous_version: String,
+    /// Unix seconds when the journal was written; informational.
+    pub at: u64,
+    pub phase: JournalPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum JournalPhase {
+    /// Backup taken, hold written, binary replaced. Validation is still owed.
+    Replaced,
+    /// Start or validation failed; rollback to the backup is in flight.
+    RollingBack,
+    /// Both the previous executable and its database have been restored.
+    Restored,
+}
+
+fn journal_path(directory: &Path) -> PathBuf {
+    directory.join("updates").join("update-journal.json")
+}
+
+/// The interrupted update's journal, if one survived. A corrupt file counts as none.
+pub fn update_journal(directory: &Path) -> Option<UpdateJournal> {
+    read_update_journal(directory).ok().flatten()
+}
+
+pub fn read_update_journal(directory: &Path) -> Result<Option<UpdateJournal>, String> {
+    match fs::read(journal_path(directory)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            "The update recovery journal is malformed. Recovery remains fenced.".into()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn save_journal(directory: &Path, journal: &UpdateJournal) -> Result<(), String> {
+    fs::create_dir_all(directory.join("updates")).map_err(|e| e.to_string())?;
+    crate::store::write_atomic(
+        &journal_path(directory),
+        &serde_json::to_vec(journal).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Drops the journal once validation completed or rollback restored the matched pair.
+pub fn clear_journal(directory: &Path) {
+    let _ = fs::remove_file(journal_path(directory));
+}
+
+/// The journal entry that answers to this watch, or none. A journal for another
+/// update id or another service is invisible to this recovery pass.
+fn journal_for<'a>(
+    journal: &'a Option<UpdateJournal>,
+    watch: &UpdateWatch,
+    service: &crate::service::Service,
+) -> Option<&'a UpdateJournal> {
+    journal.as_ref().filter(|journal| {
+        journal.update_id == watch.update_id
+            && journal.service.as_deref() == Some(service.name.as_str())
+            && journal.tag == watch.tag
+    })
+}
+
+fn service_target(service: &crate::service::Service) -> Result<InstalledTarget, String> {
+    Ok(match service.platform {
+        crate::service::Platform::Mac => InstalledTarget::MacBundle {
+            app: service
+                .executable
+                .ancestors()
+                .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+                .ok_or("The service executable is not inside an app bundle.")?
+                .to_path_buf(),
+        },
+        crate::service::Platform::Windows => InstalledTarget::Windows {
+            exe: service.executable.clone(),
+        },
+        crate::service::Platform::Linux => InstalledTarget::Linux {
+            exe: service.executable.clone(),
+        },
+    })
+}
+
+/// Whether the backup copy a swap leaves behind exists.
+fn previous_executable(target: &InstalledTarget) -> PathBuf {
+    match target {
+        InstalledTarget::Windows { exe } => exe.parent().unwrap().join("shina.old.exe"),
+        InstalledTarget::MacBundle { app } => app
+            .parent()
+            .unwrap()
+            .join("Shina-app.previous/Contents/MacOS/shina"),
+        InstalledTarget::Linux { exe } => exe.with_file_name("shina.previous"),
+    }
+}
+
+pub fn recovery_install_is_previous(
+    service: &crate::service::Service,
+    journal: &UpdateJournal,
+) -> Result<bool, String> {
+    if !service.executable.exists() {
+        return Ok(false);
+    }
+    let digest = file_sha256(&service.executable)?;
+    if digest == journal.previous_sha256 {
+        return Ok(true);
+    }
+    if digest != journal.replacement_sha256 {
+        return Err(
+            "The Shina installation changed after this update. Recovery will not replace it."
+                .into(),
+        );
+    }
+    Ok(false)
+}
+
+/// Hashes prevent a repeated rollback from exchanging the previous bundle back out,
+/// and prevent an older update's leftover backup from becoming the rollback target.
+fn restore_service_binary(
+    service: &crate::service::Service,
+    journal: &UpdateJournal,
+) -> Result<(), String> {
+    if recovery_install_is_previous(service, journal)? {
+        return Ok(());
+    }
+    let target = service_target(service)?;
+    if file_sha256(&previous_executable(&target))? != journal.previous_sha256 {
+        return Err("The previous executable does not match this update's database backup.".into());
+    }
+    restore_previous_target(&target, &service.executable)?;
+    if !recovery_install_is_previous(service, journal)? {
+        return Err("The restored executable could not be verified.".into());
+    }
+    Ok(())
+}
+
+/// Stops a held server if one owns the profile, restores the previous binary when the
+/// swap ran, replays the matched state backup, then clears the dispatch hold and the
+/// journal. The caller starts the service afterwards: the restored build is the one
+/// this helper copy was built from, so readiness is checked against this binary's
+/// version.
+///
+/// With a hold but no provable backup the restore refuses rather than unholding state
+/// the old build may not understand; the watch keeps retrying until expiry reports it.
+pub fn restore_interrupted_update(
+    service: &crate::service::Service,
+    directory: &Path,
+    journal: &mut UpdateJournal,
+) -> Result<(), String> {
+    let backup_root = directory
+        .join("backups")
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let backup = journal.backup.canonicalize().map_err(|e| e.to_string())?;
+    if backup == backup_root || !backup.starts_with(&backup_root) {
+        return Err("This update's backup is outside its profile.".into());
+    }
+    recovery_install_is_previous(service, journal)?;
+    let restored = journal.phase == JournalPhase::Restored;
+    if !restored {
+        journal.phase = JournalPhase::RollingBack;
+        save_journal(directory, journal)?;
+    }
+    if crate::server_lock::Owner::acquire(directory).is_err() {
+        // A live server still owns state, probably in the dispatch hold. Stop it
+        // through RPC so shutdown hooks run, then wait for ownership to release.
+        let discovery = crate::server_auth::Discovery::read(directory)?;
+        let server = WaitProcess::open(discovery.pid)?;
+        let launcher = fs::read_to_string(directory.join("service-launcher.pid"))
+            .ok()
+            .map(|pid| {
+                pid.trim()
+                    .parse::<u32>()
+                    .map_err(|e| e.to_string())
+                    .and_then(WaitProcess::open)
+            })
+            .transpose()?;
+        let _ = crate::maintenance::rpc(directory, "server.stop", serde_json::json!({}));
+        server.wait(METADATA_TIMEOUT)?;
+        crate::maintenance::wait_unowned(directory, METADATA_TIMEOUT)?;
+        if let Some(launcher) = launcher {
+            launcher.wait(METADATA_TIMEOUT)?;
+        }
+    }
+    service.stop()?;
+    {
+        let _owner = crate::server_lock::Owner::acquire(directory)?;
+        restore_service_binary(service, journal)?;
+        if !restored {
+            crate::maintenance::restore_backup(directory, &backup)?;
+            journal.phase = JournalPhase::Restored;
+            save_journal(directory, journal)?;
+        }
+        record_recovered_outcome(directory, &journal.update_id, &journal.tag, false,
+            Some("The update helper stopped before validation. The previous executable and its matching state were restored.".into()))?;
+        match fs::remove_file(directory.join("update-validation")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    clear_journal(directory);
+    Ok(())
+}
+
+/// What `reconcile_held_service` decided for a server sitting in the dispatch hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldRecovery {
+    /// The new server passed readiness and `validateRestart` cleared the hold.
+    Validated,
+    /// The new server did not pass readiness; the previous binary and the matched
+    /// backup were restored and the hold cleared. The caller starts the service.
+    RolledBack,
+}
+
+/// A server owns the profile while `update-validation` still holds dispatch. The
+/// watch finishes what the killed helper owed: validate the server if it answers as
+/// the expected version, else stop it and restore the journal's matched binary and
+/// backup together. Ownership alone never clears the hold.
+pub fn reconcile_held_service(
+    service: &crate::service::Service,
+    directory: &Path,
+    watch: &UpdateWatch,
+) -> Result<HeldRecovery, String> {
+    let mut journal = journal_for(&read_update_journal(directory)?, watch, service)
+        .cloned()
+        .ok_or("This update's matching recovery journal is missing. Dispatch remains held.")?;
+    recovery_install_is_previous(service, &journal)?;
+    if journal.phase == JournalPhase::Replaced
+        && readiness(directory, &journal.tag).is_ok()
+        && crate::maintenance::rpc(directory, "server.validateRestart", serde_json::json!({}))
+            .is_ok()
+    {
+        record_recovered_outcome(directory, &watch.update_id, &watch.tag, true, None)?;
+        clear_journal(directory);
+        return Ok(HeldRecovery::Validated);
+    }
+    restore_interrupted_update(service, directory, &mut journal)?;
+    Ok(HeldRecovery::RolledBack)
+}
+
+pub fn record_recovered_outcome(
+    directory: &Path,
+    update_id: &str,
+    tag: &str,
+    success: bool,
+    reason: Option<String>,
+) -> Result<(), String> {
+    crate::fleet_update::save_outcome(
+        directory,
+        &crate::fleet_update::Outcome {
+            update_id: update_id.into(),
+            tag: tag.into(),
+            success,
+            reason: reason.clone(),
+        },
+    )?;
+    if let Some(reason) = reason {
+        Storage::at(directory.join("updates")).save_failure(tag, &reason)?;
+    }
+    let request = request_for_recovery(directory)?;
+    if request["updateId"] == update_id {
+        fs::remove_file(directory.join("updates/request.json")).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn request_for_recovery(directory: &Path) -> Result<Value, String> {
+    match fs::read(directory.join("updates/request.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Starts the service on every update-helper exit path that did not complete
+/// successfully, including a panic. A killed helper never drops: the watch covers that.
+struct ServiceGuard<F: FnMut()> {
+    restart: Option<F>,
+}
+impl<F: FnMut()> ServiceGuard<F> {
+    fn disarm(&mut self) {
+        self.restart = None;
+    }
+}
+impl<F: FnMut()> Drop for ServiceGuard<F> {
+    fn drop(&mut self) {
+        if let Some(restart) = &mut self.restart {
+            restart();
+        }
+    }
+}
+
 pub fn start_coordinated_helper(update: &PreparedUpdate) -> Result<(), String> {
     start_coordinated_helper_id(update, &uuid::Uuid::new_v4().to_string())
 }
@@ -1484,9 +1957,29 @@ fn start_coordinated_helper_id(update: &PreparedUpdate, id: &str) -> Result<(), 
     if handshake.exists() {
         fs::remove_file(&handshake).map_err(|e| e.to_string())?;
     }
+    // The watch is registered before the helper starts, so it exists before anything
+    // drains or stops the service. It is written under the install lock so a second
+    // updater cannot interleave a newer watch with this one's rollback. A service
+    // manager that rejects the job fails the update closed here, while nothing has
+    // been interrupted yet.
+    let directory = crate::store::directory().ok_or("No profile.")?;
+    register_update_watch(&directory, id, &update.tag)?;
     drop(_lock);
-    let mut child = install::launch_detached(&helper, &["--coordinated-update"])?;
-    install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT)
+    let mut child = match install::launch_detached(&helper, &["--coordinated-update"]) {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = unregister_update_watch(&directory);
+            return Err(error);
+        }
+    };
+    match install::wait_for_marker(&mut child, &handshake, METADATA_TIMEOUT) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // A helper that never acknowledged owns no handoff; disarm its watch.
+            let _ = unregister_update_watch(&directory);
+            Err(error)
+        }
+    }
 }
 
 pub fn cli_update(args: &[String]) -> Result<(), String> {
@@ -1723,16 +2216,19 @@ fn readiness(directory: &Path, expected: &str) -> Result<(), String> {
     let mut evidence = ReadinessEvidence::default();
     while Instant::now() < deadline {
         evidence.started |= directory.join("server-started.pid").is_file();
-        if let Ok(discovery) = crate::server_auth::Discovery::read(directory)
-            && crate::process::is_alive(discovery.pid)
-        {
-            evidence.started = true;
+        if let Ok(discovery) = crate::server_auth::Discovery::read(directory) {
             evidence.version = Some(discovery.binary_version.clone());
-            if discovery.binary_version != expected.trim_start_matches('v') {
-                return Err(evidence.failure(expected));
-            }
+            // Windows may deny the watch a handle to an elevated server. Its
+            // authenticated RPC verifies the profile and instance without that
+            // privilege, and also rejects a stale discovery file.
             match crate::maintenance::rpc(directory, "server.status", serde_json::json!({})) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    evidence.started = true;
+                    if discovery.binary_version != expected.trim_start_matches('v') {
+                        return Err(evidence.failure(expected));
+                    }
+                    return Ok(());
+                }
                 Err(error) => evidence.rpc_error = Some(redact(&error)),
             }
         }
@@ -1847,7 +2343,42 @@ impl HelperSteps for CoordinatedUpdate {
     }
     fn replace(&mut self) -> Result<(), String> {
         let _owner = crate::server_lock::Owner::acquire(&self.directory)?;
-        self.backup = Some(crate::maintenance::backup_state(&self.directory)?);
+        let backup = crate::maintenance::backup_state(&self.directory)?;
+        // Journal before anything destructive: after this write a killed helper still
+        // leaves the watch the matched backup, the expected version and the phase it
+        // needs to finish validation or restore binary and state together.
+        let watch = update_watch(&self.directory);
+        save_journal(
+            &self.directory,
+            &UpdateJournal {
+                update_id: watch
+                    .as_ref()
+                    .map(|watch| watch.update_id.clone())
+                    .or_else(|| self.update_id.clone())
+                    .unwrap_or_default(),
+                tag: self.update.tag.clone(),
+                service: watch
+                    .map(|watch| watch.service)
+                    .or_else(|| self.service.as_ref().map(|service| service.name.clone())),
+                backup: backup.clone(),
+                previous_sha256: file_sha256(&match &self.update.target {
+                    InstalledTarget::MacBundle { app } => app.join("Contents/MacOS/shina"),
+                    InstalledTarget::Windows { exe } | InstalledTarget::Linux { exe } => {
+                        exe.clone()
+                    }
+                })?,
+                replacement_sha256: file_sha256(&match &self.update.target {
+                    InstalledTarget::MacBundle { .. } => {
+                        self.update.prepared.join("Contents/MacOS/shina")
+                    }
+                    _ => self.update.prepared.clone(),
+                })?,
+                previous_version: env!("CARGO_PKG_VERSION").into(),
+                at: unix_now(),
+                phase: JournalPhase::Replaced,
+            },
+        )?;
+        self.backup = Some(backup);
         crate::store::write_atomic(
             &self.directory.join("update-validation"),
             b"hold routine dispatch until readiness",
@@ -1905,6 +2436,12 @@ impl HelperSteps for CoordinatedUpdate {
         Ok(())
     }
     fn rollback(&mut self) -> Result<(), String> {
+        // Record that rollback started so a killed helper leaves the watch a
+        // RollingBack phase to complete rather than a Replaced one to revalidate.
+        if let Some(mut journal) = update_journal(&self.directory) {
+            journal.phase = JournalPhase::RollingBack;
+            save_journal(&self.directory, &journal)?;
+        }
         // Validation mode never dispatched routines or mutations. Refuse restoration if
         // a newer process still owns state. Never run the old binary on the new schema.
         if crate::server_lock::Owner::acquire(&self.directory).is_err() {
@@ -1941,6 +2478,7 @@ impl HelperSteps for CoordinatedUpdate {
             }
         }
         let _ = fs::remove_file(self.directory.join("update-validation"));
+        clear_journal(&self.directory);
         self.start()?;
         readiness(&self.directory, env!("CARGO_PKG_VERSION"))?;
         self.reopen()
@@ -1964,7 +2502,14 @@ pub fn coordinated_helper() -> Result<(), String> {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let mut result = (|| {
+    // First line of the stopped-service guarantee: this helper restarts the service on
+    // every unsuccessful exit path, panic included. The update watch registered below
+    // is the independent second line for a kill or a crash this process cannot catch.
+    let mut service_guard = ServiceGuard { restart: None };
+    // False until the drain commit returns: a watch armed by a helper that never
+    // interrupted anything is stale and is removed on the way out.
+    let mut committed = false;
+    let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let update = PreparedUpdate::from_value(
             &serde_json::from_slice::<Value>(
                 &fs::read(storage.manifest()).map_err(|e| e.to_string())?,
@@ -1996,6 +2541,11 @@ pub fn coordinated_helper() -> Result<(), String> {
         {
             return Err("Service points to another executable. Reconcile it with shina service install first.".into());
         }
+        if let Some(service) = service.clone() {
+            service_guard.restart = Some(move || {
+                let _ = service.start();
+            });
+        }
         fs::write(storage.root.join("coordinated-started"), b"ready").map_err(|e| e.to_string())?;
         step = "Prepare restart";
         let live = crate::server_lock::Owner::acquire(&directory).is_err();
@@ -2019,6 +2569,8 @@ pub fn coordinated_helper() -> Result<(), String> {
             replaced: false,
         };
         step = "Commit restart";
+        // The update watch was registered by start_coordinated_helper before this
+        // process existed. From the first real interruption on, both lines matter.
         let prepare = (|| {
             if let Some(pid) = prepared["serverPid"]
                 .as_u64()
@@ -2064,16 +2616,27 @@ pub fn coordinated_helper() -> Result<(), String> {
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
+                // From the first possible commit send, a panic is an uncertain
+                // handoff. Only confirmed cancellation may disarm recovery.
+                committed = true;
                 crate::maintenance::rpc(&directory, "server.commitRestart", prepared.clone())?;
             }
             Ok::<_, String>(())
         })();
         if let Err(error) = prepare {
-            if live {
-                let _ = crate::maintenance::rpc(&directory, "server.cancelRestart", prepared);
+            // A confirmed cancellation means nothing was interrupted: the service
+            // keeps running (or was already down), so neither restart line applies.
+            // If the commit may have reached the server anyway, stay armed.
+            if !live || crate::maintenance::rpc(&directory, "server.cancelRestart", prepared).is_ok() {
+                committed = false;
+                service_guard.disarm();
+            } else {
+                // The commit may still have reached the server: keep both lines.
+                committed = true;
             }
             return Err(error);
         }
+        committed = true;
         step = "Update sequence";
         let result = helper_sequence(&mut host);
         if let Err(error) = &result {
@@ -2088,13 +2651,28 @@ pub fn coordinated_helper() -> Result<(), String> {
             }
         }
         if result.is_ok() {
+            // The service was verified ready: the watch is no longer needed and the
+            // guard must not start an already verified service on the way out.
+            let _ = unregister_update_watch(&directory);
+            clear_journal(&directory);
+            service_guard.disarm();
             let _ = fs::remove_file(storage.manifest());
             let _ = fs::remove_file(storage.failed_release());
         }
         result
-    })().map_err(|error| {
+    }))
+    .unwrap_or_else(|_| {
+        Err("The update helper stopped unexpectedly. The service was asked to start again.".into())
+    })
+    .map_err(|error| {
         if step == "Update sequence" { error } else { format!("{step} failed: {error}") }
     });
+    if !committed {
+        // The helper never interrupted anything: an update that failed this early
+        // must not wake a service the operator left stopped on purpose.
+        let _ = unregister_update_watch(&directory);
+        service_guard.disarm();
+    }
     if let Some(tag) = &failed_tag {
         crate::fleet_update::save_outcome(
             &directory,
@@ -2726,10 +3304,20 @@ mod tests {
         assert!(!helper.replaced && helper.backup.is_none());
         assert_eq!(fs::read(&exe).unwrap(), b"original binary");
         assert!(!directory.join("update-validation").exists());
+        // A failed backup writes no journal: nothing destructive was owed.
+        assert!(update_journal(&directory).is_none());
         fs::remove_file(directory.join("damaged.sqlite")).unwrap();
         helper.replace().unwrap();
         assert!(helper.replaced);
         assert_eq!(fs::read(&exe).unwrap(), b"replacement binary");
+        // The journal recorded the matched backup, expected version and phase before
+        // the swap, so a helper killed here still leaves recovery its full context.
+        let journal = update_journal(&directory).expect("journal written before swap");
+        assert_eq!(journal.phase, JournalPhase::Replaced);
+        assert_eq!(journal.tag, "v99.0.0");
+        assert_eq!(journal.backup, helper.backup.clone().unwrap());
+        assert!(journal.backup.is_dir());
+        assert!(directory.join("update-validation").exists());
         let saved =
             rusqlite::Connection::open(helper.backup.as_ref().unwrap().join("state.sqlite"))
                 .unwrap();
@@ -3853,5 +4441,301 @@ mod tests {
             fs::read(destination.join("Shina.app/Contents/MacOS/shina")).unwrap(),
             b"offline fixture"
         );
+    }
+
+    fn write_watch(directory: &Path, update_id: &str, registered_at: u64) {
+        fs::create_dir_all(directory.join("updates")).unwrap();
+        crate::store::write_atomic(
+            &watch_path(directory),
+            serde_json::to_vec(&UpdateWatch {
+                update_id: update_id.into(),
+                tag: "v9.9.9".into(),
+                service: "Shina-test".into(),
+                registered_at,
+            })
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn update_watch_round_trips_and_unregister_tolerates_a_missing_record() {
+        let directory = crate::store::directory().unwrap().join("watch-roundtrip");
+        fs::create_dir_all(&directory).unwrap();
+        assert!(update_watch(&directory).is_none());
+        write_watch(&directory, "id-1", 1_700_000_000);
+        let watch = update_watch(&directory).unwrap();
+        assert_eq!(watch.update_id, "id-1");
+        assert_eq!(watch.tag, "v9.9.9");
+        assert_eq!(watch.registered_at, 1_700_000_000);
+        // No service.json exists in a test profile, so unregistration removes only
+        // the durable record and touches no platform job.
+        unregister_update_watch(&directory).unwrap();
+        assert!(update_watch(&directory).is_none());
+        unregister_update_watch(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_held_install_lock_keeps_a_stale_watch_for_the_live_helper() {
+        let directory = crate::store::directory().unwrap().join("watch-locked");
+        write_watch(&directory, "id-2", 1_700_000_000);
+        crate::fleet_update::save_outcome(
+            &directory,
+            &crate::fleet_update::Outcome {
+                update_id: "id-2".into(),
+                tag: "v9.9.9".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
+        let _lock = install::InstallLock::acquire(&directory.join("updates")).unwrap();
+        remove_stale_update_watch(&directory);
+        assert!(
+            update_watch(&directory).is_some(),
+            "a live helper's watch must survive a service start"
+        );
+        drop(_lock);
+        remove_stale_update_watch(&directory);
+        assert!(update_watch(&directory).is_none());
+    }
+
+    fn write_journal(directory: &Path, update_id: &str, phase: JournalPhase) -> PathBuf {
+        let backup = directory.join("backups/before-update-test");
+        fs::create_dir_all(&backup).unwrap();
+        save_journal(
+            directory,
+            &UpdateJournal {
+                update_id: update_id.into(),
+                tag: "v9.9.9".into(),
+                service: Some("Shina-test".into()),
+                backup: backup.clone(),
+                previous_sha256: bytes_sha256(b"previous binary"),
+                replacement_sha256: bytes_sha256(b"new binary"),
+                previous_version: env!("CARGO_PKG_VERSION").into(),
+                at: 1_700_000_000,
+                phase,
+            },
+        )
+        .unwrap();
+        backup
+    }
+
+    #[test]
+    fn a_pending_journal_keeps_the_watch_armed_even_when_a_server_owns_the_profile() {
+        let directory = crate::store::directory()
+            .unwrap()
+            .join("watch-journal-gate");
+        write_watch(&directory, "id-3", 1_700_000_000);
+        write_journal(&directory, "id-3", JournalPhase::Replaced);
+        crate::fleet_update::save_outcome(
+            &directory,
+            &crate::fleet_update::Outcome {
+                update_id: "id-3".into(),
+                tag: "v9.9.9".into(),
+                success: true,
+                reason: None,
+            },
+        )
+        .unwrap();
+        // No lock is held here: only the journal keeps the watch from being treated
+        // as stale, because a held server still owes validation or rollback.
+        remove_stale_update_watch(&directory);
+        assert!(update_watch(&directory).is_some());
+        clear_journal(&directory);
+        remove_stale_update_watch(&directory);
+        assert!(update_watch(&directory).is_none());
+    }
+
+    #[test]
+    fn a_journal_only_answers_to_its_own_watch_and_service() {
+        let directory = crate::store::directory().unwrap().join("journal-fence");
+        let watch = UpdateWatch {
+            update_id: "id-4".into(),
+            tag: "v9.9.9".into(),
+            service: "Shina-test".into(),
+            registered_at: 1_700_000_000,
+        };
+        let service = crate::service::Service {
+            platform: crate::service::Platform::Linux,
+            name: "Shina-test".into(),
+            executable: PathBuf::from("/opt/Shina/shina"),
+            directory: directory.clone(),
+            unit: PathBuf::from("/unused"),
+            home: PathBuf::from("/home/test"),
+            environment: Default::default(),
+        };
+        let mut journal = UpdateJournal {
+            update_id: "other-update".into(),
+            tag: "v9.9.9".into(),
+            service: Some("Shina-test".into()),
+            backup: PathBuf::from("/backups/x"),
+            previous_sha256: bytes_sha256(b"previous binary"),
+            replacement_sha256: bytes_sha256(b"new binary"),
+            previous_version: env!("CARGO_PKG_VERSION").into(),
+            at: 0,
+            phase: JournalPhase::Replaced,
+        };
+        assert!(journal_for(&Some(journal.clone()), &watch, &service).is_none());
+        journal.update_id = "id-4".into();
+        journal.service = Some("Shina-other".into());
+        assert!(journal_for(&Some(journal.clone()), &watch, &service).is_none());
+        journal.service = Some("Shina-test".into());
+        assert!(journal_for(&Some(journal), &watch, &service).is_some());
+        // A journal without a matching service has no recovery authority.
+        let legacy = UpdateJournal {
+            service: None,
+            ..UpdateJournal {
+                update_id: "id-4".into(),
+                tag: "v9.9.9".into(),
+                service: None,
+                backup: PathBuf::from("/backups/x"),
+                previous_sha256: bytes_sha256(b"previous binary"),
+                replacement_sha256: bytes_sha256(b"new binary"),
+                previous_version: env!("CARGO_PKG_VERSION").into(),
+                at: 0,
+                phase: JournalPhase::Replaced,
+            }
+        };
+        assert!(journal_for(&Some(legacy), &watch, &service).is_none());
+    }
+
+    #[test]
+    fn rollback_uses_this_updates_hash_and_is_safe_to_repeat() {
+        let directory = crate::store::directory().unwrap().join("rollback-hashes");
+        fs::create_dir_all(&directory).unwrap();
+        let exe = directory.join("shina.exe");
+        let previous = directory.join("shina.old.exe");
+        fs::write(&exe, b"old").unwrap();
+        fs::write(&previous, b"ancient").unwrap();
+        let service = crate::service::Service {
+            platform: crate::service::Platform::Windows,
+            name: "Shina-test".into(),
+            executable: exe.clone(),
+            directory: directory.clone(),
+            unit: directory.join("unit"),
+            home: directory.clone(),
+            environment: Default::default(),
+        };
+        let journal = UpdateJournal {
+            update_id: "hash-test".into(),
+            tag: "v9.9.9".into(),
+            service: Some(service.name.clone()),
+            backup: directory.join("backups/exact"),
+            previous_sha256: bytes_sha256(b"old"),
+            replacement_sha256: bytes_sha256(b"new"),
+            previous_version: env!("CARGO_PKG_VERSION").into(),
+            at: 0,
+            phase: JournalPhase::RollingBack,
+        };
+        // A journal written before the swap must not restore a previous release's backup.
+        restore_service_binary(&service, &journal).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        fs::write(&exe, b"new").unwrap();
+        assert!(restore_service_binary(&service, &journal).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"new");
+        fs::write(&previous, b"old").unwrap();
+        restore_service_binary(&service, &journal).unwrap();
+        restore_service_binary(&service, &journal).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), b"old");
+        fs::write(&exe, b"unrelated installation").unwrap();
+        assert!(restore_service_binary(&service, &journal).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"unrelated installation");
+    }
+
+    #[test]
+    fn a_ready_server_without_an_outcome_cannot_disarm_a_newly_registered_update() {
+        let directory = crate::store::directory()
+            .unwrap()
+            .join("watch-before-handoff");
+        write_watch(&directory, "new-attempt", 1_700_000_000);
+        remove_stale_update_watch(&directory);
+        assert!(update_watch(&directory).is_some());
+    }
+
+    #[test]
+    fn rollback_marks_the_journal_then_clears_it_once_binary_and_state_are_restored() {
+        let directory = crate::store::directory().unwrap().join("rollback-journal");
+        let install_directory = directory.join("fixture-install");
+        fs::create_dir_all(&install_directory).unwrap();
+        let exe = install_directory.join("shina.exe");
+        fs::write(&exe, b"original binary").unwrap();
+        let staged = install_directory.join("shina.new.exe");
+        fs::write(&staged, b"replacement binary").unwrap();
+        let download = directory.join("download.exe");
+        fs::write(&download, b"replacement binary").unwrap();
+        let update = PreparedUpdate {
+            tag: "v99.0.0".into(),
+            target: InstalledTarget::Windows { exe: exe.clone() },
+            asset: "shina.exe".into(),
+            size: 18,
+            sha256: bytes_sha256(b"replacement binary"),
+            download,
+            prepared: staged,
+        };
+        let mut helper = CoordinatedUpdate {
+            update,
+            directory: directory.clone(),
+            service: None,
+            clients: vec![],
+            server: None,
+            launcher: None,
+            update_id: None,
+            desktop_owned: false,
+            reopen: 0,
+            closed_clients: 0,
+            backup: None,
+            replaced: false,
+        };
+        helper.replace().unwrap();
+        // A kill here would leave phase Replaced; rollback flips it before touching
+        // state, so an interrupted rollback resumes rather than revalidates.
+        let result = helper.rollback();
+        assert!(
+            result.is_err(),
+            "the staged dummy executable cannot serve: {result:?}"
+        );
+        // The hold is gone, the original binary and backup are restored, and the
+        // journal is cleared only after both landed.
+        assert!(!directory.join("update-validation").exists());
+        assert_eq!(fs::read(&exe).unwrap(), b"original binary");
+        assert!(update_journal(&directory).is_none());
+    }
+
+    #[test]
+    fn an_explicit_stop_disarms_watch_record_and_journal_before_the_job() {
+        let directory = crate::store::directory().unwrap().join("watch-disarm");
+        write_watch(&directory, "id-5", 1_700_000_000);
+        write_journal(&directory, "id-5", JournalPhase::Replaced);
+        disarm_update_watch(&directory);
+        assert!(update_watch(&directory).is_none());
+        assert!(update_journal(&directory).is_none());
+    }
+
+    #[test]
+    fn the_service_guard_starts_the_service_on_drop_unless_disarmed() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let starts = Rc::new(Cell::new(0));
+        {
+            let starts = starts.clone();
+            let mut guard = ServiceGuard {
+                restart: Some(move || {
+                    starts.set(starts.get() + 1);
+                }),
+            };
+            guard.disarm();
+        }
+        assert_eq!(starts.get(), 0);
+        {
+            let starts = starts.clone();
+            let _guard = ServiceGuard {
+                restart: Some(move || {
+                    starts.set(starts.get() + 1);
+                }),
+            };
+        }
+        assert_eq!(starts.get(), 1);
     }
 }

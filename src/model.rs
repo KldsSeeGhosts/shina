@@ -139,6 +139,8 @@ pub use background::{BackgroundSettings, BackgroundStatus};
 mod client_state;
 #[path = "draft_routing.rs"]
 mod draft_routing;
+#[path = "provider_gate.rs"]
+mod provider_gate;
 #[path = "queued_edit.rs"]
 mod queued_edit;
 #[path = "run_control.rs"]
@@ -933,6 +935,8 @@ pub struct Thread {
     pub status: Status,
     /// Resume connectivity gate. Never retries an accepted prompt.
     offline_blocked: bool,
+    /// New turns wait while this machine replaces their provider executable.
+    provider_update_held: bool,
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
     pub thoughts: Vec<Thought>,
@@ -1146,7 +1150,10 @@ impl Thread {
     /// the band's sails): running now. Queued, interrupted, finished and approval-blocked
     /// threads are not working.
     pub fn running_now(&self) -> bool {
-        self.status == Status::Running && self.request.is_none() && !self.offline_blocked
+        self.status == Status::Running
+            && self.request.is_none()
+            && !self.offline_blocked
+            && !self.provider_update_held
     }
     pub fn queued(&self) -> bool {
         self.native.projected_queued
@@ -1473,6 +1480,7 @@ impl Thread {
             renamed: false,
             status: Status::Ready,
             offline_blocked: false,
+            provider_update_held: false,
             messages: vec![],
             tools: vec![],
             thoughts: vec![],
@@ -1591,7 +1599,7 @@ impl Thread {
         wake: Waker,
         instructions: Option<String>,
     ) {
-        if self.pi.is_some() {
+        if self.pi.is_some() || self.provider_update_held {
             return;
         }
         self.request_generation = uuid::Uuid::new_v4().to_string();
@@ -2091,7 +2099,12 @@ impl Thread {
         self.assistant = None;
         self.ensure_work();
         self.error = None;
-        self.phase = "Working".into();
+        self.phase = if self.provider_update_held {
+            "Waiting for provider update"
+        } else {
+            "Working"
+        }
+        .into();
         self.last_activity = Instant::now();
         self.drive_session();
     }
@@ -2652,7 +2665,7 @@ impl Thread {
     }
 
     fn flush_injection(&mut self) -> bool {
-        if self.offline_blocked || self.status == Status::Paused {
+        if self.offline_blocked || self.provider_update_held || self.status == Status::Paused {
             return false;
         }
         if self
@@ -2805,6 +2818,7 @@ impl Thread {
             || self.configuring
             || matches!(self.status, Status::Failed | Status::Paused)
             || self.offline_blocked
+            || self.provider_update_held
         {
             return;
         }
@@ -4316,6 +4330,7 @@ fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
 pub struct State {
     /// None means a command/global change. A poll records only changed threads.
     pub(crate) persistence_scope: Option<std::collections::HashSet<usize>>,
+    pub(crate) provider_update_drivers: std::collections::BTreeSet<String>,
     pub client: Option<crate::client::Client>,
     pub machines: crate::peer::Machines,
     pub peers: Vec<crate::peer::Peer>,
@@ -4650,6 +4665,7 @@ impl State {
             peer_runtime: Default::default(),
             headless: false,
             persistence_scope: None,
+            provider_update_drivers: Default::default(),
             owner: None,
             command_receipts: Vec::new(),
             command_intents: Default::default(),
@@ -8027,6 +8043,13 @@ impl State {
 
     /// Connects one thread's Pi with its captain's instructions and its Shina MCP link.
     pub fn connect_thread(&mut self, index: usize) {
+        if let Some(thread) = self.threads.get_mut(index) {
+            thread.provider_update_held =
+                self.provider_update_drivers.contains(&thread.harness) && thread.machine == "local";
+            if thread.provider_update_held {
+                return;
+            }
+        }
         if index < self.threads.len()
             && self
                 .tasks
@@ -14614,6 +14637,7 @@ impl State {
 
     /// Says why a restart waits, next to the update row rather than as a thread error.
     pub fn report_restart_blocker(&mut self, reason: String) {
+        self.record_fleet_restart_result(&reason);
         self.restart_notice = Some(reason);
     }
 
@@ -14641,16 +14665,29 @@ impl State {
     /// Why a restart to update must wait, or `None` when nothing is active. It checks every
     /// thread, including delegated, settled and archived ones.
     pub fn update_restart_blocker(&self) -> Option<&str> {
-        if self.client.is_some() && self.machines.selected != "local" {
+        if !self.provider_update_drivers.is_empty() {
+            return Some("A provider is updating. Restart when it finishes.");
+        }
+        self.provider_work_blocker()
+    }
+
+    pub(crate) fn provider_work_blocker(&self) -> Option<&str> {
+        if self.client.is_some() {
             if self.rename_thread.is_some() || self.captain_editor.is_some() {
                 return Some("Finish editing before restarting.");
             }
             // Updating this desktop concerns Local, not the remote thread being read.
-            return self
+            if let Some(blocker) = self
                 .machines
                 .views
                 .get("local")
-                .and_then(|view| view["updateStatus"]["blocker"].as_str());
+                .and_then(|view| view["updateStatus"]["blocker"].as_str())
+            {
+                return Some(blocker);
+            }
+            if self.machines.selected != "local" {
+                return None;
+            }
         }
         if self.routines_running() {
             return Some("A routine is still running. Restart when it finishes.");

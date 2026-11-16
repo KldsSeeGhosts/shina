@@ -1037,7 +1037,35 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                 .child(empty_list(s, p, "settings-no-results", "No settings found").py(24.0));
         }
     } else {
-        content = content.child(label(SECTIONS[s.settings.section], DIALOG_TITLE, p.ink).pb(8.0));
+        let mut header = row()
+            .center_y()
+            .gap(8.0)
+            .pb(8.0)
+            .child(label(SECTIONS[s.settings.section], DIALOG_TITLE, p.ink).grow(1.0));
+        let candidates = s.all_provider_candidates();
+        if s.settings.section == 2 && candidates.len() >= 2 {
+            // KSG `ProviderUpdatesAction`'s tooltip: "<machine>: Codex, Claude".
+            let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+            for (server, _, name, _) in &candidates {
+                let label = s.machine_label(server);
+                match grouped.iter_mut().find(|(known, _)| known == &label) {
+                    Some((_, names)) => names.push(name.clone()),
+                    None => grouped.push((label, vec![name.clone()])),
+                }
+            }
+            let tip = grouped
+                .iter()
+                .map(|(machine, names)| format!("{machine}: {}", names.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            header = header.child(
+                settings_button("provider-update-all", "Update all", p, |s| {
+                    s.update_all_providers()
+                })
+                .help(tip),
+            );
+        }
+        content = content.child(header);
         content = content.child(section_content(s, p, s.settings.section).0);
     }
     if let Some(notice) = &s.settings.notice {
@@ -1906,6 +1934,101 @@ fn panel_animation_control(s: &State, p: Palette) -> El {
         .child(slider)
 }
 
+/// A provider's update row under its Harnesses entry (KSG providers settings): the
+/// installed version, "Latest vX" when behind, then the Update button, the running
+/// message or the manual-only reason with "Copy update command".
+fn provider_status_row(s: &State, p: Palette, provider: &Value) -> El {
+    let driver = provider["driver"].as_str().unwrap_or("").to_owned();
+    let machine = s.settings.machine.clone();
+    let version = provider["version"].as_str().unwrap_or("?");
+    let latest = provider["latestVersion"].as_str().unwrap_or("");
+    let behind = provider["advisory"].as_str() == Some("behind");
+    let update = &provider["update"];
+    let running = matches!(update["status"].as_str(), Some("queued" | "running"));
+    let mut content = row().gap(8.0).flex_wrap().center_y().grow(1.0).min_w(0.0);
+    content = content.child(pixel_text(format!("v{version}"), p.muted));
+    if behind && !latest.is_empty() {
+        content = content.child(pixel_text(format!("Latest v{latest}"), p.muted));
+    }
+    let mut line = col().gap(4.0).w_full().child(content);
+    if running {
+        line = line.child(
+            row()
+                .gap(6.0)
+                .center_y()
+                .child(el().size(8.0, 8.0).fill(p.sea).a11y_hidden())
+                .child(
+                    label(
+                        update["message"].as_str().unwrap_or("Updating"),
+                        TextStyle::new(12.0, 400.0),
+                        p.muted,
+                    )
+                    .wrap(),
+                ),
+        );
+    } else if behind && provider["strategy"].is_string() {
+        if s.client.is_none() {
+            // Embedded mode has no provider backend status integration; the button
+            // would send into nothing.
+            line = line.child(
+                label(
+                    "Start the Shina server to manage provider updates.",
+                    TextStyle::new(12.0, 400.0),
+                    p.muted,
+                )
+                .wrap(),
+            );
+        } else {
+            if s.provider_send_pending(&machine, &driver) {
+                line = line.child(
+                    label(
+                        "Waiting for the machine to confirm the update.",
+                        TextStyle::new(12.0, 400.0),
+                        p.muted,
+                    )
+                    .wrap(),
+                );
+            } else {
+                let (machine_id, driver_id) = (machine.clone(), driver.clone());
+                line = line.child(settings_button(
+                    &format!("harness-update-{driver}"),
+                    "Update",
+                    p,
+                    move |s| s.update_provider(&machine_id, &driver_id),
+                ));
+            }
+            if let Some(error) = s
+                .fleet
+                .provider_send_errors
+                .get(&(machine.clone(), driver.clone()))
+            {
+                line =
+                    line.child(label(error.clone(), TextStyle::new(12.0, 400.0), p.danger).wrap());
+            }
+        }
+    } else if let Some(reason) = provider["disabledReason"].as_str().filter(|_| behind) {
+        let mut manual = row()
+            .gap(8.0)
+            .flex_wrap()
+            .center_y()
+            .child(label(reason, TextStyle::new(12.0, 400.0), p.muted).wrap());
+        if let Some(command) = provider["manualCommand"].as_str() {
+            let command = command.to_owned();
+            manual = manual.child(
+                settings_button(
+                    &format!("copy-update-command-{driver}"),
+                    "Copy update command",
+                    p,
+                    |_| {},
+                )
+                .on_press_tx(move |_: &mut State, tx| tx.copy(command.clone())),
+            );
+        }
+        line = line.child(manual);
+    }
+    line
+}
+
 fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
     let mut pane = col().w_full().min_w(0.0);
     let titles: &[&str] = match section {
@@ -2369,6 +2492,16 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                         }
                     });
                 pane=pane.child(info(&format!("settings-harness-{name}"),name,&format!("{description}. Uses SHINA_{}_CLI, then the host's existing install and PATH.",name.to_uppercase()),&status,p));
+                if name != "Pi" {
+                    let driver = name.to_lowercase();
+                    if let Some(provider) = s
+                        .machine_providers(&s.settings.machine)
+                        .into_iter()
+                        .find(|provider| provider["driver"].as_str() == Some(driver.as_str()))
+                    {
+                        pane = pane.child(provider_status_row(s, p, &provider));
+                    }
+                }
             }
             {
                 let registry = crate::harness::Registry::read();
@@ -3110,81 +3243,262 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
     (pane, found)
 }
 
+/// Ported from KSG Code's `UpdateEverythingDialog`: plan rows for this app's machines,
+/// servers and provider-only machines, with the skipped list collapsed under "N skipped".
 pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
-    let mut card=col().key("fleet-update-dialog").role("dialog").label("Update all machines")
-        .w((s.viewport_width-32.0).min(760.0)).h((s.viewport_height-48.0).clamp(240.0,660.0))
-        .padding(16.0).gap(12.0).radius(6.0).fill(p.card).border(2.0,p.frame).box_shadow(hard_shadow(p))
-        .child(row().center_y().child(label("Update all machines",DIALOG_TITLE,p.ink)).child(spacer())
-            .child(icon_button("fleet-close","Close","close",p,|s| s.fleet.open=false)))
-        .child(label("Each machine checks its own latest release. Offline machines are skipped. Closing this dialog does not cancel accepted updates.",SMALL,p.muted).wrap());
-    let mut rows = col().h(0.0).grow(1.0).min_h(0.0).scroll(ScrollSpec {
-        stick_bottom: false,
-    });
-    for (index, machine) in s.fleet.rows.iter().enumerate() {
-        let (word, detail) = machine
-            .state
-            .split_once(": ")
-            .map(|(word, detail)| (word, Some(detail)))
-            .unwrap_or((&machine.state, None));
-        // The status word and its reason share the right edge.
-        let mut control = col()
-            .gap(4.0)
-            .items_end()
-            .max_w(240.0)
-            .child(pixel_text(word, if machine.failed { p.danger } else { p.muted }).wrap());
-        if let Some(detail) = detail {
-            control =
-                control.child(label(detail, TextStyle::new(13.0, 400.0), p.muted).wrap_anywhere());
-        }
-        if machine.failed {
-            control = control.child(settings_button(
-                &format!("fleet-retry-{index}"),
-                "Retry",
-                p,
-                move |s| s.start_fleet_row(index),
-            ));
-        }
-        rows = rows.child(
-            col()
-                .key(format!("fleet-row-{index}"))
-                .w_full()
-                .child(
-                    row()
-                        .py(12.0)
-                        .gap(16.0)
-                        .items_start()
-                        .child(
-                            col()
-                                .grow(1.0)
-                                .min_w(0.0)
-                                .gap(4.0)
-                                .child(
-                                    label(&machine.name, TextStyle::new(14.0, 500.0), p.ink).wrap(),
-                                )
-                                .child(
-                                    row()
-                                        .gap(8.0)
-                                        .flex_wrap()
-                                        .child(pixel_text(&machine.current, p.muted))
-                                        .child(label("to", TextStyle::new(13.0, 400.0), p.muted))
-                                        .child(pixel_text(&machine.target, p.muted)),
-                                ),
-                        )
-                        .child(control),
-                )
-                .child(el().h(1.0).w_full().fill(p.line)),
-        );
-    }
-    card = card.child(rows).child(
-        primary_button("fleet-confirm", "Update eligible machines", p, |s| {
-            s.confirm_fleet()
+    let updating: Vec<usize> = s
+        .fleet
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.eligible || !row.providers.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    let skipped: Vec<(String, String)> = s
+        .fleet
+        .rows
+        .iter()
+        .filter(|row| !row.eligible && row.providers.is_empty())
+        .filter_map(|row| {
+            row.state
+                .strip_prefix("skipped: ")
+                .map(|reason| (row.name.clone(), reason.to_owned()))
         })
-        .disabled(
-            s.fleet.running
-                || s.fleet.rows.iter().any(|r| r.state == "checking")
-                || !s.fleet.rows.iter().any(|r| r.eligible),
-        ),
+        .collect();
+    let providers_count: usize = updating
+        .iter()
+        .map(|index| s.fleet.rows[*index].providers.len())
+        .sum();
+    let version = s
+        .fleet
+        .rows
+        .first()
+        .map(|row| row.target.clone())
+        .filter(|_| {
+            updating
+                .iter()
+                .any(|index| s.fleet.rows[*index].server == "local")
+        })
+        .or_else(|| {
+            updating
+                .iter()
+                .map(|index| s.fleet.rows[*index].target.clone())
+                .find(|target| !target.is_empty())
+        });
+    let title = format!(
+        "Update {} {}?",
+        updating.len(),
+        if updating.len() == 1 {
+            "machine"
+        } else {
+            "machines"
+        }
     );
+    let mut description = row().gap(8.0).flex_wrap().center_y();
+    if let Some(version) = &version {
+        description = description
+            .child(label("Shina", TextStyle::new(14.0, 400.0), p.muted))
+            .child(pixel_text(version, p.muted));
+    }
+    if providers_count > 0 {
+        description = description.child(label(
+            format!(
+                "{providers_count} provider {}",
+                if providers_count == 1 {
+                    "update"
+                } else {
+                    "updates"
+                }
+            ),
+            TextStyle::new(14.0, 400.0),
+            p.muted,
+        ));
+    }
+    if s.fleet.refreshing > 0 {
+        description = description.child(label(
+            "Checking for more...",
+            TextStyle::new(14.0, 400.0),
+            p.muted,
+        ));
+    }
+    // The plan table: machine names truncate first, provider lists wrap between names.
+    let mut table = col().role("table").w_full();
+    table = table
+        .child(
+            row()
+                .role("row")
+                .gap(16.0)
+                .pb(6.0)
+                .child(el().w(128.0).child(pixel_label("MACHINE", p.muted)))
+                .child(
+                    el().key("fleet-column-shina")
+                        .w(96.0)
+                        .child(pixel_label("SHINA", p.muted)),
+                )
+                .child(
+                    el().grow(1.0)
+                        .min_w(0.0)
+                        .key("fleet-column-providers")
+                        .child(pixel_label("PROVIDERS", p.muted)),
+                ),
+        )
+        .child(el().h(1.0).w_full().fill(p.line));
+    for (position, index) in updating.iter().enumerate() {
+        let machine = &s.fleet.rows[*index];
+        let mut providers = row()
+            .key(format!("fleet-providers-{index}"))
+            .flex_wrap()
+            .grow(1.0)
+            .min_w(0.0);
+        for (provider_index, name) in machine.providers.iter().enumerate() {
+            if provider_index > 0 {
+                providers = providers.child(label(", ", TextStyle::new(14.0, 400.0), p.ink));
+            }
+            providers = providers.child(label(name, TextStyle::new(14.0, 400.0), p.ink));
+        }
+        let app = if machine.server == "local" && machine.eligible {
+            Some("this-app")
+        } else if machine.eligible {
+            Some("server")
+        } else {
+            None
+        };
+        let mut app_cell = col().key(format!("fleet-shina-{index}")).w(96.0);
+        match app {
+            Some("this-app") => {
+                app_cell = app_cell
+                    .child(label("This app", TextStyle::new(14.0, 400.0), p.ink))
+                    .child(label("restarts last", TextStyle::new(12.0, 400.0), p.muted));
+            }
+            Some("server") => {
+                app_cell = app_cell.child(label("Server", TextStyle::new(14.0, 400.0), p.ink));
+            }
+            _ => {}
+        }
+        let row_el = row()
+            .key(format!("fleet-row-{index}"))
+            .role("row")
+            .py(6.0)
+            .gap(16.0)
+            .items_start()
+            .child(
+                el().w(128.0)
+                    .min_w(64.0)
+                    .max_w(128.0)
+                    .child(label(&machine.name, TextStyle::new(14.0, 400.0), p.ink).truncate()),
+            )
+            .child(app_cell)
+            .child(providers);
+        table = table.child(row_el);
+        if position + 1 < updating.len() {
+            table = table.child(el().h(1.0).w_full().fill(p.line));
+        }
+    }
+    let mut body = col().gap(12.0).w_full();
+    if !skipped.is_empty() {
+        let mut skipped_grid = col().pl(18.0).pt(6.0).gap(2.0);
+        for (name, reason) in &skipped {
+            skipped_grid = skipped_grid.child(
+                row()
+                    .gap(12.0)
+                    .items_start()
+                    .child(
+                        el().min_w(0.0)
+                            .max_w(128.0)
+                            .child(label(name, TextStyle::new(12.0, 400.0), p.muted).truncate()),
+                    )
+                    .child(
+                        label(reason, TextStyle::new(12.0, 400.0), p.muted)
+                            .wrap_anywhere()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    ),
+            );
+        }
+        let mut disclosure = col()
+            .key("fleet-skipped")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("{} skipped", skipped.len()))
+            .focusable(true)
+            .on_press(|s: &mut State| s.fleet.skipped_open = !s.fleet.skipped_open)
+            .child(
+                row()
+                    .gap(4.0)
+                    .center_y()
+                    .child(tool_icon(
+                        if s.fleet.skipped_open {
+                            "chevron-up"
+                        } else {
+                            "chevron"
+                        },
+                        p.muted,
+                    ))
+                    .child(label(
+                        format!("{} skipped", skipped.len()),
+                        TextStyle::new(12.0, 400.0),
+                        p.muted,
+                    )),
+            );
+        if s.fleet.skipped_open {
+            disclosure = disclosure.child(skipped_grid);
+        }
+        body = body.child(table).child(disclosure);
+    } else {
+        body = body.child(table);
+    }
+    let disabled_reason = updating
+        .is_empty()
+        .then(|| "Nothing can update right now.".to_owned());
+    let busy = s.fleet.running || s.fleet.rows.iter().any(|row| row.state == "checking");
+    let mut footer = row().gap(8.0).center_y();
+    if let Some(reason) = &disabled_reason {
+        footer = footer.child(label(reason, TextStyle::new(14.0, 400.0), p.ink).grow(1.0));
+    } else {
+        footer = footer.child(spacer());
+    }
+    footer = footer
+        .child(
+            secondary_button("fleet-cancel", "Cancel", p, |s| s.fleet.open = false)
+                .autofocus()
+                .disabled(busy),
+        )
+        .child(
+            primary_button("fleet-confirm", "Update", p, |s| s.confirm_fleet())
+                .disabled(disabled_reason.is_some() || busy),
+        );
+    let card = col()
+        .key("fleet-update-dialog")
+        .role("dialog")
+        .label("Update machines")
+        .w((s.viewport_width - 32.0).min(576.0))
+        .max_h(s.viewport_height - 48.0)
+        .padding(16.0)
+        .gap(12.0)
+        .radius(6.0)
+        .fill(p.card)
+        .border(2.0, p.frame)
+        .box_shadow(hard_shadow(p))
+        .on_key(|s: &mut State, event, _| {
+            if event.key == rune::Key::Escape {
+                s.fleet.open = false;
+                true
+            } else {
+                false
+            }
+        })
+        .child(label(title, DIALOG_TITLE, p.ink))
+        .child(description)
+        .child(
+            col()
+                .w_full()
+                .max_h((s.viewport_height - 218.0).max(120.0))
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(body),
+        )
+        .child(footer);
     el().key("fleet-backdrop")
         .absolute(0.0, 0.0)
         .w_full()
@@ -3238,7 +3552,7 @@ pub(super) fn archive_dialog(s: &State, p: Palette) -> El {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tests::runtime;
+    use crate::ui::tests::{press, runtime};
 
     #[test]
     fn every_settings_section_and_search_fit_the_supported_widths() {
@@ -3330,7 +3644,12 @@ mod tests {
             rt.state.demo_fleet();
             rt.frame(0.0);
             rt.frame(0.2);
-            for key in ["fleet-update-dialog", "fleet-close", "fleet-confirm"] {
+            for key in [
+                "fleet-update-dialog",
+                "fleet-cancel",
+                "fleet-confirm",
+                "fleet-skipped",
+            ] {
                 let (rect, _) = rt
                     .presented(key)
                     .unwrap_or_else(|| panic!("{width}: {key}"));
@@ -3343,9 +3662,32 @@ mod tests {
                     "{width} {key}: {rect:?}"
                 );
             }
-            for index in 0..rt.state.fleet.rows.len() {
-                assert!(rt.presented(&format!("fleet-row-{index}")).is_some());
+            // Updating machines render as rows; skipped ones fold under `fleet-skipped`.
+            for (index, machine) in rt.state.fleet.rows.iter().enumerate() {
+                let presented = rt.presented(&format!("fleet-row-{index}"));
+                if machine.eligible || !machine.providers.is_empty() {
+                    assert!(presented.is_some(), "{width}: fleet-row-{index}");
+                    for (column, cell) in [
+                        (
+                            "fleet-column-shina".to_owned(),
+                            format!("fleet-shina-{index}"),
+                        ),
+                        (
+                            "fleet-column-providers".to_owned(),
+                            format!("fleet-providers-{index}"),
+                        ),
+                    ] {
+                        let header = rt.presented(&column).unwrap().0;
+                        let body = rt.presented(&cell).unwrap().0;
+                        assert!(
+                            (header[0] - body[0]).abs() < 0.5,
+                            "{width}: {column} and {cell} do not align"
+                        );
+                    }
+                }
             }
+            press(&mut rt, "fleet-skipped");
+            assert!(rt.presented("fleet-skipped").is_some());
         }
     }
 
