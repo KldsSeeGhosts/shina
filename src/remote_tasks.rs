@@ -1737,18 +1737,13 @@ impl State {
         caller: usize,
         args: &Value,
     ) -> Option<Preparation> {
-        let thread = self.threads.iter().find(|t| t.id == caller)?;
-        if args["client_request_id"].as_str().is_some_and(|key| {
-            self.tasks.iter().any(|task| {
-                task.parent_thread_id == caller
-                    && task
-                        .remote
-                        .as_ref()
-                        .is_some_and(|remote| remote.client_request_id.as_deref() == Some(key))
-            })
-        }) {
-            // delegate_remote checks the original brief/target before replaying.
-            // Its recorded project must not depend on a later identity lookup.
+        let caller_index = self.threads.iter().position(|t| t.id == caller)?;
+        let thread = &self.threads[caller_index];
+        if let Ok(Some(key)) = tasks::delegate_request_key(args)
+            && self.delegate_receipt_known(caller_index, key)
+        {
+            // delegate_receipt_replay checks the original intent before answering,
+            // so the recorded project must not depend on a later identity lookup.
             return None;
         }
         if thread.delegated
@@ -2181,31 +2176,15 @@ impl State {
             return Err("Open the captain's primary home to delegate new work. This is an earlier conversation.".into());
         }
         let machine = target_machine(args)?.ok_or("target.machine must name a linked server.")?;
-        let request = args
-            .get("client_request_id")
-            .map(|v| {
-                v.as_str()
-                    .filter(|s| !s.is_empty() && s.len() <= 256)
-                    .ok_or("client_request_id must be 1 to 256 characters.")
-            })
-            .transpose()?;
+        let request = tasks::delegate_request_key(args)?;
         let parent = self.threads[caller].id;
         if let Some(request) = request
-            && let Some(task) = self.tasks.iter().find(|t| {
-                t.parent_thread_id == parent
-                    && t.remote
-                        .as_ref()
-                        .is_some_and(|r| r.client_request_id.as_deref() == Some(request))
-            })
+            && let Some(replayed) = self.delegate_receipt_replay(caller, request, args)?
         {
-            let expected = task.remote.as_ref().expect("remote");
-            if expected.launch_command.params["request"] != *args {
-                return Err(
-                    "client_request_id was already used with a different brief or target.".into(),
-                );
-            }
-            let id = task.child_thread_id;
-            return self.mcp_call(parent, "task_status", &json!({"thread_id":id}));
+            return Ok(replayed);
+        }
+        if request.is_some() {
+            self.delegate_receipt_ready()?;
         }
         self.check_task_capacity(parent)?;
         let peers = crate::database::for_path(&self.data_dir.join("index.json"))
@@ -2384,6 +2363,10 @@ impl State {
         thread.set_model(provider.into(), model.clone());
         let selection = json!({"harness":harness,"provider":provider,"model":model,"options":reasoning.as_ref().map(|r|json!({"reasoning":r})).unwrap_or(json!({}))});
         let mut task = Task::new(&thread, prompt, Some(selection));
+        task.request_key = request.map(|key| tasks::RequestKey {
+            key: key.into(),
+            intent_hash: tasks::delegate_intent_hash(args),
+        });
         let memories = captain
             .map(|id| {
                 self.memories(id)
@@ -2466,7 +2449,13 @@ impl State {
         self.tasks.push(task);
         self.start_queued_tasks();
         self.checkpoint();
-        self.mcp_call(parent, "task_status", &json!({"thread_id":id}))
+        let status = self.mcp_call(parent, "task_status", &json!({"thread_id":id}))?;
+        if let Some(request) = request
+            && let Err(error) = self.record_delegate_receipt(caller, request, args, &status)
+        {
+            return Err(self.fail_delegate_receipt(error));
+        }
+        Ok(status)
     }
 
     pub fn execute_peer_command(

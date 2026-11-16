@@ -8299,6 +8299,15 @@ impl State {
                 if remote_tasks::target_machine(args)?.is_some_and(|machine| machine != "local") {
                     return self.delegate_remote(caller_index, args);
                 }
+                let request_key = tasks::delegate_request_key(args)?;
+                if let Some(key) = request_key
+                    && let Some(replayed) = self.delegate_receipt_replay(caller_index, key, args)?
+                {
+                    return Ok(replayed);
+                }
+                if request_key.is_some() {
+                    self.delegate_receipt_ready()?;
+                }
                 self.check_task_capacity(caller)?;
                 let prompt = args["prompt"].as_str().map(str::trim).unwrap_or("");
                 if prompt.is_empty() {
@@ -8413,14 +8422,26 @@ impl State {
                 }
                 thread.arm_task();
                 thread.life.mark_unread();
-                let task = Task::new(&thread, prompt, selection.as_ref().map(Selection::to_value));
+                let mut task =
+                    Task::new(&thread, prompt, selection.as_ref().map(Selection::to_value));
+                task.request_key = request_key.map(|key| tasks::RequestKey {
+                    key: key.into(),
+                    intent_hash: tasks::delegate_intent_hash(args),
+                });
                 let id = thread.id;
                 self.threads.push(thread);
                 self.tasks.push(task);
                 self.sync_memory_links();
                 self.start_queued_tasks();
                 self.checkpoint();
-                self.mcp_call(caller, "task_status", &json!({"thread_id":id}))
+                let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
+                if let Some(key) = request_key
+                    && let Err(error) =
+                        self.record_delegate_receipt(caller_index, key, args, &status)
+                {
+                    return Err(self.fail_delegate_receipt(error));
+                }
+                Ok(status)
             }
             "task_status" => {
                 let thread = &self.threads[find(self)?];

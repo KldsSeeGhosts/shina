@@ -1,5 +1,6 @@
 //! Durable delegation records. Pi's active history is authoritative for acceptance and recovery.
 use super::*;
+use crate::protocol::{Receipt, ReceiptStatus};
 use serde::{Deserialize, Serialize};
 
 pub(super) const RUNNING_LIMIT: usize = 3;
@@ -42,6 +43,9 @@ impl TaskState {
 pub(super) struct Task {
     #[serde(default)]
     pub remote: Option<RemoteTask>,
+    /// The caller-scoped application retry contract for a keyed delegation.
+    #[serde(default)]
+    pub request_key: Option<RequestKey>,
     pub id: String,
     pub parent_thread_id: usize,
     pub child_thread_id: usize,
@@ -72,6 +76,100 @@ pub(super) struct Task {
     recovering: bool,
     #[serde(skip)]
     pub(super) hold_delivery: bool,
+}
+
+/// One stable request key and the canonical intent hash it committed. The hash
+/// excludes response-only options such as wait_seconds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestKey {
+    pub key: String,
+    pub intent_hash: String,
+}
+
+/// The durable caller identity behind a delegation. A Captain's scope survives
+/// home resets; a plain thread's scope is its own stable id.
+#[derive(Clone, Copy)]
+enum DelegateScope {
+    Captain(usize),
+    Thread(usize),
+}
+
+impl DelegateScope {
+    /// An audit namespace, never a registered device or an authentication grant.
+    fn device(self) -> String {
+        match self {
+            Self::Captain(captain) => format!("mcp/delegate/captain/{captain}"),
+            Self::Thread(id) => format!("mcp/delegate/thread/{id}"),
+        }
+    }
+}
+
+const DELEGATE_KEY_MISMATCH: &str =
+    "client_request_id was already used with a different brief or target.";
+
+/// A valid retry key is a nonempty string in the shared local/remote contract.
+pub(super) fn delegate_request_key(args: &Value) -> Result<Option<&str>, String> {
+    args.get("client_request_id")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|key| !key.is_empty() && key.len() <= 256)
+                .ok_or_else(|| "client_request_id must be 1 to 256 characters.".to_owned())
+        })
+        .transpose()
+}
+
+/// Canonical delegation intent: the arguments minus the key itself and
+/// response-only options like wait_seconds, which may differ on a retry.
+fn delegate_intent(args: &Value) -> Value {
+    let mut intent = args.clone();
+    if let Some(object) = intent.as_object_mut() {
+        object.remove("client_request_id");
+        object.remove("wait_seconds");
+    }
+    intent
+}
+
+/// The same canonical hash the runtime records on the durable receipt.
+pub(super) fn delegate_intent_hash(args: &Value) -> String {
+    crate::protocol::Command {
+        command_id: uuid::Uuid::nil(),
+        method: "task.delegate".into(),
+        params: delegate_intent(args),
+    }
+    .hash()
+}
+
+/// A stable command id keeps one retry key in the durable receipts table,
+/// distinct from the per-call JSON-RPC request id.
+fn delegate_request_command_id(key: &str) -> uuid::Uuid {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("shina.delegate.request-key:{key}"));
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+fn task_request_key(task: &Task) -> Option<&str> {
+    if let Some(request) = &task.request_key {
+        return Some(request.key.as_str());
+    }
+    task.remote
+        .as_ref()
+        .and_then(|remote| remote.client_request_id.as_deref())
+}
+
+fn task_intent_hash(task: &Task) -> Option<String> {
+    if let Some(request) = &task.request_key {
+        return Some(request.intent_hash.clone());
+    }
+    task.remote
+        .as_ref()
+        .and_then(|remote| remote.launch_command.params.get("request"))
+        .map(delegate_intent_hash)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,6 +271,7 @@ impl Task {
             .expect("delegated thread parent");
         Self {
             remote: None,
+            request_key: None,
             attempt_message: delivery_text(
                 &format!("{id}-brief"),
                 &format!("Shina: task from parent #{parent}\n\n{brief}"),
@@ -730,6 +829,180 @@ impl State {
                 .unwrap_or(0)
                 + 1
         })
+    }
+
+    fn delegate_scope(&self, caller_index: usize) -> DelegateScope {
+        let thread = &self.threads[caller_index];
+        match thread.captain.filter(|_| thread.captain_home) {
+            Some(captain) => DelegateScope::Captain(captain),
+            None => DelegateScope::Thread(thread.id),
+        }
+    }
+
+    /// Tasks route to a Captain's current home, so the scope home also covers
+    /// work launched from that Captain's earlier conversations.
+    fn delegate_scope_home(&self, scope: DelegateScope) -> usize {
+        match scope {
+            DelegateScope::Captain(captain) => self.captain_home(captain).unwrap_or(usize::MAX),
+            DelegateScope::Thread(id) => id,
+        }
+    }
+
+    fn delegate_receipt_lookup(
+        &self,
+        scope: DelegateScope,
+        key: &str,
+    ) -> Result<Option<Receipt>, String> {
+        let id = delegate_request_command_id(key);
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            return database.delegate_tool_receipt(&scope.device(), id);
+        }
+        Ok(self.command_receipt(&scope.device(), id).cloned())
+    }
+
+    /// True when a record already names this key, so remote preparation can skip
+    /// another repository lookup for a replay or a rejection.
+    pub(super) fn delegate_receipt_known(&self, caller_index: usize, key: &str) -> bool {
+        let scope = self.delegate_scope(caller_index);
+        let home = self.delegate_scope_home(scope);
+        self.tasks
+            .iter()
+            .any(|task| self.task_home(task) == Some(home) && task_request_key(task) == Some(key))
+            || self
+                .delegate_receipt_lookup(scope, key)
+                .ok()
+                .flatten()
+                .is_some()
+    }
+
+    /// A keyed call allocates only inside the runtime batch, so the receipt and
+    /// the task commit or roll back together. Legacy index.json profiles keep
+    /// the same contract through their committed receipt record.
+    pub(super) fn delegate_receipt_ready(&self) -> Result<(), String> {
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            database.require_batch()?;
+        }
+        Ok(())
+    }
+
+    /// An identical retry replays the original task and thread identity while
+    /// running, after completion, after deletion, after a home reset and after
+    /// restart. A changed brief, target, workspace or selection under a used
+    /// key fails clearly.
+    pub(super) fn delegate_receipt_replay(
+        &mut self,
+        caller_index: usize,
+        key: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        let scope = self.delegate_scope(caller_index);
+        let caller = self.threads[caller_index].id;
+        let intent = delegate_intent_hash(args);
+        let home = self.delegate_scope_home(scope);
+        let receipt = self.delegate_receipt_lookup(scope, key)?;
+        if let Some(receipt) = &receipt
+            && receipt.hash != intent
+        {
+            return Err(DELEGATE_KEY_MISMATCH.into());
+        }
+        let task = self
+            .tasks
+            .iter()
+            .find(|task| self.task_home(task) == Some(home) && task_request_key(task) == Some(key))
+            .cloned();
+        if let Some(task) = task {
+            if task_intent_hash(&task).as_deref() != Some(intent.as_str()) {
+                return Err(DELEGATE_KEY_MISMATCH.into());
+            }
+            let child = task.child_thread_id;
+            if self.threads.iter().any(|thread| thread.id == child) {
+                let mut status =
+                    self.mcp_call(caller, "task_status", &json!({"thread_id":child}))?;
+                status["replayed"] = json!(true);
+                if receipt.is_none() {
+                    // Backfill tasks that predate durable delegation receipts.
+                    let _ = self.record_delegate_receipt(caller_index, key, args, &status);
+                }
+                return Ok(Some(status));
+            }
+            if receipt.is_none() {
+                // A durable task record without a live thread still names the work.
+                let status = json!({"thread_id":task.child_thread_id,"task_id":task.id,
+                    "status":task.state.id(),"caller":caller,"requestKey":key,
+                    "replayed":true,"exists":false,"finished":true});
+                let _ = self.record_delegate_receipt(caller_index, key, args, &status);
+                return Ok(Some(status));
+            }
+        }
+        if let Some(receipt) = receipt {
+            if let Some(id) = receipt.result["thread_id"].as_u64().map(|id| id as usize)
+                && self.threads.iter().any(|thread| thread.id == id)
+            {
+                let mut status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
+                status["replayed"] = json!(true);
+                return Ok(Some(status));
+            }
+            let mut result = receipt.result;
+            result["replayed"] = json!(true);
+            result["exists"] = json!(false);
+            result["finished"] = json!(true);
+            return Ok(Some(result));
+        }
+        Ok(None)
+    }
+
+    /// The receipt commits in the same batch as the allocation, so a crash
+    /// after commit but before the reply cannot launch the work a second time.
+    pub(super) fn record_delegate_receipt(
+        &mut self,
+        caller_index: usize,
+        key: &str,
+        args: &Value,
+        status: &Value,
+    ) -> Result<(), String> {
+        let scope = self.delegate_scope(caller_index);
+        let command = crate::protocol::Command {
+            command_id: delegate_request_command_id(key),
+            method: "task.delegate".into(),
+            params: delegate_intent(args),
+        };
+        let mut result = status.clone();
+        result["requestKey"] = json!(key);
+        result["caller"] = json!(self.threads[caller_index].id);
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            return database.stage_delegate_tool_receipt(&scope.device(), &command, result);
+        }
+        let device = scope.device();
+        let hash = command.hash();
+        if let Some(existing) = self
+            .command_receipts
+            .iter()
+            .find(|receipt| receipt.device_id == device && receipt.command_id == command.command_id)
+        {
+            return if existing.hash == hash {
+                Ok(())
+            } else {
+                Err(DELEGATE_KEY_MISMATCH.into())
+            };
+        }
+        self.command_receipts.push(Receipt {
+            command_id: command.command_id,
+            device_id: device,
+            hash,
+            status: ReceiptStatus::Accepted,
+            result,
+            seq: self.server_seq,
+        });
+        Ok(())
+    }
+
+    /// A failed receipt write poisons the batch exactly like a Captain tool receipt.
+    pub(super) fn fail_delegate_receipt(&mut self, error: String) -> String {
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            database.fail(error.clone());
+        }
+        self.storage_error = Some(error.clone());
+        error
     }
 
     fn queue_task_attempt(&mut self, index: usize, message: &str) -> Result<(), String> {
@@ -1970,5 +2243,278 @@ mod tests {
             "the result falls back to the delegating thread when its home is archived"
         );
         assert!(!state.tasks[0].delivered);
+    }
+
+    fn delegate_args(key: &str) -> Value {
+        json!({"prompt":"Fix the parser","title":"Parser fix","client_request_id":key})
+    }
+
+    #[test]
+    fn keyed_delegation_replays_one_task_and_rejects_changed_intent() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        let first = state
+            .mcp_call(1, "delegate_task", &delegate_args("run-1"))
+            .unwrap();
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.threads.len(), 2);
+        // wait_seconds is a response option outside the keyed intent.
+        let mut waited = delegate_args("run-1");
+        waited["wait_seconds"] = json!(30);
+        let replay = state.mcp_call(1, "delegate_task", &waited).unwrap();
+        assert_eq!(replay["thread_id"], first["thread_id"]);
+        assert_eq!(replay["task_id"], first["task_id"]);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.threads.len(), 2);
+        for args in [
+            json!({"prompt":"Fix the parser differently","title":"Parser fix","client_request_id":"run-1"}),
+            json!({"prompt":"Fix the parser","title":"Another title","client_request_id":"run-1"}),
+            json!({"prompt":"Fix the parser","title":"Parser fix","workspace":"/elsewhere","client_request_id":"run-1"}),
+            json!({"prompt":"Fix the parser","title":"Parser fix","target":{"harness":"codex"},"client_request_id":"run-1"}),
+        ] {
+            let error = state.mcp_call(1, "delegate_task", &args).unwrap_err();
+            assert!(error.contains("different brief or target"), "{error}");
+        }
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.threads.len(), 2);
+        assert!(
+            state
+                .mcp_call(
+                    1,
+                    "delegate_task",
+                    &json!({"prompt":"Fix the parser","client_request_id":""})
+                )
+                .unwrap_err()
+                .contains("1 to 256")
+        );
+    }
+
+    #[test]
+    fn keyed_delegation_replays_at_capacity_and_after_completion() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        let first = state
+            .mcp_call(1, "delegate_task", &delegate_args("cap-1"))
+            .unwrap();
+        state.tasks[0].finish(TaskState::Completed, "done", "");
+        for _ in 0..UNFINISHED_LIMIT {
+            state
+                .mcp_call(1, "delegate_task", &json!({"prompt":"Another task"}))
+                .unwrap();
+        }
+        assert_eq!(state.tasks.len(), UNFINISHED_LIMIT + 1);
+        assert!(
+            state
+                .mcp_call(1, "delegate_task", &json!({"prompt":"Ninth task"}))
+                .unwrap_err()
+                .contains("8 unfinished")
+        );
+        let replay = state
+            .mcp_call(1, "delegate_task", &delegate_args("cap-1"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], first["thread_id"]);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["status"], "completed");
+    }
+
+    #[test]
+    fn keyed_delegation_replays_after_the_child_records_are_gone() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        let first = state
+            .mcp_call(1, "delegate_task", &delegate_args("gone-1"))
+            .unwrap();
+        let child = first["thread_id"].as_u64().unwrap() as usize;
+        state.remove_threads(&std::collections::HashSet::from([child]));
+        assert!(state.tasks.is_empty());
+        let replay = state
+            .mcp_call(1, "delegate_task", &delegate_args("gone-1"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], child);
+        assert_eq!(replay["task_id"], first["task_id"]);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["exists"], false);
+        assert_eq!(replay["finished"], true);
+        assert!(state.tasks.is_empty());
+        assert_eq!(state.threads.len(), 1);
+        // The durable receipt outlives the task record across a restart too.
+        let snapshot = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.demo = true;
+        restored.restore_global(&snapshot).unwrap();
+        let replay = restored
+            .mcp_call(1, "delegate_task", &delegate_args("gone-1"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], child);
+        assert_eq!(replay["exists"], false);
+        assert!(restored.tasks.is_empty());
+    }
+
+    #[test]
+    fn keyed_delegation_survives_a_snapshot_restart() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        let first = state
+            .mcp_call(1, "delegate_task", &delegate_args("boot-1"))
+            .unwrap();
+        let snapshot = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.demo = true;
+        restored.restore_global(&snapshot).unwrap();
+        let replay = restored
+            .mcp_call(1, "delegate_task", &delegate_args("boot-1"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], first["thread_id"]);
+        assert_eq!(replay["task_id"], first["task_id"]);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(restored.tasks.len(), 1);
+        assert_eq!(restored.threads.len(), 2);
+    }
+
+    #[test]
+    fn keyed_delegation_scopes_to_the_captain_across_home_resets() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        state.captains = Captain::presets();
+        state.open_captain(0);
+        let home = state.captain_home(0).unwrap();
+        let first = state
+            .mcp_call(home, "delegate_task", &delegate_args("reset-1"))
+            .unwrap();
+        state.reset_captain_conversation(0).unwrap();
+        let new_home = state.captain_home(0).unwrap();
+        assert_ne!(new_home, home);
+        let replay = state
+            .mcp_call(new_home, "delegate_task", &delegate_args("reset-1"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], first["thread_id"]);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(state.tasks.len(), 1);
+    }
+
+    #[test]
+    fn keyed_delegation_scopes_to_the_caller_and_unkeyed_calls_allocate() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        let first = state
+            .mcp_call(1, "delegate_task", &delegate_args("scope-1"))
+            .unwrap();
+        // A different caller may reuse the same key for its own task.
+        let caller = state.next_id;
+        state.threads.push(Thread::new(caller));
+        state.next_id += 1;
+        let other = state
+            .mcp_call(caller, "delegate_task", &delegate_args("scope-1"))
+            .unwrap();
+        assert_ne!(other["thread_id"], first["thread_id"]);
+        assert_eq!(state.tasks.len(), 2);
+        // Legacy callers without a key keep the old behavior: every call allocates.
+        let unkeyed = json!({"prompt":"Fix the parser","title":"Parser fix"});
+        let one = state.mcp_call(1, "delegate_task", &unkeyed).unwrap();
+        let two = state.mcp_call(1, "delegate_task", &unkeyed).unwrap();
+        assert_ne!(two["thread_id"], one["thread_id"]);
+        assert_eq!(state.tasks.len(), 4);
+    }
+
+    #[test]
+    fn keyed_delegation_commits_receipt_and_allocation_atomically() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-delegate-{}", uuid::Uuid::new_v4()));
+        let mut runtime = crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+        runtime.state.demo = true;
+        let database = runtime.database.clone().unwrap();
+        let before = database.read("index.json").unwrap().unwrap();
+        database
+            .test_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_delegate_receipt BEFORE INSERT ON command_receipts
+                     WHEN NEW.device LIKE 'mcp/delegate/%' BEGIN SELECT RAISE(ABORT,'injected delegate receipt failure'); END;",
+                )
+            })
+            .unwrap();
+        let (reply, received) = mpsc::channel();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.mcp_request(crate::mcp::Request {
+            thread: 1,
+            tool: "delegate_task".into(),
+            args: delegate_args("atomic-1"),
+            reply,
+        });
+        assert!(runtime.persist_for_test(capture.finish()).is_err());
+        assert!(received.try_recv().is_err());
+        assert!(database.read("index.json").is_err());
+        database.test_connection(|connection| {
+            assert_eq!(
+                crate::projection_store::read(connection, "index.json")
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM command_receipts WHERE device LIKE 'mcp/delegate/%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        });
+    }
+
+    #[test]
+    fn keyed_delegation_replays_after_deletion_and_restart_on_the_durable_server() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-delegate-{}", uuid::Uuid::new_v4()));
+        let child;
+        {
+            let mut runtime =
+                crate::runtime::RuntimeState::open(directory.clone(), Arc::new(|| {})).unwrap();
+            runtime.state.demo = true;
+            let database = runtime.database.clone().unwrap();
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            let first = runtime
+                .state
+                .mcp_call(1, "delegate_task", &delegate_args("db-1"))
+                .unwrap();
+            runtime.persist_for_test(capture.finish()).unwrap();
+            child = first["thread_id"].as_u64().unwrap() as usize;
+            database.test_connection(|connection| {
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT count(*) FROM command_receipts WHERE device LIKE 'mcp/delegate/%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1);
+            });
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            runtime
+                .state
+                .remove_threads(&std::collections::HashSet::from([child]));
+            runtime.persist_for_test(capture.finish()).unwrap();
+        }
+        let mut runtime = crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+        runtime.state.demo = true;
+        assert!(
+            !runtime
+                .state
+                .threads
+                .iter()
+                .any(|thread| thread.id == child)
+        );
+        let replay = runtime
+            .state
+            .mcp_call(1, "delegate_task", &delegate_args("db-1"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], child);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["exists"], false);
+        assert_eq!(replay["finished"], true);
+        assert!(runtime.state.tasks.is_empty());
     }
 }
