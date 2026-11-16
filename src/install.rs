@@ -1426,6 +1426,10 @@ mod tests {
     #[test]
     fn a_detached_helper_survives_its_parent_exiting() {
         if env::var_os("SHINA_DETACH_FIXTURE").is_some() {
+            assert!(
+                !service_managed(),
+                "the ordinary-session fixture must not inherit service settings"
+            );
             let dir = PathBuf::from(env::var_os("SHINA_DETACH_DIR").unwrap());
             let script = dir.join("helper.sh");
             let _child = launch_detached(&script, &[dir.to_str().unwrap()]).unwrap();
@@ -1444,6 +1448,10 @@ mod tests {
             ])
             .env("SHINA_DETACH_FIXTURE", "1")
             .env("SHINA_DETACH_DIR", &dir)
+            // A service-hosted test runner must still exercise the setsid path.
+            // The systemd scope path has its own service-launch test above.
+            .env_remove("INVOCATION_ID")
+            .env_remove("SHINA_BOOT_SERVICE")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
