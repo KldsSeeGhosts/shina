@@ -4,6 +4,7 @@
 use super::*;
 use crate::protocol::Command;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 struct Fixture {
@@ -85,6 +86,60 @@ impl Fixture {
             .filter_map(|line| line.strip_prefix("worktree "))
             .map(PathBuf::from)
             .collect()
+    }
+
+    /// A delegating parent on its own data dir, linked to a peer named
+    /// `Target` advertising `contracts` and a project entry matching this
+    /// fixture's repo by its `origin` remote identity.
+    fn parent_state(&self, contracts: &[&str]) -> State {
+        let dir = self.root.join("parent-data");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("server-id"), uuid::Uuid::new_v4().to_string()).unwrap();
+        let mut state = State::headless(dir);
+        state.demo = true;
+        state
+            .projects
+            .entries
+            .push(Project::new(1, self.repo.clone()));
+        state.projects.next_id = 2;
+        state.threads[0].project = Some(1);
+        // Automatic scoping needs the caller's repo identity to resolve on
+        // the project's normalized path (Project::new canonicalizes it).
+        let normalized = state.projects.entries[0].path.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while remote_tasks::repository(&normalized).is_none() {
+            assert!(Instant::now() < deadline, "repository identity unresolved");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        state.peers.push(crate::peer::Peer {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            host: "127.0.0.1:1".into(),
+            label: "Target".into(),
+            linked_at: 0,
+            capabilities: json!({
+                "contracts": contracts,
+                "projects": [{"id": 1, "path": self.repo.to_string_lossy(),
+                              "name": "Repo",
+                              "gitRemote": "example.com/team/repo"}],
+                "harnesses": [{"id": "pi"}],
+                "models": [{"provider": "cpa", "id": "fixture",
+                            "reasoning_levels": ["off"]}]}),
+            last_reached_at: Some(0),
+            last_error: None,
+        });
+        state
+    }
+
+    fn add_origin(&self) {
+        self.git(
+            &self.repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/team/repo.git",
+            ],
+        );
     }
 
     fn state(
@@ -663,4 +718,380 @@ fn peer_launch_rejects_an_invalid_placement_before_any_work() {
     assert!(error.contains("No worktree"), "{error}");
     assert_eq!(target.threads.len(), 1);
     assert_eq!(fixture.worktree_dirs().len(), 1);
+}
+
+#[test]
+fn explicit_isolated_rejects_on_unborn_and_projectless_workspaces() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("reject");
+    // Unborn repository: a Git dir with no commit cannot host a worktree.
+    let unborn = fixture.root.join("unborn");
+    fixture.git(&fixture.root, &["init", "-b", "main", "--quiet", "unborn"]);
+    assert!(unborn.join(".git").exists());
+    let (mut state, _connects) = fixture.state();
+    state.projects.entries.push(Project::new(2, unborn));
+    state.threads[0].project = Some(2);
+    let error = state
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({"prompt": "Write", "placement": {"mode": "isolated"}}),
+        )
+        .unwrap_err();
+    assert!(error.contains("no commits"), "{error}");
+    assert_eq!(state.threads.len(), 1);
+    assert!(state.tasks.is_empty());
+    // A project-less caller has no workspace; explicit isolated refuses, the
+    // writer default alone may fall back to a private scratch directory.
+    state.threads[0].project = None;
+    let error = state
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({"prompt": "Write", "placement": {"mode": "isolated"}}),
+        )
+        .unwrap_err();
+    assert!(error.contains("needs a project workspace"), "{error}");
+    assert_eq!(state.threads.len(), 1);
+    state
+        .mcp_call(1, "delegate_task", &json!({"prompt": "Write"}))
+        .unwrap();
+    let placement = child_placement(&state, 1);
+    assert_eq!(placement.mode, placement::PlacementMode::Shared);
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    assert!(!placement.primary_checkout);
+    assert!(
+        placement
+            .capability
+            .as_deref()
+            .unwrap_or("")
+            .contains("no project workspace"),
+        "{:?}",
+        placement.capability
+    );
+}
+
+#[test]
+fn the_default_mode_word_selects_the_writer_default() {
+    let spec: placement::PlacementSpec =
+        serde_json::from_value(json!({"mode": "default"})).unwrap();
+    assert_eq!(spec.mode, None);
+    assert_eq!(placement::requested_mode(&spec), None);
+    // An explicit "default" with a base is an isolated intent.
+    let spec: placement::PlacementSpec =
+        serde_json::from_value(json!({"mode": "default", "baseBranch": "main"})).unwrap();
+    assert_eq!(
+        placement::requested_mode(&spec),
+        Some(placement::PlacementMode::Isolated)
+    );
+    // And it survives end to end in the args parser.
+    let spec = placement::spec_from_args(&json!({"placement": {"mode": "default"}})).unwrap();
+    assert!(spec.is_some());
+}
+
+#[test]
+fn provisioning_adopts_a_worktree_left_by_a_lost_attempt() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("adopt");
+    let (mut state, connects) = fixture.state();
+    state
+        .mcp_call(1, "delegate_task", &json!({"prompt": "Write it"}))
+        .unwrap();
+    let planned = PathBuf::from(child_placement(&state, 1).checkout.clone().unwrap());
+    let branch = child_placement(&state, 1).branch.clone().unwrap();
+    // Simulate a crash after `git worktree add` but before the outcome was
+    // committed: the registered worktree exists at the recorded path.
+    fixture.git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &planned.to_string_lossy(),
+            "main",
+        ],
+    );
+    poll_until_ready(&mut state, 15);
+    let placement = child_placement(&state, 1);
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    assert_eq!(
+        crate::vcs::real_location(Path::new(placement.checkout.as_ref().unwrap())),
+        crate::vcs::real_location(&planned)
+    );
+    // Adopted, never duplicated: the repo still has exactly two worktrees.
+    assert_eq!(fixture.worktree_dirs().len(), 2);
+    assert_eq!(connects.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn old_peer_refuses_isolated_and_keeps_only_an_explicit_shared() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("old-peer");
+    fixture.add_origin();
+    // A peer that never heard of placement-v1: it would ignore the launch's
+    // placement argument and run the worker in its shared writable checkout.
+    let mut parent =
+        fixture.parent_state(&[crate::protocol::PEER_TASKS, crate::protocol::THREAD_READ]);
+    let delegate = |extra: &Value| {
+        let mut args = json!({"prompt": "Write it",
+            "target": {"machine": "Target", "model": "fixture"}});
+        if let Some(obj) = extra.as_object() {
+            args.as_object_mut().unwrap().extend(obj.clone());
+        }
+        args
+    };
+    // The writer default is an isolation intent: it must refuse on an old
+    // peer rather than silently run shared writable.
+    let error = parent
+        .mcp_call(1, "delegate_task", &delegate(&json!({})))
+        .unwrap_err();
+    assert!(
+        error.contains("Update required") && error.contains("placement-v1"),
+        "{error}"
+    );
+    assert_eq!(parent.threads.len(), 1);
+    assert!(parent.tasks.is_empty());
+    // Explicit isolated and existing refuse the same way.
+    for spec in [
+        json!({"mode": "isolated"}),
+        json!({"mode": "existing", "worktree": "some-branch"}),
+    ] {
+        let error = parent
+            .mcp_call(1, "delegate_task", &delegate(&json!({"placement": spec})))
+            .unwrap_err();
+        assert!(error.contains("Update required"), "{error}");
+        assert!(parent.tasks.is_empty());
+    }
+    // An explicit shared reader is the one placement an old peer can honour:
+    // it stays shared, goes out read-only, and is recorded with its
+    // capability note.
+    parent
+        .mcp_call(
+            1,
+            "delegate_task",
+            &delegate(&json!({"placement": {"mode": "shared"}})),
+        )
+        .unwrap();
+    let remote = parent.tasks[0].remote.as_ref().unwrap();
+    assert_eq!(remote.launch_command.params["access"], json!("read-only"));
+    assert!(remote.launch_command.params["placement"].is_null());
+    let placement = remote.placement.as_ref().unwrap();
+    assert_eq!(placement["mode"], json!("shared"));
+    assert_eq!(placement["phase"], json!("ready"));
+    assert!(placement["primaryCheckout"] == json!(true));
+    assert!(
+        placement["capability"]
+            .as_str()
+            .unwrap_or("")
+            .contains("placement-v1"),
+        "{placement}"
+    );
+    std::fs::remove_dir_all(parent.data_dir).unwrap();
+}
+
+#[test]
+fn two_delegated_writers_on_one_peer_get_distinct_provisioned_worktrees() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("two-server");
+    fixture.add_origin();
+    // Target executor: a second state on its own data dir that provisions for
+    // real through the peer command path.
+    let (mut target, connects) = fixture.state();
+    target.catalog.default_model = Some(crate::session::AgentModel {
+        provider: "cpa".into(),
+        id: "fixture".into(),
+        name: "Fixture".into(),
+        thinking_levels: Vec::new(),
+        ..Default::default()
+    });
+    let mut parent = fixture.parent_state(&[
+        crate::protocol::PEER_TASKS,
+        crate::protocol::THREAD_READ,
+        crate::protocol::PLACEMENT,
+    ]);
+    // Two writers delegated to the same peer project.
+    for brief in ["Write module A", "Write module B"] {
+        parent
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt": brief,
+                    "target": {"machine": "Target", "model": "fixture"}}),
+            )
+            .unwrap();
+    }
+    assert_eq!(parent.tasks.len(), 2);
+    // Carry each launch to the target and mirror its reply to the parent.
+    let mut child_ids = Vec::new();
+    for task in &parent.tasks {
+        let launch = task.remote.as_ref().unwrap().launch_command.clone();
+        assert_eq!(launch.method, "peer.thread.launch");
+        let accepted = target
+            .execute_peer_command("parent-device", &launch)
+            .unwrap();
+        assert_eq!(accepted["placement"]["mode"], json!("isolated"));
+        assert_eq!(accepted["placement"]["phase"], json!("pending"));
+        child_ids.push(accepted["threadId"].as_u64().unwrap() as usize);
+        let (send, receive) = mpsc::channel();
+        send.send(Ok(json!({"status": "accepted", "result": accepted})))
+            .unwrap();
+        parent
+            .peer_runtime
+            .inject_pending(task.id.clone(), "peer.thread.launch".into(), receive);
+    }
+    assert!(parent.poll_remote_tasks());
+    poll_until_ready(&mut target, 20);
+    // Two distinct provisioned checkouts and branches; neither is the project.
+    let mut seen = std::collections::HashSet::new();
+    for &child_id in &child_ids {
+        let index = target
+            .threads
+            .iter()
+            .position(|t| t.id == child_id)
+            .expect("worker thread");
+        let placement = target.threads[index].placement.as_ref().unwrap();
+        assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+        assert_eq!(placement.mode, placement::PlacementMode::Isolated);
+        assert!(placement.new_worktree);
+        assert!(!placement.primary_checkout);
+        let checkout = placement.checkout.clone().unwrap();
+        let branch = placement.branch.clone().unwrap();
+        assert!(Path::new(&checkout).starts_with(target.data_dir.join("worktrees")));
+        assert_ne!(
+            crate::vcs::real_location(Path::new(&checkout)),
+            crate::vcs::real_location(&fixture.repo)
+        );
+        assert!(seen.insert(checkout));
+        assert!(seen.insert(branch));
+    }
+    assert_eq!(seen.len(), 4);
+    assert_eq!(fixture.worktree_dirs().len(), 3);
+    // Each provider started in its own worktree, never the shared checkout.
+    let connected = connects.lock().unwrap().clone();
+    assert_eq!(connected.len(), 2);
+    for &child_id in &child_ids {
+        let index = target
+            .threads
+            .iter()
+            .position(|t| t.id == child_id)
+            .unwrap();
+        let placement = target.threads[index].placement.as_ref().unwrap();
+        assert!(connected.iter().any(|(tid, path)| {
+            *tid == child_id && Path::new(path) == Path::new(placement.checkout.as_ref().unwrap())
+        }));
+    }
+    // The parent mirrors each resolved placement from the launch replies.
+    for task in &parent.tasks {
+        let placement = task.remote.as_ref().unwrap().placement.as_ref().unwrap();
+        assert_eq!(placement["mode"], json!("isolated"));
+        assert!(placement["checkout"].is_string());
+    }
+    // The project checkout was never touched.
+    assert_eq!(
+        fixture
+            .git(&fixture.repo, &["symbolic-ref", "--short", "HEAD"])
+            .trim(),
+        "main"
+    );
+    std::fs::remove_dir_all(parent.data_dir).unwrap();
+}
+
+#[test]
+fn a_peer_launch_reservation_commits_before_any_provisioning_starts() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("commit-order");
+    let mut state = State::headless(fixture.root.join("server-data"));
+    std::fs::create_dir_all(&state.data_dir).unwrap();
+    state.load_global_for_test();
+    state.runtime_enabled = true;
+    state.test_git_context = Some(crate::vcs::GitContext {
+        git_config_global: Some(fixture.empty_cfg.clone()),
+        git_config_system: Some(fixture.empty_cfg.clone()),
+    });
+    state
+        .projects
+        .entries
+        .push(Project::new(1, fixture.repo.clone()));
+    state.projects.next_id = 2;
+    state.catalog.default_model = Some(crate::session::AgentModel {
+        provider: "cpa".into(),
+        id: "fixture".into(),
+        name: "Fixture".into(),
+        thinking_levels: Vec::new(),
+        ..Default::default()
+    });
+    let mut runtime = crate::runtime::RuntimeState::from_state(state);
+    let database = crate::database::Database::open(&runtime.state.data_dir).unwrap();
+    database
+        .issue_scoped_device("parent", "parent-token", &["read", "peer-delegate"])
+        .unwrap();
+    runtime.database = Some(database.clone());
+    let launch = Command::new(
+        "peer.thread.launch",
+        json!({
+            "projectId": 1, "harness": "pi", "provider": "cpa",
+            "model": "fixture", "brief": "Do the delegated work",
+            "title": "Worker", "origin": serde_json::to_value(peer_origin()).unwrap(),
+        }),
+    );
+    let receipt = runtime.command("parent", launch).unwrap();
+    assert_eq!(receipt["status"], json!("accepted"), "{receipt}");
+    let child_id = receipt["result"]["threadId"].as_u64().unwrap() as usize;
+    assert_eq!(receipt["result"]["placement"]["phase"], json!("pending"));
+    // The command transaction committed the reservation durably.
+    let committed = database.read("index.json").unwrap().unwrap();
+    let record = committed["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == json!(child_id))
+        .expect("committed worker thread");
+    assert_eq!(record["placement"]["phase"], json!("pending"));
+    assert_eq!(record["placement"]["mode"], json!("isolated"));
+    assert!(record["placement"]["checkout"].is_string());
+    // And nothing provisioned inside that transaction: the filesystem is
+    // untouched until a later committed-state tick drives it.
+    assert_eq!(fixture.worktree_dirs().len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        runtime.tick();
+        let index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == child_id)
+            .unwrap();
+        let placement = runtime.state.threads[index].placement.as_ref().unwrap();
+        if placement.phase != placement::PlacementPhase::Pending {
+            break;
+        }
+        assert!(Instant::now() < deadline, "placement never left pending");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let index = runtime
+        .state
+        .threads
+        .iter()
+        .position(|t| t.id == child_id)
+        .unwrap();
+    let placement = runtime.state.threads[index].placement.as_ref().unwrap();
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    assert_eq!(fixture.worktree_dirs().len(), 2);
+    // The provisioned checkout on disk matches the committed reservation.
+    assert_eq!(
+        crate::vcs::real_location(Path::new(placement.checkout.as_ref().unwrap())),
+        crate::vcs::real_location(Path::new(record["placement"]["checkout"].as_str().unwrap()))
+    );
+    std::fs::remove_dir_all(runtime.state.data_dir).unwrap();
 }

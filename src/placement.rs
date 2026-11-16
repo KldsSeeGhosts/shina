@@ -55,12 +55,23 @@ pub enum PlacementPhase {
     Failed,
 }
 
+/// `mode` accepts the documented `"default"` as an explicit writer default.
+fn spec_mode<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<PlacementMode>, D::Error> {
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(mode)) if mode == "default" => Ok(None),
+        Some(value) => PlacementMode::deserialize(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 /// The caller's placement selection inside `delegate_task`, `captain_crew_create`
 /// or `peer.thread.launch` arguments.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlacementSpec {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "spec_mode")]
     pub mode: Option<PlacementMode>,
     #[serde(default)]
     pub base_branch: Option<String>,

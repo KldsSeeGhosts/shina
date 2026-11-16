@@ -597,7 +597,8 @@ mod tests {
         state.threads[0].project = Some(1);
         state.peers.push(crate::peer::Peer {
             server_id:uuid::Uuid::new_v4().to_string(),host:"127.0.0.1:1".into(),label:"Target".into(),linked_at:0,
-            capabilities:json!({"projects":[{"id":9,"path":"/target/project","name":"Project","gitRemote":"example.com/team/repo"}],
+            capabilities:json!({"contracts":[crate::protocol::PLACEMENT],
+                "projects":[{"id":9,"path":"/target/project","name":"Project","gitRemote":"example.com/team/repo"}],
                 "harnesses":[{"id":"pi"}],"models":[{"provider":"cpa","id":"fixture","reasoning_levels":["off"]}]}),
             last_reached_at:Some(0),last_error:None,
         });
@@ -1810,7 +1811,10 @@ mod tests {
     #[test]
     fn explicit_followup_enables_document_reads_for_a_legacy_worker() {
         let mut home = captain_fixture();
-        home.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        home.peers[0].capabilities["contracts"] = json!([
+            crate::protocol::CAPTAIN_PEER_DOCUMENTS,
+            crate::protocol::PLACEMENT
+        ]);
         home.mcp_call(1, "delegate_task", &captain_launch_args())
             .unwrap();
         reply(
@@ -2031,7 +2035,10 @@ mod tests {
     #[test]
     fn crew_context_manifest_carries_revision_hash_and_coverage() {
         let mut state = captain_fixture();
-        state.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        state.peers[0].capabilities["contracts"] = json!([
+            crate::protocol::CAPTAIN_PEER_DOCUMENTS,
+            crate::protocol::PLACEMENT
+        ]);
         let text = format!("{}TAIL", "x".repeat(10_000));
         state
             .captain_books
@@ -2200,6 +2207,19 @@ pub(super) struct PeerRuntime {
     next_probe: u64,
     next_metadata_at: u64,
     followers: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+}
+impl PeerRuntime {
+    /// Queue a peer reply for `poll_remote_tasks`. Test-only seam so sibling
+    /// test modules never touch the channel map directly.
+    #[cfg(test)]
+    pub(crate) fn inject_pending(
+        &mut self,
+        task_id: String,
+        method: String,
+        receive: mpsc::Receiver<Result<Value, String>>,
+    ) {
+        self.pending.insert(task_id, (method, receive));
+    }
 }
 
 pub(crate) type Preparation = mpsc::Receiver<Result<Option<crate::peer::Peer>, String>>;
@@ -3364,13 +3384,37 @@ impl State {
             .transpose()?
             .flatten();
         let shared_reader = placement_mode == Some(placement::PlacementMode::Shared);
+        // A peer that does not advertise placement-v1 ignores the launch's
+        // placement argument and would run the worker in its shared checkout.
+        // Refuse isolation rather than let a writer silently share a writable
+        // checkout. Only an explicit shared placement survives on an old peer.
+        let placement_contract =
+            peer.capabilities["contracts"]
+                .as_array()
+                .is_some_and(|contracts| {
+                    contracts
+                        .iter()
+                        .any(|contract| contract == crate::protocol::PLACEMENT)
+                });
+        if !placement_contract && !shared_reader {
+            return Err(format!(
+                "Update required on {}. Worker placement needs {} there; update Shina on that server, or request a shared read-only placement.",
+                peer.label,
+                crate::protocol::PLACEMENT
+            ));
+        }
         let launch = Command::new(
             "peer.thread.launch",
             json!({"projectId":project["id"],"harness":harness,"provider":provider,
             "model":model,"reasoning":reasoning,"brief":brief,"title":thread.title,"origin":origin,"request":args,
-            "placement":placement_spec.as_ref().map(serde_json::to_value).transpose().ok().flatten(),
+            "placement":if placement_contract {placement_spec.as_ref().map(serde_json::to_value).transpose().ok().flatten()} else {Option::<Value>::None},
             "access":if shared_reader {AccessMode::ReadOnly.id()} else {match self.threads[caller].native.access {AccessMode::ReadOnly=>AccessMode::default(),access=>access}.id()}}),
         );
+        let old_peer_checkout = if placement_contract {
+            None
+        } else {
+            project["path"].as_str().map(str::to_owned)
+        };
         task.remote = Some(RemoteTask {
             server_id: peer.server_id.clone(),
             project,
@@ -3395,18 +3439,30 @@ impl State {
                 placement::ThreadPlacement {
                     requested: placement::PlacementRequest::from_mode(placement_mode),
                     mode: placement_mode.unwrap_or(placement::PlacementMode::Isolated),
-                    phase: placement::PlacementPhase::Pending,
+                    phase: if placement_contract {
+                        placement::PlacementPhase::Pending
+                    } else {
+                        placement::PlacementPhase::Ready
+                    },
                     executor: peer.server_id.clone(),
                     repository: None,
                     base_branch: None,
                     base_commit: None,
                     upstream_thread_id: None,
                     branch: None,
-                    checkout: None,
+                    checkout: old_peer_checkout,
                     start_from_origin: false,
-                    primary_checkout: false,
+                    primary_checkout: !placement_contract,
                     new_worktree: false,
-                    capability: None,
+                    capability: if placement_contract {
+                        None
+                    } else {
+                        Some(format!(
+                            "{} does not advertise {}; the worker shares the project checkout read-only.",
+                            peer.label,
+                            crate::protocol::PLACEMENT
+                        ))
+                    },
                     error: None,
                 }
                 .value(),
