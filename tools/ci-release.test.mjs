@@ -104,11 +104,14 @@ test("parallel checks and builds cannot publish until every required gate passes
   const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
   const publish = readFileSync(new URL("../.github/workflows/publish-update.yml", import.meta.url), "utf8");
 
-  assert.match(updates, /\n  core:\n    name: Core gate\n    needs: \[checks, rust\]\n    if: always\(\)/);
-  assert.match(updates, /test "\$CHECKS_RESULT" = success && test "\$RUST_RESULT" = success/);
+  assert.match(updates, /\n  core:\n    name: Core gate\n    needs: \[checks, rust, rust-tests\]\n    if: always\(\)/);
+  assert.match(updates, /test "\$CHECKS_RESULT" = success && test "\$BUILD_RESULT" = success && test "\$TESTS_RESULT" = success/);
   assert.match(updates, /cargo \+"\$RUST_TOOLCHAIN" fmt --check/);
   assert.match(updates, /node --test tools\/\*\.test\.mjs/);
-  assert.match(updates, /run: node tools\/ci-tests\.mjs/);
+  assert.match(updates, /run: node tools\/ci-tests\.mjs build/);
+  assert.match(updates, /node tools\/ci-tests\.mjs run "\$TEST_SUITE"/);
+  assert.match(updates, /rust-tests:[\s\S]*?needs: rust[\s\S]*?fail-fast: false[\s\S]*?suite: \[unit, integration\]/);
+  assert.match(updates, /name: rust-test-executables[\s\S]*?path: target\/ci-tests\.tar\.gz/);
   assert.match(updates, /pull_request:\n    branches: \[main\]/);
   assert.match(updates, /group: shina-updates-\$\{\{ github\.event\.pull_request\.number \|\| 'main' \}\}/);
   assert.match(updates, /Preserve normalized mobile fixture failures\n        if: failure\(\)[\s\S]*?path: target\/tmp\/mobile-golden\/\*\.json/);

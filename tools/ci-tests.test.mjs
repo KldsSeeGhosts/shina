@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
 import test from "node:test";
-import { runSuites, testSuite } from "./ci-tests.mjs";
+import { bundlePath, runSuites, selectSuites, testSuite } from "./ci-tests.mjs";
 
 const artifact = (name, kind = "bin", extra = {}) => ({
   reason: "compiler-artifact", manifest_path: resolve("Cargo.toml"),
@@ -13,11 +13,29 @@ test("select every local test harness, not application or dependency binaries", 
   assert.equal(testSuite(artifact("shina")).name, "bin/shina");
   assert.equal(testSuite(artifact("server_runtime", "test")).name, "test/server_runtime");
   assert.equal(testSuite(artifact("future_lib", "lib")).name, "lib/future_lib");
+  assert.equal(testSuite(artifact("shina")).group, "unit");
+  assert.equal(testSuite(artifact("server_runtime", "test")).group, "integration");
   for (const message of [
     artifact("shina", "bin", { profile: { test: false } }),
     artifact("dependency", "bin", { manifest_path: resolve("vendor/Cargo.toml") }),
     artifact("shina", "bin", { executable: null }), { reason: "build-finished" },
   ]) assert.equal(testSuite(message), null);
+});
+
+test("bundled executables require the exact checkout and commit and disjoint complete suites", () => {
+  const workspace = resolve(".");
+  const bundle = { workspace, commit: "abc", suites: [
+    { name: "bin/shina", group: "unit", executable: "target/debug/unit" },
+    { name: "test/server_runtime", group: "integration", executable: "target/debug/integration" },
+  ] };
+  assert.equal(selectSuites(bundle, "unit", workspace, "abc")[0].name, "bin/shina");
+  assert.equal(selectSuites(bundle, "integration", workspace, "abc")[0].name, "test/server_runtime");
+  assert.throws(() => selectSuites(bundle, "unit", workspace, "other"), /different checkout or commit/);
+  assert.throws(() => selectSuites(bundle, "unit", resolve("other"), "abc"), /different checkout or commit/);
+  assert.throws(() => selectSuites(bundle, "unknown", workspace, "abc"), /Expected unit or integration/);
+  assert.throws(() => selectSuites({ ...bundle, suites: [] }, "unit", workspace, "abc"), /no unit executables/);
+  assert.throws(() => selectSuites({ ...bundle, suites: [{ ...bundle.suites[0], executable: "../outside" }] }, "unit", workspace, "abc"), /outside the build tree/);
+  assert.throws(() => bundlePath(resolve("outside")), /outside the build tree/);
 });
 
 test("all harnesses start concurrently and the gate waits for both", async () => {

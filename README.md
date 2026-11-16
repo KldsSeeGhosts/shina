@@ -223,7 +223,7 @@ This copies the build to `%LOCALAPPDATA%\Programs\Shina\shina.exe`, adds a Start
 
 ### Automatic updates
 
-Every pull request and push to `main` runs the [update workflow](.github/workflows/updates.yml). Formatting, JavaScript and mobile checks run alongside the Rust job. Rust compiles its test targets once, then runs the complete unit and integration harnesses concurrently. A failed, canceled or skipped required check fails the `Core gate`. PRs never publish.
+Every pull request and push to `main` runs the [update workflow](.github/workflows/updates.yml). Formatting, JavaScript and mobile checks run alongside the Rust build. Rust compiles its test targets once and transfers the exact executables to separate unit and integration runners, so the suites do not compete for one runner's CPU or fixture shutdown deadlines. The test bundle must match the checkout path and commit. A failed, canceled or skipped required check fails the `Core gate`. PRs never publish.
 
 On `main`, Windows x86_64, Apple-silicon Mac and Linux x86_64 builds start alongside those checks. Intel Mac is not built. Each platform publishes only after its own build and the shared core gate pass. GitHub job dependencies enforce that rule without polling or holding an idle runner. One platform's build failure does not block another platform's verified asset.
 
