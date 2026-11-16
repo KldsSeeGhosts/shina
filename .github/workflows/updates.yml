@@ -3,6 +3,8 @@ name: Build and publish updates
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       checks:
@@ -14,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: shina-updates-main
+  group: shina-updates-${{ github.event.pull_request.number || 'main' }}
   cancel-in-progress: true
 
 env:
@@ -65,9 +67,20 @@ jobs:
           npm --prefix packages/mobile-client run build
       - name: Run JS tests
         run: node --test tools/*.test.mjs
-      - name: Run Rust tests
-        run: cargo test --locked --quiet
+      - name: Run server integration tests
+        run: cargo test --locked --quiet --test server_runtime
+      - name: Run Rust unit tests
+        run: cargo test --locked --quiet --bin shina
+      - name: Preserve normalized mobile fixture failures
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobile-golden-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/tmp/mobile-golden/*.json
+          if-no-files-found: ignore
+          retention-days: 3
   windows:
+    if: github.event_name != 'pull_request'
     permissions:
       actions: read
       contents: write
@@ -77,6 +90,7 @@ jobs:
       runner: windows-2025
       checks: ${{ inputs.checks || false }}
   macos:
+    if: github.event_name != 'pull_request'
     permissions:
       actions: read
       contents: write
@@ -86,6 +100,7 @@ jobs:
       runner: macos-15
       checks: ${{ inputs.checks || false }}
   linux:
+    if: github.event_name != 'pull_request'
     permissions:
       actions: read
       contents: write

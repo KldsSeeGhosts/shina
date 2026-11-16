@@ -107,6 +107,13 @@ test("CI workflows run Core gate in parallel with builds and gate publish on it"
   assert.match(updates, /cargo fmt --check/);
   assert.match(updates, /node --test tools\/\*\.test\.mjs/);
   assert.match(updates, /cargo test --locked --quiet/);
+  assert.match(updates, /pull_request:\n    branches: \[main\]/);
+  assert.match(updates, /group: shina-updates-\$\{\{ github\.event\.pull_request\.number \|\| 'main' \}\}/);
+  assert.match(updates, /Run server integration tests[\s\S]*?cargo test --locked --quiet --test server_runtime[\s\S]*?Run Rust unit tests[\s\S]*?cargo test --locked --quiet --bin shina/);
+  assert.match(updates, /Preserve normalized mobile fixture failures\n        if: failure\(\)[\s\S]*?path: target\/tmp\/mobile-golden\/\*\.json/);
+  for (const platformName of ["windows", "macos", "linux"]) {
+    assert.match(updates, new RegExp(`\\n  ${platformName}:\\n    if: github.event_name != 'pull_request'\\n`));
+  }
   assert.doesNotMatch(updates, /\n  (?:windows|macos|linux):[\s\S]*?\n    needs:/);
   assert.equal((updates.match(/actions: read/g) ?? []).length, 3);
 
