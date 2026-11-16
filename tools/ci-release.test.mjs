@@ -99,36 +99,49 @@ test("checksums require all architectures and reject unexpected, empty or linked
   }
 });
 
-test("CI workflows run Core gate in parallel with builds and gate publish on it", () => {
+test("parallel checks and builds cannot publish until every required gate passes", () => {
   const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
   const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
+  const publish = readFileSync(new URL("../.github/workflows/publish-update.yml", import.meta.url), "utf8");
 
-  assert.match(updates, /\n  core:\n    name: Core gate\n    runs-on: ubuntu-24\.04\n/);
-  assert.match(updates, /cargo fmt --check/);
+  assert.match(updates, /\n  core:\n    name: Core gate\n    needs: \[checks, rust\]\n    if: always\(\)/);
+  assert.match(updates, /test "\$CHECKS_RESULT" = success && test "\$RUST_RESULT" = success/);
+  assert.match(updates, /cargo \+"\$RUST_TOOLCHAIN" fmt --check/);
   assert.match(updates, /node --test tools\/\*\.test\.mjs/);
-  assert.match(updates, /cargo test --locked --quiet/);
+  assert.match(updates, /run: node tools\/ci-tests\.mjs/);
   assert.match(updates, /pull_request:\n    branches: \[main\]/);
   assert.match(updates, /group: shina-updates-\$\{\{ github\.event\.pull_request\.number \|\| 'main' \}\}/);
-  assert.match(updates, /Run server integration tests[\s\S]*?cargo test --locked --quiet --test server_runtime[\s\S]*?Run Rust unit tests[\s\S]*?cargo test --locked --quiet --bin shina/);
   assert.match(updates, /Preserve normalized mobile fixture failures\n        if: failure\(\)[\s\S]*?path: target\/tmp\/mobile-golden\/\*\.json/);
   for (const platformName of ["windows", "macos", "linux"]) {
     assert.match(updates, new RegExp(`\\n  ${platformName}:\\n    if: github.event_name != 'pull_request'\\n`));
+    assert.match(updates, new RegExp(`\\n  publish-${platformName}:\\n    needs: \\[core, ${platformName}\\]`));
+    assert.match(updates, new RegExp(`version: \\$\\{\\{ needs\\.${platformName}\\.outputs\\.version \\}\\}`));
   }
-  assert.doesNotMatch(updates, /\n  (?:windows|macos|linux):[\s\S]*?\n    needs:/);
+  // Build jobs start independently, and each publish waits only for its own
+  // platform and the shared gate. A failed Linux build cannot fence Windows.
+  for (const name of ["checks", "rust", "windows", "macos", "linux"]) {
+    const job = updates.split(`\n  ${name}:\n`)[1].split(/\n  [\w-]+:\n/)[0];
+    assert.doesNotMatch(job, /\n    needs:/);
+  }
   assert.equal((updates.match(/actions: read/g) ?? []).length, 3);
-
-  assert.match(platform, /\n  publish:\n[\s\S]*?permissions:\n      actions: read\n      contents: write\n/);
-  assert.match(platform, /\n  publish:\n[\s\S]*?steps:\n      - name: Wait for Core gate\n/);
-  assert.match(platform, /gh api --paginate "repos\/\$\{GITHUB_REPOSITORY\}\/actions\/runs\/\$\{GITHUB_RUN_ID\}\/jobs\?per_page=100"/);
-  assert.match(platform, /select\(\.name == "Core gate"\)/);
-  assert.match(platform, /sleep 15/);
-  assert.match(platform, /1800/);
+  assert.match(platform, /value: \$\{\{ jobs\.build\.outputs\.version \}\}/);
+  assert.doesNotMatch(platform, /\n  publish:/);
+  assert.match(publish, /permissions:\n      actions: read\n      contents: write/);
+  assert.match(publish, /group: shina-release-\$\{\{ github\.run_id \}\}/);
+  assert.match(publish, /cancel-in-progress: false\n      queue: max/);
+  assert.doesNotMatch(publish, /sleep |while true|gh api/);
+  assert.match(publish, /node tools\/ci-release\.mjs publish "\$BUILD_VERSION" "\$BUILD_PLATFORM"/);
 });
 
-test("core compilation is cached even when a test fails", () => {
+test("core cache survives failures without PR snapshots evicting main, and reruns reuse commit keys", () => {
   const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
+  const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
   assert.match(updates, /actions\/cache\/restore@[\da-f]+\s+#.*\n        id: core-cache/);
-  assert.match(updates, /Save compiled core dependencies even when a test fails\n        if: \$\{\{ !cancelled\(\) && steps\.core-cache\.outcome == 'success' && steps\.core-cache\.outputs\.cache-hit != 'true' \}\}/);
+  assert.match(updates, /Save compiled core dependencies even when a test fails\n        if: \$\{\{ !cancelled\(\) && github\.ref == 'refs\/heads\/main' && steps\.core-cache\.outcome == 'success' && steps\.core-cache\.outputs\.cache-hit != 'true' \}\}/);
   assert.match(updates, /actions\/cache\/save@[\da-f]+/);
   assert.match(updates, /key: \$\{\{ steps\.core-cache\.outputs\.cache-primary-key \}\}/);
+  for (const workflow of [updates, platform]) {
+    assert.match(workflow, /key: (?:core|fast)-v1-.*\$\{\{ github\.sha \}\}/);
+    assert.doesNotMatch(workflow, /key: (?:core|fast)-v1-.*github\.run_id/);
+  }
 });

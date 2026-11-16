@@ -12,6 +12,9 @@ on:
       checks:
         default: false
         type: boolean
+    outputs:
+      version:
+        value: ${{ jobs.build.outputs.version }}
 
 env:
   RUST_TOOLCHAIN: 1.98.1
@@ -53,7 +56,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: fast-v1-${{ inputs.platform }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: fast-v1-${{ inputs.platform }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: fast-v1-${{ inputs.platform }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}-
       - name: Prepare the build version
         env:
@@ -96,61 +99,3 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
-
-  publish:
-    name: Publish ${{ inputs.platform }}
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
-    permissions:
-      actions: read
-      contents: write
-    # Only metadata/asset writes serialize. Slow builds never hold up another platform.
-    concurrency:
-      group: shina-release-${{ github.run_id }}
-      cancel-in-progress: false
-      queue: max
-    steps:
-      - name: Wait for Core gate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          deadline=$((SECONDS + 1800))
-          while true; do
-            job_json=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" --jq '.jobs[] | select(.name == "Core gate")')
-            if [ -n "$job_json" ]; then
-              status=$(jq -r '.status' <<<"$job_json" | head -n1)
-              conclusion=$(jq -r '.conclusion // empty' <<<"$job_json" | head -n1)
-              echo "Core gate status=$status conclusion=${conclusion:-pending}"
-              if [ "$status" = "completed" ]; then
-                if [ "$conclusion" = "success" ]; then
-                  exit 0
-                fi
-                echo "Core gate failed with conclusion: $conclusion" >&2
-                exit 1
-              fi
-            else
-              echo "Core gate job not yet visible"
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "Timed out waiting 30 minutes for Core gate" >&2
-              exit 1
-            fi
-            sleep 15
-          done
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: 24
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: update-${{ inputs.platform }}
-          path: target/release-assets
-      - name: Publish this platform now
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BUILD_VERSION: ${{ needs.build.outputs.version }}
-          BUILD_PLATFORM: ${{ inputs.platform }}
-        run: node tools/ci-release.mjs publish "$BUILD_VERSION" "$BUILD_PLATFORM"
