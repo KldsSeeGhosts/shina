@@ -488,7 +488,6 @@ pub struct HandedOff {
     pub target: String,
     pub update_id: String,
     pub started_ms: i64,
-    pub started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -609,12 +608,6 @@ pub struct Fleet {
     /// `Later` was pressed during the countdown; the popover offers "Restart to update".
     pub postponed_local: bool,
 }
-impl Fleet {
-    pub fn active(&self) -> bool {
-        self.running || self.phase != RunPhase::Idle
-    }
-}
-
 impl crate::model::State {
     /// KSG's `hello.capabilities` + `canUpdate` gate for provider rows on a machine.
     /// Older machines get no provider row and no skip line for providers.
@@ -792,6 +785,7 @@ impl crate::model::State {
             ))
             || self.fleet.phase == RunPhase::Installing
     }
+    #[cfg(test)]
     pub fn fleet_available(&self) -> bool {
         self.update_everything_summary().is_some()
     }
@@ -1046,12 +1040,11 @@ impl crate::model::State {
     ) -> bool {
         match command.method.as_str() {
             "providers.update" => {
-                if let Some(index) = self
-                    .fleet
-                    .provider_sends
-                    .iter()
-                    .position(|(id, _)| *id == command.command_id)
-                {
+                if let Some(index) = self.fleet.provider_sends.iter().position(|(id, send)| {
+                    *id == command.command_id
+                        && send.server == server
+                        && send.hash == command.hash()
+                }) {
                     let (_, send) = self.fleet.provider_sends.remove(index);
                     self.provider_receipt(&send, value);
                 }
@@ -1101,7 +1094,8 @@ impl crate::model::State {
             };
             if let Ok(receipt) = result {
                 let send = &self.fleet.provider_sends[index].1;
-                let ours = receipt["commandId"].as_str() == Some(id)
+                let ours = send.server == server
+                    && receipt["commandId"].as_str() == Some(id)
                     && receipt["hash"].as_str() == Some(send.hash.as_str());
                 let status = receipt["status"].as_str().unwrap_or("");
                 if ours && matches!(status, "accepted" | "rejected" | "interrupted") {
@@ -1147,13 +1141,15 @@ impl crate::model::State {
     /// A `providers.update` receipt: the accepted id arms the run's projection watch,
     /// a refusal settles the driver at once.
     fn provider_receipt(&mut self, send: &ProviderSend, value: &Value) {
-        let accepted_id = value["result"]["result"]["updateId"]
+        let receipt = if value["result"]["status"].is_string() {
+            &value["result"]
+        } else {
+            value
+        };
+        let accepted_id = receipt["result"]["updateId"]
             .as_str()
-            .filter(|_| value["result"]["result"]["updateAccepted"] == true)
-            .or_else(|| {
-                value["result"]["updateId"]
-                    .as_str()
-                    .filter(|_| value["result"]["updateAccepted"] == true)
+            .filter(|_| {
+                receipt["status"] == "accepted" && receipt["result"]["updateAccepted"] == true
             })
             .map(str::to_owned);
         let refused = if accepted_id.is_none() {
@@ -1432,7 +1428,15 @@ impl crate::model::State {
     /// Countdown zero: the durable result lands first, then the restart request. A
     /// refused restart deletes the file in `record_fleet_restart_result`.
     fn install_local_now(&mut self) {
-        self.save_update_everything();
+        if let Err(error) = self.save_update_everything() {
+            self.record_local_failure(format!(
+                "This app: Could not save update recovery state: {error}"
+            ));
+            self.fleet.phase = RunPhase::Servers;
+            self.fleet.local_version = None;
+            self.fleet.restart_at = None;
+            return;
+        }
         self.fleet.phase = RunPhase::Installing;
         self.fleet.restart_at = None;
         self.restart_for_update = true;
@@ -1447,7 +1451,13 @@ impl crate::model::State {
         {
             return;
         }
-        let _ = std::fs::remove_file(self.data_dir.join("updates/everything.json"));
+        if let Err(error) = std::fs::remove_file(self.data_dir.join("updates/everything.json"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.storage_error = Some(format!(
+                "Could not clear the cancelled update's recovery record: {error}"
+            ));
+        }
         self.record_local_failure(format!("This app: {error}"));
         self.fleet.phase = RunPhase::Servers;
         self.fleet.local_version = None;
@@ -1473,7 +1483,7 @@ impl crate::model::State {
     }
     /// The durable `<data>/updates/everything.json`, written right before this app's
     /// restart and read once at the next launch (KSG `saveUpdateEverythingResult`).
-    fn save_update_everything(&self) {
+    fn save_update_everything(&self) -> Result<(), String> {
         let updated_servers = self
             .fleet
             .rows
@@ -1505,8 +1515,9 @@ impl crate::model::State {
             "updatedServers":updated_servers,"updatedProviders":updated_providers,
             "failures":failures,"handedOff":handed_off});
         let path = self.data_dir.join("updates/everything.json");
-        let _ = std::fs::create_dir_all(path.parent().unwrap_or(&self.data_dir));
-        let _ = crate::store::write_atomic(&path, saved.to_string().as_bytes());
+        std::fs::create_dir_all(path.parent().unwrap_or(&self.data_dir))
+            .map_err(|e| e.to_string())?;
+        crate::store::write_atomic(&path, saved.to_string().as_bytes()).map_err(|e| e.to_string())
     }
     /// One failure line per machine/provider result, for the saved file and the notice.
     fn run_failures(&self) -> Vec<String> {
@@ -1613,7 +1624,6 @@ impl crate::model::State {
                     target,
                     update_id: entry["updateId"].as_str().unwrap_or("").to_owned(),
                     started_ms,
-                    started_at: Instant::now() - Duration::from_millis(elapsed.min(600_000)),
                 }),
                 started_at: Instant::now() - Duration::from_millis(elapsed.min(600_000)),
                 ..Default::default()
@@ -2340,7 +2350,6 @@ impl crate::model::State {
                             target: row.target.clone(),
                             update_id: id,
                             started_ms: crate::lifecycle::now() as i64,
-                            started_at: Instant::now(),
                         });
                     }
                 } else if offline.contains(&row.server) {
@@ -3751,7 +3760,7 @@ mod tests {
         assert!(state.fleet_receipt(
             "remote",
             &sent,
-            &json!({"result":{"updateAccepted":true,"updateId":"prov-1"}}),
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
         ));
         // The live projection carries the accepted record's terminal status.
         let request = state
@@ -3814,7 +3823,7 @@ mod tests {
         assert!(state.fleet_receipt(
             "remote",
             &sent,
-            &json!({"result":{"updateAccepted":true,"updateId":"prov-1"}}),
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
         ));
         let request = state
             .fleet
@@ -3867,7 +3876,7 @@ mod tests {
         assert!(state.fleet_receipt(
             "remote",
             &sent,
-            &json!({"result":{"updateAccepted":true,"updateId":"prov-1"}}),
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
         ));
         let request = state
             .fleet
@@ -3972,6 +3981,28 @@ mod tests {
         let notice = state.fleet.result_notice.as_ref().expect("failure notice");
         assert!(!notice.success);
         assert_eq!(notice.lines, vec!["This app: 2 threads still have work"]);
+    }
+
+    #[test]
+    fn a_failed_recovery_record_write_never_requests_a_local_restart() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        std::fs::write(state.data_dir.join("updates"), b"not a directory").unwrap();
+        state.fleet.local_version = Some("v99.0.0".into());
+        state.fleet.running = true;
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            ..Default::default()
+        });
+        state.install_local_now();
+        assert!(!state.restart_for_update);
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        assert!(state.fleet.local_version.is_none());
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+        assert!(
+            state.fleet.result_notice.unwrap().lines[0]
+                .contains("Could not save update recovery state")
+        );
     }
     fn everything_json(state: &crate::model::State, saved: Value) {
         let updates = state.data_dir.join("updates");
@@ -4176,7 +4207,7 @@ mod tests {
         assert!(state.fleet_receipt(
             "remote",
             &sent,
-            &json!({"result":{"updateAccepted":true,"updateId":"prov-1"}}),
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
         ));
         // The snapshot reports a terminal record but the projection does not.
         let mut settled = vec![behind("codex", "Codex", "0.48.0", "0.50.0")];
@@ -4250,7 +4281,6 @@ mod tests {
             target: "v99.0.0".into(),
             update_id: "u-1".into(),
             started_ms: crate::lifecycle::now() as i64,
-            started_at: Instant::now(),
         });
         state.machines.views.insert(
             "remote".into(),
@@ -4437,6 +4467,13 @@ mod tests {
         .hash();
         let receipt = json!({"commandId":id.to_string(),"deviceId":"d","hash":hash,
             "status":"accepted","result":{"updateAccepted":true,"updateId":"prov-9"},"seq":1});
+        assert!(state.fleet_rpc(
+            "another-machine",
+            &format!("fleet:receipt:{id}"),
+            &Ok(receipt.clone())
+        ));
+        assert_eq!(state.fleet.provider_sends.len(), 1);
+        assert_eq!(state.fleet.rows[0].provider_runs[0].update_id, None);
         assert!(state.fleet_rpc("remote", &format!("fleet:receipt:{id}"), &Ok(receipt)));
         assert!(state.fleet.provider_sends.is_empty());
         assert_eq!(
