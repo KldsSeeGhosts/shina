@@ -557,7 +557,6 @@ struct ProviderSend {
     row: usize,
     /// The exact `targetVersion` sent; combined with `hash` a looked-up record is
     /// provably our command.
-    target: String,
     /// `Command::hash` of the sent method and body.
     hash: String,
     /// Epoch milliseconds of the send; the confirmation deadline counts from it.
@@ -961,7 +960,6 @@ impl crate::model::State {
                 server: server.into(),
                 driver: driver.into(),
                 row,
-                target: target.into(),
                 hash,
                 requested_ms: crate::lifecycle::now() as i64,
                 lookup_at: None,

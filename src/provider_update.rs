@@ -527,7 +527,19 @@ impl Detected {
 
 /// `/`-joined path with its original case: used for argv and install identity.
 fn slash_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    let path = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix("//?/UNC/") {
+            return format!("//{unc}");
+        }
+        if let Some(drive) = path.strip_prefix("//?/")
+            && drive.as_bytes().get(1) == Some(&b':')
+        {
+            return drive.into();
+        }
+    }
+    path
 }
 
 fn receive_worker<T>(receiver: &mpsc::Receiver<T>) -> Result<Option<T>, ()> {
@@ -1149,7 +1161,7 @@ impl ProviderUpdates {
     }
 
     /// Wire the root's gate hooks (contract 4.6).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn set_hooks(&mut self, hooks: Hooks) {
         self.hooks = hooks;
     }

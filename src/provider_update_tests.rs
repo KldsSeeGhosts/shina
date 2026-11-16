@@ -1085,7 +1085,9 @@ fn windows_npm_cmd_shim_becomes_node_argv() {
     )
     .unwrap();
     // Backslashes are legal in unix filenames; this is the shim's JS target.
-    std::fs::write(win.join("node_modules\\npm\\bin\\npm-cli.js"), "// npm\n").unwrap();
+    let npm_entry = win.join("node_modules\\npm\\bin\\npm-cli.js");
+    std::fs::create_dir_all(npm_entry.parent().unwrap()).unwrap();
+    std::fs::write(&npm_entry, "// npm\n").unwrap();
     let claude = fixture.npm_global("win-prefix", "claude", "@anthropic-ai/claude-code");
     let prefix = fixture
         .dir
@@ -1175,7 +1177,10 @@ fn mixed_case_prefix_is_preserved_not_folded() {
     };
     // Original case survives canonicalization and extraction; only the
     // comparison helpers fold.
-    assert_eq!(prefix, std::fs::canonicalize(&prefix_path).unwrap());
+    assert_eq!(
+        prefix.canonicalize().unwrap(),
+        std::fs::canonicalize(&prefix_path).unwrap()
+    );
 }
 
 #[test]
