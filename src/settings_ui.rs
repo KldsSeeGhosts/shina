@@ -3314,7 +3314,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
             p.muted,
         ));
     }
-    if s.fleet.refreshing > 0 {
+    if s.fleet.refreshing > 0 || s.fleet.rows.iter().any(|row| row.state == "checking") {
         description = description.child(label(
             "Checking for more...",
             TextStyle::new(14.0, 400.0),
@@ -3356,7 +3356,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
             }
             providers = providers.child(label(name, TextStyle::new(14.0, 400.0), p.ink));
         }
-        let app = if machine.server == "local" && machine.eligible {
+        let app = if machine.server == "local" && machine.eligible && !machine.local_server_only {
             Some("this-app")
         } else if machine.eligible {
             Some("server")
@@ -3367,13 +3367,40 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
         match app {
             Some("this-app") => {
                 app_cell = app_cell
-                    .child(label("This app", TextStyle::new(14.0, 400.0), p.ink))
+                    .child(label("App + service", TextStyle::new(14.0, 400.0), p.ink).wrap())
                     .child(label("restarts last", TextStyle::new(12.0, 400.0), p.muted));
             }
             Some("server") => {
                 app_cell = app_cell.child(label("Server", TextStyle::new(14.0, 400.0), p.ink));
             }
             _ => {}
+        }
+        if machine.eligible {
+            app_cell = app_cell.child(
+                label(
+                    format!("{} to {}", machine.current, machine.target),
+                    TextStyle::new(11.0, 400.0),
+                    p.muted,
+                )
+                .wrap_anywhere(),
+            );
+            if machine.server == "local"
+                && !machine.local_server_only
+                && let Some(version) = s
+                    .machines
+                    .views
+                    .get("local")
+                    .and_then(|view| view["updateStatus"]["runningVersion"].as_str())
+            {
+                app_cell = app_cell.child(
+                    label(
+                        format!("Service {version} to {}", machine.target),
+                        TextStyle::new(11.0, 400.0),
+                        p.muted,
+                    )
+                    .wrap_anywhere(),
+                );
+            }
         }
         let row_el = row()
             .key(format!("fleet-row-{index}"))
@@ -3447,9 +3474,13 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
     } else {
         body = body.child(table);
     }
-    let disabled_reason = updating
-        .is_empty()
-        .then(|| "Nothing can update right now.".to_owned());
+    let disabled_reason = updating.is_empty().then(|| {
+        if s.fleet.rows.iter().any(|row| row.state == "checking") {
+            "Checking published releases...".to_owned()
+        } else {
+            "Nothing can update right now.".to_owned()
+        }
+    });
     let busy = s.fleet.running || s.fleet.rows.iter().any(|row| row.state == "checking");
     let mut footer = row().gap(8.0).center_y();
     if let Some(reason) = &disabled_reason {
@@ -3461,7 +3492,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
         .child(
             secondary_button("fleet-cancel", "Cancel", p, |s| s.fleet.open = false)
                 .autofocus()
-                .disabled(busy),
+                .disabled(s.fleet.running),
         )
         .child(
             primary_button("fleet-confirm", "Update", p, |s| s.confirm_fleet())
