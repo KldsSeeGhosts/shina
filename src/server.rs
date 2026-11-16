@@ -929,6 +929,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if captain_events { capabilities.push(protocol::CAPTAIN_EVENTS); }
                         provider_updates = minor >= u64::from(protocol::PROVIDER_UPDATES_MINOR);
                         if provider_updates { capabilities.push(protocol::PROVIDER_UPDATES); }
+                        if minor >= u64::from(protocol::CAPTAIN_PEER_DOCUMENTS_MINOR) {
+                            capabilities.push(protocol::CAPTAIN_PEER_DOCUMENTS);
+                        }
                         Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
@@ -2145,6 +2148,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         worker: Option<std::thread::JoinHandle<()>>,
         disconnect: watch::Sender<bool>,
+        mcp: mpsc::Sender<crate::mcp::Request>,
     }
     impl Fixture {
         async fn new(name: &str) -> Self {
@@ -2170,6 +2174,7 @@ mod tests {
             runtime.database = Some(database.clone());
             configure(&mut runtime);
             let (calls, mut incoming) = mpsc::channel::<Call>(32);
+            let (mcp_inject, mut mcp_incoming) = mpsc::channel::<crate::mcp::Request>(8);
             let (snapshots, receive) = watch::channel(Arc::new(runtime.snapshot()));
             let history_streams = Arc::new(Mutex::new(crate::history::Streams::new(
                 &snapshots.borrow(),
@@ -2199,6 +2204,20 @@ mod tests {
                             std::thread::sleep(Duration::from_millis(2));
                         }
                         if runtime.poll_prepared_calls() {
+                            let snapshot = Arc::new(runtime.snapshot());
+                            worker_streams
+                                .lock()
+                                .expect("history streams")
+                                .ingest(runtime.take_committed_history())
+                                .unwrap();
+                            snapshots.send_replace(snapshot);
+                        }
+                        let mut injected = false;
+                        while let Ok(request) = mcp_incoming.try_recv() {
+                            runtime.test_inject_mcp(request);
+                            injected = true;
+                        }
+                        if injected || runtime.test_peer_pump() {
                             let snapshot = Arc::new(runtime.snapshot());
                             worker_streams
                                 .lock()
@@ -2252,7 +2271,13 @@ mod tests {
                 stop,
                 worker: Some(worker),
                 disconnect,
+                mcp: mcp_inject,
             }
+        }
+        /// Inject a worker-side MCP call the way the model poll's server
+        /// drain does, returning the tool's reply channel to the caller.
+        async fn inject_mcp(&self, request: crate::mcp::Request) {
+            self.mcp.send(request).await.unwrap();
         }
         fn code(&self) -> String {
             self.shared
@@ -2856,6 +2881,292 @@ mod tests {
             target.listen().await;
             target.shared.database.revoke(&link.device_id).unwrap();
             assert!(crate::client::remote_rpc(&link,"peer.thread.wait",json!({"threadId":id})).await.unwrap_err().contains("Authentication denied"));
+        });
+    }
+
+    /// A worker's captain_document_read call, forwarded through the real
+    /// transport: the read rides the origin's peer.thread.wait answer and the
+    /// page comes back as a fenced peer.captain.document.reply.
+    async fn document_read(target: &Fixture, thread: usize, args: Value) -> Result<Value, String> {
+        let (reply, receive) = std::sync::mpsc::channel();
+        target
+            .inject_mcp(crate::mcp::Request {
+                thread,
+                tool: "captain_document_read".into(),
+                args,
+                reply,
+            })
+            .await;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || receive.recv().expect("reply dropped")),
+        )
+        .await
+        .expect("Captain document read timed out")
+        .unwrap()
+    }
+
+    #[test]
+    fn captain_documents_page_to_a_remote_worker_over_the_one_way_link() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // The target holds only the project the worker runs in. The
+            // document, its revisions and crew membership all live on home.
+            let target = Fixture::new("doc-target").await;
+            let user = target.link(&target.shared.directory.join("client")).await;
+            let workspace = target.shared.directory.join("workspace");
+            let put = crate::client::remote_rpc(
+                &user,
+                "project.put",
+                json!({"path":workspace,"createFolder":true}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(put["status"], "accepted", "{put}");
+            let project_id = put["result"]["projectId"].as_u64().unwrap();
+            let target_id = target.shared.discovery.server_id.clone();
+            let home = Fixture::configured("doc-home", protocol::MINOR, |runtime| {
+                std::fs::write(
+                    runtime.state.data_dir.join("server-id"),
+                    uuid::Uuid::new_v4().to_string(),
+                )
+                .unwrap();
+            })
+            .await;
+            // Home setup goes through the same commands a client sends.
+            let local = home.shared.directory.join("workspace");
+            let project = home
+                .local_command("project.put", json!({"path":local,"createFolder":true}))
+                .await;
+            assert_eq!(project["status"], "accepted", "{project}");
+            let captain = crate::captains::Captain::presets().remove(0);
+            let created = home
+                .local_command(
+                    "captain.put",
+                    json!({"record":captain.to_value(),"project":1}),
+                )
+                .await;
+            assert_eq!(created["status"], "accepted", "{created}");
+            let opened = home
+                .local_command("captain.open", json!({"captain":0}))
+                .await;
+            assert_eq!(opened["status"], "accepted", "{opened}");
+            let home_thread = opened["result"]["threadId"].as_u64().unwrap() as usize;
+            // Ordinary one-way pairing: only home holds a credential to the
+            // target. The target has no link back at all.
+            let code = target
+                .shared
+                .pairing
+                .lock()
+                .unwrap()
+                .create_scoped(crate::lifecycle::now(), true)
+                .unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let peer = crate::peer::link_peer(
+                &home.shared.directory,
+                &home.shared.database,
+                &target.address.to_string(),
+                &code,
+            )
+            .await
+            .unwrap();
+            let link = peer.credential(&home.shared.directory).unwrap();
+            assert!(target.shared.database.peers().unwrap().is_empty());
+            // The probe fills in the peer's advertised contracts and projects.
+            wait_until(|| {
+                home.shared.database.peers().unwrap().iter().any(|peer| {
+                    peer.server_id == target_id
+                        && peer.capabilities["contracts"]
+                            .as_array()
+                            .is_some_and(|contracts| {
+                                contracts
+                                    .iter()
+                                    .any(|contract| contract == protocol::CAPTAIN_PEER_DOCUMENTS)
+                            })
+                        && peer.capabilities["projects"]
+                            .as_array()
+                            .is_some_and(|projects| projects.iter().any(|p| p["id"] == project_id))
+                })
+            })
+            .await;
+            let scope = home
+                .local_command(
+                    "captain.scope",
+                    json!({"captain":0,"projects":[1],
+                        "remoteProjects":[{"server":target_id,"projectId":project_id}]}),
+                )
+                .await;
+            assert_eq!(scope["status"], "accepted", "{scope}");
+            let mut crew = "x".repeat(9_000);
+            crew.push_str("SENTINEL-TAIL-RULE");
+            for (name, text) in [
+                ("CREW.md", crew.as_str()),
+                ("AGENTS.md", "PRIVATE-RULES"),
+                ("NOTES.md", "PRIVATE-PLAN"),
+            ] {
+                let write = home
+                    .local_command(
+                        "captain.document.write",
+                        json!({"captain":0,"name":name,"text":text,"expectedRevision":0}),
+                    )
+                    .await;
+                assert_eq!(write["status"], "accepted", "{write}");
+                assert_eq!(write["result"]["saved"], true, "{write}");
+            }
+            // Delegate through the home captain's own thread over MCP.
+            let (reply, delegate) = std::sync::mpsc::channel();
+            home.inject_mcp(crate::mcp::Request {
+                thread: home_thread,
+                tool: "delegate_task".into(),
+                args: json!({"prompt":"Inspect the files",
+                    "target":{"machine":target_id,"projectId":project_id,"model":"fixture"}}),
+                reply,
+            })
+            .await;
+            let launched = tokio::time::timeout(
+                Duration::from_secs(20),
+                tokio::task::spawn_blocking(move || delegate.recv().expect("reply dropped")),
+            )
+            .await
+            .expect("delegate_task timed out")
+            .unwrap()
+            .unwrap();
+            assert!(
+                launched["task_id"].is_string() || launched["thread_id"].is_number(),
+                "{launched}"
+            );
+            // The launch creates the worker on the target and asserts the
+            // origin can serve document reads.
+            let mut worker_id = 0usize;
+            wait_until(|| {
+                let found = target.shared.snapshots.borrow()["state"]["index"]["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|thread| thread["peerOrigin"].is_object())
+                    .and_then(|thread| thread["id"].as_u64())
+                    .map(|id| id as usize);
+                if let Some(id) = found {
+                    worker_id = id;
+                }
+                found.is_some()
+            })
+            .await;
+            {
+                let snapshot = target.shared.snapshots.borrow().clone();
+                let record = snapshot["state"]["index"]["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|thread| thread["id"] == worker_id)
+                    .unwrap();
+                assert_eq!(record["peerOrigin"]["deviceId"], link.device_id);
+                assert_eq!(record["peerOrigin"]["documentReads"], true);
+            }
+            // First page from the live transport, then the whole document
+            // past the 8 KiB context prefix, pinned to revision 1.
+            let first = document_read(
+                &target,
+                worker_id,
+                json!({"name":"CREW.md","maxBytes":4096}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(first["revision"], 1, "{first}");
+            assert_eq!(first["bytes"], crew.len() as u64, "{first}");
+            assert_eq!(first["truncated"], true, "{first}");
+            let mut collected = first["text"].as_str().unwrap().to_owned();
+            let mut offset = first["nextOffset"].as_u64().unwrap();
+            for _ in 0..32 {
+                let page = document_read(
+                    &target,
+                    worker_id,
+                    json!({"name":"CREW.md","offset":offset,"maxBytes":4096,"expectedRevision":1}),
+                )
+                .await
+                .unwrap();
+                collected.push_str(page["text"].as_str().unwrap());
+                if page["truncated"].as_bool().unwrap() {
+                    offset = page["nextOffset"].as_u64().unwrap();
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(collected, crew);
+            assert!(collected.ends_with("SENTINEL-TAIL-RULE"));
+            // Private, unknown and stale-revision reads come back as errors.
+            let private = document_read(&target, worker_id, json!({"name":"AGENTS.md"}))
+                .await
+                .unwrap_err();
+            assert!(private.contains("private"), "{private}");
+            let unknown = document_read(&target, worker_id, json!({"name":"SECRET.md"}))
+                .await
+                .unwrap_err();
+            assert!(unknown.contains("Unknown Captain document"), "{unknown}");
+            let stale = document_read(
+                &target,
+                worker_id,
+                json!({"name":"CREW.md","expectedRevision":99}),
+            )
+            .await
+            .unwrap_err();
+            assert!(stale.contains("changed since revision 99"), "{stale}");
+            // A second peer-delegate device that knows the task, thread and a
+            // plausible request id still cannot answer: the authenticated
+            // device is not the one that launched this worker.
+            let foreign_device = uuid::Uuid::new_v4().to_string();
+            target
+                .shared
+                .database
+                .issue_scoped_device(&foreign_device, "foreign-token", &["read", "peer-delegate"])
+                .unwrap();
+            let foreign = crate::peer::Link {
+                server_id: target_id.clone(),
+                host: target.address.to_string(),
+                device_id: foreign_device,
+                token: "foreign-token".into(),
+                enabled: true,
+            };
+            assert!(
+                crate::client::remote_rpc(&foreign, "peer.capabilities", json!({}))
+                    .await
+                    .is_ok()
+            );
+            let forged = Command::new(
+                "peer.captain.document.reply",
+                json!({"threadId":worker_id,"requestId":"forged","generation":"forged",
+                    "page":{"captain":0,"name":"CREW.md","text":"forged","revision":1,
+                        "bytes":6,"offset":0,"truncated":false,"hash":"h"}}),
+            );
+            let denied = crate::client::remote_command(&foreign, forged)
+                .await
+                .unwrap();
+            assert_eq!(denied["status"], "rejected", "{denied}");
+            assert!(
+                denied["result"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("did not create"),
+                "{denied}"
+            );
+            assert!(
+                crate::client::remote_rpc(
+                    &foreign,
+                    "peer.thread.wait",
+                    json!({"threadId":worker_id})
+                )
+                .await
+                .unwrap_err()
+                .contains("did not create")
+            );
+            // Revoking the origin's device denies its next RPC over transport.
+            target.shared.database.revoke(&link.device_id).unwrap();
+            let error =
+                crate::client::remote_rpc(&link, "peer.thread.wait", json!({"threadId":worker_id}))
+                    .await
+                    .unwrap_err();
+            assert!(error.contains("Authentication denied"), "{error}");
         });
     }
 

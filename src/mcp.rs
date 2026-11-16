@@ -444,8 +444,8 @@ pub fn tools() -> Value {
         },
         {
             "name":"captain_document_read",
-            "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md.",
-            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]}},"required":["name"],"additionalProperties":false},
+            "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md. On a peer-launched remote worker this returns a bounded page of the originating Captain's shared CREW.md, NOTES.md or DIGEST.md; use offset, maxBytes and expectedRevision with the manifest in the brief.",
+            "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]},"offset":{"type":"integer","minimum":0},"maxBytes":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}},"required":["name"],"additionalProperties":false},
             "annotations":{"readOnlyHint":true,"destructiveHint":false}
         },
         {
@@ -1307,8 +1307,8 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
             },
             {
                 "name":"captain_document_read",
-                "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md.",
-                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]}},"required":["name"],"additionalProperties":false},
+                "description":"Read one Captain planning document and its revision. AGENTS.md contains private coordination rules. CREW.md contains current crew rules. NOTES.md contains the plan. DIGEST.md contains the user-facing digest. Crew agents cannot read private AGENTS.md. On a peer-launched remote worker this returns a bounded page of the originating Captain's shared CREW.md, NOTES.md or DIGEST.md; use offset, maxBytes and expectedRevision with the manifest in the brief.",
+                "inputSchema":{"type":"object","properties":{"captain":{"type":"integer","minimum":0},"name":{"type":"string","enum":["AGENTS.md","CREW.md","NOTES.md","DIGEST.md"]},"offset":{"type":"integer","minimum":0},"maxBytes":{"type":"integer","minimum":1},"expectedRevision":{"type":"integer","minimum":0}},"required":["name"],"additionalProperties":false},
                 "annotations":{"readOnlyHint":true,"destructiveHint":false}
             },
             {

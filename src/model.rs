@@ -979,6 +979,9 @@ pub struct Thread {
     pub error: Option<String>,
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
+    /// A held `captain_document_read` waiting on the launch origin's reply.
+    /// Projected into snapshots so `peer.thread.wait` can carry it home.
+    pub(crate) peer_document_read: Option<remote_tasks::PeerDocumentRead>,
     pub(crate) requests_supported: bool,
     pub(crate) question_contract_supported: bool,
     pub(crate) responding_request: Option<uuid::Uuid>,
@@ -1514,6 +1517,7 @@ impl Thread {
             error: None,
             diagnostics: vec![],
             request: None,
+            peer_document_read: None,
             requests_supported: true,
             question_contract_supported: true,
             responding_request: None,
@@ -8645,6 +8649,9 @@ impl State {
         if matches!(request.tool.as_str(), "read_thread" | "list_threads")
             && self.remote_transcript_request(&request)
         {
+            return;
+        }
+        if request.tool == "captain_document_read" && self.queue_peer_document_read(&request) {
             return;
         }
         if matches!(request.tool.as_str(), "html_render" | "html_preview") {
@@ -17160,8 +17167,9 @@ mod tests {
     fn becoming_idle_never_restarts_on_its_own() {
         let _exit_record = exit_record_guard();
         let mut state = ready_state();
-        fake_pi(&mut state.threads[0], Status::Running);
-        state.threads[0].draft.replace_text("work");
+        let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
+        // Submitted work has left the composer. A leftover draft would prewarm
+        // a real provider after the fake connection is removed below.
         state.threads[0].queued_prompt = Some((
             Prompt {
                 draft: None,
@@ -17173,6 +17181,7 @@ mod tests {
         ));
         poll(&mut state, 0.0, &mut Tx::default());
         assert!(!state.take_restart_request());
+        assert_eq!(state.threads[0].status, Status::Running);
         // The run settles; a normal poll must not restart the app.
         state.threads[0].queued_prompt = None;
         state.threads[0].pi = None;
@@ -17181,6 +17190,7 @@ mod tests {
         poll(&mut state, 0.0, &mut tx);
         assert!(!state.take_restart_request());
         assert_eq!(state.threads[0].status, Status::Ready);
+        assert!(state.test_connect_workspaces.is_empty());
         assert!(crate::update::take_exit().is_none());
     }
 

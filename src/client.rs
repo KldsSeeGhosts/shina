@@ -2468,6 +2468,18 @@ async fn remote_request_outcome(
                 link.host
             ));
         }
+        if command.method == "peer.captain.document.reply"
+            && !hello["capabilities"].as_array().is_some_and(|caps| {
+                caps.iter()
+                    .any(|cap| cap == protocol::CAPTAIN_PEER_DOCUMENTS)
+            })
+        {
+            return Ok(RemoteResponse::Refused(format!(
+                "Update required on {}. Missing {}.",
+                link.host,
+                protocol::CAPTAIN_PEER_DOCUMENTS
+            )));
+        }
         if command.method == "filesystem.browse" && !supports_browse(&hello) {
             return Err(
                 "This server needs an update to browse folders. Type a path instead.".into(),

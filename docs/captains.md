@@ -55,6 +55,14 @@ Agent tools are `captain_read`, `captain_document_read`, `captain_document_write
 
 Peer-launched workers receive the shared crew context in each new launch or work follow-up command. The command captures its context once; retries and restored pending commands keep the original payload and UUID even if the rules change. The snapshot never includes private Captain profile instructions or AGENTS.md/NOTES.md contents. Input, editor and select answers retain their exact value without appended context. A brief or follow-up that exceeds the peer's 64 KiB limit after adding context rejects before allocating or requeueing work. Full originating documents remain on the Captain's server.
 
+Each snapshot ends with a coverage manifest. Crew-readable documents have a name, revision, byte count, SHA-256 prefix and exact source-byte coverage. The crew manifest labels private AGENTS.md without including its content or hash. When the worker's server advertises `captain-peer-documents-v1`, introduced at protocol minor 37, the manifest names `captain_document_read` for complete reads. An older server's snapshot never instructs its worker to call the unsupported tool.
+
+The worker's server parks each read and includes it in the existing `peer.thread.wait` status. The ordinary one-way home-to-target link needs no reverse credential. The origin serves only its own task's shared documents while the peer link, Captain and worker membership remain valid. It returns a `peer.captain.document.reply` over that same authenticated link. The target accepts only the launching device's reply for the exact request id and captured runtime generation. Revoked peer grants reject new reads and fail pending reads.
+
+Reads return pages of CREW.md, NOTES.md and DIGEST.md with the current revision and full hash. AGENTS.md remains private. An `expectedRevision` mismatch reports a changed document instead of mixing revisions. Use the returned `nextOffset` for UTF-8 boundaries. Pages have a 32 KiB hard limit; a smaller `maxBytes` that cannot fit one character still returns that whole character so paging advances. A restart or runtime-generation change invalidates the parked call. Unanswered reads expire after 120 seconds; a retry creates a fresh request.
+
+An explicit new work follow-up captures document-read support with its context. This lets a legacy worker adopt the contract after both servers update. Retrying an existing command never changes its captured support or context. Provider question answers remain exact values and do not change this capability.
+
 These operations require `captain-state-v1`, introduced at protocol minor 29. Structured report submission, question answers and the `captain.reports.list`/`captain.report.answer` user RPCs require `captain-reports-v1`, introduced at protocol minor 30. Report wake policies require `captain-events-v1`, introduced at protocol minor 35.
 
 ## Independent crew commands

@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 36;
+pub const MINOR: u32 = 37;
+pub const CAPTAIN_PEER_DOCUMENTS_MINOR: u32 = 37;
+pub const CAPTAIN_PEER_DOCUMENTS: &str = "captain-peer-documents-v1";
 pub const PROVIDER_UPDATES_MINOR: u32 = 36;
 pub const PROVIDER_UPDATES: &str = "provider-updates-v1";
 pub const PROVIDER_UPDATES_UPDATE_REQUIRED: &str =
@@ -280,10 +282,15 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "server.clientReady"
         | "server.commitRestart"
         | "server.stop" => "maintain",
-        "peer.capabilities" | "peer.thread.launch" | "peer.thread.wait" | "peer.task.ack"
-        | "peer.thread.read" | "peer.thread.list" | "peer.thread.send" | "peer.thread.stop" => {
-            "peer-delegate"
-        }
+        "peer.capabilities"
+        | "peer.thread.launch"
+        | "peer.thread.wait"
+        | "peer.task.ack"
+        | "peer.thread.read"
+        | "peer.thread.list"
+        | "peer.thread.send"
+        | "peer.thread.stop"
+        | "peer.captain.document.reply" => "peer-delegate",
         "thread.send"
         | "notifications.push.register"
         | "notifications.push.unregister"

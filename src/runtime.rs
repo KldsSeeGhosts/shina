@@ -87,6 +87,26 @@ impl RuntimeState {
         self.persist(None, effects)
     }
 
+    /// Live-fixture pump: the production tick's remote-task half, without the
+    /// harness spawn or global MCP drain that server tests cannot run.
+    #[cfg(test)]
+    pub(crate) fn test_peer_pump(&mut self) -> bool {
+        self.state.dispatch_peer_work();
+        let changed = self.state.poll_remote_tasks_for_test();
+        if changed {
+            self.last_projection = self.state.projection();
+        }
+        changed
+    }
+
+    /// Live-fixture equivalent of the model poll's `server.next_request()`
+    /// drain: the same `mcp_request` dispatch production runs.
+    #[cfg(test)]
+    pub(crate) fn test_inject_mcp(&mut self, request: crate::mcp::Request) {
+        self.state.mcp_request(request);
+        self.last_projection = self.state.projection();
+    }
+
     pub fn open(directory: PathBuf, wake: rune::Waker) -> Result<Self, String> {
         let database = crate::database::Database::open(&directory)?;
         database.fence_dispatch(directory.join("update-validation").exists());

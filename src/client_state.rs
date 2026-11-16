@@ -178,6 +178,8 @@ struct ThreadView {
     diagnostics: Vec<String>,
     request: Option<Value>,
     #[serde(default)]
+    peer_document_read: Option<Value>,
+    #[serde(default)]
     pending_approvals: Vec<Value>,
     #[serde(default)]
     requests_supported: bool,
@@ -343,6 +345,17 @@ impl ThreadView {
             diagnostics: thread.diagnostics.clone(),
             request: thread.request.clone().map(|mut request| {
                 request["runtimeGeneration"] = json!(thread.request_generation);
+                request
+            }),
+            peer_document_read: thread.peer_document_read.as_ref().map(|read| {
+                let mut request = json!({"id":read.id,"name":read.name,"offset":read.offset,
+                    "runtimeGeneration":read.generation});
+                if let Some(max) = read.max_bytes {
+                    request["maxBytes"] = json!(max);
+                }
+                if let Some(expected) = read.expected_revision {
+                    request["expectedRevision"] = json!(expected);
+                }
                 request
             }),
             pending_approvals: thread

@@ -92,7 +92,9 @@ change the endpoint status. Unit tests cover these cases in addition to the
 worker's authenticated dispatch and live serve-process tests. On the integrated
 branch, `cargo test` passes with 1,921 unit tests and 100 server-runtime tests,
 with 12 opt-in tests ignored. `cargo build`, `cargo fmt --check` and
-`git diff --check` also pass. Publish this revision as its separate #18 PR.
+`git diff --check` also pass. [PR #45](https://github.com/KldsSeeGhosts/shina/pull/45)
+passed CI and merged at `aaf3dcc8c5a015fdb5e7e365c2e01335db7e0cb3`.
+Release v0.12.50 publishes that exact commit for all three platforms.
 
 ### First review of #21
 
@@ -115,6 +117,26 @@ A Devin SWE-2 rework assignment covers these findings, revision/retry behavior,
 and a live two-server integration test through the worker's actual MCP path.
 The original handler-level tests did not exercise the transport or a foreign
 authenticated peer. Do not close #21 based on that candidate.
+
+The rework `6bac14ac8d6b158fe66d22528bea6feedd22e688` replaces the reverse
+callback with a parked document request on the existing `peer.thread.wait`
+channel. The origin answers through a launching-device-fenced
+`peer.captain.document.reply`. It needs no reverse pairing.
+
+Root review added captured runtime generations, immediate denial after peer
+revocation, and read-support negotiation on explicit follow-ups for legacy
+workers. The follow-up captures support and context together; retries retain
+both. The root also added a two-serve-process test using the worker's real
+authenticated MCP endpoint. It checks Unicode paging past 8 KiB, omitted
+private instructions, exact document content, private and revision denials,
+and revocation. The rework's unit tests retain the foreign-device, stale
+reply, bounded paging and restart cases. These changes are separate from
+the unfinished placement and task-control assignments.
+
+The integrated revision passes 1,935 unit tests and 101 server-runtime tests,
+with 12 opt-in tests ignored. Build, formatting and diff checks pass. The
+two-process test waits for the fake provider's completed prompt record before
+inspecting its brief; this fixes a fixture-readiness race found during review.
 
 The remaining first-milestone work is #20, #22 and #23. Issue #32 covers the
 effective cross-harness contract alongside these fixes. The performance track

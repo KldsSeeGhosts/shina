@@ -45,6 +45,8 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     fs.appendFileSync(path.join(process.cwd(), "fixture-prompts.jsonl"), JSON.stringify(request.message) + "\n");
     messages.push({ role: "user", content: [{ type: "text", text: request.message }] }); save();
     running = true; response(request, {}); emit({ type: "agent_start" });
+    // Keep a remote provider turn active while the integration test issues its MCP reads.
+    if (request.message.includes("peer-documents-hold-fixture")) return;
     // An integration test owns settlement through a later steer or abort, not a timer.
     if (request.message === "queue-wait-fixture") return;
     if (request.message === "dismiss-question-fixture") {
