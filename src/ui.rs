@@ -4610,13 +4610,25 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
             let notice = s.updater.notice().unwrap();
             Some(
                 col()
+                    .key("shina-update-notice")
                     .mx(8.0)
                     .mb(8.0)
                     .gap(4.0)
+                    .child(label("Shina app updates", SMALL, p.muted))
                     .child(label(truncate(notice, 300), SMALL, p.muted).wrap_anywhere())
-                    .child(button("retry-update", "Retry update check", p, |s| {
-                        s.updater.retry()
-                    })),
+                    .child(
+                        button(
+                            "retry-update",
+                            if s.updater.rate_limited() {
+                                "Waiting for GitHub"
+                            } else {
+                                "Retry Shina update check"
+                            },
+                            p,
+                            |s| s.updater.retry(),
+                        )
+                        .disabled(s.updater.rate_limited()),
+                    ),
             )
         }
         Status::Disabled | Status::Idle | Status::Checking => None,
@@ -20951,6 +20963,39 @@ pub(crate) mod tests {
         assert!(rt.state.updater.notice().unwrap().contains("gh auth login"));
         press(&mut rt, "retry-update");
         assert!(rt.state.updater.suspended().is_none());
+    }
+
+    #[test]
+    fn github_rate_limit_is_labeled_as_app_updates_and_keeps_provider_success_separate() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = true;
+            rt.state.updater = crate::update::Updater::test_rate_limited();
+            rt.state.fleet.result_notice = Some(crate::fleet_update::ResultNotice {
+                success: true,
+                title: "Updated 1 provider".into(),
+                lines: vec![],
+            });
+            rt.frame(0.0);
+            let tree = rt.accessibility_json();
+            let text = tree.to_string();
+            assert!(text.contains("Shina app updates"));
+            assert!(text.contains("Updated 1 provider"));
+            assert!(!text.contains("API rate limit exceeded for"));
+            let button = find(&tree, "retry-update").unwrap();
+            assert!(
+                button["states"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|state| state == "disabled")
+            );
+            let (bounds, _) = rt.presented("shina-update-notice").unwrap();
+            assert!(bounds[0] >= 0.0 && bounds[0] + bounds[2] <= width + 0.5);
+            press(&mut rt, "retry-update");
+            assert!(rt.state.updater.rate_limited());
+            assert!(rt.state.fleet.result_notice.as_ref().unwrap().success);
+        }
     }
 
     #[test]

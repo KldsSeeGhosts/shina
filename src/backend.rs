@@ -418,6 +418,13 @@ fn command() -> Result<Command, String> {
     if let Some(path) = env::var_os("SHINA_PI_CLI").or_else(|| env::var_os("STILL_PI_CLI")) {
         return command_for(&PathBuf::from(path));
     }
+    #[cfg(unix)]
+    if let Some(launcher) = cpa_launcher(env::split_paths(&env::var_os("PATH").unwrap_or_default()))
+    {
+        // Reuse the host owner's enrollment launcher. It supplies the existing
+        // child-process environment; Shina never reads or copies its credentials.
+        return Ok(Command::new(launcher));
+    }
     #[cfg(windows)]
     {
         for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
@@ -442,6 +449,19 @@ fn command() -> Result<Command, String> {
     }
     #[cfg(not(windows))]
     Ok(Command::new("pi"))
+}
+
+#[cfg(unix)]
+fn cpa_launcher(directories: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    directories
+        .into_iter()
+        .map(|directory| directory.join("pi-cpa"))
+        .find(|path| {
+            path.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
 }
 
 fn command_for(path: &Path) -> Result<Command, String> {
@@ -763,6 +783,26 @@ pub(crate) fn read_record(reader: &mut impl BufRead) -> Result<Option<Value>, St
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn existing_cpa_launcher_is_selected_only_when_executable_and_in_path_order() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::store::directory().unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let launcher = first.join("pi-cpa");
+        std::fs::write(&launcher, "#!/bin/sh\nexec pi \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(cpa_launcher([first.clone(), second.clone()]), None);
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            cpa_launcher([first.clone(), second.clone()]),
+            Some(launcher)
+        );
+        assert!(command_for(&root.join("missing-override")).is_err());
+    }
     #[test]
     fn resource_discovery_is_enabled_only_in_real_sessions() {
         assert_eq!(resource_args(false), &["--mode", "rpc"]);

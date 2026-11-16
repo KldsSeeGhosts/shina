@@ -27,7 +27,10 @@ pub const REPOSITORY: &str = "KldsSeeGhosts/shina";
 const SHA256SUMS: &str = "SHA256SUMS";
 /// The first check runs after this delay. Then a finished check schedules the next one.
 pub const FIRST_CHECK: Duration = Duration::from_secs(2);
-pub const INTERVAL: Duration = Duration::from_secs(30);
+pub const INTERVAL: Duration = Duration::from_secs(15 * 60);
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+const MANUAL_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const RATE_LIMIT_NOTICE: &str = "GitHub temporarily rate-limited Shina app update checks. Retrying in about an hour. Provider updates are separate.";
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_DIAGNOSTICS: usize = 10;
@@ -142,15 +145,23 @@ pub struct ReleaseAsset {
 
 /// Why an attempt failed. Quiet failures only become a diagnostic. An authentication denial
 /// stops networked attempts for the rest of this app session.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 enum Failure {
     Quiet(String),
     Auth(String),
+    RateLimited,
 }
 
 impl Failure {
     fn quiet(message: impl Into<String>) -> Self {
         Self::Quiet(message.into())
+    }
+    fn retry_delay(&self) -> Duration {
+        if matches!(self, Self::RateLimited) {
+            RATE_LIMIT_COOLDOWN
+        } else {
+            INTERVAL
+        }
     }
 }
 
@@ -559,6 +570,12 @@ fn restore_previous_target(target: &InstalledTarget, running: &Path) -> Result<(
 /// The worker side: release metadata, the download, verification and preparation.
 trait UpdateHost: Send + 'static {
     fn fetch_release(&mut self, target: &InstalledTarget) -> Result<Option<Release>, Failure>;
+    fn fetch_release_manual(
+        &mut self,
+        target: &InstalledTarget,
+    ) -> Result<Option<Release>, Failure> {
+        self.fetch_release(target)
+    }
     /// Downloads `release` into `attempt` and verifies it. Returns the file and its digest.
     fn download_release(
         &mut self,
@@ -579,6 +596,89 @@ trait UpdateHost: Send + 'static {
 struct Gh;
 
 fn published_release() -> Result<Value, Failure> {
+    published_release_with_refresh(false)
+}
+
+fn published_release_with_refresh(force: bool) -> Result<Value, Failure> {
+    cached_release(
+        &Storage::default_storage().root,
+        unix_now(),
+        force,
+        fetch_published_release,
+    )
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReleaseCheck {
+    version: u32,
+    checked_at: u64,
+    result: Result<Value, Failure>,
+}
+
+/// Desktop download checks and fleet metadata probes share one profile-local
+/// response and OS lock, including across desktop/server processes and restarts.
+fn cached_release(
+    directory: &Path,
+    now: u64,
+    force: bool,
+    fetch: impl FnOnce() -> Result<Value, Failure>,
+) -> Result<Value, Failure> {
+    fs::create_dir_all(directory)
+        .map_err(|_| Failure::quiet("Could not coordinate Shina app update checks."))?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join("release-check.lock"))
+        .map_err(|_| Failure::quiet("Could not lock Shina app update checks."))?;
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < METADATA_TIMEOUT => {
+                thread::sleep(Duration::from_millis(25))
+            }
+            _ => {
+                return Err(Failure::quiet(
+                    "Another Shina app update check is still running.",
+                ));
+            }
+        }
+    }
+    let path = directory.join("release-check.json");
+    let cached = fs::File::open(&path)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, ReleaseCheck>(file.take(1024 * 1024)).ok());
+    if let Some(cached) = cached.filter(|cached| cached.version == 1) {
+        let delay = match &cached.result {
+            Err(Failure::RateLimited) => RATE_LIMIT_COOLDOWN,
+            _ if force => MANUAL_CHECK_INTERVAL,
+            _ => INTERVAL,
+        };
+        if now
+            .checked_sub(cached.checked_at)
+            .is_some_and(|age| age < delay.as_secs())
+        {
+            return cached.result;
+        }
+    }
+    let result = fetch().map_err(|error| match error {
+        Failure::Quiet(text) => Failure::Quiet(redact(&text)),
+        Failure::Auth(text) => Failure::Auth(redact(&text)),
+        other => other,
+    });
+    let cached = ReleaseCheck {
+        version: 1,
+        checked_at: now,
+        result: result.clone(),
+    };
+    if let Ok(bytes) = serde_json::to_vec(&cached) {
+        let _ = crate::store::write_atomic(&path, &bytes);
+    }
+    result
+}
+
+fn fetch_published_release() -> Result<Value, Failure> {
     let output = run_gh(
         &[
             "release",
@@ -603,7 +703,11 @@ fn published_release() -> Result<Value, Failure> {
             "GitHub did not return a published Shina release.",
         ));
     }
-    Ok(release)
+    // Cache metadata only. Do not persist signed URLs, headers or credentials.
+    Ok(serde_json::json!({"tagName":release["tagName"],
+        "assets":release["assets"].as_array().unwrap().iter().map(|asset|
+            serde_json::json!({"name":asset["name"],"size":asset["size"],"digest":asset["digest"]})
+        ).collect::<Vec<_>>()}))
 }
 
 /// Metadata checks do not depend on installation or a prepared desktop download.
@@ -614,11 +718,14 @@ pub struct ReleaseDiscovery {
     events: Option<Receiver<Result<Value, Failure>>>,
     checked: Option<Instant>,
     suspended: bool,
+    cooldown: Duration,
 }
 impl ReleaseDiscovery {
     pub fn refresh(&mut self, force: bool) {
         if self.events.is_some()
             || self.suspended
+            || (self.cooldown == RATE_LIMIT_COOLDOWN
+                && self.checked.is_some_and(|at| at.elapsed() < self.cooldown))
             || (!force && self.checked.is_some_and(|at| at.elapsed() < INTERVAL))
         {
             return;
@@ -632,7 +739,7 @@ impl ReleaseDiscovery {
             self.events = Some(receive);
             self.value = serde_json::json!({"state":"checking"});
             thread::spawn(move || {
-                let _ = send.send(published_release());
+                let _ = send.send(published_release_with_refresh(force));
             });
         }
     }
@@ -646,6 +753,11 @@ impl ReleaseDiscovery {
         };
         self.events = None;
         self.checked = Some(Instant::now());
+        self.cooldown = result
+            .as_ref()
+            .err()
+            .map(Failure::retry_delay)
+            .unwrap_or(INTERVAL);
         self.value = match result {
             Ok(release) => serde_json::json!({
                 "state":"checked", "tag":release["tagName"], "assets":release["assets"],
@@ -673,7 +785,7 @@ impl ReleaseDiscovery {
             Duration::from_millis(100)
         } else {
             self.checked
-                .map(|at| INTERVAL.saturating_sub(at.elapsed()))
+                .map(|at| self.cooldown.max(INTERVAL).saturating_sub(at.elapsed()))
                 .unwrap_or(INTERVAL)
         })
     }
@@ -700,17 +812,13 @@ impl ReleaseDiscovery {
 
 impl UpdateHost for Gh {
     fn fetch_release(&mut self, target: &InstalledTarget) -> Result<Option<Release>, Failure> {
-        let release = published_release()?;
-        let Some(tag) = release["tagName"].as_str() else {
-            return Err(Failure::quiet("The latest release has no tag."));
-        };
-        if !is_newer(tag, env!("CARGO_PKG_VERSION")) {
-            return Ok(None);
-        }
-        Ok(select_asset(&release, target).map(|asset| Release {
-            tag: tag.to_owned(),
-            asset,
-        }))
+        release_for_target(published_release()?, target)
+    }
+    fn fetch_release_manual(
+        &mut self,
+        target: &InstalledTarget,
+    ) -> Result<Option<Release>, Failure> {
+        release_for_target(published_release_with_refresh(true)?, target)
     }
 
     fn download_release(
@@ -860,11 +968,29 @@ impl UpdateHost for Gh {
     }
 }
 
+fn release_for_target(
+    release: Value,
+    target: &InstalledTarget,
+) -> Result<Option<Release>, Failure> {
+    let Some(tag) = release["tagName"].as_str() else {
+        return Err(Failure::quiet("The latest release has no tag."));
+    };
+    if !is_newer(tag, env!("CARGO_PKG_VERSION")) {
+        return Ok(None);
+    }
+    Ok(select_asset(&release, target).map(|asset| Release {
+        tag: tag.to_owned(),
+        asset,
+    }))
+}
+
 pub struct Updater {
     status: Status,
     target: Option<InstalledTarget>,
     events: Option<Receiver<Event>>,
     next_check: Option<Instant>,
+    rate_limited_until: Option<Instant>,
+    manual_check: bool,
     /// Set after a real authentication denial: no networked attempts until the next launch.
     suspended: Option<String>,
     notice: Option<String>,
@@ -885,6 +1011,8 @@ impl Default for Updater {
             target: None,
             events: None,
             next_check: None,
+            rate_limited_until: None,
+            manual_check: false,
             suspended: None,
             notice: None,
             failed_release: None,
@@ -1093,6 +1221,7 @@ fn fetch_checksums(tag: &str) -> Result<String, Failure> {
 fn failure_text(failure: &Failure) -> String {
     match failure {
         Failure::Quiet(message) | Failure::Auth(message) => message.clone(),
+        Failure::RateLimited => RATE_LIMIT_NOTICE.into(),
     }
 }
 
@@ -1147,6 +1276,12 @@ fn run_gh_download(tag: &str, asset: &str, dir: &Path, file: &Path) -> Result<()
 /// A real authentication denial asks for a manual remedy; everything else stays quiet.
 fn failure_from_stderr(stderr: &str) -> Failure {
     let lower = stderr.to_ascii_lowercase();
+    if lower.contains("rate limit")
+        || lower.contains("http 429")
+        || lower.contains("too many requests")
+    {
+        return Failure::RateLimited;
+    }
     if [
         "authentication",
         "not logged",
@@ -2105,7 +2240,10 @@ pub fn cli_update(args: &[String]) -> Result<(), String> {
         install::installed_target().ok_or("Run shina update from the installed app.")?
     };
     println!("Checking GitHub Releases with the existing gh login.");
-    let Some(release) = Gh.fetch_release(&target).map_err(|e| failure_text(&e))? else {
+    let Some(release) = Gh
+        .fetch_release_manual(&target)
+        .map_err(|e| failure_text(&e))?
+    else {
         println!("No newer release is available.");
         return Ok(());
     };
@@ -2142,7 +2280,10 @@ pub fn request_latest(
 ) -> Result<Option<String>, String> {
     let target = crate::fleet_update::self_update_target(directory)
         .ok_or("This install cannot self-update.")?;
-    let Some(release) = Gh.fetch_release(&target).map_err(|e| failure_text(&e))? else {
+    let Some(release) = Gh
+        .fetch_release_manual(&target)
+        .map_err(|e| failure_text(&e))?
+    else {
         return Ok(None);
     };
     let storage = Storage::at(directory.join("updates"));
@@ -2870,6 +3011,9 @@ impl Updater {
     }
 
     pub fn retry(&mut self) {
+        if self.rate_limited() {
+            return;
+        }
         if matches!(self.status, Status::Idle) && self.events.is_none() && self.installed {
             match fs::remove_file(self.storage.failed_release()) {
                 Ok(()) => {}
@@ -2882,8 +3026,14 @@ impl Updater {
             self.failed_release = None;
             self.suspended = None;
             self.notice = None;
+            self.manual_check = true;
             self.next_check = Some(Instant::now());
         }
+    }
+
+    pub fn rate_limited(&self) -> bool {
+        self.rate_limited_until
+            .is_some_and(|until| Instant::now() < until)
     }
 
     pub fn prepared_update(&self) -> Option<&PreparedUpdate> {
@@ -2915,6 +3065,7 @@ impl Updater {
     }
 
     fn idle_from(&mut self, now: Instant) {
+        self.rate_limited_until = None;
         self.status = Status::Idle;
         self.next_check = Some(now + INTERVAL);
     }
@@ -3023,6 +3174,15 @@ impl Updater {
         );
         updater
     }
+    #[cfg(test)]
+    pub fn test_rate_limited() -> Self {
+        let mut updater = Self {
+            installed: true,
+            ..Self::default()
+        };
+        updater.failed(Failure::RateLimited, Instant::now());
+        updater
+    }
 
     #[cfg(test)]
     pub fn test_failed_release() -> Self {
@@ -3086,8 +3246,13 @@ impl Updater {
             return;
         };
         self.status = Status::Checking;
+        let manual = std::mem::take(&mut self.manual_check);
         self.spawn(wake, move |host| {
-            Event::Checked(host.fetch_release(&target))
+            Event::Checked(if manual {
+                host.fetch_release_manual(&target)
+            } else {
+                host.fetch_release(&target)
+            })
         });
     }
 
@@ -3227,6 +3392,13 @@ impl Updater {
     fn failed(&mut self, failure: Failure, now: Instant) {
         self.notice = Some(failure_text(&failure));
         self.record(failure_text(&failure));
+        if matches!(failure, Failure::RateLimited) {
+            self.status = Status::Idle;
+            self.rate_limited_until = Some(now + RATE_LIMIT_COOLDOWN);
+            self.next_check = self.rate_limited_until;
+            return;
+        }
+        self.rate_limited_until = None;
         if let Failure::Auth(remedy) = failure {
             // No networked attempt runs again this session, so no timer is scheduled.
             self.suspended = Some(remedy);
@@ -3266,6 +3438,91 @@ impl Updater {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_checks_share_metadata_and_respect_manual_and_rate_limit_cooldowns() {
+        let root = crate::store::directory().unwrap();
+        let now = 1_000_000;
+        let release = serde_json::json!({"tagName":"v0.12.44","assets":[]});
+        assert_eq!(
+            cached_release(&root, now, false, || Ok(release.clone())).unwrap(),
+            release
+        );
+        for force in [false, true] {
+            assert_eq!(
+                cached_release(&root, now + 1, force, || panic!(
+                    "cached checks must not contact GitHub"
+                ))
+                .unwrap(),
+                release
+            );
+        }
+        assert!(matches!(
+            cached_release(&root, now + 61, true, || Err(Failure::RateLimited)),
+            Err(Failure::RateLimited)
+        ));
+        for force in [false, true] {
+            assert!(matches!(
+                cached_release(&root, now + 1800, force, || panic!(
+                    "manual checks must honor cooldown across restarts"
+                )),
+                Err(Failure::RateLimited)
+            ));
+        }
+        assert_eq!(
+            cached_release(&root, now + 3662, false, || Ok(release.clone())).unwrap(),
+            release
+        );
+    }
+
+    #[test]
+    fn concurrent_desktop_and_fleet_checks_run_one_fetch_and_cache_corruption_is_not_success() {
+        let root = crate::store::directory().unwrap();
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let directory = root.clone();
+                let fetches = fetches.clone();
+                thread::spawn(move || {
+                    cached_release(&directory, 100_000, false, || {
+                        fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(30));
+                        Ok(serde_json::json!({"tagName":"v0.12.44","assets":[]}))
+                    })
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert!(worker.join().unwrap().is_ok());
+        }
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        fs::write(root.join("release-check.json"), b"broken").unwrap();
+        assert!(matches!(
+            cached_release(&root, 100_001, false, || Err(Failure::quiet("offline"))),
+            Err(Failure::Quiet(_))
+        ));
+    }
+
+    #[test]
+    fn rate_limiting_pauses_checks_without_disabling_provider_updates_or_retrying_on_click() {
+        let mut updater = Updater::test_rate_limited();
+        let next = updater.next_check;
+        updater.retry();
+        assert_eq!(updater.next_check, next);
+        assert_eq!(updater.notice(), Some(RATE_LIMIT_NOTICE));
+        assert!(
+            updater.suspended().is_none(),
+            "rate limiting is not an authentication denial"
+        );
+        assert!(updater.remaining(Instant::now()).unwrap() > Duration::from_secs(3500));
+        let mut discovery = ReleaseDiscovery::default();
+        let (send, receive) = mpsc::channel();
+        discovery.events = Some(receive);
+        send.send(Err(Failure::RateLimited)).unwrap();
+        discovery.poll();
+        discovery.refresh(true);
+        assert!(discovery.events.is_none());
+        assert!(discovery.remaining().unwrap() > Duration::from_secs(3500));
+    }
     #[test]
     fn release_discovery_is_independent_of_downloads_and_checks_platform_assets() {
         let mut discovery = super::ReleaseDiscovery::default();
@@ -3518,7 +3775,7 @@ mod tests {
     fn forbidden_is_not_automatically_an_authentication_denial() {
         assert!(matches!(
             failure_from_stderr("HTTP 403: API rate limit exceeded"),
-            Failure::Quiet(_)
+            Failure::RateLimited
         ));
         assert!(matches!(
             failure_from_stderr("HTTP 401: bad credentials"),
@@ -3811,7 +4068,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_check_waits_two_seconds_then_each_attempt_waits_thirty_seconds() {
+    fn the_first_check_waits_two_seconds_then_each_attempt_waits_fifteen_minutes() {
         let (mut updater, checks, _) = installed(newer());
         let start = Instant::now();
         updater.start(true, start, wake());

@@ -525,9 +525,7 @@ impl State {
                     let snap = &self.client_views["nativeCatalogs"][id];
                     let models_empty = snap["models"].as_array().is_none_or(Vec::is_empty);
                     let err = snap["error"].as_str().map(str::to_owned);
-                    let installed = snap["installed"]
-                        .as_bool()
-                        .unwrap_or_else(|| id != "claude" || crate::claude::process().is_ok());
+                    let installed = snap["installed"].as_bool().unwrap_or(!models_empty);
                     let auth = snap["authStatus"]
                         .as_str()
                         .map(ProviderAuthStatus::parse)
@@ -1245,6 +1243,38 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_harness_availability_uses_the_servers_installation_proof() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        for harness in ["codex", "claude"] {
+            state.client_views["nativeCatalogs"][harness] = json!({
+                "installed":true, "ready":true, "error":null,
+                "models":[{"provider":harness,"id":"fixture"}]
+            });
+            let entry = state
+                .provider_instance_entries()
+                .into_iter()
+                .find(|entry| entry.instance_id == harness)
+                .unwrap();
+            assert!(entry.installed && entry.is_available);
+            assert_eq!(entry.status, crate::model_picker::ProviderStatusKind::Ready);
+            state.client_views["nativeCatalogs"][harness] = json!({
+                "installed":false, "error":"Not installed on the selected machine.", "models":[]
+            });
+            let entry = state
+                .provider_instance_entries()
+                .into_iter()
+                .find(|entry| entry.instance_id == harness)
+                .unwrap();
+            assert!(
+                !entry.installed,
+                "a local CLI must not override remote installation status"
+            );
+        }
+    }
 
     #[test]
     fn draft_pickers_and_capabilities_share_prompt_free_native_models() {
