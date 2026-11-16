@@ -45,7 +45,8 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
           rustup component add rustfmt
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: core-cache
         with:
           path: |
             ~/.cargo/registry
@@ -79,6 +80,15 @@ jobs:
           path: target/tmp/mobile-golden/*.json
           if-no-files-found: ignore
           retention-days: 3
+      - name: Save compiled core dependencies even when a test fails
+        if: ${{ !cancelled() && steps.core-cache.outcome == 'success' && steps.core-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.core-cache.outputs.cache-primary-key }}
   windows:
     if: github.event_name != 'pull_request'
     permissions:

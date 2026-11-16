@@ -19469,6 +19469,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn brief_demo_routine_fixtures_are_independent() {
+        let mut first = State::new(".".into(), false);
+        let mut second = State::new(".".into(), false);
+        crate::captain_brief_demo(&mut first);
+        crate::captain_brief_demo(&mut second);
+        assert_eq!(first.background.routines.entries().len(), 3);
+        assert_eq!(second.background.routines.entries().len(), 3);
+        let first_id = first.background.routines.entries()[0].id;
+        first.background.routines.delete(first_id).unwrap();
+        assert_eq!(first.background.routines.entries().len(), 2);
+        assert_eq!(second.background.routines.entries().len(), 3);
+        crate::captain_brief_demo(&mut first);
+        assert_eq!(first.background.routines.entries().len(), 3);
+    }
+
+    #[test]
     fn a_docked_brief_has_one_control_and_routine_schedules_are_whole() {
         let mut rt = runtime(1440.0);
         crate::captain_brief_demo(&mut rt.state);

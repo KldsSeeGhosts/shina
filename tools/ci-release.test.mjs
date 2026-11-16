@@ -124,3 +124,11 @@ test("CI workflows run Core gate in parallel with builds and gate publish on it"
   assert.match(platform, /sleep 15/);
   assert.match(platform, /1800/);
 });
+
+test("core compilation is cached even when a test fails", () => {
+  const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
+  assert.match(updates, /actions\/cache\/restore@[\da-f]+\s+#.*\n        id: core-cache/);
+  assert.match(updates, /Save compiled core dependencies even when a test fails\n        if: \$\{\{ !cancelled\(\) && steps\.core-cache\.outcome == 'success' && steps\.core-cache\.outputs\.cache-hit != 'true' \}\}/);
+  assert.match(updates, /actions\/cache\/save@[\da-f]+/);
+  assert.match(updates, /key: \$\{\{ steps\.core-cache\.outputs\.cache-primary-key \}\}/);
+});

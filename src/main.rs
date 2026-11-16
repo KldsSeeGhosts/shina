@@ -929,7 +929,12 @@ fn captain_brief_demo(state: &mut State) {
     ] {
         let _ = state.add_memory(captain, text.into(), essential);
     }
-    let folder = std::env::temp_dir().join(format!("shina-demo-{}", std::process::id()));
+    // Each example owns its ledger, including concurrent headless layout tests.
+    let folder = std::env::temp_dir().join(format!(
+        "shina-demo-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     if std::fs::create_dir_all(&folder).is_ok() {
         let mut routines = routines::Routines::load(folder.join("routines.json"));
         let now = chrono::Local::now();
