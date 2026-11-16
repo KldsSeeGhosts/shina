@@ -167,11 +167,15 @@ jobs:
       runner: windows-2025
       checks: ${{ inputs.checks || false }}
   macos:
-    if: github.event_name != 'pull_request'
+    # Opt in before pushing a PR to validate changes to the Mac build pipeline.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'validate-macos')
     uses: ./.github/workflows/platform-update.yml
     with:
       platform: macos-aarch64
-      runner: macos-15
+      # ARM hosted runners can exhaust their allocation window without starting.
+      # The Intel pool uses the same Apple SDK to build the ARM release.
+      runner: macos-15-intel
+      target: aarch64-apple-darwin
       checks: ${{ inputs.checks || false }}
   linux:
     if: github.event_name != 'pull_request'
@@ -182,6 +186,7 @@ jobs:
       checks: ${{ inputs.checks || false }}
 
   publish-windows:
+    if: github.event_name != 'pull_request'
     needs: [core, windows]
     permissions:
       actions: read
@@ -191,6 +196,7 @@ jobs:
       platform: windows-x86_64
       version: ${{ needs.windows.outputs.version }}
   publish-macos:
+    if: github.event_name != 'pull_request'
     needs: [core, macos]
     permissions:
       actions: read
@@ -200,6 +206,7 @@ jobs:
       platform: macos-aarch64
       version: ${{ needs.macos.outputs.version }}
   publish-linux:
+    if: github.event_name != 'pull_request'
     needs: [core, linux]
     permissions:
       actions: read

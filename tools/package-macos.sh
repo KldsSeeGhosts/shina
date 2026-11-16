@@ -23,14 +23,21 @@ if [ ! -x "$binary" ]; then
 fi
 version=$(awk -F '"' '/^version = / { print $2; exit }' "$root/Cargo.toml")
 revision=${SHINA_SOURCE_REVISION:-$(git -C "$root" rev-parse HEAD)}
-case $(uname -m) in
+# The compiler host may differ from the release target. Name and validate the
+# artifact using the executable itself, never the runner's architecture.
+binary_arch=$(/usr/bin/lipo -archs "$binary")
+case "$binary_arch" in
     arm64) arch=aarch64 ;;
     x86_64) arch=x86_64 ;;
     *)
-        printf 'Unsupported Mac architecture: %s\n' "$(uname -m)" >&2
+        printf 'Unsupported Mac executable architecture: %s\n' "$binary_arch" >&2
         exit 1
         ;;
 esac
+if [ -n "${SHINA_PACKAGE_ARCH:-}" ] && [ "$arch" != "$SHINA_PACKAGE_ARCH" ]; then
+    printf 'Expected Mac release architecture %s, got %s\n' "$SHINA_PACKAGE_ARCH" "$arch" >&2
+    exit 1
+fi
 out="$root/target/release-package"
 mkdir -p "$out"
 # Work on a private sibling folder, then move the finished zip into place, so a failed run
