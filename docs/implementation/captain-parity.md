@@ -21,6 +21,28 @@ restart behavior and negative authorization cases. Keep private Captain
 instructions out of worker context. Preserve the difference between a saved
 operation, provider acceptance and completed work.
 
+### Integration of #19
+
+Reviewed candidate `6901cc6a6a1b0886970ec046d6ce920e079d89ad` and applied it
+locally as `548ebdc`. It stores caller-scoped delegation receipts in the same
+SQLite transaction as allocation. Canonical intent excludes `wait_seconds`.
+Unkeyed calls keep their existing allocation behavior.
+
+The root review added
+`local_delegate_mcp_retries_keep_one_worker_after_restart_and_deletion` in
+`tests/server_runtime.rs`. This test uses the real authenticated MCP endpoint,
+serve processes and fake Pi subprocesses. It checks identical task/thread ids,
+changed-intent rejection, one worker prompt, a response-only wait change, and
+receipt replay after process restart and worker deletion. The focused test
+passes. On the integrated branch, `cargo test` passes with 1,910 unit tests
+and 99 server-runtime tests, with 12 opt-in unit tests ignored. `cargo build`
+and `cargo fmt --check` also pass. This implementation is local and has not
+been pushed or published.
+
+Issue #22 is now assigned to Devin SWE-2 on top of this implementation. It adds
+durable send/cancel receipts and attempt fences. Its implementation must retain
+the local MCP retry regression.
+
 ### First review of #18
 
 Candidate `0473d01520f6992e4de14a44d7f6caca9388cca2` is not integrated.
