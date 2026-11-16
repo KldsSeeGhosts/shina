@@ -658,6 +658,40 @@ fn spawn() -> Result<Child, String> {
     command.spawn().map_err(|e| e.to_string())
 }
 
+/// Name the reason a WebSocket dial failed. A refused connection means the machine answered
+/// but no Shina server listens, which is what a service stopped by an interrupted update
+/// looks like. Calling that "offline" sends people to check the network instead.
+fn listener_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    use std::io::ErrorKind;
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+            "Authentication denied. This device may have been revoked. Re-enrollment requires user action.".to_owned()
+        }
+        Error::Io(io) if io.kind() == ErrorKind::ConnectionRefused => {
+            "Shina server is not running there. The machine refused the connection.".to_owned()
+        }
+        Error::Io(io) if io.kind() == ErrorKind::TimedOut => {
+            "Server connection timed out. The machine may be asleep or off the tailnet.".to_owned()
+        }
+        Error::Io(io)
+            if matches!(
+                io.kind(),
+                ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable
+            ) =>
+        {
+            "The machine is unreachable on the network.".to_owned()
+        }
+        // Free-form library text could contain words such as "mismatch" that the supervisor
+        // treats as permanent, so only the HTTP status is passed through.
+        Error::Http(response) => format!(
+            "Server listener is unavailable. It answered HTTP {}.",
+            response.status().as_u16()
+        ),
+        _ => "Server listener is unavailable.".to_owned(),
+    }
+}
+
 pub(crate) type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -724,11 +758,7 @@ async fn connect(
     )
     .await
     .map_err(|_| "Server connection timed out.")?
-    .map_err(|error| match error {
-        tokio_tungstenite::tungstenite::Error::Http(response) if matches!(response.status().as_u16(),401|403) =>
-            "Authentication denied. This device may have been revoked. Re-enrollment requires user action.".to_owned(),
-        _ => "Server listener is unavailable.".to_owned(),
-    })?;
+    .map_err(|error| listener_error(&error))?;
     socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","method":"hello","params":{"protocolMajor":protocol::MAJOR,"protocolMinor":protocol::MINOR,"projectionSchema":1,"clientPid":(desktop && remote.is_none()).then(std::process::id),"maintenanceClient":!desktop}}).to_string().into())).await.map_err(|e| e.to_string())?;
     let reply: Value = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -2639,6 +2669,69 @@ async fn stopped(stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_server_is_named_as_stopped_and_stays_retryable() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = rt.block_on(async {
+            // Take a free loopback port, then close it so nothing listens there.
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/ws"))
+                .await
+                .unwrap_err()
+        });
+        let message = listener_error(&error);
+        assert_eq!(
+            message,
+            "Shina server is not running there. The machine refused the connection."
+        );
+        assert_eq!(FailureKind::from_error(&message), FailureKind::Refused);
+        // The supervisor gives up for good on these words. A stopped server must be retried.
+        for permanent in ["Authentication denied", "mismatch", "handshake refused"] {
+            assert!(!message.contains(permanent), "{message}");
+        }
+    }
+
+    #[test]
+    fn dial_failures_never_pass_library_text_to_the_supervisor() {
+        use tokio_tungstenite::tungstenite::Error;
+        let http = |status: u16| {
+            Error::Http(Box::new(
+                tokio_tungstenite::tungstenite::http::Response::builder()
+                    .status(status)
+                    .body(None)
+                    .unwrap(),
+            ))
+        };
+        assert!(listener_error(&http(401)).starts_with("Authentication denied."));
+        assert_eq!(
+            listener_error(&http(502)),
+            "Server listener is unavailable. It answered HTTP 502."
+        );
+        let timed_out = Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            FailureKind::from_error(&listener_error(&timed_out)),
+            FailureKind::Timeout
+        );
+        let unreachable = Error::Io(std::io::Error::from(std::io::ErrorKind::HostUnreachable));
+        assert_eq!(
+            listener_error(&unreachable),
+            "The machine is unreachable on the network."
+        );
+        assert_eq!(
+            listener_error(&Error::Protocol(
+                tokio_tungstenite::tungstenite::error::ProtocolError::SecWebSocketAcceptKeyMismatch
+            )),
+            "Server listener is unavailable."
+        );
+    }
 
     #[test]
     fn streaming_projections_do_not_cancel_or_repeat_an_inflight_blob() {
