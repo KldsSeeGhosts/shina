@@ -17167,8 +17167,9 @@ mod tests {
     fn becoming_idle_never_restarts_on_its_own() {
         let _exit_record = exit_record_guard();
         let mut state = ready_state();
-        fake_pi(&mut state.threads[0], Status::Running);
-        state.threads[0].draft.replace_text("work");
+        let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
+        // Submitted work has left the composer. A leftover draft would prewarm
+        // a real provider after the fake connection is removed below.
         state.threads[0].queued_prompt = Some((
             Prompt {
                 draft: None,
@@ -17180,6 +17181,7 @@ mod tests {
         ));
         poll(&mut state, 0.0, &mut Tx::default());
         assert!(!state.take_restart_request());
+        assert_eq!(state.threads[0].status, Status::Running);
         // The run settles; a normal poll must not restart the app.
         state.threads[0].queued_prompt = None;
         state.threads[0].pi = None;
@@ -17188,6 +17190,7 @@ mod tests {
         poll(&mut state, 0.0, &mut tx);
         assert!(!state.take_restart_request());
         assert_eq!(state.threads[0].status, Status::Ready);
+        assert!(state.test_connect_workspaces.is_empty());
         assert!(crate::update::take_exit().is_none());
     }
 
