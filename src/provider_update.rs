@@ -1,0 +1,2140 @@
+//! One-button provider CLI updates, ported from KSG Code's
+//! `providerMaintenanceRunner`, `ProviderInstallationGate` and `maintenanceResolver`
+//! (design contract `ksg-update-design.md` sections 3 and 4).
+//!
+//! A provider is the harness CLI Shina launches: `codex` and `claude` only. Pi follows
+//! Shina's own release and ACP harnesses are arbitrary commands, so neither is managed.
+//!
+//! Only three proven strategies execute, always as a fixed argv with no shell:
+//! `npm-global` (the real path lives under a proven npm global prefix), Homebrew
+//! (the keg's own `brew` reports the same prefix) and `claude-native`
+//! (`<resolved> update` for `~/.local/share/claude/versions/` installs). Every other
+//! layout reports a `disabled_reason` and, where certain, a `manual_command` that is
+//! displayed but never run. A provider update never touches CPA, provider config,
+//! auth files or `harnesses.json`.
+//!
+//! Contract for the root agent:
+//! - `ProviderUpdates::new(data_dir)` reconciles `providers/update-state.json`, then
+//!   `statuses()` serialises to the section 5 projection. `refresh(force)` drops the
+//!   latest-version cache and re-resolves in the background; `poll()` picks the result
+//!   up and returns true whenever a projected field changed. Call `poll()` only from
+//!   the runtime tick; it never blocks.
+//! - `request(driver, target, update_id)` is the `providers.update` backend: the record
+//!   is durable before it returns and execution is driven by `poll()`. `admits(driver)`
+//!   is the gate turnstile for new harness work, and `set_hooks` wires the busy check
+//!   and the pre-run "stop idle harness processes" step. `active()` feeds the server
+//!   restart blocker.
+//! - RPC names and grant mapping (`providers.refresh`, `providers.update`, MINOR 36)
+//!   belong to the parent.
+
+// Until the root wires `ProviderUpdates` into State/runtime, nothing outside
+// tests constructs it.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{Arc, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
+
+/// Native and package updaters download large binaries quietly; KSG allows 30 minutes.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const LATEST_TIMEOUT: Duration = Duration::from_secs(4);
+const OUTPUT_MAX_BYTES: usize = 10_000;
+const PROGRESS_MAX_LEN: usize = 200;
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+const LATEST_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_RECORDS_PER_DRIVER: usize = 20;
+const WRAPPER_SCRIPT_MAX_BYTES: u64 = 16 * 1024;
+
+// ---------- projected types (section 5 JSON) ----------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Advisory {
+    Current,
+    Behind,
+    Unknown,
+}
+impl Advisory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Behind => "behind",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRecord {
+    pub update_id: String,
+    /// queued | running | succeeded | unchanged | failed
+    pub status: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    /// Never projected by `statuses()`; only `refresh()` output carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+impl UpdateRecord {
+    fn finished(&self) -> bool {
+        matches!(self.status.as_str(), "succeeded" | "unchanged" | "failed")
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderStatus {
+    pub driver: String,
+    pub name: String,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    pub advisory: String,
+    /// "npm-global" | "homebrew-formula" | "homebrew-cask" | "claude-native" | null
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
+    /// Shown to the client with the home directory collapsed to `~`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<UpdateRecord>,
+}
+
+// ---------- durable types (providers/update-state.json) ----------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredRecord {
+    update_id: String,
+    driver: String,
+    status: String,
+    message: String,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
+    from_version: Option<String>,
+    #[serde(default)]
+    target_version: Option<String>,
+    #[serde(default)]
+    output: Option<String>,
+    #[serde(default)]
+    lock_key: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Ledger {
+    version: u32,
+    #[serde(default)]
+    records: Vec<StoredRecord>,
+}
+
+// ---------- external effects, faked in tests ----------
+
+#[derive(Clone, Debug, Default)]
+pub struct ProbeResult {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Bounded, noninteractive probes: `<exe> --version`, `npm prefix -g`,
+/// `brew --prefix`, `npm outdated`/`brew info`, and the claude-native registry GET.
+pub trait Prober: Send + Sync {
+    fn run(&self, argv: &[String], timeout: Duration) -> ProbeResult;
+    fn http_get(&self, url: &str, timeout: Duration) -> Option<String>;
+}
+
+/// The running update command. `poll()` owns it; it never blocks the caller.
+trait RunningUpdate: Send {
+    /// Latest meaningful output line, sampled by `poll`.
+    fn progress(&mut self) -> Option<String>;
+    /// Finished result, or None while still running.
+    fn result(&mut self) -> Option<CommandResult>;
+    fn kill(&mut self);
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommandResult {
+    pub exit_code: Option<i32>,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+}
+
+trait Runner: Send + Sync {
+    fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String>;
+}
+
+// ---------- system implementations ----------
+
+fn run_bounded(argv: &[String], timeout: Duration) -> ProbeResult {
+    let Some((program, args)) = argv.split_first() else {
+        return ProbeResult::default();
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match crate::process::Process::spawn(&mut command) {
+        Ok(child) => child,
+        Err(error) => {
+            return ProbeResult {
+                stderr: format!("{program}: {error}"),
+                ..Default::default()
+            };
+        }
+    };
+    let (out_rx, err_rx) = (
+        pump(child.stdout.take().expect("piped stdout")),
+        pump(child.stderr.take().expect("piped stderr")),
+    );
+    let deadline = Instant::now() + timeout;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() >= deadline => {
+                child.terminate();
+                let _ = child.reap(Duration::from_secs(2));
+                break None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => break None,
+        }
+    };
+    let collect = |rx: mpsc::Receiver<Vec<u8>>| {
+        let mut tail = String::new();
+        for chunk in rx.try_iter() {
+            tail.push_str(&String::from_utf8_lossy(&chunk));
+            if tail.len() > OUTPUT_MAX_BYTES * 2 {
+                tail.drain(..tail.len() - OUTPUT_MAX_BYTES);
+            }
+        }
+        tail
+    };
+    thread::sleep(Duration::from_millis(30));
+    ProbeResult {
+        exit_code: code,
+        stdout: strip_ansi(&collect(out_rx)),
+        stderr: strip_ansi(&collect(err_rx)),
+    }
+}
+
+fn pump(mut reader: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sender.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    receiver
+}
+
+struct SystemProber;
+impl Prober for SystemProber {
+    fn run(&self, argv: &[String], timeout: Duration) -> ProbeResult {
+        run_bounded(argv, timeout)
+    }
+    fn http_get(&self, url: &str, timeout: Duration) -> Option<String> {
+        // reqwest honours HTTPS_PROXY/HTTP_PROXY like KSG's server-side fetch.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .build()
+            .ok()?;
+        let body = client
+            .get(url)
+            .header("accept", "application/json")
+            .send()
+            .ok()?
+            .text()
+            .ok()?;
+        serde_json::from_str::<serde_json::Value>(&body).ok()?["version"]
+            .as_str()
+            .map(str::to_owned)
+    }
+}
+
+struct CommandUpdate {
+    child: crate::process::Process,
+    out: mpsc::Receiver<Vec<u8>>,
+    err: mpsc::Receiver<Vec<u8>>,
+    out_tail: String,
+    err_tail: String,
+}
+impl CommandUpdate {
+    fn drain(&mut self) {
+        for (rx, tail) in [
+            (&self.out, &mut self.out_tail),
+            (&self.err, &mut self.err_tail),
+        ] {
+            while let Ok(chunk) = rx.try_recv() {
+                tail.push_str(&String::from_utf8_lossy(&chunk));
+                if tail.len() > OUTPUT_MAX_BYTES * 2 {
+                    tail.drain(..tail.len() - OUTPUT_MAX_BYTES);
+                }
+            }
+        }
+    }
+}
+impl RunningUpdate for CommandUpdate {
+    fn progress(&mut self) -> Option<String> {
+        self.drain();
+        [&self.err_tail, &self.out_tail]
+            .into_iter()
+            .find_map(|tail| tail.rsplit(['\r', '\n']).find_map(progress_line))
+    }
+    fn result(&mut self) -> Option<CommandResult> {
+        self.drain();
+        let status = self.child.try_wait().ok()??;
+        self.drain();
+        Some(CommandResult {
+            exit_code: status.code(),
+            stdout_tail: strip_ansi(&self.out_tail),
+            stderr_tail: strip_ansi(&self.err_tail),
+        })
+    }
+    fn kill(&mut self) {
+        self.child.terminate();
+        let _ = self.child.reap(Duration::from_secs(2));
+    }
+}
+
+struct SystemRunner;
+impl Runner for SystemRunner {
+    fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+        let Some((program, args)) = argv.split_first() else {
+            return Err("Empty update command.".into());
+        };
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = crate::process::Process::spawn(&mut command)
+            .map_err(|error| format!("Could not start {program}: {error}"))?;
+        Ok(Box::new(CommandUpdate {
+            out: pump(child.stdout.take().expect("piped stdout")),
+            err: pump(child.stderr.take().expect("piped stderr")),
+            child,
+            out_tail: String::new(),
+            err_tail: String::new(),
+        }))
+    }
+}
+
+// ---------- detection (contract 4.1, 4.2) ----------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Driver {
+    Codex,
+    Claude,
+}
+impl Driver {
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            _ => None,
+        }
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+        }
+    }
+    fn env_override(self) -> &'static str {
+        match self {
+            Self::Codex => "SHINA_CODEX_CLI",
+            Self::Claude => "SHINA_CLAUDE_CLI",
+        }
+    }
+    fn package(self) -> &'static str {
+        match self {
+            Self::Codex => "@openai/codex",
+            Self::Claude => "@anthropic-ai/claude-code",
+        }
+    }
+}
+
+/// A proven, executable strategy. The argv it yields is fixed; no remote input
+/// and no shell ever enters it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Strategy {
+    /// `npm install -g --prefix <prefix> <pkg>@<target>`; prefix proven by `npm prefix -g`.
+    NpmGlobal { prefix: PathBuf, npm: PathBuf },
+    /// `brew upgrade [--cask] <name>`; brew proven by `brew --prefix` == keg prefix.
+    Homebrew {
+        brew: PathBuf,
+        name: String,
+        cask: bool,
+    },
+    /// `<resolvedPath> update`; real path under `~/.local/share/claude/versions/`.
+    ClaudeNative { resolved: PathBuf },
+}
+impl Strategy {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::NpmGlobal { .. } => "npm-global",
+            Self::Homebrew { cask: false, .. } => "homebrew-formula",
+            Self::Homebrew { cask: true, .. } => "homebrew-cask",
+            Self::ClaudeNative { .. } => "claude-native",
+        }
+    }
+    fn lock_key(&self) -> String {
+        match self {
+            Self::NpmGlobal { prefix, .. } => {
+                format!("npm-global:{}", normalize_path(prefix))
+            }
+            Self::Homebrew { .. } => "homebrew".into(),
+            Self::ClaudeNative { .. } => "claude-native".into(),
+        }
+    }
+    fn argv(&self, target: &str, package: &str) -> Vec<String> {
+        match self {
+            Self::NpmGlobal { prefix, npm } => vec![
+                npm.to_string_lossy().into_owned(),
+                "install".into(),
+                "-g".into(),
+                "--prefix".into(),
+                prefix.to_string_lossy().into_owned(),
+                format!("{package}@{target}"),
+            ],
+            Self::Homebrew { brew, name, cask } => {
+                let mut argv = vec![brew.to_string_lossy().into_owned(), "upgrade".into()];
+                if *cask {
+                    argv.push("--cask".into());
+                }
+                argv.push(name.clone());
+                argv
+            }
+            Self::ClaudeNative { resolved } => {
+                vec![resolved.to_string_lossy().into_owned(), "update".into()]
+            }
+        }
+    }
+    /// Display string for "Running ..." messages and manual hints.
+    fn describe(&self, target: &str, package: &str) -> String {
+        self.argv(target, package)
+            .iter()
+            .map(|word| {
+                // Display only; the executed argv is the vector itself.
+                if word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"/:.@-_\\".contains(&b))
+                {
+                    word.clone()
+                } else {
+                    format!("'{word}'")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Filesystem proof result for one driver.
+#[derive(Clone, Debug)]
+struct Detected {
+    installed: bool,
+    resolved: Option<PathBuf>,
+    real: Option<PathBuf>,
+    /// Extra argv prefix for `--version` when the launcher is `node <script>`.
+    script_prefix: Option<Vec<String>>,
+    strategy: Option<Strategy>,
+    disabled_reason: Option<String>,
+    manual_command: Option<String>,
+}
+impl Detected {
+    fn missing() -> Self {
+        Self {
+            installed: false,
+            resolved: None,
+            real: None,
+            script_prefix: None,
+            strategy: None,
+            disabled_reason: None,
+            manual_command: None,
+        }
+    }
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
+}
+
+fn candidates(driver: Driver) -> Vec<String> {
+    // Same order as `codex.rs::process` / `claude.rs::process`, minus env overrides,
+    // which the caller checks first.
+    match driver {
+        Driver::Codex => {
+            let mut out = vec!["codex".to_owned()];
+            if cfg!(windows)
+                && let Some(local) = std::env::var_os("LOCALAPPDATA")
+            {
+                out.push(
+                    PathBuf::from(&local)
+                        .join("Programs/OpenAI/Codex/bin/codex.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if let Some(profile) = std::env::var_os("USERPROFILE") {
+                    out.push(
+                        PathBuf::from(profile)
+                            .join("AppData/Local/Programs/OpenAI/Codex/bin/codex.exe")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            out
+        }
+        Driver::Claude => {
+            let mut out = vec!["claude".to_owned()];
+            if let Some(home) = home() {
+                for relative in if cfg!(windows) {
+                    vec![
+                        ".local/bin/claude.exe",
+                        ".claude/local/claude.exe",
+                        "AppData/Roaming/npm/claude.cmd",
+                    ]
+                } else {
+                    vec![
+                        ".local/bin/claude",
+                        ".claude/local/claude",
+                        ".npm-global/bin/claude",
+                    ]
+                } {
+                    out.push(home.join(relative).to_string_lossy().into_owned());
+                }
+            }
+            out
+        }
+    }
+}
+
+fn is_mise(p: &str) -> bool {
+    p.contains("/mise/installs/")
+        || p.contains("/mise/shims/")
+        || p.contains("/mise/command-wrappers/")
+}
+fn is_pnpm(p: &str) -> bool {
+    p.contains("/.local/share/pnpm/")
+        || p.contains("/library/pnpm/")
+        || p.contains("/appdata/local/pnpm/")
+        || p.contains("/pnpm/global/")
+}
+fn is_bun(p: &str) -> bool {
+    p.contains("/.bun/")
+}
+fn is_volta(p: &str) -> bool {
+    p.contains("/volta/tools/") || p.contains("/volta/bin/")
+}
+fn is_vite_plus(p: &str) -> bool {
+    p.contains("/.vite-plus/") || p.contains("/vite-plus/bin/")
+}
+fn is_nix(p: &str) -> bool {
+    p.starts_with("/nix/store/")
+}
+fn is_macports(p: &str) -> bool {
+    p.starts_with("/opt/local/")
+}
+fn is_windows_managed(p: &str) -> Option<&'static str> {
+    if p.contains("/winget/") {
+        Some("winget")
+    } else if p.contains("/chocolatey/") {
+        Some("Chocolatey")
+    } else if p.contains("/program files/") {
+        Some("an administrator install")
+    } else {
+        None
+    }
+}
+fn is_codex_desktop_bundle(p: &str) -> bool {
+    p.contains("/openai/codex/") || p.contains("/codex.app/")
+}
+
+fn homebrew_keg(p: &str) -> Option<(String, String, bool)> {
+    // (prefix, name, cask) from `<p>/Cellar/<name>/<v>/...` or `<p>/Caskroom/<name>/<v>/...`
+    for marker in ["/cellar/", "/caskroom/"] {
+        if let Some(index) = p.find(marker) {
+            let prefix = p[..index].to_owned();
+            let name = p[index + marker.len()..]
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if !name.is_empty() {
+                return Some((prefix, name, marker == "/caskroom/"));
+            }
+        }
+    }
+    None
+}
+
+/// The npm global prefix owning `real`, per KSG `npmGlobalPrefixFromCommandPath`:
+/// `<prefix>/lib/node_modules/<pkg>/...`, never nested under another package.
+fn npm_prefix(real: &str, package: &str) -> Option<String> {
+    let segment = format!("/lib/node_modules/{}/", package.to_lowercase());
+    let index = real.rfind(&segment)?;
+    if real[..index].contains("/node_modules/") {
+        return None;
+    }
+    // Mise tool trees mimic npm globals; only globals under mise's Node count.
+    let before = &real[..index];
+    if let Some(tool) = before
+        .rsplit("/mise/installs/")
+        .next()
+        .and_then(|t| t.split('/').next())
+        .filter(|_| before.contains("/mise/installs/"))
+        && tool != "node"
+    {
+        return None;
+    }
+    Some(real[..index].to_owned())
+}
+
+fn is_wrapper_script(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > WRAPPER_SCRIPT_MAX_BYTES {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 2];
+    use std::io::Read;
+    file.read_exact(&mut head).is_ok() && &head == b"#!"
+}
+
+/// Test-seedable layout overrides: candidate lists and tool paths (npm, brew).
+#[derive(Clone, Default)]
+struct Overrides {
+    candidates: HashMap<Driver, Vec<String>>,
+    tools: HashMap<String, PathBuf>,
+}
+
+fn find_on_path(name: &str, overrides: Option<&Overrides>) -> Option<PathBuf> {
+    overrides
+        .and_then(|o| o.tools.get(name).cloned())
+        .or_else(|| crate::harness::executable(name).ok().map(|(exe, _)| exe))
+}
+
+/// Full detection with prover access (contract 4.2). `fast` skips the
+/// `npm prefix -g`/`brew --prefix` prover calls for the worker's re-resolve.
+fn detect(
+    driver: Driver,
+    prober: &dyn Prober,
+    fast: bool,
+    overrides: Option<&Overrides>,
+) -> Detected {
+    if std::env::var_os(driver.env_override()).is_some() {
+        return Detected {
+            disabled_reason: Some(format!(
+                "Set by {}. Update it where it was installed.",
+                driver.env_override()
+            )),
+            ..Detected::missing()
+        };
+    }
+    let owned;
+    let list = match overrides.and_then(|o| o.candidates.get(&driver)) {
+        Some(list) => list.as_slice(),
+        None => {
+            owned = candidates(driver);
+            &owned
+        }
+    };
+    let mut found = None;
+    for candidate in list {
+        if let Ok((executable, script)) = crate::harness::executable(&candidate) {
+            found = Some((executable, script));
+            break;
+        }
+    }
+    let Some((executable, script)) = found else {
+        return Detected {
+            disabled_reason: Some(format!("{} is not installed.", driver.name())),
+            ..Detected::missing()
+        };
+    };
+    // Ownership is judged on what an updater would replace: the entry point.
+    let resolved = script.clone().unwrap_or_else(|| executable.clone());
+    let script_prefix = script.map(|entry| {
+        vec![
+            executable.to_string_lossy().into_owned(),
+            entry.to_string_lossy().into_owned(),
+        ]
+    });
+    let Ok(real) = std::fs::canonicalize(&resolved) else {
+        return Detected {
+            installed: true,
+            resolved: Some(resolved.clone()),
+            real: None,
+            script_prefix,
+            strategy: None,
+            disabled_reason: Some(format!(
+                "Could not resolve {}. Update it where it was installed.",
+                driver.name()
+            )),
+            manual_command: None,
+        };
+    };
+    classify_resolved(
+        driver,
+        resolved,
+        real,
+        script_prefix,
+        prober,
+        fast,
+        overrides,
+    )
+}
+
+// ---------- versions (contract 4.3) ----------
+
+fn parse_version(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            continue;
+        }
+        let end = bytes[start..]
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || b".-_".contains(b)))
+            .map_or(bytes.len(), |n| start + n);
+        let candidate = text[start..end].trim_end_matches(['.', '-', '_']);
+        if candidate.split('.').count() >= 3
+            && candidate.bytes().next().is_some_and(|b| b.is_ascii_digit())
+        {
+            return Some(candidate.to_owned());
+        }
+    }
+    None
+}
+
+/// Numeric semver compare; prerelease tails rank below their release.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |v: &str| -> (Vec<u64>, bool) {
+        let (core, pre) = v.split_once('-').unwrap_or((v, ""));
+        (
+            core.split('.').map(|n| n.parse().unwrap_or(0)).collect(),
+            !pre.is_empty(),
+        )
+    };
+    let (av, a_pre) = parse(a);
+    let (bv, b_pre) = parse(b);
+    for i in 0..av.len().max(bv.len()) {
+        let ordering = av
+            .get(i)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&bv.get(i).copied().unwrap_or(0));
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    b_pre.cmp(&a_pre)
+}
+
+fn installed_version(detected: &Detected, prober: &dyn Prober) -> Option<String> {
+    let resolved = detected.resolved.as_ref()?;
+    let mut argv = detected
+        .script_prefix
+        .clone()
+        .unwrap_or_else(|| vec![resolved.to_string_lossy().into_owned()]);
+    argv.push("--version".into());
+    let result = prober.run(&argv, PROBE_TIMEOUT);
+    if result.exit_code != Some(0) {
+        return None;
+    }
+    parse_version(&result.stdout).or_else(|| parse_version(&result.stderr))
+}
+
+fn latest_version(driver: Driver, strategy: &Strategy, prober: &dyn Prober) -> Option<String> {
+    match strategy {
+        Strategy::NpmGlobal { prefix, npm } => {
+            // `outdated` respects the user's npm config (min-release-age, registry).
+            let result = prober.run(
+                &[
+                    npm.to_string_lossy().into_owned(),
+                    "outdated".into(),
+                    "-g".into(),
+                    "--prefix".into(),
+                    prefix.to_string_lossy().into_owned(),
+                    "--json".into(),
+                    driver.package().into(),
+                ],
+                PROBE_TIMEOUT,
+            );
+            // npm outdated exits 1 when updates exist, and may print {"error":...}.
+            let value: serde_json::Value = serde_json::from_str(result.stdout.trim()).ok()?;
+            value.get(driver.package())?["latest"]
+                .as_str()
+                .map(str::to_owned)
+        }
+        Strategy::Homebrew { brew, name, cask } => {
+            let result = prober.run(
+                &[
+                    brew.to_string_lossy().into_owned(),
+                    "info".into(),
+                    "--json=v2".into(),
+                    name.clone(),
+                ],
+                PROBE_TIMEOUT,
+            );
+            let value: serde_json::Value = serde_json::from_str(result.stdout.trim()).ok()?;
+            let raw = if *cask {
+                value["casks"][0]["version"]
+                    .as_str()
+                    .map(|v| v.split(',').next().unwrap_or(v).to_owned())
+            } else {
+                value["formulae"][0]["versions"]["stable"]
+                    .as_str()
+                    .map(str::to_owned)
+            };
+            raw.filter(|v| v != "latest")
+        }
+        Strategy::ClaudeNative { .. } => prober.http_get(
+            "https://registry.npmjs.org/@anthropic-ai/claude-code/latest",
+            LATEST_TIMEOUT,
+        ),
+    }
+}
+
+// ---------- gate hooks owned by the root ----------
+
+/// Root-wired admission control (contract 4.6). `busy(driver)` reports in-flight
+/// harness work for that driver; `before_run(driver)` stops idle harness processes
+/// immediately before the update command spawns. Both default to permissive so the
+/// backend is safe standalone; the parent must wire them before accepting updates.
+#[derive(Clone)]
+pub struct Hooks {
+    pub busy: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pub before_run: Arc<dyn Fn(&str) + Send + Sync>,
+}
+impl Default for Hooks {
+    fn default() -> Self {
+        Self {
+            busy: Arc::new(|_| false),
+            before_run: Arc::new(|_| {}),
+        }
+    }
+}
+
+// ---------- worker state ----------
+
+enum Job {
+    /// Background detection+version resolution from `refresh`.
+    Detect(mpsc::Receiver<DetectionOutcome>),
+    /// `npm outdated`/`brew info`/registry GET for the pre-update check.
+    Latest(mpsc::Receiver<Option<String>>),
+    /// The update command itself.
+    Command {
+        handle: Box<dyn RunningUpdate>,
+        started: Instant,
+        last_progress: Instant,
+    },
+    /// Post-update `<exe> --version`.
+    Verify(mpsc::Receiver<Option<String>>),
+}
+
+struct DetectionOutcome {
+    detected: Detected,
+    version: Option<String>,
+    latest: Option<String>,
+    checked_at: u64,
+}
+
+struct Active {
+    record: UpdateRecord,
+    lock_key: String,
+    /// Held cross-process lock file under providers/locks/.
+    lock_file: Option<PathBuf>,
+    phase: Phase,
+    strategy: Strategy,
+    real_path: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    Queued,
+    CheckingLatest,
+    WaitBusy,
+    Running,
+    Verifying,
+}
+
+// ---------- the service ----------
+
+pub struct ProviderUpdates {
+    data_dir: PathBuf,
+    ledger: Ledger,
+    /// Latest detection per driver, swapped in by the detect job.
+    detected: HashMap<Driver, DetectionOutcome>,
+    jobs: HashMap<Driver, Job>,
+    latest_cache: HashMap<String, (Instant, Option<String>)>,
+    active: HashMap<Driver, Active>,
+    hooks: Hooks,
+    prober: Arc<dyn Prober>,
+    runner: Arc<dyn Runner>,
+    /// Test hook: replaces the PATH-based candidate list.
+    overrides: Option<Overrides>,
+    update_timeout: Duration,
+}
+
+impl ProviderUpdates {
+    /// Production constructor. Reconciles interrupted records and kicks the first
+    /// detection; statuses land once `poll()` picks the detection job up.
+    pub fn new(data_dir: &Path) -> Self {
+        Self::build(
+            data_dir,
+            Hooks::default(),
+            Arc::new(SystemProber),
+            Arc::new(SystemRunner),
+            None,
+            UPDATE_TIMEOUT,
+        )
+    }
+
+    fn build(
+        data_dir: &Path,
+        hooks: Hooks,
+        prober: Arc<dyn Prober>,
+        runner: Arc<dyn Runner>,
+        overrides: Option<Overrides>,
+        update_timeout: Duration,
+    ) -> Self {
+        let mut service = Self {
+            data_dir: data_dir.to_path_buf(),
+            ledger: read_ledger(&data_dir.join("providers/update-state.json")),
+            detected: HashMap::new(),
+            jobs: HashMap::new(),
+            latest_cache: HashMap::new(),
+            active: HashMap::new(),
+            hooks,
+            prober,
+            runner,
+            overrides,
+            update_timeout,
+        };
+        // A queued/running record whose lock is not held died with its process.
+        let now = crate::lifecycle::now();
+        let mut recovered = false;
+        for record in &mut service.ledger.records {
+            if !matches!(record.status.as_str(), "succeeded" | "unchanged" | "failed") {
+                record.status = "failed".into();
+                record.finished_at = Some(now);
+                let name = Driver::from_id(&record.driver)
+                    .map_or(record.driver.clone(), |d| d.name().to_owned());
+                record.message = format!(
+                    "Shina stopped while the {name} update was running. Check {name} and retry."
+                );
+                recovered = true;
+            }
+        }
+        if recovered {
+            service.persist();
+        }
+        service.start_detect();
+        service
+    }
+
+    /// Wire the root's gate hooks (contract 4.6).
+    pub fn set_hooks(&mut self, hooks: Hooks) {
+        self.hooks = hooks;
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.data_dir.join("providers/update-state.json")
+    }
+
+    fn persist(&self) {
+        if let Ok(bytes) = serde_json::to_vec(&self.ledger) {
+            let _ = crate::store::write_atomic(&self.state_path(), &bytes);
+        }
+    }
+
+    fn start_detect(&mut self) {
+        for driver in [Driver::Codex, Driver::Claude] {
+            let prober = Arc::clone(&self.prober);
+            let overrides = self.overrides.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(resolve_driver(driver, &*prober, overrides.as_ref()));
+            });
+            self.jobs.insert(driver, Job::Detect(rx));
+        }
+    }
+
+    /// Section 5 projection. `output` is stripped: it is returned by `refresh` only.
+    pub fn statuses(&self) -> Vec<ProviderStatus> {
+        self.statuses_inner(false)
+    }
+
+    fn statuses_inner(&self, with_output: bool) -> Vec<ProviderStatus> {
+        [Driver::Codex, Driver::Claude]
+            .into_iter()
+            .map(|driver| {
+                let detection = self.detected.get(&driver);
+                let record = self
+                    .active
+                    .get(&driver)
+                    .map(|a| a.record.clone())
+                    .or_else(|| {
+                        self.ledger
+                            .records
+                            .iter()
+                            .rev()
+                            .find(|r| r.driver == driver.id())
+                            .map(|r| UpdateRecord {
+                                update_id: r.update_id.clone(),
+                                status: r.status.clone(),
+                                message: r.message.clone(),
+                                started_at: r.started_at,
+                                finished_at: r.finished_at,
+                                from_version: r.from_version.clone(),
+                                target_version: r.target_version.clone(),
+                                output: if with_output { r.output.clone() } else { None },
+                            })
+                    });
+                match detection {
+                    Some(outcome) => {
+                        let detected = &outcome.detected;
+                        let advisory = match (&outcome.version, &outcome.latest) {
+                            (Some(version), Some(latest))
+                                if compare_versions(version, latest)
+                                    == std::cmp::Ordering::Less =>
+                            {
+                                Advisory::Behind
+                            }
+                            (Some(_), Some(_)) => Advisory::Current,
+                            _ => Advisory::Unknown,
+                        };
+                        ProviderStatus {
+                            driver: driver.id().into(),
+                            name: driver.name().into(),
+                            installed: detected.installed,
+                            version: outcome.version.clone(),
+                            latest_version: outcome.latest.clone(),
+                            advisory: advisory.as_str().into(),
+                            strategy: detected
+                                .strategy
+                                .as_ref()
+                                .map(Strategy::kind)
+                                .map(str::to_owned),
+                            disabled_reason: detected.disabled_reason.clone(),
+                            manual_command: detected.manual_command.clone(),
+                            install_path: detected.real.as_ref().map(|p| collapse_home(p)),
+                            checked_at: Some(outcome.checked_at),
+                            update: record.map(|mut r| {
+                                if !with_output {
+                                    r.output = None;
+                                }
+                                r
+                            }),
+                        }
+                    }
+                    None => ProviderStatus {
+                        driver: driver.id().into(),
+                        name: driver.name().into(),
+                        installed: false,
+                        version: None,
+                        latest_version: None,
+                        advisory: Advisory::Unknown.as_str().into(),
+                        strategy: None,
+                        disabled_reason: None,
+                        manual_command: None,
+                        install_path: None,
+                        checked_at: None,
+                        update: record,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// `providers.refresh`. Drops the latest-version cache and re-resolves in the
+    /// background; returns the current view immediately, with `output` attached.
+    pub fn refresh(&mut self, force: bool) -> Vec<ProviderStatus> {
+        if force {
+            self.latest_cache.clear();
+        }
+        self.start_detect();
+        self.statuses_inner(true)
+    }
+
+    /// Pre-commit validation for `providers.update`: pure, no mutation, no
+    /// probes, no waits. The runtime calls this before accepting a receipt, then
+    /// calls `request` with the accepted update id. Same section 5 rejections.
+    pub fn validate_request(&self, driver: &str, target: &str) -> Result<(), String> {
+        let driver =
+            Driver::from_id(driver).ok_or_else(|| format!("Unknown provider {driver}."))?;
+        let Some(outcome) = self.detected.get(&driver) else {
+            return Err("Refresh and try again.".into());
+        };
+        if self.active.contains_key(&driver) {
+            return Err(format!(
+                "An update is already running for {}.",
+                driver.name()
+            ));
+        }
+        if !outcome.detected.installed {
+            return Err(format!("{} is not installed.", driver.name()));
+        }
+        if outcome.detected.strategy.is_none() {
+            return Err(outcome
+                .detected
+                .disabled_reason
+                .clone()
+                .unwrap_or_else(|| format!("{} cannot be updated here.", driver.name())));
+        }
+        if outcome.latest.as_deref() != Some(target) {
+            return Err("Refresh and try again.".into());
+        }
+        Ok(())
+    }
+
+    /// `providers.update` post-acceptance entry. The same update id with the same
+    /// payload replays its stored outcome (never re-runs); a different payload is
+    /// refused. The durable record exists before `poll()` may spawn anything.
+    pub fn request(&mut self, driver: &str, target: &str, update_id: String) -> Result<(), String> {
+        let driver =
+            Driver::from_id(driver).ok_or_else(|| format!("Unknown provider {driver}."))?;
+        // Idempotency: the same updateId replays its stored receipt when the
+        // payload matches; a different payload under it is refused.
+        let replay = self
+            .ledger
+            .records
+            .iter()
+            .find(|r| r.update_id == update_id)
+            .map(|r| (r.driver.clone(), r.target_version.clone()))
+            .or_else(|| {
+                self.active
+                    .get(&driver)
+                    .map(|a| (driver.id().to_owned(), a.record.target_version.clone()))
+            });
+        if let Some((existing_driver, existing_target)) = replay {
+            return if existing_driver == driver.id() && existing_target.as_deref() == Some(target) {
+                Ok(())
+            } else {
+                Err("A different payload under that update id is refused.".into())
+            };
+        }
+        self.validate_request(driver.id(), target)?;
+        let outcome = self.detected.get(&driver).expect("validated");
+        let strategy = outcome.detected.strategy.clone().expect("validated");
+        let real = outcome.detected.real.clone().expect("validated");
+        let record = UpdateRecord {
+            update_id: update_id.clone(),
+            status: "queued".into(),
+            message: "Waiting for another provider update to finish.".into(),
+            started_at: Some(crate::lifecycle::now()),
+            finished_at: None,
+            from_version: outcome.version.clone(),
+            target_version: Some(target.to_owned()),
+            output: None,
+        };
+        let lock_key = strategy.lock_key();
+        self.ledger.records.push(stored(&record, driver, &lock_key));
+        trim_records(&mut self.ledger, driver.id());
+        self.persist();
+        self.active.insert(
+            driver,
+            Active {
+                record,
+                lock_key,
+                lock_file: None,
+                phase: Phase::Queued,
+                strategy,
+                real_path: real,
+            },
+        );
+        Ok(())
+    }
+
+    /// Marks an accepted update id as terminally failed without running anything,
+    /// so the projection preserves the accepted receipt's outcome when the root
+    /// learns the update cannot proceed after acceptance (e.g. a refused restart
+    /// gate or a lost worker). Safe to call for an already-active record only when
+    /// the caller has settled it elsewhere; here it is a durable write only.
+    pub fn record_failure(
+        &mut self,
+        driver: &str,
+        target: &str,
+        update_id: String,
+        message: String,
+    ) {
+        let Ok(driver) = Driver::from_id(driver).ok_or(()) else {
+            return;
+        };
+        if self.active.contains_key(&driver)
+            || self
+                .ledger
+                .records
+                .iter()
+                .any(|r| r.update_id == update_id && r.target_version.as_deref() != Some(target))
+        {
+            return;
+        }
+        let now = crate::lifecycle::now();
+        let record = UpdateRecord {
+            update_id,
+            status: "failed".into(),
+            message,
+            started_at: Some(now),
+            finished_at: Some(now),
+            from_version: None,
+            target_version: Some(target.to_owned()),
+            output: None,
+        };
+        self.ledger
+            .records
+            .push(stored(&record, driver, "manual-failure"));
+        trim_records(&mut self.ledger, driver.id());
+        self.persist();
+    }
+
+    /// True while any record is queued or running. Feeds the server restart
+    /// blocker (contract 5: "A provider update is running.").
+    pub fn active(&self) -> bool {
+        !self.active.is_empty()
+    }
+
+    /// Gate turnstile (contract 4.6): the root refuses or queues new harness work
+    /// for a driver while its update is queued, waiting, or running.
+    pub fn admits(&self, driver: &str) -> bool {
+        Driver::from_id(driver).is_none_or(|d| !self.active.contains_key(&d))
+    }
+
+    /// Runtime tick. Advances every queued/running record without blocking and
+    /// picks up finished background jobs. True when a projected field changed.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        // Detection jobs.
+        for driver in [Driver::Codex, Driver::Claude] {
+            if let Some(Job::Detect(rx)) = self.jobs.get(&driver)
+                && let Ok(outcome) = rx.try_recv()
+            {
+                self.detected.insert(driver, outcome);
+                self.jobs.remove(&driver);
+                changed = true;
+            }
+        }
+        for driver in [Driver::Codex, Driver::Claude] {
+            if self.step(driver) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// One nonblocking step of a driver's state machine (contract 4.5).
+    fn step(&mut self, driver: Driver) -> bool {
+        let Some((phase, lock_key, strategy, real_path)) = self.active.get(&driver).map(|a| {
+            (
+                a.phase,
+                a.lock_key.clone(),
+                a.strategy.clone(),
+                a.real_path.clone(),
+            )
+        }) else {
+            return false;
+        };
+        match phase {
+            Phase::Queued => {
+                if !self.acquire_lock(&lock_key) {
+                    // Another update (or process) holds this install location.
+                    return false;
+                }
+                if let Some(active) = self.active.get_mut(&driver) {
+                    active.lock_file = Some(lock_path(&self.data_dir, &active.lock_key));
+                }
+                // Re-resolve before taking the gate: the install may have moved.
+                let fresh = detect(driver, &*self.prober, true, self.overrides.as_ref());
+                let changed = fresh.strategy.as_ref().map(Strategy::lock_key)
+                    != Some(lock_key.clone())
+                    || fresh.real.as_ref() != Some(&real_path);
+                if changed {
+                    self.settle(
+                        driver,
+                        "failed",
+                        "Provider installation changed. Refresh and try again.".into(),
+                        None,
+                    );
+                    return true;
+                }
+                if let Some(active) = self.active.get_mut(&driver) {
+                    active.phase = Phase::CheckingLatest;
+                    active.record.status = "running".into();
+                    active.record.message = "Checking for the latest version".into();
+                }
+                self.sync_record(driver);
+                // Latest version on a bounded background probe.
+                let cached = self
+                    .latest_cache
+                    .get(&lock_key)
+                    .filter(|(at, _)| at.elapsed() < LATEST_CACHE_TTL)
+                    .and_then(|(_, v)| v.clone());
+                if let Some(latest) = cached {
+                    self.finish_latest_check(driver, Some(latest));
+                } else {
+                    let prober = Arc::clone(&self.prober);
+                    let (tx, rx) = mpsc::channel();
+                    thread::spawn(move || {
+                        let _ = tx.send(latest_version(driver, &strategy, &*prober));
+                    });
+                    self.jobs.insert(driver, Job::Latest(rx));
+                }
+                true
+            }
+            Phase::CheckingLatest => {
+                let done = if let Some(Job::Latest(rx)) = self.jobs.get(&driver) {
+                    rx.try_recv().ok()
+                } else {
+                    None
+                };
+                let Some(done) = done else {
+                    return false;
+                };
+                self.jobs.remove(&driver);
+                self.latest_cache.insert(
+                    self.active[&driver].lock_key.clone(),
+                    (Instant::now(), done.clone()),
+                );
+                self.finish_latest_check(driver, done);
+                true
+            }
+            Phase::WaitBusy => {
+                if (self.hooks.busy)(driver.id()) {
+                    return false;
+                }
+                let target = self.active[&driver]
+                    .record
+                    .target_version
+                    .clone()
+                    .unwrap_or_default();
+                let argv = self.active[&driver]
+                    .strategy
+                    .argv(&target, driver.package());
+                let describe = self.active[&driver]
+                    .strategy
+                    .describe(&target, driver.package());
+                (self.hooks.before_run)(driver.id());
+                match self.runner.start(&argv) {
+                    Ok(handle) => {
+                        let active = self.active.get_mut(&driver).expect("active");
+                        active.phase = Phase::Running;
+                        active.record.status = "running".into();
+                        active.record.message = format!("Running {describe}");
+                        self.jobs.insert(
+                            driver,
+                            Job::Command {
+                                handle,
+                                started: Instant::now(),
+                                last_progress: Instant::now() - PROGRESS_INTERVAL,
+                            },
+                        );
+                        self.sync_record(driver);
+                    }
+                    Err(error) => {
+                        self.settle(driver, "failed", error, None);
+                    }
+                }
+                true
+            }
+            Phase::Running => {
+                let mut line = None;
+                let mut finished = None;
+                let timeout = self.update_timeout;
+                if let Some(Job::Command {
+                    handle,
+                    started,
+                    last_progress,
+                }) = self.jobs.get_mut(&driver)
+                {
+                    if let Some(progress) = handle.progress()
+                        && last_progress.elapsed() >= PROGRESS_INTERVAL
+                    {
+                        *last_progress = Instant::now();
+                        line = Some(progress);
+                    }
+                    if let Some(result) = handle.result() {
+                        finished = Some(Ok(result));
+                    } else if started.elapsed() >= timeout {
+                        handle.kill();
+                        finished = Some(Err(format!(
+                            "Update timed out after {} minutes.",
+                            timeout.as_secs().max(59) / 60
+                        )));
+                    }
+                }
+                let progressed = line.is_some();
+                if let Some(line) = line {
+                    self.message(driver, &line);
+                }
+                let Some(finished) = finished else {
+                    return progressed;
+                };
+                self.jobs.remove(&driver);
+                match finished {
+                    Err(message) => {
+                        self.settle(driver, "failed", message, None);
+                    }
+                    Ok(result) if result.exit_code != Some(0) => {
+                        let message = failure_message(&result);
+                        self.settle(driver, "failed", message, command_output(&result));
+                    }
+                    Ok(_) => {
+                        self.message(driver, "Verifying the installed version");
+                        if let Some(active) = self.active.get_mut(&driver) {
+                            active.phase = Phase::Verifying;
+                        }
+                        // Re-resolve, then probe the installed version.
+                        let detected = detect(driver, &*self.prober, true, self.overrides.as_ref());
+                        let prober = Arc::clone(&self.prober);
+                        let (tx, rx) = mpsc::channel();
+                        thread::spawn(move || {
+                            let _ = tx.send(installed_version(&detected, &*prober));
+                        });
+                        self.jobs.insert(driver, Job::Verify(rx));
+                    }
+                }
+                true
+            }
+            Phase::Verifying => {
+                let done = if let Some(Job::Verify(rx)) = self.jobs.get(&driver) {
+                    rx.try_recv().ok()
+                } else {
+                    None
+                };
+                let Some(version) = done else {
+                    return false;
+                };
+                self.jobs.remove(&driver);
+                let lock_key = self.active[&driver].lock_key.clone();
+                let name = driver.name();
+                let target = self.active[&driver].record.target_version.clone();
+                match (version, target) {
+                    (None, _) => self.settle(
+                        driver,
+                        "failed",
+                        "Could not verify the installed version.".into(),
+                        None,
+                    ),
+                    (Some(version), target) => {
+                        let reached = target.as_deref().is_none_or(|target| {
+                            compare_versions(&version, target) != std::cmp::Ordering::Less
+                        });
+                        if reached {
+                            self.settle(
+                                driver,
+                                "succeeded",
+                                format!("{name} updated: v{version}"),
+                                None,
+                            );
+                        } else {
+                            self.settle(
+                                driver,
+                                "unchanged",
+                                format!("{name} still needs an update"),
+                                None,
+                            );
+                        }
+                    }
+                }
+                self.latest_cache.remove(&lock_key);
+                true
+            }
+        }
+    }
+
+    fn finish_latest_check(&mut self, driver: Driver, latest: Option<String>) {
+        let Some(active) = self.active.get_mut(&driver) else {
+            return;
+        };
+        // Precheck (contract 4.5 step 3): already current needs no command.
+        let current = matches!(
+            (&active.record.from_version, &latest),
+            (Some(from), Some(latest))
+                if compare_versions(from, latest) != std::cmp::Ordering::Less
+        );
+        if current {
+            self.settle(driver, "succeeded", "Already up to date.".into(), None);
+            return;
+        }
+        active.phase = Phase::WaitBusy;
+        active.record.status = "running".into();
+        active.record.message = format!("Waiting for running {} work to finish.", driver.name());
+        self.sync_record(driver);
+    }
+
+    /// Mirror the active record into the durable ledger on every transition.
+    fn sync_record(&mut self, driver: Driver) {
+        let Some(active) = self.active.get(&driver) else {
+            return;
+        };
+        let stored = stored(&active.record, driver, &active.lock_key);
+        if let Some(existing) = self
+            .ledger
+            .records
+            .iter_mut()
+            .find(|r| r.update_id == stored.update_id)
+        {
+            *existing = stored;
+        } else {
+            self.ledger.records.push(stored);
+        }
+        self.persist();
+    }
+
+    fn message(&mut self, driver: Driver, message: &str) {
+        if let Some(active) = self.active.get_mut(&driver) {
+            active.record.message = message.to_owned();
+            self.sync_record(driver);
+        }
+    }
+
+    fn settle(&mut self, driver: Driver, status: &str, message: String, output: Option<String>) {
+        if let Some(mut active) = self.active.remove(&driver) {
+            active.record.status = status.into();
+            active.record.message = message;
+            active.record.finished_at = Some(crate::lifecycle::now());
+            if output.is_some() {
+                active.record.output = output;
+            }
+            let stored = stored(&active.record, driver, &active.lock_key);
+            if let Some(existing) = self
+                .ledger
+                .records
+                .iter_mut()
+                .find(|r| r.update_id == stored.update_id)
+            {
+                *existing = stored;
+            } else {
+                self.ledger.records.push(stored);
+            }
+            if let Some(lock) = active.lock_file.take() {
+                let _ = std::fs::remove_file(&lock);
+            }
+            trim_records(&mut self.ledger, driver.id());
+            self.persist();
+            // A settled update changes the projected advisory; redetect lazily.
+            self.start_detect();
+        }
+    }
+
+    fn acquire_lock(&self, lock_key: &str) -> bool {
+        let path = lock_path(&self.data_dir, lock_key);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .is_ok()
+    }
+}
+
+fn stored(record: &UpdateRecord, driver: Driver, lock_key: &str) -> StoredRecord {
+    StoredRecord {
+        update_id: record.update_id.clone(),
+        driver: driver.id().into(),
+        status: record.status.clone(),
+        message: record.message.clone(),
+        started_at: record.started_at,
+        finished_at: record.finished_at,
+        from_version: record.from_version.clone(),
+        target_version: record.target_version.clone(),
+        output: record.output.clone(),
+        lock_key: Some(lock_key.to_owned()),
+    }
+}
+
+fn lock_path(data_dir: &Path, lock_key: &str) -> PathBuf {
+    let digest = sha2::Sha256::digest(lock_key.as_bytes());
+    let name = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .take(8)
+        .collect::<String>();
+    data_dir
+        .join("providers/locks")
+        .join(format!("{name}.lock"))
+}
+
+fn read_ledger(path: &Path) -> Ledger {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Ledger {
+            version: 1,
+            records: vec![],
+        }),
+        Err(_) => Ledger {
+            version: 1,
+            records: vec![],
+        },
+    }
+}
+
+fn trim_records(ledger: &mut Ledger, driver: &str) {
+    let finished: Vec<usize> = ledger
+        .records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.driver == driver && matches!(r.status.as_str(), "succeeded" | "unchanged" | "failed")
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for index in finished
+        .iter()
+        .take(finished.len().saturating_sub(MAX_RECORDS_PER_DRIVER))
+        .rev()
+    {
+        ledger.records.remove(*index);
+    }
+}
+
+fn collapse_home(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    home()
+        .and_then(|home| {
+            let home = home.to_string_lossy().into_owned();
+            text.strip_prefix(&home).map(|rest| format!("~{rest}"))
+        })
+        .unwrap_or(text)
+}
+
+/// Detection plus installed/latest versions for one driver.
+fn resolve_driver(
+    driver: Driver,
+    prober: &dyn Prober,
+    overrides: Option<&Overrides>,
+) -> DetectionOutcome {
+    let detected = detect(driver, prober, false, overrides);
+    let version = if detected.installed {
+        installed_version(&detected, prober)
+    } else {
+        None
+    };
+    let latest = detected
+        .strategy
+        .as_ref()
+        .and_then(|strategy| latest_version(driver, strategy, prober));
+    DetectionOutcome {
+        detected,
+        version,
+        latest,
+        checked_at: crate::lifecycle::now(),
+    }
+}
+
+/// Shared tail of `detect` once a resolved/real pair exists.
+fn classify_resolved(
+    driver: Driver,
+    resolved: PathBuf,
+    real: PathBuf,
+    script_prefix: Option<Vec<String>>,
+    prober: &dyn Prober,
+    fast: bool,
+    overrides: Option<&Overrides>,
+) -> Detected {
+    let mut detected = Detected {
+        installed: true,
+        resolved: Some(resolved),
+        real: Some(real),
+        script_prefix,
+        strategy: None,
+        disabled_reason: None,
+        manual_command: None,
+    };
+    classify_inner(&mut detected, driver, prober, fast, overrides);
+    detected
+}
+
+fn classify_inner(
+    detected: &mut Detected,
+    driver: Driver,
+    prober: &dyn Prober,
+    fast: bool,
+    overrides: Option<&Overrides>,
+) {
+    let real = detected.real.clone().expect("real");
+    let resolved = detected.resolved.clone().expect("resolved");
+    let real_s = normalize_path(&real);
+    let resolved_s = normalize_path(&resolved);
+    let paths = [real_s.as_str(), resolved_s.as_str()];
+    let base = detected.clone();
+    let manual = |reason: String, command: Option<String>| Detected {
+        disabled_reason: Some(reason),
+        manual_command: command,
+        ..base.clone()
+    };
+    let managed = |manager: &str, command: Option<String>| {
+        manual(
+            format!(
+                "{} is installed by {manager}. Update it there.",
+                driver.name()
+            ),
+            command,
+        )
+    };
+    let prefix = npm_prefix(&real_s, driver.package()).or_else(|| {
+        if !cfg!(windows) {
+            return None;
+        }
+        let dir = resolved.parent()?;
+        let manifest = dir
+            .join("node_modules")
+            .join(driver.package())
+            .join("package.json");
+        manifest.is_file().then(|| normalize_path(dir))
+    });
+    if let Some(prefix) = prefix
+        && !paths.iter().any(|p| {
+            is_nix(p) || is_mise(p) || is_volta(p) || is_pnpm(p) || is_bun(p) || is_vite_plus(p)
+        })
+    {
+        if fast {
+            detected.strategy = Some(Strategy::NpmGlobal {
+                prefix: PathBuf::from(&prefix),
+                npm: PathBuf::from("npm"),
+            });
+            return;
+        }
+        if let Some(npm) = find_on_path("npm", overrides) {
+            let probe = prober.run(
+                &[
+                    npm.to_string_lossy().into_owned(),
+                    "prefix".into(),
+                    "-g".into(),
+                ],
+                PROBE_TIMEOUT,
+            );
+            let reported = probe.stdout.lines().next().unwrap_or("").trim();
+            let canonical = std::fs::canonicalize(reported)
+                .map(|p| normalize_path(&p))
+                .unwrap_or_else(|_| normalize_path(Path::new(reported)));
+            let expected = std::fs::canonicalize(&prefix)
+                .map(|p| normalize_path(&p))
+                .unwrap_or(prefix.clone());
+            if probe.exit_code == Some(0) && canonical == expected {
+                detected.strategy = Some(Strategy::NpmGlobal {
+                    prefix: PathBuf::from(&prefix),
+                    npm,
+                });
+                return;
+            }
+        }
+        *detected = managed(
+            "npm",
+            Some(format!(
+                "npm install -g --prefix {prefix} {}@latest",
+                driver.package()
+            )),
+        );
+        return;
+    }
+    if let Some((prefix, name, cask)) = paths.iter().find_map(|p| homebrew_keg(p)) {
+        let keg_brew = PathBuf::from(&prefix).join("bin/brew");
+        let brew = if keg_brew.is_file() {
+            Some(keg_brew)
+        } else {
+            find_on_path("brew", overrides)
+        };
+        if fast {
+            if let Some(brew) = brew {
+                detected.strategy = Some(Strategy::Homebrew { brew, name, cask });
+            }
+            return;
+        }
+        if let Some(brew) = brew {
+            let probe = prober.run(
+                &[brew.to_string_lossy().into_owned(), "--prefix".into()],
+                PROBE_TIMEOUT,
+            );
+            let reported = probe.stdout.lines().next().unwrap_or("").trim();
+            let canonical = std::fs::canonicalize(reported)
+                .map(|p| normalize_path(&p))
+                .unwrap_or_else(|_| normalize_path(Path::new(reported)));
+            let expected = std::fs::canonicalize(&prefix)
+                .map(|p| normalize_path(&p))
+                .unwrap_or_else(|_| prefix.clone());
+            if probe.exit_code == Some(0) && canonical == expected {
+                detected.strategy = Some(Strategy::Homebrew { brew, name, cask });
+                return;
+            }
+        }
+        *detected = managed(
+            "Homebrew",
+            Some(format!(
+                "brew upgrade {}{name}",
+                if cask { "--cask " } else { "" }
+            )),
+        );
+        return;
+    }
+    if driver == Driver::Claude && real_s.contains("/.local/share/claude/versions/") {
+        detected.strategy = Some(Strategy::ClaudeNative {
+            resolved: resolved.clone(),
+        });
+        return;
+    }
+    *detected = manual_reason(
+        detected, driver, &paths, &real, &resolved, &real_s, managed, manual,
+    );
+}
+
+fn manual_reason(
+    detected: &Detected,
+    driver: Driver,
+    paths: &[&str],
+    real: &Path,
+    resolved: &Path,
+    real_s: &str,
+    managed: impl Fn(&str, Option<String>) -> Detected,
+    manual: impl Fn(String, Option<String>) -> Detected,
+) -> Detected {
+    let _ = real;
+    if paths.iter().any(|p| is_nix(p)) {
+        return managed("Nix", None);
+    }
+    if paths.iter().any(|p| is_macports(p)) {
+        return managed("MacPorts", None);
+    }
+    if let Some(manager) = paths.iter().find_map(|p| is_windows_managed(p)) {
+        return managed(manager, None);
+    }
+    if paths.iter().any(|p| is_mise(p)) {
+        return managed("mise", Some("mise upgrade".into()));
+    }
+    if paths.iter().any(|p| is_volta(p)) {
+        return managed(
+            "Volta",
+            Some(format!("volta install {}@latest", driver.package())),
+        );
+    }
+    if paths.iter().any(|p| is_pnpm(p)) {
+        return managed(
+            "pnpm",
+            Some(format!("pnpm add -g {}@latest", driver.package())),
+        );
+    }
+    if paths.iter().any(|p| is_bun(p)) {
+        return managed(
+            "bun",
+            Some(format!("bun install -g {}@latest", driver.package())),
+        );
+    }
+    if paths.iter().any(|p| is_vite_plus(p)) {
+        return managed("Vite+", Some(format!("vp i -g {}", driver.package())));
+    }
+    if driver == Driver::Codex && paths.iter().any(|p| is_codex_desktop_bundle(p)) {
+        return manual(
+            "Codex is bundled with the Codex app. Update the app.".into(),
+            None,
+        );
+    }
+    if real_s.contains("/node_modules/") {
+        return manual(
+            format!(
+                "{} is installed into a project. Update it where it was installed.",
+                driver.name()
+            ),
+            None,
+        );
+    }
+    let resolved_is_link = std::fs::symlink_metadata(resolved)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if !resolved_is_link && is_wrapper_script(resolved) {
+        return manual(
+            format!(
+                "A wrapper script launches {}. Update it where it was installed.",
+                driver.name()
+            ),
+            None,
+        );
+    }
+    let _ = detected;
+    manual(
+        format!(
+            "{} is installed by an installer Shina cannot prove. Update it where it was installed.",
+            driver.name()
+        ),
+        None,
+    )
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// KSG `toProgressLine`: the last meaningful line, collapsed whitespace, 200 chars.
+fn progress_line(line: &str) -> Option<String> {
+    let text = strip_ansi(line);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!text.is_empty()).then(|| text.chars().take(PROGRESS_MAX_LEN).collect())
+}
+
+fn command_output(result: &CommandResult) -> Option<String> {
+    let text = [result.stderr_tail.trim(), result.stdout_tail.trim()]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// KSG `failureMessage`: exit summary plus the last line naming an error.
+fn failure_message(result: &CommandResult) -> String {
+    let summary = match result.exit_code {
+        Some(code) => format!("Update command exited with code {code}"),
+        None => "Update command failed".to_owned(),
+    };
+    let reason = [result.stderr_tail.as_str(), result.stdout_tail.as_str()]
+        .into_iter()
+        .flat_map(|s| {
+            s.rsplit(['\r', '\n'])
+                .filter_map(progress_line)
+                .collect::<Vec<_>>()
+        })
+        .find(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("error") || lower.contains("fail")
+        })
+        .or_else(|| {
+            [result.stderr_tail.as_str(), result.stdout_tail.as_str()]
+                .into_iter()
+                .find_map(|s| s.rsplit(['\r', '\n']).find_map(progress_line))
+        });
+    reason.map_or(format!("{summary}."), |r| format!("{summary}: {r}"))
+}
+
+use sha2::Digest;
+
+#[cfg(test)]
+#[path = "provider_update_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+pub(crate) mod testkit {
+    //! Fakes for `provider_update_tests.rs`.
+    use super::*;
+    use std::sync::Mutex;
+
+    pub struct FakeProber {
+        pub calls: Mutex<Vec<Vec<String>>>,
+        pub run: Box<dyn Fn(&[String]) -> ProbeResult + Send + Sync>,
+        pub http: Option<String>,
+    }
+    impl FakeProber {
+        pub fn new(run: impl Fn(&[String]) -> ProbeResult + Send + Sync + 'static) -> Self {
+            Self {
+                calls: Mutex::new(vec![]),
+                run: Box::new(run),
+                http: None,
+            }
+        }
+    }
+    impl Prober for FakeProber {
+        fn run(&self, argv: &[String], _timeout: Duration) -> ProbeResult {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            (self.run)(argv)
+        }
+        fn http_get(&self, _url: &str, _timeout: Duration) -> Option<String> {
+            self.http.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct QueuedRun {
+        pub result: CommandResult,
+        pub delay: Duration,
+    }
+    pub struct FakeRunner {
+        pub calls: Mutex<Vec<Vec<String>>>,
+        pub runs: Mutex<std::collections::VecDeque<QueuedRun>>,
+    }
+    impl FakeRunner {
+        pub fn script(runs: Vec<QueuedRun>) -> Self {
+            Self {
+                calls: Mutex::new(vec![]),
+                runs: Mutex::new(runs.into()),
+            }
+        }
+    }
+    struct FakeRunning {
+        result: CommandResult,
+        ready: Instant,
+    }
+    impl RunningUpdate for FakeRunning {
+        fn progress(&mut self) -> Option<String> {
+            None
+        }
+        fn result(&mut self) -> Option<CommandResult> {
+            (Instant::now() >= self.ready).then(|| self.result.clone())
+        }
+        fn kill(&mut self) {}
+    }
+    impl Runner for FakeRunner {
+        fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let run = self
+                .runs
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("fake runner script exhausted");
+            Ok(Box::new(FakeRunning {
+                ready: Instant::now() + run.delay,
+                result: run.result,
+            }))
+        }
+    }
+
+    pub struct Fixture {
+        pub dir: PathBuf,
+    }
+    impl Fixture {
+        pub fn new() -> Self {
+            Self {
+                dir: crate::store::directory().expect("test profile"),
+            }
+        }
+        /// A fake npm-global install: `<prefix>/bin/<name>` -> `../lib/node_modules/<pkg>/cli.js`.
+        pub fn npm_global(&self, prefix: &str, name: &str, package: &str) -> String {
+            let prefix = self.dir.join(prefix);
+            let lib = prefix.join("lib/node_modules").join(package);
+            std::fs::create_dir_all(&lib).unwrap();
+            let entry = lib.join("cli.js");
+            std::fs::write(&entry, "// cli\n").unwrap();
+            let bin = prefix.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let link = bin.join(name);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&entry, &link).unwrap();
+            #[cfg(not(unix))]
+            std::fs::write(&link, &entry).unwrap();
+            link.to_string_lossy().into_owned()
+        }
+        pub fn native(&self, path: &str) -> String {
+            let path = self.dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"\x7fELF fake").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).unwrap();
+            }
+            path.to_string_lossy().into_owned()
+        }
+        pub fn wrapper(&self, path: &str) -> String {
+            let path = self.dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\nexec real \"$@\"\n").unwrap();
+            path.to_string_lossy().into_owned()
+        }
+    }
+
+    pub fn service(
+        dir: &Path,
+        candidates: HashMap<Driver, Vec<String>>,
+        prober: FakeProber,
+        runner: impl Runner + Send + Sync + 'static,
+    ) -> ProviderUpdates {
+        // Hermetic: a driver with no override must not fall back to the real
+        // PATH, which could find a real CLI on the host.
+        let mut candidates = candidates;
+        for driver in [Driver::Codex, Driver::Claude] {
+            candidates.entry(driver).or_default();
+        }
+        ProviderUpdates::build(
+            dir,
+            Hooks::default(),
+            Arc::new(prober),
+            Arc::new(runner),
+            Some(Overrides {
+                candidates,
+                ..Default::default()
+            }),
+            Duration::from_secs(30),
+        )
+    }
+
+    /// Drive `poll()` until nothing is queued/running and no jobs are in flight.
+    pub fn settle(service: &mut ProviderUpdates, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            service.poll();
+            if !service.active() && service.jobs.is_empty() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "provider update did not settle");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
