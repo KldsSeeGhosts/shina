@@ -269,6 +269,7 @@ pub struct PeerOrigin {
 /// channel, and a retried tool call starts a fresh request.
 pub(crate) struct PeerDocumentRead {
     pub id: String,
+    pub generation: String,
     pub name: String,
     pub offset: u64,
     pub max_bytes: Option<u64>,
@@ -1806,6 +1807,108 @@ mod tests {
     }
 
     #[test]
+    fn explicit_followup_enables_document_reads_for_a_legacy_worker() {
+        let mut home = captain_fixture();
+        home.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        home.mcp_call(1, "delegate_task", &captain_launch_args())
+            .unwrap();
+        reply(
+            &mut home,
+            "peer.thread.launch",
+            accepted(json!({"threadId":17})),
+        );
+        home.queue_remote_send(0, "An explicit new turn").unwrap();
+        let remote = home.tasks[0].remote.as_ref().unwrap();
+        let mut command = remote.send_command.as_ref().unwrap().clone();
+        assert_eq!(command.params["documentReads"], true);
+        assert!(
+            command.params["message"]
+                .as_str()
+                .unwrap()
+                .contains("captain_document_read")
+        );
+        let mut target = fixture();
+        let worker = document_read_worker(&mut target, false);
+        command.params["threadId"] = json!(worker);
+        target
+            .execute_peer_command("origin-device", &command)
+            .unwrap();
+        assert!(
+            target
+                .threads
+                .iter()
+                .find(|thread| thread.id == worker)
+                .unwrap()
+                .peer_origin
+                .as_ref()
+                .unwrap()
+                .document_reads
+        );
+        let (read, received) = document_read_request(worker, json!({"name":"CREW.md"}));
+        assert!(target.queue_peer_document_read(&read));
+        assert!(
+            received.try_recv().is_err(),
+            "the read awaits its authorized reply"
+        );
+        std::fs::remove_dir_all(home.data_dir).unwrap();
+        std::fs::remove_dir_all(target.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_document_read_keeps_its_captured_runtime_generation() {
+        let mut state = fixture();
+        let id = document_read_worker(&mut state, true);
+        let (request, receive) = document_read_request(id, json!({"name":"CREW.md"}));
+        assert!(state.queue_peer_document_read(&request));
+        let worker = state
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == id)
+            .unwrap();
+        let pending = worker.peer_document_read.as_ref().unwrap();
+        let captured = pending.generation.clone();
+        let request_id = pending.id.clone();
+        worker.request_generation = "replacement-runtime".into();
+        let projection = state.projection();
+        let view = projection["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|thread| thread["id"] == id)
+            .unwrap();
+        assert_eq!(view["peer_document_read"]["runtimeGeneration"], captured);
+        // The same request id cannot be relabelled with a new runtime to make
+        // an obsolete tool call accept that runtime's answer.
+        let reply = Command::new(
+            "peer.captain.document.reply",
+            json!({"threadId":id,"requestId":request_id,"generation":"replacement-runtime",
+                "page":{"text":"stale","revision":1,"bytes":5,"offset":0,
+                    "truncated":false,"hash":"h"}}),
+        );
+        let error = state
+            .execute_peer_command("origin-device", &reply)
+            .unwrap_err();
+        assert!(error.contains("generation changed"), "{error}");
+        assert!(
+            receive
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("generation changed")
+        );
+        assert!(
+            state
+                .threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .unwrap()
+                .peer_document_read
+                .is_none()
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn peer_document_reply_reaches_the_held_call_only_from_the_launch_device() {
         let mut state = fixture();
         let thread = document_read_worker(&mut state, true);
@@ -2764,6 +2867,23 @@ impl State {
                 "The originating server cannot answer Captain document reads. Only the context in the brief is available.",
             );
         }
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json"))
+            && database
+                .authorize(
+                    &self.threads[index]
+                        .peer_origin
+                        .as_ref()
+                        .expect("origin")
+                        .device_id,
+                    "peer.thread.wait",
+                    &json!({"threadId":request.thread}),
+                )
+                .is_err()
+        {
+            return fail(
+                "The originating peer is no longer authorized to serve Captain documents.",
+            );
+        }
         if self.threads[index].peer_document_read.is_some() {
             return fail(
                 "A Captain document read is already in flight. Wait for it before paging further.",
@@ -2783,6 +2903,7 @@ impl State {
         }
         self.threads[index].peer_document_read = Some(PeerDocumentRead {
             id: uuid::Uuid::new_v4().to_string(),
+            generation: self.threads[index].request_generation.clone(),
             name: name.to_owned(),
             offset: request.args["offset"].as_u64().unwrap_or(0),
             max_bytes: request.args["maxBytes"].as_u64(),
@@ -3439,6 +3560,18 @@ impl State {
                 {
                     return Ok(json!({"delivered":false}));
                 }
+                if thread
+                    .peer_document_read
+                    .as_ref()
+                    .is_some_and(|pending| pending.generation != thread.request_generation)
+                {
+                    let pending = thread.peer_document_read.take().expect("pending read");
+                    let _ = crate::outbox::reply(
+                        &pending.reply,
+                        Err("Request or runtime generation changed.".into()),
+                    );
+                    return Err("Request or runtime generation changed.".into());
+                }
                 let pending = thread
                     .peer_document_read
                     .take()
@@ -3518,7 +3651,14 @@ impl State {
                     .as_str()
                     .filter(|s| !s.trim().is_empty() && s.len() <= 64 * 1024)
                     .ok_or("A bounded message is required.")?;
+                let document_reads = args
+                    .get("documentReads")
+                    .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
+                    .transpose()?;
                 let thread = &mut self.threads[index];
+                if let Some(reads) = document_reads {
+                    thread.peer_origin.as_mut().expect("origin").document_reads = reads;
+                }
                 if thread
                     .peer_origin
                     .as_ref()
@@ -3590,17 +3730,44 @@ impl State {
                 changed = true;
             }
         }
-        // A held document read cannot outlive its origin's answer window.
+        // A held document read cannot outlive its origin's grant or answer window.
+        let database = crate::database::for_path(&self.data_dir.join("index.json"));
         for thread in &mut self.threads {
-            if thread
+            if thread.peer_document_read.is_none() {
+                continue;
+            }
+            let revoked = database.as_ref().is_some_and(|database| {
+                thread.peer_origin.as_ref().is_none_or(|origin| {
+                    database
+                        .authorize(
+                            &origin.device_id,
+                            "peer.thread.wait",
+                            &json!({"threadId":thread.id}),
+                        )
+                        .is_err()
+                })
+            });
+            let expired = thread
                 .peer_document_read
                 .as_ref()
-                .is_some_and(|read| read.created.elapsed() > Duration::from_secs(120))
+                .is_some_and(|read| read.created.elapsed() > Duration::from_secs(120));
+            let stale = thread
+                .peer_document_read
+                .as_ref()
+                .is_some_and(|read| read.generation != thread.request_generation);
+            if (revoked || expired || stale)
                 && let Some(pending) = thread.peer_document_read.take()
             {
                 let _ = crate::outbox::reply(
                     &pending.reply,
-                    Err("The originating server did not answer the Captain document read.".into()),
+                    Err(if stale {
+                        "Request or runtime generation changed."
+                    } else if revoked {
+                        "The originating peer is no longer authorized to serve Captain documents."
+                    } else {
+                        "The originating server did not answer the Captain document read."
+                    }
+                    .into()),
                 );
                 changed = true;
             }
@@ -3611,6 +3778,19 @@ impl State {
     /// Capture current shared rules only for a new work command. Never refresh
     /// an already persisted command's payload under its existing UUID.
     pub(super) fn remote_task_message(&self, task: usize, message: &str) -> Result<String, String> {
+        let reads = self.tasks[task]
+            .remote
+            .as_ref()
+            .is_some_and(|remote| self.peer_document_reads_supported(&remote.server_id));
+        self.remote_task_message_with_reads(task, message, reads)
+    }
+
+    fn remote_task_message_with_reads(
+        &self,
+        task: usize,
+        message: &str,
+        reads: bool,
+    ) -> Result<String, String> {
         let captain = self
             .threads
             .iter()
@@ -3618,10 +3798,6 @@ impl State {
             .and_then(|thread| thread.crew_captain);
         let mut message = message.to_owned();
         if let Some(captain) = captain {
-            let reads = self.tasks[task]
-                .remote
-                .as_ref()
-                .is_some_and(|remote| self.peer_document_reads_supported(&remote.server_id));
             message.push_str("\n\n");
             message.push_str(&self.crew_turn_context(captain, reads));
         }
@@ -3632,6 +3808,10 @@ impl State {
     }
 
     pub(super) fn queue_remote_send(&mut self, task: usize, message: &str) -> Result<(), String> {
+        let document_reads = self.tasks[task]
+            .remote
+            .as_ref()
+            .is_some_and(|remote| self.peer_document_reads_supported(&remote.server_id));
         let message = if self.tasks[task]
             .remote
             .as_ref()
@@ -3639,7 +3819,7 @@ impl State {
             .request
             .is_none()
         {
-            self.remote_task_message(task, message)?
+            self.remote_task_message_with_reads(task, message, document_reads)?
         } else {
             // input/editor/select responses must retain their exact value.
             message.to_owned()
@@ -3655,6 +3835,10 @@ impl State {
             "peer.thread.send",
             json!({"threadId":remote.thread_id,"message":message}),
         ));
+        if remote.request.is_none() {
+            remote.send_command.as_mut().expect("send command").params["documentReads"] =
+                json!(document_reads);
+        }
         if let Some(request) = &remote.request {
             if !matches!(
                 request["kind"].as_str(),

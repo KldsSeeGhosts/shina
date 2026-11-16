@@ -349,7 +349,7 @@ impl ThreadView {
             }),
             peer_document_read: thread.peer_document_read.as_ref().map(|read| {
                 let mut request = json!({"id":read.id,"name":read.name,"offset":read.offset,
-                    "runtimeGeneration":thread.request_generation});
+                    "runtimeGeneration":read.generation});
                 if let Some(max) = read.max_bytes {
                     request["maxBytes"] = json!(max);
                 }

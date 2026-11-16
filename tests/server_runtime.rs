@@ -722,6 +722,182 @@ fn local_delegate_mcp_retries_keep_one_worker_after_restart_and_deletion() {
     );
 }
 
+#[test]
+fn remote_captain_documents_use_the_worker_mcp_endpoint_over_one_way_pairing() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let mut owner = home.client(uuid::Uuid::new_v4());
+    let mut executor = target.client(uuid::Uuid::new_v4());
+    let workspace = target.root.join("workspace");
+    let project = executor.command(
+        "project.put",
+        json!({"path":workspace,"createFolder":true}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(project["result"]["status"], "accepted", "{project}");
+    let project = project["result"]["result"]["projectId"].clone();
+    let discovery = target.discovery();
+    let paired = target.cli(&["pair", "--peer"]);
+    assert!(paired.status.success());
+    let output = String::from_utf8(paired.stdout).unwrap();
+    let code = output
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap();
+    let linked = home.cli(&[
+        "peer",
+        "link",
+        &format!("127.0.0.1:{}", discovery["port"]),
+        code,
+    ]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let put = owner.command(
+        "captain.put",
+        json!({"record":{"name":"Document keeper","role":"Keeper",
+            "instructions":"PRIVATE-PROFILE","portrait":1}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(put["result"]["status"], "accepted", "{put}");
+    let opened = owner.command("captain.open", json!({"captain":0}), uuid::Uuid::new_v4());
+    assert_eq!(opened["result"]["status"], "accepted", "{opened}");
+    let parent = opened["result"]["result"]["threadId"].clone();
+    let scope = owner.command(
+        "captain.scope",
+        json!({"captain":0,"projects":[],
+            "remoteProjects":[{"server":discovery["serverId"],"projectId":project}]}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(scope["result"]["status"], "accepted", "{scope}");
+    let text = format!("{}SENTINEL-TAIL-RULE", "a😀".repeat(2_000));
+    for (name, body) in [("CREW.md", text.as_str()), ("AGENTS.md", "PRIVATE-RULES")] {
+        let write = owner.command(
+            "captain.document.write",
+            json!({"captain":0,"name":name,"text":body,"expectedRevision":0}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(write["result"]["status"], "accepted", "{write}");
+    }
+    let initialized = owner.command(
+        "thread.send",
+        json!({"threadId":parent,"text":"Initialize document coordinator",
+            "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(initialized["result"]["status"], "accepted", "{initialized}");
+    owner.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["id"] == parent && thread["status"] == "Completed")
+    });
+    let coordinator_directory = PathBuf::from(
+        owner.snapshot["directories"][parent.as_u64().unwrap().to_string()]
+            .as_str()
+            .expect("the server reports the coordinator directory"),
+    );
+    assert!(
+        coordinator_directory.join("fixture-mcp.json").exists(),
+        "no coordinator MCP fixture in {}",
+        coordinator_directory.display()
+    );
+    let launch = call_fixture_tool(
+        &coordinator_directory,
+        "delegate_task",
+        json!({"prompt":"peer-documents-hold-fixture","client_request_id":"documents",
+            "target":{"environmentId":discovery["serverId"],"projectId":project,"model":"fixture"}}),
+    );
+    assert_ne!(launch["result"]["isError"], true, "{launch}");
+    executor.until(|state| {
+        workspace.join("fixture-mcp.json").exists()
+            && fs::read_to_string(workspace.join("fixture-prompts.jsonl"))
+                .ok()
+                .is_some_and(|text| {
+                    text.ends_with('\n') && text.contains("peer-documents-hold-fixture")
+                })
+            && state["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| thread["status"] == "Working" || thread["status"] == "Running")
+    });
+    let brief = fs::read_to_string(workspace.join("fixture-prompts.jsonl")).unwrap();
+    assert!(brief.contains("captain_document_read"));
+    assert!(!brief.contains("SENTINEL-TAIL-RULE"));
+    assert!(!brief.contains("PRIVATE-PROFILE"));
+    assert!(!brief.contains("PRIVATE-RULES"));
+    let read = |args| {
+        let response = call_fixture_tool(&workspace, "captain_document_read", args);
+        assert_ne!(response["result"]["isError"], true, "{response}");
+        serde_json::from_str::<Value>(response["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    let mut collected = String::new();
+    let mut offset = 0;
+    for _ in 0..20 {
+        let page = read(json!({"name":"CREW.md","offset":offset,
+            "maxBytes":1024,"expectedRevision":1}));
+        assert_eq!(page["revision"], 1);
+        assert_eq!(page["bytes"], text.len());
+        collected.push_str(page["text"].as_str().unwrap());
+        if page["truncated"] == false {
+            break;
+        }
+        let next = page["nextOffset"].as_u64().unwrap();
+        assert!(next > offset);
+        offset = next;
+    }
+    assert_eq!(collected, text);
+    for (args, error) in [
+        (json!({"name":"AGENTS.md"}), "private"),
+        (
+            json!({"name":"CREW.md","expectedRevision":0}),
+            "changed since revision",
+        ),
+    ] {
+        let response = call_fixture_tool(&workspace, "captain_document_read", args);
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(response.to_string().contains(error), "{response}");
+    }
+    executor.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("read-worker-origin"),
+    );
+    let origin = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["peerOrigin"].is_object())
+        .unwrap()["peerOrigin"]
+        .clone();
+    let revoked = executor.command(
+        "devices.revoke",
+        json!({"deviceId":origin["deviceId"]}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(revoked["result"]["status"], "accepted", "{revoked}");
+    let response = call_fixture_tool(
+        &workspace,
+        "captain_document_read",
+        json!({"name":"CREW.md"}),
+    );
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    assert!(response.to_string().contains("authorized"), "{response}");
+    drop(owner);
+    drop(executor);
+    home.stop();
+    target.stop();
+}
+
 #[cfg(unix)]
 struct PausedProcess(u32);
 #[cfg(unix)]
