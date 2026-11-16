@@ -27,10 +27,6 @@
 //! - RPC names and grant mapping (`providers.refresh`, `providers.update`, MINOR 36)
 //!   belong to the parent.
 
-// Until the root wires `ProviderUpdates` into State/runtime, nothing outside
-// tests constructs it.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -192,6 +188,61 @@ trait Runner: Send + Sync {
 
 // ---------- system implementations ----------
 
+/// A bounded byte sink shared between a pump thread and the poller. The child
+/// never blocks on output: the pump drains continuously and only the last
+/// `OUTPUT_MAX_BYTES * 2` bytes are retained, so a 30-minute install cannot grow
+/// memory unboundedly.
+#[derive(Default)]
+struct ByteTail {
+    bytes: std::collections::VecDeque<u8>,
+}
+impl ByteTail {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend(chunk.iter().copied());
+        while self.bytes.len() > OUTPUT_MAX_BYTES * 2 {
+            self.bytes.pop_front();
+        }
+    }
+    fn take(&mut self) -> Vec<u8> {
+        self.bytes.drain(..).collect()
+    }
+}
+type SharedTail = Arc<std::sync::Mutex<ByteTail>>;
+
+fn pump(mut reader: impl std::io::Read + Send + 'static) -> SharedTail {
+    let tail: SharedTail = Arc::new(std::sync::Mutex::new(ByteTail::default()));
+    let writer = Arc::clone(&tail);
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut tail) = writer.lock() {
+                        tail.push(&buffer[..n]);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    tail
+}
+
+/// Append raw bytes to a bounded UTF-8 tail without ever splitting a codepoint
+/// at the trim boundary.
+fn push_tail(tail: &mut String, bytes: &[u8]) {
+    tail.push_str(&String::from_utf8_lossy(bytes));
+    if tail.len() > OUTPUT_MAX_BYTES {
+        let mut cut = tail.len() - OUTPUT_MAX_BYTES;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
+    }
+}
+
 fn run_bounded(argv: &[String], timeout: Duration) -> ProbeResult {
     let Some((program, args)) = argv.split_first() else {
         return ProbeResult::default();
@@ -228,40 +279,16 @@ fn run_bounded(argv: &[String], timeout: Duration) -> ProbeResult {
             Err(_) => break None,
         }
     };
-    let collect = |rx: mpsc::Receiver<Vec<u8>>| {
-        let mut tail = String::new();
-        for chunk in rx.try_iter() {
-            tail.push_str(&String::from_utf8_lossy(&chunk));
-            if tail.len() > OUTPUT_MAX_BYTES * 2 {
-                tail.drain(..tail.len() - OUTPUT_MAX_BYTES);
-            }
-        }
-        tail
+    let collect = |rx: &SharedTail| {
+        let bytes = rx.lock().map(|mut t| t.take()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
     };
     thread::sleep(Duration::from_millis(30));
     ProbeResult {
         exit_code: code,
-        stdout: strip_ansi(&collect(out_rx)),
-        stderr: strip_ansi(&collect(err_rx)),
+        stdout: strip_ansi(&collect(&out_rx)),
+        stderr: strip_ansi(&collect(&err_rx)),
     }
-}
-
-fn pump(mut reader: impl std::io::Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if sender.send(buffer[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    receiver
 }
 
 struct SystemProber;
@@ -290,8 +317,8 @@ impl Prober for SystemProber {
 
 struct CommandUpdate {
     child: crate::process::Process,
-    out: mpsc::Receiver<Vec<u8>>,
-    err: mpsc::Receiver<Vec<u8>>,
+    out: SharedTail,
+    err: SharedTail,
     out_tail: String,
     err_tail: String,
 }
@@ -301,12 +328,8 @@ impl CommandUpdate {
             (&self.out, &mut self.out_tail),
             (&self.err, &mut self.err_tail),
         ] {
-            while let Ok(chunk) = rx.try_recv() {
-                tail.push_str(&String::from_utf8_lossy(&chunk));
-                if tail.len() > OUTPUT_MAX_BYTES * 2 {
-                    tail.drain(..tail.len() - OUTPUT_MAX_BYTES);
-                }
-            }
+            let bytes = rx.lock().map(|mut t| t.take()).unwrap_or_default();
+            push_tail(tail, &bytes);
         }
     }
 }
@@ -315,7 +338,10 @@ impl RunningUpdate for CommandUpdate {
         self.drain();
         [&self.err_tail, &self.out_tail]
             .into_iter()
-            .find_map(|tail| tail.rsplit(['\r', '\n']).find_map(progress_line))
+            .find_map(|tail| {
+                tail.rsplit(['\r', '\n'])
+                    .find_map(|l| progress_line_raw(l).map(|p| redact(&p)))
+            })
     }
     fn result(&mut self) -> Option<CommandResult> {
         self.drain();
@@ -403,10 +429,11 @@ impl Driver {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Strategy {
     /// `npm install -g --prefix <prefix> <pkg>@<target>`; prefix proven by `npm prefix -g`.
-    NpmGlobal { prefix: PathBuf, npm: PathBuf },
+    /// `npm` is an argv prefix: `[npm]` natively, `[node, npm-cli.js]` for `.cmd` shims.
+    NpmGlobal { prefix: PathBuf, npm: Vec<String> },
     /// `brew upgrade [--cask] <name>`; brew proven by `brew --prefix` == keg prefix.
     Homebrew {
-        brew: PathBuf,
+        brew: Vec<String>,
         name: String,
         cask: bool,
     },
@@ -425,7 +452,7 @@ impl Strategy {
     fn lock_key(&self) -> String {
         match self {
             Self::NpmGlobal { prefix, .. } => {
-                format!("npm-global:{}", normalize_path(prefix))
+                format!("npm-global:{}", slash_path(prefix))
             }
             Self::Homebrew { .. } => "homebrew".into(),
             Self::ClaudeNative { .. } => "claude-native".into(),
@@ -433,16 +460,20 @@ impl Strategy {
     }
     fn argv(&self, target: &str, package: &str) -> Vec<String> {
         match self {
-            Self::NpmGlobal { prefix, npm } => vec![
-                npm.to_string_lossy().into_owned(),
-                "install".into(),
-                "-g".into(),
-                "--prefix".into(),
-                prefix.to_string_lossy().into_owned(),
-                format!("{package}@{target}"),
-            ],
+            Self::NpmGlobal { prefix, npm } => {
+                let mut argv = npm.clone();
+                argv.extend([
+                    "install".into(),
+                    "-g".into(),
+                    "--prefix".into(),
+                    prefix.to_string_lossy().into_owned(),
+                    format!("{package}@{target}"),
+                ]);
+                argv
+            }
             Self::Homebrew { brew, name, cask } => {
-                let mut argv = vec![brew.to_string_lossy().into_owned(), "upgrade".into()];
+                let mut argv = brew.clone();
+                argv.push("upgrade".into());
                 if *cask {
                     argv.push("--cask".into());
                 }
@@ -500,8 +531,25 @@ impl Detected {
     }
 }
 
-fn normalize_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_lowercase()
+/// `/`-joined path with its original case: used for argv and install identity.
+fn slash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Case-folded form for pattern matching only. Never build a path from it:
+/// case-sensitive installs would point at the wrong location.
+fn match_key(text: &str) -> String {
+    text.to_lowercase()
+}
+
+/// ASCII case-insensitive `find`; the index still slices `haystack` because the
+/// needles here are pure ASCII and a non-matching region never verifies.
+fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let index = haystack.to_lowercase().find(needle)?;
+    haystack
+        .get(index..index + needle.len())
+        .filter(|m| m.eq_ignore_ascii_case(needle))
+        .map(|_| index)
 }
 
 fn home() -> Option<PathBuf> {
@@ -601,8 +649,8 @@ fn is_codex_desktop_bundle(p: &str) -> bool {
 
 fn homebrew_keg(p: &str) -> Option<(String, String, bool)> {
     // (prefix, name, cask) from `<p>/Cellar/<name>/<v>/...` or `<p>/Caskroom/<name>/<v>/...`
-    for marker in ["/cellar/", "/caskroom/"] {
-        if let Some(index) = p.find(marker) {
+    for (marker, cask) in [("/cellar/", false), ("/caskroom/", true)] {
+        if let Some(index) = find_ci(p, marker) {
             let prefix = p[..index].to_owned();
             let name = p[index + marker.len()..]
                 .split('/')
@@ -610,7 +658,7 @@ fn homebrew_keg(p: &str) -> Option<(String, String, bool)> {
                 .unwrap_or_default()
                 .to_owned();
             if !name.is_empty() {
-                return Some((prefix, name, marker == "/caskroom/"));
+                return Some((prefix, name, cask));
             }
         }
     }
@@ -621,12 +669,19 @@ fn homebrew_keg(p: &str) -> Option<(String, String, bool)> {
 /// `<prefix>/lib/node_modules/<pkg>/...`, never nested under another package.
 fn npm_prefix(real: &str, package: &str) -> Option<String> {
     let segment = format!("/lib/node_modules/{}/", package.to_lowercase());
-    let index = real.rfind(&segment)?;
-    if real[..index].contains("/node_modules/") {
+    let index = real.to_lowercase().rfind(&segment)?;
+    if !real.is_char_boundary(index)
+        || !real
+            .get(index..index + segment.len())
+            .is_some_and(|m| m.eq_ignore_ascii_case(&segment))
+    {
+        return None;
+    }
+    if match_key(&real[..index]).contains("/node_modules/") {
         return None;
     }
     // Mise tool trees mimic npm globals; only globals under mise's Node count.
-    let before = &real[..index];
+    let before = match_key(&real[..index]);
     if let Some(tool) = before
         .rsplit("/mise/installs/")
         .next()
@@ -654,27 +709,33 @@ fn is_wrapper_script(path: &Path) -> bool {
     file.read_exact(&mut head).is_ok() && &head == b"#!"
 }
 
-/// Test-seedable layout overrides: candidate lists and tool paths (npm, brew).
+/// Test-seedable overrides: candidate lists, tool paths (npm, brew), and an
+/// injected durable-write failure for fail-closed coverage.
 #[derive(Clone, Default)]
 struct Overrides {
     candidates: HashMap<Driver, Vec<String>>,
     tools: HashMap<String, PathBuf>,
+    fail_writes: Arc<std::sync::atomic::AtomicBool>,
 }
 
-fn find_on_path(name: &str, overrides: Option<&Overrides>) -> Option<PathBuf> {
-    overrides
-        .and_then(|o| o.tools.get(name).cloned())
-        .or_else(|| crate::harness::executable(name).ok().map(|(exe, _)| exe))
+/// A tool's argv prefix: `[exe]` for native binaries, `[node, entry.js]` when
+/// the PATH hit is a `.cmd` shim or script (Windows npm is `npm.cmd`).
+fn find_tool(name: &str, overrides: Option<&Overrides>) -> Option<Vec<String>> {
+    let (exe, script) = overrides
+        .and_then(|o| o.tools.get(name))
+        .and_then(|p| crate::harness::executable(&p.to_string_lossy()).ok())
+        .or_else(|| crate::harness::executable(name).ok())?;
+    let mut argv = vec![exe.to_string_lossy().into_owned()];
+    if let Some(script) = script {
+        argv.push(script.to_string_lossy().into_owned());
+    }
+    Some(argv)
 }
 
-/// Full detection with prover access (contract 4.2). `fast` skips the
-/// `npm prefix -g`/`brew --prefix` prover calls for the worker's re-resolve.
-fn detect(
-    driver: Driver,
-    prober: &dyn Prober,
-    fast: bool,
-    overrides: Option<&Overrides>,
-) -> Detected {
+/// Full detection with prover access (contract 4.2). Runs `npm prefix -g`/
+/// `brew --prefix` proofs, so it only ever runs on a background thread or in
+/// tests, never inside `poll()` on the reducer thread.
+fn detect(driver: Driver, prober: &dyn Prober, overrides: Option<&Overrides>) -> Detected {
     if std::env::var_os(driver.env_override()).is_some() {
         return Detected {
             disabled_reason: Some(format!(
@@ -684,9 +745,15 @@ fn detect(
             ..Detected::missing()
         };
     }
+    // When overrides are present they are authoritative: a driver absent from
+    // the map has no candidates, so tests never touch the real PATH.
     let owned;
-    let list = match overrides.and_then(|o| o.candidates.get(&driver)) {
-        Some(list) => list.as_slice(),
+    let list: &[String] = match overrides {
+        Some(overrides) => overrides
+            .candidates
+            .get(&driver)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
         None => {
             owned = candidates(driver);
             &owned
@@ -727,19 +794,36 @@ fn detect(
             manual_command: None,
         };
     };
-    classify_resolved(
-        driver,
-        resolved,
-        real,
-        script_prefix,
-        prober,
-        fast,
-        overrides,
-    )
+    classify_resolved(driver, resolved, real, script_prefix, prober, overrides)
 }
 
 // ---------- versions (contract 4.3) ----------
 
+/// Strict semver: `x.y.z` numeric parts plus optional `-prerelease`/`+build`.
+/// Anything looser ("1.2.garbage", "v2", dates) is not an installable version.
+fn valid_semver(value: &str) -> bool {
+    let without_build = value.split('+').next().unwrap_or("");
+    let (main, prerelease) = match without_build.split_once('-') {
+        Some((m, p)) => (m, Some(p)),
+        None => (without_build, None),
+    };
+    let parts: Vec<&str> = main.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    prerelease.is_none_or(|p| {
+        !p.is_empty()
+            && p.split('.')
+                .all(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    })
+}
+
+/// First strict semver in version output, or None. Eligibility and post-update
+/// verification both refuse unverifiable output rather than guessing.
 fn parse_version(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     for start in 0..bytes.len() {
@@ -751,37 +835,22 @@ fn parse_version(text: &str) -> Option<String> {
             .position(|b| !(b.is_ascii_alphanumeric() || b".-_".contains(b)))
             .map_or(bytes.len(), |n| start + n);
         let candidate = text[start..end].trim_end_matches(['.', '-', '_']);
-        if candidate.split('.').count() >= 3
-            && candidate.bytes().next().is_some_and(|b| b.is_ascii_digit())
-        {
+        if valid_semver(candidate) {
             return Some(candidate.to_owned());
         }
     }
     None
 }
 
-/// Numeric semver compare; prerelease tails rank below their release.
+/// KSG's `compareSemverVersions` (shared parser in `model_picker`).
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |v: &str| -> (Vec<u64>, bool) {
-        let (core, pre) = v.split_once('-').unwrap_or((v, ""));
-        (
-            core.split('.').map(|n| n.parse().unwrap_or(0)).collect(),
-            !pre.is_empty(),
-        )
-    };
-    let (av, a_pre) = parse(a);
-    let (bv, b_pre) = parse(b);
-    for i in 0..av.len().max(bv.len()) {
-        let ordering = av
-            .get(i)
-            .copied()
-            .unwrap_or(0)
-            .cmp(&bv.get(i).copied().unwrap_or(0));
-        if ordering != std::cmp::Ordering::Equal {
-            return ordering;
-        }
-    }
-    b_pre.cmp(&a_pre)
+    crate::model_picker::compare_semver_versions(a, b)
+}
+
+/// Removes URL credentials and token-shaped words from captured installer or
+/// probe output before it reaches a record, message, or the projection.
+fn redact(text: &str) -> String {
+    crate::update::redact(&crate::projects::redact(text))
 }
 
 fn installed_version(detected: &Detected, prober: &dyn Prober) -> Option<String> {
@@ -802,18 +871,19 @@ fn latest_version(driver: Driver, strategy: &Strategy, prober: &dyn Prober) -> O
     match strategy {
         Strategy::NpmGlobal { prefix, npm } => {
             // `outdated` respects the user's npm config (min-release-age, registry).
-            let result = prober.run(
-                &[
-                    npm.to_string_lossy().into_owned(),
+            let argv: Vec<String> = npm
+                .iter()
+                .cloned()
+                .chain([
                     "outdated".into(),
                     "-g".into(),
                     "--prefix".into(),
                     prefix.to_string_lossy().into_owned(),
                     "--json".into(),
                     driver.package().into(),
-                ],
-                PROBE_TIMEOUT,
-            );
+                ])
+                .collect();
+            let result = prober.run(&argv, PROBE_TIMEOUT);
             // npm outdated exits 1 when updates exist, and may print {"error":...}.
             let value: serde_json::Value = serde_json::from_str(result.stdout.trim()).ok()?;
             value.get(driver.package())?["latest"]
@@ -821,15 +891,12 @@ fn latest_version(driver: Driver, strategy: &Strategy, prober: &dyn Prober) -> O
                 .map(str::to_owned)
         }
         Strategy::Homebrew { brew, name, cask } => {
-            let result = prober.run(
-                &[
-                    brew.to_string_lossy().into_owned(),
-                    "info".into(),
-                    "--json=v2".into(),
-                    name.clone(),
-                ],
-                PROBE_TIMEOUT,
-            );
+            let argv: Vec<String> = brew
+                .iter()
+                .cloned()
+                .chain(["info".into(), "--json=v2".into(), name.clone()])
+                .collect();
+            let result = prober.run(&argv, PROBE_TIMEOUT);
             let value: serde_json::Value = serde_json::from_str(result.stdout.trim()).ok()?;
             let raw = if *cask {
                 value["casks"][0]["version"]
@@ -853,8 +920,10 @@ fn latest_version(driver: Driver, strategy: &Strategy, prober: &dyn Prober) -> O
 
 /// Root-wired admission control (contract 4.6). `busy(driver)` reports in-flight
 /// harness work for that driver; `before_run(driver)` stops idle harness processes
-/// immediately before the update command spawns. Both default to permissive so the
-/// backend is safe standalone; the parent must wire them before accepting updates.
+/// immediately before the update command spawns. The permissive defaults exist for
+/// standalone tests only: the parent MUST refuse new harness work while
+/// `!admits(driver)` and must have stopped idle harness processes before calling
+/// `request`, because a provider update replaces the binary those processes run.
 #[derive(Clone)]
 pub struct Hooks {
     pub busy: Arc<dyn Fn(&str) -> bool + Send + Sync>,
@@ -872,8 +941,8 @@ impl Default for Hooks {
 // ---------- worker state ----------
 
 enum Job {
-    /// Background detection+version resolution from `refresh`.
-    Detect(mpsc::Receiver<DetectionOutcome>),
+    /// Under-lock re-detection with full ownership proofs before the command.
+    Reprove(mpsc::Receiver<Detected>),
     /// `npm outdated`/`brew info`/registry GET for the pre-update check.
     Latest(mpsc::Receiver<Option<String>>),
     /// The update command itself.
@@ -882,8 +951,8 @@ enum Job {
         started: Instant,
         last_progress: Instant,
     },
-    /// Post-update `<exe> --version`.
-    Verify(mpsc::Receiver<Option<String>>),
+    /// Post-update re-detection plus `<exe> --version`.
+    Verify(mpsc::Receiver<(Detected, Option<String>)>),
 }
 
 struct DetectionOutcome {
@@ -896,8 +965,8 @@ struct DetectionOutcome {
 struct Active {
     record: UpdateRecord,
     lock_key: String,
-    /// Held cross-process lock file under providers/locks/.
-    lock_file: Option<PathBuf>,
+    /// Held cross-process lock under providers/locks/; released on drop.
+    lock_file: Option<std::fs::File>,
     phase: Phase,
     strategy: Strategy,
     real_path: PathBuf,
@@ -906,6 +975,7 @@ struct Active {
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Queued,
+    Reproving,
     CheckingLatest,
     WaitBusy,
     Running,
@@ -919,6 +989,9 @@ pub struct ProviderUpdates {
     ledger: Ledger,
     /// Latest detection per driver, swapped in by the detect job.
     detected: HashMap<Driver, DetectionOutcome>,
+    /// Refresh/startup detection jobs; kept separate from `jobs` so a refresh
+    /// can never clobber an in-flight update command, reprove, or verify.
+    detect_jobs: HashMap<Driver, mpsc::Receiver<DetectionOutcome>>,
     jobs: HashMap<Driver, Job>,
     latest_cache: HashMap<String, (Instant, Option<String>)>,
     active: HashMap<Driver, Active>,
@@ -928,18 +1001,30 @@ pub struct ProviderUpdates {
     /// Test hook: replaces the PATH-based candidate list.
     overrides: Option<Overrides>,
     update_timeout: Duration,
+    /// Durable store failure: corrupt input or a failed atomic write. Fails
+    /// closed - no request is accepted and nothing installs while set.
+    failure: Option<String>,
 }
 
 impl ProviderUpdates {
-    /// Production constructor. Reconciles interrupted records and kicks the first
+    /// Production constructor. Reconciles `providers/update-state.json`, then
     /// detection; statuses land once `poll()` picks the detection job up.
+    ///
+    /// Under `cfg(test)` detection is hermetic: empty candidate overrides mean
+    /// no real CLI is ever resolved and no probe or network call runs, so unit
+    /// fixtures that construct the service stay offline. The module's own tests
+    /// use `build` with fake probers/runners and seeded candidates.
     pub fn new(data_dir: &Path) -> Self {
+        #[cfg(not(test))]
+        let overrides = None;
+        #[cfg(test)]
+        let overrides = Some(Overrides::default());
         Self::build(
             data_dir,
             Hooks::default(),
             Arc::new(SystemProber),
             Arc::new(SystemRunner),
-            None,
+            overrides,
             UPDATE_TIMEOUT,
         )
     }
@@ -952,10 +1037,12 @@ impl ProviderUpdates {
         overrides: Option<Overrides>,
         update_timeout: Duration,
     ) -> Self {
+        let (ledger, failure) = load_ledger(&data_dir.join("providers/update-state.json"));
         let mut service = Self {
             data_dir: data_dir.to_path_buf(),
-            ledger: read_ledger(&data_dir.join("providers/update-state.json")),
+            ledger,
             detected: HashMap::new(),
+            detect_jobs: HashMap::new(),
             jobs: HashMap::new(),
             latest_cache: HashMap::new(),
             active: HashMap::new(),
@@ -964,12 +1051,26 @@ impl ProviderUpdates {
             runner,
             overrides,
             update_timeout,
+            failure,
         };
-        // A queued/running record whose lock is not held died with its process.
-        let now = crate::lifecycle::now();
-        let mut recovered = false;
-        for record in &mut service.ledger.records {
-            if !matches!(record.status.as_str(), "succeeded" | "unchanged" | "failed") {
+        // A queued/running record whose lock is free died with its process: the
+        // OS releases the file lock when the owner exits, so an acquirable lock
+        // proves the previous run is gone. A lock still held by another live
+        // process leaves the record alone rather than re-dispatching it.
+        if service.failure.is_none() {
+            let now = crate::lifecycle::now();
+            let mut recovered = false;
+            for record in &mut service.ledger.records {
+                if matches!(record.status.as_str(), "succeeded" | "unchanged" | "failed") {
+                    continue;
+                }
+                let free = record
+                    .lock_key
+                    .as_deref()
+                    .is_none_or(|key| try_lock_file(&service.data_dir, key).is_some());
+                if !free {
+                    continue;
+                }
                 record.status = "failed".into();
                 record.finished_at = Some(now);
                 let name = Driver::from_id(&record.driver)
@@ -979,9 +1080,9 @@ impl ProviderUpdates {
                 );
                 recovered = true;
             }
-        }
-        if recovered {
-            service.persist();
+            if recovered {
+                let _ = service.persist();
+            }
         }
         service.start_detect();
         service
@@ -996,21 +1097,51 @@ impl ProviderUpdates {
         self.data_dir.join("providers/update-state.json")
     }
 
-    fn persist(&self) {
-        if let Ok(bytes) = serde_json::to_vec(&self.ledger) {
-            let _ = crate::store::write_atomic(&self.state_path(), &bytes);
+    /// Atomic ledger write. Fails closed: a failed write marks the service so
+    /// no request is accepted and no installer runs on an out-of-date ledger.
+    fn persist(&mut self) -> Result<(), String> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
         }
+        let write = if self
+            .overrides
+            .as_ref()
+            .is_some_and(|o| o.fail_writes.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            Err("injected write failure".to_owned())
+        } else {
+            serde_json::to_vec(&self.ledger)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    crate::store::write_atomic(&self.state_path(), &bytes)
+                        .map_err(|e| e.to_string())
+                })
+        };
+        write.map_err(|error| {
+            let failure = format!("Could not persist provider update state: {error}");
+            self.failure = Some(failure.clone());
+            failure
+        })
+    }
+
+    /// Durable-store failure the root can quarantine on. While Some, every
+    /// mutation API refuses and no install can start.
+    pub fn failure(&self) -> Option<String> {
+        self.failure.clone()
     }
 
     fn start_detect(&mut self) {
         for driver in [Driver::Codex, Driver::Claude] {
+            if self.detect_jobs.contains_key(&driver) {
+                continue;
+            }
             let prober = Arc::clone(&self.prober);
             let overrides = self.overrides.clone();
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 let _ = tx.send(resolve_driver(driver, &*prober, overrides.as_ref()));
             });
-            self.jobs.insert(driver, Job::Detect(rx));
+            self.detect_jobs.insert(driver, rx);
         }
     }
 
@@ -1115,6 +1246,9 @@ impl ProviderUpdates {
     /// probes, no waits. The runtime calls this before accepting a receipt, then
     /// calls `request` with the accepted update id. Same section 5 rejections.
     pub fn validate_request(&self, driver: &str, target: &str) -> Result<(), String> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
+        }
         let driver =
             Driver::from_id(driver).ok_or_else(|| format!("Unknown provider {driver}."))?;
         let Some(outcome) = self.detected.get(&driver) else {
@@ -1146,23 +1280,23 @@ impl ProviderUpdates {
     /// payload replays its stored outcome (never re-runs); a different payload is
     /// refused. The durable record exists before `poll()` may spawn anything.
     pub fn request(&mut self, driver: &str, target: &str, update_id: String) -> Result<(), String> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
+        }
         let driver =
             Driver::from_id(driver).ok_or_else(|| format!("Unknown provider {driver}."))?;
-        // Idempotency: the same updateId replays its stored receipt when the
-        // payload matches; a different payload under it is refused.
-        let replay = self
+        // Idempotency: only the same updateId with the same payload replays its
+        // stored receipt. A different payload under it is refused, and a new id
+        // while an update is active is rejected by `validate_request`.
+        if let Some(existing) = self
             .ledger
             .records
             .iter()
             .find(|r| r.update_id == update_id)
-            .map(|r| (r.driver.clone(), r.target_version.clone()))
-            .or_else(|| {
-                self.active
-                    .get(&driver)
-                    .map(|a| (driver.id().to_owned(), a.record.target_version.clone()))
-            });
-        if let Some((existing_driver, existing_target)) = replay {
-            return if existing_driver == driver.id() && existing_target.as_deref() == Some(target) {
+        {
+            let same = existing.driver == driver.id()
+                && existing.target_version.as_deref() == Some(target);
+            return if same {
                 Ok(())
             } else {
                 Err("A different payload under that update id is refused.".into())
@@ -1185,7 +1319,12 @@ impl ProviderUpdates {
         let lock_key = strategy.lock_key();
         self.ledger.records.push(stored(&record, driver, &lock_key));
         trim_records(&mut self.ledger, driver.id());
-        self.persist();
+        // Fail closed: the record must be durable before any install side
+        // effect; a failed write drops the intent and marks the service.
+        if let Err(error) = self.persist() {
+            self.ledger.records.retain(|r| r.update_id != update_id);
+            return Err(error);
+        }
         self.active.insert(
             driver,
             Active {
@@ -1203,43 +1342,68 @@ impl ProviderUpdates {
     /// Marks an accepted update id as terminally failed without running anything,
     /// so the projection preserves the accepted receipt's outcome when the root
     /// learns the update cannot proceed after acceptance (e.g. a refused restart
-    /// gate or a lost worker). Safe to call for an already-active record only when
-    /// the caller has settled it elsewhere; here it is a durable write only.
+    /// gate or a lost worker). Releases the driver lock when the id is active.
+    /// Returns the durable-write error, if any.
     pub fn record_failure(
         &mut self,
         driver: &str,
         target: &str,
         update_id: String,
         message: String,
-    ) {
-        let Ok(driver) = Driver::from_id(driver).ok_or(()) else {
-            return;
+    ) -> Result<(), String> {
+        if let Some(failure) = &self.failure {
+            return Err(failure.clone());
+        }
+        let Some(driver) = Driver::from_id(driver) else {
+            return Err("Unknown provider.".into());
         };
-        if self.active.contains_key(&driver)
-            || self
-                .ledger
-                .records
-                .iter()
-                .any(|r| r.update_id == update_id && r.target_version.as_deref() != Some(target))
+        // Same-id terminal failure for the accepted payload only.
+        if self
+            .ledger
+            .records
+            .iter()
+            .any(|r| r.update_id == update_id && r.target_version.as_deref() != Some(target))
         {
-            return;
+            return Err("A different payload under that update id is refused.".into());
+        }
+        // If the accepted id is still active, release it (its lock drops).
+        if self
+            .active
+            .get(&driver)
+            .is_some_and(|a| a.record.update_id == update_id)
+        {
+            self.active.remove(&driver);
+        } else if self.active.contains_key(&driver) {
+            return Err(format!(
+                "An update is already running for {}.",
+                driver.name()
+            ));
         }
         let now = crate::lifecycle::now();
-        let record = UpdateRecord {
-            update_id,
+        let stored_record = StoredRecord {
+            update_id: update_id.clone(),
+            driver: driver.id().into(),
             status: "failed".into(),
-            message,
+            message: redact(&message),
             started_at: Some(now),
             finished_at: Some(now),
             from_version: None,
             target_version: Some(target.to_owned()),
             output: None,
+            lock_key: None,
         };
-        self.ledger
+        if let Some(existing) = self
+            .ledger
             .records
-            .push(stored(&record, driver, "manual-failure"));
+            .iter_mut()
+            .find(|r| r.update_id == update_id)
+        {
+            *existing = stored_record;
+        } else {
+            self.ledger.records.push(stored_record);
+        }
         trim_records(&mut self.ledger, driver.id());
-        self.persist();
+        self.persist()
     }
 
     /// True while any record is queued or running. Feeds the server restart
@@ -1260,11 +1424,11 @@ impl ProviderUpdates {
         let mut changed = false;
         // Detection jobs.
         for driver in [Driver::Codex, Driver::Claude] {
-            if let Some(Job::Detect(rx)) = self.jobs.get(&driver)
+            if let Some(rx) = self.detect_jobs.get(&driver)
                 && let Ok(outcome) = rx.try_recv()
             {
                 self.detected.insert(driver, outcome);
-                self.jobs.remove(&driver);
+                self.detect_jobs.remove(&driver);
                 changed = true;
             }
         }
@@ -1290,19 +1454,43 @@ impl ProviderUpdates {
         };
         match phase {
             Phase::Queued => {
-                if !self.acquire_lock(&lock_key) {
-                    // Another update (or process) holds this install location.
+                // Cross-process lock on the install location, held until settle.
+                let Some(lock) = try_lock_file(&self.data_dir, &lock_key) else {
                     return false;
-                }
+                };
+                let prober = Arc::clone(&self.prober);
+                let overrides = self.overrides.clone();
+                let (tx, rx) = mpsc::channel();
+                // Ownership is re-proven under the lock on a worker thread with
+                // the full npm/brew prover calls, never on the reducer.
+                thread::spawn(move || {
+                    let _ = tx.send(detect(driver, &*prober, overrides.as_ref()));
+                });
                 if let Some(active) = self.active.get_mut(&driver) {
-                    active.lock_file = Some(lock_path(&self.data_dir, &active.lock_key));
+                    active.lock_file = Some(lock);
+                    active.phase = Phase::Reproving;
+                    active.record.status = "running".into();
+                    active.record.message = "Checking the installation".into();
                 }
-                // Re-resolve before taking the gate: the install may have moved.
-                let fresh = detect(driver, &*self.prober, true, self.overrides.as_ref());
-                let changed = fresh.strategy.as_ref().map(Strategy::lock_key)
-                    != Some(lock_key.clone())
-                    || fresh.real.as_ref() != Some(&real_path);
-                if changed {
+                self.jobs.insert(driver, Job::Reprove(rx));
+                self.sync_record(driver);
+                true
+            }
+            Phase::Reproving => {
+                let done = if let Some(Job::Reprove(rx)) = self.jobs.get(&driver) {
+                    rx.try_recv().ok()
+                } else {
+                    None
+                };
+                let Some(fresh) = done else {
+                    return false;
+                };
+                self.jobs.remove(&driver);
+                // Same strategy and same canonical install, or nothing runs.
+                let same = fresh.strategy.as_ref().map(Strategy::lock_key)
+                    == Some(lock_key.clone())
+                    && fresh.real.as_ref() == Some(&real_path);
+                if !same {
                     self.settle(
                         driver,
                         "failed",
@@ -1437,12 +1625,15 @@ impl ProviderUpdates {
                         if let Some(active) = self.active.get_mut(&driver) {
                             active.phase = Phase::Verifying;
                         }
-                        // Re-resolve, then probe the installed version.
-                        let detected = detect(driver, &*self.prober, true, self.overrides.as_ref());
+                        // Re-resolve the owned location and probe its version on
+                        // a worker, so a swapped install cannot verify a wrapper.
                         let prober = Arc::clone(&self.prober);
+                        let overrides = self.overrides.clone();
                         let (tx, rx) = mpsc::channel();
                         thread::spawn(move || {
-                            let _ = tx.send(installed_version(&detected, &*prober));
+                            let detected = detect(driver, &*prober, overrides.as_ref());
+                            let version = installed_version(&detected, &*prober);
+                            let _ = tx.send((detected, version));
                         });
                         self.jobs.insert(driver, Job::Verify(rx));
                     }
@@ -1455,13 +1646,28 @@ impl ProviderUpdates {
                 } else {
                     None
                 };
-                let Some(version) = done else {
+                let Some((fresh, version)) = done else {
                     return false;
                 };
                 self.jobs.remove(&driver);
                 let lock_key = self.active[&driver].lock_key.clone();
+                let real_path = self.active[&driver].real_path.clone();
                 let name = driver.name();
                 let target = self.active[&driver].record.target_version.clone();
+                // The update must have landed in the same owned location it was
+                // proven for; a different path means something else answered.
+                let same = fresh.strategy.as_ref().map(Strategy::lock_key)
+                    == Some(lock_key.clone())
+                    && fresh.real.as_ref() == Some(&real_path);
+                if !same {
+                    self.settle(
+                        driver,
+                        "failed",
+                        "Provider installation changed. Refresh and try again.".into(),
+                        None,
+                    );
+                    return true;
+                }
                 match (version, target) {
                     (None, _) => self.settle(
                         driver,
@@ -1532,7 +1738,7 @@ impl ProviderUpdates {
         } else {
             self.ledger.records.push(stored);
         }
-        self.persist();
+        let _ = self.persist();
     }
 
     fn message(&mut self, driver: Driver, message: &str) {
@@ -1561,27 +1767,34 @@ impl ProviderUpdates {
             } else {
                 self.ledger.records.push(stored);
             }
-            if let Some(lock) = active.lock_file.take() {
-                let _ = std::fs::remove_file(&lock);
-            }
+            // Dropping the File releases the OS lock; the lock file stays on
+            // disk harmlessly and is never unlinked while held.
+            drop(active.lock_file.take());
             trim_records(&mut self.ledger, driver.id());
-            self.persist();
+            let _ = self.persist();
             // A settled update changes the projected advisory; redetect lazily.
             self.start_detect();
         }
     }
+}
 
-    fn acquire_lock(&self, lock_key: &str) -> bool {
-        let path = lock_path(&self.data_dir, lock_key);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .is_ok()
+/// Cross-process advisory lock on an install location. The lock is held by the
+/// open File; the OS releases it automatically if the process dies, so a stale
+/// lock can never strand retries. Some means this process now owns it.
+fn try_lock_file(data_dir: &Path, lock_key: &str) -> Option<std::fs::File> {
+    let path = lock_path(data_dir, lock_key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
     }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 fn stored(record: &UpdateRecord, driver: Driver, lock_key: &str) -> StoredRecord {
@@ -1611,16 +1824,31 @@ fn lock_path(data_dir: &Path, lock_key: &str) -> PathBuf {
         .join(format!("{name}.lock"))
 }
 
-fn read_ledger(path: &Path) -> Ledger {
+/// Durable ledger load. Missing is a fresh ledger; unreadable, malformed, or a
+/// foreign version is a service failure that preserves the file and disables
+/// updates rather than overwriting whatever is there.
+fn load_ledger(path: &Path) -> (Ledger, Option<String>) {
+    let empty = || Ledger {
+        version: 1,
+        records: vec![],
+    };
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Ledger {
-            version: 1,
-            records: vec![],
-        }),
-        Err(_) => Ledger {
-            version: 1,
-            records: vec![],
+        Ok(bytes) => match serde_json::from_slice::<Ledger>(&bytes) {
+            Ok(ledger) if ledger.version == 1 => (ledger, None),
+            Ok(_) => (
+                empty(),
+                Some("Provider update state has an unknown version; updates are disabled.".into()),
+            ),
+            Err(_) => (
+                empty(),
+                Some("Provider update state is unreadable; updates are disabled.".into()),
+            ),
         },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (empty(), None),
+        Err(error) => (
+            empty(),
+            Some(format!("Could not read provider update state: {error}")),
+        ),
     }
 }
 
@@ -1659,7 +1887,7 @@ fn resolve_driver(
     prober: &dyn Prober,
     overrides: Option<&Overrides>,
 ) -> DetectionOutcome {
-    let detected = detect(driver, prober, false, overrides);
+    let detected = detect(driver, prober, overrides);
     let version = if detected.installed {
         installed_version(&detected, prober)
     } else {
@@ -1684,7 +1912,6 @@ fn classify_resolved(
     real: PathBuf,
     script_prefix: Option<Vec<String>>,
     prober: &dyn Prober,
-    fast: bool,
     overrides: Option<&Overrides>,
 ) -> Detected {
     let mut detected = Detected {
@@ -1696,7 +1923,7 @@ fn classify_resolved(
         disabled_reason: None,
         manual_command: None,
     };
-    classify_inner(&mut detected, driver, prober, fast, overrides);
+    classify_inner(&mut detected, driver, prober, overrides);
     detected
 }
 
@@ -1704,14 +1931,17 @@ fn classify_inner(
     detected: &mut Detected,
     driver: Driver,
     prober: &dyn Prober,
-    fast: bool,
     overrides: Option<&Overrides>,
 ) {
     let real = detected.real.clone().expect("real");
     let resolved = detected.resolved.clone().expect("resolved");
-    let real_s = normalize_path(&real);
-    let resolved_s = normalize_path(&resolved);
-    let paths = [real_s.as_str(), resolved_s.as_str()];
+    // Original-case slash paths feed extraction and argv; the folded copies are
+    // for pattern matching only and never become paths again.
+    let real_s = slash_path(&real);
+    let resolved_s = slash_path(&resolved);
+    let real_low = match_key(&real_s);
+    let resolved_low = match_key(&resolved_s);
+    let paths = [real_low.as_str(), resolved_low.as_str()];
     let base = detected.clone();
     let manual = |reason: String, command: Option<String>| Detected {
         disabled_reason: Some(reason),
@@ -1736,36 +1966,27 @@ fn classify_inner(
             .join("node_modules")
             .join(driver.package())
             .join("package.json");
-        manifest.is_file().then(|| normalize_path(dir))
+        manifest.is_file().then(|| slash_path(dir))
     });
     if let Some(prefix) = prefix
         && !paths.iter().any(|p| {
             is_nix(p) || is_mise(p) || is_volta(p) || is_pnpm(p) || is_bun(p) || is_vite_plus(p)
         })
     {
-        if fast {
-            detected.strategy = Some(Strategy::NpmGlobal {
-                prefix: PathBuf::from(&prefix),
-                npm: PathBuf::from("npm"),
-            });
-            return;
-        }
-        if let Some(npm) = find_on_path("npm", overrides) {
-            let probe = prober.run(
-                &[
-                    npm.to_string_lossy().into_owned(),
-                    "prefix".into(),
-                    "-g".into(),
-                ],
-                PROBE_TIMEOUT,
-            );
+        if let Some(npm) = find_tool("npm", overrides) {
+            let argv: Vec<String> = npm
+                .iter()
+                .cloned()
+                .chain(["prefix".into(), "-g".into()])
+                .collect();
+            let probe = prober.run(&argv, PROBE_TIMEOUT);
             let reported = probe.stdout.lines().next().unwrap_or("").trim();
             let canonical = std::fs::canonicalize(reported)
-                .map(|p| normalize_path(&p))
-                .unwrap_or_else(|_| normalize_path(Path::new(reported)));
+                .map(|p| match_key(&slash_path(&p)))
+                .unwrap_or_else(|_| match_key(&slash_path(Path::new(reported))));
             let expected = std::fs::canonicalize(&prefix)
-                .map(|p| normalize_path(&p))
-                .unwrap_or(prefix.clone());
+                .map(|p| match_key(&slash_path(&p)))
+                .unwrap_or_else(|_| match_key(&prefix));
             if probe.exit_code == Some(0) && canonical == expected {
                 detected.strategy = Some(Strategy::NpmGlobal {
                     prefix: PathBuf::from(&prefix),
@@ -1783,31 +2004,26 @@ fn classify_inner(
         );
         return;
     }
-    if let Some((prefix, name, cask)) = paths.iter().find_map(|p| homebrew_keg(p)) {
+    let keg = [&real_s, resolved_s.as_str()]
+        .iter()
+        .find_map(|p| homebrew_keg(p));
+    if let Some((prefix, name, cask)) = keg {
         let keg_brew = PathBuf::from(&prefix).join("bin/brew");
         let brew = if keg_brew.is_file() {
-            Some(keg_brew)
+            Some(vec![keg_brew.to_string_lossy().into_owned()])
         } else {
-            find_on_path("brew", overrides)
+            find_tool("brew", overrides)
         };
-        if fast {
-            if let Some(brew) = brew {
-                detected.strategy = Some(Strategy::Homebrew { brew, name, cask });
-            }
-            return;
-        }
         if let Some(brew) = brew {
-            let probe = prober.run(
-                &[brew.to_string_lossy().into_owned(), "--prefix".into()],
-                PROBE_TIMEOUT,
-            );
+            let argv: Vec<String> = brew.iter().cloned().chain(["--prefix".into()]).collect();
+            let probe = prober.run(&argv, PROBE_TIMEOUT);
             let reported = probe.stdout.lines().next().unwrap_or("").trim();
             let canonical = std::fs::canonicalize(reported)
-                .map(|p| normalize_path(&p))
-                .unwrap_or_else(|_| normalize_path(Path::new(reported)));
+                .map(|p| match_key(&slash_path(&p)))
+                .unwrap_or_else(|_| match_key(&slash_path(Path::new(reported))));
             let expected = std::fs::canonicalize(&prefix)
-                .map(|p| normalize_path(&p))
-                .unwrap_or_else(|_| prefix.clone());
+                .map(|p| match_key(&slash_path(&p)))
+                .unwrap_or_else(|_| match_key(&prefix));
             if probe.exit_code == Some(0) && canonical == expected {
                 detected.strategy = Some(Strategy::Homebrew { brew, name, cask });
                 return;
@@ -1822,14 +2038,14 @@ fn classify_inner(
         );
         return;
     }
-    if driver == Driver::Claude && real_s.contains("/.local/share/claude/versions/") {
+    if driver == Driver::Claude && real_low.contains("/.local/share/claude/versions/") {
         detected.strategy = Some(Strategy::ClaudeNative {
             resolved: resolved.clone(),
         });
         return;
     }
     *detected = manual_reason(
-        detected, driver, &paths, &real, &resolved, &real_s, managed, manual,
+        detected, driver, &paths, &resolved, &real_low, managed, manual,
     );
 }
 
@@ -1837,13 +2053,11 @@ fn manual_reason(
     detected: &Detected,
     driver: Driver,
     paths: &[&str],
-    real: &Path,
     resolved: &Path,
     real_s: &str,
     managed: impl Fn(&str, Option<String>) -> Detected,
     manual: impl Fn(String, Option<String>) -> Detected,
 ) -> Detected {
-    let _ = real;
     if paths.iter().any(|p| is_nix(p)) {
         return managed("Nix", None);
     }
@@ -1932,7 +2146,7 @@ fn strip_ansi(text: &str) -> String {
 }
 
 /// KSG `toProgressLine`: the last meaningful line, collapsed whitespace, 200 chars.
-fn progress_line(line: &str) -> Option<String> {
+fn progress_line_raw(line: &str) -> Option<String> {
     let text = strip_ansi(line);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     (!text.is_empty()).then(|| text.chars().take(PROGRESS_MAX_LEN).collect())
@@ -1944,7 +2158,7 @@ fn command_output(result: &CommandResult) -> Option<String> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    (!text.is_empty()).then_some(text)
+    (!text.is_empty()).then(|| redact(&text))
 }
 
 /// KSG `failureMessage`: exit summary plus the last line naming an error.
@@ -1957,7 +2171,7 @@ fn failure_message(result: &CommandResult) -> String {
         .into_iter()
         .flat_map(|s| {
             s.rsplit(['\r', '\n'])
-                .filter_map(progress_line)
+                .filter_map(progress_line_raw)
                 .collect::<Vec<_>>()
         })
         .find(|line| {
@@ -1967,9 +2181,11 @@ fn failure_message(result: &CommandResult) -> String {
         .or_else(|| {
             [result.stderr_tail.as_str(), result.stdout_tail.as_str()]
                 .into_iter()
-                .find_map(|s| s.rsplit(['\r', '\n']).find_map(progress_line))
+                .find_map(|s| s.rsplit(['\r', '\n']).find_map(progress_line_raw))
         });
-    reason.map_or(format!("{summary}."), |r| format!("{summary}: {r}"))
+    reason.map_or(format!("{summary}."), |r| {
+        format!("{summary}: {}", redact(&r))
+    })
 }
 
 use sha2::Digest;
@@ -2130,7 +2346,7 @@ pub(crate) mod testkit {
         let deadline = Instant::now() + timeout;
         loop {
             service.poll();
-            if !service.active() && service.jobs.is_empty() {
+            if !service.active() && service.jobs.is_empty() && service.detect_jobs.is_empty() {
                 return;
             }
             assert!(Instant::now() < deadline, "provider update did not settle");

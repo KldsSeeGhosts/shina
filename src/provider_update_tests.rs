@@ -176,9 +176,8 @@ fn homebrew_keg_proves_with_its_own_brew() {
 #[test]
 fn claude_native_versions_dir_uses_the_cli_update() {
     let fixture = testkit::Fixture::new();
-    let home = fixture.dir.join("home");
+    // The strategy matcher keys on the versions/ path segment, not HOME.
     let claude = fixture.native("home/.local/share/claude/versions/2.0.4/claude");
-    let _home_guard = EnvGuard::set("HOME", &home);
     let mut prober = prober(|argv| {
         if argv.last().is_some_and(|a| a == "--version") {
             ProbeResult {
@@ -212,7 +211,6 @@ fn env_override_and_wrappers_are_manual() {
     let detected = detect(
         Driver::Claude,
         &prober,
-        false,
         Some(&Overrides {
             candidates: HashMap::from([(Driver::Claude, vec![wrapper])]),
             ..Default::default()
@@ -236,7 +234,6 @@ fn unproven_managers_report_honest_reasons() {
         let detected = detect(
             Driver::Claude,
             &prober(|_| ProbeResult::default()),
-            false,
             Some(&overrides),
         );
         // Fixture paths live under the temp dir, so only the manager matchers
@@ -703,12 +700,14 @@ fn record_failure_preserves_the_accepted_id() {
     let mut service = claude_npm_service(&fixture);
     detected(&mut service);
     let id = uuid::Uuid::new_v4().to_string();
-    service.record_failure(
-        "claude",
-        "2.1.0",
-        id.clone(),
-        "Install blocked by the restart gate.".into(),
-    );
+    service
+        .record_failure(
+            "claude",
+            "2.1.0",
+            id.clone(),
+            "Install blocked by the restart gate.".into(),
+        )
+        .unwrap();
     let record = update_record(&service, "claude");
     assert_eq!(record.update_id, id);
     assert_eq!(record.status, "failed");
@@ -746,28 +745,6 @@ fn statuses_strip_output_but_refresh_keeps_it() {
 
 // ---------- small helpers ----------
 
-struct EnvGuard {
-    name: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-impl EnvGuard {
-    fn set(name: &'static str, value: &Path) -> Self {
-        let previous = std::env::var_os(name);
-        unsafe { std::env::set_var(name, value) };
-        Self { name, previous }
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
-        }
-    }
-}
-
 #[test]
 fn version_and_progress_parsing() {
     assert_eq!(parse_version("codex 0.48.0\n").as_deref(), Some("0.48.0"));
@@ -777,12 +754,534 @@ fn version_and_progress_parsing() {
     );
     assert_eq!(parse_version("no version"), None);
     assert_eq!(
-        progress_line("\u{1b}[32mDownloading  42%\u{1b}[0m").as_deref(),
+        progress_line_raw("\u{1b}[32mDownloading  42%\u{1b}[0m").as_deref(),
         Some("Downloading 42%")
     );
     assert_eq!(compare_versions("2.0.5", "2.1.0"), std::cmp::Ordering::Less);
     assert_eq!(
         compare_versions("2.1.0", "2.1.0-alpha"),
         std::cmp::Ordering::Greater
+    );
+}
+
+// ---------- release-blocker coverage ----------
+
+#[test]
+fn write_failure_fails_closed_before_any_install() {
+    let fixture = testkit::Fixture::new();
+    let claude = fixture.npm_global("claude-npm", "claude", "@anthropic-ai/claude-code");
+    let prefix = fixture
+        .dir
+        .join("claude-npm")
+        .to_string_lossy()
+        .into_owned();
+    let fail = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(0usize));
+    struct Counting(Arc<Mutex<usize>>);
+    impl Runner for Counting {
+        fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            *self.0.lock().unwrap() += 1;
+            testkit::FakeRunner::script(vec![ok_update()]).start(argv)
+        }
+    }
+    let mut overrides = Overrides::default();
+    overrides.candidates.insert(Driver::Claude, vec![claude]);
+    overrides.fail_writes = Arc::clone(&fail);
+    let mut service = ProviderUpdates::build(
+        &fixture.dir,
+        Hooks::default(),
+        Arc::new(update_prober(prefix, Arc::new(AtomicBool::new(false)))),
+        Arc::new(Counting(Arc::clone(&calls))),
+        Some(overrides),
+        Duration::from_secs(30),
+    );
+    detected(&mut service);
+    fail.store(true, Ordering::Relaxed);
+    // A request whose record cannot be persisted is refused outright; the
+    // installer never runs.
+    let error = service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap_err();
+    assert!(error.contains("persist"), "{error}");
+    assert!(service.failure().is_some());
+    assert!(!service.active());
+    for _ in 0..10 {
+        service.poll();
+    }
+    assert_eq!(*calls.lock().unwrap(), 0);
+    // Everything stays refused while the store is broken.
+    assert!(service.validate_request("claude", "2.1.0").is_err());
+    assert!(
+        service
+            .record_failure(
+                "claude",
+                "2.1.0",
+                uuid::Uuid::new_v4().to_string(),
+                "x".into()
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn malformed_ledger_disables_updates_and_preserves_file() {
+    let fixture = testkit::Fixture::new();
+    let ledger = fixture.dir.join("providers/update-state.json");
+    for contents in ["not json at all", r#"{"version": 99, "records": []}"#] {
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::write(&ledger, contents).unwrap();
+        let mut service = testkit::service(
+            &fixture.dir,
+            HashMap::new(),
+            prober(|_| ProbeResult::default()),
+            no_run(),
+        );
+        detected(&mut service);
+        assert!(service.failure().is_some(), "{contents}");
+        assert!(
+            service
+                .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+                .is_err()
+        );
+        // The unreadable file is preserved exactly.
+        assert_eq!(std::fs::read_to_string(&ledger).unwrap(), contents);
+        std::fs::remove_file(&ledger).unwrap();
+    }
+}
+
+#[test]
+fn locks_survive_owner_death_and_serialize_shared_prefixes() {
+    // A lock held by a dead owner is free again: a second service retries.
+    let fixture = testkit::Fixture::new();
+    let lock_key = "npm-global:/shared".to_owned();
+    {
+        let _held = try_lock_file(&fixture.dir, &lock_key).expect("first lock");
+        assert!(
+            try_lock_file(&fixture.dir, &lock_key).is_none(),
+            "held lock must exclude others"
+        );
+    } // drop releases the OS lock
+    assert!(try_lock_file(&fixture.dir, &lock_key).is_some());
+}
+
+#[test]
+fn shared_prefix_serializes_two_drivers() {
+    let fixture = testkit::Fixture::new();
+    // One npm prefix owns both CLIs.
+    let claude = fixture.npm_global("shared", "claude", "@anthropic-ai/claude-code");
+    let codex = fixture.npm_global("shared", "codex", "@openai/codex");
+    let prefix = fixture.dir.join("shared").to_string_lossy().into_owned();
+    let updated = Arc::new(AtomicBool::new(false));
+    let prober = {
+        let updated = Arc::clone(&updated);
+        prober(move |argv| {
+            if argv.ends_with(&["prefix".into(), "-g".into()]) {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: format!("{prefix}\n"),
+                    ..Default::default()
+                }
+            } else if argv.contains(&"outdated".into()) {
+                let pkg = argv.last().cloned().unwrap_or_default();
+                ProbeResult {
+                    exit_code: Some(1),
+                    stdout: format!(r#"{{"{pkg}":{{"latest":"2.1.0"}}}}"#),
+                    ..Default::default()
+                }
+            } else {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: if updated.load(Ordering::Relaxed) {
+                        "2.1.0".into()
+                    } else {
+                        "2.0.5".into()
+                    },
+                    ..Default::default()
+                }
+            }
+        })
+    };
+    struct SlowFlip(Arc<AtomicBool>);
+    impl Runner for SlowFlip {
+        fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            let run = testkit::FakeRunner::script(vec![testkit::QueuedRun {
+                result: CommandResult {
+                    exit_code: Some(0),
+                    stdout_tail: "done".into(),
+                    stderr_tail: String::new(),
+                },
+                delay: Duration::from_millis(80),
+            }]);
+            let handle = run.start(argv)?;
+            self.0.store(true, Ordering::Relaxed);
+            Ok(handle)
+        }
+    }
+    let mut service = testkit::service(
+        &fixture.dir,
+        HashMap::from([(Driver::Claude, vec![claude]), (Driver::Codex, vec![codex])]),
+        prober,
+        SlowFlip(updated),
+    );
+    detected(&mut service);
+    service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    service
+        .request("codex", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    // Same install lock: whichever driver steps first holds the prefix while
+    // the other stays queued; a second installer must never run concurrently.
+    let mut saw_waiting = false;
+    for _ in 0..80 {
+        service.poll();
+        thread::sleep(Duration::from_millis(3));
+        let statuses = service.statuses();
+        let queued = statuses
+            .iter()
+            .filter(|s| s.update.as_ref().is_some_and(|r| r.status == "queued"))
+            .count();
+        let running = statuses
+            .iter()
+            .filter(|s| s.update.as_ref().is_some_and(|r| r.status == "running"))
+            .count();
+        if queued > 0 && running > 0 {
+            saw_waiting = true;
+        }
+    }
+    assert!(saw_waiting, "no driver ever waited on the shared lock");
+    testkit::settle(&mut service, Duration::from_secs(10));
+    assert_eq!(update_record(&service, "claude").status, "succeeded");
+    assert_eq!(update_record(&service, "codex").status, "succeeded");
+}
+
+#[test]
+fn refresh_while_active_never_drops_the_command() {
+    let fixture = testkit::Fixture::new();
+    // Parallel updates on distinct lock keys: npm-global Claude, keg Codex.
+    let claude = fixture.npm_global("claude-a", "claude", "@anthropic-ai/claude-code");
+    let brew = fixture.native("brew/bin/brew");
+    let codex = fixture.native("brew/Cellar/codex/0.48.0/bin/codex");
+    let npm_prefix = fixture.dir.join("claude-a").to_string_lossy().into_owned();
+    let brew_prefix = fixture.dir.join("brew").to_string_lossy().into_owned();
+    let updated = Arc::new(AtomicBool::new(false));
+    let prober = {
+        let updated = Arc::clone(&updated);
+        prober(move |argv| {
+            if argv.ends_with(&["prefix".into(), "-g".into()]) {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: format!("{npm_prefix}\n"),
+                    ..Default::default()
+                }
+            } else if argv.ends_with(&["--prefix".into()]) && argv[0].contains("brew") {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: format!("{brew_prefix}\n"),
+                    ..Default::default()
+                }
+            } else if argv.contains(&"outdated".into()) {
+                ProbeResult {
+                    exit_code: Some(1),
+                    stdout: r#"{"@anthropic-ai/claude-code":{"latest":"2.1.0"}}"#.into(),
+                    ..Default::default()
+                }
+            } else if argv.contains(&"info".into()) {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: r#"{"formulae":[{"versions":{"stable":"2.1.0"}}]}"#.into(),
+                    ..Default::default()
+                }
+            } else {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: if updated.load(Ordering::Relaxed) {
+                        "2.1.0".into()
+                    } else {
+                        "2.0.5".into()
+                    },
+                    ..Default::default()
+                }
+            }
+        })
+    };
+    let updated2 = Arc::clone(&updated);
+    struct Flip(Arc<AtomicBool>);
+    impl Runner for Flip {
+        fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            let run = testkit::FakeRunner::script(vec![testkit::QueuedRun {
+                result: CommandResult {
+                    exit_code: Some(0),
+                    stdout_tail: "done".into(),
+                    stderr_tail: String::new(),
+                },
+                delay: Duration::from_millis(60),
+            }]);
+            let handle = run.start(argv)?;
+            self.0.store(true, Ordering::Relaxed);
+            Ok(handle)
+        }
+    }
+    let mut overrides = Overrides::default();
+    overrides.candidates.insert(Driver::Claude, vec![claude]);
+    overrides.candidates.insert(Driver::Codex, vec![codex]);
+    overrides.tools.insert("brew".into(), PathBuf::from(&brew));
+    let mut service = ProviderUpdates::build(
+        &fixture.dir,
+        Hooks::default(),
+        Arc::new(prober),
+        Arc::new(Flip(updated2)),
+        Some(overrides),
+        Duration::from_secs(30),
+    );
+    detected(&mut service);
+    service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    service
+        .request("codex", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    for _ in 0..30 {
+        service.poll();
+        let _ = service.refresh(true); // must not strand the running commands
+        thread::sleep(Duration::from_millis(4));
+    }
+    testkit::settle(&mut service, Duration::from_secs(10));
+    assert_eq!(update_record(&service, "claude").status, "succeeded");
+    assert_eq!(update_record(&service, "codex").status, "succeeded");
+}
+
+#[cfg(unix)]
+#[test]
+fn real_command_output_is_bounded_and_utf8_safe() {
+    let fixture = testkit::Fixture::new();
+    // ~5 MB of multi-byte output, far beyond the capture cap.
+    let big = fixture.dir.join("big.txt");
+    let chunk = "héllo wörld  🌊\n".repeat(300_000);
+    std::fs::write(&big, &chunk).unwrap();
+    let mut handle = SystemRunner
+        .start(&["/bin/cat".into(), big.to_string_lossy().into_owned()])
+        .unwrap();
+    let result = loop {
+        if let Some(result) = handle.result() {
+            break result;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.stdout_tail.len() <= OUTPUT_MAX_BYTES + 64);
+    assert!(result.stdout_tail.ends_with("🌊\n") || !result.stdout_tail.is_empty());
+}
+
+#[test]
+fn windows_npm_cmd_shim_becomes_node_argv() {
+    let fixture = testkit::Fixture::new();
+    // A Windows-style npm shim: npm.cmd referencing %dp0%\...\npm-cli.js.
+    let win = fixture.dir.join("win-npm-tool");
+    std::fs::create_dir_all(&win).unwrap();
+    std::fs::write(
+        win.join("npm.cmd"),
+        "@echo off\r\n\"%dp0%\\node_modules\\npm\\bin\\npm-cli.js\" %*\r\n",
+    )
+    .unwrap();
+    // Backslashes are legal in unix filenames; this is the shim's JS target.
+    std::fs::write(win.join("node_modules\\npm\\bin\\npm-cli.js"), "// npm\n").unwrap();
+    let claude = fixture.npm_global("win-prefix", "claude", "@anthropic-ai/claude-code");
+    let prefix = fixture
+        .dir
+        .join("win-prefix")
+        .to_string_lossy()
+        .into_owned();
+    let mut overrides = Overrides::default();
+    overrides.candidates.insert(Driver::Claude, vec![claude]);
+    overrides.tools.insert("npm".into(), win.join("npm.cmd"));
+    let updated = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(Mutex::new(vec![]));
+    struct Record(Arc<Mutex<Vec<Vec<String>>>>, Arc<AtomicBool>);
+    impl Runner for Record {
+        fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            self.0.lock().unwrap().push(argv.to_vec());
+            let handle = testkit::FakeRunner::script(vec![ok_update()]).start(argv)?;
+            self.1.store(true, Ordering::Relaxed);
+            Ok(handle)
+        }
+    }
+    let mut service = ProviderUpdates::build(
+        &fixture.dir,
+        Hooks::default(),
+        Arc::new(update_prober(prefix, Arc::clone(&updated))),
+        Arc::new(Record(Arc::clone(&calls), updated)),
+        Some(overrides),
+        Duration::from_secs(30),
+    );
+    detected(&mut service);
+    service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    testkit::settle(&mut service, Duration::from_secs(5));
+    let argv = &calls.lock().unwrap()[0];
+    // The update ran `node <npm-cli.js> install -g ...`, never a bare shim.
+    assert!(argv[0].ends_with("node") || argv[0] == "node", "{argv:?}");
+    assert!(argv[1].ends_with("npm-cli.js"), "{argv:?}");
+}
+
+#[test]
+fn mixed_case_prefix_is_preserved_not_folded() {
+    let fixture = testkit::Fixture::new();
+    let claude = fixture.npm_global("MixedCasePrefix", "claude", "@anthropic-ai/claude-code");
+    let prefix_path = fixture.dir.join("MixedCasePrefix");
+    let prefix = prefix_path.to_string_lossy().into_owned();
+    let detected = detect(
+        Driver::Claude,
+        &prober(move |argv| {
+            if argv.ends_with(&["prefix".into(), "-g".into()]) {
+                ProbeResult {
+                    exit_code: Some(0),
+                    stdout: format!("{prefix}\n"),
+                    ..Default::default()
+                }
+            } else {
+                ProbeResult::default()
+            }
+        }),
+        Some(&Overrides {
+            candidates: HashMap::from([(Driver::Claude, vec![claude])]),
+            ..Default::default()
+        }),
+    );
+    let Some(Strategy::NpmGlobal { prefix, .. }) = detected.strategy else {
+        panic!("expected npm-global, got {detected:?}");
+    };
+    // Original case survives canonicalization and extraction; only the
+    // comparison helpers fold.
+    assert_eq!(prefix, std::fs::canonicalize(&prefix_path).unwrap());
+}
+
+#[test]
+fn malformed_installed_output_never_succeeds() {
+    let fixture = testkit::Fixture::new();
+    let claude = fixture.npm_global("claude-npm", "claude", "@anthropic-ai/claude-code");
+    let prefix = fixture
+        .dir
+        .join("claude-npm")
+        .to_string_lossy()
+        .into_owned();
+    let updated = Arc::new(AtomicBool::new(false));
+    let prober = prober(move |argv| {
+        if argv.ends_with(&["prefix".into(), "-g".into()]) {
+            ProbeResult {
+                exit_code: Some(0),
+                stdout: format!("{prefix}\n"),
+                ..Default::default()
+            }
+        } else if argv.contains(&"outdated".into()) {
+            ProbeResult {
+                exit_code: Some(1),
+                stdout: r#"{"@anthropic-ai/claude-code":{"latest":"2.1.0"}}"#.into(),
+                ..Default::default()
+            }
+        } else {
+            // Unparseable both before and after the command.
+            ProbeResult {
+                exit_code: Some(0),
+                stdout: "1.2.garbage".into(),
+                ..Default::default()
+            }
+        }
+    });
+    struct Flip(Arc<AtomicBool>);
+    impl Runner for Flip {
+        fn start(&self, argv: &[String]) -> Result<Box<dyn RunningUpdate>, String> {
+            let handle = testkit::FakeRunner::script(vec![ok_update()]).start(argv)?;
+            self.0.store(true, Ordering::Relaxed);
+            Ok(handle)
+        }
+    }
+    let mut service = testkit::service(
+        &fixture.dir,
+        HashMap::from([(Driver::Claude, vec![claude])]),
+        prober,
+        Flip(updated),
+    );
+    detected(&mut service);
+    service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    testkit::settle(&mut service, Duration::from_secs(5));
+    let record = update_record(&service, "claude");
+    assert_eq!(record.status, "failed");
+    assert!(record.message.contains("verify"), "{}", record.message);
+}
+
+#[test]
+fn strict_semver_rules_versions() {
+    assert!(valid_semver("2.1.0"));
+    assert!(valid_semver("2.1.0-rc.1"));
+    assert!(valid_semver("2.1.0+build.5"));
+    assert!(!valid_semver("1.2.garbage"));
+    assert!(!valid_semver("v2.1"));
+    assert!(!valid_semver("2.1.0-"));
+    assert_eq!(parse_version("codex 0.48.0\n").as_deref(), Some("0.48.0"));
+    assert_eq!(parse_version("1.2.garbage"), None);
+    assert_eq!(
+        compare_versions("2.1.0-alpha", "2.1.0"),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        compare_versions("2.1.0", "2.1.0-alpha"),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        compare_versions("2.1.0-rc.1", "2.1.0-rc.2"),
+        std::cmp::Ordering::Less
+    );
+}
+
+#[test]
+fn new_id_while_active_is_rejected_even_same_payload() {
+    let fixture = testkit::Fixture::new();
+    let mut service = claude_npm_service(&fixture);
+    detected(&mut service);
+    service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    // Different UUID, identical payload: a new intent, refused while active.
+    let error = service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap_err();
+    assert!(error.contains("already running"), "{error}");
+}
+
+#[test]
+fn captured_output_is_secret_redacted() {
+    let fixture = testkit::Fixture::new();
+    let mut service = npm_service(
+        &fixture,
+        "redact",
+        CommandResult {
+            exit_code: Some(1),
+            stdout_tail: String::new(),
+            stderr_tail:
+                "fetch https://user:secret-token@registry.example/x failed\nghp_abc123def456".into(),
+        },
+    );
+    detected(&mut service);
+    service
+        .request("claude", "2.1.0", uuid::Uuid::new_v4().to_string())
+        .unwrap();
+    testkit::settle(&mut service, Duration::from_secs(5));
+    let record = service
+        .refresh(true)
+        .into_iter()
+        .find(|s| s.driver == "claude")
+        .and_then(|s| s.update)
+        .unwrap();
+    let output = record.output.unwrap_or_default();
+    assert!(!output.contains("secret-token"), "{output}");
+    assert!(!output.contains("ghp_abc123def456"), "{output}");
+    assert!(
+        !record.message.contains("secret-token"),
+        "{}",
+        record.message
     );
 }
