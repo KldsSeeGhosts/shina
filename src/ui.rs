@@ -11514,9 +11514,12 @@ fn image_preview(
         let clock = s.attachment_poster_clock.get().wrapping_add(1);
         s.attachment_poster_clock.set(clock);
         let mut posters = s.attachment_video_posters.borrow_mut();
-        let (player, accessed) = posters
-            .entry(image.id.clone())
-            .or_insert_with(|| (rune::Player::file(path), clock));
+        let (player, accessed) = posters.entry(image.id.clone()).or_insert_with(|| {
+            (
+                rune::Player::file(attachment_preview::player_path(&path)),
+                clock,
+            )
+        });
         *accessed = clock;
         let player = player.clone();
         if player.time() == 0.0

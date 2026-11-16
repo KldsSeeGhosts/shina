@@ -3620,7 +3620,13 @@ mod tests {
             assert_eq!(b.shared.snapshots.borrow()["state"]["index"]["threads"][0]["title"],"Before sleep");
             b.listen().await;
             wait_until(||desktop.commands_for(&link_b.server_id).unwrap().connected()).await;
-            assert!(profile.join("linked-views").join(&link_b.server_id).join("view.json").is_file());
+            // Hello marks the link connected before the asynchronous cache writer
+            // finishes. Wait for durable projection evidence, not that handshake.
+            let cached = profile.join("linked-views").join(&link_b.server_id).join("view.json");
+            wait_until(|| crate::store::load(&cached).ok().flatten().is_some_and(|view| {
+                view["schemaVersion"] == 1
+                    && view["state"]["index"]["threads"][0]["title"] == "Before sleep"
+            })).await;
             // Shutdown of a linked client never stops either server.
             desktop.shutdown();
             assert!(!b.stop.load(Ordering::Acquire));
