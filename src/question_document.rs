@@ -133,8 +133,8 @@ pub fn ensure(path: &Path) -> Option<PathBuf> {
         let mut command = Command::new("node");
         command
             .arg("--max-old-space-size=192")
-            .arg(worker)
-            .arg(path)
+            .arg(crate::vcs::child_process_path(&worker))
+            .arg(crate::vcs::child_process_path(path))
             .arg(format!(".{extension}"))
             .env("ELECTRON_RUN_AS_NODE", "1")
             .stdin(Stdio::null())
@@ -218,6 +218,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("shina-question-document-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let path = root.join("answer.ipynb");
         std::fs::write(
             &path,

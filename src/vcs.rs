@@ -477,7 +477,7 @@ pub(crate) fn child_process_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn child_process_path(path: &Path) -> PathBuf {
+pub(crate) fn child_process_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
