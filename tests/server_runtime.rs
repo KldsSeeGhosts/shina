@@ -2378,10 +2378,11 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
             uuid::Uuid::new_v4(),
         );
         assert_eq!(followup["result"]["status"], "accepted", "{followup}");
+        let attempt = followup["result"]["result"]["attempt_id"].clone();
         let pause = PausedProcess::new(target.children.last().unwrap());
         let cancelled = client.command(
             "task.cancel",
-            json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"stop-second-turn"}}),
+            json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"stop-second-turn","attempt_id":attempt}}),
             uuid::Uuid::new_v4(),
         );
         assert_eq!(cancelled["result"]["status"], "accepted", "{cancelled}");
@@ -3264,6 +3265,132 @@ fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
     );
     assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
     client.until(|state| state["index"]["tasks"][0]["state"] == "cancelled");
+    profile.stop();
+}
+
+/// A declared steer reaches the child harness as streamingBehavior:"steer"
+/// over the live MCP wire, while an ordinary send goes as followUp. Steering
+/// without an observed attempt, or against a finished attempt, is refused.
+#[test]
+fn steered_task_send_reaches_the_child_harness_as_steer_on_the_wire() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let workspace = profile.root.join("Shina/chats/1");
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"Initialize the coordinator fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+
+    // The hold marker keeps the child's turn active with no pending request,
+    // so a declared steer has a live run to pin.
+    let delegated = call_fixture_tool(
+        &workspace,
+        "delegate_task",
+        json!({"prompt":"peer-documents-hold-fixture","title":"Steerable child",
+            "client_request_id":"steer-delegate"}),
+    );
+    assert_ne!(delegated["result"]["isError"], true, "{delegated}");
+    let child =
+        serde_json::from_str::<Value>(delegated["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()["thread_id"]
+            .as_u64()
+            .unwrap();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .is_some_and(|tasks| !tasks.is_empty() && tasks[0]["state"] == "running")
+    });
+    let attempt = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
+    let child_directory = profile
+        .root
+        .join(format!("Shina/chats/{child}/fixture-behavior.jsonl"));
+
+    // Steering without the observed attempt is refused before any dispatch.
+    let unfenced = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"steer-this-turn","client_request_id":"steer-0","delivery":"steer"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(unfenced.to_string().contains("attempt_id"), "{unfenced}");
+
+    // The fenced steer interrupts the live run on the wire.
+    let steered = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"steer-this-turn","client_request_id":"steer-1","delivery":"steer","attempt_id":attempt}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(steered["result"]["status"], "accepted", "{steered}");
+
+    // An ordinary keyed send stays follow-up input while the run is live.
+    let follow_up = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"queue-behind","client_request_id":"send-1"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(follow_up["result"]["status"], "accepted", "{follow_up}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let records = loop {
+        if let Ok(text) = fs::read_to_string(&child_directory) {
+            let records: Vec<Value> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if records.iter().any(|record| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("steer-this-turn"))
+            }) && records.iter().any(|record| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("queue-behind"))
+            }) {
+                break records;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child wire log at {child_directory:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let steered_prompt = records
+        .iter()
+        .find(|record| {
+            record["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("steer-this-turn"))
+        })
+        .unwrap();
+    assert_eq!(steered_prompt["streamingBehavior"], "steer");
+    let queued_prompt = records
+        .iter()
+        .find(|record| {
+            record["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("queue-behind"))
+        })
+        .unwrap();
+    assert_eq!(queued_prompt["streamingBehavior"], "followUp");
+
+    // Once the attempt finishes, steering is refused outright instead of
+    // silently queueing as input the caller never marked as follow-up.
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    let finished = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"steer-after-end","client_request_id":"steer-2","delivery":"steer","attempt_id":attempt}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        finished.to_string().contains("cannot accept steering"),
+        "{finished}"
+    );
     profile.stop();
 }
 

@@ -43,6 +43,8 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   else if (request.type === "set_thinking_level") { thinking = request.level; response(request, { level: thinking }); }
   else if (request.type === "prompt") {
     fs.appendFileSync(path.join(process.cwd(), "fixture-prompts.jsonl"), JSON.stringify(request.message) + "\n");
+    fs.appendFileSync(path.join(process.cwd(), "fixture-behavior.jsonl"), JSON.stringify({
+      message: request.message, streamingBehavior: request.streamingBehavior ?? null }) + "\n");
     messages.push({ role: "user", content: [{ type: "text", text: request.message }] }); save();
     running = true; response(request, {}); emit({ type: "agent_start" });
     // Keep a remote provider turn active while the integration test issues its MCP reads.

@@ -392,24 +392,24 @@ pub fn tools() -> Value {
         },
         {
             "name": "task_cancel",
-            "description": "Clear queued work and abort a child you delegated. Only its parent may cancel it. client_request_id is required: an identical retry replays the recorded outcome and never stops a second time. Pass attempt_id from task_status to fence the cancel to the attempt you observed; a delayed cancel for an older attempt is refused and never stops newer work. Clients older than this contract are refused rather than silently unfenced.",
+            "description": "Clear queued work and abort a child you delegated. Only its parent may cancel it. client_request_id and attempt_id are required: an identical retry replays the recorded outcome and never stops a second time. attempt_id must be the attempt_id currently reported by task_status; a delayed cancel naming an older attempt is refused and never stops newer work. Clients older than this contract are refused rather than silently unfenced.",
             "inputSchema": {"type":"object","properties":{
                 "thread_id":id,
                 "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Required durable retry key scoped to the calling Captain or thread. Reuse it verbatim to retry after an uncertain response; reusing it with different arguments fails."},
-                "attempt_id":{"type":"string","minLength":1,"maxLength":256,"description":"Optional fence: the attempt_id observed from task_status. The cancel applies only while the task still runs that attempt."}
-            },"required":["thread_id","client_request_id"]}
+                "attempt_id":{"type":"string","minLength":1,"maxLength":256,"description":"Required fence: the attempt_id observed from task_status. The cancel applies only while the task still runs that attempt."}
+            },"required":["thread_id","client_request_id","attempt_id"]}
         },
         {
             "name": "task_send",
-            "description": "Send corrections or follow-up work to a child you delegated. client_request_id is required: an identical retry replays the recorded outcome and never delivers the message twice, even after completion, restart or home reset. delivery defaults to follow_up, which queues after the current work; delivery steer interrupts the current run and requires attempt_id. Pass attempt_id from task_status to fence the send to the attempt you observed; when a request is pending, pass request_id and runtime_generation so the answer cannot land on a different question. Unsupported delivery modes are rejected, never reinterpreted. Clients older than this contract are refused rather than silently unfenced. Only its parent may send.",
+            "description": "Send corrections or follow-up work to a child you delegated. client_request_id is required: an identical retry replays the recorded outcome and never delivers the message twice, even after completion, restart or home reset. delivery defaults to follow_up, which queues after the current work; delivery steer interrupts the current run and requires attempt_id. Pass attempt_id from task_status to fence the send to the attempt you observed; while task_status shows a pending request, request_id and runtime_generation are required so the answer cannot land on a different question. Unsupported delivery modes are rejected, never reinterpreted. Clients older than this contract are refused rather than silently unfenced. Only its parent may send.",
             "inputSchema": {"type":"object","properties":{
                 "thread_id":id,
                 "message":{"type":"string","description":"The correction or follow-up brief."},
                 "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Required durable retry key scoped to the calling Captain or thread. Reuse it verbatim to retry after an uncertain response; reusing it with different arguments fails."},
                 "attempt_id":{"type":"string","minLength":1,"maxLength":256,"description":"Optional fence: the attempt_id observed from task_status. Required for steering. The send is refused when the task has moved to a newer attempt."},
                 "delivery":{"type":"string","enum":["follow_up","steer"],"description":"follow_up (default) queues after the current work. steer interrupts the live run of the observed attempt and fails when the harness cannot steer."},
-                "request_id":{"type":"string","minLength":1,"maxLength":256,"description":"When answering a pending request, the requestId observed from task_status.request. The send fails if the pending request expired or changed."},
-                "runtime_generation":{"type":"string","minLength":1,"maxLength":256,"description":"The runtime_generation observed from task_status. The send fails if the runtime moved to a newer generation."}
+                "request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Required while task_status.request shows a pending request: the requestId observed there. The send fails if the pending request expired or changed."},
+                "runtime_generation":{"type":"string","minLength":1,"maxLength":256,"description":"Required while task_status.request shows a pending request: the generation observed there. The send fails if the runtime moved to a newer generation."}
             },"required":["thread_id","message","client_request_id"]}
         },
         {

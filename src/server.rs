@@ -2825,6 +2825,78 @@ mod tests {
     }
 
     #[test]
+    fn fenced_peer_controls_require_the_negotiated_contract() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let home = Fixture::new("fences-home").await;
+            let target =
+                Fixture::with_minor("fences-target", protocol::PEER_TASK_FENCES_MINOR - 1).await;
+            let code = target
+                .shared
+                .pairing
+                .lock()
+                .unwrap()
+                .create_scoped(crate::lifecycle::now(), true)
+                .unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let peer = crate::peer::link_peer(
+                &home.shared.directory,
+                &home.shared.database,
+                &target.address.to_string(),
+                &code,
+            )
+            .await
+            .unwrap();
+            let link = peer.credential(&home.shared.directory).unwrap();
+            // Every fenced command is refused before dispatch: the target's
+            // hello lacks peer-task-fences-v1, so attempt and delivery fields
+            // may never reach it.
+            for command in [
+                Command::new(
+                    "peer.thread.stop",
+                    json!({"threadId":1,"attemptId":"attempt-1"}),
+                ),
+                Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":1,"message":"x","delivery":"steer","attemptId":"attempt-1"}),
+                ),
+                Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":1,"message":"x","delivery":"attempt","attemptId":"attempt-1"}),
+                ),
+                Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":1,"message":"x","delivery":"follow_up","attemptId":"attempt-1"}),
+                ),
+            ] {
+                assert_eq!(
+                    crate::client::remote_command(&link, command)
+                        .await
+                        .unwrap_err(),
+                    protocol::PEER_TASK_FENCES_UPDATE_REQUIRED
+                );
+            }
+            // An unfenced follow-up keeps the legacy contract: it reaches the
+            // target, which rejects it only because no peer worker exists.
+            let unfenced = crate::client::remote_command(
+                &link,
+                Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":1,"message":"x","delivery":"follow_up"}),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unfenced["status"], "rejected", "{unfenced}");
+            assert!(
+                !unfenced.to_string().contains("attempt-fenced"),
+                "{unfenced}"
+            );
+        });
+    }
+
+    #[test]
     fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home=Fixture::new("peer-home").await;

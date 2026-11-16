@@ -8566,11 +8566,21 @@ impl State {
                     "attempt_id": task.map(|task| task.attempt_id.as_str()),
                     "run_id": thread.run_id.as_deref(),
                     "runtime_generation": thread.request_generation,
-                    "request": thread.request.as_ref().map(|request| json!({
-                        "requestId": request["id"],
-                        "generation": thread.request_generation,
-                        "kind": request["method"],
-                    })),
+                    // One request shape for local and remote children; the
+                    // answer fence reads requestId and generation from here.
+                    "request": task
+                        .and_then(|task| task.remote.as_ref())
+                        .and_then(|remote| remote.request.as_ref())
+                        .map(|request| json!({
+                            "requestId": request["requestId"],
+                            "generation": request["generation"],
+                            "kind": request["kind"],
+                        }))
+                        .or_else(|| thread.request.as_ref().map(|request| json!({
+                            "requestId": request["id"],
+                            "generation": thread.request_generation,
+                            "kind": request["method"],
+                        }))),
                     "queue_position": task.and_then(|task| self.task_queue_position(task)),
                     "selection": selection_value(thread),
                     "finished": task.map(|task| task.state.finished()).unwrap_or(thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed))),
@@ -18535,6 +18545,10 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, events) = child(&mut state);
+        let mut task = Task::new(&state.threads[index], "A bounded task", None);
+        task.state = TaskState::Running;
+        let attempt = task.attempt_id.clone();
+        state.tasks.push(task);
         let mut stranger = Thread::new(3);
         stranger.status = Status::Ready;
         state.threads.push(stranger);
@@ -18551,7 +18565,7 @@ mod tests {
                 .mcp_call(
                     1,
                     "task_cancel",
-                    &json!({"thread_id":3,"client_request_id":"cancel-stranger"})
+                    &json!({"thread_id":3,"client_request_id":"cancel-stranger","attempt_id":attempt})
                 )
                 .is_err()
         );
@@ -18580,7 +18594,7 @@ mod tests {
             .mcp_call(
                 1,
                 "task_cancel",
-                &json!({"thread_id":2,"client_request_id":"cancel-1"}),
+                &json!({"thread_id":2,"client_request_id":"cancel-1","attempt_id":attempt}),
             )
             .unwrap();
         assert_eq!(commands.try_recv().unwrap()["type"], "clear_queue");
@@ -18677,6 +18691,38 @@ mod tests {
     }
 
     #[test]
+    fn a_steer_pinned_to_a_dead_run_sends_follow_up_instead_of_steering() {
+        let mut thread = Thread::new(1);
+        let (commands, _events) = fake_pi(&mut thread, Status::Running);
+        thread.run_id = Some("run-b".into());
+        thread.pending_injections.push_back(Injection {
+            text: "Shina: input for the ended run".into(),
+            shown: false,
+            steer: Some("run-a".into()),
+        });
+        assert!(thread.flush_injection());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        // The pinned run ended; the input queues behind the live run instead
+        // of interrupting work the caller never observed.
+        assert_eq!(prompt["streamingBehavior"], "followUp");
+        assert_eq!(thread.run_id.as_deref(), Some("run-b"));
+        acknowledge(&mut thread, &prompt);
+        // A pin that still matches the live run steers it on the wire.
+        thread.pending_injections.push_back(Injection {
+            text: "Shina: steer the live run".into(),
+            shown: false,
+            steer: Some("run-b".into()),
+        });
+        assert!(thread.flush_injection());
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .expect("the live-run steer prompt");
+        assert_eq!(prompt["streamingBehavior"], "steer");
+    }
+
+    #[test]
     fn a_wait_deadline_wakes_an_otherwise_idle_ui() {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
@@ -18706,13 +18752,17 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, _events) = child(&mut state);
+        let mut task = Task::new(&state.threads[index], "A bounded task", None);
+        task.state = TaskState::Running;
+        let attempt = task.attempt_id.clone();
+        state.tasks.push(task);
         state.threads[index].initializing = true;
         state.threads[index].enqueue_injection("Shina: task brief".into());
         let result = state
             .mcp_call(
                 1,
                 "task_cancel",
-                &json!({"thread_id":2,"client_request_id":"cancel-early"}),
+                &json!({"thread_id":2,"client_request_id":"cancel-early","attempt_id":attempt}),
             )
             .unwrap();
         assert_eq!(result["status"], "cancelled");
@@ -18727,11 +18777,15 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, _events) = child(&mut state);
+        let mut task = Task::new(&state.threads[index], "A bounded task", None);
+        task.state = TaskState::Running;
+        let attempt = task.attempt_id.clone();
+        state.tasks.push(task);
         state
             .mcp_call(
                 1,
                 "task_cancel",
-                &json!({"thread_id":2,"client_request_id":"cancel-stop"}),
+                &json!({"thread_id":2,"client_request_id":"cancel-stop","attempt_id":attempt}),
             )
             .unwrap();
         assert_eq!(commands.try_recv().unwrap()["type"], "clear_queue");

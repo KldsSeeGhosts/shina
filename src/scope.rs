@@ -689,11 +689,15 @@ mod tests {
             2
         );
         restored.demo = true;
+        let worker_attempt = restored
+            .mcp_call(primary, "task_status", &json!({"thread_id":worker}))
+            .unwrap()["attempt_id"]
+            .clone();
         restored
             .mcp_call(
                 primary,
                 "task_cancel",
-                &json!({"thread_id":worker,"client_request_id":"cancel-worker"}),
+                &json!({"thread_id":worker,"client_request_id":"cancel-worker","attempt_id":worker_attempt}),
             )
             .unwrap();
         restored.poll_tasks(Instant::now());

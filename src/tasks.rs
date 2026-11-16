@@ -1054,10 +1054,14 @@ impl State {
         Ok(self.command_receipt(&scope.device(), id).cloned())
     }
 
-    /// An identical keyed send or cancel replays its committed receipt: current
-    /// status plus replayed:true when the task still exists, the recorded
-    /// result plus exists:false when it does not. The replay never queues
-    /// another input, starts another attempt or stops another attempt.
+    /// An identical keyed send or cancel replays its committed receipt: the
+    /// outcome the original operation recorded, plus replayed:true. The
+    /// recorded acceptance, delivery and attempt never move, so a retry can
+    /// never mistake newer state for its own operation. `exists` reports
+    /// whether the task's thread is still present and `current` carries a
+    /// fresh task_status when it is, so the caller can make a fresh decision.
+    /// The replay never queues another input, starts another attempt or stops
+    /// another attempt.
     pub(super) fn task_control_receipt_replay(
         &mut self,
         caller_index: usize,
@@ -1074,16 +1078,18 @@ impl State {
         if receipt.hash != intent {
             return Err(CONTROL_KEY_MISMATCH.into());
         }
-        if let Some(id) = args["thread_id"].as_u64().map(|id| id as usize)
-            && self.threads.iter().any(|thread| thread.id == id)
-        {
-            let mut status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
-            status["replayed"] = json!(true);
-            return Ok(Some(status));
-        }
         let mut result = receipt.result;
         result["replayed"] = json!(true);
-        result["exists"] = json!(false);
+        let exists = args["thread_id"]
+            .as_u64()
+            .map(|id| id as usize)
+            .is_some_and(|id| self.threads.iter().any(|thread| thread.id == id));
+        result["exists"] = json!(exists);
+        result["current"] = if let Some(id) = args["thread_id"].as_u64().filter(|_| exists) {
+            self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?
+        } else {
+            Value::Null
+        };
         Ok(Some(result))
     }
 
@@ -1275,6 +1281,9 @@ impl State {
             .iter()
             .position(|task| task.child_thread_id == thread.id)
         else {
+            if tool == "task_cancel" {
+                return Err("This child has no durable task or attempt; a keyed cancel cannot be fenced. Stop it from Shina instead.".into());
+            }
             return Ok(false);
         };
         let attempt = Self::control_fence(args, "attempt_id")?;
@@ -1284,15 +1293,18 @@ impl State {
                     return Err(format!("task_cancel does not accept {field}."));
                 }
             }
-            if let Some(observed) = attempt
-                && observed != self.tasks[task_index].attempt_id
-            {
+            // An observed attempt is mandatory: a delayed cancel must never
+            // stop work the caller did not name.
+            let observed = attempt.ok_or(
+                "task_cancel requires the attempt_id observed from task_status; read task_status and retry with its attempt_id.",
+            )?;
+            if observed != self.tasks[task_index].attempt_id {
                 return Err(Self::attempt_changed_error(
                     &self.tasks[task_index],
                     observed,
                 ));
             }
-            self.tasks[task_index].owe_remote_stop(attempt.map(str::to_owned));
+            self.tasks[task_index].owe_remote_stop(Some(observed.to_owned()));
             if self.tasks[task_index].state.finished() {
                 return Ok(true);
             }
@@ -1312,15 +1324,23 @@ impl State {
         {
             return Err("This task was interrupted by a restart. The user must resume or dismiss it in Shina after checking partial work.".into());
         }
-        if Self::control_fence(args, "request_id")?.is_some()
-            || Self::control_fence(args, "runtime_generation")?.is_some()
-        {
-            self.check_request_fence(
-                task_index,
-                index,
-                Self::control_fence(args, "request_id")?,
-                Self::control_fence(args, "runtime_generation")?,
-            )?;
+        let request_id = Self::control_fence(args, "request_id")?;
+        let generation = Self::control_fence(args, "runtime_generation")?;
+        // A live pending request makes every send a declared answer: it must
+        // name the request and generation it observed so a delayed answer
+        // cannot resolve a newer question or silently become follow-up work.
+        // A remote request is a snapshot of the target's live attempt; once
+        // the attempt ends a send starts fresh work and no longer answers it.
+        let request_pending = if let Some(remote) = &self.tasks[task_index].remote {
+            !self.tasks[task_index].state.finished() && remote.request.is_some()
+        } else {
+            self.threads[index].request.is_some()
+        };
+        if request_pending && (request_id.is_none() || generation.is_none()) {
+            return Err("task_status shows a pending request. Answering it requires request_id and runtime_generation from task_status.".into());
+        }
+        if request_id.is_some() || generation.is_some() {
+            self.check_request_fence(task_index, index, request_id, generation)?;
         }
         let delivery = Self::control_delivery(args)?;
         if delivery == Some("steer") && attempt.is_none() {
@@ -1335,10 +1355,20 @@ impl State {
             ));
         }
         // Preserve the existing input/editor/select response path. Confirmations remain user-only.
-        if self.threads[index].request.is_some() && self.tasks[task_index].remote.is_none() {
+        if let Some(request) = &self.threads[index].request
+            && self.tasks[task_index].remote.is_none()
+        {
             // A declared steer must not silently become a question answer.
             if delivery == Some("steer") {
                 return Err("This attempt cannot accept steering.".into());
+            }
+            // A fenced send naming a request the provider will not let Shina
+            // answer fails rather than silently becoming follow-up input.
+            if !matches!(
+                request["method"].as_str(),
+                Some("input" | "editor" | "select")
+            ) {
+                return Err("Confirmations require the user's device link.".into());
             }
             return Ok(false);
         }
@@ -1720,6 +1750,13 @@ impl State {
             if !thread.completion_notified
                 && let Some(result) = thread.task_result
             {
+                if task.state == TaskState::Queued {
+                    // The settled turn's result belongs to the previous
+                    // attempt; a queued retry must not inherit it.
+                    thread.task_result = None;
+                    thread.completion_notified = true;
+                    continue;
+                }
                 // A correction may still be local, queued by the provider, or
                 // running in its next turn. The previous turn cannot finish it.
                 if thread.pi.is_some()
@@ -2202,11 +2239,15 @@ mod tests {
                 .unwrap_err()
                 .contains("8 unfinished")
         );
+        let attempt = state
+            .mcp_call(1, "task_status", &json!({"thread_id":2}))
+            .unwrap()["attempt_id"]
+            .clone();
         state
             .mcp_call(
                 1,
                 "task_cancel",
-                &json!({"thread_id":2,"client_request_id":"cancel-2"}),
+                &json!({"thread_id":2,"client_request_id":"cancel-2","attempt_id":attempt}),
             )
             .unwrap();
         state.poll_tasks(Instant::now());
@@ -2285,6 +2326,47 @@ mod tests {
     }
 
     #[test]
+    fn keyed_control_receipts_survive_a_captain_home_reset() {
+        let mut state = state_with_task();
+        // The caller is a Captain home, so its control receipts are scoped to
+        // the Captain rather than the thread that happens to host it.
+        state.captains = Captain::presets();
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        state.captain_homes.insert(0, 1);
+        let send = json!({"thread_id":2,"message":"Scoped work","client_request_id":"home-send"});
+        let first = state.mcp_call(1, "task_send", &send).unwrap();
+        let attempt = first["attempt_id"].clone();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+
+        // The reset retires home 1 and opens a fresh home for the same Captain.
+        state.reset_captain_conversation(0).unwrap();
+        let home = state.captain_home(0).unwrap();
+        assert_ne!(home, 1);
+
+        // The same keyed send replays the committed receipt instead of
+        // queueing the input a second time.
+        let replay = state.mcp_call(home, "task_send", &send).unwrap();
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(replay["attempt_id"], attempt);
+        assert_eq!(
+            state.threads[1].pending_injections.len(),
+            1,
+            "a replayed send never queues the input again"
+        );
+
+        // A keyed cancel issued from the new home stops the named attempt,
+        // and its own retry replays the receipt without another stop.
+        let cancel = json!({"thread_id":2,"client_request_id":"home-cancel","attempt_id":attempt});
+        state.mcp_call(home, "task_cancel", &cancel).unwrap();
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+        let replay = state.mcp_call(home, "task_cancel", &cancel).unwrap();
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(replay["status"], "cancelled");
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+    }
+
+    #[test]
     fn a_stale_attempt_fence_never_cancels_newer_work() {
         let mut state = state_with_task();
         let status = state
@@ -2337,6 +2419,101 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn sends_to_a_pending_request_must_name_it_and_its_generation() {
+        let mut state = state_with_task();
+        let (commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].request = Some(json!({"id":"request-1","method":"input"}));
+        state.threads[1].request_generation = "generation-1".into();
+        // An unfenced send cannot resolve a request the caller never observed.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"answer","client_request_id":"a-1"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("pending request"), "{error}");
+        // Naming a request or generation the state does not show fails closed,
+        // so a delayed answer cannot resolve a newer question.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"answer","client_request_id":"a-2",
+                    "request_id":"request-0","runtime_generation":"generation-1"}),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("Request or runtime generation changed"),
+            "{error}"
+        );
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"answer","client_request_id":"a-3",
+                    "request_id":"request-1","runtime_generation":"generation-0"}),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("Request or runtime generation changed"),
+            "{error}"
+        );
+        assert!(state.threads[1].request.is_some());
+        // The observed identity answers the request once.
+        state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"the answer","client_request_id":"a-4",
+                    "request_id":"request-1","runtime_generation":"generation-1"}),
+            )
+            .unwrap();
+        assert!(state.threads[1].request.is_none());
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "extension_ui_response"
+        );
+        // A delayed retry of the same answer now fences against the expired
+        // request instead of becoming silent follow-up input.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"the answer","client_request_id":"a-5",
+                    "request_id":"request-1","runtime_generation":"generation-1"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("expired"), "{error}");
+    }
+
+    #[test]
+    fn task_cancel_refuses_to_guess_the_observed_attempt() {
+        let mut state = state_with_task();
+        let error = state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-no-fence"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("attempt_id"), "{error}");
+        assert!(!state.tasks[0].state.finished());
+        assert!(state.threads[1].task_result.is_none());
+        for field in ["message", "delivery", "request_id", "runtime_generation"] {
+            let error = state
+                .mcp_call(
+                    1,
+                    "task_cancel",
+                    &json!({"thread_id":2,"client_request_id":format!("cancel-{field}"),
+                        "attempt_id":"a",field:"x"}),
+                )
+                .unwrap_err();
+            assert!(error.contains("does not accept"), "{error}");
+        }
     }
 
     #[test]

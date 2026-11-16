@@ -1182,7 +1182,8 @@ mod tests {
                 .mcp_call(
                     1,
                     "task_send",
-                    &json!({"thread_id":child,"message":"yes","client_request_id":"answer-confirm"})
+                    &json!({"thread_id":child,"message":"yes","client_request_id":"answer-confirm",
+                        "request_id":"approval","runtime_generation":"generation-1"})
                 )
                 .unwrap_err()
                 .contains("Confirmations")
@@ -1451,11 +1452,15 @@ mod tests {
         );
         assert!(!state.tasks[0].state.finished());
         let child = state.tasks[0].child_thread_id;
+        let attempt = state
+            .mcp_call(1, "task_status", &json!({"thread_id":child}))
+            .unwrap()["attempt_id"]
+            .clone();
         state
             .mcp_call(
                 1,
                 "task_cancel",
-                &json!({"thread_id":child,"client_request_id":"cancel-child"}),
+                &json!({"thread_id":child,"client_request_id":"cancel-child","attempt_id":attempt}),
             )
             .unwrap();
         let stop = state.tasks[0]
@@ -1652,6 +1657,7 @@ mod tests {
             result: None,
             acknowledged: false,
             attempt_message: String::new(),
+            attempt_id: None,
             cancelled_commands: vec![],
             reply_after_position: 0,
             document_reads,
@@ -2276,7 +2282,9 @@ mod tests {
             "peer.thread.launch",
             accepted(json!({"threadId":17})),
         );
-        state.queue_remote_send(0, "More work", "follow_up").unwrap();
+        state
+            .queue_remote_send(0, "More work", "follow_up")
+            .unwrap();
         let message = state.tasks[0]
             .remote
             .as_ref()
