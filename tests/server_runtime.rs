@@ -253,8 +253,31 @@ fn question_files_use_server_paths_and_document_text_in_the_native_answer() {
         answer.contains("Review the attached notebook.\n\nAttached file \"answer.ipynb\": "),
         "{answer}"
     );
-    assert!(answer.contains(" (text extracted to: "), "{answer}");
-    assert!(answer.contains(profile.root.to_str().unwrap()), "{answer}");
+    let references = answer
+        .strip_prefix("Review the attached notebook.\n\nAttached file \"answer.ipynb\": ")
+        .unwrap();
+    let (attachment, extracted) = references
+        .split_once(" (text extracted to: ")
+        .unwrap_or_else(|| panic!("Missing extracted document reference: {answer}"));
+    // Paths are JSON strings in the provider text. Decode before checking
+    // ownership so Windows backslash escaping cannot alter the assertion.
+    let attachment: PathBuf = serde_json::from_str(attachment).unwrap();
+    let extracted: PathBuf = serde_json::from_str(extracted.strip_suffix(')').unwrap()).unwrap();
+    let root = profile.root.canonicalize().unwrap();
+    assert!(
+        attachment.starts_with(&root) && attachment.is_file(),
+        "{answer}"
+    );
+    assert!(
+        extracted.starts_with(&root) && extracted.is_file(),
+        "{answer}"
+    );
+    assert!(
+        fs::read_to_string(extracted)
+            .unwrap()
+            .contains("# File answer"),
+        "{answer}"
+    );
     profile.stop();
 }
 
