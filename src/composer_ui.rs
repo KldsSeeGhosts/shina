@@ -828,8 +828,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
             base_branch,
             start_from_origin,
         } => {
-            let mode_w =
-                text_width(crate::branch_toolbar::resolve_env_mode_label(*mode), SMALL) + 50.0;
+            let mode_w = text_width(super::env_mode_title(s, *mode), SMALL) + 50.0;
             let branch_w = if *mode == crate::model::ThreadEnvMode::Worktree {
                 let is_remote = base_branch.as_deref().and_then(|name| {
                     s.thread_vcs_repo_key(t).and_then(|key| {
@@ -1038,6 +1037,21 @@ pub(super) fn overflow_menu(s: &State, p: Palette) -> El {
                     s.machines.picker = true;
                 }),
         );
+        // The workspace choice hides with the machine block. A crew draft's worker checkout
+        // is chosen there, so it stays reachable from here like Run on.
+        if matches!(
+            s.composer_vcs_controls(),
+            crate::model::ComposerVcsControls::Editable { .. }
+        ) {
+            menu = menu.child(
+                menu_item("overflow-workspace", "Workspace", "branch", p).on_press(
+                    |s: &mut State| {
+                        s.composer_ui.overflow.set(false);
+                        s.env_mode_picker = true;
+                    },
+                ),
+            );
+        }
     }
     if visible <= 1 {
         menu = menu.child(

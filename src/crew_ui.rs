@@ -6,6 +6,7 @@
 //! borders in `line`, rows at a 4 px radius, cards at 6 px, and motion of 0.18 s on
 //! `cubic-bezier(.23, 1, .32, 1)`. The visual skin follows docs/ui/pixel-voyage.md.
 use super::*;
+use crate::model::placement::{PlacementMode, PlacementPhase, ThreadPlacement};
 use crate::model::{AttentionItem, AttentionKind, TaskState, TaskView};
 use rune::Transition;
 
@@ -108,6 +109,19 @@ fn open_thread(s: &mut State, id: usize) {
 /// A task's place in the shared status vocabulary, and the word for it. A child that is
 /// asking for something needs the user whatever its task record says.
 fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
+    // No provider starts before its checkout is ready, so a pending or failed placement is
+    // the whole story until then.
+    let placement = || match worker_placement(s, task.child_id).map(|placement| placement.phase) {
+        Some(PlacementPhase::Failed)
+            if !matches!(task.state, TaskState::Completed | TaskState::Cancelled) =>
+        {
+            Some((Status::Failed, "Setup failed"))
+        }
+        Some(PlacementPhase::Pending) if !task.state.finished() => {
+            Some((Status::Ready, "Preparing"))
+        }
+        _ => None,
+    };
     if let Some(remote) = &task.remote {
         if remote.state == crate::model::RemoteState::UpdateRequired {
             return (Status::Waiting, "Update required");
@@ -117,6 +131,9 @@ fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
         }
         if remote.needs_you && !task.state.finished() {
             return (Status::Waiting, "Needs you");
+        }
+        if let Some(status) = placement() {
+            return status;
         }
         if task.state != TaskState::Queued {
             return (
@@ -140,6 +157,9 @@ fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
     {
         return (Status::Waiting, "Needs you");
     }
+    if let Some(status) = placement() {
+        return status;
+    }
     match task.state {
         TaskState::Queued => (Status::Ready, "Queued"),
         TaskState::Starting => (Status::Running, "Starting"),
@@ -149,6 +169,185 @@ fn task_status(s: &State, task: &TaskView) -> (Status, &'static str) {
         TaskState::Cancelled => (Status::Ready, "Dismissed"),
         TaskState::Interrupted => (Status::Waiting, "Interrupted"),
     }
+}
+
+/// Where a worker actually runs: the placement mirrored from the target for a remote task,
+/// else the worker thread's own record.
+pub(super) fn worker_placement(s: &State, thread: usize) -> Option<ThreadPlacement> {
+    s.remote_task(thread)
+        .and_then(|remote| remote.placement.clone())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| s.threads.iter().find(|t| t.id == thread)?.placement.clone())
+}
+
+/// The machine a placement's checkout lives on, by name.
+fn placement_machine(s: &State, thread: usize, placement: &ThreadPlacement) -> String {
+    match s.remote_task(thread) {
+        Some(remote) => remote.label.clone(),
+        None if placement.executor.is_empty() || placement.executor == "local" => {
+            s.machine_label(&s.machines.selected)
+        }
+        None => s.machine_label(&placement.executor),
+    }
+}
+
+/// The checkout's kind in the status vocabulary. A shared checkout of a real project is read
+/// only; one without a project is the thread's private scratch folder.
+fn placement_word(placement: &ThreadPlacement) -> &'static str {
+    match placement.mode {
+        PlacementMode::Shared if placement.primary_checkout => "Read only",
+        PlacementMode::Shared => "Scratch folder",
+        PlacementMode::Isolated => "Worktree",
+        PlacementMode::Existing if placement.primary_checkout => "Main checkout",
+        PlacementMode::Existing => "Existing worktree",
+    }
+}
+
+/// The last two segments of a checkout, so the worktree's own folder survives truncation.
+fn path_tail(path: &str) -> String {
+    let separator = if path.contains('\\') && !path.contains('/') {
+        "\\"
+    } else {
+        "/"
+    };
+    let parts: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return path.to_owned();
+    }
+    format!("…{separator}{}", parts[parts.len() - 2..].join(separator))
+}
+
+/// Every resolved field of a placement, one per line, for the tooltip and the screen reader.
+fn placement_details(placement: &ThreadPlacement, machine: &str) -> String {
+    let mut lines = vec![format!("{} on {machine}", placement_word(placement))];
+    if let Some(checkout) = &placement.checkout {
+        lines.push(format!("Checkout: {checkout}"));
+    }
+    if let Some(branch) = &placement.branch {
+        lines.push(format!("Branch: {branch}"));
+    }
+    let commit = placement
+        .base_commit
+        .as_deref()
+        .map(|commit| commit.get(..12).unwrap_or(commit));
+    match (&placement.base_branch, commit) {
+        (Some(base), Some(commit)) => lines.push(format!("Base: {base} at {commit}")),
+        (Some(base), None) => lines.push(format!("Base: {base}")),
+        (None, Some(commit)) => lines.push(format!("Base: {commit}")),
+        (None, None) => {}
+    }
+    if let Some(upstream) = placement.upstream_thread_id {
+        lines.push(format!("Builds on thread #{upstream}"));
+    }
+    if let Some(repository) = &placement.repository
+        && placement.checkout.as_ref() != Some(repository)
+    {
+        lines.push(format!("Repository: {repository}"));
+    }
+    lines.join("\n")
+}
+
+/// What a failed placement leaves the user to do. Nothing started, and the reservation stays,
+/// so a retry reuses the same checkout.
+fn placement_recovery(s: &State, thread: usize, sender: &str) -> String {
+    let setup_failed = s.threads.iter().any(|t| {
+        t.id == thread
+            && t.worktree_setup
+                .as_ref()
+                .is_some_and(|setup| setup.phase == crate::model::WorktreeSetupPhase::Failed)
+    });
+    if setup_failed {
+        "Nothing started. Open the worker to retry or skip its setup script.".into()
+    } else {
+        format!("Nothing started. New work from {sender} retries in the same checkout.")
+    }
+}
+
+/// Where a worker runs: the checkout's kind, its live phase, the branch and the checkout's last
+/// folders, with every field in the tooltip. Ported from the locked row in KSG Code's
+/// `BranchToolbarEnvModeSelector` (`h-6 gap-1.5 px-1.75 text-xs text-muted-foreground`, a
+/// `size-3` folder icon and the full worktree path as the tooltip) and the branch line of
+/// `PreviousWorktreeItemContent`. KSG has no pending or failed placement, so the phase word,
+/// the error and the recovery line are Shina's. `with_phase` is false where a status word beside
+/// it already names the phase, as on a task card.
+pub(super) fn placement_block(
+    s: &State,
+    p: Palette,
+    thread: usize,
+    placement: &ThreadPlacement,
+    key: &str,
+    sender: &str,
+    with_phase: bool,
+) -> El {
+    let (_, tertiary) = quiet_inks(p);
+    let machine = placement_machine(s, thread, placement);
+    let details = placement_details(placement, &machine);
+    let glyph = match placement.mode {
+        PlacementMode::Shared if placement.primary_checkout => "lock",
+        PlacementMode::Shared => "folder",
+        PlacementMode::Isolated | PlacementMode::Existing => "branch",
+    };
+    let phase = match placement.phase {
+        _ if !with_phase => None,
+        PlacementPhase::Pending => Some(("Preparing", p.brass)),
+        PlacementPhase::Failed => Some(("Setup failed", p.danger)),
+        PlacementPhase::Ready => None,
+    };
+    let mut line = row()
+        .key(key.to_owned())
+        .role("group")
+        .label(details.replace('\n', ". "))
+        .help(details)
+        .min_h(20.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0)
+        .child(icon(glyph, p.muted).size(12.0, 12.0))
+        .child(pixel_text(placement_word(placement), p.muted).key(format!("{key}-mode")));
+    if let Some((word, ink)) = phase {
+        line = line.child(pixel_text(word, ink).key(format!("{key}-phase")));
+    }
+    if let Some(branch) = &placement.branch {
+        line = line.child(
+            label(branch, TextStyle::new(12.0, 500.0), p.ink)
+                .key(format!("{key}-branch"))
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+    }
+    if let Some(checkout) = &placement.checkout {
+        line = line.child(
+            label(path_tail(checkout), SMALL, tertiary)
+                .key(format!("{key}-checkout"))
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+    }
+    let mut block = col().gap(2.0).min_w(0.0).child(line);
+    if placement.phase == PlacementPhase::Failed {
+        if let Some(error) = placement.error.as_deref().filter(|e| !e.trim().is_empty()) {
+            block = block.child(
+                label(truncate(error, 400), SMALL, p.danger)
+                    .key(format!("{key}-error"))
+                    .wrap_anywhere()
+                    .selectable(true),
+            );
+        }
+        block = block.child(
+            label(placement_recovery(s, thread, sender), SMALL, p.muted)
+                .key(format!("{key}-recovery"))
+                .wrap(),
+        );
+    } else if let Some(note) = &placement.capability {
+        block = block.child(
+            label(note, SMALL, tertiary)
+                .key(format!("{key}-note"))
+                .wrap(),
+        );
+    }
+    block
 }
 
 /// The mark a worker's sidebar row shares with its crew chip when its row has no other mark:
@@ -332,8 +531,34 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .on_press(move |s: &mut State| open_thread(s, child))
         .child(head)
         .child(meta);
-    // The record's fallback line is the state's id, which the meta line already says.
-    if !task.last_activity_line.is_empty() && task.last_activity_line != task.state.id() {
+    let placement = worker_placement(s, child);
+    if let Some(placement) = &placement {
+        let sender = s
+            .current()
+            .captain
+            .and_then(|c| s.captains.get(c))
+            .map_or_else(|| "the parent".to_owned(), |c| c.name.clone());
+        card = card.child(
+            placement_block(
+                s,
+                p,
+                child,
+                placement,
+                &format!("task-placement-{child}"),
+                &sender,
+                false,
+            )
+            .pl(CARD_INDENT),
+        );
+    }
+    // The record's fallback line is the state's id, which the meta line already says. A failed
+    // placement's block already shows the error.
+    if !task.last_activity_line.is_empty()
+        && task.last_activity_line != task.state.id()
+        && placement
+            .as_ref()
+            .is_none_or(|placement| placement.phase != PlacementPhase::Failed)
+    {
         card = card.child(
             label(
                 &task.last_activity_line,
@@ -767,11 +992,22 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             task_clock(task)
         };
         let clock_width = super::text_width(&clock) + 4.0;
+        // The chip has no room for the checkout, so its tooltip and label carry it.
+        let place = worker_placement(s, child).map(|placement| {
+            placement_details(&placement, &placement_machine(s, child, &placement))
+        });
         let chip = row()
             .key(format!("crew-chip-{child}"))
             .role("button")
             .cursor(rune::Cursor::Pointer)
-            .label(format!("{}. {word}. Open the worker", task.title))
+            .label(match &place {
+                Some(place) => format!(
+                    "{}. {word}. {}. Open the worker",
+                    task.title,
+                    place.replace('\n', ". ")
+                ),
+                None => format!("{}. {word}. Open the worker", task.title),
+            })
             .focusable(true)
             .center_y()
             .gap(7.0)
@@ -819,6 +1055,10 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             // A card fill and a 1 px `line` border, so a chip reads as a chip.
             .fill(p.card)
             .border(1.0, p.line);
+        let chip = match place {
+            Some(place) => chip.help(place),
+            None => chip,
+        };
         if stacked {
             chips = chips.child(chip.w_full());
         } else {
@@ -1064,6 +1304,30 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     let t = s.current();
     // Ported from KSG Code's ThreadRelationshipsControl DelegatedFromRow.
     if let Some(origin) = &t.peer_origin {
+        let mut who = col().gap(4.0).grow(1.0).min_w(0.0).child(
+            label(
+                format!(
+                    "Delegated from {} on {}",
+                    origin.captain, origin.server_label
+                ),
+                SMALL,
+                p.muted,
+            )
+            .key("parent-bar-name")
+            .wrap()
+            .min_w(0.0),
+        );
+        if let Some(placement) = &t.placement {
+            who = who.child(placement_block(
+                s,
+                p,
+                t.id,
+                placement,
+                "parent-bar-placement",
+                &origin.captain,
+                true,
+            ));
+        }
         return Some(
             row()
                 .key("parent-bar")
@@ -1076,19 +1340,7 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                 .center_y()
                 .radius(6.0)
                 .border(1.0, hairline(p))
-                .child(
-                    label(
-                        format!(
-                            "Delegated from {} on {}",
-                            origin.captain, origin.server_label
-                        ),
-                        SMALL,
-                        p.muted,
-                    )
-                    .key("parent-bar-name")
-                    .wrap()
-                    .min_w(0.0),
-                ),
+                .child(who),
         );
     }
     let parent = t
@@ -1139,18 +1391,28 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
             .key("remote-result-machine"),
         );
     }
+    // The status beside the name already says the phase, so the placement line does not.
+    let placement = worker_placement(s, t.id).map(|placement| {
+        let sender = captain
+            .and_then(|c| s.captains.get(c))
+            .map_or_else(|| parent.title.clone(), |c| c.name.clone());
+        placement_block(
+            s,
+            p,
+            t.id,
+            &placement,
+            "parent-bar-placement",
+            &sender,
+            false,
+        )
+    });
     let mut bar = row()
-        .key("parent-bar")
-        .role("group")
-        .label("Delegated work")
         .min_h(48.0)
         .py(8.0)
         .pl(20.0)
         .pr(8.0)
         .gap(12.0)
         .center_y()
-        .radius(6.0)
-        .border(1.0, hairline(p))
         .child(who);
     if let Some(task) = &task {
         let (status, word) = task_status(s, task);
@@ -1175,39 +1437,60 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
             p.muted,
         ));
     }
-    Some(
-        bar.child(
-            row()
-                .key("open-captain")
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label(if captain.is_some() {
+    let bar = bar.child(
+        row()
+            .key("open-captain")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(if captain.is_some() {
+                "Open captain"
+            } else {
+                "Open parent"
+            })
+            .focusable(true)
+            .center_y()
+            .gap(6.0)
+            .h(32.0)
+            .px(10.0)
+            .radius(ROW_RADIUS)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+            .on_press(move |s: &mut State| open_thread(s, parent_id))
+            .child(icon("back", p.muted))
+            .child(label(
+                if captain.is_some() {
                     "Open captain"
                 } else {
                     "Open parent"
-                })
-                .focusable(true)
-                .center_y()
-                .gap(6.0)
-                .h(32.0)
-                .px(10.0)
-                .radius(ROW_RADIUS)
-                .hover(hover_wash(s, p))
-                .press(active_wash(s, p))
-                .hover_motion(motion(), motion())
-                .on_press(move |s: &mut State| open_thread(s, parent_id))
-                .child(icon("back", p.muted))
-                .child(label(
-                    if captain.is_some() {
-                        "Open captain"
-                    } else {
-                        "Open parent"
-                    },
-                    TextStyle::new(13.0, 500.0),
-                    p.ink,
-                )),
-        ),
-    )
+                },
+                TextStyle::new(13.0, 500.0),
+                p.ink,
+            )),
+    );
+    Some(with_placement(
+        bar,
+        placement,
+        "parent-bar",
+        "Delegated work".into(),
+        p,
+    ))
+}
+
+/// A worker bar and, under it on its own full-width line, where the worker runs. The line sits
+/// at the bar's 20 px text inset so it never squeezes the status or the buttons.
+fn with_placement(bar: El, placement: Option<El>, key: &str, name: String, p: Palette) -> El {
+    let mut group = col()
+        .key(key.to_owned())
+        .role("group")
+        .label(name)
+        .radius(6.0)
+        .border(1.0, hairline(p))
+        .child(bar);
+    if let Some(placement) = placement {
+        group = group.child(placement.px(20.0).pb(10.0).mt(-4.0));
+    }
+    group
 }
 
 /// The independent crew root's bar: which captain's crew it belongs to, and a button back
@@ -1223,89 +1506,99 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
     let thread_id = t.id;
     let open_server = s.machines.selected.clone();
     let more_server = open_server.clone();
-    Some(
-        row()
-            .key("crew-bar")
-            .role("group")
-            .label(format!("In {}'s crew", profile.name))
-            .min_h(48.0)
-            .py(8.0)
-            .pl(20.0)
-            .pr(8.0)
-            .gap(12.0)
-            .center_y()
-            .radius(6.0)
-            .border(1.0, hairline(p))
-            .child(
-                row()
-                    .center_y()
-                    .gap(8.0)
-                    .min_w(0.0)
-                    .shrink()
-                    .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
-                    .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
-                    .child(
-                        label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
-                            .key("crew-bar-name")
-                            .truncate()
-                            .shrink()
-                            .min_w(0.0),
-                    )
-                    .child(label("'s crew", TextStyle::new(14.0, 400.0), p.muted)),
-            )
-            .child(spacer())
-            .child(
-                row()
-                    .key("crew-bar-open-captain")
-                    .role("button")
-                    .cursor(rune::Cursor::Pointer)
-                    .label("Open captain")
-                    .focusable(true)
-                    .center_y()
-                    .gap(6.0)
-                    .h(32.0)
-                    .px(10.0)
-                    .radius(ROW_RADIUS)
-                    .hover(hover_wash(s, p))
-                    .press(active_wash(s, p))
-                    .hover_motion(motion(), motion())
-                    .on_press(move |s: &mut State| {
-                        if s.machines.selected == open_server && home.is_some() {
-                            s.open_captain(captain);
-                        }
-                    })
-                    .child(icon("back", p.muted))
-                    .child(label("Open captain", TextStyle::new(13.0, 500.0), p.ink)),
-            )
-            .child({
-                let open = s.brief.more == Some(thread_id);
-                row()
-                    .key("crew-bar-more")
-                    .role("button")
-                    .cursor(rune::Cursor::Pointer)
-                    .label("Crew actions")
-                    .focusable(true)
-                    .center_y()
-                    .h(32.0)
-                    .w(32.0)
-                    .center()
-                    .radius(ROW_RADIUS)
-                    .hover(hover_wash(s, p))
-                    .press(active_wash(s, p))
-                    .hover_motion(motion(), motion())
-                    .on_press(move |s: &mut State| {
-                        if s.machines.selected != more_server {
-                            return;
-                        }
-                        s.brief.more = if s.brief.more == Some(thread_id) {
-                            None
-                        } else {
-                            Some(thread_id)
-                        };
-                    })
-                    .child(icon("more", if open { p.ink } else { p.muted }))
-            }),
-    )
+    let who = row()
+        .center_y()
+        .gap(8.0)
+        .min_w(0.0)
+        .shrink()
+        .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
+        .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
+        .child(
+            label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+                .key("crew-bar-name")
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(label("'s crew", TextStyle::new(14.0, 400.0), p.muted));
+    let placement = t.placement.as_ref().map(|placement| {
+        placement_block(
+            s,
+            p,
+            thread_id,
+            placement,
+            "crew-bar-placement",
+            &profile.name,
+            true,
+        )
+    });
+    let bar = row()
+        .min_h(48.0)
+        .py(8.0)
+        .pl(20.0)
+        .pr(8.0)
+        .gap(12.0)
+        .center_y()
+        .child(who)
+        .child(spacer())
+        .child(
+            row()
+                .key("crew-bar-open-captain")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label("Open captain")
+                .focusable(true)
+                .center_y()
+                .gap(6.0)
+                .h(32.0)
+                .px(10.0)
+                .radius(ROW_RADIUS)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .hover_motion(motion(), motion())
+                .on_press(move |s: &mut State| {
+                    if s.machines.selected == open_server && home.is_some() {
+                        s.open_captain(captain);
+                    }
+                })
+                .child(icon("back", p.muted))
+                .child(label("Open captain", TextStyle::new(13.0, 500.0), p.ink)),
+        )
+        .child({
+            let open = s.brief.more == Some(thread_id);
+            row()
+                .key("crew-bar-more")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label("Crew actions")
+                .focusable(true)
+                .center_y()
+                .h(32.0)
+                .w(32.0)
+                .center()
+                .radius(ROW_RADIUS)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .hover_motion(motion(), motion())
+                .on_press(move |s: &mut State| {
+                    if s.machines.selected != more_server {
+                        return;
+                    }
+                    s.brief.more = if s.brief.more == Some(thread_id) {
+                        None
+                    } else {
+                        Some(thread_id)
+                    };
+                })
+                .child(icon("more", if open { p.ink } else { p.muted }))
+        });
+    Some(with_placement(
+        bar,
+        placement,
+        "crew-bar",
+        format!("In {}'s crew", profile.name),
+        p,
+    ))
 }
 
 fn attention_word(kind: AttentionKind) -> &'static str {
