@@ -360,6 +360,10 @@ impl NativeCatalog {
                     }
                 }
                 Event::Record(record) if record["type"] == "response" => {
+                    // A real CLI response proves that this harness is installed.
+                    // The old default false leaked into projections even after a
+                    // successful catalog probe, disabling working remote harnesses.
+                    self.installed = true;
                     if record["success"] == false {
                         self.fail(
                             record["error"]
@@ -541,6 +545,10 @@ impl Catalog {
                             };
                             self.models =
                                 models.iter().filter_map(AgentModel::from_value).collect();
+                            if self.models.is_empty() {
+                                self.fail("Pi returned no CPA models. Check the existing CPA enrollment launcher and retry catalog discovery. No direct-provider fallback was used.".into());
+                                break;
+                            }
                             self.models_loaded = true;
                         }
                         _ => {}
@@ -600,6 +608,8 @@ mod tests {
             assert!(catalog.poll(harness));
             assert!(catalog.pi.is_none());
             assert!(catalog.commands_ready());
+            assert!(catalog.installed);
+            assert_eq!(catalog.snapshot()["installed"], true);
             assert_eq!(catalog.models[0].thinking_levels, ["high"]);
             assert!(commands.try_recv().is_err());
         }
@@ -640,6 +650,24 @@ mod tests {
         assert_eq!(catalog.models[1].context_window, Some(32000));
         assert_eq!(catalog.models[1].supports_images, Some(false));
         assert!(catalog.loaded.is_some());
+    }
+    #[test]
+    fn a_pi_response_without_cpa_models_is_an_explicit_failure() {
+        let (pi, _, events) = Pi::test_connection();
+        let mut catalog = Catalog {
+            pi: Some(pi),
+            ..Default::default()
+        };
+        events
+            .send(Event::Record(
+                json!({"type":"response","command":"get_available_models",
+            "success":true,"data":{"models":[{"provider":"direct","id":"not-cpa"}]}}),
+            ))
+            .unwrap();
+        assert!(catalog.poll());
+        assert!(catalog.models.is_empty());
+        assert!(catalog.error.as_deref().unwrap().contains("no CPA models"));
+        assert!(!catalog.loading());
     }
 
     #[test]

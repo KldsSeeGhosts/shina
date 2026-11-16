@@ -132,6 +132,8 @@ If the server dies during release preparation before a detached helper takes own
 
 Release discovery is a metadata-only check, independent of the desktop's prepared download. `server.updateStatus` with `refresh: true` starts a bounded background check and returns its `release` state, latest tag and platform-asset availability. Failed checks never mean "up to date". The controller also checks published metadata for legacy servers, requiring all supported platform assets before offering those servers the release. It never substitutes its running version for an unknown release. A current desktop with an older local service still offers the service update through the existing receipted request and saves that exact handoff before the restart.
 
+The desktop updater and fleet discovery share `updates/release-check.json` under an OS file lock, including across processes. Automatic checks reuse metadata for 15 minutes. Explicit checks can refresh after one minute, but cannot bypass a cached GitHub rate-limit cooldown of one hour. Rate limiting is distinct from an authentication denial, never changes credentials, and appears as a Shina app-update notice rather than a provider-update failure.
+
 Desktop restart checks read Local's blocker even when the open conversation belongs to another machine. A busy remote thread cannot prevent an otherwise idle local update. Unsaved rename/captain editors still block closing the window.
 
 ### Provider updates and interrupted restart recovery
