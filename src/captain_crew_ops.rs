@@ -276,7 +276,15 @@ impl State {
     ) -> Result<Value, String> {
         keys(
             args,
-            &["captain", "project", "title", "input", "target", "access"],
+            &[
+                "captain",
+                "project",
+                "title",
+                "input",
+                "target",
+                "access",
+                "placement",
+            ],
         )?;
         if args
             .get("captain")
@@ -292,6 +300,27 @@ impl State {
             .filter(|id| *id < usize::MAX)
             .ok_or("Thread IDs are exhausted.")?;
         self.crew_database()?;
+        #[cfg(test)]
+        let git_ctx = self.test_git_context.clone().unwrap_or_default();
+        #[cfg(not(test))]
+        let git_ctx = crate::vcs::GitContext::default();
+        let placement = self.plan_thread_placement(
+            &thread,
+            placement::spec_from_args(args)?.as_ref(),
+            &format!("crew:{intent_id}"),
+            "local",
+            &git_ctx,
+        )?;
+        if placement.read_only() {
+            thread.native.access = AccessMode::ReadOnly;
+        }
+        let pending = placement.phase == placement::PlacementPhase::Pending;
+        if matches!(placement.mode, placement::PlacementMode::Existing) {
+            thread.worktree_path = placement.checkout.clone();
+            thread.branch = placement.branch.clone();
+            thread.env_mode = Some(ThreadEnvMode::Worktree);
+        }
+        thread.placement = Some(placement);
         attachments::stage_prompt_files(&mut prompt)?;
         let id = thread.id;
         thread.server_owned = true;
@@ -301,7 +330,9 @@ impl State {
         let index = self.threads.len() - 1;
         self.sync_memory_links();
         self.refresh_captain_contexts();
-        self.connect_thread(index);
+        if !pending {
+            self.connect_thread(index);
+        }
         // A synchronous startup refusal restores the prompt to a draft. Save
         // that exact input in this creation transaction, not on a later tick.
         if self.threads[index].has_draft_content() {
@@ -312,7 +343,8 @@ impl State {
         self.persistence_scope = None;
         Ok(
             json!({"saved":true,"captain":captain,"threadId":id,"runId":self.threads[index].run_id,
-            "runtimeGeneration":self.threads[index].request_generation}),
+            "runtimeGeneration":self.threads[index].request_generation,
+            "placement":self.threads[index].placement.as_ref().map(placement::ThreadPlacement::value)}),
         )
     }
 
@@ -351,7 +383,19 @@ impl State {
         // Existing queues serialize as held input at restart. Never rebuild a
         // follow-up by replaying its tool receipt.
         thread.drive_session();
-        if self.threads[index].pi.is_none() {
+        if self.threads[index]
+            .placement
+            .as_ref()
+            .is_some_and(|placement| placement.phase == placement::PlacementPhase::Failed)
+        {
+            self.request_reprovision(index);
+        }
+        if self.threads[index].pi.is_none()
+            && self.threads[index]
+                .placement
+                .as_ref()
+                .is_none_or(|placement| placement.phase == placement::PlacementPhase::Ready)
+        {
             self.connect_thread(index);
         }
         self.persistence_scope = None;
@@ -445,7 +489,10 @@ impl State {
         }
         let result = match tool {
             "captain_crew_create" => {
-                keys(&intent, &["prompt", "project", "title", "target"])?;
+                keys(
+                    &intent,
+                    &["prompt", "project", "title", "target", "placement"],
+                )?;
                 let prompt = intent["prompt"]
                     .as_str()
                     .filter(|text| !text.trim().is_empty() && text.len() <= 64000)

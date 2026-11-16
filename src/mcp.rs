@@ -304,6 +304,20 @@ pub fn tools() -> Value {
     crew_target["description"] = json!(
         "Optional local model and harness selection. Omit to inherit the Captain's selection. Explicit unsupported choices reject before a crew root is allocated."
     );
+    let placement = json!({
+        "type":"object",
+        "description":"The worker's checkout placement. Omit for the default: an isolated Git worktree on its own branch, or the shared project checkout when the workspace is not a Git repository. shared runs read-only in the project checkout and sees its uncommitted changes. existing selects a registered worktree by path or branch. isolated accepts one base from baseBranch, baseCommit or upstreamThreadId; startFromOrigin applies to a base branch.",
+        "properties":{
+            "mode":{"enum":["shared","isolated","existing"]},
+            "baseBranch":{"type":"string","minLength":1,"description":"The branch the new worktree starts from."},
+            "baseCommit":{"type":"string","minLength":1,"description":"The commit the new worktree starts from."},
+            "upstreamThreadId":{"type":"integer","minimum":1,"description":"A ready crew or delegated thread whose worktree branch becomes the base."},
+            "startFromOrigin":{"type":"boolean","description":"Fetch and start from the remote-tracking ref of the base branch."},
+            "branch":{"type":"string","minLength":1,"description":"An explicit name for the new worktree branch."},
+            "worktree":{"type":"string","minLength":1,"description":"existing mode only: a registered worktree's absolute path or branch name."}
+        },
+        "additionalProperties":false
+    });
     let mut tools = json!([
         {
             "name":"html_render",
@@ -380,6 +394,7 @@ pub fn tools() -> Value {
                 "captain": {"type":"string","description":"Optional assertion of the calling captain's name. Crew inherits the coordinator's project and profile."},
                 "workspace": {"oneOf":[{"type":"integer"},{"type":"string"}],"description":"Local project id or path in the caller's scope. Required with several local scoped workspaces. For remote work this is a legacy alias for an explicitly scoped target-owned id or opaque path; prefer target.projectId."},
                 "target": target,
+                "placement": placement,
                 "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Stable retry key for local and remote delegation, scoped to the calling Captain or thread. Reuse it with identical arguments after an uncertain response; a changed brief, target or workspace fails. wait_seconds is a response option outside the keyed intent."},
                 "wait_seconds": wait
             },"required":["prompt"],"allOf":[{"not":{"required":["workspace","target"],"properties":{"target":{"required":["projectId"]}}}}]}
@@ -494,13 +509,14 @@ pub fn tools() -> Value {
     let crew_tools = json!([
         {
             "name":"captain_crew_create",
-            "description":"Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. Crew starts in that workspace, not a new Git worktree. prompt accepts at most 64000 UTF-8 bytes.",
+            "description":"Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. By default the worker gets a new isolated Git worktree on its own branch; placement selects a shared read-only project checkout or an existing worktree instead. prompt accepts at most 64000 UTF-8 bytes.",
             "inputSchema":{"type":"object","properties":{
                 "requestId":{"type":"string","format":"uuid"},
                 "prompt":{"type":"string","minLength":1,"maxLength":64000},
                 "project":{"type":["integer","null"],"minimum":1},
                 "title":{"type":"string","minLength":1,"maxLength":200},
-                "target":crew_target
+                "target":crew_target,
+                "placement":placement
             },"required":["requestId","prompt"],"additionalProperties":false},
             "annotations":{"readOnlyHint":false,"destructiveHint":false}
         },
@@ -1373,7 +1389,7 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
         let expected = [
             (
                 "captain_crew_create",
-                "Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. Crew starts in that workspace, not a new Git worktree. prompt accepts at most 64000 UTF-8 bytes.",
+                "Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. By default the worker gets a new isolated Git worktree on its own branch; placement selects a shared read-only project checkout or an existing worktree instead. prompt accepts at most 64000 UTF-8 bytes.",
                 json!(["requestId", "prompt"]),
             ),
             (
