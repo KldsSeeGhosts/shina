@@ -22336,9 +22336,17 @@ mod tests {
         let empty_cfg_ok = root_ok.join("empty.gitconfig");
         std::fs::write(&empty_cfg_ok, "").unwrap();
         let repo_ok = init_temp_git_repo(&root_ok, &empty_cfg_ok);
+        let setup_command = if cfg!(windows) {
+            "Write-Output line1; Set-Content -LiteralPath setup.marker -Value setup-done"
+        } else {
+            "echo line1 && echo setup-done > setup.marker"
+        };
         std::fs::write(
             repo_ok.join("t3.json"),
-            r#"{"scripts":[{"name":"Setup","command":"echo line1 && echo setup-done > setup.marker","runOnWorktreeCreate":true}]}"#,
+            json!({"scripts":[{
+                "name":"Setup", "command":setup_command, "runOnWorktreeCreate":true
+            }]})
+            .to_string(),
         )
         .unwrap();
         {
@@ -22448,10 +22456,17 @@ mod tests {
         std::fs::write(&empty_cfg_fail, "").unwrap();
         let repo_fail = init_temp_git_repo(&root_fail, &empty_cfg_fail);
         let gate_file = root_fail.join("allow_pass");
-        let cmd_str = format!(
-            "if [ -f '{}' ]; then echo retry-ok; else echo failing-tail; exit 2; fi",
-            gate_file.display()
-        );
+        let cmd_str = if cfg!(windows) {
+            format!(
+                "if (Test-Path -LiteralPath '{}') {{ Write-Output retry-ok }} else {{ Write-Output failing-tail; exit 2 }}",
+                gate_file.to_string_lossy().replace('\'', "''")
+            )
+        } else {
+            format!(
+                "if [ -f '{}' ]; then echo retry-ok; else echo failing-tail; exit 2; fi",
+                gate_file.display()
+            )
+        };
         std::fs::write(
             repo_fail.join("t3.json"),
             json!({
