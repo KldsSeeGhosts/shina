@@ -2216,16 +2216,19 @@ fn readiness(directory: &Path, expected: &str) -> Result<(), String> {
     let mut evidence = ReadinessEvidence::default();
     while Instant::now() < deadline {
         evidence.started |= directory.join("server-started.pid").is_file();
-        if let Ok(discovery) = crate::server_auth::Discovery::read(directory)
-            && crate::process::is_alive(discovery.pid)
-        {
-            evidence.started = true;
+        if let Ok(discovery) = crate::server_auth::Discovery::read(directory) {
             evidence.version = Some(discovery.binary_version.clone());
-            if discovery.binary_version != expected.trim_start_matches('v') {
-                return Err(evidence.failure(expected));
-            }
+            // Windows may deny the watch a handle to an elevated server. Its
+            // authenticated RPC verifies the profile and instance without that
+            // privilege, and also rejects a stale discovery file.
             match crate::maintenance::rpc(directory, "server.status", serde_json::json!({})) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    evidence.started = true;
+                    if discovery.binary_version != expected.trim_start_matches('v') {
+                        return Err(evidence.failure(expected));
+                    }
+                    return Ok(());
+                }
                 Err(error) => evidence.rpc_error = Some(redact(&error)),
             }
         }
