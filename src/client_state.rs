@@ -1526,7 +1526,9 @@ impl State {
                 crate::client::Event::Maintenance(method, mut params) => {
                     if method == "server.draining" {
                         params["pid"] = json!(std::process::id());
-                        let saved = self.checkpoint_and_flush();
+                        let saved = self
+                            .checkpoint_and_flush()
+                            .and_then(|()| self.prepare_fleet_service_restart());
                         let (method, params) = match saved {
                             Ok(()) => ("server.clientReady", params),
                             Err(error) => {

@@ -258,6 +258,9 @@ impl RuntimeState {
             }
         }
         if command.method == "server.updateStatus" {
+            if command.params["refresh"] == true {
+                self.updates.release.refresh(true);
+            }
             if self.updates.poll(&self.state.data_dir) {
                 self.record_update()?;
                 if let Some(db) = &self.database {

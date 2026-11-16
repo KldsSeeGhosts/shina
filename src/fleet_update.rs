@@ -68,6 +68,8 @@ impl Host for InstalledHost {
 }
 
 pub struct ServerUpdates {
+    pub release: crate::update::ReleaseDiscovery,
+    release_target: Option<crate::install::InstalledTarget>,
     pub phase: String,
     pub id: Option<String>,
     pub tag: String,
@@ -106,6 +108,8 @@ impl ServerUpdates {
             .as_str()
             .filter(|id| outcome.as_ref().is_none_or(|o| o.update_id != *id));
         let mut updates = Self {
+            release: Default::default(),
+            release_target: self_update_target(directory),
             phase: if diagnostic.is_some() {
                 "checking"
             } else if pending.is_some() {
@@ -260,7 +264,8 @@ impl ServerUpdates {
             .unwrap_or(&self.phase);
         json!({"runningVersion":env!("CARGO_PKG_VERSION"),"canSelfUpdate":self.capable,
             "state":phase,"updateId":self.id,"tag":self.tag,"lastOutcome":self.outcome,"blocker":blocker,
-            "diagnostic":self.diagnostic})
+            "diagnostic":self.diagnostic,
+            "release":self.release.for_target(self.release_target.as_ref())})
     }
     /// Called only after the accepted receipt and audit row commit.
     pub fn start(&mut self, directory: PathBuf, id: String) {
@@ -304,6 +309,7 @@ impl ServerUpdates {
     }
     pub fn poll(&mut self, directory: &Path) -> bool {
         let before = self.status(None, &Value::Null);
+        let release_changed = self.release.poll();
         let mut disconnected = false;
         if let Some(events) = &self.events {
             loop {
@@ -350,7 +356,7 @@ impl ServerUpdates {
             .last_probe
             .is_none_or(|probed| probed.elapsed() >= PROBE_INTERVAL);
         if !probe_due {
-            return before != self.status(None, &Value::Null);
+            return release_changed || before != self.status(None, &Value::Null);
         }
         if self.phase == "checking" && self.id.is_none() {
             self.last_probe = Some(Instant::now());
@@ -379,7 +385,7 @@ impl ServerUpdates {
         if !self.active() && self.host.is_none() {
             self.host = Some(Box::new(InstalledHost));
         }
-        before != self.status(None, &Value::Null)
+        release_changed || before != self.status(None, &Value::Null)
     }
 }
 
@@ -498,6 +504,10 @@ pub struct Row {
     pub target: String,
     pub state: String,
     pub eligible: bool,
+    /// An already-current desktop can still have an older local service.
+    pub local_server_only: bool,
+    /// Read-only hello/update status used to re-plan after release discovery.
+    pub probe: Option<Value>,
     pub failed: bool,
     pub update_id: Option<String>,
     pub prior_outcome: Option<String>,
@@ -567,6 +577,7 @@ struct ProviderSend {
 
 #[derive(Default)]
 pub struct Fleet {
+    pub release: crate::update::ReleaseDiscovery,
     pub open: bool,
     pub running: bool,
     pub rows: Vec<Row>,
@@ -608,6 +619,166 @@ pub struct Fleet {
     pub postponed_local: bool,
 }
 impl crate::model::State {
+    fn discovered_target(&self, status: &Value) -> Result<Option<String>, String> {
+        // New services resolve their own platform release. Older services use the
+        // controller's metadata-only catalog, never its executable version.
+        let own = &status["release"];
+        let fallback = self.fleet.release.view();
+        let use_own =
+            own.is_object() && (own["state"] != "checking" || fallback["state"] != "checked");
+        let catalog = if use_own { own.clone() } else { fallback };
+        match catalog["state"].as_str() {
+            Some("failed") => Err(catalog["error"]
+                .as_str()
+                .unwrap_or("Release check failed.")
+                .into()),
+            Some("checked") => {
+                if use_own && own["assetAvailable"] == false {
+                    return Err("The latest release has no download for this machine.".into());
+                }
+                // Legacy hello has no OS/architecture. Only offer a fleet release
+                // once all supported platforms have actually been published.
+                if !use_own
+                    && ![
+                        "shina.exe",
+                        "Shina-macos-aarch64.zip",
+                        "Shina-linux-x86_64.tar.gz",
+                    ]
+                    .iter()
+                    .all(|name| {
+                        catalog["assets"].as_array().is_some_and(|assets| {
+                            assets.iter().any(|asset| {
+                                asset["name"] == *name && asset["size"].as_u64().unwrap_or(0) > 0
+                            })
+                        })
+                    })
+                {
+                    return Err(
+                        "The latest release is not published for every platform yet.".into(),
+                    );
+                }
+                catalog["tag"]
+                    .as_str()
+                    .map(|tag| Some(tag.to_owned()))
+                    .ok_or_else(|| "The release check returned no version.".into())
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn plan_fleet_versions(&mut self) -> bool {
+        self.plan_fleet_versions_for(env!("CARGO_PKG_VERSION"))
+    }
+    fn plan_fleet_versions_for(&mut self, app_version: &str) -> bool {
+        if self.fleet.running || !self.fleet.open {
+            return false;
+        }
+        let mut changed = false;
+        for index in 0..self.fleet.rows.len() {
+            let row = &self.fleet.rows[index];
+            if row.server != "local" && row.probe.is_none() {
+                continue;
+            }
+            let probe = row.probe.clone().unwrap_or(Value::Null);
+            let status = self
+                .machines
+                .views
+                .get(&row.server)
+                .map(|view| &view["updateStatus"])
+                .filter(|status| status["release"].is_object() || row.server == "local")
+                .cloned()
+                .unwrap_or_else(|| probe["status"].clone());
+            let discovered = self.discovered_target(&status);
+            let local = row.server == "local";
+            let current = row.current.clone();
+            let mut target = String::new();
+            let mut eligible = false;
+            let mut local_server_only = false;
+            let state = match discovered {
+                Err(error) => format!("skipped: {error}"),
+                Ok(None) => "checking".into(),
+                Ok(Some(tag)) => {
+                    target = tag;
+                    if local {
+                        let server_version = status["runningVersion"].as_str().unwrap_or(&current);
+                        let app_behind = crate::update::is_newer(&target, app_version);
+                        let server_behind = crate::update::is_newer(&target, server_version);
+                        if self.client.is_some() && !status["runningVersion"].is_string() {
+                            "checking".into()
+                        } else if let Some(blocker) = self
+                            .update_restart_blocker()
+                            .filter(|_| app_behind || server_behind)
+                        {
+                            format!("skipped: {blocker}")
+                        } else if app_behind {
+                            if self
+                                .updater
+                                .prepared_update()
+                                .is_some_and(|update| update.tag == target)
+                            {
+                                eligible = true;
+                                "will update app and service".into()
+                            } else {
+                                self.updater.check_for_newer_prepared(&target);
+                                if let Some(error) = self.updater.notice() {
+                                    format!("skipped: {error}")
+                                } else {
+                                    "waiting for desktop download".into()
+                                }
+                            }
+                        } else if server_behind && self.client.is_some() {
+                            let hello = self
+                                .client
+                                .as_ref()
+                                .unwrap()
+                                .info
+                                .lock()
+                                .expect("connection info")
+                                .clone();
+                            if let Some(reason) = skip_reason(true, &hello, &status, &target) {
+                                format!("skipped: {reason}")
+                            } else {
+                                eligible = true;
+                                local_server_only = true;
+                                "will update local service".into()
+                            }
+                        } else {
+                            "up to date".into()
+                        }
+                    } else if let Some(reason) =
+                        skip_reason(true, &probe["hello"], &status, &target)
+                    {
+                        format!("skipped: {reason}")
+                    } else if crate::update::is_newer(&target, &current) {
+                        eligible = true;
+                        "will update".into()
+                    } else {
+                        "up to date".into()
+                    }
+                }
+            };
+            let row = &mut self.fleet.rows[index];
+            if !target.is_empty() && crate::update::is_newer(&current, &target) {
+                target = current;
+            }
+            changed |= row.target != target
+                || row.state != state
+                || row.eligible != eligible
+                || row.local_server_only != local_server_only;
+            row.target = target;
+            row.state = state;
+            row.eligible = eligible;
+            row.local_server_only = local_server_only;
+            if local_server_only {
+                row.current = status["runningVersion"]
+                    .as_str()
+                    .unwrap_or(&row.current)
+                    .to_owned();
+            }
+        }
+        changed
+    }
+
     /// KSG's `hello.capabilities` + `canUpdate` gate for provider rows on a machine.
     /// Older machines get no provider row and no skip line for providers.
     fn provider_capable(&self, server: &str) -> bool {
@@ -720,11 +891,6 @@ impl crate::model::State {
     /// Machines whose server this run can move to the target release (KSG
     /// `collectServerUpdateTargets` on the client side).
     fn server_update_targets(&self) -> usize {
-        let target = self
-            .updater
-            .prepared_update()
-            .map(|u| u.tag.clone())
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
         let mut counted: std::collections::HashSet<String> = Default::default();
         if let Some(client) = &self.client {
             for (id, remote) in &client.linked {
@@ -736,9 +902,6 @@ impl crate::model::State {
                         .unwrap_or("")
                         .to_owned()
                 });
-                if !crate::update::is_newer(&target, &current) {
-                    continue;
-                }
                 let hello = remote.info.lock().expect("connection info").clone();
                 let status = self
                     .machines
@@ -746,6 +909,12 @@ impl crate::model::State {
                     .get(id)
                     .map(|view| view["updateStatus"].clone())
                     .unwrap_or(Value::Null);
+                let Ok(Some(target)) = self.discovered_target(&status) else {
+                    continue;
+                };
+                if !crate::update::is_newer(&target, &current) {
+                    continue;
+                }
                 let online = remote.commands.connected();
                 if skip_reason(online, &hello, &status, &target).is_none() {
                     counted.insert(id.clone());
@@ -754,7 +923,32 @@ impl crate::model::State {
         }
         // Only connected, eligible linked machines count; a stale cached view for a
         // machine that is not linked right now must not join the summary.
-        counted.len()
+        let local_status = self
+            .machines
+            .views
+            .get("local")
+            .map(|view| &view["updateStatus"])
+            .unwrap_or(&Value::Null);
+        let local_service = self
+            .discovered_target(local_status)
+            .ok()
+            .flatten()
+            .is_some_and(|target| {
+                !crate::update::is_newer(&target, env!("CARGO_PKG_VERSION"))
+                    && local_status["runningVersion"]
+                        .as_str()
+                        .is_some_and(|version| crate::update::is_newer(&target, version))
+                    && self.client.as_ref().is_some_and(|client| {
+                        skip_reason(
+                            client.commands.connected(),
+                            &client.info.lock().expect("connection info"),
+                            local_status,
+                            &target,
+                        )
+                        .is_none()
+                    })
+            });
+        counted.len() + usize::from(local_service)
     }
     /// KSG `describeUpdateEverything`'s button summary, or None when nothing updates:
     /// "Update this app, 2 servers and 3 providers".
@@ -796,17 +990,15 @@ impl crate::model::State {
             self.fleet.open = true;
             return;
         }
-        let target = self
-            .updater
-            .prepared_update()
-            .map(|u| u.tag.clone())
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into());
-        let local_update = self.updater.prepared_update().is_some();
+        let target = String::new();
         let restored = self.fleet.restored;
         let pill_dismissed = std::mem::take(&mut self.fleet.pill_dismissed);
         let pill_visible_after = self.fleet.pill_visible_after.take();
         let pill = self.fleet.pill.take();
+        let mut release = std::mem::take(&mut self.fleet.release);
+        release.refresh(true);
         self.fleet = Fleet {
+            release,
             open: true,
             restored,
             pill_dismissed,
@@ -825,14 +1017,7 @@ impl crate::model::State {
             name: "Local".into(),
             current: env!("CARGO_PKG_VERSION").into(),
             target: target.clone(),
-            state: if local_update {
-                self.update_restart_blocker()
-                    .map(|s| format!("skipped: {s}"))
-                    .unwrap_or("will update".into())
-            } else {
-                "up to date".into()
-            },
-            eligible: local_update && self.update_restart_blocker().is_none(),
+            state: "checking".into(),
             provider_capable: local_capable,
             providers: local_providers,
             ..Default::default()
@@ -898,7 +1083,7 @@ impl crate::model::State {
                                 caps.iter().any(|cap| cap == PROVIDER_UPDATES)
                             });
                         let status = if hello["canUpdate"] == true && hello["protocolMinor"].as_u64().unwrap_or(0) >= 6 {
-                            crate::client::remote_rpc(&link, "server.updateStatus", json!({})).await?
+                            crate::client::remote_rpc(&link, "server.updateStatus", json!({"refresh":true})).await?
                         } else { Value::Null };
                         let skipped = skip_reason(true, &hello, &status, &target);
                         let providers = if capable {
@@ -908,7 +1093,7 @@ impl crate::model::State {
                                 .and_then(|value| value["providers"].as_array().cloned())
                                 .unwrap_or_default()
                         } else { Vec::new() };
-                        Ok(json!({"current":hello["binaryVersion"],"skip":skipped,"status":status,
+                        Ok(json!({"current":hello["binaryVersion"],"hello":hello,"skip":skipped,"status":status,
                             "providerCapable":capable,"providers":providers}))
                     }));
                     let _ = send.send((index, result, false));
@@ -916,6 +1101,7 @@ impl crate::model::State {
                 });
             }
         }
+        self.plan_fleet_versions();
     }
     /// An unreceipted `providers.refresh` for one machine. The answer lands on
     /// `fleet_rpc`; the next projection carries the same statuses regardless.
@@ -1208,7 +1394,7 @@ impl crate::model::State {
             .fleet
             .rows
             .first()
-            .is_some_and(|r| r.server == "local" && r.eligible)
+            .is_some_and(|r| r.server == "local" && r.eligible && !r.local_server_only)
         {
             self.updater.prepared_update().map(|u| u.tag.clone())
         } else {
@@ -1246,7 +1432,8 @@ impl crate::model::State {
                     message: None,
                 })
                 .collect();
-            row.server_target = if row.server != "local" && row.eligible {
+            row.server_target = if (row.server != "local" || row.local_server_only) && row.eligible
+            {
                 Some(row.target.clone())
             } else {
                 None
@@ -1306,7 +1493,7 @@ impl crate::model::State {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.server != "local" && r.server_target.is_some() && r.result.is_none())
+            .filter(|(_, r)| r.server_target.is_some() && r.result.is_none())
             .map(|(i, _)| i)
             .collect();
         for index in indices {
@@ -1315,7 +1502,7 @@ impl crate::model::State {
         }
     }
     pub fn start_fleet_row(&mut self, index: usize) {
-        if self.fleet.rows[index].server == "local" {
+        if self.fleet.rows[index].server == "local" && !self.fleet.rows[index].local_server_only {
             self.restart_notice = None;
             if let Some(blocker) = self.update_restart_blocker() {
                 self.fleet.rows[0].state = format!("failed: {blocker}");
@@ -1337,9 +1524,12 @@ impl crate::model::State {
             self.fleet.rows[index].state = format!("updated to {target}");
             return;
         }
-        let Some(link) = self.fleet.rows[index].link.clone() else {
+        let local = self.fleet.rows[index].local_server_only;
+        let link = self.fleet.rows[index].link.clone();
+        if !local && link.is_none() {
             return;
-        };
+        }
+        let directory = self.data_dir.clone();
         let Some(send) = self.fleet.sender.clone() else {
             return;
         };
@@ -1369,11 +1559,19 @@ impl crate::model::State {
             let result = tokio::runtime::Runtime::new()
                 .map_err(|e| e.to_string())
                 .and_then(|rt| {
-                    rt.block_on(crate::client::remote_rpc(
-                        &link,
-                        "server.requestUpdate",
-                        json!({}),
-                    ))
+                    rt.block_on(async {
+                        if local {
+                            crate::client::local_rpc(&directory, "server.requestUpdate", json!({}))
+                                .await
+                        } else {
+                            crate::client::remote_rpc(
+                                link.as_ref().unwrap(),
+                                "server.requestUpdate",
+                                json!({}),
+                            )
+                            .await
+                        }
+                    })
                 });
             let _ = send.send((index, result, true));
             wake();
@@ -1381,14 +1579,11 @@ impl crate::model::State {
     }
     /// The machine's server already runs `target` (KSG `runsVersion`).
     fn machine_runs_version(&self, server: &str, target: &str) -> bool {
-        let running = if server == "local" {
-            Some(env!("CARGO_PKG_VERSION"))
-        } else {
-            self.machines
-                .views
-                .get(server)
-                .and_then(|view| view["updateStatus"]["runningVersion"].as_str())
-        };
+        let running = self
+            .machines
+            .views
+            .get(server)
+            .and_then(|view| view["updateStatus"]["runningVersion"].as_str());
         running
             .is_some_and(|running| !running.is_empty() && !crate::update::is_newer(target, running))
     }
@@ -1444,7 +1639,11 @@ impl crate::model::State {
     /// `self.record_fleet_restart_result(&error)`. A coordinated-restart "error" is a
     /// pending state, not a refusal.
     pub fn record_fleet_restart_result(&mut self, error: &str) {
-        if self.fleet.phase != RunPhase::Installing
+        let service_restart =
+            self.fleet.rows.iter().any(|row| {
+                row.server == "local" && row.local_server_only && row.handed_off.is_some()
+            });
+        if (self.fleet.phase != RunPhase::Installing && !service_restart)
             || error.starts_with("Coordinated restart requested")
         {
             return;
@@ -1457,6 +1656,11 @@ impl crate::model::State {
             ));
         }
         self.record_local_failure(format!("This app: {error}"));
+        if service_restart
+            && let Some(row) = self.fleet.rows.iter_mut().find(|row| row.server == "local")
+        {
+            row.handed_off = None;
+        }
         self.fleet.phase = RunPhase::Servers;
         self.fleet.local_version = None;
     }
@@ -1516,6 +1720,23 @@ impl crate::model::State {
         std::fs::create_dir_all(path.parent().unwrap_or(&self.data_dir))
             .map_err(|e| e.to_string())?;
         crate::store::write_atomic(&path, saved.to_string().as_bytes()).map_err(|e| e.to_string())
+    }
+    pub fn prepare_fleet_service_restart(&mut self) -> Result<(), String> {
+        let Some(row) = self.fleet.rows.iter_mut().find(|row| {
+            row.server == "local" && row.local_server_only && row.attempted && row.result.is_none()
+        }) else {
+            return Ok(());
+        };
+        let id = row
+            .update_id
+            .clone()
+            .ok_or("The local service update receipt has not arrived. Restart cancelled.")?;
+        row.handed_off = Some(HandedOff {
+            target: row.target.clone(),
+            update_id: id,
+            started_ms: crate::lifecycle::now() as i64,
+        });
+        self.save_update_everything()
     }
     /// One failure line per machine/provider result, for the saved file and the notice.
     fn run_failures(&self) -> Vec<String> {
@@ -1985,6 +2206,13 @@ impl crate::model::State {
     }
     pub fn poll_fleet(&mut self) -> bool {
         let mut changed = false;
+        if !self.headless && !self.demo {
+            self.fleet.release.refresh(false);
+            changed |= self.fleet.release.poll();
+            if let Some(wait) = self.fleet.release.remaining() {
+                self.schedule_fleet_wake(Instant::now() + wait);
+            }
+        }
         if !self.fleet.restored {
             self.restore_update_everything();
             changed = true;
@@ -2010,6 +2238,7 @@ impl crate::model::State {
                     row.state = "downloading".into();
                 }
                 Ok(value) if !requested => {
+                    row.probe = Some(value.clone());
                     row.prior_outcome = value["status"]["lastOutcome"]["updateId"]
                         .as_str()
                         .map(str::to_owned);
@@ -2021,14 +2250,7 @@ impl crate::model::State {
                     }
                     self.fleet.refresh_pending.remove(&row.server);
                     self.fleet.refreshing = self.fleet.refresh_pending.len();
-                    row.state = if let Some(reason) = value["skip"].as_str() {
-                        format!("skipped: {reason}")
-                    } else if crate::update::is_newer(&row.target, &row.current) {
-                        row.eligible = true;
-                        "will update".into()
-                    } else {
-                        "up to date".into()
-                    };
+                    row.state = "checking".into();
                     let server = row.server.clone();
                     let providers = row.providers_view.clone();
                     let _ = row;
@@ -2066,6 +2288,7 @@ impl crate::model::State {
                 }
             }
         }
+        changed |= self.plan_fleet_versions();
         // Provider runs settle from the projection: the record with the accepted
         // updateId reaching a terminal status. `succeeded` counts; `unchanged` and
         // `failed` record "<machine> <Name>: <message>".
@@ -2291,12 +2514,7 @@ impl crate::model::State {
             .filter(|r| !self.machine_connected(&r.server))
             .map(|r| r.server.clone())
             .collect();
-        for row in self
-            .fleet
-            .rows
-            .iter_mut()
-            .filter(|r| r.server != "local" && r.attempted)
-        {
+        for row in self.fleet.rows.iter_mut().filter(|r| r.attempted) {
             if let Some(view) = self.machines.views.get(&row.server) {
                 let status = &view["updateStatus"];
                 let outcome = &status["lastOutcome"];
@@ -2472,10 +2690,7 @@ impl crate::model::State {
         // The local install waits for every server handoff, then counts down 5 s. A
         // download still running delays the countdown (KSG `downloadLocal`).
         let servers_pending = self.fleet.rows.iter().any(|row| {
-            row.server != "local"
-                && row.server_target.is_some()
-                && row.result.is_none()
-                && row.handed_off.is_none()
+            row.server_target.is_some() && row.result.is_none() && row.handed_off.is_none()
         });
         if self.fleet.phase == RunPhase::Servers
             && self.fleet.local_version.is_some()
@@ -2740,6 +2955,8 @@ impl Default for Row {
             target: String::new(),
             state: String::new(),
             eligible: false,
+            local_server_only: false,
+            probe: None,
             failed: false,
             update_id: None,
             prior_outcome: None,
@@ -3667,6 +3884,141 @@ mod tests {
             "disabledReason": null, "manualCommand": null
         })
     }
+    fn catalog(tag: &str) -> Value {
+        json!({"state":"checked","tag":tag,"assets":[
+            {"name":"shina.exe","size":1},
+            {"name":"Shina-macos-aarch64.zip","size":1},
+            {"name":"Shina-linux-x86_64.tar.gz","size":1}
+        ]})
+    }
+    #[test]
+    fn services_discover_a_release_without_a_prepared_desktop_download() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.open = true;
+        state.fleet.release.set(catalog("v0.12.39"));
+        for (id, version) in [("old", "0.12.34"), ("new", "0.12.39")] {
+            state.fleet.rows.push(Row {
+                server: id.into(),
+                current: version.into(),
+                state: "checking".into(),
+                probe: Some(json!({"hello":{"protocolMinor":36,"canUpdate":true},
+                    "status":{"runningVersion":version,"canSelfUpdate":true,"state":"idle"}})),
+                ..Default::default()
+            });
+        }
+        state.plan_fleet_versions();
+        assert!(state.updater.prepared_update().is_none());
+        assert!(state.fleet.rows[0].eligible);
+        assert_eq!(state.fleet.rows[0].target, "v0.12.39");
+        assert_eq!(state.fleet.rows[1].state, "up to date");
+        assert!(!state.fleet.rows[1].eligible);
+        assert_eq!(state.fleet.rows[1].target, "v0.12.39");
+    }
+    #[test]
+    fn failed_and_pending_release_checks_never_claim_up_to_date() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.open = true;
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            current: "0.12.34".into(),
+            probe: Some(json!({"hello":{"protocolMinor":36,"canUpdate":true},
+                "status":{"runningVersion":"0.12.34","canSelfUpdate":true}})),
+            ..Default::default()
+        });
+        state.plan_fleet_versions();
+        assert_eq!(state.fleet.rows[0].state, "checking");
+        assert!(state.fleet.rows[0].target.is_empty());
+        state
+            .fleet
+            .release
+            .set(json!({"state":"failed","error":"Release check unavailable."}));
+        state.plan_fleet_versions();
+        assert_eq!(
+            state.fleet.rows[0].state,
+            "skipped: Release check unavailable."
+        );
+        assert!(!state.fleet.rows[0].eligible);
+    }
+    #[test]
+    fn each_service_uses_its_own_platform_release_and_missing_assets_are_not_current() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.open = true;
+        state.fleet.release.set(catalog("v0.12.34"));
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            current: "0.12.34".into(),
+            probe: Some(json!({"hello":{"protocolMinor":36,"canUpdate":true},
+                "status":{"runningVersion":"0.12.34","canSelfUpdate":true,
+                    "release":{"state":"checked","tag":"v0.12.39","assetAvailable":true}}})),
+            ..Default::default()
+        });
+        state.plan_fleet_versions();
+        assert_eq!(state.fleet.rows[0].target, "v0.12.39");
+        assert!(state.fleet.rows[0].eligible);
+        state.machines.views.insert(
+            "remote".into(),
+            json!({"updateStatus":{
+                "runningVersion":"0.12.34","canSelfUpdate":true,
+                "release":{"state":"checked","tag":"v0.12.39","assetAvailable":false}
+            }}),
+        );
+        state.plan_fleet_versions();
+        assert!(!state.fleet.rows[0].eligible);
+        assert!(state.fleet.rows[0].state.contains("no download"));
+    }
+    #[test]
+    fn a_current_app_still_plans_an_older_local_service() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"protocolMinor":36,"canUpdate":true});
+        state.client = Some(client);
+        state.fleet.open = true;
+        state.fleet.release.set(catalog("v0.12.39"));
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            current: "0.12.39".into(),
+            ..Default::default()
+        });
+        state.machines.views.insert(
+            "local".into(),
+            json!({"updateStatus":{
+                "runningVersion":"0.12.34","canSelfUpdate":true,"state":"idle"
+            }}),
+        );
+        state.plan_fleet_versions_for("0.12.39");
+        assert!(state.fleet.rows[0].eligible);
+        assert!(state.fleet.rows[0].local_server_only);
+        assert!(state.updater.prepared_update().is_none());
+        assert!(!state.machine_runs_version("local", "0.12.39"));
+    }
+    #[test]
+    fn local_service_only_restart_saves_exact_handoff_and_cancellation_clears_it() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.running = true;
+        state.fleet.phase = RunPhase::Servers;
+        state.fleet.rows.push(Row {
+            server: "local".into(),
+            name: "Local service".into(),
+            target: "v0.12.39".into(),
+            local_server_only: true,
+            attempted: true,
+            update_id: Some("local-attempt".into()),
+            ..Default::default()
+        });
+        state.prepare_fleet_service_restart().unwrap();
+        let path = state.data_dir.join("updates/everything.json");
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved["localVersion"].is_null(),
+            "an unchanged app is not counted as updated"
+        );
+        assert_eq!(saved["handedOff"][0]["server"], "local");
+        assert_eq!(saved["handedOff"][0]["updateId"], "local-attempt");
+        state.record_fleet_restart_result("Update drain cancelled. Normal operation resumed.");
+        assert!(!path.exists());
+        assert!(state.fleet.rows[0].handed_off.is_none());
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+    }
     fn linked(
         state: &mut crate::model::State,
         server: &str,
@@ -3696,6 +4048,7 @@ mod tests {
     #[test]
     fn the_everything_summary_uses_oxford_commas_and_singular_forms() {
         let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.release.set(catalog("v99.0.0"));
         let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
         state.client = Some(client);
         state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
@@ -4415,6 +4768,7 @@ mod tests {
     #[test]
     fn a_stale_unlinked_view_is_not_a_server_update_target() {
         let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.fleet.release.set(catalog("v99.0.0"));
         state.updater = crate::update::Updater::test_ready(prepared("v99.0.0"));
         let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
         state.client = Some(client);

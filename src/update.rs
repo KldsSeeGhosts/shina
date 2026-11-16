@@ -578,21 +578,129 @@ trait UpdateHost: Send + 'static {
 /// The real host: `gh` for metadata and downloads, the filesystem for preparation.
 struct Gh;
 
+fn published_release() -> Result<Value, Failure> {
+    let output = run_gh(
+        &[
+            "release",
+            "view",
+            "--repo",
+            REPOSITORY,
+            "--json",
+            "tagName,assets,isDraft,isPrerelease",
+        ],
+        METADATA_TIMEOUT,
+    )?;
+    let release: Value = serde_json::from_slice(&output)
+        .map_err(|_| Failure::quiet("GitHub returned unreadable release metadata."))?;
+    if release["isDraft"] == true
+        || release["isPrerelease"] == true
+        || release["tagName"]
+            .as_str()
+            .is_none_or(|tag| !is_newer(tag, "0.0.0"))
+        || !release["assets"].is_array()
+    {
+        return Err(Failure::quiet(
+            "GitHub did not return a published Shina release.",
+        ));
+    }
+    Ok(release)
+}
+
+/// Metadata checks do not depend on installation or a prepared desktop download.
+/// Both servers and the desktop use this bounded, read-only background check.
+#[derive(Default)]
+pub struct ReleaseDiscovery {
+    value: Value,
+    events: Option<Receiver<Result<Value, Failure>>>,
+    checked: Option<Instant>,
+    suspended: bool,
+}
+impl ReleaseDiscovery {
+    pub fn refresh(&mut self, force: bool) {
+        if self.events.is_some()
+            || self.suspended
+            || (!force && self.checked.is_some_and(|at| at.elapsed() < INTERVAL))
+        {
+            return;
+        }
+        // Unit tests inject metadata. They never use the user's GitHub login.
+        #[cfg(test)]
+        return;
+        #[cfg(not(test))]
+        {
+            let (send, receive) = mpsc::channel();
+            self.events = Some(receive);
+            self.value = serde_json::json!({"state":"checking"});
+            thread::spawn(move || {
+                let _ = send.send(published_release());
+            });
+        }
+    }
+    pub fn poll(&mut self) -> bool {
+        let result = match self.events.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => result,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                Err(Failure::quiet("The release check stopped unexpectedly."))
+            }
+            _ => return false,
+        };
+        self.events = None;
+        self.checked = Some(Instant::now());
+        self.value = match result {
+            Ok(release) => serde_json::json!({
+                "state":"checked", "tag":release["tagName"], "assets":release["assets"],
+                "checkedAt":crate::lifecycle::now()
+            }),
+            Err(error) => {
+                self.suspended = matches!(error, Failure::Auth(_));
+                serde_json::json!({"state":"failed","error":redact(&failure_text(&error))})
+            }
+        };
+        true
+    }
+    pub fn view(&self) -> Value {
+        if self.value.is_null() {
+            serde_json::json!({"state":"checking"})
+        } else {
+            self.value.clone()
+        }
+    }
+    pub fn remaining(&self) -> Option<Duration> {
+        if self.suspended {
+            return None;
+        }
+        Some(if self.events.is_some() {
+            Duration::from_millis(100)
+        } else {
+            self.checked
+                .map(|at| INTERVAL.saturating_sub(at.elapsed()))
+                .unwrap_or(INTERVAL)
+        })
+    }
+    pub fn for_target(&self, target: Option<&InstalledTarget>) -> Value {
+        let mut view = self.view();
+        if let Some(target) = target {
+            view["asset"] = serde_json::json!(target.asset());
+            view["assetAvailable"] =
+                serde_json::json!(view["assets"].as_array().is_some_and(|assets| {
+                    assets.iter().any(|asset| {
+                        asset["name"] == target.asset() && asset["size"].as_u64().unwrap_or(0) > 0
+                    })
+                }));
+        }
+        view.as_object_mut().unwrap().remove("assets");
+        view
+    }
+    #[cfg(test)]
+    pub fn set(&mut self, value: Value) {
+        self.value = value;
+        self.checked = Some(Instant::now());
+    }
+}
+
 impl UpdateHost for Gh {
     fn fetch_release(&mut self, target: &InstalledTarget) -> Result<Option<Release>, Failure> {
-        let output = run_gh(
-            &[
-                "release",
-                "view",
-                "--repo",
-                REPOSITORY,
-                "--json",
-                "tagName,assets",
-            ],
-            METADATA_TIMEOUT,
-        )?;
-        let release: Value = serde_json::from_slice(&output)
-            .map_err(|_| Failure::quiet("GitHub returned unreadable release metadata."))?;
+        let release = published_release()?;
         let Some(tag) = release["tagName"].as_str() else {
             return Err(Failure::quiet("The latest release has no tag."));
         };
@@ -2708,6 +2816,17 @@ pub fn coordinated_helper() -> Result<(), String> {
 }
 
 impl Updater {
+    /// A verified older download must not freeze fleet planning on that release.
+    pub fn check_for_newer_prepared(&mut self, latest: &str) {
+        if self
+            .prepared_update()
+            .is_some_and(|update| is_newer(latest, &update.tag))
+        {
+            self.clear_manifest();
+            self.status = Status::Idle;
+            self.next_check = Some(Instant::now());
+        }
+    }
     pub fn last_check_label(&self) -> &str {
         self.last_check
             .as_deref()
@@ -3147,6 +3266,50 @@ impl Updater {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_discovery_is_independent_of_downloads_and_checks_platform_assets() {
+        let mut discovery = super::ReleaseDiscovery::default();
+        let (send, receive) = std::sync::mpsc::channel();
+        discovery.events = Some(receive);
+        send.send(Ok(serde_json::json!({"tagName":"v0.12.39","assets":[
+            {"name":"shina.exe","size":42}
+        ]})))
+        .unwrap();
+        assert!(discovery.poll());
+        let windows = super::InstalledTarget::Windows {
+            exe: "shina.exe".into(),
+        };
+        let linux = super::InstalledTarget::Linux {
+            exe: "shina".into(),
+        };
+        assert_eq!(discovery.for_target(Some(&windows))["assetAvailable"], true);
+        assert_eq!(discovery.for_target(Some(&linux))["assetAvailable"], false);
+        assert_eq!(discovery.view()["tag"], "v0.12.39");
+        assert!(discovery.for_target(Some(&windows)).get("assets").is_none());
+    }
+    #[test]
+    fn release_discovery_worker_loss_and_auth_denial_are_terminal_not_current() {
+        let mut discovery = super::ReleaseDiscovery::default();
+        let (send, receive) = std::sync::mpsc::channel();
+        discovery.events = Some(receive);
+        drop(send);
+        assert!(discovery.poll());
+        assert_eq!(discovery.view()["state"], "failed");
+        let (send, receive) = std::sync::mpsc::channel();
+        discovery.events = Some(receive);
+        send.send(Err(super::Failure::Auth(
+            "Run gh auth login manually.".into(),
+        )))
+        .unwrap();
+        discovery.poll();
+        assert!(discovery.suspended);
+        discovery.refresh(true);
+        assert!(
+            discovery.events.is_none(),
+            "never retry an authentication denial"
+        );
+        assert!(discovery.remaining().is_none());
+    }
     use super::*;
 
     #[test]
