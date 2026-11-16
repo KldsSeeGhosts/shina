@@ -2613,6 +2613,9 @@ pub fn coordinated_helper() -> Result<(), String> {
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
+                // From the first possible commit send, a panic is an uncertain
+                // handoff. Only confirmed cancellation may disarm recovery.
+                committed = true;
                 crate::maintenance::rpc(&directory, "server.commitRestart", prepared.clone())?;
             }
             Ok::<_, String>(())
@@ -2622,6 +2625,7 @@ pub fn coordinated_helper() -> Result<(), String> {
             // keeps running (or was already down), so neither restart line applies.
             // If the commit may have reached the server anyway, stay armed.
             if !live || crate::maintenance::rpc(&directory, "server.cancelRestart", prepared).is_ok() {
+                committed = false;
                 service_guard.disarm();
             } else {
                 // The commit may still have reached the server: keep both lines.

@@ -1126,6 +1126,27 @@ fn windows_npm_cmd_shim_becomes_node_argv() {
 }
 
 #[test]
+fn windows_global_prefix_is_extracted_without_a_posix_lib_directory() {
+    let path = "C:/Users/Ermin/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/cli.js";
+    assert_eq!(
+        npm_prefix_for(path, "@anthropic-ai/claude-code", true).as_deref(),
+        Some("C:/Users/Ermin/AppData/Roaming/npm")
+    );
+    assert_eq!(
+        npm_prefix_for(path, "@anthropic-ai/claude-code", false),
+        None
+    );
+    assert_eq!(
+        npm_prefix_for(
+            "C:/Project/node_modules/outer/node_modules/@openai/codex/bin/codex.js",
+            "@openai/codex",
+            true
+        ),
+        None
+    );
+}
+
+#[test]
 fn mixed_case_prefix_is_preserved_not_folded() {
     let fixture = testkit::Fixture::new();
     let claude = fixture.npm_global("MixedCasePrefix", "claude", "@anthropic-ai/claude-code");

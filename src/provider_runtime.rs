@@ -196,6 +196,7 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},

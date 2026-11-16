@@ -695,8 +695,21 @@ fn homebrew_keg(p: &str) -> Option<(String, String, bool)> {
 /// The npm global prefix owning `real`, per KSG `npmGlobalPrefixFromCommandPath`:
 /// `<prefix>/lib/node_modules/<pkg>/...`, never nested under another package.
 fn npm_prefix(real: &str, package: &str) -> Option<String> {
-    let segment = format!("/lib/node_modules/{}/", package.to_lowercase());
-    let index = real.to_lowercase().rfind(&segment)?;
+    npm_prefix_for(real, package, cfg!(windows))
+}
+
+fn npm_prefix_for(real: &str, package: &str, windows: bool) -> Option<String> {
+    let posix = format!("/lib/node_modules/{}/", package.to_lowercase());
+    let native = format!("/node_modules/{}/", package.to_lowercase());
+    let lowered = real.to_lowercase();
+    let segment = if lowered.contains(&posix) {
+        posix
+    } else if windows {
+        native
+    } else {
+        return None;
+    };
+    let index = lowered.rfind(&segment)?;
     if !real.is_char_boundary(index)
         || !real
             .get(index..index + segment.len())
@@ -989,7 +1002,7 @@ impl Default for Hooks {
 
 enum Job {
     /// Under-lock re-detection with full ownership proofs before the command.
-    Reprove(mpsc::Receiver<Detected>),
+    Reprove(mpsc::Receiver<(Detected, Option<String>)>),
     /// `npm outdated`/`brew info`/registry GET for the pre-update check.
     Latest(mpsc::Receiver<Option<String>>),
     /// The update command itself.
@@ -1517,7 +1530,9 @@ impl ProviderUpdates {
                 // Ownership is re-proven under the lock on a worker thread with
                 // the full npm/brew prover calls, never on the reducer.
                 thread::spawn(move || {
-                    let _ = tx.send(detect(driver, &*prober, overrides.as_ref()));
+                    let detected = detect(driver, &*prober, overrides.as_ref());
+                    let version = installed_version(&detected, &*prober);
+                    let _ = tx.send((detected, version));
                 });
                 if let Some(active) = self.active.get_mut(&driver) {
                     active.lock_file = Some(lock);
@@ -1535,7 +1550,7 @@ impl ProviderUpdates {
                 } else {
                     Err(())
                 };
-                let fresh = match done {
+                let (fresh, version) = match done {
                     Ok(Some(fresh)) => fresh,
                     Ok(None) => return false,
                     Err(()) => return self.worker_stopped(driver),
@@ -1555,6 +1570,7 @@ impl ProviderUpdates {
                     return true;
                 }
                 if let Some(active) = self.active.get_mut(&driver) {
+                    active.record.from_version = version;
                     active.phase = Phase::CheckingLatest;
                     active.record.status = "running".into();
                     active.record.message = "Checking for the latest version".into();
@@ -1770,15 +1786,15 @@ impl ProviderUpdates {
         true
     }
 
-    fn finish_latest_check(&mut self, driver: Driver, latest: Option<String>) {
+    fn finish_latest_check(&mut self, driver: Driver, _latest: Option<String>) {
         let Some(active) = self.active.get_mut(&driver) else {
             return;
         };
         // Precheck (contract 4.5 step 3): already current needs no command.
         let current = matches!(
-            (&active.record.from_version, &latest),
-            (Some(from), Some(latest))
-                if compare_versions(from, latest) != std::cmp::Ordering::Less
+            (&active.record.from_version, &active.record.target_version),
+            (Some(from), Some(target))
+                if compare_versions(from, target) != std::cmp::Ordering::Less
         );
         if current {
             self.settle(driver, "succeeded", "Already up to date.".into(), None);
@@ -2362,11 +2378,22 @@ pub(crate) mod testkit {
             std::fs::write(&entry, "// cli\n").unwrap();
             let bin = prefix.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
-            let link = bin.join(name);
+            let link = bin.join(if cfg!(windows) {
+                format!("{name}.cmd")
+            } else {
+                name.into()
+            });
             #[cfg(unix)]
             std::os::unix::fs::symlink(&entry, &link).unwrap();
             #[cfg(not(unix))]
-            std::fs::write(&link, &entry).unwrap();
+            std::fs::write(
+                &link,
+                format!(
+                    "@echo off\r\nnode \"%dp0%..\\lib\\node_modules\\{}\\cli.js\" %*\r\n",
+                    package.replace('/', "\\")
+                ),
+            )
+            .unwrap();
             link.to_string_lossy().into_owned()
         }
         pub fn native(&self, path: &str) -> String {
