@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 /// How many named presets earlier versions seeded.
 const LEGACY_PRESETS: usize = 4;
 
+/// The backend's stale-version refusal for `captain.promote`, which the client
+/// classifies as a review-again conflict.
+pub const PROMOTE_CONFLICT_PREFIX: &str = "Thread changed since version";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Captain {
     pub name: String,
@@ -83,10 +87,53 @@ impl Captain {
     }
 }
 
+/// Promotion mode state carried by `CaptainEditor` while an existing thread is
+/// being made a Captain. The thread identity, machine and workspace are fixed
+/// at open time; `preview` is the backend's authoritative `captain.promote.preview`
+/// result and `pending` whichever command is in flight (first the preview read,
+/// then the mutation). `error` lives on the editor itself.
+#[derive(Clone, Debug)]
+pub struct CaptainPromotion {
+    /// The machine key the dialog opened on; it never changes for the dialog's life.
+    pub server: String,
+    /// The server-side thread id on that machine.
+    pub thread: usize,
+    /// The thread's title at open time, for the dialog title and toasts.
+    pub title: String,
+    /// The thread's workspace at open time. Promotion never moves a thread.
+    pub project: Option<usize>,
+    /// The retired Captain whose profile will be restored. `Some` only while the
+    /// restore switch is on; the UI locks the profile fields while it is `Some`.
+    pub restore: Option<usize>,
+    /// The retired Captain eligible for restore, present when this thread is its
+    /// surviving former home. `restore` is never `Some` without this.
+    pub restore_candidate: Option<usize>,
+    /// The backend's own read shape (`threadId`, `restoreCaptain`,
+    /// `threadVersion`, `blockers`, `permissionsChanged`).
+    pub preview: Option<Value>,
+    /// The `captain.promote.preview` read or `captain.promote` mutation in flight.
+    pub pending: Option<uuid::Uuid>,
+}
+
+impl CaptainPromotion {
+    /// The `restoreCaptain` argument for preview and promote commands.
+    pub fn restore_captain(&self) -> Option<usize> {
+        self.restore
+    }
+
+    /// The backend refused the last confirmation because the thread changed
+    /// under the open editor. Carried on the editor's error line so the user
+    /// re-reviews before a fresh press.
+    pub fn conflict(error: Option<&str>) -> bool {
+        error.is_some_and(|error| error.starts_with(PROMOTE_CONFLICT_PREFIX))
+    }
+}
+
 pub struct CaptainEditor {
     pub server: String,
     pub machine_picker: bool,
     pub editing: Option<usize>,
+    pub promotion: Option<CaptainPromotion>,
     pub name: TextEdit,
     pub role: TextEdit,
     pub instructions: TextEdit,
@@ -100,6 +147,7 @@ impl CaptainEditor {
             server: "local".into(),
             machine_picker: false,
             editing: None,
+            promotion: None,
             name: TextEdit::default(),
             role: TextEdit::default(),
             instructions: TextEdit::default(),

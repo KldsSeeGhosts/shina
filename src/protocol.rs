@@ -3,7 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 33;
+pub const MINOR: u32 = 35;
+pub const CAPTAIN_EVENTS_MINOR: u32 = 35;
+pub const CAPTAIN_EVENTS: &str = "captain-events-v1";
+pub const CAPTAIN_EVENTS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to change Captain report policies.";
+pub const CAPTAIN_CREW_CONTROL_MINOR: u32 = 34;
+pub const CAPTAIN_CREW_CONTROL: &str = "captain-crew-control-v1";
+pub const CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to create and control independent crew.";
 pub const CAPTAIN_DELETE_MINOR: u32 = 33;
 pub const CAPTAIN_DELETE: &str = "captain-delete-v1";
 pub const CAPTAIN_DELETE_UPDATE_REQUIRED: &str =
@@ -330,6 +338,10 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.crew.join"
         | "captain.crew.release"
         | "captain.crew.move"
+        | "captain.crew.create"
+        | "captain.crew.send"
+        | "captain.crew.stop"
+        | "captain.reportPolicy"
         | "captain.archive"
         | "captain.unarchive"
         | "captain.promote"

@@ -791,6 +791,11 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
             ));
     }
     let t = s.current();
+    let crew_width = if t.crew_draft.is_some() {
+        (width * 0.4).clamp(96.0, 180.0)
+    } else {
+        0.0
+    };
     let text_width = |value: &str, style| rune::text::measure(value, &[], style, None).0;
     let machine = text_width(&s.machine_label(&s.machines.selected), SMALL) + 50.0;
     let captain = t.captain.and_then(|id| s.captains.get(id));
@@ -873,6 +878,11 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     let layout = resolve(
         // The stash badge takes 28 px plus its gap when the stash has entries.
         width
+            - if crew_width > 0.0 {
+                crew_width + 4.0
+            } else {
+                0.0
+            }
             - if s.stash.entries.is_empty() {
                 0.0
             } else {
@@ -920,6 +930,9 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
                 .min_w(52.0)
                 .offset(model_x - controls_x, model_y - controls_y),
         ));
+    }
+    if crew_width > 0.0 {
+        controls = controls.child(super::crew_draft_chip(s, p, crew_width));
     }
     if visible > 0 {
         controls = controls.child(machine_selector(s, p, icon_only(0)));

@@ -986,41 +986,48 @@ impl State {
     }
     pub fn collect_recovered_inputs(&mut self) -> bool {
         let mut changed = false;
-        for thread in &mut self.threads {
-            if !thread.has_draft_content() {
-                continue;
-            }
-            if let Some(previous) = self.recovered_inputs.get(&thread.id) {
-                let images: Vec<Attachment> =
-                    serde_json::from_value(previous["attachments"].clone()).unwrap_or_default();
-                let snapshot = serde_json::from_value::<crate::composer_rich::Snapshot>(
-                    previous["draft"].clone(),
-                )
-                .unwrap_or_else(|_| {
-                    crate::composer_rich::Snapshot::capture(
-                        &crate::composer_rich::draft(previous["text"].as_str().unwrap_or("")),
-                        &images,
-                    )
-                });
-                thread.restore_snapshot(&snapshot);
-            }
-            let snapshot = crate::composer_rich::Snapshot::capture_with_context(
-                &thread.draft,
-                &thread.draft_images,
-                &thread.draft_context,
-            );
-            self.recovered_inputs.insert(
-                thread.id,
-                json!({"text":thread.draft.text,"attachments":thread.draft_images,
-                "draft":snapshot,"commandId":thread.recovery_command}),
-            );
-            thread.draft.replace_text("");
-            thread.draft_images.clear();
-            thread.draft_context.clear();
-            thread.retained_context = Default::default();
-            changed = true;
+        for index in 0..self.threads.len() {
+            changed |= self.collect_recovered_input(index);
         }
         changed
+    }
+
+    pub(super) fn collect_recovered_input(&mut self, index: usize) -> bool {
+        let Some(thread) = self
+            .threads
+            .get_mut(index)
+            .filter(|thread| thread.has_draft_content())
+        else {
+            return false;
+        };
+        if let Some(previous) = self.recovered_inputs.get(&thread.id) {
+            let images: Vec<Attachment> =
+                serde_json::from_value(previous["attachments"].clone()).unwrap_or_default();
+            let snapshot =
+                serde_json::from_value::<crate::composer_rich::Snapshot>(previous["draft"].clone())
+                    .unwrap_or_else(|_| {
+                        crate::composer_rich::Snapshot::capture(
+                            &crate::composer_rich::draft(previous["text"].as_str().unwrap_or("")),
+                            &images,
+                        )
+                    });
+            thread.restore_snapshot(&snapshot);
+        }
+        let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+            &thread.draft,
+            &thread.draft_images,
+            &thread.draft_context,
+        );
+        self.recovered_inputs.insert(
+            thread.id,
+            json!({"text":thread.draft.text,"attachments":thread.draft_images,
+                "draft":snapshot,"commandId":thread.recovery_command}),
+        );
+        thread.draft.replace_text("");
+        thread.draft_images.clear();
+        thread.draft_context.clear();
+        thread.retained_context = Default::default();
+        true
     }
     pub fn server_sequence(&self) -> u64 {
         self.command_receipts
@@ -1212,6 +1219,12 @@ impl State {
                     if let Some(start_from_origin) = t.start_from_origin {
                         entry["startFromOrigin"] = json!(start_from_origin);
                     }
+                    if let Some(target) = &t.crew_draft {
+                        entry["crewDraft"] = json!(target);
+                        entry["crewCommand"] = json!(t.client_creating);
+                        entry["crewPendingInput"] =
+                            json!(t.remote_send.as_ref().map(|(_, snapshot)| snapshot));
+                    }
                     entry
                 })
                 .collect::<Vec<_>>()
@@ -1311,7 +1324,12 @@ impl State {
             };
             changed = true;
             if let crate::client::Event::Receipt(command, value) = &event
-                && (self.captain_document_receipt(&server, command, value)
+                && (self.captain_lifecycle_receipt(&server, command, value)
+                    || self.captain_policy_receipt(&server, command, value)
+                    || self.captain_promotion_receipt(&server, command, value)
+                    || self.crew_question_receipt(&server, command, value)
+                    || self.crew_draft_receipt(&server, command, value)
+                    || self.captain_document_receipt(&server, command, value)
                     || self.captain_crew_receipt(&server, command, value))
             {
                 continue;
@@ -1850,6 +1868,14 @@ impl State {
         let mut old = std::mem::take(&mut self.threads);
         // Validate server records without session restoration's navigation or draft creation.
         self.restore_records(&projection["index"], false)?;
+        if self.brief.record.as_ref().is_some_and(|(server, captain)| {
+            *server == self.machines.selected
+                && self.captain_phase(*captain) != CaptainPhase::Retired
+        }) {
+            self.brief.record = None;
+            self.show_activity = false;
+            self.activity_full = false;
+        }
         self.peers = serde_json::from_value(projection["peers"].clone()).unwrap_or_default();
         let metadata = std::mem::take(&mut self.threads);
         for mut thread in metadata {
@@ -1951,6 +1977,34 @@ impl State {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
                 thread.start_from_origin = draft.get("startFromOrigin").and_then(Value::as_bool);
+                if let Some(binding) = draft.get("crewDraft").filter(|binding| !binding.is_null()) {
+                    let binding: CrewDraftTarget = serde_json::from_value(binding.clone())
+                        .map_err(|_| "Invalid saved crew draft.")?;
+                    if binding.server != self.machines.selected
+                        || binding.name.is_empty()
+                        || binding.name.chars().count() > 60
+                        || binding.name.chars().any(char::is_control)
+                    {
+                        return Err("Invalid saved crew draft identity.".into());
+                    }
+                    thread.crew_draft = Some(binding);
+                    if let Some(command) = draft.get("crewCommand").filter(|id| !id.is_null()) {
+                        let command = serde_json::from_value(command.clone())
+                            .map_err(|_| "Invalid saved crew command identity.")?;
+                        thread.client_creating = Some(command);
+                        if let Some(snapshot) = draft
+                            .get("crewPendingInput")
+                            .filter(|input| !input.is_null())
+                        {
+                            thread.remote_send = Some((
+                                command,
+                                serde_json::from_value(snapshot.clone())
+                                    .map_err(|_| "Invalid saved crew input.")?,
+                            ));
+                        }
+                        thread.error = Some("Crew creation was pending when Shina closed. Check the Captain's crew on its machine. This draft is held and will not create a second member.".into());
+                    }
+                }
                 self.threads.push(thread);
             }
         }
@@ -2387,6 +2441,11 @@ impl State {
                 Some("This machine is unreachable and has no cached workspace yet.".into());
             return;
         }
+        if self.current().client_creating.is_none()
+            && let Some(target) = self.current_mut().crew_draft.take()
+        {
+            self.current_mut().crew_draft_notice = Some(self.crew_draft_removed_notice(&target));
+        }
         self.machines
             .scope_server
             .get_or_insert_with(|| self.machines.selected.clone());
@@ -2465,6 +2524,7 @@ impl State {
             self.captain_homes.clear();
             self.captain_books.clear();
             self.captain_lifecycles.clear();
+            self.captain_report_policies.clear();
             self.captain_reports.clear();
             self.captain_question_answers.clear();
             self.tasks.clear();
@@ -2852,6 +2912,7 @@ impl State {
         self.drop_saved_client_draft(&source, draft);
         self.threads.push(thread);
         self.select_thread(self.threads.len() - 1);
+        self.crew_draft_strip_foreign();
         self.apply_retarget_rules();
         self.checkpoint();
     }
@@ -2937,6 +2998,19 @@ impl State {
     /// draft on the target machine plus the project picker.
     fn retarget_draft_choose(&mut self, server: &str) {
         let source = (self.machines.selected.clone(), self.current().id);
+        let crew_notice = self
+            .current()
+            .crew_draft
+            .as_ref()
+            .map(|target| {
+                format!(
+                    "Removed from {}'s crew. {} lives on {}.",
+                    target.name,
+                    target.name,
+                    self.machine_label(&target.server)
+                )
+            })
+            .or_else(|| self.current().crew_draft_notice.clone());
         let draft = self.current().draft.clone();
         let images = self.current().draft_images.clone();
         let context = self.current().draft_context.clone();
@@ -2952,6 +3026,7 @@ impl State {
         self.current_mut().draft_context = context;
         self.current_mut().draft_reply_to = reply_to;
         self.current_mut().retained_context = retained;
+        self.current_mut().crew_draft_notice = crew_notice;
         if let Some(thread) = self
             .machines
             .threads
@@ -2982,6 +3057,7 @@ impl State {
         }
         let reuse = self.threads.iter().position(|thread| {
             thread.client_draft
+                && thread.crew_draft.is_none()
                 && thread.project == project
                 && thread.blank_draft()
                 && thread.client_creating.is_none()
@@ -3018,7 +3094,8 @@ impl State {
     }
 
     pub fn choose_draft_project(&mut self, project: Option<usize>) {
-        if self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
+        if (self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
+            || self.current().crew_draft.is_some())
             && self.current().client_draft
         {
             if self.current().project != project {
@@ -3035,7 +3112,8 @@ impl State {
     }
 
     pub(super) fn promote_client_draft(&mut self) {
-        if !self.current().has_draft_content()
+        if self.current().crew_draft.is_some()
+            || !self.current().has_draft_content()
             || self.current().client_creating.is_some()
             || self.current().remote_send.is_some()
             || self.current().client_promoted.is_some()
@@ -3348,7 +3426,7 @@ impl State {
             || self
                 .captain_editor
                 .as_ref()
-                .is_none_or(|editor| editor.editing.is_some())
+                .is_none_or(|editor| editor.editing.is_some() || editor.promotion.is_some())
         {
             return;
         }
@@ -4394,6 +4472,13 @@ impl State {
             "captain.read" => {
                 return self.captain_read_value(number("captain")?, true);
             }
+            "captain.reportPolicy" => {
+                let policy = serde_json::from_value(args["policy"].clone())
+                    .map_err(|_| "policy must be react, context or ignore.")?;
+                let expected = serde_json::from_value(args["expectedPolicy"].clone())
+                    .map_err(|_| "expectedPolicy must be react, context or ignore.")?;
+                return self.set_captain_report_policy(number("captain")?, policy, expected);
+            }
             "captain.lifecycle.preview" => {
                 return self.captain_lifecycle_preview(number("captain")?, &text("action")?);
             }
@@ -4489,6 +4574,38 @@ impl State {
             }
             "captain.crew.join" => {
                 self.captain_crew_join(number("captain")?, number("threadId")?)?
+            }
+            "captain.crew.create" => {
+                return self.captain_crew_create(
+                    number("captain")?,
+                    args,
+                    false,
+                    command.command_id,
+                );
+            }
+            "captain.crew.send" => {
+                captain_crew_ops::keys(args, &["captain", "threadId", "input"])?;
+                return self.captain_crew_send(
+                    number("captain")?,
+                    number("threadId")?,
+                    &args["input"],
+                );
+            }
+            "captain.crew.stop" => {
+                captain_crew_ops::keys(
+                    args,
+                    &["captain", "threadId", "runId", "runtimeGeneration"],
+                )?;
+                let generation = text("runtimeGeneration")?;
+                let run = args
+                    .get("runId")
+                    .ok_or("runId is required, including null for an idle thread.")?;
+                return self.captain_crew_stop(
+                    number("captain")?,
+                    number("threadId")?,
+                    run,
+                    &generation,
+                );
             }
             "captain.crew.release" => {
                 self.captain_crew_release(number("captain")?, number("threadId")?)?
@@ -7860,5 +7977,50 @@ mod tests {
         assert!(state.captain_books.is_empty());
         assert!(state.captains.is_empty());
         std::fs::remove_dir_all(&server.data_dir).ok();
+    }
+    #[test]
+    fn crew_bindings_restore_and_uncertain_creations_never_turn_into_plain_sends() {
+        for pending in [false, true] {
+            let (mut state, server, _) = tab_client();
+            state.new_client_draft(None);
+            let id = state.current().id;
+            state.current_mut().crew_draft = Some(CrewDraftTarget {
+                server: "local".into(),
+                captain: 0,
+                name: "Ember".into(),
+            });
+            state
+                .current_mut()
+                .draft
+                .replace_text("Preserve my crew input");
+            let command = uuid::Uuid::new_v4();
+            if pending {
+                let snapshot = crate::composer_rich::Snapshot::capture_with_context(
+                    &state.current().draft,
+                    &[],
+                    &[],
+                );
+                state.current_mut().client_creating = Some(command);
+                state.current_mut().remote_send = Some((command, snapshot));
+            }
+            state.checkpoint_client();
+            let saved = state.machines.ui["local"].clone();
+            let mut restored = State::new(PathBuf::new(), false);
+            restored.client_views["localUi"] = saved;
+            restored.apply_projection(server.projection()).unwrap();
+            let draft = restored
+                .threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .unwrap();
+            assert_eq!(draft.crew_draft.as_ref().unwrap().name, "Ember");
+            assert_eq!(draft.client_creating, pending.then_some(command));
+            assert_eq!(draft.remote_send.is_some(), pending);
+            if pending {
+                assert!(draft.error.as_ref().unwrap().contains("held"));
+            } else {
+                assert_eq!(draft.draft.text, "Preserve my crew input");
+            }
+        }
     }
 }

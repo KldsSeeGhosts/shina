@@ -990,6 +990,24 @@ fn captain_brief_demo(state: &mut State) {
     state.show_activity = true;
 }
 
+/// Confirmation examples use only the demo's records and a read-only preview.
+fn captain_lifecycle_demo(state: &mut State, action: model::CaptainLifecycleAction) {
+    captain_workspace_demo(state);
+    let captain = state.current().captain.unwrap();
+    state.brief.lifecycle = Some(model::CaptainLifecycleDialog {
+        server: "local".into(),
+        captain,
+        action,
+        preview: state
+            .captain_lifecycle_preview(captain, action.action())
+            .ok(),
+        pending: None,
+        error: None,
+        confirm_name: rune::TextEdit::default(),
+        keep_conversations: true,
+    });
+}
+
 /// The same Brief with an example NOTES.md plan, its document open in reading state.
 fn captain_plan_demo(state: &mut State) {
     captain_brief_demo(state);
@@ -1328,6 +1346,12 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 home.tools.clear();
             }),
             ("captain-brief", captain_brief_demo),
+            ("captain-archive", |state| {
+                captain_lifecycle_demo(state, model::CaptainLifecycleAction::Archive);
+            }),
+            ("captain-delete", |state| {
+                captain_lifecycle_demo(state, model::CaptainLifecycleAction::Delete);
+            }),
             ("captain-plan", captain_plan_demo),
             ("captain-brief-dark", |state| {
                 captain_brief_demo(state);

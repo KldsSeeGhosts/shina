@@ -5126,3 +5126,6 @@ mod mobile_contract;
 
 #[path = "support/mobile_sdk_runtime.rs"]
 mod mobile_sdk_runtime;
+
+#[path = "support/captain_contract.rs"]
+mod captain_contract;

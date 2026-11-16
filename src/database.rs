@@ -34,6 +34,7 @@ struct Inner {
     batch: Option<std::thread::ThreadId>,
     staged: BTreeMap<String, Value>,
     staged_push: Vec<crate::mobile_push::Staged>,
+    staged_captain_receipts: Vec<Receipt>,
     revocations: Vec<String>,
     failure: Option<String>,
     dispatch_fenced: bool,
@@ -227,6 +228,7 @@ impl Database {
             batch: None,
             staged: BTreeMap::new(),
             staged_push: Vec::new(),
+            staged_captain_receipts: Vec::new(),
             revocations: Vec::new(),
             failure: None,
             dispatch_fenced: false,
@@ -442,6 +444,7 @@ impl Database {
             return Err(error.clone());
         }
         let staged = std::mem::take(&mut inner.staged);
+        let captain_receipts = std::mem::take(&mut inner.staged_captain_receipts);
         let history_events = std::mem::take(&mut inner.history_events);
         let metrics_path = if cfg!(debug_assertions) {
             std::env::var_os("SHINA_TEST_STORAGE_METRICS").map(PathBuf::from)
@@ -490,6 +493,10 @@ impl Database {
                 if name == "honcho-outbox.json" {
                     sync_honcho(&tx, &value)?;
                 }
+            }
+            for mut tool_receipt in captain_receipts {
+                tool_receipt.seq = seq;
+                put_receipt(&tx, &tool_receipt)?;
             }
             if let Some(receipt) = receipt {
                 put_receipt(&tx, receipt)?;
@@ -629,6 +636,65 @@ impl Database {
             .map_err(error)?;
         text.map(|text| serde_json::from_str(&text).map_err(error))
             .transpose()
+    }
+
+    /// An audit namespace, never a registered device or an authentication grant.
+    pub fn captain_tool_receipt(
+        &self,
+        captain: usize,
+        id: uuid::Uuid,
+    ) -> Result<Option<Receipt>, String> {
+        let owner = format!("mcp/captain/{captain}");
+        {
+            let inner = self.0.lock().expect("database");
+            if let Some(error) = &inner.failure {
+                return Err(error.clone());
+            }
+            if inner.batch == Some(std::thread::current().id())
+                && let Some(receipt) = inner
+                    .staged_captain_receipts
+                    .iter()
+                    .find(|receipt| receipt.device_id == owner && receipt.command_id == id)
+            {
+                return Ok(Some(receipt.clone()));
+            }
+        }
+        self.receipt(&owner, id)
+    }
+
+    pub fn stage_captain_tool_receipt(
+        &self,
+        captain: usize,
+        command: &crate::protocol::Command,
+        result: Value,
+    ) -> Result<(), String> {
+        if !matches!(
+            command.method.as_str(),
+            "captain.crew.create" | "captain.crew.send" | "captain.crew.stop"
+        ) {
+            return Err("Unsupported Captain tool receipt.".into());
+        }
+        self.require_batch()?;
+        let hash = command.hash();
+        if let Some(existing) = self.captain_tool_receipt(captain, command.command_id)? {
+            if existing.hash != hash || existing.result != result {
+                return Err("This requestId already names a different crew operation.".into());
+            }
+            return Ok(());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_captain_receipts
+            .push(Receipt {
+                command_id: command.command_id,
+                device_id: format!("mcp/captain/{captain}"),
+                hash,
+                status: crate::protocol::ReceiptStatus::Accepted,
+                result,
+                seq: 0,
+            });
+        Ok(())
     }
 
     pub fn stage_history(&self, events: Vec<Value>) {
@@ -1262,6 +1328,7 @@ impl Database {
         inner.batch = None;
         inner.staged.clear();
         inner.staged_push.clear();
+        inner.staged_captain_receipts.clear();
         inner.revocations.clear();
         inner.history_events.clear();
     }
@@ -1271,6 +1338,7 @@ impl Database {
         if !inner.revocations.is_empty()
             || !inner.history_events.is_empty()
             || !inner.staged_push.is_empty()
+            || !inner.staged_captain_receipts.is_empty()
         {
             return Ok(false);
         }

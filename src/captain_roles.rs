@@ -281,7 +281,7 @@ impl State {
             )
             .any(|report| {
                 report.captain == captain
-                    && (!report.delivered
+                    && (report.needs_delivery()
                         || report.question.is_some()
                             && !self
                                 .captain_question_answers

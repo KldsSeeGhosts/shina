@@ -490,6 +490,117 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
     )
 }
 
+/// KSG has no crew report record. Adapt its result row geometry, reading the saved
+/// record by exact delivery ID rather than interpreting a worker's prose as status.
+pub(super) fn report_message(s: &State, p: Palette, text: &str) -> Option<El> {
+    use crate::model::crew_reports::{CrewOutcome, QuestionRecipient};
+    let header = text
+        .strip_prefix(crate::model::INJECTION_PREFIX)?
+        .split_once('\n')?
+        .0;
+    let id = header.strip_prefix("[delivery ")?.strip_suffix(']')?;
+    let captain = s
+        .current()
+        .captain
+        .filter(|_| s.is_captain_home(s.current()))?;
+    let report = s
+        .crew_reports()
+        .iter()
+        .find(|report| report.id == id && report.captain == captain)?;
+    let (word, status) = match report.outcome {
+        CrewOutcome::Completed => ("Reported done", Status::Completed),
+        CrewOutcome::Failed => ("Reported failed", Status::Failed),
+        CrewOutcome::Cancelled => ("Reported cancelled", Status::Ready),
+        CrewOutcome::Progress => ("Reported progress", Status::Running),
+        CrewOutcome::Blocked => ("Reported blocked", Status::Waiting),
+    };
+    let thread = report.thread_id;
+    let mut body = col().gap(8.0).pl(CARD_INDENT).child(
+        label(truncate(&report.summary, 6000), body_style(false), p.ink)
+            .wrap()
+            .selectable(true),
+    );
+    if !report.error.is_empty() {
+        body = body.child(
+            label(truncate(&report.error, 2000), SMALL, p.danger)
+                .wrap()
+                .selectable(true),
+        );
+    }
+    for artifact in report.artifacts.iter().take(16) {
+        body = body.child(
+            col()
+                .gap(2.0)
+                .child(label(&artifact.label, SMALL, p.muted).wrap())
+                .child(
+                    label(
+                        format!(
+                            "Unverified reference on {}: {}",
+                            s.machine_label(&s.machines.selected),
+                            artifact.reference
+                        ),
+                        SMALL,
+                        p.faint,
+                    )
+                    .wrap_anywhere()
+                    .selectable(true),
+                ),
+        );
+    }
+    if let Some(question) = &report.question {
+        let answer = s
+            .crew_answers()
+            .iter()
+            .find(|answer| answer.report_id == report.id);
+        let state = match answer {
+            None => "Open",
+            Some(answer) if !answer.delivered => "Answer saved, waiting for the source thread",
+            Some(_) => "Answer accepted by the source thread",
+        };
+        body = body.child(
+            label(
+                format!(
+                    "Asked {}: {}. {state}",
+                    match question.recipient {
+                        QuestionRecipient::User => "you",
+                        QuestionRecipient::Captain => &s.captains[captain].name,
+                    },
+                    question.text
+                ),
+                SMALL,
+                p.brass,
+            )
+            .wrap(),
+        );
+    }
+    Some(
+        col()
+            .key(format!("crew-report-{}", report.id))
+            .gap(6.0)
+            .child(
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(mark_slot(status, p))
+                    .child(pixel_text(word, status_ink(status, p)))
+                    .child(
+                        label(&report.title, ACTIVITY, p.muted)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(ghost_button(
+                        s,
+                        format!("crew-report-{}-open", report.id),
+                        "Open thread",
+                        p,
+                        move |s| open_thread(s, thread),
+                    )),
+            )
+            .child(body),
+    )
+}
+
 /// A brief or follow-up Shina delivered to a worker: `(is_follow_up, parent id, text)`.
 pub(super) fn parse_brief(text: &str) -> Option<(bool, usize, &str)> {
     let (first, body) = text.split_once(
@@ -757,7 +868,8 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
         .into_iter()
         .filter(|item| needs_you_item(s, t.id, item))
         .collect();
-    if items.is_empty() {
+    let report_cards = super::crew_questions_ui::cards(s, p);
+    if items.is_empty() && report_cards.is_none() {
         return None;
     }
     let mut stack = col().gap(8.0);
@@ -912,6 +1024,9 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                         .child(actions),
                 ),
         );
+    }
+    if let Some(cards) = report_cards {
+        stack = stack.child(cards);
     }
     Some(
         col()
@@ -1408,6 +1523,57 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_rows_require_the_exact_saved_delivery_and_captain() {
+        let mut state = State::headless(
+            std::env::temp_dir().join(format!("shina-report-row-{}", uuid::Uuid::new_v4())),
+        );
+        state.load_global_for_test();
+        state.demo = true;
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        let id = state.next_id;
+        state.next_id += 1;
+        let mut worker = Thread::new(id);
+        worker.crew_captain = Some(0);
+        worker.captain = Some(0);
+        worker.run_id = Some("report-row-run".into());
+        state.threads.push(worker);
+        state.demo = false;
+        let report = state
+            .mcp_call(
+                id,
+                "captain_crew_report",
+                &json!({
+                    "requestId": uuid::Uuid::new_v4().to_string(),
+                    "outcome":"blocked", "summary":"Needs a decision",
+                    "question":{"text":"Which branch?", "recipient":"user"}
+                }),
+            )
+            .unwrap();
+        let text = format!(
+            "{}[delivery {}]\nCrew report",
+            crate::model::INJECTION_PREFIX,
+            report["reportId"].as_str().unwrap()
+        );
+        let palette = super::palette(false);
+        assert!(report_message(&state, palette, &text).is_some());
+        assert!(report_message(&state, palette, "Crew report").is_none());
+        assert!(
+            report_message(
+                &state,
+                palette,
+                &format!(
+                    "{}[delivery unknown]\nCrew report",
+                    crate::model::INJECTION_PREFIX
+                )
+            )
+            .is_none()
+        );
+        state.open_captain(1);
+        assert!(report_message(&state, palette, &text).is_none());
+    }
 
     #[test]
     fn completion_messages_parse_with_multiline_replies() {

@@ -75,6 +75,14 @@ pub struct RuntimeState {
 }
 
 impl RuntimeState {
+    #[cfg(test)]
+    pub(crate) fn persist_for_test(
+        &mut self,
+        effects: Vec<crate::outbox::Effect>,
+    ) -> Result<(), String> {
+        self.persist(None, effects)
+    }
+
     pub fn open(directory: PathBuf, wake: rune::Waker) -> Result<Self, String> {
         let database = crate::database::Database::open(&directory)?;
         database.fence_dispatch(directory.join("update-validation").exists());
@@ -1790,6 +1798,75 @@ mod tests {
                     .contains(&report_id)
             })
         }));
+    }
+
+    #[test]
+    fn report_policy_commits_before_report_capture_and_failed_change_leaves_no_saved_policy() {
+        use crate::model::ReportPolicy;
+        let (mut runtime, database, channels, worker) = runtime_fixture_with_crew();
+        let command = Command::new(
+            "captain.reportPolicy",
+            json!({"captain":0,"policy":"ignore","expectedPolicy":"react"}),
+        );
+        let receipt = runtime.command("maintainer", command.clone()).unwrap();
+        assert_eq!(receipt["status"], "accepted", "{receipt}");
+        assert_eq!(runtime.state.captain_report_policy(0), ReportPolicy::Ignore);
+        assert_eq!(
+            database.read("index.json").unwrap().unwrap()["captainReportPolicies"]["0"],
+            "ignore"
+        );
+        assert_eq!(runtime.command("maintainer", command).unwrap(), receipt);
+        let before_connections = channels.lock().unwrap().len();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.persistence_scope = Some(Default::default());
+        let index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|thread| thread.id == worker)
+            .unwrap();
+        runtime.state.threads[index].apply(json!({"type":"agent_start"}));
+        runtime.state.threads[index].apply(json!({
+            "type":"message_end","message":{"role":"assistant","content":"A recorded claim"}
+        }));
+        runtime.state.threads[index].apply(json!({"type":"agent_settled","aborted":false}));
+        crate::model::poll(&mut runtime.state, 0.0, &mut rune::Tx::default());
+        runtime.persist(None, capture.finish()).unwrap();
+        let saved = database.read("index.json").unwrap().unwrap();
+        assert_eq!(saved["captainReports"][0]["policy"], "ignore");
+        assert_eq!(saved["captainReports"][0]["delivered"], false);
+        assert_eq!(
+            channels.lock().unwrap().len(),
+            before_connections,
+            "ignored report cannot connect a provider"
+        );
+        let report_id = saved["captainReports"][0]["id"].as_str().unwrap();
+        assert!(
+            channels
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .flat_map(|commands| commands.try_iter())
+                .all(|command| !command.to_string().contains(report_id))
+        );
+        let before = saved;
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime
+            .state
+            .set_captain_report_policy(0, ReportPolicy::Context, ReportPolicy::Ignore)
+            .unwrap();
+        database.fail("injected policy failure".into());
+        assert!(runtime.persist(None, capture.finish()).is_err());
+        database.test_connection(|connection| {
+            assert_eq!(
+                crate::projection_store::read(connection, "index.json")
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+        });
     }
 
     #[test]

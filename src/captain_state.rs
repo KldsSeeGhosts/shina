@@ -280,8 +280,21 @@ impl State {
                 }
             })
             .collect();
-        for (thread, context) in self.threads.iter_mut().zip(contexts) {
+        // Members capture reports under their owner's current policy; released
+        // threads return to the react default.
+        let policies: Vec<ReportPolicy> = self
+            .threads
+            .iter()
+            .map(|thread| {
+                thread
+                    .crew_captain
+                    .map(|captain| self.captain_report_policy(captain))
+                    .unwrap_or_default()
+            })
+            .collect();
+        for ((thread, context), policy) in self.threads.iter_mut().zip(contexts).zip(policies) {
             thread.captain_context = context;
+            thread.crew_report_policy = policy;
         }
     }
 
@@ -319,6 +332,9 @@ impl State {
             "title":thread.title,
             "status":status_word(thread.status),
             "phase":thread.phase,
+            "runId":thread.run_id,
+            "runtimeGeneration":thread.request_generation,
+            "independent":!thread.delegated && !thread.captain_home && thread.peer_origin.is_none(),
             "machine":thread.machine,
             "project":thread.project,
             "question":thread.request.as_ref().map(|r| r["method"].clone()).unwrap_or(Value::Null),
@@ -857,6 +873,7 @@ impl State {
         self.require_captain(captain)?;
         let profile = &self.captains[captain];
         let digest = self.captain_document(captain, "DIGEST.md");
+        let activity = self.captain_activity_digest(captain)?;
         let documents: serde_json::Map<String, Value> = DOCUMENT_NAMES
             .iter()
             .map(|name| {
@@ -882,6 +899,8 @@ impl State {
             "crew":self.captain_crew(captain),
             "documents":documents,
             "digest":{"text":digest.text,"revision":digest.revision,"updatedAt":digest.updated_at},
+            "reportPolicy":self.captain_report_policy(captain).id(),
+            "activityDigest":activity,
         }))
     }
 
@@ -921,7 +940,7 @@ impl State {
             || self
                 .captain_reports
                 .iter()
-                .any(|report| report.thread_id == owner && !report.delivered)
+                .any(|report| report.thread_id == owner && report.needs_delivery())
         {
             return Err(
                 "The thread's crew report must reach its Captain before membership changes.".into(),

@@ -392,6 +392,16 @@ impl State {
         }
     }
 
+    pub(super) fn home_group_ids(&self, home: usize) -> BTreeSet<usize> {
+        self.threads
+            .iter()
+            .find(|thread| thread.id == home && thread.captain_home)
+            .and_then(|thread| thread.captain)
+            .filter(|captain| self.captain_home(*captain) == Some(home))
+            .map(|captain| self.captain_group_ids(captain))
+            .unwrap_or_else(|| BTreeSet::from([home]))
+    }
+
     /// The token changes with confirmation-relevant state, not streaming text,
     /// elapsed clocks or catalog refreshes. It carries no authority by itself.
     pub fn captain_version(&self, captain: usize) -> Result<String, String> {
@@ -448,7 +458,9 @@ impl State {
                     .flat_map(|thread| &thread.crew_report_outbox),
             )
             .filter(|report| report.captain == captain)
-            .map(|report| json!({"id":report.id,"delivered":report.delivered}))
+            .map(|report| {
+                json!({"id":report.id,"delivered":report.delivered,"policy":report.policy.id()})
+            })
             .collect();
         let answers: Vec<_> = self
             .captain_question_answers
@@ -466,6 +478,7 @@ impl State {
         Ok(crate::protocol::revision(&json!({
             "captain":captain,"profile":self.captains[captain].to_value(),
             "lifecycle":self.captain_lifecycles.get(&captain).cloned().unwrap_or_default(),
+            "reportPolicy":self.captain_report_policy(captain).id(),
             "home":self.captain_home(captain),"threads":threads,
             "scope":self.captain_scope(captain),"remoteScope":self.remote_captain_scope(captain),
             "documents":documents,"memory":self.memories(captain),
@@ -581,6 +594,7 @@ impl State {
                     || self.captain_books.contains_key(&captain)
                     || self.captain_scopes.contains_key(&captain)
                     || self.captain_remote_scopes.contains_key(&captain)
+                    || self.captain_report_policies.contains_key(&captain)
                     || self
                         .threads
                         .iter()

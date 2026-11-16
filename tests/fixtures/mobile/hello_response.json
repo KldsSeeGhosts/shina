@@ -54,7 +54,13 @@
       "notification-feed-v1",
       "mobile-push-v1",
       "captain-state-v1",
-      "captain-reports-v1"
+      "captain-reports-v1",
+      "captain-archive-v1",
+      "captain-promote-v1",
+      "captain-retire-v1",
+      "captain-delete-v1",
+      "captain-crew-control-v1",
+      "captain-events-v1"
     ],
     "deviceId": "<uuid>",
     "epoch": "<epoch>",
@@ -72,7 +78,7 @@
     },
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 29,
+    "protocolMinor": 35,
     "serverId": "<serverId>",
     "serverTime": "<time>"
   }

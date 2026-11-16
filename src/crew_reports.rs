@@ -55,6 +55,10 @@ pub struct CrewReport {
     pub run_id: String,
     pub title: String,
     pub outcome: CrewOutcome,
+    /// The Captain's wake policy frozen at capture. Legacy records restore as
+    /// `react`; later policy changes never rewrite this snapshot.
+    #[serde(default)]
+    pub policy: ReportPolicy,
     pub summary: String,
     pub error: String,
     pub created_at: u64,
@@ -70,6 +74,13 @@ pub struct CrewReport {
 }
 
 impl CrewReport {
+    /// Whether this record still needs to reach the Captain's accepted history.
+    /// `ignore` reports never inject or wake and stay retained undelivered;
+    /// their questions and answers still settle separately.
+    pub fn needs_delivery(&self) -> bool {
+        !self.delivered && self.policy != ReportPolicy::Ignore
+    }
+
     /// "turn" for observed terminal outcomes, "agent" for explicitly submitted claims.
     pub fn source(&self) -> &'static str {
         if self.request_id.is_some() {
@@ -182,6 +193,9 @@ impl Thread {
             .take(ERROR_MAX_CHARS)
             .collect();
         self.crew_report_last_run = Some(run.run_id.clone());
+        // The observed turn snapshots the member's current policy; a Context
+        // capture holds until an explicit turn releases it.
+        let policy = self.crew_report_policy;
         self.crew_report_outbox.push(CrewReport {
             id: format!("crew-{}", uuid::Uuid::new_v4()),
             captain,
@@ -189,6 +203,7 @@ impl Thread {
             run_id: run.run_id,
             title,
             outcome,
+            policy,
             summary,
             error,
             created_at: lifecycle::now(),
@@ -196,7 +211,7 @@ impl Thread {
             question: None,
             artifacts: Vec::new(),
             delivered: false,
-            hold_delivery: false,
+            hold_delivery: policy == ReportPolicy::Context,
         });
         true
     }
@@ -223,8 +238,11 @@ impl State {
             changed = true;
         }
         changed |= self.scrub_crew_report_injections();
-        // Durable records commit before any process is woken with them.
+        // Durable records commit before any process is woken with them. Global
+        // report changes leave a scoped poll's partial snapshot, so the batch
+        // must persist the whole index.
         if changed {
+            self.persistence_scope = None;
             self.checkpoint();
         }
         let routes: Vec<Option<usize>> = self
@@ -233,7 +251,9 @@ impl State {
             .map(|report| self.captain_home(report.captain))
             .collect();
         for index in 0..self.captain_reports.len() {
-            if self.captain_reports[index].delivered || self.captain_reports[index].hold_delivery {
+            if !self.captain_reports[index].needs_delivery()
+                || self.captain_reports[index].hold_delivery
+            {
                 continue;
             }
             let Some(home) = routes[index] else {
@@ -306,6 +326,7 @@ impl State {
                 .filter(|report| {
                     report.delivered
                         || report.hold_delivery
+                        || report.policy == ReportPolicy::Ignore
                         || self.captain_home(report.captain) != Some(thread_id)
                 })
                 .map(|report| report.id.as_str())
@@ -341,7 +362,7 @@ impl State {
             }
         }
         for report in &mut self.captain_reports {
-            if !report.delivered {
+            if report.needs_delivery() {
                 report.hold_delivery = true;
             }
         }
@@ -381,7 +402,6 @@ impl State {
         self.release_crew_answers(parent_thread_id);
     }
 
-    #[cfg(test)]
     pub(crate) fn crew_reports(&self) -> &[CrewReport] {
         &self.captain_reports
     }
@@ -521,7 +541,9 @@ impl State {
                 .iter()
                 .find(|t| t.id == report.thread_id)
                 .ok_or("A crew report references an unknown thread.")?;
-            if !report.delivered && !recruited_root(source, report.captain) {
+            // Deliverable reports must still belong to a current recruited root;
+            // an undelivered ignore record may survive a release or move.
+            if report.needs_delivery() && !recruited_root(source, report.captain) {
                 return Err(
                     "An undelivered crew report must belong to its source's current crew.".into(),
                 );
@@ -542,7 +564,7 @@ impl State {
                 }
                 if report.thread_id != thread.id
                     || report.delivered
-                    || !recruited_root(thread, report.captain)
+                    || (report.needs_delivery() && !recruited_root(thread, report.captain))
                 {
                     return Err("A thread's crew report outbox is inconsistent.".into());
                 }

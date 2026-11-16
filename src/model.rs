@@ -20,7 +20,7 @@ use std::{
 /// The label shown when a thread uses whatever model Pi is configured with.
 pub const DEFAULT_MODEL: &str = "Default model";
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
-const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
+pub(crate) const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 struct ContextAssetDownload {
     machine: String,
@@ -109,8 +109,11 @@ mod approval_send;
 #[cfg(test)]
 #[path = "approval_send_tests.rs"]
 mod approval_send_tests;
+#[path = "crew_question_state.rs"]
+pub(crate) mod crew_question_state;
 #[path = "crew_questions.rs"]
 pub(crate) mod crew_questions;
+pub use crew_question_state::CrewQuestionDraft;
 #[path = "crew_reports.rs"]
 pub(crate) mod crew_reports;
 #[path = "question_answers.rs"]
@@ -146,14 +149,32 @@ use queued_edit::queue_revision;
 #[cfg(test)]
 pub use run_control::StopPhase;
 pub use run_control::{StopControl, TurnCapabilities};
+#[path = "captain_event_policy.rs"]
+mod captain_event_policy;
 #[path = "captain_state.rs"]
 mod captain_state;
+pub use captain_event_policy::ReportPolicy;
+#[path = "captain_policy_client.rs"]
+mod captain_policy_client;
+pub use captain_policy_client::CaptainPolicyChange;
+#[path = "captain_digest.rs"]
+mod captain_digest;
 pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
 #[path = "captain_lifecycle.rs"]
 mod captain_lifecycle;
 pub use captain_lifecycle::CaptainPhase;
+#[path = "captain_crew_draft.rs"]
+mod captain_crew_draft;
+#[path = "captain_crew_ops.rs"]
+mod captain_crew_ops;
+pub use captain_crew_draft::CrewDraftTarget;
 #[path = "captain_delete.rs"]
 mod captain_delete;
+#[path = "captain_lifecycle_state.rs"]
+mod captain_lifecycle_state;
+#[path = "captain_promotion_state.rs"]
+mod captain_promotion_state;
+pub use captain_promotion_state::PromotionChange;
 #[path = "captain_roles.rs"]
 mod captain_roles;
 #[cfg(test)]
@@ -229,7 +250,16 @@ pub enum ToastKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToastAction {
-    OpenThread { server: String, thread_id: usize },
+    OpenThread {
+        server: String,
+        thread_id: usize,
+    },
+    ReviewCaptainPromotion {
+        server: String,
+        thread_id: usize,
+        profile: Captain,
+        restore: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -507,6 +537,8 @@ pub enum ProjectPicker {
 /// Nothing here is persisted; committed values go through the State memory and scope APIs.
 #[derive(Default)]
 pub struct BriefUi {
+    /// Expanded activity groups, scoped to their owning machine and Captain.
+    pub activity_open: std::collections::BTreeSet<(String, usize, &'static str)>,
     /// The memory whose text is being edited inline, and its draft.
     pub editing: Option<String>,
     pub edit: TextEdit,
@@ -528,6 +560,12 @@ pub struct BriefUi {
     pub moving: Option<MovePicker>,
     /// A crew row's More menu: the member thread it was opened for.
     pub more: Option<usize>,
+    /// The open lifecycle confirmation (archive, unarchive, demote or delete),
+    /// bound to the machine and Captain it was opened for.
+    pub lifecycle: Option<CaptainLifecycleDialog>,
+    /// A retired Captain record (server, captain) opened read-only from the
+    /// Archive's Former captains rows. UI-only identity; never persisted.
+    pub record: Option<(String, usize)>,
     /// Demo scenes only: a stand-in for the live background status.
     pub demo_status: Option<background::BackgroundStatus>,
 }
@@ -625,6 +663,78 @@ pub struct MovePicker {
     pub mode: MoveMode,
     /// The element key the picker hangs from.
     pub anchor: String,
+}
+
+/// The Captain lifecycle actions the shared confirmation dialog can ask for.
+/// `action` is the backend's preview/command verb; `method` is the wire command;
+/// `capability` is the negotiated feature string that must be present to offer it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptainLifecycleAction {
+    Archive,
+    Unarchive,
+    Demote,
+    Delete,
+}
+
+impl CaptainLifecycleAction {
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Unarchive => "unarchive",
+            Self::Demote => "demote",
+            Self::Delete => "delete",
+        }
+    }
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Archive => "captain.archive",
+            Self::Unarchive => "captain.unarchive",
+            Self::Demote => "captain.demote",
+            Self::Delete => "captain.delete",
+        }
+    }
+    pub fn capability(&self) -> &'static str {
+        match self {
+            Self::Archive | Self::Unarchive => crate::protocol::CAPTAIN_ARCHIVE,
+            Self::Demote => crate::protocol::CAPTAIN_RETIRE,
+            Self::Delete => crate::protocol::CAPTAIN_DELETE,
+        }
+    }
+}
+
+/// The shared Captain archive/unarchive/demote/delete confirmation, bound to the
+/// machine and Captain it was opened for. `pending` is whichever command is in
+/// flight: first the `captain.lifecycle.preview` read, then the mutation itself.
+/// `preview` is the backend's own read shape (`captainVersion`, `crewSeen`,
+/// `affectedThreads`, `blockers`, and the delete extras); the dialog renders from
+/// it and the confirm sends its `captainVersion`/`crewSeen` back unchanged.
+#[derive(Clone)]
+pub struct CaptainLifecycleDialog {
+    pub server: String,
+    pub captain: usize,
+    pub action: CaptainLifecycleAction,
+    pub preview: Option<Value>,
+    pub pending: Option<uuid::Uuid>,
+    pub error: Option<String>,
+    pub confirm_name: TextEdit,
+    pub keep_conversations: bool,
+}
+
+impl CaptainLifecycleDialog {
+    /// The backend refused the last confirmation because the Captain changed
+    /// under the open dialog. The list must be re-reviewed before a fresh press.
+    pub fn conflict(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Captain changed since version"))
+    }
+}
+
+/// A lifecycle mutation queued on a machine, awaiting its exact command receipt.
+#[derive(Clone, Copy, Debug)]
+pub struct LifecycleChange {
+    pub captain: usize,
+    pub action: CaptainLifecycleAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -761,6 +871,9 @@ pub struct Thread {
     resume_command: Option<uuid::Uuid>,
     /// Device-owned draft, promoted on Send rather than while choosing a host or project.
     pub client_draft: bool,
+    /// Client-only binding for an atomic first input into an independent crew root.
+    pub crew_draft: Option<CrewDraftTarget>,
+    pub crew_draft_notice: Option<String>,
     pub(crate) client_creating: Option<uuid::Uuid>,
     pub(crate) client_promoted: Option<usize>,
     pub remote: Option<crate::client::Commands>,
@@ -926,6 +1039,7 @@ pub struct Thread {
     forwarded_question: Option<String>,
     accepted_deliveries: Vec<String>,
     crew_report_run: Option<crew_reports::CrewRun>,
+    crew_report_policy: ReportPolicy,
     crew_report_outbox: Vec<crew_reports::CrewReport>,
     crew_report_last_run: Option<String>,
     recovering_task: bool,
@@ -1330,6 +1444,8 @@ impl Thread {
             request_generation: uuid::Uuid::new_v4().to_string(),
             server_owned: false,
             client_draft: false,
+            crew_draft: None,
+            crew_draft_notice: None,
             client_creating: None,
             client_promoted: None,
             recovery_command: None,
@@ -1449,6 +1565,7 @@ impl Thread {
             forwarded_question: None,
             accepted_deliveries: Vec::new(),
             crew_report_run: None,
+            crew_report_policy: ReportPolicy::React,
             crew_report_outbox: Vec::new(),
             crew_report_last_run: None,
             recovering_task: false,
@@ -4403,6 +4520,7 @@ pub struct State {
     captain_homes: std::collections::BTreeMap<usize, usize>,
     captain_books: std::collections::BTreeMap<usize, captain_state::CaptainBook>,
     captain_lifecycles: std::collections::BTreeMap<usize, captain_lifecycle::CaptainLifecycle>,
+    captain_report_policies: std::collections::BTreeMap<usize, ReportPolicy>,
     captain_reports: Vec<crew_reports::CrewReport>,
     captain_question_answers: Vec<crew_questions::CrewAnswer>,
     /// In-memory Captain document drafts, keyed by server, captain and document name. Never
@@ -4410,6 +4528,15 @@ pub struct State {
     pub captain_drafts: std::collections::BTreeMap<DocumentDraftKey, DocumentDraft>,
     /// Crew changes queued on linked machines, awaiting their exact command receipts.
     pub crew_pending: std::collections::BTreeMap<(String, uuid::Uuid), CrewChange>,
+    /// Lifecycle mutations queued on a machine, awaiting their exact command
+    /// receipts. Entries stay Waiting across a link drop; nothing retries them.
+    pub lifecycle_pending: std::collections::BTreeMap<(String, uuid::Uuid), LifecycleChange>,
+    pub promotion_pending: std::collections::BTreeMap<(String, uuid::Uuid), PromotionChange>,
+    pub captain_policy_pending:
+        std::collections::BTreeMap<(String, uuid::Uuid), CaptainPolicyChange>,
+    pub captain_policy_errors: std::collections::BTreeMap<(String, usize), String>,
+    pub crew_question_drafts: std::collections::BTreeMap<(String, String), CrewQuestionDraft>,
+    pub crew_questions_captain_open: bool,
     /// A dirty-draft close parked behind the discard confirmation.
     pub doc_discard: Option<DocDiscard>,
     /// Crew change rejections per machine: an error from one host must not render on another.
@@ -4690,10 +4817,17 @@ impl State {
             captain_homes: Default::default(),
             captain_books: Default::default(),
             captain_lifecycles: Default::default(),
+            captain_report_policies: Default::default(),
             captain_reports: Vec::new(),
             captain_question_answers: Vec::new(),
             captain_drafts: Default::default(),
             crew_pending: Default::default(),
+            lifecycle_pending: Default::default(),
+            promotion_pending: Default::default(),
+            captain_policy_pending: Default::default(),
+            captain_policy_errors: Default::default(),
+            crew_question_drafts: Default::default(),
+            crew_questions_captain_open: false,
             doc_discard: None,
             crew_errors: Default::default(),
             memory: Arc::default(),
@@ -4845,6 +4979,7 @@ impl State {
         self.tab_epoch += 1;
         self.requested_tab = None;
         self.requested_tab_restore = None;
+        self.brief.record = None;
         self.focus_thread(index);
     }
     /// Focus an existing tab. Background reducers must not open tabs.
@@ -7588,6 +7723,18 @@ impl State {
     }
 
     pub fn save_captain(&mut self) {
+        if self
+            .captain_editor
+            .as_ref()
+            .is_some_and(|editor| editor.promotion.is_some())
+        {
+            if let Err(error) = self.save_captain_promotion()
+                && let Some(editor) = self.captain_editor.as_mut()
+            {
+                editor.error = Some(error);
+            }
+            return;
+        }
         if self.client.is_some() {
             if let Some(editor) = &self.captain_editor {
                 if editor.server != self.machines.selected {
@@ -7669,9 +7816,10 @@ impl State {
             .unwrap_or(Status::Ready)
     }
     pub fn home_status(&self, home: usize) -> Status {
+        let group = self.home_group_ids(home);
         self.threads
             .iter()
-            .filter(|t| !t.archived() && (t.id == home || self.captain_worker(t, home)))
+            .filter(|t| !t.archived() && group.contains(&t.id))
             .filter(|t| t.id == home || t.request.as_ref().is_none_or(|r| r["method"] == "confirm"))
             .map(|t| t.status)
             .max_by_key(|s| s.urgency())
@@ -8005,6 +8153,12 @@ impl State {
         tool: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        if matches!(
+            tool,
+            "captain_crew_create" | "captain_crew_send" | "captain_crew_stop"
+        ) {
+            return self.captain_crew_tool(caller, tool, args);
+        }
         if !matches!(
             tool,
             "list_routines"
@@ -9648,6 +9802,64 @@ impl State {
             return;
         };
         match action {
+            ToastAction::ReviewCaptainPromotion {
+                server,
+                thread_id,
+                profile,
+                restore,
+            } => {
+                if self.machines.selected != server {
+                    self.select_machine(&server);
+                }
+                if self.machines.selected != server {
+                    return;
+                }
+                match self.begin_captain_promotion(&server, thread_id) {
+                    Ok(()) => {
+                        let current_restore = self
+                            .captain_editor
+                            .as_ref()
+                            .and_then(|editor| editor.promotion.as_ref())
+                            .and_then(|promotion| promotion.restore);
+                        if current_restore != restore {
+                            let candidate = self
+                                .captain_editor
+                                .as_ref()
+                                .and_then(|editor| editor.promotion.as_ref())
+                                .and_then(|promotion| promotion.restore_candidate);
+                            if restore.is_none() || candidate == restore {
+                                if let Err(error) =
+                                    self.set_captain_promotion_restore(restore.is_some())
+                                    && let Some(editor) = self.captain_editor.as_mut()
+                                {
+                                    editor.error = Some(error);
+                                }
+                            } else if let Some(editor) = self.captain_editor.as_mut() {
+                                editor.error = Some("The former captain changed. Review the profile before confirming.".into());
+                            }
+                        }
+                        if restore.is_none()
+                            && let Some(editor) = self.captain_editor.as_mut()
+                            && editor
+                                .promotion
+                                .as_ref()
+                                .is_some_and(|promotion| promotion.restore.is_none())
+                        {
+                            editor.name.replace_text(profile.name);
+                            editor.role.replace_text(profile.role);
+                            editor.instructions.replace_text(profile.instructions);
+                            editor.portrait = profile.portrait;
+                        }
+                    }
+                    Err(error) => self.push_toast(
+                        ToastKind::Error,
+                        "Could not reopen promotion",
+                        Some(error),
+                        None,
+                        Some(6000),
+                    ),
+                }
+            }
             ToastAction::OpenThread { server, thread_id } => {
                 if self.client.is_some() {
                     if server != self.machines.selected {
@@ -12440,6 +12652,14 @@ impl State {
         if self.current().resume_pending() || self.current().responding_request.is_some() {
             return false;
         }
+        if self.current().crew_draft.is_some() {
+            if background || approval_redirect {
+                self.current_mut().crew_draft_notice =
+                    Some("Send this crew thread normally before starting background work.".into());
+                return false;
+            }
+            return self.send_crew_draft();
+        }
         if self.current().queued_edit.is_some() {
             let target_server_id = self.machine_identity(&self.machines.selected);
             let peers = self.peers.clone();
@@ -13909,12 +14129,14 @@ impl State {
             self.captains = captains;
             // A different machine's records must not consult the old lifecycle map.
             self.captain_lifecycles.clear();
+            self.captain_report_policies.clear();
             self.projects.entries = projects;
             self.restore_captain_records(index, &project_remap)?;
             self.captain_books = self.restore_captain_books(index)?;
             self.restore_crew_reports(index)?;
             self.restore_crew_answers(index)?;
             self.restore_captain_lifecycles(index)?;
+            self.restore_captain_report_policies(index)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             if restore_session {
@@ -14552,6 +14774,7 @@ impl State {
             "captainHomes":self.captain_homes,
             "captainBooks":self.captain_book_value(),
             "captainLifecycles":self.captain_lifecycles,
+            "captainReportPolicies":self.captain_report_policies,
             "captainReports":self.captain_reports,
             "captainQuestionAnswers":self.captain_question_answers,
             "threads":self.threads.iter().filter(|thread| {

@@ -265,6 +265,16 @@ pub fn tools() -> Value {
         ]}}],
         "additionalProperties":false
     });
+    let mut crew_target = target.clone();
+    crew_target["properties"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|key, _| matches!(key.as_str(), "harness" | "provider" | "model" | "options"));
+    crew_target["anyOf"] = json!([{"required":["model"]},{"required":["harness"]}]);
+    crew_target.as_object_mut().unwrap().remove("allOf");
+    crew_target["description"] = json!(
+        "Optional local model and harness selection. Omit to inherit the Captain's selection. Explicit unsupported choices reject before a crew root is allocated."
+    );
     let mut tools = json!([
         {
             "name":"html_render",
@@ -452,6 +462,45 @@ pub fn tools() -> Value {
             "annotations":{"readOnlyHint":true,"destructiveHint":false}
         }
     ]);
+    let crew_tools = json!([
+        {
+            "name":"captain_crew_create",
+            "description":"Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. Crew starts in that workspace, not a new Git worktree. prompt accepts at most 64000 UTF-8 bytes.",
+            "inputSchema":{"type":"object","properties":{
+                "requestId":{"type":"string","format":"uuid"},
+                "prompt":{"type":"string","minLength":1,"maxLength":64000},
+                "project":{"type":["integer","null"],"minimum":1},
+                "title":{"type":"string","minLength":1,"maxLength":200},
+                "target":crew_target
+            },"required":["requestId","prompt"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_send",
+            "description":"Save work for an independent root in the calling primary Captain's current crew. It queues behind the current turn and never answers provider approvals or human questions. Recovered input requires user review before more work is accepted. Use a stable requestId UUID; retrying it never sends the message twice or reattaches moved or released crew. Saved means durable queued input, not worker acceptance or completion. message accepts at most 64000 UTF-8 bytes.",
+            "inputSchema":{"type":"object","properties":{
+                "requestId":{"type":"string","format":"uuid"},
+                "threadId":{"type":"integer","minimum":1},
+                "message":{"type":"string","minLength":1,"maxLength":64000}
+            },"required":["requestId","threadId","message"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        },
+        {
+            "name":"captain_crew_stop",
+            "description":"Stop the observed run of an independent root in the calling primary Captain's current crew. Read captain_crew_list for runId and runtimeGeneration, then pass them unchanged with a stable requestId UUID. A stale run or generation rejects. An uncertain retry returns the old receipt and never stops a newer run. This does not approve tools, resolve questions or delete queued input.",
+            "inputSchema":{"type":"object","properties":{
+                "requestId":{"type":"string","format":"uuid"},
+                "threadId":{"type":"integer","minimum":1},
+                "runId":{"type":["string","null"]},
+                "runtimeGeneration":{"type":"string","minLength":1}
+            },"required":["requestId","threadId","runId","runtimeGeneration"],"additionalProperties":false},
+            "annotations":{"readOnlyHint":false,"destructiveHint":false}
+        }
+    ]);
+    tools
+        .as_array_mut()
+        .expect("tool array")
+        .extend(crew_tools.as_array().expect("crew tools").iter().cloned());
     tools
         .as_array_mut()
         .expect("tool array")
@@ -1263,6 +1312,59 @@ assert.equal(decide("full-access", false, false, false, false), "allow");
                 .find(|entry| entry["name"] == name)
                 .unwrap_or_else(|| panic!("missing tool {name}"));
             assert_eq!(found, tool, "{name} drifted from the contract");
+        }
+    }
+
+    #[test]
+    fn independent_crew_tools_pin_retry_authority_and_local_only_contracts() {
+        let published = tools();
+        let expected = [
+            (
+                "captain_crew_create",
+                "Create an independent crew root and save its first work message together. Only the current primary Captain home can create crew. This is not a delegated Task. It excludes private Captain rules and uses the existing worker access policy. It never grants a tool approval. Use a stable requestId UUID for the same intent; a retry returns the original identity without creating or recruiting another thread. project is required with several local scoped workspaces. Crew starts in that workspace, not a new Git worktree. prompt accepts at most 64000 UTF-8 bytes.",
+                json!(["requestId", "prompt"]),
+            ),
+            (
+                "captain_crew_send",
+                "Save work for an independent root in the calling primary Captain's current crew. It queues behind the current turn and never answers provider approvals or human questions. Recovered input requires user review before more work is accepted. Use a stable requestId UUID; retrying it never sends the message twice or reattaches moved or released crew. Saved means durable queued input, not worker acceptance or completion. message accepts at most 64000 UTF-8 bytes.",
+                json!(["requestId", "threadId", "message"]),
+            ),
+            (
+                "captain_crew_stop",
+                "Stop the observed run of an independent root in the calling primary Captain's current crew. Read captain_crew_list for runId and runtimeGeneration, then pass them unchanged with a stable requestId UUID. A stale run or generation rejects. An uncertain retry returns the old receipt and never stops a newer run. This does not approve tools, resolve questions or delete queued input.",
+                json!(["requestId", "threadId", "runId", "runtimeGeneration"]),
+            ),
+        ];
+        for (name, description, required) in expected {
+            let tool = published
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            assert_eq!(tool["description"], description);
+            assert_eq!(tool["inputSchema"]["required"], required);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                tool["inputSchema"]["properties"]["requestId"]["format"],
+                "uuid"
+            );
+            assert_eq!(
+                tool["annotations"],
+                json!({"readOnlyHint":false,"destructiveHint":false})
+            );
+        }
+        let create = published
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "captain_crew_create")
+            .unwrap();
+        let properties = &create["inputSchema"]["properties"];
+        assert!(properties.get("captain").is_none() && properties.get("access").is_none());
+        let target = &properties["target"]["properties"];
+        for remote in ["machine", "environmentId", "projectId"] {
+            assert!(target.get(remote).is_none());
         }
     }
 }

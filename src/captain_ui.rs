@@ -16,7 +16,7 @@ use rune::Transition;
 /// The Brief's width beside the chat, as KSG's right panel.
 pub(super) const PANEL_WIDTH: f32 = 320.0;
 /// Below this window width (ui.rs's `narrow`) the Brief is a sheet over the chat.
-const SHEET_BELOW: f32 = 1050.0;
+pub(super) const SHEET_BELOW: f32 = 1050.0;
 /// Rows, chips and inputs share this corner.
 /// Rows, buttons and chips.
 const ROW_RADIUS: f32 = 4.0;
@@ -50,8 +50,17 @@ fn report<T>(s: &mut State, result: Result<T, String>) -> bool {
     }
 }
 
-/// The captain whose Brief the open thread shows: its primary home or an earlier one.
+/// The captain whose Brief is shown: a retired record opened from the Archive, else the
+/// primary home or an earlier conversation of the open thread. A record binds to the
+/// machine it was opened on and draws only while its phase stays Retired.
 pub(super) fn brief_captain(s: &State) -> Option<usize> {
+    if let Some((server, captain)) = &s.brief.record
+        && *server == s.machines.selected
+        && *captain < s.captains.len()
+        && s.captain_phase(*captain) == crate::model::CaptainPhase::Retired
+    {
+        return Some(*captain);
+    }
     let t = s.current();
     s.is_captain_home(t)
         .then_some(t.captain)
@@ -59,15 +68,20 @@ pub(super) fn brief_captain(s: &State) -> Option<usize> {
         .filter(|&captain| captain < s.captains.len())
 }
 
-/// The open thread is a captain's earlier conversation, which opens read-only.
+/// The open thread is a captain's earlier conversation, which opens read-only. Only a real
+/// earlier home counts: a retired record Brief never turns the ordinary composer read-only.
 pub(super) fn is_earlier(s: &State) -> bool {
-    brief_captain(s).is_some_and(|captain| s.captain_home(captain) != Some(s.current().id))
+    let t = s.current();
+    s.is_captain_home(t)
+        && t.captain
+            .is_some_and(|captain| s.captain_home(captain) != Some(t.id))
 }
 
-fn close_brief(s: &mut State) {
+pub(super) fn close_brief(s: &mut State) {
     s.show_activity = false;
     s.activity_full = false;
     s.brief.confirm_reset = false;
+    s.brief.record = None;
 }
 
 /// A 24 px icon action, as KSG's `THREAD_DETAILS_PANEL_ICON_ACTION_CLASS` (`size-6 rounded-md`).
@@ -140,7 +154,13 @@ pub(super) fn switch(
 
 /// One section, as KSG's `ThreadDetailsSection`: `px-2 pt-2 pb-2.5`, a 32 px heading row in
 /// `text-2xs font-medium text-muted-foreground`, actions at its end, and a hairline above.
-fn section(key: &str, title: &str, meta: Option<String>, actions: Vec<El>, p: Palette) -> El {
+pub(super) fn section(
+    key: &str,
+    title: &str,
+    meta: Option<String>,
+    actions: Vec<El>,
+    p: Palette,
+) -> El {
     let mut heading = row()
         .h(32.0)
         .px(10.0)
@@ -179,6 +199,9 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         return el();
     };
     let access = s.captain_access(captain);
+    // A retired record opened from the Archive: read-only throughout, with no crew,
+    // workspace or routine controls and no private document edits.
+    let record = s.brief.record.is_some();
     let profile = &s.captains[captain];
     let header = row()
         .key("captain-brief-header")
@@ -195,7 +218,11 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .radius(4.0)
                 .fill(p.selected)
                 .child(icon("list", p.muted))
-                .child(label("Brief", SMALL, p.ink)),
+                .child(label(
+                    if record { "Captain record" } else { "Brief" },
+                    SMALL,
+                    p.ink,
+                )),
         )
         .child(spacer())
         .child(icon_button(
@@ -216,7 +243,17 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         .pb(12.0)
         .gap(12.0)
         .center_y()
-        .child(avatar(s, p, captain, 36.0, shown_status(s)))
+        .child(avatar(
+            s,
+            p,
+            captain,
+            36.0,
+            if record {
+                crate::model::Status::Ready
+            } else {
+                shown_status(s)
+            },
+        ))
         .child(
             col()
                 .grow(1.0)
@@ -281,13 +318,18 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
     );
     let sections = [
         knowable.then(|| digest_section(s, p, captain)),
-        knowable.then(|| crew_section(s, p, captain)),
+        (knowable && !record).then(|| crew_section(s, p, captain)),
         knowable.then(|| documents_section(s, p, captain)),
-        Some(scope_section(s, p, captain)),
+        (!record).then(|| {
+            scope_section(s, p, captain).disabled(access != crate::model::CaptainAccess::Full)
+        }),
         Some(memory_section(s, p, captain)),
-        Some(routines_section(s, p, captain)),
+        (!record).then(|| {
+            routines_section(s, p, captain).disabled(access != crate::model::CaptainAccess::Full)
+        }),
         Some(earlier_section(s, p, captain)),
-        Some(reset_section(s, p, captain)),
+        super::captain_lifecycle_ui::section_visible(s, captain)
+            .then(|| super::captain_lifecycle_ui::section(s, p, captain)),
     ];
     for section in sections.into_iter().flatten() {
         body = body
@@ -303,15 +345,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         .child(header)
         // The same closing rule as the chat header, so one line runs across the pane.
         .child(rule(p).key("brief-header-rule"))
-        .children(
-            super::crew_membership_ui::access_reason(access).map(|reason| {
-                label(reason, META, p.muted)
-                    .key("brief-captain-state-notice")
-                    .wrap()
-                    .px(16.0)
-                    .py(6.0)
-            }),
-        )
+        .children(brief_notice(s, p, captain, access))
         .child(
             col()
                 .grow(1.0)
@@ -324,8 +358,112 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         )
 }
 
-/// The Brief beside the chat on a wide pane.
+/// The state line under the Brief's header rule: the record and archived notices, else the
+/// shared access reason. The archived notice carries the inline Unarchive action; every
+/// other phase reads as it did before.
+fn brief_notice(
+    s: &State,
+    p: Palette,
+    captain: usize,
+    access: crate::model::CaptainAccess,
+) -> Vec<El> {
+    let server = s.machines.selected.clone();
+    if s.brief.record.is_some() {
+        return vec![
+            label(
+                "Demoted to a thread. This record is read-only.",
+                META,
+                p.muted,
+            )
+            .key("brief-captain-state-notice")
+            .wrap()
+            .px(16.0)
+            .py(6.0),
+        ];
+    }
+    if s.captain_phase(captain) == crate::model::CaptainPhase::Archived {
+        let reason = s.captain_lifecycle_unavailable(
+            &server,
+            captain,
+            crate::model::CaptainLifecycleAction::Unarchive,
+        );
+        let expected = server.clone();
+        let unarchive = ghost_button(s, "brief-unarchive".into(), "Unarchive", p, move |s| {
+            if s.machines.selected != expected {
+                return;
+            }
+            if let Err(error) = s.open_captain_lifecycle(
+                &expected,
+                captain,
+                crate::model::CaptainLifecycleAction::Unarchive,
+            ) {
+                s.brief.error = Some(error);
+            }
+        })
+        .disabled(reason.is_some());
+        let unarchive = match reason {
+            Some(reason) => unarchive.help(reason),
+            None => unarchive,
+        };
+        return vec![
+            row()
+                .key("brief-captain-state-notice")
+                .px(16.0)
+                .py(6.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(
+                        "Archived. Unarchive the captain to change it.",
+                        META,
+                        p.muted,
+                    )
+                    .wrap()
+                    .grow(1.0)
+                    .min_w(0.0),
+                )
+                .child(unarchive),
+        ];
+    }
+    super::crew_membership_ui::access_reason(access)
+        .map(|reason| {
+            label(reason, META, p.muted)
+                .key("brief-captain-state-notice")
+                .wrap()
+                .px(16.0)
+                .py(6.0)
+        })
+        .into_iter()
+        .collect()
+}
+
+/// The Brief beside the chat on a wide pane. A retired record always draws as a sheet over
+/// the chat instead: there is no home conversation for it to sit beside.
 pub(super) fn brief_side(s: &State, p: Palette) -> El {
+    if s.brief.record.is_some() {
+        let width = (s.viewport_width - 48.0).clamp(280.0, 360.0);
+        return row()
+            .key("brief-sheet")
+            .instant_changes()
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .justify_end()
+            .px(8.0)
+            .pb(8.0)
+            .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
+            .modal(false, close_brief)
+            .on_press(close_brief)
+            .focusable(false)
+            .child(
+                brief_panel(s, p)
+                    .w(width)
+                    .fill(p.panel)
+                    .radius(6.0)
+                    .border(2.0, p.frame)
+                    .box_shadow(hard_shadow(p))
+                    .on_press(|_: &mut State| {})
+                    .transition(Transition::offset(16.0, 0.0).combined(Transition::opacity())),
+            );
+    }
     brief_panel(s, p).w(PANEL_WIDTH).min_w(PANEL_WIDTH)
 }
 
@@ -483,8 +621,11 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
     section
 }
 
-/// The digest row: a bounded twelve-line markdown preview of the captain's DIGEST.md and a
-/// button that opens the document tab. The document is only read on demand.
+/// The Digest section: the automatic crew-activity digest, a rule, then the
+/// saved DIGEST.md under its own sub-heading so the document's age never reads
+/// as the age of the activity above it. The preview bounds itself to six
+/// lines when activity sits above it, twelve when it stands alone. The
+/// document is only read on demand and the section never writes it.
 fn digest_section(s: &State, p: Palette, captain: usize) -> El {
     let meta = s
         .captain_document_meta(captain)
@@ -501,12 +642,32 @@ fn digest_section(s: &State, p: Palette, captain: usize) -> El {
             open_captain_document(s, captain, "DIGEST.md");
         }
     });
-    let mut section = section("brief-digest", "Digest", age, vec![open], p);
+    let has_activity = super::captain_activity_ui::activity_has_entries(s, captain);
+    let mut section = section("brief-digest", "Digest", None, vec![open], p);
+    section = section.child(super::captain_activity_ui::activity(s, p, captain));
+    // The only divider inside the section: activity above, the saved digest below.
+    section = section.child(
+        el().key("brief-digest-rule")
+            .h(1.0)
+            .mx(10.0)
+            .fill(hairline(p)),
+    );
+    let mut summary = row()
+        .key("brief-digest-summary")
+        .h(20.0)
+        .px(10.0)
+        .center_y()
+        .child(pixel_label("Saved digest", p.muted))
+        .child(spacer());
+    if let Some(age) = age {
+        summary = summary.child(pixel_text(age, p.faint));
+    }
+    section = section.child(summary);
     if empty {
         section = section.child(
             quiet_note(
                 format!(
-                    "No digest yet. {} writes a summary of its crew's work here.",
+                    "No saved digest. {} can write one; Open digest shows it.",
                     s.captains
                         .get(captain)
                         .map(|c| c.name.as_str())
@@ -519,13 +680,14 @@ fn digest_section(s: &State, p: Palette, captain: usize) -> El {
         return section;
     }
     let (_, _, text) = s.captain_document_body(captain, "DIGEST.md");
-    let preview: String = text.lines().take(12).collect::<Vec<_>>().join("\n");
+    let lines = if has_activity { 6 } else { 12 };
+    let preview: String = text.lines().take(lines).collect::<Vec<_>>().join("\n");
     section = section.child(
         el().key("brief-digest-preview")
             .px(10.0)
             .py(4.0)
-            // Twelve lines at the reading size; long wrapped lines clip at the bound.
-            .max_h(12.0 * 16.0)
+            // Bounded lines at the reading size; long wrapped lines clip at the bound.
+            .max_h(lines as f32 * 16.0)
             .clip_fade_linear(0.0, 0.0, 0.0, 16.0)
             .child(super::markdown_ui::render_with_find(
                 &preview,
@@ -858,14 +1020,31 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
                 .color(p.danger),
         );
     }
+    let draft_server = s.machines.selected.clone();
+    let draft_reason = s.crew_creation_unavailable(&draft_server, captain);
+    let new_thread = ghost_button(s, "brief-crew-new".into(), "New crew thread", p, move |s| {
+        if s.machines.selected != draft_server {
+            return;
+        }
+        match s.begin_crew_draft(&draft_server, captain) {
+            Ok(()) => {
+                if s.viewport_width < SHEET_BELOW {
+                    close_brief(s);
+                }
+            }
+            Err(error) => s.brief.error = Some(error),
+        }
+    })
+    .disabled(draft_reason.is_some());
+    let new_thread = match draft_reason {
+        Some(reason) => new_thread.help(reason),
+        None => new_thread,
+    };
     let recruit_server = s.machines.selected.clone();
     let actions = if full {
-        vec![ghost_button(
-            s,
-            "brief-crew-recruit".into(),
-            "Recruit...",
-            p,
-            move |s| {
+        vec![
+            new_thread,
+            ghost_button(s, "brief-crew-recruit".into(), "Recruit...", p, move |s| {
                 if s.machines.selected != recruit_server
                     || s.captain_access(captain) != crate::model::CaptainAccess::Full
                 {
@@ -876,8 +1055,8 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
                     captain,
                     query: rune::TextEdit::default(),
                 });
-            },
-        )]
+            }),
+        ]
     } else {
         vec![]
     };
@@ -889,6 +1068,7 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         p,
     )
     .child(rows)
+    .child(super::captain_activity_ui::policy_block(s, p, captain))
 }
 
 fn machine_label(s: &State) -> String {
@@ -1103,7 +1283,9 @@ fn memory_editor(s: &State, p: Palette, captain: usize, id: Option<String>) -> E
 /// One memory, as KSG's details rows: an essential pin, the text, a lock badge for entries the
 /// user controls, then edit and delete.
 fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El {
-    if s.brief.editing.as_deref() == Some(memory.id.as_str()) {
+    let record =
+        s.brief.record.is_some() || s.captain_access(captain) != crate::model::CaptainAccess::Full;
+    if !record && s.brief.editing.as_deref() == Some(memory.id.as_str()) {
         return memory_editor(s, p, captain, Some(memory.id.clone()));
     }
     let id = memory.id.clone();
@@ -1166,11 +1348,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
             ),
         );
     }
-    let edit_id = id.clone();
-    let text_value = memory.text.clone();
-    let wash = hover_wash(s, p);
-    let backing = p.panel.mix(wash, wash.a);
-    row()
+    let mut row_ = row()
         .key(format!("memory-{id}"))
         .px(4.0)
         .py(4.0)
@@ -1179,78 +1357,93 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
         .hover(hover_wash(s, p))
         .hover_motion(motion(), motion())
         // The edit and delete icons show on hover and when keyboard focus is in the row.
-        .hover_group_focus()
-        .child(pin)
-        .child(text)
-        // The controls lie over the row's trailing edge on hover and focus, on a backing the
-        // colour of the hovered row, so the text uses the row's full width at rest.
-        .child(
-            row()
-                .key(format!("memory-actions-{id}"))
-                .pin(None, Some(4.0), Some(4.0), None)
-                .gap(2.0)
-                .px(2.0)
-                .radius(ROW_RADIUS)
-                .fill(backing)
-                .child(icon_action(
+        .hover_group_focus();
+    if !record {
+        row_ = row_.child(pin);
+    }
+    row_ = row_.child(text);
+    if record {
+        return row_;
+    }
+    let edit_id = id.clone();
+    let text_value = memory.text.clone();
+    let wash = hover_wash(s, p);
+    let backing = p.panel.mix(wash, wash.a);
+    row_.child(
+        row()
+            .key(format!("memory-actions-{id}"))
+            .pin(None, Some(4.0), Some(4.0), None)
+            .gap(2.0)
+            .px(2.0)
+            .radius(ROW_RADIUS)
+            .fill(backing)
+            .child(
+                icon_action(
                     s,
                     format!("memory-edit-{id}"),
                     "Edit memory",
                     icon("edit", p.muted),
                     p,
-                    move |s| {
-                        s.brief.adding = false;
-                        s.brief.editing = Some(edit_id.clone());
-                        s.brief.edit = rune::TextEdit::default();
-                        s.brief.edit.replace_text(&text_value);
-                        s.brief.edit.focused = true;
-                    },
-                ))
-                .child(icon_action(
-                    s,
-                    format!("memory-delete-{id}"),
-                    "Delete memory",
-                    glyph_icon(&super::pixel_icons::TRASH, p.muted),
-                    p,
-                    move |s| {
-                        let result = s.delete_memory(captain, &id);
-                        report(s, result);
-                    },
-                ))
-                .group_opacity(0.0, 1.0),
-        )
+                    |_| {},
+                )
+                .on_press_tx(move |s: &mut State, tx| {
+                    s.brief.adding = false;
+                    s.brief.editing = Some(edit_id.clone());
+                    s.brief.edit = rune::TextEdit::default();
+                    s.brief.edit.replace_text(&text_value);
+                    s.brief.edit.focused = true;
+                    tx.scroll_into_view(format!("memory-input-{edit_id}-editor"));
+                }),
+            )
+            .child(icon_action(
+                s,
+                format!("memory-delete-{id}"),
+                "Delete memory",
+                glyph_icon(&super::pixel_icons::TRASH, p.muted),
+                p,
+                move |s| {
+                    let result = s.delete_memory(captain, &id);
+                    report(s, result);
+                },
+            ))
+            .group_opacity(0.0, 1.0),
+    )
 }
 
 fn memory_section(s: &State, p: Palette, captain: usize) -> El {
     let memories = s.memories(captain);
+    let record =
+        s.brief.record.is_some() || s.captain_access(captain) != crate::model::CaptainAccess::Full;
     let add = icon_action(
         s,
         "brief-memory-add".into(),
         "Add memory",
         icon("plus", p.muted),
         p,
-        |s| {
-            s.brief.editing = None;
-            s.brief.adding = true;
-            s.brief.draft = rune::TextEdit::default();
-            s.brief.draft.focused = true;
-        },
-    );
+        |_| {},
+    )
+    .on_press_tx(|s: &mut State, tx| {
+        s.brief.editing = None;
+        s.brief.adding = true;
+        s.brief.draft = rune::TextEdit::default();
+        s.brief.draft.focused = true;
+        tx.scroll_into_view("brief-memory-input-editor");
+    });
     let mut section = section(
         "brief-memory",
         "Memory",
         (!memories.is_empty()).then(|| memories.len().to_string()),
-        vec![add],
+        if record { vec![] } else { vec![add] },
         p,
     );
     if let Some(status) = memory_backend_line(s) {
         section = section.child(quiet_note(status, p));
     }
     section = section.child(budget_meter(&memories, p));
-    if s.brief.adding {
+    if s.brief.adding && !record {
         section = section.child(memory_editor(s, p, captain, None));
     }
-    if memories.is_empty() && !s.brief.adding {
+    if memories.is_empty() && (record || !s.brief.adding) {
         section = section.child(super::empty_list(
             s,
             p,
@@ -1530,29 +1723,9 @@ fn earlier_section(s: &State, p: Palette, captain: usize) -> El {
     section
 }
 
-fn reset_section(s: &State, p: Palette, captain: usize) -> El {
-    let busy = s
-        .captain_home(captain)
-        .and_then(|home| s.threads.iter().find(|t| t.id == home))
-        .is_some_and(|t| t.status.busy() || t.configuring || t.queued());
-    let mut section =
-        section("brief-conversation", "Conversation", None, vec![], p).child(quiet_note(
-            "Start over with an empty conversation. Memory, scope, routines and tasks stay.",
-            p,
-        ));
-    let button = ghost_button(s, "brief-reset".into(), "Reset conversation…", p, |s| {
-        s.brief.confirm_reset = true
-    })
-    .mx(10.0)
-    .mt(4.0)
-    .disabled(busy)
-    .opacity(if busy { 0.5 } else { 1.0 });
-    section = section.child(row().child(button));
-    if busy {
-        section = section.child(quiet_note("Stop the current turn first.", p));
-    }
-    section
-}
+// The old reset-only "Conversation" section is replaced by
+// `captain_lifecycle_ui::section`, which keeps `brief-conversation`/`brief-reset` and adds
+// archive, demote and delete rows.
 
 /// The reset confirmation, as KSG's `ui/alert-dialog.tsx`: a title, what happens, and what is
 /// kept, with Cancel before the action.
@@ -2230,14 +2403,16 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
 
 /// Dialogs this module owns, mounted above everything else in the window.
 pub(super) fn dialogs(s: &State, p: Palette) -> Vec<El> {
-    [
+    let mut out: Vec<El> = [
         reset_dialog(s, p),
         profile_dialog(s, p),
         super::captain_docs_ui::discard_dialog(s, p),
     ]
     .into_iter()
     .flatten()
-    .collect()
+    .collect();
+    out.extend(super::captain_lifecycle_ui::dialogs(s, p));
+    out
 }
 
 #[cfg(test)]
@@ -2273,11 +2448,57 @@ mod tests {
         rt.frame(0.0);
         rt.frame(1.0);
     }
-    /// Scroll the Brief to its end, as a wheel over the panel does.
+    /// Scroll the Brief to its end, as a wheel over the panel does. Wheels until the
+    /// scroll-top identity stops moving, so taller bodies still reach the bottom.
     fn scroll_brief(rt: &mut Runtime<State>) {
         let (panel, _) = rt.presented("captain-brief").unwrap();
-        rt.wheel(panel[0] + panel[2] / 2.0, panel[1] + 200.0, -2000.0);
-        rt.frame(1.0);
+        let mut prev = f32::INFINITY;
+        for _ in 0..24 {
+            rt.wheel(panel[0] + panel[2] / 2.0, panel[1] + 200.0, -2000.0);
+            rt.frame(1.0);
+            let y = rt
+                .presented("brief-pennant")
+                .map(|(r, _)| r[1])
+                .unwrap_or(f32::INFINITY);
+            if (y - prev).abs() < 0.5 {
+                return;
+            }
+            prev = y;
+        }
+    }
+    /// Scroll `key` into the Brief's scroll viewport and wait until its centre is
+    /// really inside the clip, so a later press or bounds check sees it.
+    fn reveal_in_brief(rt: &mut Runtime<State>, key: &str) {
+        for _ in 0..24 {
+            if let Some((x, y)) = rt.find(key) {
+                if rt.contains(key, x, y) {
+                    return;
+                }
+            }
+            rt.update(|_, tx| tx.scroll_into_view_in("captain-brief", key.to_string()));
+            rt.frame(0.5);
+        }
+        panic!("{key} never revealed inside the brief's scroll viewport");
+    }
+    /// Every corner of `key`'s drawn box is inside its ancestors' clips, so the
+    /// element is fully on screen rather than cut by the scroll viewport.
+    fn fully_visible(rt: &Runtime<State>, key: &str) -> bool {
+        let Some((r, _)) = rt.presented(key) else {
+            return false;
+        };
+        [
+            (r[0] + 1.0, r[1] + 1.0),
+            (r[0] + r[2] - 1.0, r[1] + 1.0),
+            (r[0] + 1.0, r[1] + r[3] - 1.0),
+            (r[0] + r[2] - 1.0, r[1] + r[3] - 1.0),
+        ]
+        .into_iter()
+        .all(|(x, y)| rt.contains(key, x, y))
+    }
+    /// A press on a Brief control that may sit outside the scroll viewport.
+    fn press_in_brief(rt: &mut Runtime<State>, key: &str) {
+        reveal_in_brief(rt, key);
+        press(rt, key);
     }
     fn inside(outer: [f32; 4], inner: [f32; 4]) -> bool {
         inner[0] >= outer[0] - 0.5
@@ -2346,7 +2567,7 @@ mod tests {
     #[test]
     fn brief_sections_fit_beside_or_over_the_chat_at_supported_widths() {
         for width in WIDTHS {
-            let (rt, routine) = brief_runtime(width);
+            let (mut rt, routine) = brief_runtime(width);
             let (panel, _) = rt.presented("captain-brief").expect("brief is shown");
             assert!(
                 panel[0] >= 0.0 && panel[0] + panel[2] <= width + 0.5,
@@ -2360,14 +2581,20 @@ mod tests {
             );
             assert!(rt.presented("session-panel").is_none());
             assert!(rt.presented("composer").is_some(), "{width}");
+            // The header's close control is fixed above the scroll viewport: it
+            // shows, fully on screen, without scrolling.
+            let (close, _) = rt.presented("close-brief").expect("close-brief");
+            assert!(inside(panel, close), "{width}: {close:?} outside {panel:?}");
+            assert!(fully_visible(&rt, "close-brief"), "{width}");
+            // Sections below the header scroll into the viewport fully, not clipped.
             for key in [
-                "close-brief",
                 "brief-scope-1",
                 "brief-scope-remove-2",
                 "brief-scope-add",
                 "memory-budget",
                 "brief-memory-add",
             ] {
+                reveal_in_brief(&mut rt, key);
                 let (rect, _) = rt
                     .presented(key)
                     .unwrap_or_else(|| panic!("{key} at {width}"));
@@ -2375,13 +2602,21 @@ mod tests {
                     inside(panel, rect),
                     "{key} at {width}: {rect:?} outside {panel:?}"
                 );
+                assert!(
+                    fully_visible(&rt, key),
+                    "{key} at {width}: {rect:?} clipped by the scroll viewport"
+                );
             }
-            // Rows below the fold still lay out inside the panel's width.
+            // Rows lower in the scroll still lay out inside the panel's width. The
+            // delete overlay is transparent until hover, so it scrolls to without
+            // the clip check the visible rows take.
             for key in [
                 format!("routine-pause-{routine}"),
                 format!("routine-delete-{routine}"),
                 "brief-reset".into(),
             ] {
+                rt.update(|_, tx| tx.scroll_into_view_in("captain-brief", key.clone()));
+                rt.frame(1.0);
                 let (rect, _) = rt
                     .presented(&key)
                     .unwrap_or_else(|| panic!("{key} at {width}"));
@@ -2408,6 +2643,12 @@ mod tests {
                 .brief
                 .edit
                 .replace_text("The release branch is cut on Fridays.");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                rt.presented("save-memory").is_some(),
+                "{width}: edited memory remains visible"
+            );
             press(&mut rt, "save-memory");
             assert!(
                 rt.state
@@ -2417,9 +2658,16 @@ mod tests {
             );
             press(&mut rt, &format!("memory-delete-{release}"));
             assert_eq!(rt.state.memories(0).len(), 1, "{width}");
-            scroll_brief(&mut rt);
+            rt.update(|_, tx| tx.scroll_into_view("brief-memory-add"));
+            rt.frame(1.0);
             press(&mut rt, "brief-memory-add");
             rt.state.brief.draft.replace_text("Use British spelling.");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(
+                rt.presented("save-memory").is_some(),
+                "{width}: new memory editor remains visible"
+            );
             press(&mut rt, "save-memory");
             assert_eq!(rt.state.memories(0).len(), 2, "{width}");
             assert!(rt.state.brief.error.is_none());
@@ -2566,7 +2814,7 @@ mod tests {
                 linked_at:0, last_reached_at:Some(0), last_error:None,
                 capabilities:json!({"projects":[{"id":9,"name":"Scratch","path":"C:\\scratch","machine":"local"}]}),
             });
-            press(&mut rt, "brief-scope-add");
+            press_in_brief(&mut rt, "brief-scope-add");
             let key = format!("choose-project-{server}-9");
             assert!(rt.presented(&key).is_some(), "{width}");
             press(&mut rt, &key);
@@ -2577,11 +2825,12 @@ mod tests {
                     project_id: 9,
                 }]
             );
+            reveal_in_brief(&mut rt, &format!("brief-scope-{server}-9"));
             assert!(
                 rt.presented(&format!("brief-scope-{server}-9")).is_some(),
                 "{width}"
             );
-            press(&mut rt, &format!("brief-scope-remove-{server}-9"));
+            press_in_brief(&mut rt, &format!("brief-scope-remove-{server}-9"));
             assert!(rt.state.remote_captain_scope(0).is_empty());
         }
     }
@@ -2590,9 +2839,9 @@ mod tests {
     fn scope_chips_remove_and_the_picker_adds_a_workspace() {
         for width in WIDTHS {
             let (mut rt, _) = brief_runtime(width);
-            press(&mut rt, "brief-scope-remove-2");
+            press_in_brief(&mut rt, "brief-scope-remove-2");
             assert_eq!(rt.state.captain_scope(0), vec![1], "{width}");
-            press(&mut rt, "brief-scope-add");
+            press_in_brief(&mut rt, "brief-scope-add");
             assert_eq!(rt.state.project_picker, Some(ProjectPicker::CaptainScope));
             assert!(rt.presented("choose-no-project").is_none());
             press(&mut rt, "choose-project-3");

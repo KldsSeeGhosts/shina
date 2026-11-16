@@ -268,6 +268,9 @@ impl State {
         let run_id = thread_run
             .filter(|id| !id.is_empty() && id.len() <= 256)
             .ok_or("This thread has no current run to report against.")?;
+        // Explicit claims snapshot the Captain's current policy the same way
+        // observed turns snapshot the member's; Context holds for release.
+        let policy = self.captain_report_policy(target);
         let report = CrewReport {
             id: uuid_id("crew-"),
             captain: target,
@@ -275,6 +278,7 @@ impl State {
             run_id,
             title: thread_title.chars().take(200).collect(),
             outcome,
+            policy,
             summary,
             error: String::new(),
             created_at: lifecycle::now(),
@@ -282,7 +286,7 @@ impl State {
             question,
             artifacts,
             delivered: false,
-            hold_delivery: false,
+            hold_delivery: policy == ReportPolicy::Context,
         };
         if serde_json::to_vec(&report)
             .map(|bytes| bytes.len())
@@ -574,7 +578,6 @@ impl State {
         self.reports_page(captain, None, args)
     }
 
-    #[cfg(test)]
     pub(crate) fn crew_answers(&self) -> &[CrewAnswer] {
         &self.captain_question_answers
     }

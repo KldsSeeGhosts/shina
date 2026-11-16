@@ -204,9 +204,10 @@ impl State {
     /// `working_now_count` for one captain's home thread and its crew, what that captain's
     /// header and band count, so they agree with its crew line.
     pub fn crew_working_now(&self, home: usize) -> usize {
+        let group = self.home_group_ids(home);
         self.threads
             .iter()
-            .filter(|t| (t.id == home || t.parent == Some(home)) && t.running_now())
+            .filter(|t| group.contains(&t.id) && t.running_now())
             .count()
     }
     pub(super) fn background_work_count(&self) -> usize {
