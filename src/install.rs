@@ -997,7 +997,14 @@ pub fn restore_mac_bundle(app: &Path) -> Result<(), String> {
     if !previous.is_dir() {
         return Err("There is no previous Shina to restore.".into());
     }
-    exchange_paths(&previous, app).map_err(|e| format!("Could not restore the previous Shina: {e}"))
+    // An exchange needs both paths. When the installed bundle is absent entirely the
+    // previous copy simply takes its place.
+    let restored = if app.exists() {
+        exchange_paths(&previous, app)
+    } else {
+        fs::rename(&previous, app)
+    };
+    restored.map_err(|e| format!("Could not restore the previous Shina: {e}"))
 }
 
 /// Opens the replaced bundle, as an explicit update restart does. `open` exits nonzero when

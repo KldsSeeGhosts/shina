@@ -130,13 +130,195 @@ fn recover_update_at_expiry_records_an_honest_failure_and_removes_the_watch() {
             .join("Shina/updates/update-watch.json")
             .exists()
     );
-    // A second pass finds nothing to do and never duplicates the outcome.
+    // A second pass finds no record: a missing watch is a pure no-op that only
+    // unloads the stale job, and the recorded outcome is never duplicated.
     let output = recover(&profile, "watch-2");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Expired");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Stale");
     let again: Value =
         serde_json::from_slice(&fs::read(profile.root.join("Shina/updates/outcome.json")).unwrap())
             .unwrap();
     assert_eq!(again, outcome);
+    profile.stop();
+}
+
+#[test]
+fn a_stale_invocation_never_touches_a_newer_watch() {
+    let mut profile = Profile::new();
+    fake_manager_bin(&profile);
+    write_service(&profile);
+    // A live, unexpired watch for a newer update.
+    write_watch(&profile, "new-watch", unix_now());
+    let output = recover(&profile, "old-update-id");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Stale");
+    assert!(output.status.success(), "{output:?}");
+    // The newer watch record survives untouched, the service was not started for
+    // someone else's watch, and no outcome was written.
+    assert!(
+        profile
+            .root
+            .join("Shina/updates/update-watch.json")
+            .is_file()
+    );
+    assert!(
+        !profile.root.join("calls.log").exists(),
+        "a stale invocation must not start the service"
+    );
+    assert!(!profile.root.join("Shina/updates/outcome.json").exists());
+    // A watch record for another service is just as fenced.
+    write_watch(&profile, "new-watch", unix_now());
+    fs::write(
+        profile.root.join("Shina/updates/update-watch.json"),
+        json!({"updateId":"new-watch","tag":"v9.9.9","service":"Shina-other",
+            "registeredAt":unix_now()})
+        .to_string(),
+    )
+    .unwrap();
+    let output = recover(&profile, "new-watch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Stale");
+    assert!(!profile.root.join("calls.log").exists());
+    profile.stop();
+}
+
+#[test]
+fn recover_update_runs_from_the_profile_argument_not_the_environment() {
+    let mut profile = Profile::new();
+    fake_manager_bin(&profile);
+    write_service(&profile);
+    write_watch(&profile, "watch-pinned", unix_now());
+    // The generated job pins --profile: the environment may resolve a different,
+    // even missing, data directory and the watch still finds its own record.
+    let decoy = profile.root.join("decoy-profile");
+    fs::create_dir_all(decoy.join("Shina")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shina"));
+    command
+        .args([
+            "service",
+            "recover-update",
+            "watch-pinned",
+            "--profile",
+            profile.root.join("Shina").to_str().unwrap(),
+        ])
+        .env("LOCALAPPDATA", &decoy)
+        .env("XDG_DATA_HOME", &decoy)
+        .env("SHINA_SERVICE_BIN_DIR", profile.root.join("fake-bin"))
+        .current_dir(&profile.root)
+        .stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let output = command.output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
+    assert!(output.status.success(), "{output:?}");
+    let calls = fs::read_to_string(profile.root.join("calls.log")).unwrap();
+    assert!(calls.contains("bootstrap"), "{calls}");
+    profile.stop();
+}
+
+fn write_journal(profile: &Profile, update_id: &str, phase: &str) -> PathBuf {
+    let updates = profile.root.join("Shina/updates");
+    let backup = profile.root.join("Shina/backups/before-update-test");
+    fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("notes.json"), json!({"kept":true}).to_string()).unwrap();
+    fs::write(
+        updates.join("update-journal.json"),
+        json!({"updateId":update_id,"tag":"v9.9.9","service":"Shina-recovery-fixture",
+            "backup":backup,"at":unix_now(),"phase":phase})
+        .to_string(),
+    )
+    .unwrap();
+    backup
+}
+
+fn write_service_missing_bundle(profile: &Profile) -> (PathBuf, PathBuf) {
+    // The installed app bundle is absent mid-swap; only the previous copy remains.
+    let install = profile.root.join("install");
+    let app = install.join("Shina.app");
+    let previous = install.join("Shina-app.previous");
+    fs::create_dir_all(previous.join("Contents/MacOS")).unwrap();
+    fs::write(previous.join("Contents/MacOS/shina"), b"previous binary").unwrap();
+    let directory = profile.root.join("Shina");
+    fs::write(
+        directory.join("service.json"),
+        json!({
+            "platform":"Mac","name":"Shina-recovery-fixture",
+            "executable":app.join("Contents/MacOS/shina"),
+            "directory":directory,"unit":directory.join("unused-unit"),"home":profile.root,
+            "environment":{}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (app, previous)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_interrupted_swap_restores_the_matched_binary_and_backup_before_starting() {
+    let mut profile = Profile::new();
+    fake_manager_bin(&profile);
+    let (app, previous) = write_service_missing_bundle(&profile);
+    write_watch(&profile, "watch-6", unix_now());
+    write_journal(&profile, "watch-6", "RollingBack");
+    fs::write(profile.root.join("Shina/update-validation"), b"hold").unwrap();
+    let output = recover(&profile, "watch-6");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
+    assert!(output.status.success(), "{output:?}");
+    // The previous bundle is back in place, the matched backup was replayed into
+    // the profile, and the hold and journal are cleared before the service starts.
+    assert!(!previous.exists());
+    assert!(app.join("Contents/MacOS/shina").is_file());
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &fs::read_to_string(profile.root.join("Shina/notes.json")).unwrap()
+        )
+        .unwrap(),
+        json!({"kept":true})
+    );
+    assert!(!profile.root.join("Shina/update-validation").exists());
+    assert!(
+        !profile
+            .root
+            .join("Shina/updates/update-journal.json")
+            .exists()
+    );
+    // The watch itself stays: the service has not proven readiness yet.
+    assert!(
+        profile
+            .root
+            .join("Shina/updates/update-watch.json")
+            .is_file()
+    );
+    let calls = fs::read_to_string(profile.root.join("calls.log")).unwrap();
+    assert!(calls.contains("bootstrap"), "{calls}");
+    profile.stop();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_replaced_but_held_update_starts_once_and_keeps_its_journal() {
+    let mut profile = Profile::new();
+    fake_manager_bin(&profile);
+    let (app, _previous) = write_service_missing_bundle(&profile);
+    // This time the new bundle landed: the executable is present.
+    fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+    fs::write(app.join("Contents/MacOS/shina"), b"new binary").unwrap();
+    write_watch(&profile, "watch-7", unix_now());
+    write_journal(&profile, "watch-7", "Replaced");
+    fs::write(profile.root.join("Shina/update-validation"), b"hold").unwrap();
+    let output = recover(&profile, "watch-7");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
+    assert!(output.status.success(), "{output:?}");
+    // Starting an unvalidated binary must not clear the hold or the journal: the
+    // next tick, with the server owning the profile, validates or rolls back.
+    assert!(profile.root.join("Shina/update-validation").exists());
+    assert!(
+        profile
+            .root
+            .join("Shina/updates/update-journal.json")
+            .is_file()
+    );
     profile.stop();
 }
 
