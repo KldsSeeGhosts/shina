@@ -590,8 +590,13 @@ fn read_only_denies_exact_shina_names_until_the_resolved_server_verifies() {
             "deny"
         );
     };
-    // mcp_status never answered: the registration could not be confirmed.
-    deny(&mut initialized_client("read-only"));
+    // An expired status request cannot confirm the registration.
+    let mut expired = initialized_client("read-only");
+    expired
+        .pending
+        .retain(|_, pending| pending.request["subtype"] != "mcp_status");
+    expired.finish_binding(false);
+    deny(&mut expired);
     // A foreign server claimed the shina name.
     let mut client = initialized_client("read-only");
     status_response(
@@ -601,6 +606,17 @@ fn read_only_denies_exact_shina_names_until_the_resolved_server_verifies() {
             "headers":{"Authorization":"Bearer foreign-token"}}}]),
     );
     deny(&mut client);
+    // Matching URL and headers on an unconnected or different transport do not qualify.
+    for (status, transport) in [("failed", "http"), ("connected", "stdio")] {
+        let mut client = initialized_client("read-only");
+        status_response(
+            &mut client,
+            json!([{"name":"shina","status":status,"config":{"type":transport,
+                "url":"http://127.0.0.1:12345/mcp",
+                "headers":{"Authorization":"Bearer fixture-thread-token"}}}]),
+        );
+        deny(&mut client);
+    }
     // No shina server registered at all.
     let mut client = initialized_client("read-only");
     status_response(&mut client, json!([]));
@@ -661,6 +677,74 @@ fn read_only_denies_exact_shina_names_until_the_resolved_server_verifies() {
         client.wire.last().unwrap()["response"]["response"]["behavior"],
         "allow"
     );
+}
+
+#[test]
+fn read_only_tool_requests_wait_for_binding_and_fail_closed_on_cancel_or_timeout() {
+    let request = json!({"request_id":"racing-tool","request":{"subtype":"can_use_tool",
+        "tool_name":"mcp__shina__list_threads","tool_use_id":"call","input":{}}});
+    for outcome in ["verified", "foreign", "timeout", "cancel"] {
+        let mut client = initialized_client("read-only");
+        client.wire.clear();
+        client.server_request(&request).unwrap();
+        assert!(
+            client.wire.is_empty(),
+            "{outcome} answered before verification"
+        );
+        assert_eq!(client.binding_approvals.len(), 1);
+        match outcome {
+            "verified" => bind(&mut client),
+            "foreign" => status_response(&mut client, json!([])),
+            "timeout" => {
+                client
+                    .pending
+                    .retain(|_, pending| pending.request["subtype"] != "mcp_status");
+                client.finish_binding(false);
+            }
+            "cancel" => {
+                client.command(json!({"type":"abort","id":"stop"})).unwrap();
+                bind(&mut client);
+            }
+            _ => unreachable!(),
+        }
+        assert!(client.binding_approvals.is_empty());
+        let responses: Vec<_> = client
+            .wire
+            .iter()
+            .filter(|record| record["response"]["request_id"] == "racing-tool")
+            .collect();
+        assert_eq!(responses.len(), 1, "{outcome}");
+        assert_eq!(
+            responses[0]["response"]["response"]["behavior"],
+            if outcome == "verified" {
+                "allow"
+            } else {
+                "deny"
+            },
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn optional_usage_errors_do_not_change_verified_endpoint_state() {
+    let mut client = initialized_client("read-only");
+    bind(&mut client);
+    client.events.clear();
+    let id = client
+        .pending
+        .iter()
+        .find(|(_, pending)| pending.request["subtype"] == "get_usage")
+        .map(|(id, _)| id.clone())
+        .unwrap();
+    client
+        .incoming(
+            json!({"type":"control_response","response":{"subtype":"error",
+            "request_id":id,"error":"Usage unavailable"}}),
+        )
+        .unwrap();
+    assert!(client.shina_bound);
+    assert!(client.events.is_empty());
 }
 
 #[test]
