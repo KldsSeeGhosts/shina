@@ -21,6 +21,27 @@ restart behavior and negative authorization cases. Keep private Captain
 instructions out of worker context. Preserve the difference between a saved
 operation, provider acceptance and completed work.
 
+### First review of #18
+
+Candidate `0473d01520f6992e4de14a44d7f6caca9388cca2` is not integrated.
+It admits exact advertised Shina tool names on both native Claude permission
+paths and adds role-based capability reporting. Review identified these
+remaining checks and corrections:
+
+- A supplied `start.link` and a matching tool name do not independently prove
+  the CLI registered that name to the supplied endpoint. Verify same-name MCP
+  configuration precedence and registration failures, or fail closed when
+  the endpoint binding is uncertain.
+- `may_write_captain_documents` must reflect inactive ownership, not just
+  primary-home identity.
+- Capability and documentation claims must distinguish server authorization
+  from each provider's permission prompts. The candidate's statement that
+  Shina tools run in every access mode is too broad.
+
+A Devin SWE-2 rework assignment covers endpoint identity, effective rights and
+protocol evidence. No frontend change is required for the current access-mode
+description.
+
 ### First review of #21
 
 Candidate `14accf5829141bd67838d70941b07099f72580c7` is not integrated.
