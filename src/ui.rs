@@ -4834,18 +4834,27 @@ fn capsule_popover(s: &State, p: Palette) -> El {
             ));
         }
         list = list.child(machine_row);
-        if let Some(failure) = machine.provider_failure.as_ref().or_else(|| {
-            machine
-                .state
-                .strip_prefix("failed: ")
-                .map(|_| &machine.state)
-        }) {
-            let text = failure.strip_prefix("failed: ").unwrap_or(failure);
+        // A machine can carry both a provider failure and a server failure; show both.
+        let mut failures: Vec<String> = Vec::new();
+        if let Some(failure) = &machine.provider_failure {
+            failures.push(failure.clone());
+        }
+        if let Some(reason) = machine.state.strip_prefix("failed: ")
+            && Some(reason) != machine.provider_failure.as_deref()
+        {
+            failures.push(reason.to_owned());
+        }
+        for (failure_index, text) in failures.into_iter().enumerate() {
+            let key = if failure_index == 0 {
+                format!("capsule-failure-{index}")
+            } else {
+                format!("capsule-failure-{index}-{failure_index}")
+            };
             list = list.child(
                 label(text, TextStyle::new(12.0, 400.0), p.muted)
                     .wrap()
                     .pb(4.0)
-                    .key(format!("capsule-failure-{index}")),
+                    .key(key),
             );
         }
     }
@@ -4862,6 +4871,7 @@ fn capsule_popover(s: &State, p: Palette) -> El {
         list = list.child(actions);
     }
     list.padding(4.0)
+        .key("update-capsule-popover")
         .fill(p.card)
         .border(2.0, p.frame)
         .radius(4.0)
@@ -29849,9 +29859,37 @@ pub(crate) mod tests {
                 );
             }
             assert!(rt.presented("update-all-machines").is_none());
-            // The popover opens above the capsule and stays in the window.
+            // The popover opens above the capsule and stays in the window, light
+            // and dark.
             press(&mut rt, "update-capsule");
             assert!(rt.state.fleet.popover);
+            for dark in [false, true] {
+                rt.state.dark = dark;
+                rt.invalidate();
+                rt.frame(0.0);
+                let (popover_rect, _) = rt
+                    .presented("update-capsule-popover")
+                    .unwrap_or_else(|| panic!("{width} dark={dark}: update-capsule-popover"));
+                assert!(
+                    popover_rect[0] >= -0.5
+                        && popover_rect[0] + popover_rect[2] <= width + 0.5
+                        && popover_rect[1] >= -0.5
+                        && popover_rect[1] + popover_rect[3] <= 720.5,
+                    "{width} dark={dark} popover: {popover_rect:?}"
+                );
+                // A machine carrying both a provider failure and a server failure
+                // lists both lines.
+                rt.state.fleet.rows[0].result = Some(false);
+                rt.state.fleet.rows[0].provider_failure = Some("studio Codex: exit 1".into());
+                rt.state.fleet.rows[0].state = "failed: connection lost".into();
+                rt.invalidate();
+                rt.frame(0.0);
+                assert!(
+                    rt.presented("capsule-failure-0").is_some()
+                        && rt.presented("capsule-failure-0-1").is_some(),
+                    "{width} dark={dark}: both failure lines"
+                );
+            }
         }
     }
 }

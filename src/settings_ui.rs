@@ -1967,12 +1967,45 @@ fn provider_status_row(s: &State, p: Palette, provider: &Value) -> El {
                 ),
         );
     } else if behind && provider["strategy"].is_string() {
-        line = line.child(settings_button(
-            &format!("harness-update-{driver}"),
-            "Update",
-            p,
-            move |s| s.update_provider(&machine, &driver),
-        ));
+        if s.client.is_none() {
+            // Embedded mode has no provider backend status integration; the button
+            // would send into nothing.
+            line = line.child(
+                label(
+                    "Start the Shina server to manage provider updates.",
+                    TextStyle::new(12.0, 400.0),
+                    p.muted,
+                )
+                .wrap(),
+            );
+        } else {
+            if s.provider_send_pending(&machine, &driver) {
+                line = line.child(
+                    label(
+                        "Waiting for the machine to confirm the update.",
+                        TextStyle::new(12.0, 400.0),
+                        p.muted,
+                    )
+                    .wrap(),
+                );
+            } else {
+                let (machine_id, driver_id) = (machine.clone(), driver.clone());
+                line = line.child(settings_button(
+                    &format!("harness-update-{driver}"),
+                    "Update",
+                    p,
+                    move |s| s.update_provider(&machine_id, &driver_id),
+                ));
+            }
+            if let Some(error) = s
+                .fleet
+                .provider_send_errors
+                .get(&(machine.clone(), driver.clone()))
+            {
+                line =
+                    line.child(label(error.clone(), TextStyle::new(12.0, 400.0), p.danger).wrap());
+            }
+        }
     } else if let Some(reason) = provider["disabledReason"].as_str().filter(|_| behind) {
         let mut manual = row()
             .gap(8.0)
