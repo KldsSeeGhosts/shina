@@ -79,6 +79,32 @@ fn windows_task_arguments(executable: &str, arguments: &[&str]) -> String {
     )
 }
 
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<String, String> {
+    // USERDOMAIN may be WORKGROUP over OpenSSH, not the local account's
+    // authority. Task Scheduler accepts the current token's stable SID.
+    let output = crate::process::output(
+        Command::new("whoami.exe").args(["/user", "/fo", "csv", "/nh"]),
+        Duration::from_secs(5),
+        8192,
+    )
+    .map_err(|_| "Could not resolve the current Windows user SID.")?;
+    if !output.status.success() {
+        return Err("Could not resolve the current Windows user SID.".into());
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split('"')
+        .find(|value| {
+            value.starts_with("S-1-")
+                && value.len() > 4
+                && value[4..]
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .ok_or_else(|| "Missing current Windows user SID.".into())
+}
+
 impl Service {
     fn launcher_pid(&self) -> Option<u32> {
         fs::read_to_string(self.directory.join("service-launcher.pid"))
@@ -227,15 +253,9 @@ impl Service {
                 environment.insert(key.into(), value);
             }
         }
-        if cfg!(windows) {
-            environment.insert(
-                "SHINA_SERVICE_USER".into(),
-                format!(
-                    "{}\\{}",
-                    std::env::var("USERDOMAIN").unwrap_or_default(),
-                    std::env::var("USERNAME").map_err(|e| e.to_string())?
-                ),
-            );
+        #[cfg(windows)]
+        {
+            environment.insert("SHINA_SERVICE_USER".into(), current_windows_user_sid()?);
         }
         let executable = std::env::current_exe().map_err(|e| e.to_string())?;
         if [&directory, &home, &unit, &executable]
@@ -643,6 +663,19 @@ fn launch_server(service: &Service, log: &fs::File) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn scheduled_tasks_use_the_current_token_sid_not_environment_account_names() {
+        let sid = current_windows_user_sid().unwrap();
+        let service = Service::current(Some("Shina-sid-test".into())).unwrap();
+        assert_eq!(service.environment["SHINA_SERVICE_USER"], sid);
+        assert!(
+            service
+                .render()
+                .contains(&format!("<UserId>{sid}</UserId>"))
+        );
+    }
+
     #[test]
     fn start_confirmation_requires_a_changed_live_launcher() {
         let mut pids = [Some(10), None, Some(20), Some(30)].into_iter();
