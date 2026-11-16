@@ -2146,6 +2146,7 @@ mod tests {
         assert_eq!(runtime.updates.id.as_deref(), Some(new_id.as_str()));
         assert!(runtime.updates.outcome.as_ref().unwrap().success);
         runtime.shutdown().unwrap();
+        drop(runtime);
         std::fs::remove_dir_all(&directory).unwrap();
     }
     #[test]
