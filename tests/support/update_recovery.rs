@@ -92,7 +92,12 @@ fn recover_update_starts_a_stopped_service_and_keeps_the_watch() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
     assert!(output.status.success(), "{output:?}");
     let calls = fs::read_to_string(profile.root.join("calls.log")).unwrap();
-    assert!(calls.contains("bootstrap"), "{calls}");
+    let start = if cfg!(target_os = "macos") {
+        "launchctl bootstrap"
+    } else {
+        "systemctl --user start Shina-recovery-fixture.service"
+    };
+    assert!(calls.contains(start), "{calls}");
     // The service did not verify readiness yet: the watch stays for the next pass.
     assert!(
         profile
@@ -212,7 +217,12 @@ fn recover_update_runs_from_the_profile_argument_not_the_environment() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
     assert!(output.status.success(), "{output:?}");
     let calls = fs::read_to_string(profile.root.join("calls.log")).unwrap();
-    assert!(calls.contains("bootstrap"), "{calls}");
+    let start = if cfg!(target_os = "macos") {
+        "launchctl bootstrap"
+    } else {
+        "systemctl --user start Shina-recovery-fixture.service"
+    };
+    assert!(calls.contains(start), "{calls}");
     profile.stop();
 }
 

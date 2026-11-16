@@ -1263,6 +1263,10 @@ mod tests {
                 break;
             }
             if std::time::Instant::now() >= deadline {
+                let direct = Command::new(&binary)
+                    .args(["service", "recover-update", &id, "--profile"])
+                    .arg(&cleanup.profile)
+                    .output();
                 let task = format!("{}-update-watch", cleanup.service.name);
                 let diagnostics = if cfg!(windows) {
                     cleanup.service.run(
@@ -1273,7 +1277,7 @@ mod tests {
                     Ok("See the native service-manager log.".into())
                 };
                 panic!(
-                    "native watch did not run against its pinned profile; helperExists={}, watchPresent={}, outcome={outcome:?}, manager={diagnostics:?}, profile={}",
+                    "native watch did not run against its pinned profile; direct={direct:?}, helperExists={}, watchPresent={}, outcome={outcome:?}, manager={diagnostics:?}, profile={}",
                     cleanup.profile.join("updates/watch-helper.exe").exists(),
                     crate::update::update_watch(&cleanup.profile).is_some(),
                     cleanup.profile.display()

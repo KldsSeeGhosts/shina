@@ -2069,11 +2069,22 @@ impl crate::model::State {
         // Provider runs settle from the projection: the record with the accepted
         // updateId reaching a terminal status. `succeeded` counts; `unchanged` and
         // `failed` record "<machine> <Name>: <message>".
+        let now_ms = crate::lifecycle::now() as i64;
         for index in 0..self.fleet.rows.len() {
             let server = self.fleet.rows[index].server.clone();
             let providers = self.machine_providers(&server);
             for run_index in 0..self.fleet.rows[index].provider_runs.len() {
                 if self.fleet.rows[index].provider_runs[run_index].settled() {
+                    continue;
+                }
+                if now_ms
+                    .saturating_sub(self.fleet.rows[index].provider_runs[run_index].requested_ms)
+                    >= PROVIDER_CONFIRM_MS
+                {
+                    let run = &mut self.fleet.rows[index].provider_runs[run_index];
+                    run.outcome = Some("failed".into());
+                    run.message = Some(PROVIDER_CONFIRM_TIMEOUT.into());
+                    changed = true;
                     continue;
                 }
                 let driver = self.fleet.rows[index].provider_runs[run_index]
@@ -2177,7 +2188,6 @@ impl crate::model::State {
         // Unreceipted `providers.update` sends never resend. The exact command is
         // looked up read-only by its id; a machine that cannot produce its receipt
         // stays uncertain until the 65 minute confirmation deadline.
-        let now_ms = crate::lifecycle::now() as i64;
         let connectivity: std::collections::BTreeMap<String, bool> = self
             .fleet
             .provider_sends
@@ -2246,6 +2256,14 @@ impl crate::model::State {
             .provider_sends
             .iter()
             .map(|(_, send)| send.requested_ms + PROVIDER_CONFIRM_MS)
+            .chain(
+                self.fleet
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.provider_runs)
+                    .filter(|run| !run.settled())
+                    .map(|run| run.requested_ms + PROVIDER_CONFIRM_MS),
+            )
             .min()
         {
             let wait = (deadline - now_ms)
@@ -4520,6 +4538,44 @@ mod tests {
         let run = &state.fleet.rows[0].provider_runs[0];
         assert_eq!(run.outcome.as_deref(), Some("failed"));
         assert_eq!(run.message.as_deref(), Some(PROVIDER_CONFIRM_TIMEOUT));
+    }
+    #[test]
+    fn an_accepted_provider_without_terminal_projection_expires_without_resending() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        let mut calls = linked(&mut state, "remote", "99.0.0");
+        state.fleet.rows.push(Row {
+            server: "remote".into(),
+            name: "studio".into(),
+            state: "will update".into(),
+            provider_capable: true,
+            providers_view: Some(Value::Array(vec![behind(
+                "codex", "Codex", "0.48.0", "0.50.0",
+            )])),
+            ..Default::default()
+        });
+        state.confirm_fleet();
+        let sent = calls.try_recv().expect("initial provider request");
+        assert!(state.fleet_receipt(
+            "remote",
+            &sent,
+            &json!({"status":"accepted","result":{"updateAccepted":true,"updateId":"prov-1"}}),
+        ));
+        assert!(state.fleet.provider_sends.is_empty());
+        state.client.as_mut().unwrap().linked.remove("remote");
+        state.poll_fleet();
+        assert_eq!(state.fleet.phase, RunPhase::Providers);
+        state.fleet.rows[0].provider_runs[0].requested_ms =
+            crate::lifecycle::now() as i64 - PROVIDER_CONFIRM_MS - 1;
+        state.poll_fleet();
+        let run = &state.fleet.rows[0].provider_runs[0];
+        assert_eq!(run.outcome.as_deref(), Some("failed"));
+        assert_eq!(run.message.as_deref(), Some(PROVIDER_CONFIRM_TIMEOUT));
+        assert_eq!(state.fleet.phase, RunPhase::Servers);
+        assert_eq!(state.fleet.rows[0].result, Some(false));
+        assert!(!state.fleet.result_notice.as_ref().unwrap().success);
+        assert!(calls.try_recv().is_err(), "never resend an accepted update");
     }
     /// A restored handoff keeps up to ten minutes of elapsed time, not sixty
     /// seconds.
