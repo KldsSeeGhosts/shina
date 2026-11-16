@@ -1077,7 +1077,7 @@ impl Database {
                     | "peer.thread.list"
                     | "peer.thread.send"
                     | "peer.thread.stop"
-                    | "peer.captain.document.read"
+                    | "peer.captain.document.reply"
             )
             && !(method == "devices.revoke" && args["deviceId"] == id)
         {

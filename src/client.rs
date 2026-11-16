@@ -2468,7 +2468,7 @@ async fn remote_request_outcome(
                 link.host
             ));
         }
-        if command.method == "peer.captain.document.read"
+        if command.method == "peer.captain.document.reply"
             && !hello["capabilities"].as_array().is_some_and(|caps| {
                 caps.iter()
                     .any(|cap| cap == protocol::CAPTAIN_PEER_DOCUMENTS)

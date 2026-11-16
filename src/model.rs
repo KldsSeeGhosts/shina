@@ -979,6 +979,9 @@ pub struct Thread {
     pub error: Option<String>,
     pub diagnostics: Vec<String>,
     pub request: Option<Value>,
+    /// A held `captain_document_read` waiting on the launch origin's reply.
+    /// Projected into snapshots so `peer.thread.wait` can carry it home.
+    pub(crate) peer_document_read: Option<remote_tasks::PeerDocumentRead>,
     pub(crate) requests_supported: bool,
     pub(crate) question_contract_supported: bool,
     pub(crate) responding_request: Option<uuid::Uuid>,
@@ -1514,6 +1517,7 @@ impl Thread {
             error: None,
             diagnostics: vec![],
             request: None,
+            peer_document_read: None,
             requests_supported: true,
             question_contract_supported: true,
             responding_request: None,
@@ -8647,7 +8651,7 @@ impl State {
         {
             return;
         }
-        if request.tool == "captain_document_read" && self.peer_document_request(&request) {
+        if request.tool == "captain_document_read" && self.queue_peer_document_read(&request) {
             return;
         }
         if matches!(request.tool.as_str(), "html_render" | "html_preview") {

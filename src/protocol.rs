@@ -290,7 +290,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "peer.thread.list"
         | "peer.thread.send"
         | "peer.thread.stop"
-        | "peer.captain.document.read" => "peer-delegate",
+        | "peer.captain.document.reply" => "peer-delegate",
         "thread.send"
         | "notifications.push.register"
         | "notifications.push.unregister"
