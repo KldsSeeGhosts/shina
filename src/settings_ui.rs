@@ -3330,17 +3330,26 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
                 .gap(16.0)
                 .pb(6.0)
                 .child(el().w(128.0).child(pixel_label("MACHINE", p.muted)))
-                .child(el().w(96.0).child(pixel_label("SHINA", p.muted)))
+                .child(
+                    el().key("fleet-column-shina")
+                        .w(96.0)
+                        .child(pixel_label("SHINA", p.muted)),
+                )
                 .child(
                     el().grow(1.0)
                         .min_w(0.0)
+                        .key("fleet-column-providers")
                         .child(pixel_label("PROVIDERS", p.muted)),
                 ),
         )
         .child(el().h(1.0).w_full().fill(p.line));
     for (position, index) in updating.iter().enumerate() {
         let machine = &s.fleet.rows[*index];
-        let mut providers = row().flex_wrap().grow(1.0).min_w(0.0);
+        let mut providers = row()
+            .key(format!("fleet-providers-{index}"))
+            .flex_wrap()
+            .grow(1.0)
+            .min_w(0.0);
         for (provider_index, name) in machine.providers.iter().enumerate() {
             if provider_index > 0 {
                 providers = providers.child(label(", ", TextStyle::new(14.0, 400.0), p.ink));
@@ -3354,7 +3363,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
         } else {
             None
         };
-        let mut app_cell = col().w(96.0);
+        let mut app_cell = col().key(format!("fleet-shina-{index}")).w(96.0);
         match app {
             Some("this-app") => {
                 app_cell = app_cell
@@ -3373,7 +3382,8 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
             .gap(16.0)
             .items_start()
             .child(
-                el().min_w(64.0)
+                el().w(128.0)
+                    .min_w(64.0)
                     .max_w(128.0)
                     .child(label(&machine.name, TextStyle::new(14.0, 400.0), p.ink).truncate()),
             )
@@ -3657,6 +3667,23 @@ mod tests {
                 let presented = rt.presented(&format!("fleet-row-{index}"));
                 if machine.eligible || !machine.providers.is_empty() {
                     assert!(presented.is_some(), "{width}: fleet-row-{index}");
+                    for (column, cell) in [
+                        (
+                            "fleet-column-shina".to_owned(),
+                            format!("fleet-shina-{index}"),
+                        ),
+                        (
+                            "fleet-column-providers".to_owned(),
+                            format!("fleet-providers-{index}"),
+                        ),
+                    ] {
+                        let header = rt.presented(&column).unwrap().0;
+                        let body = rt.presented(&cell).unwrap().0;
+                        assert!(
+                            (header[0] - body[0]).abs() < 0.5,
+                            "{width}: {column} and {cell} do not align"
+                        );
+                    }
                 }
             }
             press(&mut rt, "fleet-skipped");

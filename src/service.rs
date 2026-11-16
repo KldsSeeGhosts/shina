@@ -1262,10 +1262,23 @@ mod tests {
             {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "native watch did not run against its pinned profile"
-            );
+            if std::time::Instant::now() >= deadline {
+                let task = format!("{}-update-watch", cleanup.service.name);
+                let diagnostics = if cfg!(windows) {
+                    cleanup.service.run(
+                        "schtasks.exe",
+                        &["/Query", "/TN", &task, "/V", "/FO", "LIST"],
+                    )
+                } else {
+                    Ok("See the native service-manager log.".into())
+                };
+                panic!(
+                    "native watch did not run against its pinned profile; helperExists={}, watchPresent={}, outcome={outcome:?}, manager={diagnostics:?}, profile={}",
+                    cleanup.profile.join("updates/watch-helper.exe").exists(),
+                    crate::update::update_watch(&cleanup.profile).is_some(),
+                    cleanup.profile.display()
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(
