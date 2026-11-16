@@ -491,7 +491,16 @@ fn mobile_send_receipts_dedupe_across_disconnect_and_restart() {
 fn mobile_scoped_history_pages_replays_and_gap_falls_back() {
     let mut template = Profile::new();
     template.launch(&["serve"]);
-    let base = template.client(uuid::Uuid::new_v4()).snapshot.clone();
+    let mut template_client = template.client(uuid::Uuid::new_v4());
+    // Model discovery is asynchronous, and models are control rows in history.
+    // Seed a settled catalog so the golden never depends on startup timing.
+    template_client.until(|state| {
+        state["threads"][0]["models"]
+            .as_array()
+            .is_some_and(|models| models.len() == 1 && models[0]["id"] == "fixture")
+    });
+    let base = template_client.snapshot.clone();
+    drop(template_client);
     template.stop();
 
     let mut profile = Profile::new();
