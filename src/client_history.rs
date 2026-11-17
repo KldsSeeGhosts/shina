@@ -730,6 +730,11 @@ impl ProjectionCache {
             Self::upsert_row(view, installed, counters, &sid);
         }
         *structural |= view.pending.structural;
+    }
+
+    /// Scalar refreshes carry raw server anchors even when no message item
+    /// changed. Always remap from the raw source, never an already-local index.
+    fn remap_work_retries(view: &View, installed: &mut Installed) {
         // `harness_state.workRetries` rides inside the record-level scalars.
         // Installed scalars carry local anchors, so restore the raw entries
         // before remapping against the new window.
@@ -867,6 +872,8 @@ impl ProjectionCache {
         };
         let mut installed = view.installed.take().unwrap_or_default();
         let mut structural = false;
+        let mut remap_retries =
+            installed.scalars.is_null() || installed.scalars_sequence != view.fields_sequence;
         if installed.scalars.is_null() {
             installed.scalars = view.fields.clone();
             installed.scalars_sequence = view.fields_sequence;
@@ -913,11 +920,15 @@ impl ProjectionCache {
             }
             if messages_moved {
                 Self::reanchor(view, &mut installed, &mut self.counters, &mut structural);
+                remap_retries = true;
             }
             for sid in anchored {
                 Self::upsert_row(view, &mut installed, &mut self.counters, &sid);
             }
             structural |= view.pending.structural;
+        }
+        if remap_retries {
+            Self::remap_work_retries(view, &mut installed);
         }
         Self::recompute_deferred(view, &mut installed, self.deferred_work);
         view.pending.structural |= structural;
@@ -1660,6 +1671,12 @@ impl ProjectionCache {
                         if let Some(previous) = self.emitted.get(&id) {
                             structural |= previous.record["harness_state"]["workRetries"]
                                 != thread["harness_state"]["workRetries"];
+                            structural |= previous.record["historyMeta"]["deferredWork"]
+                                != thread["historyMeta"]["deferredWork"];
+                            // The record is compact. Comparing it includes
+                            // history loading/errors and retry transitions
+                            // without walking or serializing item payloads.
+                            record_changed |= previous.record.as_ref() != &thread;
                         }
                         if rebuild {
                             items_changed = None;
@@ -1937,6 +1954,152 @@ mod tests {
             .receive(&json!({"id":"history","result":result}))
             .unwrap();
         request
+    }
+
+    #[test]
+    fn scalar_only_retry_updates_remap_to_the_loaded_message_window() {
+        let messages: Vec<_> = (0..30)
+            .map(|i| {
+                json!({
+                    "id":format!("m-{i}"), "role":if i % 2 == 0 {"You"} else {"Pi"}, "text":"text"
+                })
+            })
+            .collect();
+        let mut initial = snapshot(1, json!({"id":1,"messages":messages,"stats":{}}));
+        crate::history::stamp(&Value::Null, &mut initial["state"]["threads"][0], 1);
+        let streams = Streams::new(&initial);
+        let mut cache = cache(&initial);
+        answer_with_budget(
+            &mut cache,
+            &streams,
+            &mut Fragments::default(),
+            crate::history::PAGE_MAX_ENCODED_BYTES,
+        );
+        assert_eq!(
+            cache.views[&1].installed.as_ref().unwrap().fields["messages"].ords[0],
+            10
+        );
+        cache.projected().unwrap();
+        for sequence in [2, 3] {
+            cache
+                .receive(&protocol::notification(
+                    "thread.stream",
+                    json!({
+                        "kind":"event","threadId":1,"streamEpoch":"stream","sequence":sequence,
+                        "events":[{"type":"fields.updated","fields":{"id":1,"harness_state":{
+                            "workRetries":[
+                                {"id":"visible","anchor":{"message":29,"offset":0}},
+                                {"id":"unloaded","anchor":{"message":1,"offset":0}}
+                            ]
+                        }}}]
+                    }),
+                ))
+                .unwrap();
+            let history = cache.assembled(1).unwrap();
+            let retries = history["harness_state"]["workRetries"].as_array().unwrap();
+            assert_eq!(retries.len(), 1);
+            assert_eq!(retries[0]["anchor"]["message"], 19);
+        }
+    }
+
+    fn deferred_marker_cache() -> ProjectionCache {
+        let initial = snapshot(1, json!({"id":1,"messages":[],"stats":{}}));
+        let mut cache = cache(&initial);
+        cache
+            .reconnect(&json!({"capabilities":[protocol::HISTORY_ITEMS,protocol::DEFERRED_WORK]}))
+            .unwrap();
+        cache
+            .merge_page(
+                1,
+                json!({
+                    "threadId":1,"snapshotSequence":1,"historyRevision":"1","nextCursor":null,
+                    "hasMoreHistory":false,"fields":{"id":1,"stats":{}},
+                    "items":[
+                        {"sourceThreadId":1,"sourceItemId":"messages:m","field":"messages",
+                            "ordinal":0,"position":0,"item":{"id":"m","role":"Pi","text":"answer"}},
+                        {"sourceThreadId":1,"sourceItemId":"work:w","field":"work",
+                            "ordinal":0,"position":1,"item":{"start":0,
+                                "deferredWork":{"start":0,"cursor":"work-cursor","count":10}}}
+                    ]
+                }),
+                true,
+                "stream",
+                None,
+            )
+            .unwrap();
+        cache.subscribed = Some(1);
+        cache
+    }
+
+    #[test]
+    fn deferred_loading_errors_and_removal_invalidate_structure_and_record() {
+        let mut cache = deferred_marker_cache();
+        let before = cache.projected().unwrap();
+        cache.request_work(1, "work:w".into());
+        let loading = cache.projected().unwrap();
+        assert!(loading.views[&1].structural);
+        assert!(loading.views[&1].record_changed);
+        assert!(loading.views[&1].structure > before.views[&1].structure);
+        assert_eq!(
+            loading.views[&1].record["historyMeta"]["deferredWork"][0]["loading"],
+            true
+        );
+        assert_eq!(cache.next_history().unwrap()["method"], "thread.history");
+        cache
+            .receive(&protocol::response(
+                json!("history"),
+                Err("Work fetch failed".into()),
+            ))
+            .unwrap();
+        let error = cache.projected().unwrap();
+        assert!(error.views[&1].structural);
+        assert!(error.views[&1].record_changed);
+        assert!(error.views[&1].structure > loading.views[&1].structure);
+        assert_eq!(
+            error.views[&1].record["historyMeta"]["deferredWork"][0]["error"],
+            "Work fetch failed"
+        );
+        cache
+            .stream(
+                &json!({"kind":"event","threadId":1,"streamEpoch":"stream","sequence":2,
+            "events":[{"type":"item.removed","sourceItemId":"work:w"}]}),
+            )
+            .unwrap();
+        let removed = cache.projected().unwrap();
+        assert!(removed.views[&1].structural);
+        assert!(removed.views[&1].record_changed);
+        assert_eq!(
+            removed.views[&1].record["historyMeta"]["deferredWork"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn history_error_and_retry_transitions_mark_record_changes() {
+        let mut cache = deferred_marker_cache();
+        cache.projected().unwrap();
+        let view = cache.views.get_mut(&1).unwrap();
+        view.has_more = true;
+        view.cursor = Some("earlier".into());
+        cache.request_earlier(1, None);
+        cache.projected().unwrap();
+        cache.next_history().unwrap();
+        cache
+            .receive(&protocol::response(
+                json!("history"),
+                Err("History fetch failed".into()),
+            ))
+            .unwrap();
+        let error = cache.projected().unwrap();
+        assert!(error.views[&1].record_changed);
+        assert_eq!(
+            error.views[&1].record["historyMeta"]["error"],
+            "History fetch failed"
+        );
+        cache.failed(1, "Replay unavailable", true);
+        let retry = cache.projected().unwrap();
+        assert!(retry.views[&1].record_changed);
+        assert_eq!(retry.views[&1].record["historyRetry"]["count"], 1);
     }
 
     #[test]

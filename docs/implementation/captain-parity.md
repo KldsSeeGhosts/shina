@@ -301,6 +301,20 @@ logical workload comparisons only; do not claim a cross-runtime speed ratio.
 Native UI-frame performance and finer virtualization remain #25 and #26 work.
 This candidate is not yet publication or issue-closure evidence.
 
+Independent review confirmed the coalescing repair but reproduced scalar-only
+retry anchors that remained server-relative and deferred/history metadata that
+missed invalidation flags. Retry remapping now runs on scalar refresh as well
+as message-window changes. Compact record comparisons cover history errors and
+retry transitions; deferred-list changes invalidate structure. The three new
+regressions fail before these corrections and pass afterward.
+
+The same review found cache eviction retaining emitted item references and
+leaving an evicted subscription unable to reload. That correction and its
+budget/reload regression remain pending. The candidate must not be handed to
+#25/#26 as a complete contract until eviction is fixed. The benchmark also
+still lacks an actual historical-executable comparison and a pinned KSG run
+using the same transcript; current reference numbers do not close those gaps.
+
 ## Capy package investigation
 
 Inspected on November 16, 2026 without installing or launching Capy. The official
