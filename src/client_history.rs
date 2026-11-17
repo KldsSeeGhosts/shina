@@ -910,9 +910,9 @@ impl ProjectionCache {
         };
         let mut installed = view.installed.take().unwrap_or_default();
         let mut structural = false;
-        let mut remap_retries =
-            installed.scalars.is_null() || installed.scalars_sequence != view.fields_sequence;
-        if installed.scalars.is_null() {
+        let fresh = installed.scalars.is_null();
+        let mut remap_retries = fresh || installed.scalars_sequence != view.fields_sequence;
+        if fresh {
             installed.scalars = view.fields.clone();
             installed.scalars_sequence = view.fields_sequence;
             installed.scalars_bytes = view.fields.to_string().len();
@@ -933,13 +933,21 @@ impl ProjectionCache {
             // Messages and plain fields splice first so anchored items see the
             // settled ordinal map, then anchored fields run their splices.
             let mut anchored = Vec::new();
-            let mut messages_moved = false;
+            // Fresh assembly sorts compactions before messages. Its anchors
+            // need one final remap after the loaded message window is known.
+            let mut messages_moved = fresh;
             for sid in reconcile {
                 let sid: Arc<str> = Arc::from(sid.as_str());
                 match view.rows.get(sid.as_ref()) {
                     Some((_, row)) if Self::anchored_field(&row.field) => anchored.push(sid),
                     Some((_, row)) => {
-                        messages_moved |= row.field == "messages";
+                        messages_moved |= match installed.slot.get(&sid) {
+                            Some(slot) => {
+                                (slot.field == "messages" || row.field == "messages")
+                                    && (slot.field != row.field || slot.ordinal != row.ordinal)
+                            }
+                            None => row.field == "messages",
+                        };
                         Self::upsert_row(view, &mut installed, &mut self.counters, &sid);
                     }
                     None => {
@@ -2198,6 +2206,22 @@ mod tests {
         let request = cache.next_history().unwrap();
         assert_eq!(request["method"], "thread.subscribe");
         assert!(request["params"]["afterSequence"].is_null());
+    }
+
+    #[test]
+    fn fresh_compaction_anchors_remap_after_the_message_window_is_installed() {
+        let mut cache = cache(&snapshot(1, json!({"id":1})));
+        let mut page = large_page(1, 32);
+        page["items"][0]["ordinal"] = json!(11);
+        page["items"].as_array_mut().unwrap().push(json!({
+            "sourceThreadId":1,"sourceItemId":"compactions:c","field":"compactions",
+            "ordinal":0,"position":1,"item":{"anchor":{"message":11,"offset":0},"order":1}
+        }));
+        cache.merge_page(1, page, true, "stream", None).unwrap();
+        assert_eq!(
+            cache.assembled(1).unwrap()["compactions"][0]["anchor"]["message"],
+            0
+        );
     }
 
     #[test]

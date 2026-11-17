@@ -1,5 +1,8 @@
 //! State facade and plain projections. Execution still uses the original State/Thread methods.
 use super::*;
+#[cfg(test)]
+#[path = "../tools/projection-benchmark.rs"]
+mod projection_benchmark;
 use crate::client_history::Projection;
 use crate::model::pi_session::SlashCommand;
 use crate::protocol::{Command, Receipt};
@@ -8977,6 +8980,24 @@ mod tests {
                 }
             }
             after
+        }
+
+        #[test]
+        fn text_only_message_updates_keep_anchored_field_vectors_shared() {
+            let (mut cache, mut streams, threads, _) = rig(1, 10, 4, 1 << 22, true);
+            let before = cache.projected().unwrap();
+            let mut after = workspace(2, &threads);
+            after["state"]["threads"][0]["messages"][9]["text"] = json!("streamed text");
+            publish(&mut cache, &mut streams, &workspace(1, &threads), &after);
+            let after = cache.projected().unwrap();
+            assert!(!after.views[&1].structural);
+            assert!(
+                Arc::ptr_eq(
+                    &before.views[&1].fields["tools"],
+                    &after.views[&1].fields["tools"]
+                ),
+                "text changes do not move message ordinals or require re-anchoring"
+            );
         }
 
         #[test]
