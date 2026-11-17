@@ -1102,6 +1102,14 @@ mod tests {
             index_ids(&runtime.snapshot()["state"]),
             index_ids(&subscriber)
         );
+        assert_eq!(subscriber["index"], committed["index"]);
+        // Workspace patches use the compact wire shape; full history is
+        // delivered separately. Compare through the production compactor.
+        assert_eq!(
+            crate::protocol::compact(&subscriber)["threads"],
+            crate::protocol::compact(&committed)["threads"]
+        );
+        assert_eq!(runtime.snapshot()["state"]["index"], committed["index"]);
     }
     #[test]
     fn a_new_thread_discovered_by_a_scoped_poll_is_announced_with_a_full_projection() {
@@ -1149,6 +1157,12 @@ mod tests {
             .clone();
         assert_eq!(index_ids(&committed), index_ids(&subscriber));
         assert!(index_ids(&subscriber).contains(&json!(id)));
+        assert_eq!(subscriber["index"], committed["index"]);
+        assert_eq!(
+            crate::protocol::compact(&subscriber)["threads"],
+            crate::protocol::compact(&committed)["threads"]
+        );
+        assert_eq!(runtime.snapshot()["state"]["index"], committed["index"]);
     }
     fn index_ids(state: &Value) -> Vec<Value> {
         state["index"]["threads"]
