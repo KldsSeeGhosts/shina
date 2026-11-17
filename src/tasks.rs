@@ -2654,12 +2654,11 @@ mod tests {
                 "a reply escaped a failed commit"
             );
             database.test_connection(|connection| {
-                assert_eq!(
-                    crate::projection_store::read(connection, "index.json")
-                        .unwrap()
-                        .unwrap(),
-                    before
-                );
+                let mut saved = crate::projection_store::read(connection, "index.json")
+                    .unwrap()
+                    .unwrap();
+                crate::identity::decorate_index(connection, &mut saved).unwrap();
+                assert_eq!(saved, before);
             });
         }
     }
@@ -3352,5 +3351,75 @@ mod tests {
         assert_eq!(replay["exists"], false);
         assert_eq!(replay["finished"], true);
         assert!(runtime.state.tasks.is_empty());
+    }
+
+    #[test]
+    fn keyed_delegation_replays_across_the_identity_schema_migration() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-identity-replay-{}", uuid::Uuid::new_v4()));
+        let first;
+        let stored_receipt;
+        let server_id;
+        {
+            let mut runtime =
+                crate::runtime::RuntimeState::open(directory.clone(), Arc::new(|| {})).unwrap();
+            runtime.state.demo = true;
+            let database = runtime.database.clone().unwrap();
+            server_id = database.identity().unwrap()["controllerId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            first = runtime
+                .state
+                .mcp_call(1, "delegate_task", &delegate_args("migration-replay"))
+                .unwrap();
+            runtime.persist_for_test(capture.finish()).unwrap();
+            stored_receipt = database
+                .delegate_tool_receipt(
+                    "mcp/delegate/thread/1",
+                    delegate_request_command_id("migration-replay"),
+                )
+                .unwrap()
+                .unwrap();
+        }
+        std::fs::write(directory.join("server-id"), &server_id).unwrap();
+        let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
+        let mut legacy = crate::projection_store::read(&connection, "index.json")
+            .unwrap()
+            .unwrap();
+        legacy["version"] = json!(4);
+        legacy.as_object_mut().unwrap().remove("identity");
+        crate::projection_store::write(&connection, "index.json", &legacy).unwrap();
+        drop(connection);
+
+        let mut runtime = crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+        runtime.state.demo = true;
+        let replay = runtime
+            .state
+            .mcp_call(1, "delegate_task", &delegate_args("migration-replay"))
+            .unwrap();
+        assert_eq!(replay["thread_id"], first["thread_id"]);
+        assert_eq!(replay["task_id"], first["task_id"]);
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert!(
+            runtime
+                .database
+                .as_ref()
+                .unwrap()
+                .delegate_tool_receipt(
+                    "mcp/delegate/thread/1",
+                    delegate_request_command_id("migration-replay"),
+                )
+                .unwrap()
+                .is_some_and(|receipt| {
+                    receipt.command_id == stored_receipt.command_id
+                        && receipt.hash == stored_receipt.hash
+                })
+        );
+        assert_eq!(runtime.state.tasks.len(), 1);
+        assert_eq!(runtime.state.threads.len(), 2);
     }
 }

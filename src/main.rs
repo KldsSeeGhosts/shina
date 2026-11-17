@@ -43,6 +43,7 @@ mod html_fallback;
 mod html_network;
 mod html_render;
 mod html_window;
+mod identity;
 mod install;
 mod keybindings;
 mod lifecycle;
