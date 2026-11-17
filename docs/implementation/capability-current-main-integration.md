@@ -66,3 +66,9 @@ the existing per-state fake connection hook. Native executable discovery and
 dispatch share that test-only executor proof. Production probing and the real
 fixture-adapter integration tests remain unchanged. No CLI installation,
 provider configuration, authentication change or test skip is required.
+
+A later CI run passed all units but exposed overlapping fake-provider turns
+between the mobile SDK's receipt/replay and resume subtests. Those cases now
+wait for their own committed completion before the next case starts. The
+resume, prompt-count and history assertions are unchanged. The original live
+SDK integration test and TypeScript check pass with these completion barriers.
