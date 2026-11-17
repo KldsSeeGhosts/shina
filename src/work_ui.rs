@@ -6,55 +6,11 @@ use serde_json::Value;
 #[path = "work_ui_tests.rs"]
 mod tests;
 
-pub(super) fn has_boundary_events(t: &Thread, message: usize) -> bool {
-    t.native
-        .compactions
-        .iter()
-        .any(|item| crate::work::compaction_anchor(t, item).message == message)
-        || crate::work::retry_events(t)
-            .iter()
-            .any(|event| event["anchor"]["message"].as_u64() == Some(message as u64))
-        || t.work.iter().any(|work| {
-            work.start == message
-                && work.stopped
-                && (message < t.messages.len() || !t.status.busy())
-        })
-}
-
 pub(super) fn boundary_events(s: &State, p: Palette, wide: bool, message: usize) -> Option<El> {
-    let mut events = vec![];
-    for (index, item) in s.current().native.compactions.iter().enumerate() {
-        if crate::work::compaction_anchor(s.current(), item).message == message {
-            events.push((item["order"].as_u64().unwrap_or(u64::MAX), 0, index));
-        }
-    }
-    for (index, event) in crate::work::retry_events(s.current()).iter().enumerate() {
-        if event["anchor"]["message"].as_u64() == Some(message as u64) {
-            events.push((event["order"].as_u64().unwrap_or(u64::MAX), 1, index));
-        }
-    }
-    for work in &s.current().work {
-        if work.start == message
-            && work.stopped
-            && (message < s.current().messages.len() || !s.current().status.busy())
-        {
-            events.push((
-                if work.stopped_order == 0 {
-                    u64::MAX
-                } else {
-                    work.stopped_order
-                },
-                2,
-                0,
-            ));
-        }
-    }
-    if events.is_empty() {
-        return None;
-    }
-    events.sort_by_key(|e| e.0);
+    let structure = timeline_structure(s.current());
+    let events = structure.boundaries.get(&message)?;
     let mut rows = col().min_w(0.0).gap(6.0);
-    for (_, kind, index) in events {
+    for &(_, kind, index) in events {
         rows = rows.child(match kind {
             0 => pi_ui::compaction_activity(s, p, index),
             1 => retry_row(s, p, index),

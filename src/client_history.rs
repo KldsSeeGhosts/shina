@@ -559,6 +559,9 @@ impl ProjectionCache {
                     "deferredWork",
                     "role",
                     "kind",
+                    "name",
+                    "stopped",
+                    "stopped_order",
                 ]
                 .iter()
                 .any(|key| items.items[pos].get(*key) != item.get(*key));

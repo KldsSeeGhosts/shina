@@ -9689,78 +9689,14 @@ enum TranscriptPart {
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
 fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
-    let mut events: Vec<_> = t
-        .tools
-        .iter()
-        .enumerate()
-        .filter(|(_, tool)| {
-            (start..end).contains(&tool.anchor.message)
-                && tool.name.rsplit("__").next() != Some("html_preview")
-        })
-        .map(|(index, tool)| {
-            (
-                tool.anchor,
-                if tool.order == 0 {
-                    tool.block as u64
-                } else {
-                    tool.order
-                },
-                0,
-                index,
-            )
-        })
-        .collect();
-    events.extend(
-        t.thoughts
-            .iter()
-            .enumerate()
-            .filter(|(_, thought)| (start..end).contains(&thought.anchor.message))
-            .map(|(index, thought)| {
-                (
-                    thought.anchor,
-                    if thought.order == 0 {
-                        thought.block as u64
-                    } else {
-                        thought.order
-                    },
-                    1,
-                    index,
-                )
-            }),
-    );
-    events.extend(
-        t.native
-            .compactions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let anchor = crate::work::compaction_anchor(t, item);
-                (start..end).contains(&anchor.message).then_some((
-                    anchor,
-                    item["order"].as_u64().unwrap_or(u64::MAX),
-                    2,
-                    index,
-                ))
-            }),
-    );
-    events.extend(
-        crate::work::retry_events(t)
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let anchor =
-                    serde_json::from_value::<crate::model::ToolAnchor>(item["anchor"].clone())
-                        .ok()?;
-                (start..end).contains(&anchor.message).then_some((
-                    anchor,
-                    item["order"].as_u64().unwrap_or(u64::MAX),
-                    3,
-                    index,
-                ))
-            }),
-    );
-    events.sort_by_key(|(anchor, block, _, _)| (*anchor, *block));
-    let mut events = events.into_iter().peekable();
+    let structure = timeline_structure(t);
+    let lo = structure
+        .events
+        .partition_point(|event| event.0.message < start);
+    let hi = structure
+        .events
+        .partition_point(|event| event.0.message < end);
+    let mut events = structure.events[lo..hi].iter().copied().peekable();
     let mut parts = vec![];
     for message in start..end {
         let text = &t.messages[message].text;
@@ -10440,6 +10376,118 @@ fn history_control(s: &State, p: Palette) -> Option<El> {
     Some(section)
 }
 
+type TimelineEvent = (crate::model::ToolAnchor, u64, u8, usize);
+type BoundaryEvent = (u64, u8, usize);
+
+/// Ported from KSG's useIncrementalTimelineEntries and useIncrementalTimelineRows.
+/// This stores derived identities and ordinals only, never old history payloads.
+#[derive(Default)]
+pub(crate) struct TimelineCache {
+    input: Option<(u64, bool, bool, bool, Vec<(String, usize)>)>,
+    structure: std::sync::Arc<TimelineStructure>,
+}
+
+#[derive(Default)]
+struct TimelineStructure {
+    rows: std::sync::Arc<Vec<TimelineRow>>,
+    events: Vec<TimelineEvent>,
+    boundaries: std::collections::HashMap<usize, Vec<BoundaryEvent>>,
+    version: u64,
+}
+
+fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
+    let input = (
+        t.transcript_structure,
+        t.history_has_more || t.history_error.is_some(),
+        t.worktree_setup.is_some(),
+        t.status.busy(),
+        t.handoffs
+            .iter()
+            .map(|handoff| (handoff.id.clone(), handoff.message_index))
+            .collect(),
+    );
+    let mut cache = t.timeline_cache.borrow_mut();
+    // The desktop consumes revisioned projections. Untracked fixtures and
+    // in-process demo threads retain the complete rebuild fallback.
+    if t.transcript_structure != 0 && cache.input.as_ref() == Some(&input) {
+        return cache.structure.clone();
+    }
+    let mut structure = TimelineStructure::default();
+    for (index, tool) in t.tools.iter().enumerate() {
+        if tool.name.rsplit("__").next() != Some("html_preview") {
+            structure.events.push((
+                tool.anchor,
+                if tool.order == 0 {
+                    tool.block as u64
+                } else {
+                    tool.order
+                },
+                0,
+                index,
+            ));
+        }
+    }
+    for (index, thought) in t.thoughts.iter().enumerate() {
+        structure.events.push((
+            thought.anchor,
+            if thought.order == 0 {
+                thought.block as u64
+            } else {
+                thought.order
+            },
+            1,
+            index,
+        ));
+    }
+    for (index, item) in t.native.compactions.iter().enumerate() {
+        let anchor = crate::work::compaction_anchor(t, item);
+        let order = item["order"].as_u64().unwrap_or(u64::MAX);
+        structure.events.push((anchor, order, 2, index));
+        structure
+            .boundaries
+            .entry(anchor.message)
+            .or_default()
+            .push((order, 0, index));
+    }
+    for (index, item) in crate::work::retry_events(t).iter().enumerate() {
+        if let Ok(anchor) =
+            serde_json::from_value::<crate::model::ToolAnchor>(item["anchor"].clone())
+        {
+            let order = item["order"].as_u64().unwrap_or(u64::MAX);
+            structure.events.push((anchor, order, 3, index));
+            structure
+                .boundaries
+                .entry(anchor.message)
+                .or_default()
+                .push((order, 1, index));
+        }
+    }
+    for work in &t.work {
+        if work.stopped && (work.start < t.messages.len() || !t.status.busy()) {
+            let order = if work.stopped_order == 0 {
+                u64::MAX
+            } else {
+                work.stopped_order
+            };
+            structure
+                .boundaries
+                .entry(work.start)
+                .or_default()
+                .push((order, 2, 0));
+        }
+    }
+    structure.events.sort_by_key(|event| (event.0, event.1));
+    for events in structure.boundaries.values_mut() {
+        events.sort_by_key(|event| event.0);
+    }
+    structure.rows = std::sync::Arc::new(derive_timeline_rows(t, &structure.boundaries));
+    static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    structure.version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache.input = Some(input);
+    cache.structure = std::sync::Arc::new(structure);
+    cache.structure.clone()
+}
+
 #[derive(Clone)]
 enum TimelineRow {
     HistoryControl {
@@ -10514,7 +10562,14 @@ fn push_unique_row_key(seen: &mut std::collections::HashSet<String>, base: Strin
     }
 }
 
-fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
+fn build_timeline_rows(t: &Thread) -> std::sync::Arc<Vec<TimelineRow>> {
+    timeline_structure(t).rows.clone()
+}
+
+fn derive_timeline_rows(
+    t: &Thread,
+    boundaries: &std::collections::HashMap<usize, Vec<BoundaryEvent>>,
+) -> Vec<TimelineRow> {
     let mut rows = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if t.history_has_more || t.history_error.is_some() {
@@ -10552,7 +10607,7 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
     while index < t.messages.len() {
         let message = &t.messages[index];
         emit_handoffs(index, &mut rows, &mut seen);
-        if message.role != "Pi" && work_ui::has_boundary_events(t, index) {
+        if message.role != "Pi" && boundaries.contains_key(&index) {
             rows.push(TimelineRow::Boundary {
                 message_index: index,
                 key: push_unique_row_key(&mut seen, format!("boundary-{}-{}", t.id, message.id)),
@@ -10579,7 +10634,7 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
         index += 1;
     }
     emit_handoffs(usize::MAX, &mut rows, &mut seen);
-    if work_ui::has_boundary_events(t, t.messages.len()) {
+    if boundaries.contains_key(&t.messages.len()) {
         rows.push(TimelineRow::Boundary {
             message_index: t.messages.len(),
             key: push_unique_row_key(&mut seen, format!("boundary-end-{}", t.id)),
@@ -11084,7 +11139,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     }
 
     let thread_id = t.id;
-    let rows = std::rc::Rc::new(build_timeline_rows(t));
+    let structure = timeline_structure(t);
+    let rows = structure.rows.clone();
     let key_rows = rows.clone();
     let build_rows = rows.clone();
     let row_visit = visit.clone();
@@ -11138,7 +11194,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 );
                 row
             },
-        );
+        )
+        .virtual_rows_version(structure.version);
 
     let find_open = s.thread_find_active();
     let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
@@ -23861,6 +23918,73 @@ pub(crate) mod tests {
         rt.frame(4.0);
         assert!(rt.presented("composer").is_some());
     }
+    #[test]
+    fn timeline_structure_reuses_streamed_rows_and_reindexes_prepended_history() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        let thread = state.current_mut();
+        thread.transcript_structure = 1;
+        let first = timeline_structure(thread);
+        let old_keys: Vec<_> = first.rows.iter().map(|row| row.key().to_owned()).collect();
+        thread
+            .messages
+            .last_mut()
+            .unwrap()
+            .text
+            .push_str(" Streaming more text.");
+        thread.transcript_content += 1;
+        let streamed = timeline_structure(thread);
+        assert!(std::sync::Arc::ptr_eq(&first, &streamed));
+        assert!(std::sync::Arc::ptr_eq(&first.rows, &streamed.rows));
+        assert_eq!(first.version, streamed.version);
+        let last = thread.messages.len() - 1;
+        assert!(turn_parts(thread, last, last + 1).iter().any(|part| {
+            matches!(part, TranscriptPart::Text { to, .. } if *to == thread.messages[last].text.len())
+        }));
+
+        thread.messages.insert(
+            0,
+            crate::model::Message {
+                id: "earlier-question".into(),
+                role: "You",
+                text: "An earlier question.".into(),
+                images: vec![],
+                context: None,
+            },
+        );
+        for tool in &mut thread.tools {
+            tool.anchor.message += 1;
+        }
+        for thought in &mut thread.thoughts {
+            thought.anchor.message += 1;
+        }
+        for work in &mut thread.work {
+            work.start += 1;
+        }
+        thread.transcript_structure = 2;
+        let prepended = timeline_structure(thread);
+        assert!(!std::sync::Arc::ptr_eq(&first, &prepended));
+        assert_ne!(first.version, prepended.version);
+        for key in old_keys {
+            assert!(prepended.rows.iter().any(|row| row.key() == key));
+        }
+        assert!(matches!(
+            &turn_parts(thread, 3, 4)[0],
+            TranscriptPart::Tools(indices) if *indices == vec![0, 1]
+        ));
+
+        let start = thread.work[0].start;
+        thread.work[0].stopped = true;
+        thread.native.compactions.push(json!({
+            "anchor":{"message":start,"offset":0}, "order":100
+        }));
+        thread.transcript_structure = 3;
+        let boundary = timeline_structure(thread);
+        assert!(boundary.boundaries.contains_key(&start));
+        assert!(boundary.events.iter().any(|event| event.2 == 2));
+        assert_ne!(boundary.version, prepended.version);
+    }
+
     #[test]
     fn summaries_group_calls_at_the_same_transcript_position_only() {
         let mut s = State::new(".".into(), false);
