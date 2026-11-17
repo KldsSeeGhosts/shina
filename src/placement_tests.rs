@@ -1442,3 +1442,536 @@ fn a_peer_launch_reservation_commits_before_any_provisioning_starts() {
     );
     std::fs::remove_dir_all(runtime.state.data_dir).unwrap();
 }
+
+#[test]
+fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservation() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("upstream-target");
+    fixture.add_origin();
+    let (mut target, connects) = fixture.state();
+    target.next_id = 100;
+    target.catalog.default_model = Some(crate::session::AgentModel {
+        provider: "cpa".into(),
+        id: "fixture".into(),
+        name: "Fixture".into(),
+        thinking_levels: Vec::new(),
+        ..Default::default()
+    });
+    let mut parent = fixture.parent_state(&[
+        crate::protocol::PEER_TASKS,
+        crate::protocol::THREAD_READ,
+        crate::protocol::PLACEMENT,
+    ]);
+    let upstream = parent
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Build upstream", "target":{"machine":"Target","model":"fixture"}
+            }),
+        )
+        .unwrap()["thread_id"]
+        .as_u64()
+        .unwrap() as usize;
+    let launch = parent.tasks[0]
+        .remote
+        .as_ref()
+        .unwrap()
+        .launch_command
+        .clone();
+    let accepted = target
+        .execute_peer_command("parent-device", &launch)
+        .unwrap();
+    let target_upstream = accepted["threadId"].as_u64().unwrap() as usize;
+    assert_ne!(target_upstream, upstream);
+    let (send, receive) = mpsc::channel();
+    send.send(Ok(json!({"status":"accepted","result":accepted})))
+        .unwrap();
+    parent.peer_runtime.inject_pending(
+        parent.tasks[0].id.clone(),
+        "peer.thread.launch".into(),
+        receive,
+    );
+    assert!(parent.poll_remote_tasks());
+    assert_eq!(
+        parent.tasks[0]
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.thread_id),
+        Some(target_upstream)
+    );
+    poll_until_ready(&mut target, 20);
+    let upstream_index = target
+        .threads
+        .iter()
+        .position(|thread| thread.id == target_upstream)
+        .expect("upstream worker");
+    let upstream_placement = child_placement(&target, upstream_index).clone();
+    assert_eq!(upstream_placement.phase, placement::PlacementPhase::Ready);
+    let upstream_branch = upstream_placement.branch.clone().unwrap();
+    let upstream_checkout = PathBuf::from(upstream_placement.checkout.as_ref().unwrap());
+    std::fs::write(
+        upstream_checkout.join("upstream-result.txt"),
+        "upstream result\n",
+    )
+    .unwrap();
+    fixture.git(&upstream_checkout, &["add", "upstream-result.txt"]);
+    fixture.git(
+        &upstream_checkout,
+        &["commit", "-m", "upstream result", "--quiet"],
+    );
+    let upstream_head = fixture
+        .git(&upstream_checkout, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(
+        upstream_head,
+        upstream_placement.base_commit.as_deref().unwrap(),
+        "the selected upstream output must differ from the default base"
+    );
+    // Carry the executor's ready status home the same way its peer wait does.
+    let (send, receive) = mpsc::channel();
+    send.send(Ok(json!({
+        "status":"accepted",
+        "result":{"threadId":target_upstream,"status":"Running",
+            "revision":"upstream-ready","placement":upstream_placement.value()}
+    })))
+    .unwrap();
+    parent.peer_runtime.inject_pending(
+        parent.tasks[0].id.clone(),
+        "peer.thread.wait".into(),
+        receive,
+    );
+    assert!(parent.poll_remote_tasks());
+    assert_eq!(
+        parent.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .placement
+            .as_ref()
+            .unwrap()["phase"],
+        json!("ready")
+    );
+
+    let dependent = parent
+        .mcp_call(
+            1,
+            "delegate_task",
+            &json!({
+                "prompt":"Build dependent", "target":{"machine":"Target","model":"fixture"},
+                "placement":{"mode":"isolated","upstreamThreadId":upstream}
+            }),
+        )
+        .unwrap()["thread_id"]
+        .as_u64()
+        .unwrap() as usize;
+    assert_ne!(dependent, upstream);
+    let dependent_launch = parent.tasks[1]
+        .remote
+        .as_ref()
+        .unwrap()
+        .launch_command
+        .clone();
+    assert_eq!(
+        dependent_launch.params["placement"]["upstreamThreadId"],
+        json!(target_upstream),
+        "the home task id must map to the target's acknowledged worker"
+    );
+    let accepted = target
+        .execute_peer_command("parent-device", &dependent_launch)
+        .unwrap();
+    let dependent_target_id = accepted["threadId"].as_u64().unwrap() as usize;
+    assert_eq!(
+        accepted["placement"]["upstreamThreadId"],
+        json!(target_upstream)
+    );
+    assert_eq!(accepted["placement"]["baseBranch"], json!(upstream_branch));
+    assert_eq!(accepted["placement"]["baseCommit"], json!(upstream_head));
+    assert_eq!(accepted["placement"]["phase"], json!("pending"));
+    // The reservation pinned the branch head it saw. Advance that branch
+    // afterwards to prove provisioning still starts from the saved commit.
+    std::fs::write(upstream_checkout.join("advanced.txt"), "newer upstream\n").unwrap();
+    fixture.git(&upstream_checkout, &["add", "advanced.txt"]);
+    fixture.git(
+        &upstream_checkout,
+        &["commit", "-m", "advance upstream", "--quiet"],
+    );
+    let advanced_head = fixture
+        .git(&upstream_checkout, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(advanced_head, upstream_head);
+    let (send, receive) = mpsc::channel();
+    send.send(Ok(json!({"status":"accepted","result":accepted})))
+        .unwrap();
+    parent.peer_runtime.inject_pending(
+        parent.tasks[1].id.clone(),
+        "peer.thread.launch".into(),
+        receive,
+    );
+    assert!(parent.poll_remote_tasks());
+    poll_until_ready(&mut target, 20);
+    let dependent_index = target
+        .threads
+        .iter()
+        .position(|thread| thread.id == dependent_target_id)
+        .expect("dependent worker");
+    let dependent_placement = child_placement(&target, dependent_index).clone();
+    assert_eq!(dependent_placement.phase, placement::PlacementPhase::Ready);
+    assert_eq!(dependent_placement.mode, placement::PlacementMode::Isolated);
+    assert_eq!(
+        dependent_placement.upstream_thread_id,
+        Some(target_upstream)
+    );
+    assert_eq!(
+        dependent_placement.base_branch.as_deref(),
+        Some(upstream_branch.as_str())
+    );
+    assert_eq!(
+        dependent_placement.base_commit.as_deref(),
+        Some(upstream_head.as_str())
+    );
+    let dependent_checkout = PathBuf::from(dependent_placement.checkout.as_ref().unwrap());
+    assert_eq!(
+        fixture
+            .git(&dependent_checkout, &["rev-parse", "HEAD"])
+            .trim(),
+        upstream_head,
+        "the dependent worktree starts at the pinned base, not the advanced branch"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dependent_checkout.join("upstream-result.txt")).unwrap(),
+        "upstream result\n"
+    );
+    assert!(!dependent_checkout.join("advanced.txt").exists());
+    assert_eq!(
+        fixture
+            .git(
+                &fixture.repo,
+                &["rev-parse", &format!("refs/heads/{upstream_branch}")]
+            )
+            .trim(),
+        advanced_head,
+        "the upstream branch itself still advances"
+    );
+    let mirrored = parent.tasks[1]
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.placement.as_ref())
+        .expect("mirrored dependent placement");
+    assert_eq!(mirrored["upstreamThreadId"], json!(target_upstream));
+    assert_eq!(mirrored["baseBranch"], json!(upstream_branch));
+    assert_eq!(mirrored["baseCommit"], json!(upstream_head));
+    assert_eq!(connects.lock().unwrap().len(), 2);
+    std::fs::remove_dir_all(parent.data_dir).unwrap();
+}
+
+#[test]
+fn non_force_cleanup_preserves_worker_work_and_unmerged_branch_commits() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("cleanup");
+    let (mut state, _connects) = fixture.state();
+    state
+        .mcp_call(1, "delegate_task", &json!({"prompt": "Write it"}))
+        .unwrap();
+    poll_until_ready(&mut state, 15);
+    let placement = child_placement(&state, 1).clone();
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    let checkout = PathBuf::from(placement.checkout.as_ref().unwrap());
+    let branch = placement.branch.clone().unwrap();
+    let ctx = state.test_git_context.clone().unwrap_or_default();
+    // A worker commit that exists only on its worker branch.
+    std::fs::write(checkout.join("worker.txt"), "worker commit\n").unwrap();
+    fixture.git(&checkout, &["add", "worker.txt"]);
+    fixture.git(
+        &checkout,
+        &["commit", "-m", "unmerged worker work", "--quiet"],
+    );
+    let head = fixture
+        .git(&checkout, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert!(crate::vcs::branch_exists(&fixture.repo, &branch, &ctx));
+    // Dirty tracked, staged new and untracked files, all in one checkout.
+    std::fs::write(checkout.join("README.md"), "dirty tracked\n").unwrap();
+    std::fs::write(checkout.join("staged.txt"), "staged new\n").unwrap();
+    fixture.git(&checkout, &["add", "staged.txt"]);
+    std::fs::write(checkout.join("untracked.txt"), "untracked\n").unwrap();
+    for input in [
+        crate::vcs::VcsRemoveWorktreeInput {
+            cwd: fixture.repo.to_string_lossy().into_owned(),
+            path: checkout.to_string_lossy().into_owned(),
+            force: None,
+        },
+        crate::vcs::VcsRemoveWorktreeInput {
+            cwd: fixture.repo.to_string_lossy().into_owned(),
+            path: checkout.to_string_lossy().into_owned(),
+            force: Some(false),
+        },
+    ] {
+        let error = crate::vcs::remove_worktree_with(&input, &ctx).unwrap_err();
+        assert!(error.contains("GitVcsDriver.removeWorktree"), "{error}");
+        assert!(checkout.exists(), "non-force removal deleted the checkout");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "dirty tracked\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("staged.txt")).unwrap(),
+            "staged new\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("untracked.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert_eq!(fixture.git(&checkout, &["rev-parse", "HEAD"]).trim(), head);
+        assert!(crate::vcs::branch_exists(&fixture.repo, &branch, &ctx));
+    }
+    // Restore the fixture's own temporary checkout to clean, then prove a
+    // non-force removal still keeps the unmerged branch and commit.
+    std::fs::write(checkout.join("README.md"), "hello\n").unwrap();
+    fixture.git(&checkout, &["reset", "--quiet"]);
+    std::fs::remove_file(checkout.join("staged.txt")).unwrap();
+    std::fs::remove_file(checkout.join("untracked.txt")).unwrap();
+    assert_eq!(
+        fixture.git(&checkout, &["status", "--porcelain"]).trim(),
+        ""
+    );
+    crate::vcs::remove_worktree_with(
+        &crate::vcs::VcsRemoveWorktreeInput {
+            cwd: fixture.repo.to_string_lossy().into_owned(),
+            path: checkout.to_string_lossy().into_owned(),
+            force: None,
+        },
+        &ctx,
+    )
+    .unwrap();
+    assert!(!checkout.exists());
+    assert!(crate::vcs::branch_exists(&fixture.repo, &branch, &ctx));
+    assert_eq!(
+        fixture
+            .git(
+                &fixture.repo,
+                &["rev-parse", &format!("refs/heads/{branch}")]
+            )
+            .trim(),
+        head
+    );
+    assert_eq!(
+        fixture
+            .git(&fixture.repo, &["show", &format!("{branch}:worker.txt")])
+            .trim(),
+        "worker commit"
+    );
+}
+
+#[test]
+fn direct_worker_send_does_not_retry_a_failed_reservation_and_keeps_parent_recovery() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("direct-recovery");
+    let (mut state, connects) = fixture.state();
+    state.headless = true;
+    state
+        .mcp_call(1, "delegate_task", &json!({"prompt": "Write it"}))
+        .unwrap();
+    let child = state.threads[1].id;
+    let placement = child_placement(&state, 1).clone();
+    let planned = PathBuf::from(placement.checkout.as_ref().unwrap());
+    let branch = placement.branch.clone().unwrap();
+    std::fs::create_dir_all(&planned).unwrap();
+    poll_until_ready(&mut state, 10);
+    let placement = child_placement(&state, 1);
+    assert_eq!(placement.phase, placement::PlacementPhase::Failed);
+    let error = placement.error.clone().unwrap();
+    assert!(error.contains("will not delete"), "{error}");
+    assert_eq!(state.tasks[0].state, tasks::TaskState::Queued);
+
+    // A direct send to the worker is not the recovery route. It starts
+    // nothing, keeps the failed reservation, and says where new work must
+    // come from. It also must not leave the worker looking busy.
+    let direct = state
+        .execute_command(&Command::new(
+            "thread.send",
+            json!({"threadId":child,"text":"Direct follow-up","attachments":[],"mode":"prompt"}),
+        ))
+        .unwrap_err();
+    assert!(direct.contains("Nothing started"), "{direct}");
+    assert!(direct.contains("same checkout"), "{direct}");
+    assert_eq!(
+        child_placement(&state, 1).phase,
+        placement::PlacementPhase::Failed
+    );
+    assert_eq!(
+        child_placement(&state, 1).error.as_deref(),
+        Some(error.as_str())
+    );
+    assert_eq!(state.threads[1].status, Status::Failed);
+    assert_eq!(state.tasks[0].state, tasks::TaskState::Queued);
+    assert!(state.threads[1].messages.is_empty());
+    assert!(state.threads[1].queued_prompt.is_none());
+    assert!(state.threads[1].native.queue.is_empty());
+    assert!(state.threads[1].pending_injections.is_empty());
+    assert!(state.threads[1].pi.is_none());
+    assert!(state.placement_rxs.is_empty());
+    assert!(connects.lock().unwrap().is_empty());
+    assert!(planned.exists());
+    assert_eq!(fixture.worktree_dirs().len(), 1);
+
+    // Captain new work is the recovery route and reuses the reservation.
+    std::fs::remove_dir_all(&planned).unwrap();
+    let sent = state
+        .mcp_call(
+            1,
+            "task_send",
+            &json!({"thread_id":child,"message":"continue","client_request_id":"recover-direct"}),
+        )
+        .unwrap();
+    assert_eq!(sent["control"]["saved"], true);
+    assert_eq!(
+        child_placement(&state, 1).phase,
+        placement::PlacementPhase::Pending
+    );
+    poll_until_ready(&mut state, 15);
+    let placement = child_placement(&state, 1);
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    assert_eq!(
+        placement.checkout.as_deref(),
+        Some(planned.to_string_lossy().as_ref())
+    );
+    assert_eq!(placement.branch.as_deref(), Some(branch.as_str()));
+    assert_eq!(connects.lock().unwrap().len(), 1);
+    assert_eq!(fixture.worktree_dirs().len(), 2);
+}
+
+#[test]
+fn captain_crew_send_retries_a_failed_reservation_in_the_same_checkout() {
+    if !crate::vcs::git_available() {
+        return;
+    }
+    let fixture = Fixture::new("crew-recovery");
+    let (mut state, _connects) = fixture.state();
+    state.headless = true;
+    state.captains = crate::captains::Captain::presets();
+    state.open_captain(0);
+    let home = state.captain_home(0).unwrap();
+    let model = crate::session::AgentModel {
+        provider: "cpa".into(),
+        id: "fixture".into(),
+        name: "Fixture".into(),
+        thinking_levels: Vec::new(),
+        ..Default::default()
+    };
+    state.catalog.default_model = Some(model.clone());
+    let home_index = state
+        .threads
+        .iter()
+        .position(|thread| thread.id == home)
+        .unwrap();
+    state.threads[home_index].models = vec![model];
+    state.threads[home_index].set_model("cpa".into(), "fixture".into());
+    // Keep the fake provider's command channel alive so a real prompt send
+    // does not fail as a dropped test transport.
+    let channels: std::sync::Arc<
+        std::sync::Mutex<Vec<(usize, mpsc::Receiver<Value>, mpsc::SyncSender<Event>)>>,
+    > = std::sync::Arc::default();
+    let paths: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> = std::sync::Arc::default();
+    let kept = channels.clone();
+    let seen = paths.clone();
+    state.test_connect_pi = Some(Box::new(move |tid, path| {
+        seen.lock()
+            .unwrap()
+            .push((tid, path.to_string_lossy().into_owned()));
+        let (pi, commands, events) = Pi::test_connection();
+        kept.lock().unwrap().push((tid, commands, events));
+        Some(pi)
+    }));
+    let database = crate::database::Database::open(&state.data_dir).unwrap();
+    database.begin().unwrap();
+    let created = state
+        .mcp_call(
+            home,
+            "captain_crew_create",
+            &json!({
+                "requestId":uuid::Uuid::new_v4(), "prompt":"Crew first input",
+                "project":1, "placement":{"mode":"isolated"}
+            }),
+        )
+        .unwrap();
+    let crew = created["threadId"].as_u64().unwrap() as usize;
+    let index = state
+        .threads
+        .iter()
+        .position(|thread| thread.id == crew)
+        .unwrap();
+    let placement = state.threads[index].placement.clone().unwrap();
+    let planned = PathBuf::from(placement.checkout.as_ref().unwrap());
+    let branch = placement.branch.clone().unwrap();
+    std::fs::create_dir_all(&planned).unwrap();
+    poll_until_ready(&mut state, 10);
+    let placement = state.threads[index].placement.as_ref().unwrap();
+    assert_eq!(placement.phase, placement::PlacementPhase::Failed);
+    assert!(
+        placement
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("will not delete")
+    );
+    assert_eq!(state.threads[index].status, Status::Failed);
+    assert!(state.threads[index].native.queue_held);
+    assert!(state.threads[index].pi.is_none());
+    assert!(paths.lock().unwrap().is_empty());
+    // The first input stays available for review instead of being lost.
+    assert!(state.threads[index].draft.text.contains("Crew first input"));
+
+    // The Captain's send is the recovery route even though the failed
+    // placement left the worker's native queue held.
+    let sent = state
+        .mcp_call(
+            home,
+            "captain_crew_send",
+            &json!({"requestId":uuid::Uuid::new_v4(), "threadId":crew,
+                "message":"Retry after fixing the checkout"}),
+        )
+        .unwrap();
+    assert_eq!(sent["saved"], true);
+    let placement = state.threads[index].placement.as_ref().unwrap();
+    assert_eq!(placement.phase, placement::PlacementPhase::Pending);
+    assert!(!state.threads[index].native.queue_held);
+    assert_eq!(state.threads[index].native.queue.len(), 1);
+    assert!(state.threads[index].pi.is_none());
+    std::fs::remove_dir_all(&planned).unwrap();
+    poll_until_ready(&mut state, 15);
+    let placement = state.threads[index].placement.as_ref().unwrap();
+    assert_eq!(placement.phase, placement::PlacementPhase::Ready);
+    assert_eq!(
+        placement.checkout.as_deref(),
+        Some(planned.to_string_lossy().as_ref())
+    );
+    assert_eq!(placement.branch.as_deref(), Some(branch.as_str()));
+    assert!(
+        state.threads[index].pi.is_some(),
+        "status={:?} error={:?} queue={} pending={}",
+        state.threads[index].status,
+        state.threads[index].error,
+        state.threads[index].native.queue.len(),
+        state.threads[index].pending_prompt.is_some()
+    );
+    let paths = paths.lock().unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        crate::vcs::real_location(Path::new(&paths[0].1)),
+        crate::vcs::real_location(&planned)
+    );
+    drop(paths);
+    assert_eq!(channels.lock().unwrap().len(), 1);
+    assert_eq!(fixture.worktree_dirs().len(), 2);
+    assert!(state.threads[index].draft.text.contains("Crew first input"));
+}

@@ -186,6 +186,24 @@ UI head passed CI. Release `v0.12.57` published that exact source commit.
 The core gate, three platform builds and publish jobs passed, and the actual
 tag target, manifest and downloaded asset hashes were verified.
 
+The #20 acceptance follow-up found two recovery defects. A direct send to a
+failed-placement worker could mark it busy without starting a provider, which
+then blocked its parent's retry. A Captain crew send also rejected the failed
+placement's recoverable queue hold. Direct sends now refuse before starting or
+marking the worker busy. New parent or Captain work can retry the same
+reservation, while other interrupted-input guards remain enforced and the
+original crew draft remains available for review.
+
+The follow-up adds real-Git cleanup tests for dirty tracked, staged and untracked
+files, and preserves unmerged branches and commits after clean checkout removal.
+The live two-server fixture now selects an existing worktree and launches a
+dependent writer at an upstream-only commit. Home and executor numeric thread
+ids deliberately differ, so the mapping cannot pass by coincidence. A separate
+two-state peer-command test advances the upstream branch after reservation and
+proves provisioning still uses the captured commit. These tests supplement the
+published placement coverage rather than replacing it. Issue #20 remains open
+until this follow-up passes CI and publication.
+
 Issue #22's mandatory cancellation and question-answer fences are in PR #48.
 Root review adds receipt-transaction preflight, atomic send/cancel failure
 tests, mandatory question fences for legacy children, and refusal of fenced
