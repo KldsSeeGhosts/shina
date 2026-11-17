@@ -1,6 +1,7 @@
 """Local JSONL ACP fixture. No providers, network, login, or non-fixture files."""
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -12,6 +13,7 @@ args.add_argument("--resume", action="store_true")
 args.add_argument("--auth-denied", action="store_true")
 args.add_argument("--delay-seconds", type=float, default=0)
 args.add_argument("--no-history", action="store_true")
+args.add_argument("--no-mcp", action="store_true")
 opts = args.parse_args()
 session = "fixture-session"
 pending = None
@@ -53,7 +55,8 @@ for line in sys.stdin:
             "loadSession": not opts.no_load and not opts.resume,
             "sessionCapabilities": {"resume": {}} if opts.resume else {},
             "promptCapabilities": {"image": True},
-            "mcpCapabilities": {"http": not opts.stdio, "stdio": True}}})
+            "mcpCapabilities": {"http": not opts.stdio and not opts.no_mcp,
+                                "stdio": not opts.no_mcp}}})
     elif method in ("session/new", "session/load", "session/resume"):
         if opts.auth_denied:
             send({"id": req_id, "error": {"code": -32000, "message": "Authentication required"}})
@@ -64,10 +67,19 @@ for line in sys.stdin:
         if opts.stdio:
             assert mcp["args"] == ["--mcp-bridge"]
             assert {v["name"] for v in mcp["env"]} == {"SHINA_MCP_URL", "SHINA_MCP_TOKEN"}
+            endpoint = {v["name"]: v["value"] for v in mcp["env"]}
+            with open(os.path.join(params["cwd"], "fixture-mcp.json"), "w",
+                      encoding="utf8") as out:
+                json.dump({"url": endpoint["SHINA_MCP_URL"],
+                           "token": endpoint["SHINA_MCP_TOKEN"]}, out)
         else:
             assert mcp["type"] == "http"
             assert mcp["url"].startswith("http://127.0.0.1:")
             assert mcp["headers"][0]["value"].startswith("Bearer ")
+            with open(os.path.join(params["cwd"], "fixture-mcp.json"), "w",
+                      encoding="utf8") as out:
+                json.dump({"url": mcp["url"],
+                           "token": mcp["headers"][0]["value"][7:]}, out)
         if method != "session/new":
             assert params["sessionId"] == session
             if not opts.no_history:

@@ -19,6 +19,11 @@ const shinaUrl = shinaEntry.url;
 const shinaToken = process.env.SHINA_MCP_TOKEN || "";
 const shinaHeaders = Object.fromEntries(
   Object.entries(shinaEntry.headers || {}).map(([name, value]) => [name, expand(value)]));
+// The thread's token-scoped endpoint, the same record fake_pi writes.
+if (shinaUrl && shinaToken) {
+  fs.writeFileSync(path.join(process.cwd(), "fixture-mcp.json"),
+    JSON.stringify({ url: shinaUrl, token: shinaToken }));
+}
 const callbacks = {};
 const dispatch = (name, input, done) => {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",

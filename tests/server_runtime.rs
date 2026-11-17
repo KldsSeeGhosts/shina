@@ -1441,6 +1441,11 @@ impl Profile {
             include_str!("../assets/tests/fake_claude_requests.cjs"),
         )
         .unwrap();
+        fs::write(
+            root.join("fake_codex.js"),
+            include_str!("../assets/tests/fake_codex.js"),
+        )
+        .unwrap();
         fs::write(root.join("Shina/harnesses.json"), json!([{"id":"fixture-acp","name":"Fixture ACP",
             "command":if cfg!(windows) { "python" } else { "python3" },
             "args":["-u",root.join("fake_acp.py"),"--log",root.join("acp-log.jsonl"),"--delay-seconds","0.6","--resume","--no-history"]}]).to_string()).unwrap();
@@ -1491,6 +1496,9 @@ impl Profile {
                     self.root.join("fake_claude_requests.js"),
                 )
                 .env("CLAUDE_CONFIG_DIR", self.root.join("claude-config"));
+        }
+        if self.root.join("use-fake-codex-fixture").exists() {
+            command.env("SHINA_CODEX_CLI", self.root.join("fake_codex.js"));
         }
         if self.root.join("measure-storage").exists() {
             command.env(
@@ -7873,3 +7881,6 @@ mod captain_contract;
 
 #[path = "support/update_recovery.rs"]
 mod update_recovery;
+
+#[path = "support/capability_parity.rs"]
+mod capability_parity;
