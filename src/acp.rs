@@ -13,12 +13,100 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
+        Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread,
     time::{Duration, Instant},
 };
+
+/// Metadata-only ACP probe. It negotiates `initialize` in a short-lived
+/// process and never creates a session, registers MCP or sends a prompt.
+pub fn probe(agent: &Agent) -> Result<Value, String> {
+    static PROBES: OnceLock<Mutex<HashMap<String, Result<Value, String>>>> = OnceLock::new();
+    let key = json!({"id":agent.id,"command":agent.command,"args":agent.args,"env":agent.env})
+        .to_string();
+    let cache = PROBES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache.lock().expect("ACP probes").get(&key) {
+        return cached.clone();
+    }
+    let result = probe_uncached(agent);
+    cache
+        .lock()
+        .expect("ACP probes")
+        .insert(key, result.clone());
+    result
+}
+
+/// Re-probe before allocation. Discovery may be cached, but dispatch must
+/// answer from the executable and protocol state that exists now.
+pub(crate) fn probe_live(agent: &Agent) -> Result<Value, String> {
+    probe_uncached(agent)
+}
+
+fn probe_uncached(agent: &Agent) -> Result<Value, String> {
+    let mut child = agent
+        .process()?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("Could not start ACP harness {}: {error}", agent.id))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("ACP probe could not open stdin.")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("ACP probe could not open stdout.")?;
+    let request = json!({
+        "jsonrpc":"2.0","id":"shina-probe","method":"initialize",
+        "params":{"protocolVersion":1,
+            "clientInfo":{"name":"Shina","version":env!("CARGO_PKG_VERSION")},
+            "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},
+                "terminal":false}}
+    });
+    stdin
+        .write_all(format!("{request}\n").as_bytes())
+        .map_err(|error| format!("ACP probe could not write initialize: {error}"))?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut result = Err("ACP agent exited before answering initialize.".into());
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if value["id"] != "shina-probe" {
+                continue;
+            }
+            result = if value["error"].is_null() {
+                if value["result"]["protocolVersion"] == 1 {
+                    Ok(value["result"]["agentCapabilities"].clone())
+                } else {
+                    Err("This ACP agent did not negotiate protocol version 1.".into())
+                }
+            } else {
+                Err(value["error"]["message"]
+                    .as_str()
+                    .unwrap_or("ACP initialize failed.")
+                    .to_owned())
+            };
+            break;
+        }
+        let _ = sender.send(result);
+    });
+    let result = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| {
+            Err("ACP initialize timed out before advertising its capabilities.".into())
+        });
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
 
 pub fn start(agent: Agent, start: Start, wake: Waker) -> Result<Pi, String> {
     if matches!(start.source, SessionSource::Fork(_)) {
@@ -727,7 +815,7 @@ impl Client {
         if !self.awareness_sent {
             content.push(json!({"type":"text","text":format!(
                 "<shina_context>\n{}\n{}\n</shina_context>",
-                crate::mcp::INSTRUCTIONS, self.start.instructions.as_deref().unwrap_or("")
+                self.start.shina, self.start.instructions.as_deref().unwrap_or("")
             )}));
         }
         let dispatch = crate::composer_skills::claude_dispatch(text, &self.claude_skills);

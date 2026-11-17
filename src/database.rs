@@ -1168,8 +1168,18 @@ impl Database {
             let text:String=inner.connection.query_row("SELECT payload FROM projection_records WHERE document='index.json' AND scope=?1 AND key='$'",[scope],|r|r.get(0)).map_err(error)?;
             serde_json::from_str(&text).map_err(error)
         };
+        let scheduler: Value = inner
+            .connection
+            .query_row(
+                "SELECT payload FROM projection_records WHERE document='index.json' AND scope='$' AND key='scheduler'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null);
         Ok(
-            json!({"index":{"threads":[read(&format!("threads/{thread}"))?]},"threads":[read(&format!("threadViews/{thread}"))?]}),
+            json!({"index":{"threads":[read(&format!("threads/{thread}"))?],"scheduler":scheduler},"threads":[read(&format!("threadViews/{thread}"))?]}),
         )
     }
 

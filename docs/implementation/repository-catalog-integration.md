@@ -3,8 +3,8 @@
 This branch preserves original #28 commit `9424b27` and integrates published main
 `6eff805`. The original Devin checkout remains unchanged. Schema 10 follows the
 already published schema 9 task-operation and input-intent tables. The tentative
-catalog contract remains `logical-repositories-v1` at minor 47. Scheduler minor
-46 and execution leases remain separate publication gates.
+catalog contract is `logical-repositories-v1` at minor 48, after scheduler 46
+and execution leases 47. Execution ownership remains a separate integration gate.
 
 ## Reproduced findings and corrections
 
@@ -152,3 +152,16 @@ clone remains bound if only later placement planning fails.
 `credential_failures_are_distinct_and_retry_the_recorded_checkout` checks these
 ordinary authentication failures against a transport failure, snapshot
 round-trip and retry without starting a provider.
+
+## Published-main composition
+
+This candidate now includes published main `25340bb`, including scheduler and
+effective-capability corrections. Repository launch still reserves target
+admission before its provider can start. The two scheduler placement fixtures
+and two remote-task fixtures include the additive catalog fields.
+
+The all-target compiler check and existing two-executor clone/setup/restart
+contract pass on the combined code. No full local suite was repeated. The
+subsequent protocol-number update reserves 48 for this dependent catalog
+publication, after execution ownership at 47. That dependency still needs to
+land before this candidate can publish.

@@ -797,41 +797,40 @@ fn serve(
         // Notifications such as notifications/initialized need no answer.
         return respond(&mut stream, 202, None, &Value::Null);
     }
-    let result = match method {
+    // initialize and tools/list are meta requests: the answer depends on the
+    // calling thread's effective record, so they ride the same UI-thread queue
+    // as tool calls and return the RPC result verbatim rather than a tool
+    // result wrapper.
+    let meta = |tool: &str, args: Value| -> Result<Value, String> {
+        dispatch(server, requests, thread, tool, args)
+    };
+    let result: Result<Value, String> = match method {
         "initialize" => {
             let session = random_hex(2);
-            let result = json!({
-                "protocolVersion": message["params"]["protocolVersion"].as_str().unwrap_or(PROTOCOL),
-                "capabilities": {"tools": {}, "experimental": {"shina": {"threadRead": 2, "peerTasks": 2}}},
-                "serverInfo": {"name": "Shina", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": INSTRUCTIONS,
-            });
-            return respond(&mut stream, 200, Some(&session), &rpc_result(id, result));
+            let body = match meta("initialize", message["params"].clone()) {
+                Ok(result) => rpc_result(id, result),
+                Err(error) => rpc_error(id, -32603, &error),
+            };
+            return respond(&mut stream, 200, Some(&session), &body);
         }
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools()})),
+        "tools/list" => match meta("tools/list", message["params"].clone()) {
+            Ok(result) => Ok(result),
+            Err(error) => return respond(&mut stream, 200, None, &rpc_error(id, -32603, &error)),
+        },
         "tools/call" => {
-            let (reply, answer) = mpsc::channel();
-            let request = Request {
+            match dispatch(
+                server,
+                requests,
                 thread,
-                tool: message["params"]["name"].as_str().unwrap_or("").to_owned(),
-                args: message["params"]["arguments"].clone(),
-                reply,
-            };
-            if requests.try_send(request).is_err() {
-                Err("Shina's request queue is full or shutting down. Retry later.".to_owned())
-            } else {
-                (server.wake.lock().expect("mcp waker"))();
-                let outcome = answer
-                    .recv_timeout(Duration::from_secs(630))
-                    .unwrap_or_else(|_| Err("Shina did not answer within 630 seconds.".into()));
-                Ok(match outcome {
-                    Ok(value) => tool_result(value),
-                    Err(error) => json!({
-                        "content": [{"type":"text","text": error}],
-                        "isError": true,
-                    }),
-                })
+                message["params"]["name"].as_str().unwrap_or(""),
+                message["params"]["arguments"].clone(),
+            ) {
+                Ok(value) => Ok(tool_result(value)),
+                Err(error) => Ok(json!({
+                    "content": [{"type":"text","text": error}],
+                    "isError": true,
+                })),
             }
         }
         _ => {
@@ -848,6 +847,30 @@ fn serve(
         Err(error) => rpc_error(id, -32603, &error),
     };
     respond(&mut stream, 200, None, &body)
+}
+
+/// Sends one request to the UI thread and waits for its committed answer.
+fn dispatch(
+    server: &Server,
+    requests: &SyncSender<Request>,
+    thread: usize,
+    tool: &str,
+    args: Value,
+) -> Result<Value, String> {
+    let (reply, answer) = mpsc::channel();
+    let request = Request {
+        thread,
+        tool: tool.to_owned(),
+        args,
+        reply,
+    };
+    if requests.try_send(request).is_err() {
+        return Err("Shina's request queue is full or shutting down. Retry later.".to_owned());
+    }
+    (server.wake.lock().expect("mcp waker"))();
+    answer
+        .recv_timeout(Duration::from_secs(630))
+        .unwrap_or_else(|_| Err("Shina did not answer within 630 seconds.".into()))
 }
 
 fn tool_result(value: Value) -> Value {
@@ -1067,6 +1090,32 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
         );
         assert_eq!(status, 401);
+        // initialize, tools/list and tools/call all ride the UI-thread queue;
+        // the stand-in pump answers each with the shape production returns.
+        let worker = {
+            let server = server.clone();
+            thread::spawn(move || {
+                let mut calls = 0;
+                loop {
+                    if let Some(request) = server.next_request() {
+                        assert_eq!(request.thread, 7);
+                        calls += 1;
+                        let _ = request.reply.send(Ok(match request.tool.as_str() {
+                            "initialize" => json!({
+                                "serverInfo": {"name": "Shina"},
+                                "instructions": INSTRUCTIONS,
+                            }),
+                            "tools/list" => json!({"tools": tools()}),
+                            tool => json!({"tool": tool}),
+                        }));
+                        if calls == 3 {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
         let (status, body) = post(
             &server.url,
             &token,
@@ -1082,19 +1131,6 @@ mod tests {
         );
         assert!(body.contains("delegate_task"));
         assert!(body.contains("orchestrator_capabilities"));
-        let worker = {
-            let server = server.clone();
-            thread::spawn(move || {
-                loop {
-                    if let Some(request) = server.next_request() {
-                        assert_eq!(request.thread, 7);
-                        let _ = request.reply.send(Ok(json!({"tool": request.tool})));
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            })
-        };
         let (_, body) = post(
             &server.url,
             &token,

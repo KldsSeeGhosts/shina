@@ -114,6 +114,8 @@ pub(crate) mod crew_question_state;
 #[path = "crew_questions.rs"]
 pub(crate) mod crew_questions;
 pub use crew_question_state::CrewQuestionDraft;
+#[path = "admission.rs"]
+mod admission;
 #[path = "crew_reports.rs"]
 pub(crate) mod crew_reports;
 #[path = "question_answers.rs"]
@@ -199,6 +201,8 @@ mod scope;
 #[allow(unused_imports)]
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 pub use scope::RemoteProject;
+#[path = "capabilities.rs"]
+mod capabilities;
 #[path = "codex_model.rs"]
 mod codex_model;
 #[path = "placement.rs"]
@@ -1010,6 +1014,8 @@ pub struct Thread {
     /// Last successfully applied source, not the network's previous emission.
     pub(crate) transcript_projection:
         Option<std::sync::Arc<crate::client_history::ThreadProjection>>,
+    /// Disclosure keys survive unloaded history without retaining payloads.
+    pub(crate) transcript_disclosures: client_state::Disclosures,
     /// Structure and content revisions of the last applied emission; the
     /// timeline consumer (#25) diffs these instead of rescanning items.
     pub(crate) transcript_structure: u64,
@@ -1078,6 +1084,11 @@ pub struct Thread {
     pub captain_home: bool,
     pub crew_captain: Option<usize>,
     pub captain_context: String,
+    /// The role whose Shina awareness this session received or will receive.
+    pub(crate) instruction_role: Option<&'static str>,
+    pub(crate) shina: &'static str,
+    /// A role change that needs a next-turn update or a fresh session.
+    pub(crate) instruction_context_pending: bool,
     /// Started by another thread through the Shina MCP. Delegated threads cannot delegate.
     pub delegated: bool,
     pub parent: Option<usize>,
@@ -1141,6 +1152,15 @@ pub struct Thread {
     crew_report_last_run: Option<String>,
     recovering_task: bool,
     task_history: Option<Value>,
+    /// The live admission reservation id this crew member or peer worker
+    /// holds, and the monotonic run counter its reservations key to.
+    pub admission: Option<String>,
+    pub admission_run: u64,
+    /// Runtime-only mirror of the ledger: true while a covering reservation
+    /// is queued (or a managed thread waits for lazy admission). Delivery
+    /// loops consult it so queued managed work cannot reach a live provider
+    /// connection ahead of its grant; unmanaged threads never set it.
+    pub admission_blocked: bool,
     memory: Option<memory::MemoryLink>,
     learned_turn: Option<honcho::Turn>,
     memory_pending: VecDeque<mpsc::Receiver<Value>>,
@@ -1581,6 +1601,7 @@ impl Thread {
             work: vec![],
             transcript_fields: std::collections::HashMap::new(),
             transcript_projection: None,
+            transcript_disclosures: client_state::Disclosures::default(),
             transcript_structure: 0,
             transcript_content: 0,
             draft: crate::composer_rich::draft(""),
@@ -1633,6 +1654,9 @@ impl Thread {
             captain_home: false,
             crew_captain: None,
             captain_context: String::new(),
+            instruction_role: None,
+            shina: crate::model::capabilities::THREAD_INSTRUCTIONS,
+            instruction_context_pending: false,
             delegated: false,
             parent: None,
             host: None,
@@ -1683,6 +1707,9 @@ impl Thread {
             crew_report_last_run: None,
             recovering_task: false,
             task_history: None,
+            admission: None,
+            admission_run: 0,
+            admission_blocked: false,
             memory: None,
             learned_turn: None,
             memory_pending: VecDeque::new(),
@@ -1745,6 +1772,7 @@ impl Thread {
                 workspace: path,
                 source,
                 instructions,
+                shina: self.shina_instructions(),
                 link: self.host.clone(),
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
@@ -1958,10 +1986,12 @@ impl Thread {
         self.serial += 1;
         data["type"] = kind.into();
         data["id"] = format!("{}-{}", self.id, self.serial).into();
-        let result = self.send_memory_command(data);
-        if let Err(error) = result {
+        if let Err(error) = self.send_memory_command(data) {
             self.error = Some(error);
             return false;
+        }
+        if kind == "prompt" {
+            self.instruction_context_pending = false;
         }
         if let Some(context) = context {
             self.memory_context = context;
@@ -2772,7 +2802,11 @@ impl Thread {
     }
 
     fn flush_injection(&mut self) -> bool {
-        if self.offline_blocked || self.provider_update_held || self.status == Status::Paused {
+        if self.offline_blocked
+            || self.provider_update_held
+            || self.admission_blocked
+            || self.status == Status::Paused
+        {
             return false;
         }
         #[cfg(debug_assertions)]
@@ -2974,6 +3008,7 @@ impl Thread {
             || matches!(self.status, Status::Failed | Status::Paused)
             || self.offline_blocked
             || self.provider_update_held
+            || self.admission_blocked
         {
             return;
         }
@@ -4494,6 +4529,9 @@ fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
 pub struct State {
     /// None means a command/global change. A poll records only changed threads.
     pub(crate) persistence_scope: Option<std::collections::HashSet<usize>>,
+    /// The durable admission scheduler shared by delegated tasks, crew
+    /// members and peer-launched workers. Persisted with the index.
+    pub(crate) scheduler: admission::Scheduler,
     pub(crate) provider_update_drivers: std::collections::BTreeSet<String>,
     pub client: Option<crate::client::Client>,
     pub machines: crate::peer::Machines,
@@ -4858,6 +4896,7 @@ impl State {
             peer_runtime: Default::default(),
             headless: false,
             persistence_scope: None,
+            scheduler: admission::Scheduler::default(),
             provider_update_drivers: Default::default(),
             owner: None,
             command_receipts: Vec::new(),
@@ -8217,8 +8256,8 @@ impl State {
                 "host_supported": caller.machine == "local",
             },
             "constraints": {
-                "running_children_per_coordinator": tasks::RUNNING_LIMIT,
-                "unfinished_tasks_per_coordinator": tasks::UNFINISHED_LIMIT,
+                "running_children_per_coordinator": self.scheduler.limits.coordinator_running,
+                "unfinished_tasks_per_coordinator": self.scheduler.limits.coordinator_unfinished,
                 "direct_providers": false,
                 "remote_hosts": true,
                 "model_ids": "exact ids only",
@@ -8252,8 +8291,6 @@ impl State {
         // Each `may_*` mirrors the matching handler's ownership and lifecycle gates; it
         // does not promise call-specific validation (prompt, target or capacity) succeeds.
         let (captain, primary_home) = self.captain_actor(caller_index);
-        let owner_active = self.require_active_thread_owner(caller.id).is_ok();
-        let local = caller.peer_origin.is_none();
         // How the caller's harness treats `mcp__shina__` names before they reach this
         // server. Stated per adapter because admission policy is not uniform: Pi's bridge
         // and Claude's policy gate by name, Codex leaves it to its approval mode, and ACP
@@ -8272,37 +8309,57 @@ impl State {
                 "MCP admission is the agent's own permission policy on this harness; Shina cannot report whether a call prompts or is refused."
             }
         };
+        // Authoritative admission state for this caller's coordinator: the
+        // same limits the scheduler enforces at execution time, usage and
+        // the caller-visible queue. Not a cached discovery record.
+        capabilities["scheduling"] =
+            self.scheduling_scoped_value(Some(self.effective_home(caller.id)));
         capabilities["caller"] = json!({
-            "role": if caller.delegated {
-                "worker"
-            } else if caller.captain_home {
-                if primary_home { "captain_home" } else { "earlier_home" }
-            } else if captain.is_some() {
-                "crew"
-            } else {
-                "thread"
-            },
+            "role": self.mcp_role(caller_index),
             "captain": captain,
             "primary_home": primary_home,
             "access": caller.native.access.id(),
-            "may_delegate": owner_active
-                && local
-                && !caller.delegated
-                && (!caller.captain_home || primary_home),
-            "may_control_crew": self.client.is_none()
-                && owner_active
-                && local
-                && !caller.delegated
-                && primary_home,
-            "may_write_captain_documents": owner_active
-                && local
-                && primary_home
-                && self.require_captain_capability().is_ok(),
+            "harness": caller.harness,
+            "machine": caller.machine,
+            "host": if caller.peer_origin.is_some() { "remote" } else { "local" },
+            "delegated": caller.delegated,
+            "crew_member": caller.crew_captain.is_some(),
+            "owner_status": captain.map(|id| match self.captain_phase(id) {
+                CaptainPhase::Active => "active",
+                CaptainPhase::Archived => "archived",
+                CaptainPhase::Retired => "retired",
+                CaptainPhase::Deleted => "deleted",
+            }),
+            // Legacy booleans remain for older clients, but derive from the
+            // same effective gates the tool record and dispatch use.
+            "may_delegate": self.denial(caller_index, "delegate_task").is_none(),
+            "may_control_crew": self.denial(caller_index, "captain_crew_create").is_none(),
+            "may_write_captain_documents": self
+                .denial(caller_index, "captain_document_write")
+                .is_none(),
+            "may_answer_questions": self
+                .denial(caller_index, "captain_question_answer")
+                .is_none(),
+            "may_manage_routines": self.denial(caller_index, "create_routine").is_none(),
             "shina_tools": {
                 "endpoint": caller.host.is_some(),
                 "admission": admission,
             },
         });
+        // The effective record (#32): coordination rights with precise reasons,
+        // interaction support, authorized reads, placement, live capacity and
+        // the per-tool listing `tools/list` now returns. Dispatch revalidates
+        // each gate again at call time.
+        capabilities["contract"] = json!(capabilities::CONTRACT);
+        capabilities["effective"] = json!({
+            "coordination": self.coordination(caller_index),
+            "interaction": self.interaction(caller_index),
+            "reads": self.reads(caller_index),
+            "execution": self.execution(caller_index),
+            "placement": self.placement(caller_index),
+            "capacity": self.capacity(caller_index),
+        });
+        capabilities["tools"] = self.tools_record(caller_index);
         capabilities
     }
 
@@ -8329,6 +8386,12 @@ impl State {
                 .iter()
                 .any(|task| task.child_thread_id == self.threads[index].id && task.remote.is_some())
         {
+            return;
+        }
+        // A queued admission reservation gates every provider start, however
+        // the call reached here. Held reservations and unmanaged interactive
+        // threads never match.
+        if index < self.threads.len() && self.admission_blocks_connect(self.threads[index].id) {
             return;
         }
         if self.demo
@@ -8397,6 +8460,12 @@ impl State {
         let thread_id = self.threads[index].id;
         self.sync_memory_links();
         self.refresh_captain_contexts();
+        let role = self.mcp_role(index);
+        self.threads[index].instruction_role = Some(role);
+        self.threads[index].shina = Self::instructions_for_role(role);
+        // The session start carries the current text, so a stale next-turn
+        // update is not needed for this connection.
+        self.threads[index].instruction_context_pending = false;
         let instructions = self.connection_instructions(index);
         if matches!(
             self.threads[index].harness.as_str(),
@@ -8449,6 +8518,9 @@ impl State {
         tool: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        if matches!(tool, "initialize" | "tools/list") {
+            return self.mcp_meta_call(caller, tool, args);
+        }
         if matches!(
             tool,
             "captain_crew_create" | "captain_crew_send" | "captain_crew_stop"
@@ -8609,6 +8681,7 @@ impl State {
                     .and_then(|t| t.harness.clone())
                     .unwrap_or_else(|| self.threads[caller_index].harness.clone());
                 self.validate_harness(&harness)?;
+                self.require_harness_executable(&harness)?;
                 let provider = if harness == "pi" { "cpa" } else { &harness };
                 if target
                     .as_ref()
@@ -8738,6 +8811,8 @@ impl State {
                 self.threads.push(thread);
                 self.tasks.push(task);
                 self.sync_memory_links();
+                // The attempt reserves admission before the pump can start it.
+                self.admit_task_index(self.tasks.len() - 1);
                 let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
                 if let Some(key) = request_key
                     && let Err(error) =
@@ -8818,6 +8893,7 @@ impl State {
                             "kind": request["method"],
                         }))),
                     "queue_position": task.and_then(|task| self.task_queue_position(task)),
+                    "admission": task.map(|task| self.admission_value_for_task(task)).unwrap_or(Value::Null),
                     "selection": selection_value(thread),
                     "placement": task.and_then(|task|task.remote.as_ref()).and_then(|remote|remote.placement.clone())
                         .or_else(|| thread.placement.as_ref().map(placement::ThreadPlacement::value)),
@@ -13120,6 +13196,12 @@ impl State {
             self.current_mut().error = Some(error);
             return false;
         }
+        if self.remote_task(self.current().id).is_some() {
+            self.current_mut().submission_error = Some(
+                "This is a remote task result. Open its thread on the target machine, or send a follow-up from its parent.".into(),
+            );
+            return false;
+        }
         // KSG's useComposerSend refuses while readPendingEnvironmentChange is
         // set: the draft is still being addressed to its new machine.
         if self.machines.draft_retarget.is_some() {
@@ -13539,8 +13621,18 @@ impl State {
         {
             self.current_mut().request = None;
         }
+        if self.thread_admission_managed(self.active)
+            && let Err(error) = self.check_thread_admission(self.active)
+        {
+            self.current_mut().submission_error = Some(error);
+            return false;
+        }
         self.release_task_results(self.current().id);
         if let Some(sent) = self.try_worktree_bootstrap_send(fresh_context, fresh_arm) {
+            if sent && self.thread_admission_managed(self.active) {
+                let peer_worker = self.current().peer_origin.is_some();
+                self.ensure_thread_admission(self.active, peer_worker, false);
+            }
             return sent;
         }
         if compact_before_send && !self.current().status.busy() {
@@ -13599,6 +13691,10 @@ impl State {
                 return false;
             }
             self.current_mut().submission_error = None;
+            if self.thread_admission_managed(self.active) {
+                let peer_worker = self.current().peer_origin.is_some();
+                self.ensure_thread_admission(self.active, peer_worker, false);
+            }
             let thread = self.current_mut();
             thread.prompt_history.reset();
             thread.typing_guard.on_blur_or_send();
@@ -13625,6 +13721,10 @@ impl State {
             return true;
         }
         if self.current().status.busy() {
+            if self.thread_admission_managed(self.active) {
+                let peer_worker = self.current().peer_origin.is_some();
+                self.ensure_thread_admission(self.active, peer_worker, false);
+            }
             if !self.headless {
                 if let Ok(prompt) = crate::composer_tokens::prompt_for_target_with_reply(
                     &self.current().draft,
@@ -13704,6 +13804,13 @@ impl State {
             .iter()
             .map(|p| (p.server_id.clone(), p.label.clone()))
             .collect();
+        let managed = self.thread_admission_managed(self.active);
+        if managed {
+            // Reserve while the provider is still idle. begin_prompt drives
+            // an existing connection and marks Running before it returns.
+            let peer_worker = self.current().peer_origin.is_some();
+            self.ensure_thread_admission(self.active, peer_worker, false);
+        }
         self.current_mut().send_with_fresh(
             Some(&local_server_id),
             &peers,
@@ -13721,6 +13828,9 @@ impl State {
             fresh_context,
         );
         if self.current().has_draft_content() || self.current().status != Status::Running {
+            if managed {
+                self.admission_pump();
+            }
             return false;
         }
         let id = self.current().id;
@@ -13732,6 +13842,9 @@ impl State {
         }
         if let Some(arm) = fresh_arm {
             self.disarm_fresh_session(id, Some(arm));
+        }
+        if managed {
+            self.admission_pump();
         }
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
@@ -14550,6 +14663,42 @@ impl State {
                         .transpose()
                         .ok()?;
                     thread.stop_serial = record["stopSerial"].as_u64().unwrap_or(0);
+                    thread.admission = record["admission"].as_str().map(str::to_owned);
+                    thread.admission_run = record["admissionRun"].as_u64().unwrap_or(0);
+                    if let Some(saved) = record
+                        .get("admissionPrompt")
+                        .filter(|value| !value.is_null())
+                    {
+                        // A malformed queued prompt must not invalidate the
+                        // thread record; the reservation it covers simply
+                        // releases at reconcile instead.
+                        let images: Vec<_> = saved["images"]
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Attachment::from_value)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let context = saved
+                            .get("context")
+                            .filter(|v| !v.is_null())
+                            .map(crate::composer_context::decode_message_context)
+                            .transpose()
+                            .ok()
+                            .flatten();
+                        if let Some(text) = saved["text"].as_str()
+                            && let Ok(prompt) = crate::composer_tokens::received_prompt_with_context(
+                                text.into(),
+                                images,
+                                saved.get("draft").cloned(),
+                                context,
+                            )
+                        {
+                            thread.queued_prompt = Some((prompt, thread.messages.len()));
+                        }
+                    }
                     thread.parent = if record["parent"].is_null() {
                         None
                     } else {
@@ -14732,6 +14881,12 @@ impl State {
             self.capture_opened_draft();
         }
         self.restore_tasks(index, &project_remap)?;
+        if let Some(saved) = index.get("scheduler") {
+            self.scheduler = serde_json::from_value(saved.clone())
+                .map_err(|error| format!("Invalid saved scheduler: {error}."))?;
+            self.scheduler.validate()?;
+        }
+        self.requeue_undelivered_managed_inputs();
         self.validate_captain_archives()?;
         self.sync_memory_links();
         self.refresh_captain_contexts();
@@ -14739,6 +14894,43 @@ impl State {
             self.restore_persisted_history(&index["threadViews"])?;
         }
         Ok(())
+    }
+    /// Accepted managed input that never reached a provider survives shutdown
+    /// as a recovered draft. A still-queued reservation proves the provider
+    /// never received it, so the prompt requeues under the same admission
+    /// instead of blocking on manual review while the line it owns releases.
+    fn requeue_undelivered_managed_inputs(&mut self) {
+        let ids: Vec<usize> = self.recovered_inputs.keys().copied().collect();
+        for id in ids {
+            let Some(position) = self.threads.iter().position(|thread| thread.id == id) else {
+                continue;
+            };
+            let covered = self
+                .reservation_covering_thread(id)
+                .is_some_and(|reservation| {
+                    reservation.state == admission::ReservationState::Queued
+                });
+            if !covered {
+                continue;
+            }
+            let value = self.recovered_inputs[&id].clone();
+            let Some(text) = value["text"].as_str() else {
+                continue;
+            };
+            let images: Vec<Attachment> =
+                serde_json::from_value(value["attachments"].clone()).unwrap_or_default();
+            let Ok(prompt) = crate::composer_tokens::received_prompt_with_context(
+                text.into(),
+                images,
+                value.get("draft").cloned(),
+                None,
+            ) else {
+                continue;
+            };
+            self.recovered_inputs.remove(&id);
+            let at = self.threads[position].messages.len();
+            self.threads[position].queued_prompt = Some((prompt, at));
+        }
     }
     pub fn keybindings_path(&self) -> PathBuf {
         self.data_dir.join("keybindings.json")
@@ -15133,6 +15325,17 @@ impl State {
         self.flush_stores()
     }
 
+    /// The commit an admission grant performs before its provider effect.
+    /// Separate from `checkpoint_and_flush` so a test can fault exactly
+    /// this boundary without breaking unrelated commits in the process.
+    pub(super) fn admission_commit(&mut self) -> Result<(), String> {
+        #[cfg(debug_assertions)]
+        if crate::outbox::commit_fault(&self.data_dir) {
+            return Err("Injected commit failure for integration testing.".into());
+        }
+        self.checkpoint_and_flush()
+    }
+
     #[cfg(test)]
     pub fn take_restart_request(&mut self) -> bool {
         std::mem::take(&mut self.restart_approved)
@@ -15333,6 +15536,7 @@ impl State {
                 self.headless || self.persist_transcripts || !thread.blank_draft() || thread.crew_captain.is_some() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(Thread::stored_metadata).collect::<Vec<_>>()
         });
+        index["scheduler"] = json!(self.scheduler);
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
         // Bounded projection only. The durable table keeps every operation;
@@ -15585,6 +15789,16 @@ impl Thread {
         });
         record.as_object_mut().unwrap().extend(json!({
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
+            "admission":self.admission,"admissionRun":self.admission_run,
+            // A managed thread's accepted-but-unsent prompt is the durable
+            // payload of its admission reservation; without it a queued
+            // crew root would survive restart with nothing left to run.
+            "admissionPrompt":(self.crew_captain.is_some() || self.peer_origin.is_some())
+                .then(|| self.queued_prompt.as_ref().map(|(prompt, _)| json!({
+                    "text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+                    "context":prompt.context,"draft":prompt.draft
+                })))
+                .flatten(),
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
             "options":self.model_options,
@@ -18818,7 +19032,14 @@ mod tests {
         assert_eq!(primary["captain"], 0);
         assert_eq!(primary["access"], "read-only");
         assert_eq!(primary["may_delegate"], true);
-        assert_eq!(primary["may_control_crew"], true);
+        let primary_record = state
+            .mcp_call(home, "orchestrator_capabilities", &json!({}))
+            .unwrap();
+        assert_eq!(
+            primary_record["caller"]["may_control_crew"],
+            primary_record["effective"]["coordination"]["crew"]["create"]["available"],
+            "legacy crew control must match the effective crew.create gate"
+        );
         assert_eq!(primary["may_write_captain_documents"], true);
         let earlier = caller(&mut state, earlier);
         assert_eq!(earlier["role"], "earlier_home");

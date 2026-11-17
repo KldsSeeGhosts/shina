@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 47;
+pub const MINOR: u32 = 48;
 /// The logical repository catalog and executor checkout provisioning are
-/// additive at tentative protocol 1.47. The parent serializes final numbers
-/// before publication; the feature marker is authoritative, not the minor.
-pub const LOGICAL_REPOSITORIES_MINOR: u32 = 47;
+/// additive at protocol 1.48, after execution leases at 1.47.
+/// The feature marker is authoritative, not the minor.
+pub const LOGICAL_REPOSITORIES_MINOR: u32 = 48;
 pub const LOGICAL_REPOSITORIES: &str = "logical-repositories-v1";
 /// Stable workspace/owner/controller identities are additive at protocol 1.42.
 /// Scheduler and effective-capability minors remain independently owned.
@@ -217,6 +217,15 @@ pub const PEER_TASK_EVIDENCE: &str = "peer-task-evidence-v1";
 /// statuses and thread records.
 pub const PLACEMENT_MINOR: u32 = 38;
 pub const PLACEMENT: &str = "placement-v1";
+/// The durable admission scheduler: scheduling.status/configure RPCs and
+/// admission fields on task, crew and peer-worker status replies. Older
+/// peers simply omit the fields; the server still enforces its own limits.
+/// Tentative minor for the unpublished scheduler feature; serialized at
+/// publication time by the integrator.
+pub const SCHEDULING_MINOR: u32 = 46;
+pub const SCHEDULING: &str = "admission-scheduler-v1";
+pub const SCHEDULING_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to read or change scheduler limits.";
 pub const REMOTE_PROJECT_SCOPE: &str = "remote-project-scope-v1";
 /// The answering server can open its scratch project (`project.ensureScratch`),
 /// which a manual draft retarget uses when no logical project matches there.
@@ -290,7 +299,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.crew.list"
         | "captain.reports.list"
         | "captain.promote.preview"
-        | "captain.lifecycle.preview" => "read",
+        | "captain.lifecycle.preview"
+        | "scheduling.status" => "read",
         "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
         "server.updateStatus"
         | "server.requestUpdate"
@@ -390,7 +400,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.unarchive"
         | "captain.promote"
         | "captain.demote"
-        | "captain.delete" => "operate",
+        | "captain.delete"
+        | "scheduling.configure" => "operate",
         _ => return None,
     })
 }
@@ -794,7 +805,8 @@ mod tests {
                 | "captain.reports.list"
                 | "captain.promote.preview"
                 | "captain.lifecycle.preview"
-                | "repository.list" => "read",
+                | "repository.list"
+                | "scheduling.status" => "read",
                 "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus"
                 | "server.requestUpdate"

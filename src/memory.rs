@@ -814,6 +814,15 @@ impl Thread {
         &self,
         data: &mut Value,
     ) -> Option<BTreeMap<String, String>> {
+        if self.instruction_context_pending {
+            let role = self.instruction_role.unwrap_or("thread");
+            data["message"] = format!(
+                "<shina_capability_update>\nYour Shina role is now {role}. These restrictions are current and replace earlier Shina role text.\n{}\n</shina_capability_update>\n\n{}",
+                self.shina,
+                data["message"].as_str().unwrap_or("")
+            )
+            .into();
+        }
         let link = self.memory.as_ref()?;
         let context = link
             .book

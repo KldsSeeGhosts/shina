@@ -2301,7 +2301,7 @@ pub(crate) fn auth_guidance(message: &str) -> String {
 pub(crate) fn developer_instructions(start: &Start) -> String {
     format!(
         "{}\n\n{}",
-        crate::mcp::INSTRUCTIONS,
+        start.shina,
         start.instructions.as_deref().unwrap_or("")
     )
 }
