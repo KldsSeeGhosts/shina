@@ -878,9 +878,7 @@ impl State {
         })
     }
 
-    /// Live capacity for this coordinator plus the admission seam the scheduler
-    /// will fill (#23): static per-coordinator limits today, truthful about the
-    /// queue, no invented scheduler capacity.
+    /// Effective capacity from the same durable scheduler that grants work.
     pub(crate) fn capacity(&self, index: usize) -> Value {
         let home = self.effective_home(self.threads[index].id);
         let unfinished = self
@@ -888,29 +886,19 @@ impl State {
             .iter()
             .filter(|task| self.task_home(task) == Some(home) && !task.state.finished())
             .count();
-        let running = self
-            .tasks
-            .iter()
-            .filter(|task| self.task_home(task) == Some(home) && self.task_occupies_slot(task))
-            .count();
-        let queued = self
-            .tasks
-            .iter()
-            .filter(|task| {
-                self.task_home(task) == Some(home) && task.state == crate::model::TaskState::Queued
-            })
-            .count();
+        let scheduling = self.scheduling_scoped_value(Some(home));
         json!({
-            "running_children_per_coordinator": tasks::RUNNING_LIMIT,
-            "unfinished_tasks_per_coordinator": tasks::UNFINISHED_LIMIT,
-            "running": running,
+            "running_children_per_coordinator": self.scheduler.limits.coordinator_running,
+            "unfinished_tasks_per_coordinator": self.scheduler.limits.coordinator_unfinished,
+            "running": scheduling["coordinator"]["running"],
             "unfinished": unfinished,
-            "queued": queued,
-            "admission": "Static per-coordinator limits. Extra children queue until a running slot frees.",
+            "queued": scheduling["queue"].as_array().map_or(0, Vec::len),
+            "admission": "Accepted work reserves through the shared durable admission scheduler.",
             "scheduler": {
-                "implemented": false,
-                "reason": "Admission is per-coordinator only. Scheduler capacity and cross-coordinator ordering are not implemented."
-            }
+                "implemented": true,
+                "contract": crate::protocol::SCHEDULING,
+                "status": scheduling
+            },
         })
     }
 
@@ -1688,10 +1676,10 @@ mod tests {
             "a peer without placement-v1 cannot host placed workers"
         );
         let capacity = state.capacity(i);
-        assert_eq!(capacity["scheduler"]["implemented"], false);
+        assert_eq!(capacity["scheduler"]["implemented"], true);
         assert_eq!(
             capacity["running_children_per_coordinator"],
-            tasks::RUNNING_LIMIT
+            json!(state.scheduler.limits.coordinator_running)
         );
         let coordination = state.coordination(i);
         assert_eq!(coordination["delegate_local"]["available"], true);

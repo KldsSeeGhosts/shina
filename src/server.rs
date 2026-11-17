@@ -801,6 +801,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut captain_crew_control = false;
     let mut captain_events = false;
     let mut provider_updates = false;
+    let mut scheduling = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -965,6 +966,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= u64::from(protocol::IDENTITY_MINOR) {
                             capabilities.push(protocol::IDENTITY);
                         }
+                        scheduling = minor >= u64::from(protocol::SCHEDULING_MINOR);
+                        if scheduling { capabilities.push(protocol::SCHEDULING); }
                         match identity_for_read(&shared) {
                             Err(error) => Err(error),
                             Ok(identity) => {
@@ -1012,6 +1015,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err(protocol::CAPTAIN_DELETE_UPDATE_REQUIRED.into())
                 } else if matches!(method, "captain.crew.create" | "captain.crew.send" | "captain.crew.stop") && !captain_crew_control {
                     Err(protocol::CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED.into())
+                } else if matches!(method, "scheduling.status" | "scheduling.configure") && !scheduling {
+                    Err(protocol::SCHEDULING_UPDATE_REQUIRED.into())
                 } else if matches!(method, "notifications.get" | "notifications.push.status") {
                     if !mobile_push {
                         Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())

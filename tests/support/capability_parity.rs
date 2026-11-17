@@ -281,8 +281,8 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
         "independent crew roots on a linked machine are not implemented: {record}"
     );
     assert_eq!(
-        record["effective"]["capacity"]["scheduler"]["implemented"], false,
-        "scheduler work stays in its own issue: {record}"
+        record["effective"]["capacity"]["scheduler"]["implemented"], true,
+        "capabilities report the integrated durable scheduler: {record}"
     );
     // A shared context document at a realistic size reaches workers verbatim.
     let large = format!("{}SHARED-CONTEXT-TAIL", "large note body; ".repeat(2_000));

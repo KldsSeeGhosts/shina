@@ -38,12 +38,24 @@ dependencies were installed without changing the lockfile. The complete
 verification command exited successfully on the merge's source tree; subsequent
 changes only record this evidence.
 
-The current base still uses protocol minor 45 and static per-coordinator
-admission. `capacity.scheduler.implemented` therefore remains false. If the
-separate scheduler PR lands first, this branch must integrate its actual
-capacity and admission contract before publication. No protocol number or
-migration was changed.
+The original base used protocol minor 45 and static per-coordinator admission.
+The scheduler composition below replaces that old capacity description.
 
 Exact-head CI, combined-main review, serialized merge and downloaded release
 verification remain required. Issue #32 stays open. Issue #22's unsupported
 automatic recovery case is not resolved by this capability contract.
+
+## Scheduler composition
+
+This candidate now integrates PR59 head `a8fd656`, which includes PR60's merged
+source `970dc0c`. The one source conflict kept the durable scheduler instead of
+the obsolete static task-start loop.
+
+Capability capacity now reads the scheduler's actual limits, held occupancy,
+caller queue and status. It advertises `admission-scheduler-v1` as implemented,
+not the original static-capacity placeholder. The existing capability unit and
+live assertions use that composed contract. Protocol minor 46 comes from PR59;
+this integration reserves no additional number and changes no migration.
+
+No new tests, provider configuration or feature scope was added. PR59 must
+finish its own CI and publication before this candidate can merge into main.

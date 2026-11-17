@@ -466,6 +466,10 @@ impl State {
             "question":thread.request.as_ref().map(|r| r["method"].clone()).unwrap_or(Value::Null),
             "taskId":task.map(|task| task.id.clone()),
             "taskState":task.map(|task| task.state.id()),
+            "admission":task
+                .map(|task| self.admission_value_for_task(task))
+                .filter(|value| !value.is_null())
+                .unwrap_or_else(|| self.admission_value_for(thread.id)),
         })
     }
 
