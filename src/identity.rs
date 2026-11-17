@@ -2348,6 +2348,10 @@ mod tests {
             .execute_batch(
                 "DROP TABLE task_input_intents;
                  DROP TABLE task_operations;
+                 DROP TABLE catalog_captain_scopes;
+                 DROP TABLE catalog_checkouts;
+                 DROP TABLE catalog_repository_remotes;
+                 DROP TABLE catalog_repositories;
                  PRAGMA user_version=8;",
             )
             .unwrap();
@@ -2360,7 +2364,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         for table in ["task_operations", "task_input_intents"] {
             let exists: bool = connection
                 .query_row(
@@ -2370,6 +2374,71 @@ mod tests {
                 )
                 .unwrap();
             assert!(exists, "schema 8 -> 9 did not create {table}");
+        }
+    }
+
+    #[test]
+    fn schema_nine_catalog_upgrade_preserves_identity_and_task_evidence() {
+        let directory =
+            schema_seven_profile("identity-schema-nine-catalog", &fixture(), &routines());
+        let database = Database::open(&directory).unwrap();
+        let identity = database.identity().unwrap();
+        drop(database);
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO task_operations
+                (scope,request_key,command_id,task_id,target_thread_id,updated_at,payload)
+                VALUES('fixture','key','command','task',1,1,'{\"saved\":true}');
+             INSERT INTO task_input_intents
+                (thread_id,command_id,kind,attempt_id,updated_at,payload)
+                VALUES(1,'command','input','attempt',1,'{\"provider_state\":\"unknown\"}');
+             DROP TABLE catalog_captain_scopes;
+             DROP TABLE catalog_checkouts;
+             DROP TABLE catalog_repository_remotes;
+             DROP TABLE catalog_repositories;
+             PRAGMA user_version=9;",
+            )
+            .unwrap();
+        drop(connection);
+        let upgraded = Database::open(&directory).unwrap();
+        assert_eq!(upgraded.identity().unwrap(), identity);
+        drop(upgraded);
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        let operation: String = connection
+            .query_row(
+                "SELECT payload FROM task_operations WHERE scope='fixture' AND request_key='key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let input: String = connection
+            .query_row(
+                "SELECT payload FROM task_input_intents WHERE thread_id=1 AND command_id='command'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation, "{\"saved\":true}");
+        assert_eq!(input, "{\"provider_state\":\"unknown\"}");
+        for table in [
+            "catalog_repositories",
+            "catalog_repository_remotes",
+            "catalog_checkouts",
+            "catalog_captain_scopes",
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "schema 9 -> 10 did not create {table}");
         }
     }
 

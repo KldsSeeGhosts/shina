@@ -5634,16 +5634,21 @@ impl State {
             let git_ctx = self.test_git_context.clone().unwrap_or_default();
             #[cfg(not(test))]
             let git_ctx = crate::vcs::GitContext::default();
-            let spec = placement::spec_from_args(args)?;
-            if project.is_none() {
+            let spec = repositories::default_placement(
+                placement::spec_from_args(args)?,
+                launch_repository.as_ref(),
+            );
+            let resolved = if project.is_none() {
                 // No executor-local checkout binds this repository yet. Record
                 // the deterministic target now; poll_checkout_provisioning
                 // clones or adopts it, then runs the deferred plan.
-                let repository = launch_repository.expect("repository checked above");
+                let repository = launch_repository
+                    .as_ref()
+                    .expect("repository checked above");
                 let target =
                     repositories::checkout_target(&self.data_dir, &repository.id, &repository.name);
                 let checkout = target.to_string_lossy().into_owned();
-                let local = self.learn_repository(&repository);
+                let local = self.learn_repository(repository)?;
                 self.record_binding(
                     &local,
                     "local",
@@ -5657,7 +5662,7 @@ impl State {
                     .map(placement::validate_spec)
                     .transpose()?
                     .flatten();
-                let record = placement::ThreadPlacement {
+                placement::ThreadPlacement {
                     requested: placement::PlacementRequest::from_mode(mode),
                     mode: mode.unwrap_or(placement::PlacementMode::Isolated),
                     phase: placement::PlacementPhase::Pending,
@@ -5678,62 +5683,55 @@ impl State {
                     error: None,
                     binding: Some(placement::PlacementBinding {
                         repository: local,
-                        remotes: repository.remotes,
-                        clone_url: repository.clone_url,
+                        remotes: repository.remotes.clone(),
+                        clone_url: repository.clone_url.clone(),
                         checkout,
                         state: placement::BindingPhase::Pending,
                         spec: spec.clone(),
                         error: None,
                     }),
-                };
-                if record.read_only() {
-                    thread.native.access = AccessMode::ReadOnly;
                 }
-                thread.placement = Some(record.clone());
-                let id = thread.id;
-                self.next_id += 1;
-                self.threads.push(thread);
-                return Ok(json!({"threadId":id,"placement":record.value()}));
-            }
-            let resolved = self.plan_thread_placement(
-                &thread,
-                spec.as_ref(),
-                &placement_seed,
-                &executor,
-                &git_ctx,
-            )?;
-            let resolved = if let Some(repository) = &launch_repository {
-                let local = self.learn_repository(repository);
-                let project_id = project.expect("checked above");
-                let path = self
-                    .projects
-                    .entries
-                    .iter()
-                    .find(|p| p.id == project_id)
-                    .map(|p| p.path.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.record_binding(
-                    &local,
-                    "local",
-                    Some(project_id as u64),
-                    &path,
-                    repositories::BindingState::Bound,
-                    None,
-                );
-                let mut resolved = resolved;
-                resolved.binding = Some(placement::PlacementBinding {
-                    repository: local,
-                    remotes: repository.remotes.clone(),
-                    clone_url: String::new(),
-                    checkout: path,
-                    state: placement::BindingPhase::Ready,
-                    spec: None,
-                    error: None,
-                });
-                resolved
             } else {
-                resolved
+                self.plan_thread_placement(
+                    &thread,
+                    spec.as_ref(),
+                    &placement_seed,
+                    &executor,
+                    &git_ctx,
+                )?
             };
+            let resolved =
+                if let (Some(repository), Some(project_id)) = (&launch_repository, project) {
+                    let local = self.learn_repository(repository)?;
+                    let path = self
+                        .projects
+                        .entries
+                        .iter()
+                        .find(|p| p.id == project_id)
+                        .map(|p| p.path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.record_binding(
+                        &local,
+                        "local",
+                        Some(project_id as u64),
+                        &path,
+                        repositories::BindingState::Bound,
+                        None,
+                    );
+                    let mut resolved = resolved;
+                    resolved.binding = Some(placement::PlacementBinding {
+                        repository: local,
+                        remotes: repository.remotes.clone(),
+                        clone_url: String::new(),
+                        checkout: path,
+                        state: placement::BindingPhase::Ready,
+                        spec: None,
+                        error: None,
+                    });
+                    resolved
+                } else {
+                    resolved
+                };
             if resolved.read_only() {
                 // A shared placement views the project checkout without write
                 // access, whatever access the launch requested.

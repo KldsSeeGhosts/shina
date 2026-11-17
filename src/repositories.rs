@@ -86,6 +86,25 @@ pub struct LaunchRepository {
     pub base_branch: Option<String>,
 }
 
+pub(super) fn default_placement(
+    spec: Option<placement::PlacementSpec>,
+    repository: Option<&LaunchRepository>,
+) -> Option<placement::PlacementSpec> {
+    let Some(base) = repository.and_then(|repository| repository.base_branch.as_ref()) else {
+        return spec;
+    };
+    let mut spec = spec.unwrap_or_default();
+    let mode = placement::requested_mode(&spec);
+    if mode.is_none_or(|mode| mode == placement::PlacementMode::Isolated)
+        && spec.base_branch.is_none()
+        && spec.base_commit.is_none()
+        && spec.upstream_thread_id.is_none()
+    {
+        spec.base_branch = Some(base.clone());
+    }
+    Some(spec)
+}
+
 /// One checkout materialization attempt. The target is deterministic per
 /// repository, so retries adopt a completed clone and remove only this
 /// job's own staging directory.
@@ -149,6 +168,26 @@ fn canonical_of_input(input: &str) -> Option<String> {
     })
 }
 
+/// Shared clone metadata may name a transport user such as SSH's `git`, but
+/// never a password or HTTP userinfo token. Executors use their own helpers.
+fn clone_source(input: &str) -> Result<crate::projects::Source, String> {
+    let source = crate::projects::parse_source(input)?;
+    if let crate::projects::Source::Url(raw) = &source
+        && raw.contains("://")
+    {
+        let url = url::Url::parse(raw).map_err(|_| "Invalid repository clone URL.")?;
+        if url.password().is_some()
+            || (!matches!(url.scheme(), "ssh" | "git+ssh") && !url.username().is_empty())
+        {
+            return Err(
+                "Repository clone URLs cannot contain credentials. Configure credentials on the executor."
+                    .into(),
+            );
+        }
+    }
+    Ok(source)
+}
+
 /// Whether a stored remote is already in canonical `host/path` form. The
 /// canonicalizer needs a transport to parse, so the check wraps the value in
 /// an HTTPS URL: a default port can never appear in canonical form, while
@@ -181,6 +220,9 @@ impl LogicalRepository {
                 == self.remotes.len()
             && self.clone_url.len() <= MAX_URL
             && !self.clone_url.chars().any(char::is_control)
+            && clone_source(&self.clone_url)
+                .and_then(|source| canonical_of_source(&source))
+                .is_ok_and(|remote| self.remotes.contains(&remote))
             && self.base_branch.as_deref().is_none_or(|b| valid_branch(b))
             && self
                 .setup
@@ -259,8 +301,7 @@ pub(crate) fn parse_launch_repository(value: &Value) -> Result<LaunchRepository,
         MAX_URL,
         "repository.cloneUrl",
     )?;
-    let source = crate::projects::parse_source(&clone_url)
-        .map_err(|_| "repository.cloneUrl is not a source Shina can clone.".to_string())?;
+    let source = clone_source(&clone_url)?;
     let canonical = canonical_of_source(&source)
         .map_err(|_| "repository.cloneUrl does not map to a canonical remote.".to_string())?;
     if !remotes.contains(&canonical) {
@@ -305,34 +346,17 @@ fn default_name(remote: &str) -> String {
 /// The deterministic checkout target for one repository on this executor.
 /// Retries, restarts and reprovisioning all resolve to this same directory,
 /// which keeps provisioning idempotent.
-pub(crate) fn checkout_target(data_dir: &Path, id: &str, name: &str) -> PathBuf {
-    let slug: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches(['-', '.'])
-        .chars()
-        .take(48)
-        .collect();
-    let slug = if slug.is_empty() { "repository" } else { &slug };
-    let suffix: String = id
-        .strip_prefix("repo-")
-        .unwrap_or(id)
-        .chars()
-        .take(8)
-        .collect();
+pub(crate) fn checkout_target(data_dir: &Path, id: &str, _name: &str) -> PathBuf {
+    // Mutable display names and truncated caller ids cannot identify a
+    // checkout. Hash the full logical id into a fixed, path-safe component.
+    use sha2::Digest;
+    let key = format!("repo-{:x}", sha2::Sha256::digest(id.as_bytes()));
     // The canonical base keeps the recorded checkout identical to the path a
     // provisioned clone is later registered under.
     let base = data_dir
         .canonicalize()
         .unwrap_or_else(|_| data_dir.to_path_buf());
-    base.join("checkouts").join(format!("{slug}-{suffix}"))
+    base.join("checkouts").join(key)
 }
 
 fn remote_at(path: &Path) -> Option<String> {
@@ -358,6 +382,11 @@ fn remote_at(path: &Path) -> Option<String> {
 /// executor's existing Git credentials are used; prompting stays disabled,
 /// so unavailable credentials surface as a distinct failure reason.
 pub(crate) fn provision_checkout(job: &CheckoutJob) -> Result<PathBuf, String> {
+    let source = clone_source(&job.clone_url)?;
+    let canonical = canonical_of_source(&source)?;
+    if !job.remotes.contains(&canonical) {
+        return Err("The clone URL does not belong to this repository.".into());
+    }
     let target = &job.target;
     if target.exists() {
         match remote_at(target) {
@@ -395,26 +424,28 @@ pub(crate) fn provision_checkout(job: &CheckoutJob) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("checkout");
-    let staging = parent.join(format!("{name}.clone-tmp"));
-    if staging.exists() {
-        // A leftover staging directory belongs to an interrupted attempt.
-        std::fs::remove_dir_all(&staging).map_err(|e| {
-            format!(
-                "Could not clear the staged clone {}: {e}",
-                staging.display()
-            )
-        })?;
-    }
-    let source = crate::projects::parse_source(&job.clone_url)
-        .map_err(|_| "The repository's clone URL is not a source Shina can clone.".to_string())?;
-    let mut command = crate::projects::clone_command(&source, &staging);
-    let output = crate::process::output(&mut command, CLONE_TIMEOUT, 64 * 1024).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::TimedOut {
-            "Clone timed out.".to_string()
-        } else {
-            format!("Clone could not start: {e}")
+    // Never infer ownership from a deterministic name. A crash can leave a
+    // staging folder for manual recovery; later attempts do not remove it.
+    let staging = loop {
+        let candidate = parent.join(format!("{name}.clone-tmp-{}", uuid::Uuid::new_v4()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not reserve a clone staging folder: {error}")),
         }
-    })?;
+    };
+    let mut command = crate::projects::clone_command(&source, &staging);
+    let output = match crate::process::output(&mut command, CLONE_TIMEOUT, 64 * 1024) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(if error.kind() == std::io::ErrorKind::TimedOut {
+                "Clone timed out.".to_string()
+            } else {
+                format!("Clone could not start: {error}")
+            });
+        }
+    };
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&staging);
         let stderr = crate::projects::redact(&String::from_utf8_lossy(&output.stderr));
@@ -620,7 +651,7 @@ impl State {
         self.repositories
             .iter()
             .position(|r| r.remotes.contains(&canonical))
-            .ok_or_else(|| format!("No catalog repository matches {selector}."))
+            .ok_or_else(|| "No catalog repository matches that selector.".into())
     }
 
     /// Register or update a repository, and optionally assign it to a
@@ -636,7 +667,7 @@ impl State {
             MAX_URL,
             "repository.url",
         )?;
-        let source = crate::projects::parse_source(&url)?;
+        let source = clone_source(&url)?;
         let primary = canonical_of_source(&source)?;
         let mut remotes = vec![primary.clone()];
         if let Some(extras) = args.get("remotes") {
@@ -711,6 +742,15 @@ impl State {
         let index = match claimers.first() {
             Some(&index) => {
                 let repository = &mut self.repositories[index];
+                if repository.remotes.len()
+                    + remotes
+                        .iter()
+                        .filter(|remote| !repository.remotes.contains(remote))
+                        .count()
+                    > MAX_REMOTES
+                {
+                    return Err("The merged repository would have too many remote aliases.".into());
+                }
                 for remote in remotes {
                     if !repository.remotes.contains(&remote) {
                         repository.remotes.push(remote);
@@ -965,23 +1005,53 @@ impl State {
     /// Executor side: keep a local catalog row for the repository a peer
     /// launch named, preferring an existing local record for its remotes.
     /// Returns the local repository id used for binding bookkeeping.
-    pub(super) fn learn_repository(&mut self, launch: &LaunchRepository) -> String {
+    pub(super) fn learn_repository(&mut self, launch: &LaunchRepository) -> Result<String, String> {
+        // A peer may not reuse a known id for a different repository or merge
+        // two independent local catalog records by asserting their remotes.
+        let claimers: Vec<usize> = self
+            .repositories
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record
+                    .remotes
+                    .iter()
+                    .any(|remote| launch.remotes.contains(remote))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if claimers.len() > 1 {
+            return Err("Peer repository remotes name several existing catalog records.".into());
+        }
         if let Some(index) = self.repositories.iter().position(|r| r.id == launch.id) {
+            if claimers.as_slice() != [index] {
+                return Err("Peer repository identity conflicts with the existing catalog.".into());
+            }
             let repository = &mut self.repositories[index];
+            if repository.remotes.len()
+                + launch
+                    .remotes
+                    .iter()
+                    .filter(|remote| !repository.remotes.contains(remote))
+                    .count()
+                > MAX_REMOTES
+            {
+                return Err("Peer repository has too many remote aliases.".into());
+            }
             for remote in &launch.remotes {
                 if !repository.remotes.contains(remote) {
                     repository.remotes.push(remote.clone());
                 }
             }
             repository.updated_at = lifecycle::now();
-            return repository.id.clone();
+            return Ok(repository.id.clone());
         }
         if let Some(index) = self.repositories.iter().position(|r| {
             r.remotes
                 .iter()
                 .any(|remote| launch.remotes.contains(remote))
         }) {
-            return self.repositories[index].id.clone();
+            return Ok(self.repositories[index].id.clone());
         }
         let now = lifecycle::now();
         self.repositories.push(LogicalRepository {
@@ -994,7 +1064,7 @@ impl State {
             created_at: now,
             updated_at: now,
         });
-        launch.id.clone()
+        Ok(launch.id.clone())
     }
 
     /// Register the executor-local project wrapping a provisioned checkout
@@ -1131,9 +1201,7 @@ impl State {
                 let project_path = crate::projects::clean_path(
                     &path.canonicalize().unwrap_or_else(|_| path.clone()),
                 );
-                let project = self.register_checkout_project(&project_path);
-                self.threads[index].project = Some(project);
-                let local = self.learn_repository(&LaunchRepository {
+                let local = match self.learn_repository(&LaunchRepository {
                     id: binding.repository.clone(),
                     name: binding
                         .remotes
@@ -1143,7 +1211,15 @@ impl State {
                     remotes: binding.remotes.clone(),
                     clone_url: binding.clone_url.clone(),
                     base_branch: None,
-                });
+                }) {
+                    Ok(local) => local,
+                    Err(error) => {
+                        self.fail_checkout_binding(index, error);
+                        return;
+                    }
+                };
+                let project = self.register_checkout_project(&project_path);
+                self.threads[index].project = Some(project);
                 self.record_binding(
                     &local,
                     "local",
@@ -1308,6 +1384,186 @@ mod tests {
                 "machine":"Target","repository":repository,"model":"fixture",
                 "options":{"reasoning":"off"}}}),
         )
+    }
+
+    #[test]
+    fn catalog_never_persists_or_forwards_embedded_clone_credentials() {
+        let mut state = state();
+        for url in [
+            "https://synthetic-token@example.com/team/repo.git",
+            "https://user:synthetic-password@example.com/team/repo.git",
+            "ssh://git:synthetic-password@example.com/team/repo.git",
+            "git+ssh://git:synthetic-password@example.com/team/repo.git",
+        ] {
+            let error = state.put_repository(&json!({"url":url})).unwrap_err();
+            assert!(error.contains("credentials"), "{error}");
+            assert!(
+                !error.contains("synthetic-"),
+                "errors must not echo credentials"
+            );
+            assert!(state.repositories.is_empty());
+            let launch = json!({"id":"repo-credential-test","name":"repo",
+                "remotes":["example.com/team/repo"],"cloneUrl":url});
+            assert!(parse_launch_repository(&launch).is_err());
+            let record = json!({"id":"repo-credential-test","name":"repo",
+                "remotes":["example.com/team/repo"],"cloneUrl":url,
+                "createdAt":1,"updatedAt":1});
+            assert!(catalog_from_index(&json!({"repositories":[record]})).is_err());
+        }
+        for url in [
+            "https://example.com/team/repo.git",
+            "ssh://git@example.com/team/repo.git",
+            "git@example.com:team/repo.git",
+        ] {
+            assert!(state.put_repository(&json!({"url":url})).is_ok());
+        }
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn restored_clone_sources_must_belong_to_the_saved_repository() {
+        let state = state();
+        let record = json!({"id":"repo-restore-test","name":"repo",
+            "remotes":["example.com/team/repo"],
+            "cloneUrl":"https://example.com/another/fork.git",
+            "createdAt":1,"updatedAt":1});
+        assert!(catalog_from_index(&json!({"repositories":[record]})).is_err());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn peer_learning_refuses_identity_collisions_without_catalog_mutation() {
+        let mut state = state();
+        let first = state
+            .put_repository(&json!({"url":"https://example.com/team/one"}))
+            .unwrap();
+        state
+            .put_repository(&json!({"url":"https://example.com/team/two"}))
+            .unwrap();
+        let before = state.repositories.clone();
+        let mut launch = LaunchRepository {
+            id: first["id"].as_str().unwrap().into(),
+            name: "other".into(),
+            remotes: vec!["example.com/team/two".into()],
+            clone_url: "https://example.com/team/two".into(),
+            base_branch: None,
+        };
+        assert!(state.learn_repository(&launch).is_err());
+        assert_eq!(state.repositories, before);
+        launch.id = "repo-new-peer-record".into();
+        launch.remotes.push("example.com/team/one".into());
+        assert!(state.learn_repository(&launch).is_err());
+        assert_eq!(state.repositories, before);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn repository_default_base_applies_only_to_unselected_isolated_bases() {
+        let repository = LaunchRepository {
+            id: "repo-base-test".into(),
+            name: "repo".into(),
+            remotes: vec!["example.com/team/repo".into()],
+            clone_url: "https://example.com/team/repo".into(),
+            base_branch: Some("release".into()),
+        };
+        assert_eq!(
+            default_placement(None, Some(&repository))
+                .unwrap()
+                .base_branch
+                .as_deref(),
+            Some("release")
+        );
+        for spec in [
+            placement::PlacementSpec {
+                mode: Some(placement::PlacementMode::Shared),
+                ..Default::default()
+            },
+            placement::PlacementSpec {
+                base_branch: Some("explicit".into()),
+                ..Default::default()
+            },
+            placement::PlacementSpec {
+                base_commit: Some("commit".into()),
+                ..Default::default()
+            },
+            placement::PlacementSpec {
+                upstream_thread_id: Some(2),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                default_placement(Some(spec.clone()), Some(&repository)),
+                Some(spec)
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_never_deletes_an_unowned_staging_folder() {
+        let state = state();
+        let target = state.data_dir.join("checkouts/repo");
+        let staging = state.data_dir.join("checkouts/repo.clone-tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        let keep = staging.join("user-work.txt");
+        std::fs::write(&keep, "uncommitted user work").unwrap();
+        let job = CheckoutJob {
+            clone_url: "-invalid-source".into(),
+            remotes: vec!["example.com/team/repo".into()],
+            target,
+        };
+        assert!(provision_checkout(&job).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&keep).unwrap(),
+            "uncommitted user work"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_clone_only_removes_its_own_new_staging_folder() {
+        let state = state();
+        let target = state.data_dir.join("checkouts/repo");
+        let unowned = state.data_dir.join("checkouts/repo.clone-tmp");
+        std::fs::create_dir_all(&unowned).unwrap();
+        std::fs::write(unowned.join("user-work.txt"), "keep").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let refuse = std::thread::spawn(move || {
+            let (connection, _) = listener.accept().unwrap();
+            drop(connection);
+        });
+        let job = CheckoutJob {
+            clone_url: format!("git://127.0.0.1:{port}/team/repo"),
+            remotes: vec![format!("127.0.0.1:{port}/team/repo")],
+            target,
+        };
+        assert!(
+            provision_checkout(&job)
+                .unwrap_err()
+                .contains("Clone failed")
+        );
+        refuse.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(unowned.join("user-work.txt")).unwrap(),
+            "keep"
+        );
+        let remaining = std::fs::read_dir(state.data_dir.join("checkouts"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![unowned]);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn checkout_targets_use_the_full_immutable_repository_identity() {
+        let state = state();
+        let first = checkout_target(&state.data_dir, "repo-12345678-first", "same-name");
+        let renamed = checkout_target(&state.data_dir, "repo-12345678-first", "new-name");
+        let other = checkout_target(&state.data_dir, "repo-12345678-second", "same-name");
+        assert_eq!(first, renamed);
+        assert_ne!(first, other);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]
@@ -1478,6 +1734,18 @@ mod tests {
             .unwrap();
         let placement = state.threads[index].placement.as_ref().unwrap();
         assert_eq!(placement.phase, placement::PlacementPhase::Pending);
+        assert!(state.threads[index].pending_injections.is_empty());
+        assert!(
+            state.peer_task_intents.iter().any(|intent| {
+                intent.thread_id == thread_id
+                    && intent.command_id == launch.command_id.to_string()
+                    && intent
+                        .message
+                        .as_ref()
+                        .is_some_and(|message| message.contains("A bounded task"))
+            }),
+            "a pending clone must retain the durable brief before any provider effect"
+        );
         assert_eq!(
             placement.binding.as_ref().unwrap().state,
             placement::BindingPhase::Pending
@@ -1506,6 +1774,11 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].state, BindingState::Bound);
         assert_eq!(bindings[0].path, project.path.to_string_lossy().as_ref());
+        assert_eq!(state.threads[index].pending_injections.len(), 1);
+        assert_eq!(
+            state.threads[index].pending_injections[0].peer_input,
+            Some(launch.command_id)
+        );
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 }
