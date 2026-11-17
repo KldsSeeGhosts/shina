@@ -40,6 +40,9 @@ unknown. It does not claim universal exactly-once provider delivery.
 A fresh peer prompt cannot clear a hold left by an older input whose acceptance
 is unknown. The target rejects the new prompt before staging it or changing
 the attempt. A replay of the original command still returns its saved receipt.
+The home records the new send's rejection, clears its pending command and
+refreshes target state. It does not retry a command the target already refused
+or change the older input's unknown outcome.
 
 A matching user-input marker can prove acceptance even when the rest of history
 is incomplete. The target then removes that exact restored input from its

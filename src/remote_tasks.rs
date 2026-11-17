@@ -15,6 +15,9 @@ fn peer_runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("peer runtime"))
 }
 
+const PEER_INPUT_RECOVERY_HELD: &str =
+    "An earlier input may have reached the provider. Recovery is held; no new input was queued.";
+
 /// Ported from KSG RemoteDelegation.lastReply. Read all text chunks before
 /// recording completion, then acknowledge exactly the result that was read.
 async fn peer_completion(
@@ -1385,6 +1388,49 @@ mod tests {
         let replay = state.mcp_call(1, "task_send", &args).unwrap();
         assert_eq!(replay["replayed"], true);
         assert_eq!(replay["operation"]["completion"], "completed");
+    }
+
+    #[test]
+    fn a_held_input_refuses_the_new_send_without_retrying_its_receipt() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let child = state.tasks[0].child_thread_id;
+        let args = json!({"thread_id":child,"message":"next input",
+            "client_request_id":"held-replacement"});
+        let saved = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(saved["operation"]["transport"], "not_observed");
+        state.tasks[0].remote.as_mut().unwrap().wait_revision = Some("before-send".into());
+        reply(
+            &mut state,
+            "peer.thread.send",
+            Ok(json!({"status":"rejected","result":{"error":PEER_INPUT_RECOVERY_HELD}})),
+        );
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert!(remote.send_command.is_none());
+        assert!(remote.wait_revision.is_none(), "request fresh target state");
+        assert_ne!(remote.state, RemoteState::TargetOffline);
+        let replay = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["operation"]["transport"], "rejected");
+        assert_eq!(replay["operation"]["acceptance"], "not_observed");
+        assert!(
+            replay["operation"]["rejection"]
+                .as_str()
+                .unwrap()
+                .contains(PEER_INPUT_RECOVERY_HELD)
+        );
+        assert!(
+            state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .send_command
+                .is_none()
+        );
     }
 
     #[test]
@@ -6194,7 +6240,7 @@ impl State {
                     .transpose()?;
                 let thread = &self.threads[index];
                 if thread.peer_recovery_held {
-                    return Err("An earlier input may have reached the provider. Recovery is held; no new input was queued.".into());
+                    return Err(PEER_INPUT_RECOVERY_HELD.into());
                 }
                 if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
                     return Err("This attempt cannot accept steering.".into());
@@ -7353,7 +7399,9 @@ impl State {
                     }
                     if method == "peer.thread.send"
                         && (error.contains("generation changed")
-                            || error.contains("Request expired"))
+                            || error.contains("Request expired")
+                            || error.strip_prefix("Rejected peer.thread.send: ")
+                                == Some(PEER_INPUT_RECOVERY_HELD))
                     {
                         if let Some(delivery) = &send_delivery {
                             rejected_operations.push((delivery.clone(), error.clone()));
