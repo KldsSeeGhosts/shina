@@ -555,8 +555,8 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
                 .any(|thread| thread["id"] == home && thread["status"] == "Completed")
         })
     });
-    // The old endpoint keeps its own bearer token even after the reset writes
-    // a new endpoint record into the same scratch directory.
+    // The old endpoint keeps its bearer even when another home opens a
+    // session in the same scratch directory.
     let (old_url, old_token) = endpoint(&home_directory);
     let reset = client.command("captain.reset", json!({"captain":0}), uuid::Uuid::new_v4());
     assert_eq!(reset["result"]["status"], "accepted", "{reset}");
@@ -627,21 +627,41 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
         !instructions.contains("You may delegate independent work"),
         "{instructions}"
     );
-    // The new home's session rewrites the endpoint record with its own token.
-    let new_deadline = Instant::now() + Duration::from_secs(60);
+    // Start the new home explicitly: report delivery may all have finished
+    // before the reset. Use the bearer captured by this prompt's actual MCP
+    // call, since the two homes can overwrite the shared endpoint file.
+    let started = client.command(
+        "thread.send",
+        json!({"threadId":new_home,"text":"shina-dispatch-fixture",
+            "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(started["result"]["status"], "accepted", "{started}");
+    let new_deadline = Instant::now() + Duration::from_secs(20);
     let (new_url, new_token) = loop {
-        if let Ok(bytes) = fs::read(home_directory.join("fixture-mcp.json"))
-            && let Ok(host) = serde_json::from_slice::<Value>(&bytes)
-            && host["token"].as_str() != Some(old_token.as_str())
+        if let Ok(log) = fs::read_to_string(home_directory.join("pi-mcp-dispatch.jsonl"))
+            && let Some(call) = log
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|call| call["name"] == "orchestrator_capabilities")
         {
-            break (
-                host["url"].as_str().unwrap().to_owned(),
-                host["token"].as_str().unwrap().to_owned(),
-            );
+            let response: Value = serde_json::from_str(call["result"].as_str().unwrap()).unwrap();
+            let record: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(record["caller"]["role"], "captain_home", "{record}");
+            assert_eq!(record["caller"]["primary_home"], true, "{record}");
+            let token = call["authorization"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("Bearer ")
+                .unwrap();
+            assert!(token != old_token, "the new home must have its own bearer");
+            break (call["url"].as_str().unwrap().to_owned(), token.to_owned());
         }
         assert!(
             Instant::now() < new_deadline,
-            "new home endpoint never appeared"
+            "the new home's explicitly started turn did not call MCP"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
