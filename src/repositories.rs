@@ -126,7 +126,10 @@ pub(super) fn pin_placement_base(
         return Ok(());
     };
     placement::validate_spec(spec)?;
-    for candidate in [branch.to_owned(), format!("refs/remotes/origin/{branch}")] {
+    for candidate in [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ] {
         let reference = format!("{candidate}^{{commit}}");
         let output = crate::vcs::run_git_raw(
             "Catalog.baseCommit",
@@ -1572,20 +1575,48 @@ mod tests {
         };
         let branch = git(&["symbolic-ref", "HEAD"]);
         let commit = git(&["rev-parse", "HEAD"]);
-        git(&["update-ref", "refs/remotes/origin/release", &commit]);
+        git(&["tag", "release", &commit]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "release base",
+        ]);
+        let remote_commit = git(&["rev-parse", "HEAD"]);
+        assert_ne!(remote_commit, commit);
+        git(&["update-ref", "refs/remotes/origin/release", &remote_commit]);
         let mut spec = Some(placement::PlacementSpec {
             base_branch: Some("release".into()),
             ..Default::default()
         });
         pin_placement_base(&mut spec, &path, &crate::vcs::GitContext::default()).unwrap();
         let resolved = spec.as_ref().unwrap();
-        assert_eq!(resolved.base_commit.as_deref(), Some(commit.as_str()));
+        assert_eq!(
+            resolved.base_commit.as_deref(),
+            Some(remote_commit.as_str()),
+            "a same-named tag must not replace the selected branch"
+        );
         assert!(
             resolved.base_branch.is_none(),
             "the planner accepts one base selector"
         );
         placement::validate_spec(resolved).unwrap();
         assert_eq!(git(&["symbolic-ref", "HEAD"]), branch);
+        git(&["update-ref", "refs/heads/release", &remote_commit]);
+        let mut local = Some(placement::PlacementSpec {
+            base_branch: Some("release".into()),
+            ..Default::default()
+        });
+        pin_placement_base(&mut local, &path, &crate::vcs::GitContext::default()).unwrap();
+        assert_eq!(
+            local.unwrap().base_commit.as_deref(),
+            Some(remote_commit.as_str())
+        );
         let mut missing = Some(placement::PlacementSpec {
             base_branch: Some("not-fetched".into()),
             ..Default::default()

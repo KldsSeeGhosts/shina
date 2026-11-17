@@ -67,3 +67,33 @@ remote-provider, cross-runtime speed or complete issue-28 claim is made.
 
 No production CPA, provider login, authentication configuration, real profile or
 paid-provider request changed. No worker was replaced.
+
+## Review follow-up
+
+Devin reviewed clean candidate `94c5fd5`. A same-named tag could win over the
+selected local or origin branch because the resolver used a bare ref name.
+The expanded branch regression failed with the tag's older commit before the
+fix. Resolution now probes only `refs/heads/<branch>` and
+`refs/remotes/origin/<branch>`. It never interprets a tag as the selected branch.
+All 15 catalog units and the paired two-executor fresh-clone/restart test pass.
+
+The review also identified unresolved work before issue #28 can close:
+
+- Cold or failed identity lookup must not approve an explicit project/repository
+  pair. Warm this route and validate it before recording a checkout binding.
+- A slow binding lookup currently creates a durable rejected launch receipt.
+  Its message must not promise retry of that same command. The operation needs
+  an explicit retryable outcome or an honest terminal failure contract.
+- Validate placement before catalog mutations. Cancelled clone completion must
+  also settle its catalog binding rather than leave permanent provisioning.
+- Idle binding discovery must mark its batch changed and request a full catalog
+  projection.
+- Repository updates cannot clear fields or replace the clone URL. Remote
+  checkout bindings are visible in task placement, not the controller catalog.
+- Catalog setup metadata is not carried in the launch payload. Do not claim
+  that catalog setup configuration drives executor setup.
+- A pre-existing executor catalog id may differ from the controller's id, and
+  restore lacks an explicit duplicate binding-key validation.
+
+These findings are separate from the verified branch fix. No completion or
+publication claim is made for the remaining catalog requirements.
