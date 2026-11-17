@@ -469,7 +469,7 @@ fn remote_upstream_selection_maps_the_home_task_to_its_acknowledged_target() {
             }),
         )
         .unwrap_err();
-    assert!(unrelated.contains("same peer project"), "{unrelated}");
+    assert!(unrelated.contains("same peer repository"), "{unrelated}");
 }
 
 #[test]

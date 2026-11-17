@@ -275,6 +275,7 @@ pub fn tools() -> Value {
             "machine":{"type":"string","minLength":1,"description":"A linked peer's server id, host or label from orchestrator_capabilities.peers. Omit for local work. A machine-only target runs there with the inherited model and harness."},
             "environmentId":{"type":"string","minLength":1,"description":"Owning linked server id from orchestrator_capabilities.peers. Alias of machine. Use capabilities.projects to list its projects."},
             "projectId":{"type":"integer","minimum":1,"description":"Project id on the named machine. Must be explicitly in the captain's remote scope. Omit for automatic, unique Git origin matching. Paths are opaque target-owned strings."},
+            "repository":{"type":"string","minLength":1,"description":"Catalog repository id (repo-...) or repository URL from orchestrator_capabilities.repositories. Delegates into the captain's repository scope on a linked machine; the executor reuses a bound checkout or provisions one. Mutually exclusive with projectId."},
             "provider":{"type":"string","description":"cpa for Pi, otherwise the harness id. Defaults to the chosen harness."},
             "model":{"type":"string","minLength":1,"description":"An exact model id from orchestrator_capabilities.models[].id."},
             "options":{
@@ -291,7 +292,10 @@ pub fn tools() -> Value {
         "allOf":[{"if":{"required":["projectId"]},"then":{"anyOf":[
             {"required":["environmentId"],"properties":{"environmentId":{"not":{"const":"local"}}}},
             {"required":["machine"],"properties":{"machine":{"not":{"const":"local"}}}}
-        ]}}],
+        ]}},{"if":{"required":["repository"]},"then":{"anyOf":[
+            {"required":["environmentId"],"properties":{"environmentId":{"not":{"const":"local"}}}},
+            {"required":["machine"],"properties":{"machine":{"not":{"const":"local"}}}}
+        ],"not":{"required":["projectId"]}}}],
         "additionalProperties":false
     });
     let mut crew_target = target.clone();

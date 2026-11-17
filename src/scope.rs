@@ -341,6 +341,19 @@ impl State {
             value["machine"] = json!(peer.map(|p| p.label.as_str()).unwrap_or(&entry.server));
             projects.push(value);
         }
+        for id in captain
+            .map(|id| self.captain_repository_scope(id))
+            .unwrap_or_default()
+        {
+            if let Some(repository) = self.repositories.iter().find(|r| r.id == id) {
+                projects.push(json!({
+                    "repositoryId":repository.id,
+                    "name":repository.name,
+                    "remotes":repository.remotes,
+                    "cloneUrl":repository.clone_url,
+                }));
+            }
+        }
         json!(projects)
     }
 

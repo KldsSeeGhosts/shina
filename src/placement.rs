@@ -89,6 +89,44 @@ pub struct PlacementSpec {
     pub worktree: Option<String>,
 }
 
+/// Checkout-binding provisioning state on the executor. `pending` means the
+/// executor is still materializing the clone; `ready` means an executor-local
+/// checkout serves the placement; `failed` keeps the recorded reason for a
+/// retry that reuses the same target directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BindingPhase {
+    Pending,
+    Ready,
+    Failed,
+}
+
+/// The logical-repository binding a placement resolved or is still resolving.
+/// `spec` holds the caller's deferred placement selection while the executor
+/// provisions the checkout; it is cleared once planning runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementBinding {
+    /// The controller's logical repository id (`repo-…`).
+    pub repository: String,
+    /// Canonical remotes the binding was resolved against.
+    #[serde(default)]
+    pub remotes: Vec<String>,
+    /// The clone source the executor used or will use.
+    #[serde(default)]
+    pub clone_url: String,
+    /// The executor-local checkout that serves, or will serve, the repository.
+    #[serde(default)]
+    pub checkout: String,
+    pub state: BindingPhase,
+    #[serde(default)]
+    pub spec: Option<PlacementSpec>,
+    /// Distinct failure reason: missing clone credentials, a non-Git target
+    /// directory, an ambiguous binding, or a failed clone.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// The durable reservation and resolved placement of one worker thread. It is
 /// recorded on the thread before any filesystem work starts, projected to
 /// clients in the thread record, returned by `task_status` and carried back to
@@ -133,6 +171,10 @@ pub struct ThreadPlacement {
     pub capability: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The logical-repository binding this placement runs on, when delegation
+    /// named a catalog repository instead of a machine-local project.
+    #[serde(default)]
+    pub binding: Option<PlacementBinding>,
 }
 
 impl ThreadPlacement {
@@ -405,6 +447,7 @@ impl State {
             new_worktree: false,
             capability: None,
             error: None,
+            binding: None,
         };
         let shared = |record: &mut ThreadPlacement, capability: Option<String>| {
             record.capability = capability;
@@ -701,7 +744,7 @@ impl State {
     /// A Pending placement on a thread whose work is still wanted gets
     /// provisioned. Delegated children want work while their task is queued;
     /// peer workers while no result is recorded; crew roots always.
-    fn placement_wanted(&self, thread: &Thread) -> bool {
+    pub(super) fn placement_wanted(&self, thread: &Thread) -> bool {
         if thread.archived() {
             return false;
         }
@@ -901,13 +944,20 @@ impl State {
     }
 
     /// A new work attempt reuses the recorded reservation and provisions
-    /// again instead of allocating a second checkout.
+    /// again instead of allocating a second checkout. A failed checkout
+    /// binding retries its clone into the same recorded target first.
     pub(super) fn request_reprovision(&mut self, index: usize) {
-        if let Some(placement) = self.threads[index].placement.as_mut()
-            && placement.phase == PlacementPhase::Failed
-        {
-            placement.phase = PlacementPhase::Pending;
-            placement.error = None;
+        if let Some(placement) = self.threads[index].placement.as_mut() {
+            if let Some(binding) = placement.binding.as_mut()
+                && binding.state == BindingPhase::Failed
+            {
+                binding.state = BindingPhase::Pending;
+                binding.error = None;
+            }
+            if placement.phase == PlacementPhase::Failed {
+                placement.phase = PlacementPhase::Pending;
+                placement.error = None;
+            }
         }
     }
 }

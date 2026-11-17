@@ -964,6 +964,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= u64::from(protocol::IDENTITY_MINOR) {
                             capabilities.push(protocol::IDENTITY);
                         }
+                        if minor >= u64::from(protocol::LOGICAL_REPOSITORIES_MINOR) {
+                            capabilities.push(protocol::LOGICAL_REPOSITORIES);
+                        }
                         match identity_for_read(&shared) {
                             Err(error) => Err(error),
                             Ok(identity) => {

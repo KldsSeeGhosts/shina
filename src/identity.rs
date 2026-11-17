@@ -1953,7 +1953,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 8,
+            version, 10,
             "the schema gate is durable even when identity data rolls back"
         );
         let rows: i64 = connection
@@ -2341,7 +2341,7 @@ mod tests {
         let directory = profile_dir("identity-newer-schema");
         let connection = Connection::open(directory.join("state.sqlite")).unwrap();
         connection
-            .execute_batch("CREATE TABLE untouched(value TEXT); PRAGMA user_version=9;")
+            .execute_batch("CREATE TABLE untouched(value TEXT); PRAGMA user_version=11;")
             .unwrap();
         drop(connection);
         let error = match Database::open(&directory) {

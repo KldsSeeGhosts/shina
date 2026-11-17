@@ -124,7 +124,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 8 {
+        if version > 10 {
             return Err(error("This schema requires a newer Shina binary."));
         }
         // Check the authoritative saved format before any schema migration.
@@ -206,6 +206,14 @@ impl Database {
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
+        // Migration 009 is reserved by the pending task-evidence candidate.
+        if version < 10 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/010.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
         let imported: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='legacy-import-v1')",
@@ -217,6 +225,7 @@ impl Database {
             Self::import(&mut connection, directory)?;
         }
         crate::identity::ensure_database(directory, &mut connection).map_err(error)?;
+        crate::model::repositories::validate_open(&connection).map_err(error)?;
         // Process-bound effects, including committed but undispatched prompts, cannot
         // be retried safely. Honcho keeps its reconciled, stable-ID ledger separately.
         {
@@ -415,6 +424,7 @@ impl Database {
             let tx = inner.connection.transaction().map_err(error)?;
             if name == "index.json" {
                 crate::identity::sync_index(&tx, &value)?;
+                crate::model::repositories::sync_index(&tx, &value)?;
             }
             tx.execute(
                 "INSERT INTO documents(name,payload) VALUES(?1,?2)
@@ -520,6 +530,7 @@ impl Database {
                 if matches!(name.as_str(), "index.json" | "server-inputs.json") {
                     if name == "index.json" {
                         crate::identity::sync_index(&tx, &value)?;
+                        crate::model::repositories::sync_index(&tx, &value)?;
                     }
                     crate::projection_store::write(&tx, &name, &value)?;
                     continue;
@@ -2047,7 +2058,7 @@ mod tests {
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
         database
             .commit(
                 1,

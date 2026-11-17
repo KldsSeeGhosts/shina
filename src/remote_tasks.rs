@@ -2515,6 +2515,10 @@ pub struct RemoteTask {
     /// The worker's resolved placement, mirrored from the target's replies.
     #[serde(default)]
     pub placement: Option<Value>,
+    /// The catalog repository this task delegates into, when the caller
+    /// named one with target.repository.
+    #[serde(default)]
+    pub repository: Option<Value>,
 }
 
 #[derive(Default)]
@@ -2683,7 +2687,7 @@ pub(super) fn target_machine(args: &Value) -> Result<Option<&str>, String> {
     }
     Ok(environment.or(machine))
 }
-fn canonical_remote(remote: &str) -> Option<String> {
+pub(super) fn canonical_remote(remote: &str) -> Option<String> {
     let remote = remote.trim();
     if remote.chars().any(char::is_control) {
         return None;
@@ -2795,7 +2799,13 @@ impl State {
             return self
                 .prepare_remote_delegation(args["threadId"].as_u64()? as usize, &args["args"]);
         }
-        if method != "peer.capabilities" {
+        // A repository launch with no projectId resolves checkout bindings
+        // here; cold Git identities wait so the answer is a real miss, not a
+        // spurious provisioning of a checkout the executor already has.
+        let launch_needs_bindings = method == "peer.thread.launch"
+            && args["projectId"].is_null()
+            && !args["repository"].is_null();
+        if method != "peer.capabilities" && !launch_needs_bindings {
             return None;
         }
         let lookups: Vec<_> = self
@@ -3431,6 +3441,7 @@ impl State {
                 client_request_id: None,
                 send_command: None,
                 document_replies: VecDeque::new(),
+                repository: None,
             });
         }
     }
@@ -3516,10 +3527,16 @@ impl State {
             .map(str::trim)
             .filter(|s| !s.is_empty() && s.len() <= 48 * 1024)
             .ok_or("prompt must contain a brief of at most 48 KiB.")?;
+        let catalog_repository = args["target"]
+            .get("repository")
+            .filter(|v| !v.is_null())
+            .map(|selector| self.repository_index_by_selector(selector))
+            .transpose()?
+            .map(|index| self.repositories[index].clone());
         let explicit = args["target"]
             .get("projectId")
             .or_else(|| args.get("workspace"));
-        let remote = if explicit.is_none() {
+        let remote = if explicit.is_none() && catalog_repository.is_none() {
             let source = self.project(self.threads[caller].project).ok_or(
                 "Pass target.projectId: this thread has no project repository to match there.",
             )?;
@@ -3558,36 +3575,118 @@ impl State {
         } else {
             None
         };
-        let project = match_project(&peer.capabilities["projects"], explicit, remote.as_deref())?;
-        let scope = if self.threads[caller].captain_home {
-            self.threads[caller]
-                .captain
-                .map(|id| self.captain_scope(id))
-                .unwrap_or_default()
-        } else {
-            self.threads[caller].project.into_iter().collect()
+        // A catalog repository delegates against its advertised executor
+        // bindings; an executor with no bound checkout provisions one.
+        let (project, provision) = match &catalog_repository {
+            Some(repository) => {
+                let mut bound: Vec<Value> = peer.capabilities["projects"]
+                    .as_array()
+                    .map(|projects| {
+                        projects
+                            .iter()
+                            .filter(|p| p["hidden"] != true)
+                            .filter(|p| {
+                                p["gitRemote"].as_str().is_some_and(|remote| {
+                                    repository.remotes.iter().any(|r| r == remote)
+                                })
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                match bound.len() {
+                    0 => (Value::Null, true),
+                    1 => (bound.pop().expect("one binding"), false),
+                    _ => {
+                        return Err(format!(
+                            "Several checkouts on {} bind repository {}. Pass target.projectId to pick one. Projects: {}",
+                            peer.label,
+                            repository.name,
+                            serde_json::to_string(&bound).expect("projects")
+                        ));
+                    }
+                }
+            }
+            None => (
+                match_project(&peer.capabilities["projects"], explicit, remote.as_deref())?,
+                false,
+            ),
         };
-        let explicitly_scoped = self.threads[caller]
-            .captain
-            .filter(|_| self.threads[caller].captain_home)
-            .is_some_and(|id| {
-                self.remote_captain_scope(id).iter().any(|entry| {
-                    entry.server == peer.server_id
-                        && project["id"].as_u64() == Some(entry.project_id as u64)
+        if let Some(repository) = &catalog_repository {
+            // Repository scope is its own grant: a captain's assigned
+            // repositories, or the caller's bound local checkout.
+            let repository_scoped = if self.threads[caller].captain_home {
+                self.threads[caller].captain.is_some_and(|captain| {
+                    self.captain_repository_scope(captain)
+                        .contains(&repository.id)
                 })
-            });
-        let automatic_scope = explicit.is_none()
-            && self.threads[caller]
-                .project
-                .is_some_and(|id| scope.contains(&id))
-            && project["gitRemote"].as_str() == remote.as_deref();
-        if !explicitly_scoped && !automatic_scope {
-            return Err(format!(
-                "Project {} ({}) on {} is outside the caller's scope. Add it to the captain's scope before delegating.",
-                project["name"].as_str().unwrap_or("Unknown"),
-                project["id"],
-                peer.label
-            ));
+            } else {
+                self.threads[caller]
+                    .project
+                    .is_some_and(|id| self.project_binds_repository(id, repository))
+            };
+            let explicitly_scoped = !provision
+                && self.threads[caller]
+                    .captain
+                    .filter(|_| self.threads[caller].captain_home)
+                    .is_some_and(|id| {
+                        self.remote_captain_scope(id).iter().any(|entry| {
+                            entry.server == peer.server_id
+                                && project["id"].as_u64() == Some(entry.project_id as u64)
+                        })
+                    });
+            if !repository_scoped && !explicitly_scoped {
+                return Err(format!(
+                    "Repository {} is outside the caller's scope. Assign it to the captain's repository scope before delegating.",
+                    repository.name
+                ));
+            }
+            if provision
+                && !peer.capabilities["contracts"]
+                    .as_array()
+                    .is_some_and(|contracts| {
+                        contracts
+                            .iter()
+                            .any(|contract| contract == crate::protocol::LOGICAL_REPOSITORIES)
+                    })
+            {
+                return Err(format!(
+                    "Update required on {}. Provisioning a checkout for a catalog repository needs {} there; update Shina on that server, or bind a checkout and pass target.projectId.",
+                    peer.label,
+                    crate::protocol::LOGICAL_REPOSITORIES
+                ));
+            }
+        } else {
+            let scope = if self.threads[caller].captain_home {
+                self.threads[caller]
+                    .captain
+                    .map(|id| self.captain_scope(id))
+                    .unwrap_or_default()
+            } else {
+                self.threads[caller].project.into_iter().collect()
+            };
+            let explicitly_scoped = self.threads[caller]
+                .captain
+                .filter(|_| self.threads[caller].captain_home)
+                .is_some_and(|id| {
+                    self.remote_captain_scope(id).iter().any(|entry| {
+                        entry.server == peer.server_id
+                            && project["id"].as_u64() == Some(entry.project_id as u64)
+                    })
+                });
+            let automatic_scope = explicit.is_none()
+                && self.threads[caller]
+                    .project
+                    .is_some_and(|id| scope.contains(&id))
+                && project["gitRemote"].as_str() == remote.as_deref();
+            if !explicitly_scoped && !automatic_scope {
+                return Err(format!(
+                    "Project {} ({}) on {} is outside the caller's scope. Add it to the captain's scope before delegating.",
+                    project["name"].as_str().unwrap_or("Unknown"),
+                    project["id"],
+                    peer.label
+                ));
+            }
         }
         let target = parse_delegation_target(args)?;
         let target = target.as_ref().expect("remote target");
@@ -3765,9 +3864,20 @@ impl State {
             let upstream = self.tasks.iter()
                 .find(|task| task.child_thread_id == upstream_id)
                 .and_then(|task| task.remote.as_ref())
-                .filter(|remote| remote.server_id == peer.server_id
-                    && remote.project["id"] == project["id"])
-                .ok_or("placement.upstreamThreadId must name a delegated task on the same peer project.")?;
+                .filter(|remote| {
+                    remote.server_id == peer.server_id
+                        && match &catalog_repository {
+                            Some(repository) => {
+                                remote
+                                    .repository
+                                    .as_ref()
+                                    .and_then(|entry| entry["id"].as_str())
+                                    == Some(repository.id.as_str())
+                            }
+                            None => remote.project["id"] == project["id"],
+                        }
+                })
+                .ok_or("placement.upstreamThreadId must name a delegated task on the same peer repository.")?;
             if upstream
                 .placement
                 .as_ref()
@@ -3783,7 +3893,7 @@ impl State {
         }
         let launch = Command::new(
             "peer.thread.launch",
-            json!({"projectId":project["id"],"harness":harness,"provider":provider,
+            json!({"projectId":project["id"],"repository":catalog_repository.as_ref().map(|repo|repo.launch_value()),"harness":harness,"provider":provider,
             "model":model,"reasoning":reasoning,"brief":brief,"title":thread.title,"origin":origin,"request":args,
             "placement":if placement_contract {placement_spec.as_ref().map(serde_json::to_value).transpose().ok().flatten()} else {Option::<Value>::None},
             "access":if shared_reader {AccessMode::ReadOnly.id()} else {match self.threads[caller].native.access {AccessMode::ReadOnly=>AccessMode::default(),access=>access}.id()}}),
@@ -3792,6 +3902,11 @@ impl State {
             None
         } else {
             project["path"].as_str().map(str::to_owned)
+        };
+        let binding_checkout = if provision {
+            String::new()
+        } else {
+            project["path"].as_str().unwrap_or_default().to_owned()
         };
         task.remote = Some(RemoteTask {
             server_id: peer.server_id.clone(),
@@ -3814,11 +3929,12 @@ impl State {
             client_request_id: request.map(str::to_owned),
             send_command: None,
             document_replies: VecDeque::new(),
+            repository: catalog_repository.as_ref().map(|repo| repo.launch_value()),
             placement: Some(
                 placement::ThreadPlacement {
                     requested: placement::PlacementRequest::from_mode(placement_mode),
                     mode: placement_mode.unwrap_or(placement::PlacementMode::Isolated),
-                    phase: if placement_contract {
+                    phase: if placement_contract || provision {
                         placement::PlacementPhase::Pending
                     } else {
                         placement::PlacementPhase::Ready
@@ -3843,6 +3959,25 @@ impl State {
                         ))
                     },
                     error: None,
+                    binding: catalog_repository.as_ref().map(|repo| {
+                        placement::PlacementBinding {
+                            repository: repo.id.clone(),
+                            remotes: repo.remotes.clone(),
+                            clone_url: if provision {
+                                repo.clone_url.clone()
+                            } else {
+                                String::new()
+                            },
+                            checkout: binding_checkout.clone(),
+                            state: if provision {
+                                placement::BindingPhase::Pending
+                            } else {
+                                placement::BindingPhase::Ready
+                            },
+                            spec: None,
+                            error: None,
+                        }
+                    }),
                 }
                 .value(),
             ),
@@ -3869,7 +4004,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PLACEMENT,crate::protocol::PEER_TASK_FENCES],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PLACEMENT,crate::protocol::PEER_TASK_FENCES,crate::protocol::LOGICAL_REPOSITORIES],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
@@ -3925,13 +4060,70 @@ impl State {
             {
                 return Err("Invalid peer origin or memory budget.".into());
             }
-            let project = self
-                .projects
-                .entries
-                .iter()
-                .find(|p| !p.hidden && json!(p.id) == args["projectId"])
-                .map(|p| p.id)
-                .ok_or("Unknown target project.")?;
+            let launch_repository = match args.get("repository") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(repositories::parse_launch_repository(value)?),
+            };
+            let project = match args["projectId"]
+                .as_u64()
+                .and_then(|id| usize::try_from(id).ok())
+            {
+                Some(id) => {
+                    let entry = self
+                        .projects
+                        .entries
+                        .iter()
+                        .find(|p| !p.hidden && p.id == id)
+                        .ok_or("Unknown target project.")?;
+                    if let Some(repository) = &launch_repository
+                        && let Some(Ok(Some(remote))) = repository_result(&entry.path)
+                        && !repository.remotes.contains(&remote)
+                    {
+                        return Err(format!(
+                            "Project {} is not a checkout of repository {}.",
+                            entry.name, repository.id
+                        ));
+                    }
+                    Some(entry.id)
+                }
+                None => {
+                    let repository = launch_repository
+                        .as_ref()
+                        .ok_or("Unknown target project.")?;
+                    let mut bound = Vec::new();
+                    let mut resolving = false;
+                    for entry in self
+                        .projects
+                        .entries
+                        .iter()
+                        .filter(|p| !p.hidden && p.machine == "local")
+                    {
+                        match repository_result(&entry.path) {
+                            Some(Ok(Some(remote))) if repository.remotes.contains(&remote) => {
+                                bound.push((entry.id, entry.name.clone()))
+                            }
+                            None => resolving = true,
+                            _ => {}
+                        }
+                    }
+                    if bound.len() > 1 {
+                        return Err(format!(
+                            "The repository binds several checkouts on this machine ({}). The controller must pass a projectId.",
+                            bound
+                                .iter()
+                                .map(|(_, name)| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    if bound.is_empty() && resolving {
+                        return Err(
+                            "Checkout bindings are still resolving on this machine. The controller can retry the launch.".into(),
+                        );
+                    }
+                    bound.into_iter().next().map(|(id, _)| id)
+                }
+            };
             let harness = args["harness"]
                 .as_str()
                 .ok_or("A target harness is required.")?;
@@ -3970,7 +4162,7 @@ impl State {
                 .chars()
                 .take(45)
                 .collect();
-            thread.project = Some(project);
+            thread.project = project;
             thread.harness = harness.into();
             thread.delegated = true;
             let placement_seed = format!("peer:{}", origin.task_id);
@@ -3988,6 +4180,66 @@ impl State {
             #[cfg(not(test))]
             let git_ctx = crate::vcs::GitContext::default();
             let spec = placement::spec_from_args(args)?;
+            if project.is_none() {
+                // No executor-local checkout binds this repository yet. Record
+                // the deterministic target now; poll_checkout_provisioning
+                // clones or adopts it, then runs the deferred plan.
+                let repository = launch_repository.expect("repository checked above");
+                let target =
+                    repositories::checkout_target(&self.data_dir, &repository.id, &repository.name);
+                let checkout = target.to_string_lossy().into_owned();
+                let local = self.learn_repository(&repository);
+                self.record_binding(
+                    &local,
+                    "local",
+                    None,
+                    &checkout,
+                    repositories::BindingState::Provisioning,
+                    Some("No bound checkout on this machine; provisioning one.".into()),
+                );
+                let mode = spec
+                    .as_ref()
+                    .map(placement::validate_spec)
+                    .transpose()?
+                    .flatten();
+                let record = placement::ThreadPlacement {
+                    requested: placement::PlacementRequest::from_mode(mode),
+                    mode: mode.unwrap_or(placement::PlacementMode::Isolated),
+                    phase: placement::PlacementPhase::Pending,
+                    executor,
+                    repository: Some(checkout.clone()),
+                    base_branch: repository.base_branch.clone(),
+                    base_commit: None,
+                    upstream_thread_id: None,
+                    branch: None,
+                    checkout: Some(checkout.clone()),
+                    start_from_origin: spec
+                        .as_ref()
+                        .and_then(|s| s.start_from_origin)
+                        .unwrap_or(false),
+                    primary_checkout: false,
+                    new_worktree: false,
+                    capability: None,
+                    error: None,
+                    binding: Some(placement::PlacementBinding {
+                        repository: local,
+                        remotes: repository.remotes,
+                        clone_url: repository.clone_url,
+                        checkout,
+                        state: placement::BindingPhase::Pending,
+                        spec: spec.clone(),
+                        error: None,
+                    }),
+                };
+                if record.read_only() {
+                    thread.native.access = AccessMode::ReadOnly;
+                }
+                thread.placement = Some(record.clone());
+                let id = thread.id;
+                self.next_id += 1;
+                self.threads.push(thread);
+                return Ok(json!({"threadId":id,"placement":record.value()}));
+            }
             let resolved = self.plan_thread_placement(
                 &thread,
                 spec.as_ref(),
@@ -3995,6 +4247,38 @@ impl State {
                 &executor,
                 &git_ctx,
             )?;
+            let resolved = if let Some(repository) = &launch_repository {
+                let local = self.learn_repository(repository);
+                let project_id = project.expect("checked above");
+                let path = self
+                    .projects
+                    .entries
+                    .iter()
+                    .find(|p| p.id == project_id)
+                    .map(|p| p.path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.record_binding(
+                    &local,
+                    "local",
+                    Some(project_id as u64),
+                    &path,
+                    repositories::BindingState::Bound,
+                    None,
+                );
+                let mut resolved = resolved;
+                resolved.binding = Some(placement::PlacementBinding {
+                    repository: local,
+                    remotes: repository.remotes.clone(),
+                    clone_url: String::new(),
+                    checkout: path,
+                    state: placement::BindingPhase::Ready,
+                    spec: None,
+                    error: None,
+                });
+                resolved
+            } else {
+                resolved
+            };
             if resolved.read_only() {
                 // A shared placement views the project checkout without write
                 // access, whatever access the launch requested.
