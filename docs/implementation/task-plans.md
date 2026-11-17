@@ -20,6 +20,12 @@ base. An override does not let a stacked node bypass the Git check.
 The backend started at Devin commit `0177fae` and was integrated against main
 `fb64bc0`. The ordinary delegation path keeps the current harness preflight
 and admission rules. Plans currently reject linked executor targets rather
-than starting those nodes locally by mistake. The desktop needs its plan
-controls and a live stacked-launch check before closure. No production provider
-credentials or sessions are required for verification.
+than starting those nodes locally by mistake.
+
+The live server test drafts three nodes through authenticated MCP, revises the
+stacked child, and refuses that child before its dependency is ready. It checks
+the downstream worktree's actual `HEAD` and file content against a distinct
+upstream commit. After a server restart, the same request key returns the same
+task and thread without another worker prompt. The third node remains a draft.
+The desktop controls still need to land. Verification uses only a fixture
+provider and a temporary Git repository.
