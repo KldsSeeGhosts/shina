@@ -125,3 +125,14 @@ At this checkpoint, the all-target build, formatting and diff checks pass.
 All 24 scheduler unit tests, 63 remote-task tests and 47 task tests pass, as
 does the new paired-server launch-refusal/restart/retry contract. This is
 focused verification, not a replacement for the final full suite or CI.
+
+At `1033a9e`, the complete local run passes 2,093 unit tests and 130 integration
+tests, with 13 ignored tests. The all-target build, formatting, diff checks,
+live mobile SDK test and TypeScript typecheck pass.
+
+PR60's failed integration run separately exposed deferred task dispatch evidence
+being saved without a global projection update in a quiet batch. The same
+two-line correction and deterministic regression are included here so this
+branch does not depend on unrelated activity to publish dispatch state.
+Transport and provider acceptance still require their own observations.
+Updated-head CI and review still gate merging.

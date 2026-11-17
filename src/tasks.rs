@@ -1454,8 +1454,10 @@ impl State {
     /// remote commands use. Dispatch, provider input acceptance and completion
     /// are separate observations, all bound to the delivery or attempt.
     pub(super) fn reconcile_task_operations(&mut self) -> bool {
-        let mut changed = false;
-        if std::mem::take(&mut self.task_operations_dirty) {
+        // Dispatch runs before the reducer transaction. Publishing its saved
+        // evidence also needs a full projection, even with no provider reply.
+        let mut changed = std::mem::take(&mut self.task_operations_dirty);
+        if changed {
             self.stage_task_operations();
         }
         let dispatches: Vec<_> = self
@@ -4479,6 +4481,57 @@ mod tests {
         let two = state.mcp_call(1, "delegate_task", &unkeyed).unwrap();
         assert_ne!(two["thread_id"], one["thread_id"]);
         assert_eq!(state.tasks.len(), 4);
+    }
+
+    #[test]
+    fn deferred_dispatch_evidence_marks_the_next_projection_changed() {
+        let directory = std::env::temp_dir().join(format!(
+            "shina-dispatch-projection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut runtime = crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+        runtime.state.demo = true;
+        runtime.state.runtime_enabled = false;
+        let mut operation = TaskOperation::saved(
+            &DelegateScope::Thread(1),
+            1,
+            "dispatch-projection",
+            "task_send",
+            &json!({}),
+            &runtime.state.threads[0],
+            None,
+            "follow_up",
+        );
+        operation.dispatch = OPERATION_QUEUED.into();
+        operation.delivery_id = Some("held-peer-send".into());
+        runtime.state.task_operations.push(operation);
+        let database = runtime.database.clone().unwrap();
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime.state.stage_task_operations();
+        runtime.persist_for_test(capture.finish()).unwrap();
+        assert_eq!(
+            database.projection().unwrap().unwrap()["index"]["taskOperations"][0]["dispatch"],
+            OPERATION_QUEUED
+        );
+
+        // The production dispatcher runs before the reducer transaction.
+        assert!(runtime.state.mark_operation_dispatched("held-peer-send"));
+        assert!(runtime.state.task_operations_dirty);
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        assert!(
+            runtime.state.reconcile_task_operations(),
+            "dispatch-only evidence must promote the next batch to a full projection"
+        );
+        assert!(!runtime.state.task_operations_dirty);
+        runtime.persist_for_test(capture.finish()).unwrap();
+        let projection = database.projection().unwrap().unwrap();
+        let operation = &projection["index"]["taskOperations"][0];
+        assert_eq!(operation["dispatch"], OPERATION_DISPATCHED);
+        assert_eq!(operation["transport"], OPERATION_NOT_OBSERVED);
+        assert_eq!(operation["acceptance"], OPERATION_NOT_OBSERVED);
+        assert!(!runtime.state.reconcile_task_operations(), "publish once");
     }
 
     #[test]
