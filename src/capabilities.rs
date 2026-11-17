@@ -311,6 +311,9 @@ impl State {
             return Some("Delegated threads cannot control other tasks.".into());
         }
         match tool {
+            "task_prepare" | "task_update" | "task_start" => {
+                self.task_plan_write_guard(index).err()
+            }
             "delegate_task" => {
                 if thread.delegated {
                     Some(

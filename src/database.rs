@@ -917,6 +917,42 @@ impl Database {
         Ok(())
     }
 
+    /// A keyed task_start call commits its caller-scoped launch receipt in the
+    /// same batch as the plan nodes it launched.
+    pub fn stage_task_launch_receipt(
+        &self,
+        owner: &str,
+        command: &crate::protocol::Command,
+        result: Value,
+    ) -> Result<(), String> {
+        if command.method != "task_start" {
+            return Err("Unsupported task launch receipt.".into());
+        }
+        self.require_batch()?;
+        let hash = command.hash();
+        if let Some(existing) = self.delegate_tool_receipt(owner, command.command_id)? {
+            if existing.hash != hash {
+                return Err(
+                    "client_request_id was already used with different launch arguments.".into(),
+                );
+            }
+            return Ok(());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_tool_receipts
+            .push(Receipt {
+                command_id: command.command_id,
+                device_id: owner.into(),
+                hash,
+                status: crate::protocol::ReceiptStatus::Accepted,
+                result,
+                seq: 0,
+            });
+        Ok(())
+    }
+
     /// Keyed task_send and task_cancel calls commit their caller-scoped receipt
     /// in the same batch as the queued input or the owed stop.
     pub fn stage_task_control_receipt(
