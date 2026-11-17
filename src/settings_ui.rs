@@ -3739,8 +3739,7 @@ mod tests {
             json!({
                 "profile":{"name":"Remote user","time_zone":"UTC","preferences":"Remote preferences"},
                 "keepAwake":"on_ac_power"
-            }),
-        );
+            }).into());
         assert_eq!(state.settings_profile().name, "Remote user");
         assert_eq!(
             state.settings_keep_awake(),

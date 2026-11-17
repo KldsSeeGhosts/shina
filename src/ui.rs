@@ -16054,7 +16054,7 @@ pub(crate) mod tests {
             rt.state
                 .machines
                 .views
-                .insert(server.into(), projection.clone());
+                .insert(server.into(), projection.clone().into());
         }
     }
 
@@ -17661,7 +17661,7 @@ pub(crate) mod tests {
             rt.state
                 .machines
                 .views
-                .insert("server-b".into(), remote.projection());
+                .insert("server-b".into(), remote.projection().into());
             rt.state
                 .machines
                 .threads
@@ -17910,8 +17910,7 @@ pub(crate) mod tests {
                 json!({"index":{"threads":[
                     {"id":1,"title":"Remote thread","session":"fixture","captainHome":false,"lifecycle":{}},
                     {"id":2,"title":"Remote captain","captainHome":true,"lifecycle":{}}
-                ]}}),
-            );
+                ]}}).into());
             rt.frame(0.0);
             for key in ["machine-selector", "machine-selector-label"] {
                 let (rect, _) = rt
@@ -30427,8 +30426,7 @@ pub(crate) mod tests {
                         "version": "0.48.0", "latestVersion": "0.50.0",
                         "advisory": "behind", "strategy": "npm-global"
                     }]
-                }),
-            );
+                }).into());
             rt.state.updater = crate::update::Updater::test_ready(crate::update::PreparedUpdate {
                 tag: "v99.0.0".into(),
                 target: crate::install::InstalledTarget::Windows {
