@@ -385,9 +385,42 @@ impl State {
                     .unwrap_or_default()
             })
             .collect();
-        for ((thread, context), policy) in self.threads.iter_mut().zip(contexts).zip(policies) {
+        let roles: Vec<(&'static str, &'static str)> = (0..self.threads.len())
+            .map(|index| {
+                let role = self.mcp_role(index);
+                (role, State::instructions_for_role(role))
+            })
+            .collect();
+        for (((thread, context), policy), (role, instructions)) in self
+            .threads
+            .iter_mut()
+            .zip(contexts)
+            .zip(policies)
+            .zip(roles)
+        {
             thread.captain_context = context;
             thread.crew_report_policy = policy;
+            if thread.instruction_role != Some(role) {
+                let known = thread.instruction_role.is_some();
+                let restricted = matches!(
+                    role,
+                    "earlier_home"
+                        | "archived_home"
+                        | "archived_crew"
+                        | "retired_home"
+                        | "retired_crew"
+                );
+                thread.instruction_role = Some(role);
+                thread.shina = instructions;
+                // A live session gets the current restrictions on its next
+                // prompt; a reconnect re-injects the same text before work.
+                // A restored unrestricted role keeps its existing awareness
+                // flag, so a normal resume does not repeat the full prompt.
+                if known || restricted {
+                    thread.harness_context_sent = false;
+                }
+                thread.instruction_context_pending = known;
+            }
         }
     }
 

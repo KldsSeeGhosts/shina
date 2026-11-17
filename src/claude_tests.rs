@@ -227,6 +227,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         workspace: crate::store::directory().unwrap(),
         source,
         instructions: Some("Captain profile\nEssential memory: use Rust".into()),
+        shina: crate::mcp::INSTRUCTIONS,
         link: Some(crate::backend::HostLink {
             url: "http://127.0.0.1:12345/mcp".into(),
             token: "fixture-thread-token".into(),
@@ -1776,6 +1777,7 @@ fn claude_fresh_session_passes_session_id_and_not_resume() {
         workspace: PathBuf::from("."),
         source: SessionSource::New,
         instructions: None,
+        shina: crate::mcp::INSTRUCTIONS,
         link: None,
         owner: Arc::default(),
         context_sent: false,

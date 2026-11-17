@@ -201,6 +201,8 @@ mod scope;
 #[allow(unused_imports)]
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 pub use scope::RemoteProject;
+#[path = "capabilities.rs"]
+mod capabilities;
 #[path = "codex_model.rs"]
 mod codex_model;
 #[path = "placement.rs"]
@@ -1082,6 +1084,11 @@ pub struct Thread {
     pub captain_home: bool,
     pub crew_captain: Option<usize>,
     pub captain_context: String,
+    /// The role whose Shina awareness this session received or will receive.
+    pub(crate) instruction_role: Option<&'static str>,
+    pub(crate) shina: &'static str,
+    /// A role change that needs a next-turn update or a fresh session.
+    pub(crate) instruction_context_pending: bool,
     /// Started by another thread through the Shina MCP. Delegated threads cannot delegate.
     pub delegated: bool,
     pub parent: Option<usize>,
@@ -1648,6 +1655,9 @@ impl Thread {
             captain_home: false,
             crew_captain: None,
             captain_context: String::new(),
+            instruction_role: None,
+            shina: crate::model::capabilities::THREAD_INSTRUCTIONS,
+            instruction_context_pending: false,
             delegated: false,
             parent: None,
             host: None,
@@ -1763,6 +1773,7 @@ impl Thread {
                 workspace: path,
                 source,
                 instructions,
+                shina: self.shina_instructions(),
                 link: self.host.clone(),
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
@@ -1976,10 +1987,12 @@ impl Thread {
         self.serial += 1;
         data["type"] = kind.into();
         data["id"] = format!("{}-{}", self.id, self.serial).into();
-        let result = self.send_memory_command(data);
-        if let Err(error) = result {
+        if let Err(error) = self.send_memory_command(data) {
             self.error = Some(error);
             return false;
+        }
+        if kind == "prompt" {
+            self.instruction_context_pending = false;
         }
         if let Some(context) = context {
             self.memory_context = context;
@@ -8272,8 +8285,6 @@ impl State {
         // Each `may_*` mirrors the matching handler's ownership and lifecycle gates; it
         // does not promise call-specific validation (prompt, target or capacity) succeeds.
         let (captain, primary_home) = self.captain_actor(caller_index);
-        let owner_active = self.require_active_thread_owner(caller.id).is_ok();
-        let local = caller.peer_origin.is_none();
         // How the caller's harness treats `mcp__shina__` names before they reach this
         // server. Stated per adapter because admission policy is not uniform: Pi's bridge
         // and Claude's policy gate by name, Codex leaves it to its approval mode, and ACP
@@ -8298,36 +8309,51 @@ impl State {
         capabilities["scheduling"] =
             self.scheduling_scoped_value(Some(self.effective_home(caller.id)));
         capabilities["caller"] = json!({
-            "role": if caller.delegated {
-                "worker"
-            } else if caller.captain_home {
-                if primary_home { "captain_home" } else { "earlier_home" }
-            } else if captain.is_some() {
-                "crew"
-            } else {
-                "thread"
-            },
+            "role": self.mcp_role(caller_index),
             "captain": captain,
             "primary_home": primary_home,
             "access": caller.native.access.id(),
-            "may_delegate": owner_active
-                && local
-                && !caller.delegated
-                && (!caller.captain_home || primary_home),
-            "may_control_crew": self.client.is_none()
-                && owner_active
-                && local
-                && !caller.delegated
-                && primary_home,
-            "may_write_captain_documents": owner_active
-                && local
-                && primary_home
-                && self.require_captain_capability().is_ok(),
+            "harness": caller.harness,
+            "machine": caller.machine,
+            "host": if caller.peer_origin.is_some() { "remote" } else { "local" },
+            "delegated": caller.delegated,
+            "crew_member": caller.crew_captain.is_some(),
+            "owner_status": captain.map(|id| match self.captain_phase(id) {
+                CaptainPhase::Active => "active",
+                CaptainPhase::Archived => "archived",
+                CaptainPhase::Retired => "retired",
+                CaptainPhase::Deleted => "deleted",
+            }),
+            // Legacy booleans remain for older clients, but derive from the
+            // same effective gates the tool record and dispatch use.
+            "may_delegate": self.denial(caller_index, "delegate_task").is_none(),
+            "may_control_crew": self.denial(caller_index, "captain_crew_create").is_none(),
+            "may_write_captain_documents": self
+                .denial(caller_index, "captain_document_write")
+                .is_none(),
+            "may_answer_questions": self
+                .denial(caller_index, "captain_question_answer")
+                .is_none(),
+            "may_manage_routines": self.denial(caller_index, "create_routine").is_none(),
             "shina_tools": {
                 "endpoint": caller.host.is_some(),
                 "admission": admission,
             },
         });
+        // The effective record (#32): coordination rights with precise reasons,
+        // interaction support, authorized reads, placement, live capacity and
+        // the per-tool listing `tools/list` now returns. Dispatch revalidates
+        // each gate again at call time.
+        capabilities["contract"] = json!(capabilities::CONTRACT);
+        capabilities["effective"] = json!({
+            "coordination": self.coordination(caller_index),
+            "interaction": self.interaction(caller_index),
+            "reads": self.reads(caller_index),
+            "execution": self.execution(caller_index),
+            "placement": self.placement(caller_index),
+            "capacity": self.capacity(caller_index),
+        });
+        capabilities["tools"] = self.tools_record(caller_index);
         capabilities
     }
 
@@ -8428,6 +8454,12 @@ impl State {
         let thread_id = self.threads[index].id;
         self.sync_memory_links();
         self.refresh_captain_contexts();
+        let role = self.mcp_role(index);
+        self.threads[index].instruction_role = Some(role);
+        self.threads[index].shina = Self::instructions_for_role(role);
+        // The session start carries the current text, so a stale next-turn
+        // update is not needed for this connection.
+        self.threads[index].instruction_context_pending = false;
         let instructions = self.connection_instructions(index);
         if matches!(
             self.threads[index].harness.as_str(),
@@ -8480,6 +8512,9 @@ impl State {
         tool: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        if matches!(tool, "initialize" | "tools/list") {
+            return self.mcp_meta_call(caller, tool, args);
+        }
         if matches!(
             tool,
             "captain_crew_create" | "captain_crew_send" | "captain_crew_stop"
@@ -8640,6 +8675,7 @@ impl State {
                     .and_then(|t| t.harness.clone())
                     .unwrap_or_else(|| self.threads[caller_index].harness.clone());
                 self.validate_harness(&harness)?;
+                self.require_harness_executable(&harness)?;
                 let provider = if harness == "pi" { "cpa" } else { &harness };
                 if target
                     .as_ref()
@@ -18966,7 +19002,14 @@ mod tests {
         assert_eq!(primary["captain"], 0);
         assert_eq!(primary["access"], "read-only");
         assert_eq!(primary["may_delegate"], true);
-        assert_eq!(primary["may_control_crew"], true);
+        let primary_record = state
+            .mcp_call(home, "orchestrator_capabilities", &json!({}))
+            .unwrap();
+        assert_eq!(
+            primary_record["caller"]["may_control_crew"],
+            primary_record["effective"]["coordination"]["crew"]["create"]["available"],
+            "legacy crew control must match the effective crew.create gate"
+        );
         assert_eq!(primary["may_write_captain_documents"], true);
         let earlier = caller(&mut state, earlier);
         assert_eq!(earlier["role"], "earlier_home");

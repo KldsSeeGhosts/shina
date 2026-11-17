@@ -4840,14 +4840,20 @@ impl State {
             .harness
             .clone()
             .unwrap_or_else(|| self.threads[caller].harness.clone());
-        if !peer.capabilities["harnesses"]
+        let advertised_harness = peer.capabilities["harnesses"]
             .as_array()
-            .is_some_and(|hs| hs.iter().any(|h| h["id"] == harness))
-        {
+            .and_then(|harnesses| harnesses.iter().find(|entry| entry["id"] == harness));
+        let Some(advertised_harness) = advertised_harness else {
             return Err(
                 "The target does not advertise this harness. Read orchestrator_capabilities.peers."
                     .into(),
             );
+        };
+        if advertised_harness["executable"] == false {
+            let reason = advertised_harness["reason"]
+                .as_str()
+                .unwrap_or("The target harness is not executable.");
+            return Err(format!("{} cannot run {harness}: {reason}", peer.label));
         }
         let provider = if harness == "pi" { "cpa" } else { &harness };
         if target.provider.as_deref().is_some_and(|p| p != provider) {
@@ -5763,6 +5769,7 @@ impl State {
                 .as_str()
                 .ok_or("A target harness is required.")?;
             self.validate_harness(harness)?;
+            self.require_harness_executable(harness)?;
             let selection: Selection = Selection {
                 provider: args["provider"]
                     .as_str()

@@ -318,6 +318,7 @@ impl State {
             self.captain_lifecycles.remove(&captain);
             // No release_task_results, release_crew_reports or connect here.
         }
+        self.refresh_captain_contexts();
         self.persistence_scope = None;
         Ok(
             json!({"captain":captain,"lifecycle":self.captain_phase(captain),
