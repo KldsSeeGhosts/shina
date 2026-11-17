@@ -960,6 +960,19 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
     );
     assert_eq!(project["result"]["status"], "accepted", "{project}");
     let project = project["result"]["result"]["projectId"].clone();
+    // Force different local id spaces so a missing upstream translation
+    // cannot pass by accidentally addressing the same numeric thread id.
+    for _ in 0..2 {
+        let created = executor.command(
+            "thread.create",
+            json!({"project":project,"occupiedDrafts":[1,2,3]}),
+            uuid::Uuid::new_v4(),
+        );
+        assert!(
+            created["result"]["result"]["threadId"].is_number(),
+            "{created}"
+        );
+    }
     let discovery = target.discovery();
     let pairing = target.cli(&["pair", "--peer"]);
     assert!(pairing.status.success());
@@ -1072,6 +1085,7 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
         .collect();
     let first = workers[0]["placement"].clone();
     let second = workers[1]["placement"].clone();
+    let upstream_target = workers[0]["id"].clone();
     assert_ne!(first["checkout"], second["checkout"]);
     assert_ne!(first["branch"], second["branch"]);
     for worker in &workers {
@@ -1183,6 +1197,94 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
         .find(|task| task["child_thread_id"] == existing_home)
         .expect("existing worktree task");
     assert!(existing_task["remote"]["placement"] == *placement);
+
+    // A dependent launch uses the home-local worker address on the wire,
+    // maps it to the executor's worker, and starts at its output commit.
+    let upstream_home = owner.snapshot["index"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["remote"]["threadId"] == upstream_target)
+        .expect("upstream task mapping")["child_thread_id"]
+        .clone();
+    assert_ne!(upstream_home, upstream_target);
+    let upstream_checkout = first["checkout"].as_str().unwrap();
+    fs::write(
+        PathBuf::from(upstream_checkout).join("upstream-result.txt"),
+        "upstream-only result\n",
+    )
+    .unwrap();
+    git(&["-C", upstream_checkout, "add", "upstream-result.txt"]);
+    git(&[
+        "-C",
+        upstream_checkout,
+        "commit",
+        "-m",
+        "upstream output",
+        "--quiet",
+    ]);
+    let upstream_head = git(&["-C", upstream_checkout, "rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(upstream_head, base);
+    let dependent = owner.command(
+        "task.delegate",
+        json!({"threadId":parent,"args":{
+            "prompt":"placement-writer-dependent", "client_request_id":"placement-writer-dependent",
+            "target":{"environmentId":discovery["serverId"],"projectId":project,"model":"fixture"},
+            "placement":{"mode":"isolated","upstreamThreadId":upstream_home}
+        }}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(dependent["result"]["status"], "accepted", "{dependent}");
+    let dependent_home = dependent["result"]["result"]["thread_id"].clone();
+    executor.until(|state| {
+        state["index"]["threads"].as_array().is_some_and(|threads| {
+            threads.iter().any(|thread| {
+                thread["placement"]["upstreamThreadId"] == upstream_target
+                    && thread["placement"]["phase"] == "ready"
+                    && thread["placement"]["baseCommit"] == upstream_head
+                    && thread["placement"]["checkout"]
+                        .as_str()
+                        .is_some_and(|checkout| {
+                            fs::read_to_string(
+                                PathBuf::from(checkout).join("fixture-prompts.jsonl"),
+                            )
+                            .ok()
+                            .is_some_and(|text| {
+                                text.ends_with('\n') && text.contains("placement-writer-dependent")
+                            })
+                        })
+            })
+        })
+    });
+    let dependent_placement = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["placement"]["upstreamThreadId"] == upstream_target)
+        .expect("dependent worker")["placement"]
+        .clone();
+    assert_eq!(dependent_placement["baseBranch"], first["branch"]);
+    assert_eq!(dependent_placement["baseCommit"], upstream_head);
+    assert_ne!(dependent_placement["branch"], first["branch"]);
+    let dependent_checkout = dependent_placement["checkout"].as_str().unwrap();
+    assert_eq!(
+        git(&["-C", dependent_checkout, "rev-parse", "HEAD"]).trim(),
+        upstream_head
+    );
+    assert_eq!(
+        fs::read_to_string(PathBuf::from(dependent_checkout).join("upstream-result.txt")).unwrap(),
+        "upstream-only result\n"
+    );
+    owner.until(|state| {
+        state["index"]["tasks"].as_array().is_some_and(|tasks| {
+            tasks.iter().any(|task| {
+                task["child_thread_id"] == dependent_home
+                    && task["remote"]["placement"] == dependent_placement
+            })
+        })
+    });
     assert_eq!(git(&["status", "--porcelain"]), original_status);
     assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]).trim(), "main");
     assert_eq!(
@@ -1190,7 +1292,7 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
             .lines()
             .filter(|line| line.starts_with("worktree "))
             .count(),
-        4
+        5
     );
     assert!(!repository.join("fixture-prompts.jsonl").exists());
     drop(owner);

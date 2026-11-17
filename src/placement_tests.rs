@@ -1451,6 +1451,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
     let fixture = Fixture::new("upstream-target");
     fixture.add_origin();
     let (mut target, connects) = fixture.state();
+    target.next_id = 100;
     target.catalog.default_model = Some(crate::session::AgentModel {
         provider: "cpa".into(),
         id: "fixture".into(),
@@ -1484,6 +1485,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
         .execute_peer_command("parent-device", &launch)
         .unwrap();
     let target_upstream = accepted["threadId"].as_u64().unwrap() as usize;
+    assert_ne!(target_upstream, upstream);
     let (send, receive) = mpsc::channel();
     send.send(Ok(json!({"status":"accepted","result":accepted})))
         .unwrap();
@@ -1509,7 +1511,26 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
     let upstream_placement = child_placement(&target, upstream_index).clone();
     assert_eq!(upstream_placement.phase, placement::PlacementPhase::Ready);
     let upstream_branch = upstream_placement.branch.clone().unwrap();
-    let upstream_head = upstream_placement.base_commit.clone().unwrap();
+    let upstream_checkout = PathBuf::from(upstream_placement.checkout.as_ref().unwrap());
+    std::fs::write(
+        upstream_checkout.join("upstream-result.txt"),
+        "upstream result\n",
+    )
+    .unwrap();
+    fixture.git(&upstream_checkout, &["add", "upstream-result.txt"]);
+    fixture.git(
+        &upstream_checkout,
+        &["commit", "-m", "upstream result", "--quiet"],
+    );
+    let upstream_head = fixture
+        .git(&upstream_checkout, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    assert_ne!(
+        upstream_head,
+        upstream_placement.base_commit.as_deref().unwrap(),
+        "the selected upstream output must differ from the default base"
+    );
     // Carry the executor's ready status home the same way its peer wait does.
     let (send, receive) = mpsc::channel();
     send.send(Ok(json!({
@@ -1559,7 +1580,6 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
         json!(target_upstream),
         "the home task id must map to the target's acknowledged worker"
     );
-    let upstream_checkout = PathBuf::from(upstream_placement.checkout.as_ref().unwrap());
     let accepted = target
         .execute_peer_command("parent-device", &dependent_launch)
         .unwrap();
@@ -1621,6 +1641,10 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
             .trim(),
         upstream_head,
         "the dependent worktree starts at the pinned base, not the advanced branch"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dependent_checkout.join("upstream-result.txt")).unwrap(),
+        "upstream result\n"
     );
     assert!(!dependent_checkout.join("advanced.txt").exists());
     assert_eq!(
