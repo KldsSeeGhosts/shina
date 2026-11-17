@@ -20,7 +20,7 @@ projections.
 
 Structural invalidation also includes tool-name and stopped-work changes.
 History prepends, retry/compaction changes, role/anchor/order changes and
-snapshot replacement rebuild the indexes. Existing row keys remain unchanged.
+snapshot replacement rebuild the indexes. Message-id row keys survive prepends.
 
 Completed visible turns now use Rune memos. Projection item deserialization
 notifies only the owning turn, so it stays correct across coalesced emissions
@@ -96,3 +96,9 @@ reset regression. All-target checking, formatting and diff checks pass.
 Exact-head CI and downloaded release verification remain required. Issue25
 stays open. This does not claim finer tool-row virtualization or completion
 of issue26.
+
+The first PR CI run passed integration tests but failed four UI tests that
+still queried the old positional element keys. Those tests now use message-id
+keys, with every original layout, clipboard, loading and ordering assertion
+retained. All four pass at their existing four widths. No production code or
+benchmark input changed in that correction.

@@ -18154,13 +18154,14 @@ pub(crate) mod tests {
             let clipboard = rune::clipboard::memory();
             rt.use_clipboard(&clipboard);
             rt.frame(0.0);
-            let key = "copy-code-1-1-0-0";
-            let (rect, _) = rt.presented(key).unwrap();
+            let thread = rt.state.current();
+            let key = format!("copy-code-{}-{}-0-0", thread.id, thread.messages[1].id);
+            let (rect, _) = rt.presented(&key).unwrap();
             assert!(
                 rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
                 "{width}: {rect:?}"
             );
-            press(&mut rt, key);
+            press(&mut rt, &key);
             assert_eq!(
                 clipboard.text().as_deref().map(|text| text.as_str()),
                 Some("let ready = true;")
@@ -18180,12 +18181,17 @@ pub(crate) mod tests {
             // Reveal the top of the conversation to exercise the user code header.
             rt.wheel(width - 80.0, 200.0, 2000.0);
             rt.frame(1.0);
-            press(&mut rt, "copy-code-user-1-0-0");
+            let thread = rt.state.current();
+            let user_key = format!("copy-code-user-{}-{}-0", thread.id, thread.messages[0].id);
+            let key = format!(
+                "copy-code-{}-{}-0-diff-{diff_start}",
+                thread.id, thread.messages[1].id
+            );
+            press(&mut rt, &user_key);
             assert_eq!(
                 clipboard.text().as_deref().map(|text| text.as_str()),
                 Some("let ready = true;")
             );
-            let key = format!("copy-code-1-1-0-diff-{diff_start}");
             rt.wheel(width - 80.0, 400.0, -2000.0);
             rt.frame(2.0);
             let (rect, _) = rt.presented(&key).unwrap();
