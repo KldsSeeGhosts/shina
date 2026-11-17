@@ -110,6 +110,9 @@ impl Catalog {
             }
             return Ok(None);
         };
+        if index["version"] != INDEX_VERSION {
+            return Err("Unsupported index version.".into());
+        }
         let catalog: Self = serde_json::from_value(value.clone())
             .map_err(|e| format!("Invalid identity catalog: {e}"))?;
         catalog.validate()?;
@@ -143,6 +146,7 @@ impl Catalog {
             .as_array()
             .ok_or("Invalid project list.")?;
         let canonical_projects = canonical_project_aliases(projects)?;
+        let mut checkout_owners = BTreeMap::new();
         for project in projects {
             let id = project["id"]
                 .as_u64()
@@ -154,6 +158,12 @@ impl Catalog {
             let canonical = canonical_projects
                 .get(&id.to_string())
                 .ok_or("Project alias was not canonicalized.")?;
+            let uid = self.checkout_uid(id).expect("checked checkout identity");
+            if let Some(previous) = checkout_owners.insert(uid, canonical)
+                && previous != canonical
+            {
+                return Err(format!("Project {id} has a checkout identity collision."));
+            }
             if self.checkout_uid(id)
                 != self.checkout_uid(
                     canonical
@@ -1104,6 +1114,9 @@ pub(crate) fn decorate_index(connection: &Connection, index: &mut Value) -> Resu
     let Some(catalog) = load_catalog(connection)? else {
         return Ok(());
     };
+    if index["version"] != 3 && index["version"] != 4 && index["version"] != INDEX_VERSION {
+        return Err("Unsupported index version.".into());
+    }
     catalog.annotate_index(index);
     Ok(())
 }
@@ -1174,11 +1187,14 @@ fn receipt_subjects(connection: &Connection) -> Result<Vec<String>, String> {
 /// legacy documents have been imported. The transaction publishes the sidecar
 /// and the version 5 index together.
 pub(crate) fn ensure_database(directory: &Path, connection: &mut Connection) -> Result<(), String> {
-    if load_catalog(connection)?.is_some() {
+    if let Some(catalog) = load_catalog(connection)? {
         if let Some((index, _)) = read_index(connection)? {
-            if index["version"] == INDEX_VERSION || index["identity"].is_object() {
-                validate_sidecar_index(connection, &index)?;
-            }
+            validate_sidecar_index(connection, &index)?;
+        }
+        if controller_from_disk(directory)
+            .is_some_and(|controller| controller != catalog.controller_id)
+        {
+            return Err("The saved controller identity does not match server-id. Restore the matched backup.".into());
         }
         let subjects = receipt_subjects(connection)?;
         if !subjects.is_empty() {
@@ -1263,6 +1279,12 @@ pub fn migrate_file_index(directory: &Path, index: &Value) -> Result<Value, Stri
     if directory.join("state.sqlite").exists() {
         return Err("A durable profile must migrate identities through SQLite.".into());
     }
+    // Identity/reference checks do not validate every saved model record.
+    // Reuse restore validation without starting a runtime or saving anything.
+    crate::model::State::validate_import(
+        directory,
+        &BTreeMap::from([("index.json".into(), index.clone())]),
+    )?;
     let source_path = directory.join("index.json");
     let source_bytes = std::fs::read(&source_path).map_err(|e| e.to_string())?;
     let source_sha = format!("{:x}", Sha256::digest(&source_bytes));
@@ -1469,6 +1491,28 @@ mod tests {
         }]})
     }
 
+    fn legacy_content(mut index: Value) -> Value {
+        let object = index.as_object_mut().unwrap();
+        object.remove("identity");
+        object.insert("version".into(), json!(4));
+        for (field, added) in [
+            ("captains", &["captainUid"][..]),
+            ("projects", &["checkoutUid"][..]),
+            ("threads", &["threadUid"][..]),
+            ("threadViews", &["threadUid"][..]),
+            ("tasks", &["taskUid"][..]),
+            ("captainReports", &["captainUid", "threadUid"][..]),
+            ("captainQuestionAnswers", &["captainUid", "threadUid"][..]),
+        ] {
+            for record in index[field].as_array_mut().into_iter().flatten() {
+                for key in added {
+                    record.as_object_mut().unwrap().remove(*key);
+                }
+            }
+        }
+        index
+    }
+
     fn profile_dir(name: &str) -> PathBuf {
         let directory = crate::store::directory().unwrap().join(format!(
             "{name}-{}-{}",
@@ -1607,6 +1651,7 @@ mod tests {
         assert_eq!(migrated["captainQuestionAnswers"][0]["id"], "crew-answer-1");
         assert_eq!(migrated["captainBooks"]["0"]["DOC.md"]["revision"], 3);
         assert_eq!(migrated["commandReceipts"], original["commandReceipts"]);
+        assert_eq!(legacy_content(migrated), original);
 
         let mut replayed = original;
         let again = migrate_index(
@@ -1789,6 +1834,12 @@ mod tests {
             database.read("routines.json").unwrap().unwrap()["routines"][0]["active_delivery"],
             "routine-7-50"
         );
+        database.test_connection(|connection| {
+            let saved = crate::projection_store::read(connection, "index.json")
+                .unwrap()
+                .unwrap();
+            assert_eq!(legacy_content(saved), original);
+        });
 
         let identity = database.identity().unwrap();
         assert_eq!(
@@ -2043,17 +2094,153 @@ mod tests {
     }
 
     #[test]
-    fn file_only_index_gate_migrates_once_after_a_verified_backup() {
-        let directory = profile_dir("identity-file-only");
-        let mut index = fixture();
-        index["captains"][3]["name"] = json!("Deleted Captain 3");
-        let source = index.to_string().into_bytes();
-        std::fs::write(directory.join("index.json"), &source).unwrap();
+    fn database_rejects_a_future_index_without_losing_its_fields() {
+        let directory = schema_seven_profile("identity-future-database", &fixture(), &routines());
+        let database = Database::open(&directory).unwrap();
+        let mut future = database.read("index.json").unwrap().unwrap();
+        future["version"] = json!(INDEX_VERSION + 1);
+        future["futureField"] = json!({"preserve":"newer-format-data"});
+        database.test_connection(|connection| {
+            crate::projection_store::write(connection, "index.json", &future).unwrap();
+        });
+        drop(database);
+        let error = match Database::open(&directory) {
+            Ok(_) => panic!("a future index opened"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Unsupported index version"), "{error}");
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        assert_eq!(
+            crate::projection_store::read(&connection, "index.json")
+                .unwrap()
+                .unwrap(),
+            future
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_projection_upgrades_but_future_projection_is_not_rewritten() {
+        let legacy = fixture();
+        let directory = schema_seven_profile("identity-workspace-projection", &legacy, &routines());
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        crate::projection_store::write(&connection, "workspace-index", &legacy).unwrap();
+        crate::projection_store::write(&connection, "workspace", &json!({"threads":[]})).unwrap();
+        drop(connection);
+        let database = Database::open(&directory).unwrap();
+        let projection = database.projection().unwrap().unwrap();
+        assert_eq!(projection["index"]["version"], INDEX_VERSION);
+        assert_eq!(
+            projection["index"]["identity"]["captainIds"],
+            database.identity().unwrap()["captainIds"]
+        );
+        database.test_connection(|connection| {
+            assert_eq!(
+                crate::projection_store::read(connection, "workspace-index")
+                    .unwrap()
+                    .unwrap(),
+                legacy
+            );
+        });
+        let mut future = legacy;
+        future["version"] = json!(INDEX_VERSION + 1);
+        future["futureField"] = json!("keep this projection");
+        database.test_connection(|connection| {
+            crate::projection_store::write(connection, "workspace-index", &future).unwrap();
+        });
+        assert!(
+            database
+                .projection()
+                .unwrap_err()
+                .contains("Unsupported index version")
+        );
+        database.test_connection(|connection| {
+            assert_eq!(
+                crate::projection_store::read(connection, "workspace-index")
+                    .unwrap()
+                    .unwrap(),
+                future
+            );
+        });
+    }
+
+    #[test]
+    fn database_rejects_a_changed_controller_without_rewriting_identity() {
+        let directory =
+            schema_seven_profile("identity-changed-controller", &fixture(), &routines());
+        let database = Database::open(&directory).unwrap();
+        let original = database.identity().unwrap();
+        drop(database);
         std::fs::write(
-            directory.join("routines.json"),
-            routines().to_string().as_bytes(),
+            directory.join("server-id"),
+            "44444444-4444-4444-8444-444444444444",
         )
         .unwrap();
+        let error = match Database::open(&directory) {
+            Ok(_) => panic!("a mismatched controller opened"),
+            Err(error) => error,
+        };
+        assert!(error.contains("controller"), "{error}");
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        assert_eq!(identity_value(&connection).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn distinct_canonical_checkouts_cannot_share_a_logical_identity() {
+        let mut index = fixture();
+        let mut catalog = migrate_index(
+            &mut index,
+            "33333333-3333-4333-8333-333333333333",
+            Some(&routines()),
+            None,
+        )
+        .unwrap();
+        catalog
+            .project_checkout_ids
+            .insert("3".into(), catalog.project_checkout_ids["1"].clone());
+        catalog.annotate_index(&mut index);
+        let error = Catalog::from_index(&index).unwrap_err();
+        assert!(error.contains("checkout identity collision"), "{error}");
+    }
+
+    #[test]
+    fn file_migration_rejects_invalid_records_before_rewriting_index() {
+        for field in ["title", "machine", "lifecycle"] {
+            let directory = profile_dir("identity-invalid-file-record");
+            let mut index =
+                legacy_content(crate::model::State::headless(directory.clone()).snapshot());
+            index["threads"][0].as_object_mut().unwrap().remove(field);
+            let bytes = index.to_string().into_bytes();
+            std::fs::write(directory.join("index.json"), &bytes).unwrap();
+            assert!(
+                crate::store::load_global(&directory, None).is_err(),
+                "invalid {field} was migrated"
+            );
+            assert_eq!(std::fs::read(directory.join("index.json")).unwrap(), bytes);
+        }
+        for (field, value) in [
+            ("threadViews", json!([{"id":1,"messages":[]}])),
+            ("runtimeInputs", json!(42)),
+            ("runtimeInputs", json!({"999":{}})),
+        ] {
+            let directory = profile_dir("identity-invalid-file-inputs");
+            let mut index =
+                legacy_content(crate::model::State::headless(directory.clone()).snapshot());
+            index[field] = value;
+            let bytes = index.to_string().into_bytes();
+            std::fs::write(directory.join("index.json"), &bytes).unwrap();
+            assert!(crate::store::load_global(&directory, None).is_err());
+            assert_eq!(std::fs::read(directory.join("index.json")).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn file_only_index_gate_migrates_once_after_a_verified_backup() {
+        let directory = profile_dir("identity-file-only");
+        let mut state = crate::model::State::headless(directory.clone());
+        state.captains = crate::captains::Captain::presets();
+        let index = legacy_content(state.snapshot());
+        let source = index.to_string().into_bytes();
+        std::fs::write(directory.join("index.json"), &source).unwrap();
         let migrated = crate::store::load_global(&directory, None)
             .unwrap()
             .unwrap();

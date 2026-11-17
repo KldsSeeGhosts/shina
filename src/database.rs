@@ -1820,12 +1820,11 @@ mod tests {
                 seq: 1,
             };
             database.begin().unwrap();
-            database
-                .write(
-                    "index.json",
-                    json!({"runtimeInputs":{"1":[{"text":"Only once"}]}}),
-                )
-                .unwrap();
+            // Vary the input payload without replacing the identity-bearing
+            // index with an incomplete document.
+            let mut index = database.read("index.json").unwrap().unwrap();
+            index["runtimeInputs"] = json!({"1":[{"text":"Only once"}]});
+            database.write("index.json", index).unwrap();
             let capture = outbox::Capture::begin();
             let (sender, receiver) = std::sync::mpsc::sync_channel(8);
             outbox::send(&sender, json!({"type":"prompt","message":"Only once"})).unwrap();

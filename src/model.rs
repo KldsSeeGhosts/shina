@@ -16405,7 +16405,17 @@ mod tests {
             old.threads.push(crew);
         }
         let mut index = old.snapshot();
+        index.as_object_mut().unwrap().remove("identity");
         index["version"] = 3.into();
+        for (field, uid) in [
+            ("captains", "captainUid"),
+            ("projects", "checkoutUid"),
+            ("threads", "threadUid"),
+        ] {
+            for record in index[field].as_array_mut().into_iter().flatten() {
+                record.as_object_mut().unwrap().remove(uid);
+            }
+        }
         for t in index["threads"].as_array_mut().unwrap() {
             t.as_object_mut().unwrap().remove("lifecycle");
             t["pinned"] = true.into();

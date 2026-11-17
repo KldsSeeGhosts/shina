@@ -38,10 +38,12 @@ IDs. Duplicate local project paths share one checkout ID while both numeric
 project aliases remain present.
 
 Missing references, alias conflicts, malformed IDs and unknown future index or
-schema versions block opening. File-only profiles use the same catalog in
-`index.json`; their pre-migration directory is copied to `backups/` and the
-new index is installed with the existing atomic JSON writer. Read-only
-snapshot loading upgrades a legacy index in memory only.
+schema versions block opening. Reopening also checks the controller against
+`server-id`; replacing that file cannot silently reassign the saved controller.
+File-only profiles validate saved records, history and queued inputs before
+writing the same catalog into `index.json`. Their pre-migration directory is
+copied to `backups/` and the new index is installed with the existing atomic
+JSON writer. Read-only snapshot loading upgrades a legacy index in memory only.
 
 ## Restore a matched backup
 
