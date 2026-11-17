@@ -611,6 +611,15 @@ impl State {
     /// grants. Held and released reservations never block; unmanaged
     /// (interactive) threads have no reservation and are unaffected.
     pub(super) fn admission_blocks_connect(&self, thread_id: usize) -> bool {
+        if self.threads.iter().any(|thread| {
+            thread.id == thread_id && thread.recovering_task && thread.session.is_some()
+        }) && self.tasks.iter().any(|task| {
+            task.child_thread_id == thread_id && task.remote.is_none() && task.recovering
+        }) {
+            // Reading a saved session is not a new provider turn. The thread's
+            // admission_blocked flag still fences prompt/native delivery.
+            return false;
+        }
         self.scheduler.reservations.iter().any(|reservation| {
             reservation.state == ReservationState::Queued
                 && match &reservation.subject {
@@ -787,8 +796,16 @@ impl State {
     /// A stop receipt, disconnection, revocation or protocol error cannot
     /// prove provider settlement. Keep occupancy until a terminal result
     /// reaches the home, and also while this attempt still owes its stop.
-    fn remote_occupancy_unproven(task: &Task, attempt: &str) -> bool {
+    pub(super) fn remote_occupancy_unproven(task: &Task, attempt: &str) -> bool {
         task.remote.as_ref().is_some_and(|remote| {
+            if remote.thread_id.is_none()
+                && remote.rejected_launch == Some(remote.launch_command.command_id)
+                && remote.launch_command.method == "peer.thread.launch"
+                && remote.launch_command.params["origin"]["taskId"] == task.id
+                && remote.launch_command.params["origin"]["attemptId"] == attempt
+            {
+                return false;
+            }
             remote.stop_owed
                 && remote
                     .stop_attempt_id
@@ -992,6 +1009,28 @@ impl State {
         {
             self.sync_admission_flag(index);
         }
+    }
+
+    /// Only an authenticated rejected launch receipt proves this exact attempt
+    /// never allocated a target thread. Transport and authorization errors do
+    /// not call this path and retain their uncertain occupancy.
+    pub(super) fn release_rejected_remote_launch(&mut self, task_id: &str, attempt: &str) -> bool {
+        let ids: Vec<String> = self.scheduler.reservations.iter().filter(|reservation| {
+            reservation.state != ReservationState::Released
+                && matches!(&reservation.subject,
+                    Subject::Task { task_id: id, attempt_id } if id == task_id && attempt_id == attempt)
+        }).map(|reservation| reservation.id.clone()).collect();
+        for id in &ids {
+            if let Some(index) = self
+                .scheduler
+                .reservations
+                .iter()
+                .position(|reservation| &reservation.id == id)
+            {
+                self.release_reservation_at(index, "launch_rejected");
+            }
+        }
+        !ids.is_empty()
     }
 
     /// A rate-limit signal backs off the provider scope with bounded
@@ -2297,6 +2336,7 @@ mod tests {
             label: "Peer".into(),
             thread_id: Some(41),
             launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),
+            rejected_launch: None,
             stop_owed: false,
             stop_command_id: None,
             stop_attempt_id: None,
@@ -2687,6 +2727,77 @@ mod tests {
     }
 
     #[test]
+    fn a_requeued_granted_attempt_can_read_history_without_dispatching_work() {
+        let mut state = demo();
+        state.data_dir =
+            std::env::temp_dir().join(format!("shina-admission-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state.data_dir).unwrap();
+        state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"recover this attempt"}),
+            )
+            .unwrap();
+        let child_id = state.tasks[0].child_thread_id;
+        let child = state
+            .threads
+            .iter()
+            .position(|thread| thread.id == child_id)
+            .unwrap();
+        state.threads[child].session = Some("saved-session.jsonl".into());
+        state.tasks[0].state = TaskState::Queued;
+        state.tasks[0].started_at = None;
+        let reservation = &mut state.scheduler.reservations[0];
+        reservation.state = ReservationState::Queued;
+        reservation.granted_at = Some(1);
+        reservation.not_before = lifecycle::now() + 60_000;
+        let snapshot = state.snapshot();
+        let directory = state.data_dir.clone();
+        let mut restored = State::new(directory, false);
+        restored.demo = true;
+        restored.restore_global(&snapshot).unwrap();
+        let mut state = restored;
+        state.prepare_task_recovery();
+        state.admission_pump();
+        assert!(state.tasks[0].recovering);
+        assert!(state.threads[child].recovering_task);
+        assert!(state.threads[child].admission_blocked);
+        assert!(
+            !state.admission_blocks_connect(child_id),
+            "history-only recovery must not wait for a grant that itself waits for recovery"
+        );
+        let (pi, commands, _events) = Pi::test_connection();
+        let mut connection = Some(pi);
+        state.test_connect_pi = Some(Box::new(move |id, _| {
+            (id == child_id).then(|| connection.take()).flatten()
+        }));
+        state.demo = false;
+        state.runtime_enabled = true;
+        state.start_task_recovery();
+        assert!(state.threads[child].pi.is_some());
+        state.threads[child].apply(json!({
+            "type":"response","id":"history","command":"get_messages",
+            "success":true,"data":{"messages":[]},
+        }));
+        state.poll_tasks(Instant::now());
+        state.admission_pump();
+        assert!(!state.tasks[0].recovering);
+        assert_eq!(state.tasks[0].state, TaskState::Interrupted);
+        assert_eq!(
+            state.scheduler.reservations[0].state,
+            ReservationState::Released
+        );
+        assert!(
+            commands
+                .try_iter()
+                .all(|command| command["type"] != "prompt"),
+            "a recovery connection never dispatches the queued brief"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn a_cancelled_remote_attempt_stays_uncertain_until_the_stop_lands() {
         let mut state = demo();
         state.scheduler.limits.account_running = Some(1);
@@ -2914,6 +3025,7 @@ mod tests {
             label: "Peer".into(),
             thread_id: Some(41),
             launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),
+            rejected_launch: None,
             stop_owed,
             stop_command_id: stop_owed.then(uuid::Uuid::new_v4),
             stop_attempt_id: stop_attempt.map(str::to_owned),
@@ -2947,13 +3059,6 @@ mod tests {
         ));
         state.threads[second].pending_injections.clear();
         state.admission_pump();
-        let reservation = reservation_for(&state, state.threads[second].id);
-        eprintln!(
-            "state={:?} reason={:?} active={}",
-            reservation.state,
-            reservation.release_reason,
-            state.admission_active(second)
-        );
         assert_eq!(
             reservation_for(&state, state.threads[second].id).state,
             ReservationState::Queued

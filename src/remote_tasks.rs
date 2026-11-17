@@ -803,6 +803,327 @@ mod tests {
         Ok(json!({"status":"accepted","result":value}))
     }
 
+    #[test]
+    fn admission_rejected_launch_receipt_releases_only_the_proven_absent_attempt() {
+        let mut state = fixture();
+        state.admission_pump();
+        let task = &state.tasks[0];
+        let task_id = task.id.clone();
+        let attempt = task.attempt_id.clone();
+        let command = task.remote.as_ref().unwrap().launch_command.clone();
+        let reservation_id = state
+            .scheduler
+            .reservations
+            .iter()
+            .find(|reservation| {
+                matches!(&reservation.subject, admission::Subject::Task { task_id: id, attempt_id }
+                if *id == task_id && *attempt_id == attempt)
+            })
+            .unwrap()
+            .id
+            .clone();
+        let mut older = state
+            .scheduler
+            .reservations
+            .iter()
+            .find(|reservation| reservation.id == reservation_id)
+            .unwrap()
+            .clone();
+        older.id = "older-unproven-reservation".into();
+        older.subject = admission::Subject::Task {
+            task_id: task_id.clone(),
+            attempt_id: "older-unproven-attempt".into(),
+        };
+        older.state = admission::ReservationState::Held;
+        older.uncertain = true;
+        state.scheduler.reservations.push(older);
+        let receipt = json!({
+            "commandId":command.command_id,"hash":command.hash(),
+            "status":"rejected","result":{"error":"The admission queue is full."},
+        });
+        reply(&mut state, "peer.thread.launch", Ok(receipt.clone()));
+        state.admission_pump();
+        let reservation = state
+            .scheduler
+            .reservations
+            .iter()
+            .find(|reservation| reservation.id == reservation_id)
+            .unwrap();
+        assert_eq!(
+            reservation.state,
+            admission::ReservationState::Released,
+            "an authenticated rejection before allocation proves no worker occupies this slot"
+        );
+        assert_eq!(
+            reservation.release_reason.as_deref(),
+            Some("launch_rejected")
+        );
+        let released_at = reservation.released_at;
+        assert_eq!(
+            state
+                .scheduler
+                .reservations
+                .iter()
+                .find(|reservation| reservation.id == "older-unproven-reservation")
+                .unwrap()
+                .state,
+            admission::ReservationState::Held
+        );
+        reply(&mut state, "peer.thread.launch", Ok(receipt));
+        state.admission_pump();
+        assert_eq!(
+            state
+                .scheduler
+                .reservations
+                .iter()
+                .find(|reservation| reservation.id == reservation_id)
+                .unwrap()
+                .released_at,
+            released_at
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn admission_retry_after_rejected_launch_allocates_a_fresh_target_command() {
+        let mut state = fixture();
+        state.admission_pump();
+        let original = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .launch_command
+            .clone();
+        let rejected = json!({
+            "commandId":original.command_id,"hash":original.hash(),
+            "status":"rejected","result":{"error":"The admission queue is full."},
+        });
+        reply(&mut state, "peer.thread.launch", Ok(rejected));
+        state.admission_pump();
+        assert_eq!(state.tasks[0].state, TaskState::Failed);
+        // The durable proof is not the scheduler's bounded released-audit
+        // tail. It must remain usable after that tail is pruned and restored.
+        state
+            .scheduler
+            .reservations
+            .retain(|reservation| reservation.state != admission::ReservationState::Released);
+        let snapshot = state.snapshot();
+        let mut restored = State::new(state.data_dir.clone(), false);
+        restored.demo = true;
+        restored.restore_global(&snapshot).unwrap();
+        // Peer credentials/capabilities live in their own durable registry,
+        // not the task/index snapshot.
+        restored.peers = state.peers.clone();
+        let mut state = restored;
+        let child = state.tasks[0].child_thread_id;
+        let result = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({
+                    "thread_id":child, "message":"try this brief after capacity is available",
+                    "client_request_id":"retry-after-launch-refusal",
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["status"], "queued", "{result}");
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert_ne!(
+            remote.launch_command.command_id, original.command_id,
+            "a new attempt cannot replay the previous launch's durable rejection"
+        );
+        assert_eq!(
+            remote.launch_command.params["origin"]["attemptId"],
+            state.tasks[0].attempt_id
+        );
+        assert!(
+            remote.launch_command.params["brief"]
+                .as_str()
+                .unwrap()
+                .contains("try this brief after capacity is available")
+        );
+        assert!(
+            remote.send_command.is_none(),
+            "there is no executor thread to send to yet"
+        );
+        let command = remote.launch_command.clone();
+        let replay = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({
+                    "thread_id":child, "message":"try this brief after capacity is available",
+                    "client_request_id":"retry-after-launch-refusal",
+                }),
+            )
+            .unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            state.tasks[0].remote.as_ref().unwrap().launch_command,
+            command
+        );
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let operation = state
+            .task_operations
+            .iter()
+            .find(|operation| operation.request_key == "retry-after-launch-refusal")
+            .unwrap();
+        assert_eq!(operation.transport, "accepted");
+        assert_eq!(operation.acceptance, "not_observed");
+        assert_eq!(
+            operation.delivery_id.as_deref(),
+            Some(command.command_id.to_string().as_str())
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn admission_unknown_remote_outcomes_refuse_new_attempts_without_new_slots() {
+        let mut state = fixture();
+        state.admission_pump();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            Err("Authentication denied after an unknown launch outcome.".into()),
+        );
+        state.admission_pump();
+        let child = state.tasks[0].child_thread_id;
+        let attempt = state.tasks[0].attempt_id.clone();
+        let command = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .launch_command
+            .clone();
+        let scheduler = serde_json::to_value(&state.scheduler).unwrap();
+        for retry in 0..3 {
+            let error = state
+                .mcp_call(
+                    1,
+                    "task_send",
+                    &json!({
+                        "thread_id":child,"message":"do not replace unverified work",
+                        "client_request_id":format!("unverified-retry-{retry}"),
+                    }),
+                )
+                .unwrap_err();
+            assert!(error.contains("unproven occupancy"), "{error}");
+            assert_eq!(state.tasks[0].attempt_id, attempt);
+            assert_eq!(
+                state.tasks[0].remote.as_ref().unwrap().launch_command,
+                command
+            );
+            assert_eq!(serde_json::to_value(&state.scheduler).unwrap(), scheduler);
+        }
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn admission_launch_evidence_uses_the_committed_peer_registry() {
+        for registered in [false, true] {
+            let mut state = fixture();
+            state.admission_pump();
+            let database = crate::database::Database::open(&state.data_dir).unwrap();
+            if registered {
+                database.put_peer(&state.peers[0]).unwrap();
+                state.peers.clear();
+            }
+            state.peer_runtime.next_metadata_at = u64::MAX;
+            assert_eq!(
+                state.peer_supports_task_evidence(
+                    &state.tasks[0].remote.as_ref().unwrap().server_id
+                ),
+                registered,
+            );
+            let command = state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .launch_command
+                .clone();
+            reply(
+                &mut state,
+                "peer.thread.launch",
+                Ok(json!({
+                    "commandId":command.command_id,"hash":command.hash(),
+                    "status":"rejected","result":{"error":"The admission queue is full."},
+                })),
+            );
+            state.admission_pump();
+            assert_eq!(
+                state.scheduler.reservations[0].state,
+                if registered {
+                    admission::ReservationState::Released
+                } else {
+                    admission::ReservationState::Held
+                }
+            );
+            drop(database);
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn admission_incomplete_or_unbound_launch_refusals_do_not_release_capacity() {
+        for case in [
+            "transport",
+            "command",
+            "hash",
+            "missing",
+            "missing_error",
+            "interrupted",
+            "legacy",
+            "attempt",
+            "accepted",
+            "known_thread",
+        ] {
+            let mut state = fixture();
+            state.admission_pump();
+            let command = state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .launch_command
+                .clone();
+            let mut receipt = json!({
+                "commandId":command.command_id,"hash":command.hash(),
+                "status":"rejected","result":{"error":"target refused"},
+            });
+            match case {
+                "command" => receipt["commandId"] = json!(uuid::Uuid::new_v4()),
+                "hash" => receipt["hash"] = json!("wrong-payload"),
+                "missing" => {
+                    receipt.as_object_mut().unwrap().remove("commandId");
+                }
+                "missing_error" => receipt["result"] = json!({}),
+                "interrupted" => receipt["status"] = json!("interrupted"),
+                "legacy" => state.peers[0].capabilities["contracts"] = json!([]),
+                "attempt" => state.tasks[0].attempt_id = "different-attempt".into(),
+                "accepted" => receipt["status"] = json!("accepted"),
+                "known_thread" => state.tasks[0].remote.as_mut().unwrap().thread_id = Some(9),
+                _ => {}
+            }
+            let response = if case == "transport" {
+                Err("Authentication denied after an unknown launch outcome.".into())
+            } else {
+                Ok(receipt)
+            };
+            reply(&mut state, "peer.thread.launch", response);
+            state.admission_pump();
+            assert_eq!(
+                state.scheduler.reservations[0].state,
+                admission::ReservationState::Held,
+                "{case}"
+            );
+            assert!(state.scheduler.reservations[0].uncertain, "{case}");
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
+    }
+
     fn answer_evidence_fixture() -> (State, Value) {
         let mut state = fixture();
         reply(
@@ -1416,6 +1737,8 @@ mod tests {
             let remote = state.tasks[0].remote.as_mut().unwrap();
             remote.request = None;
             remote.send_command = None;
+            // Model executor settlement as well as the completed home state.
+            remote.state = RemoteState::Done;
         }
         state.tasks[0].finish(TaskState::Completed, "Done", "");
         state.tasks[0].delivered = true;
@@ -3304,6 +3627,10 @@ pub struct RemoteTask {
     pub label: String,
     pub thread_id: Option<usize>,
     pub launch_command: Command,
+    /// The exact saved launch was rejected before target allocation. Unlike
+    /// the scheduler's bounded audit tail, this proof survives until retry.
+    #[serde(default)]
+    pub rejected_launch: Option<uuid::Uuid>,
     pub stop_owed: bool,
     pub stop_command_id: Option<uuid::Uuid>,
     /// The attempt the caller observed when it owed this stop. A target that
@@ -4303,6 +4630,7 @@ impl State {
                 label: label.into(),
                 thread_id: Some(99),
                 launch_command: Command::new("peer.thread.launch", json!({})),
+                rejected_launch: None,
                 stop_owed: false,
                 stop_command_id: None,
                 stop_attempt_id: None,
@@ -4689,6 +5017,7 @@ impl State {
             label: peer.label.clone(),
             thread_id: None,
             launch_command: launch,
+            rejected_launch: None,
             stop_owed: false,
             stop_command_id: None,
             stop_attempt_id: None,
@@ -6219,7 +6548,7 @@ impl State {
             );
             if matches!(
                 command.method.as_str(),
-                "peer.thread.send" | "peer.thread.stop"
+                "peer.thread.launch" | "peer.thread.send" | "peer.thread.stop"
             ) {
                 dispatched_operations.push(command.command_id.to_string());
             }
@@ -6285,7 +6614,11 @@ impl State {
     }
 
     fn peer_supports_task_evidence(&self, server_id: &str) -> bool {
-        self.peers
+        let durable = crate::database::for_path(&self.data_dir.join("index.json"))
+            .map(|database| database.peers().unwrap_or_default());
+        durable
+            .as_ref()
+            .unwrap_or(&self.peers)
             .iter()
             .find(|peer| peer.server_id == server_id)
             .is_some_and(|peer| {
@@ -6469,8 +6802,17 @@ impl State {
             })
             .collect();
         let mut document_requests = Vec::new();
-        let evidence_servers: HashSet<String> = self
-            .peers
+        let evidence_peers = match crate::database::for_path(&self.data_dir.join("index.json")) {
+            Some(database) => match database.peers() {
+                Ok(peers) => peers,
+                Err(error) => {
+                    self.storage_error = Some(error);
+                    Vec::new()
+                }
+            },
+            None => self.peers.clone(),
+        };
+        let evidence_servers: HashSet<String> = evidence_peers
             .iter()
             .filter(|peer| {
                 peer.capabilities["contracts"]
@@ -6488,6 +6830,7 @@ impl State {
         let mut rejected_operations: Vec<(String, String)> = Vec::new();
         let mut peer_inputs: Vec<(String, PeerReplySource, Value)> = Vec::new();
         let mut completed_operations: Vec<(String, String, Option<String>, TaskState)> = Vec::new();
+        let mut rejected_launches: Vec<(String, String)> = Vec::new();
         for (id, method, source, result) in ready {
             self.peer_runtime.pending.remove(&id);
             self.peer_runtime.followers.remove(&id);
@@ -6502,6 +6845,23 @@ impl State {
             if !source.matches(remote) {
                 continue;
             }
+            if method == "peer.thread.launch"
+                && source.thread_id.is_none()
+                && remote.thread_id.is_none()
+                && evidence_servers.contains(&remote.server_id)
+                && let Ok(receipt) = &result
+                && receipt["status"] == "rejected"
+                && receipt["commandId"] == remote.launch_command.command_id.to_string()
+                && receipt["hash"] == remote.launch_command.hash()
+                && receipt["result"]["threadId"].is_null()
+                && receipt["result"]["error"].is_string()
+                && remote.launch_command.params["origin"]["taskId"] == task.id
+                && remote.launch_command.params["origin"]["attemptId"] == task.attempt_id
+            {
+                remote.rejected_launch = Some(remote.launch_command.command_id);
+                rejected_launches.push((task.id.clone(), task.attempt_id.clone()));
+            }
+            let launch_delivery = remote.launch_command.command_id.to_string();
             let send_delivery = remote
                 .send_command
                 .as_ref()
@@ -6564,6 +6924,10 @@ impl State {
                     };
                     match method {
                         "peer.thread.launch" => {
+                            accepted_operations.push((
+                                launch_delivery.clone(),
+                                evidence_servers.contains(&remote.server_id),
+                            ));
                             remote.thread_id = value["threadId"]
                                 .as_u64()
                                 .and_then(|n| usize::try_from(n).ok());
@@ -6797,7 +7161,9 @@ impl State {
                     }
                 }
                 Err(error) => {
-                    let operation_delivery = if method == "peer.thread.send" {
+                    let operation_delivery = if method == "peer.thread.launch" {
+                        Some(&launch_delivery)
+                    } else if method == "peer.thread.send" {
                         send_delivery.as_ref()
                     } else if method == "peer.thread.stop" {
                         stop_delivery.as_ref()
@@ -6891,6 +7257,9 @@ impl State {
                     }
                 }
             }
+        }
+        for (task_id, attempt) in rejected_launches {
+            changed |= self.release_rejected_remote_launch(&task_id, &attempt);
         }
         for (delivery, evidence_supported) in accepted_operations {
             changed |= self.mark_operation_transport_accepted(&delivery, "peer_receipt");

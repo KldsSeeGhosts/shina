@@ -61,3 +61,51 @@ test-contract update.
 After integrating main `6eff805`, the final production tree builds with all
 targets and all 129 server-runtime integration tests pass. Formatting and diff
 checks pass. The exact-head aggregate unit run remains a required PR CI gate.
+
+## Exact-head review corrections
+
+The independent review at `00cea3a` found a capacity leak after a remote launch
+was rejected before allocation, and a recovery interlock after a granted attempt
+returned to the queue. Both new regressions failed before their corrections.
+
+An authenticated rejected launch receipt now releases only its exact task and
+attempt. It must match the saved command UUID and payload hash, name no target
+thread, retain the saved origin task/attempt, and come from a peer with the
+durable input-evidence contract. Transport errors, authorization failures,
+interrupted or malformed replies, older attempts and legacy peers do not prove
+absence. An unrelated older uncertain reservation remains held.
+
+The task retains the exact rejected launch UUID independently of the scheduler's
+bounded released-audit tail. A deliberate retry can allocate a fresh launch
+command after this proof survives restart and audit pruning. Replaying that
+retry keeps its one command. Launch transport acceptance remains distinct from
+provider acceptance in the operation ledger.
+
+Unknown remote outcomes refuse a newer attempt rather than accumulating more
+reservations or replacing unverified work. No timeout or disconnected state
+frees that occupancy. Peer evidence checks read the committed peer registry,
+not a periodic in-memory copy. The paired-server regression reproduced that
+cache window before the lookup correction.
+
+A queued, previously granted attempt may connect solely to read its saved
+session during recovery. Its admission delivery flag remains blocked, so that
+connection cannot send the brief or native queued work. The regression restores
+the saved scheduler and session, reads history, observes interruption, and
+checks both reservation release and zero provider prompts.
+
+A live two-server contract fills the target's account and pending queue, rejects
+the remote launch without allocating a worker, verifies that the home slot
+releases, restarts the home, and explicitly retries after target capacity is
+available. The new command starts once, and a keyed replay does not start it
+again. This test uses fixture-owned profiles and the fake provider only.
+
+These corrections do not complete #23. The review's direct-input path for a
+finished delegated child and pending-bound checks on thread re-admission still
+need resolution. Exact-head aggregate CI, publication and the final acceptance
+audit remain gates. Published migrations 008/009 and production authentication
+and CPA configuration are unchanged.
+
+At this checkpoint, the all-target build, formatting and diff checks pass.
+All 24 scheduler unit tests, 63 remote-task tests and 47 task tests pass, as
+does the new paired-server launch-refusal/restart/retry contract. This is
+focused verification, not a replacement for the final full suite or CI.

@@ -1924,6 +1924,20 @@ impl State {
     }
 
     fn queue_task_attempt(&mut self, index: usize, message: &str) -> Result<(), String> {
+        let task = &self.tasks[index];
+        if task.state.finished()
+            && task.remote.is_some()
+            && (Self::remote_occupancy_unproven(task, &task.attempt_id)
+                || self.scheduler.reservations.iter().any(|reservation| {
+                    reservation.state == admission::ReservationState::Held
+                        && reservation.uncertain
+                        && matches!(&reservation.subject,
+                            admission::Subject::Task { task_id, attempt_id }
+                            if *task_id == task.id && *attempt_id != task.attempt_id)
+                }))
+        {
+            return Err("The previous remote attempt has unproven occupancy. Verify target settlement before starting another attempt.".into());
+        }
         let parent = self.tasks[index].parent_thread_id;
         if self.tasks[index].state.finished() {
             self.check_task_capacity(parent)?;
@@ -2348,17 +2362,33 @@ impl State {
                 self.attach_operation_target_attempt(&operation_scope, key, &attempt_id);
             }
             let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
-            remote.send_command = Some(crate::protocol::Command::new(
-                "peer.thread.send",
-                json!({"threadId":remote.thread_id,"message":message_with_context,
-                    "delivery":"attempt","attemptId":attempt_id}),
-            ));
-            let command_id = remote
-                .send_command
-                .as_ref()
-                .expect("send command")
-                .command_id
-                .to_string();
+            let command_id = if remote.thread_id.is_none()
+                && remote.rejected_launch == Some(remote.launch_command.command_id)
+            {
+                // This launch provably created no target. A deliberate new
+                // attempt needs a new command; replaying the old command would
+                // return its immutable rejected receipt forever.
+                let mut params = remote.launch_command.params.clone();
+                params["brief"] = json!(message_with_context);
+                params["origin"]["attemptId"] = json!(attempt_id);
+                remote.launch_command = crate::protocol::Command::new("peer.thread.launch", params);
+                remote.rejected_launch = None;
+                remote.send_command = None;
+                remote.last_error = None;
+                remote.launch_command.command_id.to_string()
+            } else {
+                remote.send_command = Some(crate::protocol::Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":remote.thread_id,"message":message_with_context,
+                        "delivery":"attempt","attemptId":attempt_id}),
+                ));
+                remote
+                    .send_command
+                    .as_ref()
+                    .expect("send command")
+                    .command_id
+                    .to_string()
+            };
             remote.state = RemoteState::Launching;
             remote.next_retry_at = 0;
             if let Some(key) = operation_key {

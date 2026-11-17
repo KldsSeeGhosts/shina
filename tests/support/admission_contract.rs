@@ -519,6 +519,159 @@ fn mcp_delegate_calls_share_the_one_account_limit() {
 }
 
 #[test]
+fn rejected_remote_launch_releases_capacity_and_retries_once_after_restart() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let (discovery, mut there, mut here, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/admission-launch-refusal.git",
+    );
+    hello(&mut there, "refused-launch-target");
+    hello(&mut here, "refused-launch-home");
+    captain_open(&mut there, "Target capacity");
+    scheduling_configure(
+        &mut there,
+        json!({"limits":{
+            "accountRunning":1,"accountPending":1,
+        }}),
+    );
+    let first = accepted(&there.command(
+        "captain.crew.create",
+        json!({"captain":0,"title":"Holding target capacity",
+            "input":{"text":"queue-wait-fixture"}}),
+        uuid::Uuid::new_v4(),
+    ));
+    let first_id = first["threadId"].as_u64().unwrap().to_string();
+    there.until(|state| state["directories"][&first_id].is_string());
+    let first_prompts = PathBuf::from(there.snapshot["directories"][&first_id].as_str().unwrap())
+        .join("fixture-prompts.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&first_prompts)
+        .unwrap_or_default()
+        .contains("queue-wait-fixture")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the target's held provider did not start"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let queued = accepted(&there.command(
+        "captain.crew.create",
+        json!({"captain":0,"title":"Filling target queue",
+            "input":{"text":"target-queued-capacity-fixture"}}),
+        uuid::Uuid::new_v4(),
+    ));
+    assert_eq!(queued["admission"]["state"], "queued", "{queued}");
+    scheduling_configure(&mut here, json!({"limits":{"accountRunning":1}}));
+    let delegated = delegate_fixture(
+        &mut here,
+        &parent,
+        "must be refused before target allocation",
+        "refused-launch",
+        &discovery,
+    );
+    let task_id = delegated["result"]["result"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    here.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == task_id && task["state"] == "failed")
+    });
+    let failed = task_record(&here, &task_id);
+    assert!(failed["remote"]["threadId"].is_null(), "{failed}");
+    let original = failed["remote"]["launchCommand"]["commandId"].clone();
+    assert_eq!(failed["remote"]["rejectedLaunch"], original, "{failed}");
+    let status = scheduling_status(&mut here);
+    assert_eq!(status["usage"]["account"]["held"], 0, "{status}");
+    assert_eq!(status["usage"]["account"]["queued"], 0, "{status}");
+    there.rpc("workspace.subscribe", json!({}), json!("refused-target"));
+    assert!(
+        there.snapshot["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|thread| thread["peerOrigin"]["taskId"] != task_id)
+    );
+    drop(here);
+    home.stop();
+    home.launch(&["serve"]);
+    let mut here = home.client(uuid::Uuid::new_v4());
+    hello(&mut here, "refused-launch-home-restart");
+    let status = scheduling_status(&mut here);
+    assert_eq!(status["usage"]["account"]["held"], 0, "{status}");
+    assert_eq!(
+        task_record(&here, &task_id)["remote"]["rejectedLaunch"],
+        original
+    );
+
+    // Free a target slot. A new deliberate attempt gets a new launch command,
+    // while retries of that attempt retain its single saved command.
+    scheduling_configure(
+        &mut there,
+        json!({"limits":{
+            "accountRunning":2,"accountPending":4,
+        }}),
+    );
+    let retry = json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"retry-after-target-refusal",
+        "client_request_id":"retry-refused-launch",
+    }});
+    let accepted_retry = here.command("task.send", retry.clone(), uuid::Uuid::new_v4());
+    assert_eq!(
+        accepted_retry["result"]["status"], "accepted",
+        "{accepted_retry}"
+    );
+    let fresh = accepted_retry["result"]["result"]["remote"]["launchCommand"]["commandId"].clone();
+    assert!(fresh.is_string());
+    assert_ne!(fresh, original);
+    here.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == task_id && task["state"] == "completed")
+    });
+    let operation = task_record(&here, &task_id);
+    assert_eq!(operation["remote"]["launchCommand"]["commandId"], fresh);
+    let status = scheduling_status(&mut here);
+    assert_eq!(status["usage"]["account"]["held"], 0, "{status}");
+    let replay = here.command("task.send", retry, uuid::Uuid::new_v4());
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    assert_eq!(
+        task_record(&here, &task_id)["remote"]["launchCommand"]["commandId"],
+        fresh
+    );
+    let target_id = task_record(&here, &task_id)["remote"]["threadId"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    there.rpc("workspace.subscribe", json!({}), json!("retry-target"));
+    let target_prompts = fs::read_to_string(
+        PathBuf::from(there.snapshot["directories"][&target_id].as_str().unwrap())
+            .join("fixture-prompts.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(
+        target_prompts
+            .lines()
+            .filter(|line| line.contains("retry-after-target-refusal"))
+            .count(),
+        1
+    );
+    home.stop();
+    target.stop();
+}
+
+#[test]
 fn a_cancelled_remote_task_stays_uncertain_until_the_stop_lands() {
     let mut home = Profile::new();
     let mut target = Profile::new();
