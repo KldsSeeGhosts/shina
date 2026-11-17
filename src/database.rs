@@ -99,6 +99,13 @@ impl Database {
             return Err(error("This profile already has an open database owner."));
         }
         std::fs::create_dir_all(directory).map_err(error)?;
+        // Reject a newer file profile before creating a SQLite file that an
+        // older binary could mistake for a completed durable migration.
+        if !directory.join("state.sqlite").exists()
+            && let Some(index) = crate::store::load(&directory.join("index.json")).map_err(error)?
+        {
+            crate::identity::validate_index_version(&index).map_err(error)?;
+        }
         let mut connection = Connection::open(directory.join("state.sqlite")).map_err(error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -119,6 +126,14 @@ impl Database {
             .map_err(error)?;
         if version > 8 {
             return Err(error("This schema requires a newer Shina binary."));
+        }
+        // Check the authoritative saved format before any schema migration.
+        if let Some((index, _)) = crate::identity::read_index(&connection).map_err(error)? {
+            crate::identity::validate_index_version(&index).map_err(error)?;
+        } else if let Some(index) =
+            crate::store::load(&directory.join("index.json")).map_err(error)?
+        {
+            crate::identity::validate_index_version(&index).map_err(error)?;
         }
         connection
             .execute_batch(
@@ -1777,19 +1792,25 @@ mod tests {
                     .unwrap()
                     .contains("Writes are blocked")
             );
-            let connection = Connection::open(directory.join("state.sqlite")).unwrap();
-            let count: i64 = connection
-                .query_row(
-                    "SELECT (SELECT count(*) FROM documents)+(SELECT count(*) FROM metadata)",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 0);
-            drop(connection);
+            if name == "index.json" {
+                assert!(!directory.join("state.sqlite").exists());
+            } else {
+                let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT (SELECT count(*) FROM documents)+(SELECT count(*) FROM metadata)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
             // A valid JSON object with the wrong version also cannot complete import.
             crate::store::write_atomic(&directory.join(name), b"{\"version\":999}").unwrap();
             assert!(Database::open(&directory).is_err());
+            if name == "index.json" {
+                assert!(!directory.join("state.sqlite").exists());
+            }
         }
     }
 

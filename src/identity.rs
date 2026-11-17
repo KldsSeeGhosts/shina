@@ -857,9 +857,32 @@ fn require_id(
     Ok(())
 }
 
+pub(crate) fn validate_index_version(index: &Value) -> Result<(), String> {
+    if index["version"] != 3 && index["version"] != 4 && index["version"] != INDEX_VERSION {
+        return Err("Unsupported index version.".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn read_index(connection: &Connection) -> Result<Option<(Value, String)>, String> {
-    if let Some(value) = crate::projection_store::read(connection, "index.json")? {
+    // Startup also uses this before migrations, including an empty database
+    // or an older schema that has documents but no row projection table.
+    let has_table = |name: &str| {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| e.to_string())
+    };
+    if has_table("projection_records")?
+        && let Some(value) = crate::projection_store::read(connection, "index.json")?
+    {
         return Ok(Some((value.clone(), value.to_string())));
+    }
+    if !has_table("documents")? {
+        return Ok(None);
     }
     let text: Option<String> = connection
         .query_row(
@@ -2116,6 +2139,58 @@ mod tests {
                 .unwrap(),
             future
         );
+    }
+
+    #[test]
+    fn future_index_is_rejected_before_schema_upgrade_or_first_import() {
+        let mut future = fixture();
+        future["version"] = json!(INDEX_VERSION + 1);
+        future["futureField"] = json!({"preserve":"before any schema write"});
+        let directory = schema_seven_profile("identity-future-schema-seven", &future, &routines());
+        assert!(Database::open(&directory).is_err());
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='identity_workspace'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(read_index(&connection).unwrap().unwrap().0, future);
+
+        let directory = profile_dir("identity-future-first-import");
+        let bytes = future.to_string().into_bytes();
+        std::fs::write(directory.join("index.json"), &bytes).unwrap();
+        assert!(Database::open(&directory).is_err());
+        assert!(!directory.join("state.sqlite").exists());
+        assert_eq!(std::fs::read(directory.join("index.json")).unwrap(), bytes);
+        // A prior failed startup may already have left an empty SQLite file.
+        drop(Connection::open(directory.join("state.sqlite")).unwrap());
+        assert!(Database::open(&directory).is_err());
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(directory.join("index.json")).unwrap(), bytes);
     }
 
     #[test]
