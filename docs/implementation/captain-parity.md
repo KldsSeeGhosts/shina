@@ -352,10 +352,28 @@ limit across three threads, checks released item references, applies a metadata
 update, reloads the evicted subscription and compares it with a fresh snapshot.
 All 13 client-history and 13 delta-projection tests pass.
 
-The candidate still needs combined-main verification and publication before a
-#25/#26 handoff. The benchmark also lacks an actual historical-executable
-comparison and a pinned KSG run using the same transcript; current reference
-numbers do not close those gaps.
+The candidate still needs CI and publication before a #25/#26 merge.
+The actual historical-executable and pinned same-transcript comparison is now
+recorded in [projection-benchmark.md](projection-benchmark.md), with full
+numbers and source/fixture hashes in the adjacent JSON. It uses compiled main
+`5c6e98a`, not the legacy cache proxy, and a clean KSG checkout at `4807bb1`.
+The client-path measurement also found an unnecessary full re-anchor pass for
+text-only message changes. That pass now runs only when message positions
+change or fresh assembly needs its final anchor remap. Fourteen client-history
+tests and thirteen non-benchmark delta tests cover the correction.
+
+Combined-main verification at `8475cc6` includes the identity prerequisite and
+strict server baseline. Build, formatting and the full serial test run passed:
+2,033 unit tests, 112 integration tests and two examples, with 12 opt-in tests
+ignored. The shared benchmark tooling under development is separate from that
+tested production code.
+
+The returned #23 scheduler candidate still needs current-main integration.
+Its `remote_occupancy_unproven` helper checks `stop_owed` and offline state, but
+merged #22 clears the owed transport stop on receipt and keeps the remote state
+`Running` until provider settlement. Integration must preserve the reservation
+through that intermediate state. A stored stop receipt alone cannot release
+capacity. The original candidate remains unchanged.
 
 ## Capy package investigation
 
