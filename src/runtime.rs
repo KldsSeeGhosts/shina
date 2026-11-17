@@ -709,6 +709,31 @@ impl RuntimeState {
             let mut index = self
                 .state
                 .snapshot_scoped(self.state.persistence_scope.as_ref());
+            // A scoped batch may be the first commit to see a thread that a
+            // tool or harness created inside this poll. The wire baseline only
+            // grows thread arrays on a full projection, so promote such a
+            // batch to one before stamping or diffing it.
+            if index["_partial"] == true {
+                let known = self.last_projection["threads"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let known_index = self.last_projection["index"]["threads"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let unknown = ["threads", "threadViews"]
+                    .iter()
+                    .flat_map(|field| index[*field].as_array().into_iter().flatten())
+                    .any(|thread| {
+                        let id = &thread["id"];
+                        !known.iter().any(|old| old["id"] == *id)
+                            || !known_index.iter().any(|old| old["id"] == *id)
+                    });
+                if unknown {
+                    index = self.state.snapshot_scoped(None);
+                }
+            }
             let next = self
                 .seq
                 .checked_add(1)
@@ -883,7 +908,7 @@ fn update_projection(current: &mut Value, delta: &Value) -> Value {
             continue;
         }
         if key == "index" {
-            let nested = update_projection(&mut current["index"], value);
+            let nested = update_index_projection(&mut current["index"], value);
             for mut patch in nested.as_array().unwrap().clone() {
                 patch["path"]
                     .as_array_mut()
@@ -921,6 +946,44 @@ fn update_projection(current: &mut Value, delta: &Value) -> Value {
                 patches.push(patch);
             }
             current[key] = value.clone();
+        }
+    }
+    json!(patches)
+}
+
+/// Partial index deltas carry metadata only for the threads changed in this
+/// batch. Merge those entries into the full index by id so neither the diff
+/// nor the stored baseline shrinks to the scoped subset.
+fn update_index_projection(current: &mut Value, delta: &Value) -> Value {
+    let mut patches = Vec::new();
+    for (key, value) in delta.as_object().unwrap() {
+        match key.as_str() {
+            "_partial" | "threadViews" | "runtimeInputs" => {}
+            "threads" => {
+                let threads = current["threads"].as_array_mut().unwrap();
+                for thread in value.as_array().unwrap() {
+                    let position = threads
+                        .iter()
+                        .position(|old| old["id"] == thread["id"])
+                        .expect("dirty known index thread");
+                    let change = crate::protocol::diff(&threads[position], thread);
+                    for mut patch in change.as_array().unwrap().clone() {
+                        let path = patch["path"].as_array_mut().unwrap();
+                        path.insert(0, json!(position.to_string()));
+                        path.insert(0, json!("threads"));
+                        patches.push(patch);
+                    }
+                    threads[position] = thread.clone();
+                }
+            }
+            _ => {
+                let change = crate::protocol::diff(&current[key], value);
+                for mut patch in change.as_array().unwrap().clone() {
+                    patch["path"].as_array_mut().unwrap().insert(0, json!(key));
+                    patches.push(patch);
+                }
+                current[key] = value.clone();
+            }
         }
     }
     json!(patches)
@@ -972,6 +1035,128 @@ mod tests {
             );
             runtime.shutdown().unwrap();
         }
+    }
+    #[test]
+    fn partial_projection_keeps_the_committed_index_and_wire_baseline_in_sync() {
+        let mut runtime = durable();
+        for _ in 0..4 {
+            let occupied: Vec<usize> = runtime.state.threads.iter().map(|t| t.id).collect();
+            runtime
+                .command(
+                    "maintainer",
+                    Command::new("thread.create", json!({"occupiedDrafts":occupied})),
+                )
+                .unwrap();
+        }
+        let committed = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .committed_snapshot()
+            .unwrap();
+        assert_eq!(
+            index_ids(&committed["state"]),
+            index_ids(&runtime.snapshot()["state"])
+        );
+        let occupied_after: Vec<usize> = runtime.state.threads.iter().map(|t| t.id).collect();
+        runtime
+            .command(
+                "maintainer",
+                Command::new("thread.create", json!({"occupiedDrafts":occupied_after})),
+            )
+            .unwrap();
+        let mut subscriber = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .committed_snapshot()
+            .unwrap()["state"]
+            .clone();
+        assert_eq!(index_ids(&subscriber).len(), 6);
+        let changed = runtime.state.threads[2].id;
+        runtime.state.threads[2].life.latest_user_message_at = Some(1);
+        runtime.state.persistence_scope = Some([changed].into_iter().collect());
+        let before = runtime.seq;
+        runtime.database.as_ref().unwrap().begin().unwrap();
+        runtime.persist(None, vec![]).unwrap();
+        assert!(runtime.seq > before);
+        let events = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .replay(before, runtime.seq)
+            .unwrap()
+            .unwrap();
+        for event in events {
+            crate::protocol::apply(&mut subscriber, event["patch"].clone()).unwrap();
+        }
+        let committed = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .committed_snapshot()
+            .unwrap()["state"]
+            .clone();
+        assert_eq!(index_ids(&committed), index_ids(&subscriber));
+        assert_eq!(
+            index_ids(&runtime.snapshot()["state"]),
+            index_ids(&subscriber)
+        );
+    }
+    #[test]
+    fn a_new_thread_discovered_by_a_scoped_poll_is_announced_with_a_full_projection() {
+        let mut runtime = durable();
+        for _ in 0..4 {
+            let occupied: Vec<usize> = runtime.state.threads.iter().map(|t| t.id).collect();
+            runtime
+                .command(
+                    "maintainer",
+                    Command::new("thread.create", json!({"occupiedDrafts":occupied})),
+                )
+                .unwrap();
+        }
+        let mut subscriber = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .committed_snapshot()
+            .unwrap()["state"]
+            .clone();
+        let id = runtime.state.next_id;
+        runtime.state.next_id += 1;
+        runtime.state.threads.push(crate::model::Thread::new(id));
+        runtime.state.persistence_scope = Some([id].into_iter().collect());
+        let before = runtime.seq;
+        runtime.database.as_ref().unwrap().begin().unwrap();
+        runtime.persist(None, vec![]).unwrap();
+        assert_eq!(runtime.seq, before + 1);
+        let events = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .replay(before, runtime.seq)
+            .unwrap()
+            .unwrap();
+        for event in events {
+            crate::protocol::apply(&mut subscriber, event["patch"].clone()).unwrap();
+        }
+        let committed = runtime
+            .database
+            .as_ref()
+            .unwrap()
+            .committed_snapshot()
+            .unwrap()["state"]
+            .clone();
+        assert_eq!(index_ids(&committed), index_ids(&subscriber));
+        assert!(index_ids(&subscriber).contains(&json!(id)));
+    }
+    fn index_ids(state: &Value) -> Vec<Value> {
+        state["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|thread| thread["id"].clone())
+            .collect()
     }
     fn runtime() -> RuntimeState {
         let mut state = State::headless(crate::store::directory().unwrap());
