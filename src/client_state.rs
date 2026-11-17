@@ -1194,7 +1194,10 @@ impl State {
     ) -> Result<(), String> {
         let mut state = Self::headless(directory.to_path_buf());
         if let Some(index) = documents.get("index.json") {
-            if index["version"] != 3 && index["version"] != 4 {
+            if index["version"] != 3
+                && index["version"] != 4
+                && index["version"] != crate::identity::INDEX_VERSION
+            {
                 return Err("Unsupported legacy index version.".into());
             }
             state.restore_global(index)?;
@@ -1353,6 +1356,7 @@ impl State {
         state.data_dir = directory;
         state.headless = true;
         state.persist_transcripts = true;
+        state.identity = crate::identity::Catalog::local(&state.data_dir);
         state
     }
 
@@ -1660,10 +1664,27 @@ impl State {
     }
 
     pub(crate) fn document_projection(&self) -> Value {
+        let identity = self.snapshot_identity();
+        let routines = (0..self.captains.len())
+            .map(|id| {
+                let mut views = json!(self.routines(id));
+                if let Some(views) = views.as_array_mut() {
+                    for routine in views {
+                        if let Some(uid) = routine["id"]
+                            .as_u64()
+                            .and_then(|id| identity.routine_uid(id))
+                        {
+                            routine["routineUid"] = json!(uid);
+                        }
+                    }
+                }
+                (id.to_string(), views)
+            })
+            .collect::<serde_json::Map<_, _>>();
         json!({
             "memories":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.memories(id)))).collect::<serde_json::Map<_,_>>(),
             "profile":self.user_profile(),
-            "routines":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.routines(id)))).collect::<serde_json::Map<_,_>>(),
+            "routines":routines,
             "background":self.background_status(),
             "memoryBackend":self.memory_backend_status(),
             "keepAwake":self.background_settings().keep_awake
@@ -5852,6 +5873,16 @@ mod tests {
     /// A client on "local" linked to a capable "server-b". The local workspace
     /// owns repository project 1 and folder project 2; server-b owns the same
     /// repository as project 7 and a folder twin for project 2.
+    fn reindex_test_projects(view: &mut Value, ids: &[usize]) {
+        let mut catalog: crate::identity::Catalog =
+            serde_json::from_value(view["index"]["identity"].clone()).unwrap();
+        for id in ids {
+            let key = id.to_string();
+            catalog.add_alias(crate::identity::PROJECT_CHECKOUT, key.clone(), &key);
+        }
+        catalog.annotate_index(&mut view["index"]);
+    }
+
     fn draft_routing_fixture() -> (
         State,
         tokio::sync::mpsc::Receiver<Command>,
@@ -5874,6 +5905,7 @@ mod tests {
             ),
             project(2, "notes", "/local/notes", None, 8),
         ]);
+        reindex_test_projects(&mut local_view, &[1, 2]);
         let mut remote_view = runtime.state.projection();
         remote_view["index"]["projects"] = json!([
             project(
@@ -5885,6 +5917,7 @@ mod tests {
             ),
             project(8, "notes", "/srv/b/notes", None, 5),
         ]);
+        reindex_test_projects(&mut remote_view, &[7, 8]);
         let mut state = State::new(PathBuf::new(), false);
         let (mut client, local) = crate::client::Client::test_connected(state.data_dir.clone());
         let (remote, commands) = crate::client::Client::test_connected(state.data_dir.clone());
@@ -7007,6 +7040,7 @@ mod tests {
             .unwrap()
             .push(json!({"id":9,"name":"New","path":"/srv/new","machine":"local"}));
         projection["index"]["nextProjectId"] = json!(10);
+        reindex_test_projects(&mut projection, &[9]);
         state.apply_projection(projection).unwrap();
         state.finish_project_selection();
         assert_eq!(state.project_scope, ProjectScope::Project(9));

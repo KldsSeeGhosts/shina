@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 39;
+pub const MINOR: u32 = 42;
+/// Stable workspace/owner/controller identities are additive at protocol 1.42.
+/// Scheduler and effective-capability minors remain independently owned.
+pub const IDENTITY_MINOR: u32 = 42;
+pub const IDENTITY: &str = "identity-v1";
 pub const CAPTAIN_PEER_DOCUMENTS_MINOR: u32 = 37;
 pub const CAPTAIN_PEER_DOCUMENTS: &str = "captain-peer-documents-v1";
 pub const PEER_TASK_FENCES_MINOR: u32 = 39;

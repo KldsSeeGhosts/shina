@@ -93,6 +93,31 @@ fn authorized(shared: &Shared, headers: &HeaderMap, method: &str) -> Option<Stri
     Some(device)
 }
 
+fn identity_for_read(shared: &Shared) -> Result<Value, String> {
+    let mut identity = shared.database.identity()?;
+    let live = shared.snapshots.borrow()["state"]["index"]["identity"].clone();
+    if live.is_object() {
+        for field in [
+            "captainIds",
+            "threadIds",
+            "projectCheckoutIds",
+            "taskIds",
+            "routineIds",
+        ] {
+            let mut merged = identity[field].as_object().cloned().unwrap_or_default();
+            merged.extend(
+                live[field]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            identity[field] = Value::Object(merged);
+        }
+    }
+    Ok(identity)
+}
+
 async fn upload_start(
     State(shared): State<Shared>,
     headers: HeaderMap,
@@ -936,9 +961,27 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if minor >= u64::from(protocol::PLACEMENT_MINOR) {
                             capabilities.push(protocol::PLACEMENT);
                         }
-                        Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
+                        if minor >= u64::from(protocol::IDENTITY_MINOR) {
+                            capabilities.push(protocol::IDENTITY);
+                        }
+                        match identity_for_read(&shared) {
+                            Err(error) => Err(error),
+                            Ok(identity) => {
+                                let logical_ids = json!({
+                                    "captains":identity["captainIds"],
+                                    "threads":identity["threadIds"],
+                                    "projectCheckouts":identity["projectCheckoutIds"],
+                                    "tasks":identity["taskIds"],
+                                    "routines":identity["routineIds"]
+                                });
+                                Ok(json!({"protocolMajor":protocol::MAJOR,"protocolMinor":minor,"projectionSchema":1,
                             "serverId":shared.discovery.server_id,"instanceId":shared.discovery.instance_id,"epoch":shared.discovery.epoch,
                             "binaryVersion":shared.discovery.binary_version,"deviceId":device,"serverTime":crate::lifecycle::now(),
+                            "workspaceId":identity["workspaceId"],"ownerId":identity["ownerId"],
+                            "controllerId":identity["controllerId"],"executorId":identity["executorId"],
+                            "identity":{"workspaceId":identity["workspaceId"],"ownerId":identity["ownerId"],
+                                "controllerId":identity["controllerId"],"executorId":identity["executorId"],
+                                "deviceId":device,"logicalIds":logical_ids,"auditSubjects":identity["auditSubjects"]},
                             "canUpdate":shared.database.authorize(&device,"server.requestUpdate",&json!({})).is_ok(),
                             "canApprove":shared.database.authorize(&device,"request.respond",&json!({})).is_ok(),
                             "canOperate":shared.database.authorize(&device,"thread.send",&json!({})).is_ok(),
@@ -946,6 +989,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                                 "fileAttachmentBytes":if staged_attachments {Some(crate::attachments::MAX_FILE_BYTES)} else {None},
                                 "historyLeaseCount":crate::history::LEASE_COUNT,"historyLeaseBytes":crate::history::LEASE_BYTES,"historyLeaseIdleSeconds":crate::history::LEASE_IDLE.as_secs(),
                                 "threadReplayEvents":crate::history::REPLAY_EVENTS,"threadReplayBytes":crate::history::REPLAY_BYTES}}))
+                            }
+                        }
                     }
                 } else if !hello {
                     Err("Send hello before other requests.".into())
@@ -2059,11 +2104,13 @@ async fn identity(State(shared): State<Shared>, headers: HeaderMap) -> Response 
     if headers.contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
     }
-    Json(
-        json!({"serverId":shared.discovery.server_id,"label":machine_label(),
+    // Pairing discovery is public. Domain identity and record aliases belong
+    // to the authenticated hello response, not this bootstrap endpoint.
+    Json(json!({
+        "serverId":shared.discovery.server_id,"label":machine_label(),
         "protocolMajor":protocol::MAJOR,"protocolMinor":shared.discovery.protocol_minor,
-        "peerDelegation":shared.discovery.protocol_minor >= 5}),
-    )
+        "peerDelegation":shared.discovery.protocol_minor >= 5
+    }))
     .into_response()
 }
 
@@ -2169,6 +2216,10 @@ mod tests {
             let directory = crate::store::directory().unwrap().join(name);
             std::fs::create_dir_all(&directory).unwrap();
             let database = crate::database::Database::open(&directory).unwrap();
+            let server_id = database.identity().unwrap()["controllerId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
             let mut state = crate::model::State::headless(directory.clone());
             state.load_global_for_test();
             state.catalog.models.push(crate::session::AgentModel::from_value(
@@ -2243,7 +2294,7 @@ mod tests {
                 uploads: Arc::default(),
                 answer_preparations: Arc::default(),
                 discovery: Discovery {
-                    server_id: uuid::Uuid::new_v4().to_string(),
+                    server_id,
                     instance_id: uuid::Uuid::new_v4().to_string(),
                     epoch: uuid::Uuid::new_v4().to_string(),
                     pid: std::process::id(),
@@ -2369,6 +2420,28 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+    async fn hello_with_token(fixture: &Fixture, token: &str) -> Value {
+        let mut request = format!("ws://{}/v1/ws", fixture.address)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(ClientMessage::Text(
+                json!({"jsonrpc":"2.0","id":1,"method":"hello","params":{
+                    "protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1
+                }})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let hello = next_json(&mut socket).await;
+        assert!(hello["error"].is_null(), "{hello}");
+        hello["result"].clone()
     }
 
     #[test]
@@ -5001,5 +5074,187 @@ mod tests {
             .await;
             assert!(refused.unwrap_err().contains("Update required"));
         });
+    }
+
+    #[tokio::test]
+    async fn public_identity_discovery_does_not_enumerate_domain_records() {
+        let fixture = Fixture::new("identity-public-discovery").await;
+        fixture
+            .local_command(
+                "captain.put",
+                json!({
+                    "record":crate::captains::Captain::presets()[0].to_value(),
+                    "project":null
+                }),
+            )
+            .await;
+        wait_until(|| {
+            fixture.shared.snapshots.borrow()["state"]["index"]["identity"]["captainIds"]["0"]
+                .is_string()
+        })
+        .await;
+        let response = crate::peer::http()
+            .unwrap()
+            .get(format!("http://{}/v1/identity", fixture.address))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let discovery: Value = response.json().await.unwrap();
+        let mut keys: Vec<_> = discovery
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "label",
+                "peerDelegation",
+                "protocolMajor",
+                "protocolMinor",
+                "serverId"
+            ]
+        );
+        assert_eq!(discovery["serverId"], fixture.shared.discovery.server_id);
+
+        fixture
+            .shared
+            .database
+            .issue_scoped_device("catalog-reader", "catalog-token", &["read", "paired"])
+            .unwrap();
+        let hello = hello_with_token(&fixture, "catalog-token").await;
+        assert!(hello["identity"]["logicalIds"]["captains"]["0"].is_string());
+        assert!(hello["workspaceId"].is_string());
+        assert!(hello["ownerId"].is_string());
+    }
+
+    #[tokio::test]
+    async fn two_authenticated_devices_share_one_domain_identity_and_revocation_does_not_change_it()
+    {
+        let fixture = Fixture::new("identity-two-devices").await;
+        fixture
+            .local_command(
+                "captain.put",
+                json!({
+                    "record":crate::captains::Captain::presets()[0].to_value(),
+                    "project":null
+                }),
+            )
+            .await;
+        wait_until(|| {
+            fixture.shared.snapshots.borrow()["state"]["index"]["identity"]["captainIds"]["0"]
+                .is_string()
+        })
+        .await;
+        fixture
+            .shared
+            .database
+            .issue_scoped_device("identity-device-a", "identity-token-a", &["read", "paired"])
+            .unwrap();
+        fixture
+            .shared
+            .database
+            .issue_scoped_device("identity-device-b", "identity-token-b", &["read", "paired"])
+            .unwrap();
+
+        let a = hello_with_token(&fixture, "identity-token-a").await;
+        let b = hello_with_token(&fixture, "identity-token-b").await;
+        assert_eq!(a["deviceId"], "identity-device-a");
+        assert_eq!(b["deviceId"], "identity-device-b");
+        assert_eq!(a["serverId"], a["controllerId"]);
+        assert_eq!(a["controllerId"], a["executorId"]);
+        assert_ne!(a["ownerId"], a["deviceId"]);
+        assert_eq!(a["workspaceId"], b["workspaceId"]);
+        assert_eq!(a["ownerId"], b["ownerId"]);
+        assert_eq!(a["controllerId"], b["controllerId"]);
+        assert_eq!(
+            a["identity"]["logicalIds"]["captains"]["0"],
+            b["identity"]["logicalIds"]["captains"]["0"]
+        );
+        assert_eq!(
+            a["identity"]["logicalIds"]["threads"]["1"],
+            b["identity"]["logicalIds"]["threads"]["1"]
+        );
+        assert!(
+            a["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == protocol::IDENTITY)
+        );
+        let snapshot = fixture.shared.snapshots.borrow().clone();
+        let projected = &snapshot["state"]["index"]["identity"];
+        assert_eq!(projected["workspaceId"], a["workspaceId"]);
+        assert_eq!(projected["ownerId"], a["ownerId"]);
+        assert_eq!(projected["controllerId"], a["controllerId"]);
+        let thread = &snapshot["state"]["index"]["threads"][0];
+        let thread_id = thread["id"].to_string();
+        assert_eq!(
+            thread["threadUid"],
+            a["identity"]["logicalIds"]["threads"][thread_id.as_str()]
+        );
+
+        let domain = fixture.shared.database.identity().unwrap();
+        assert!(
+            fixture
+                .shared
+                .database
+                .issue_device("mcp/captain/0", "not-a-device")
+                .is_err()
+        );
+        fixture.shared.database.revoke("identity-device-a").unwrap();
+        assert!(
+            fixture
+                .shared
+                .database
+                .device("identity-token-a")
+                .unwrap()
+                .is_none()
+        );
+        let after = hello_with_token(&fixture, "identity-token-b").await;
+        assert_eq!(after["workspaceId"], domain["workspaceId"]);
+        assert_eq!(after["ownerId"], domain["ownerId"]);
+        assert_eq!(after["identity"]["logicalIds"], a["identity"]["logicalIds"]);
+        assert_eq!(fixture.shared.database.identity().unwrap(), domain);
+    }
+
+    #[tokio::test]
+    async fn identity_capability_starts_at_protocol_42_without_claiming_other_minors() {
+        let older = Fixture::with_minor("identity-protocol-41", protocol::IDENTITY_MINOR - 1).await;
+        older
+            .shared
+            .database
+            .issue_scoped_device(
+                "identity-old-device",
+                "identity-old-token",
+                &["read", "paired"],
+            )
+            .unwrap();
+        let hello = hello_with_token(&older, "identity-old-token").await;
+        assert_eq!(hello["protocolMinor"], protocol::IDENTITY_MINOR - 1);
+        assert!(!crate::client::supports_identity(&hello));
+        for unavailable in [
+            protocol::PLACEMENT,
+            protocol::PROVIDER_UPDATES,
+            protocol::CAPTAIN_PEER_DOCUMENTS,
+        ] {
+            assert!(
+                hello["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|capability| capability == unavailable)
+            );
+        }
+        assert!(
+            !hello["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == protocol::IDENTITY)
+        );
     }
 }

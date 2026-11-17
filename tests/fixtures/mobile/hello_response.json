@@ -64,10 +64,30 @@
       "captain-events-v1",
       "provider-updates-v1",
       "captain-peer-documents-v1",
-      "placement-v1"
+      "placement-v1",
+      "identity-v1"
     ],
+    "controllerId": "<uuid>",
     "deviceId": "<uuid>",
     "epoch": "<epoch>",
+    "executorId": "<uuid>",
+    "identity": {
+      "auditSubjects": {},
+      "controllerId": "<uuid>",
+      "deviceId": "<uuid>",
+      "executorId": "<uuid>",
+      "logicalIds": {
+        "captains": {},
+        "projectCheckouts": {},
+        "routines": {},
+        "tasks": {},
+        "threads": {
+          "1": "<uuid>"
+        }
+      },
+      "ownerId": "<uuid>",
+      "workspaceId": "<uuid>"
+    },
     "instanceId": "<instanceId>",
     "limits": {
       "controlBytes": 1048576,
@@ -80,10 +100,12 @@
       "threadReplayBytes": 1048576,
       "threadReplayEvents": 128
     },
+    "ownerId": "<uuid>",
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 39,
+    "protocolMinor": 42,
     "serverId": "<serverId>",
-    "serverTime": "<time>"
+    "serverTime": "<time>",
+    "workspaceId": "<uuid>"
   }
 }
