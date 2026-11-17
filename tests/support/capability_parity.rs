@@ -798,6 +798,17 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
 fn remote_worker_capability_contract_over_a_real_pairing() {
     let mut home = Profile::new();
     let mut target = Profile::new();
+    fs::write(
+        target.root.join("Shina/harnesses.json"),
+        json!([
+            {"id":"fixture-acp-nomcp","name":"Fixture ACP without MCP",
+            "command":if cfg!(windows) { "python" } else { "python3" },
+            "args":["-u",target.root.join("fake_acp.py"),"--log",
+                target.root.join("acp-nomcp-log.jsonl"),"--no-mcp"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
     home.launch(&["serve"]);
     target.launch(&["serve"]);
     let mut owner = home.client(uuid::Uuid::new_v4());
@@ -928,6 +939,49 @@ fn remote_worker_capability_contract_over_a_real_pairing() {
     assert!(
         fixture_refusal(&workspace, "delegate_task", json!({"prompt":"x"}))
             .contains("remote worker")
+    );
+    executor.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("target-before-refusal"),
+    );
+    let target_threads = executor.snapshot["threads"].as_array().map_or(0, Vec::len);
+    owner.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("home-before-refusal"),
+    );
+    let home_threads = owner.snapshot["threads"].as_array().map_or(0, Vec::len);
+    let error = fixture_refusal(
+        &coordinator_directory,
+        "delegate_task",
+        json!({"prompt":"target must preflight ACP","client_request_id":"remote-no-mcp",
+            "target":{"environmentId":discovery["serverId"],"projectId":project,
+                "model":"fixture","harness":"fixture-acp-nomcp"}}),
+    );
+    assert!(
+        error.contains("cannot run fixture-acp-nomcp") && error.contains("neither HTTP nor stdio"),
+        "{error}"
+    );
+    owner.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("home-after-refusal"),
+    );
+    assert_eq!(
+        owner.snapshot["threads"].as_array().map_or(0, Vec::len),
+        home_threads,
+        "the origin must refuse a peer-advertised non-executable harness before allocating"
+    );
+    executor.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("target-after-refusal"),
+    );
+    assert_eq!(
+        executor.snapshot["threads"].as_array().map_or(0, Vec::len),
+        target_threads,
+        "the target must refuse an MCP-less ACP harness before allocating a thread"
     );
     target.stop();
 }

@@ -709,57 +709,11 @@ impl State {
     /// Execution options this caller could delegate with: local harnesses with
     /// availability, exact models and the per-peer equivalents.
     pub(crate) fn execution(&self, index: usize) -> Value {
-        let mut harnesses = Vec::new();
-        for harness in self.harness_ids() {
-            let mut entry = json!({"id": harness});
-            let (ready, reason) = match harness.as_str() {
-                "pi" => (
-                    self.catalog.error.is_none() || !self.catalog.models.is_empty(),
-                    self.catalog.error.clone(),
-                ),
-                "codex" => match crate::codex::process() {
-                    Ok(_) => (true, None),
-                    Err(error) => (false, Some(error)),
-                },
-                "claude" => match crate::claude::process() {
-                    Ok(_) => (true, None),
-                    Err(error) => (false, Some(error)),
-                },
-                _ => match self.harnesses.find(&harness).and_then(|agent| {
-                    crate::acp::probe(&agent).map(|capabilities| (agent, capabilities))
-                }) {
-                    Ok((_, capabilities)) => {
-                        let mcp = &capabilities["mcpCapabilities"];
-                        let available = mcp["http"] == true || mcp["stdio"] != false;
-                        entry["discovery"] = json!("probed");
-                        entry["mcp"] = json!({
-                            "available": available,
-                            "http": mcp["http"],
-                            "stdio": mcp["stdio"],
-                            "reason": (!available).then(|| "This ACP agent advertises neither HTTP nor stdio MCP. Shina cannot register its tools.".to_string()),
-                        });
-                        if available {
-                            (true, None)
-                        } else {
-                            (false, Some("This ACP agent supports neither HTTP nor stdio MCP. Shina cannot register its tools.".into()))
-                        }
-                    }
-                    Err(error) => {
-                        entry["discovery"] = json!("failed");
-                        (false, Some(error))
-                    }
-                },
-            };
-            entry["executable"] = json!(ready);
-            entry["reason"] = json!(reason);
-            entry["models"] = json!(
-                self.harness_models(&harness)
-                    .iter()
-                    .map(|model| json!({"id": model.id, "reasoning_levels": model.thinking_levels}))
-                    .collect::<Vec<_>>()
-            );
-            harnesses.push(entry);
-        }
+        let harnesses = self
+            .harness_ids()
+            .iter()
+            .map(|harness| self.harness_capability(harness))
+            .collect::<Vec<_>>();
         let peers = self
             .delegation_peers()
             .iter()
@@ -820,6 +774,79 @@ impl State {
                 "delegate_task creates delegated workers only. Independent crew roots on a linked machine are not implemented.".into(),
             )),
         })
+    }
+
+    /// One local harness probe used by both the caller record and the
+    /// capability table this account publishes to linked peers.
+    pub(super) fn harness_capability(&self, harness: &str) -> Value {
+        let (name, provider, protocol) = match harness {
+            "pi" => ("Pi".to_owned(), "cpa", "pi.rpc"),
+            "codex" => ("Codex".to_owned(), "codex", "codex.app-server"),
+            "claude" => ("Claude".to_owned(), "claude", "claude.stream-json"),
+            _ => {
+                let agent = self.harnesses.find(harness).ok();
+                (
+                    agent
+                        .as_ref()
+                        .map_or_else(|| harness.to_owned(), |agent| agent.name.clone()),
+                    harness,
+                    "acp",
+                )
+            }
+        };
+        let mut entry = json!({
+            "id": harness,
+            "name": name,
+            "provider": provider,
+            "protocol": protocol,
+        });
+        let (ready, reason) = match harness {
+            "pi" => (
+                self.catalog.error.is_none() || !self.catalog.models.is_empty(),
+                self.catalog.error.clone(),
+            ),
+            "codex" => match crate::codex::process() {
+                Ok(_) => (true, None),
+                Err(error) => (false, Some(error)),
+            },
+            "claude" => match crate::claude::process() {
+                Ok(_) => (true, None),
+                Err(error) => (false, Some(error)),
+            },
+            _ => match self.harnesses.find(harness).and_then(|agent| {
+                crate::acp::probe(&agent).map(|capabilities| (agent, capabilities))
+            }) {
+                Ok((_, capabilities)) => {
+                    let mcp = &capabilities["mcpCapabilities"];
+                    let available = mcp["http"] == true || mcp["stdio"] != false;
+                    entry["discovery"] = json!("probed");
+                    entry["mcp"] = json!({
+                        "available": available,
+                        "http": mcp["http"],
+                        "stdio": mcp["stdio"],
+                        "reason": (!available).then(|| "This ACP agent advertises neither HTTP nor stdio MCP. Shina cannot register its tools.".to_string()),
+                    });
+                    if available {
+                        (true, None)
+                    } else {
+                        (false, Some("This ACP agent supports neither HTTP nor stdio MCP. Shina cannot register its tools.".into()))
+                    }
+                }
+                Err(error) => {
+                    entry["discovery"] = json!("failed");
+                    (false, Some(error))
+                }
+            },
+        };
+        entry["executable"] = json!(ready);
+        entry["reason"] = json!(reason);
+        entry["models"] = json!(
+            self.harness_models(harness)
+                .iter()
+                .map(|model| json!({"id": model.id, "reasoning_levels": model.thinking_levels}))
+                .collect::<Vec<_>>()
+        );
+        entry
     }
 
     /// Placement modes the worker contract supports locally and on peers.
