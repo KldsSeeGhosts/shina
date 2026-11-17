@@ -191,11 +191,13 @@ fn placement_machine(s: &State, thread: usize, placement: &ThreadPlacement) -> S
     }
 }
 
-/// The checkout's kind in the status vocabulary. A shared checkout of a real project is read
-/// only; one without a project is the thread's private scratch folder.
+/// The checkout's kind in the status vocabulary. A shared checkout of a real project, the main
+/// one or a parent's existing worktree, is read only; one without a project is the thread's
+/// private scratch folder. `ThreadPlacement::read_only` decides, so the word matches the
+/// access the worker actually gets.
 fn placement_word(placement: &ThreadPlacement) -> &'static str {
     match placement.mode {
-        PlacementMode::Shared if placement.primary_checkout => "Read only",
+        PlacementMode::Shared if placement.read_only() => "Read only",
         PlacementMode::Shared => "Scratch folder",
         PlacementMode::Isolated => "Worktree",
         PlacementMode::Existing if placement.primary_checkout => "Main checkout",
@@ -283,7 +285,7 @@ pub(super) fn placement_block(
     let machine = placement_machine(s, thread, placement);
     let details = placement_details(placement, &machine);
     let glyph = match placement.mode {
-        PlacementMode::Shared if placement.primary_checkout => "lock",
+        PlacementMode::Shared if placement.read_only() => "lock",
         PlacementMode::Shared => "folder",
         PlacementMode::Isolated | PlacementMode::Existing => "branch",
     };

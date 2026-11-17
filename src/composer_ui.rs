@@ -935,36 +935,41 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     }
     if visible > 0 {
         controls = controls.child(machine_selector(s, p, icon_only(0)));
-        match &vcs_controls {
-            crate::model::ComposerVcsControls::Hidden => {}
-            crate::model::ComposerVcsControls::Editable {
-                mode,
-                base_branch,
-                start_from_origin,
-            } => {
-                controls = controls.child(env_mode_trigger(s, p, icon_only(0), *mode));
-                if *mode == crate::model::ThreadEnvMode::Worktree {
-                    controls = controls.child(base_branch_trigger(
-                        s,
-                        p,
-                        base_branch.as_deref(),
-                        *start_from_origin,
-                        branch_max_w,
-                    ));
-                }
-            }
-            crate::model::ComposerVcsControls::LockedWorktree {
-                branch,
-                worktree_path,
-            } => {
-                controls = controls.child(worktree_branch_indicator(
-                    p,
-                    branch.as_deref(),
-                    worktree_path,
-                    branch_max_w,
-                ));
-            }
+        if let crate::model::ComposerVcsControls::Editable { mode, .. } = &vcs_controls {
+            controls = controls.child(env_mode_trigger(s, p, icon_only(0), *mode));
         }
+    }
+    // The base branch stays in the strip when the machine and workspace move into the
+    // overflow menu, as KSG Code's `BranchToolbar` keeps `BranchToolbarBranchSelector`
+    // (`min-w-0 flex-initial`) beside the collapsed `RunContextSelector` below
+    // `@xl/composer-surface`. Its width is already in `vcs_fixed`, so it never displaces
+    // the blocks the resolver placed.
+    if let crate::model::ComposerVcsControls::Editable {
+        mode: crate::model::ThreadEnvMode::Worktree,
+        base_branch,
+        start_from_origin,
+    } = &vcs_controls
+    {
+        controls = controls.child(base_branch_trigger(
+            s,
+            p,
+            base_branch.as_deref(),
+            *start_from_origin,
+            branch_max_w,
+        ));
+    }
+    if visible > 0
+        && let crate::model::ComposerVcsControls::LockedWorktree {
+            branch,
+            worktree_path,
+        } = &vcs_controls
+    {
+        controls = controls.child(worktree_branch_indicator(
+            p,
+            branch.as_deref(),
+            worktree_path,
+            branch_max_w,
+        ));
     }
     if visible > 1 {
         controls = controls.child(captain_selector_trigger(s, p, icon_only(1)));
