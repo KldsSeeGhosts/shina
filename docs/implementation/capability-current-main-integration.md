@@ -31,7 +31,12 @@ metadata-only task when its cached record still advertised support.
 ## Verification and publication gates
 
 The combined all-target build, formatting and diff checks pass. The full serial
-unit/integration run and mobile TypeScript check are in progress.
+unit suite and all 126 integration tests pass, including the four live
+capability-parity cases, strict projection recovery and source-bound task
+evidence. The mobile SDK live test and TypeScript check pass. Locked mobile
+dependencies were installed without changing the lockfile. The complete
+verification command exited successfully on the merge's source tree; subsequent
+changes only record this evidence.
 
 The current base still uses protocol minor 45 and static per-coordinator
 admission. `capacity.scheduler.implemented` therefore remains false. If the
