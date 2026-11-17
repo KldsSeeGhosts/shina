@@ -249,9 +249,15 @@ impl Database {
                 receipt.result = json!({"error":"Server restarted before dispatch was confirmed. Review before retrying.","previousResult":receipt.result});
                 put_receipt(&tx, &receipt)?;
             }
+            tx.execute(
+                "UPDATE effect_outbox SET status='interrupted', error=?1
+                 WHERE kind='harness' AND status='pending'",
+                [crate::outbox::RESTARTED_BEFORE_DISPATCH],
+            )
+            .map_err(error)?;
             tx.execute_batch(
                 "UPDATE effect_outbox SET status='interrupted', error='Server restarted. Review before retrying.'
-                 WHERE kind='harness' AND status IN ('pending','dispatching');",
+                 WHERE kind='harness' AND status='dispatching';",
             ).map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -1233,6 +1239,26 @@ impl Database {
         Ok((events.len() as u64 == through - after).then_some(events))
     }
 
+    pub(crate) fn undispatched_prompt_runs(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let inner = self.0.lock().expect("database");
+        let mut stmt = inner
+            .connection
+            .prepare(
+                "SELECT json_extract(payload,'$.runId') FROM effect_outbox
+             WHERE kind='harness' AND json_extract(payload,'$.type')='prompt'
+               AND json_type(payload,'$.runId')='text'
+             GROUP BY 1
+             HAVING count(*) = sum(CASE WHEN status='interrupted' AND error=?1 THEN 1 ELSE 0 END)",
+            )
+            .map_err(error)?;
+        stmt.query_map([crate::outbox::RESTARTED_BEFORE_DISPATCH], |row| row.get(0))
+            .map_err(error)?
+            .collect::<Result<_, _>>()
+            .map_err(error)
+    }
+
     pub fn effect_status(
         &self,
         id: &str,
@@ -2176,7 +2202,12 @@ mod tests {
             database.write("index.json", index).unwrap();
             let capture = outbox::Capture::begin();
             let (sender, receiver) = std::sync::mpsc::sync_channel(8);
-            outbox::send(&sender, json!({"type":"prompt","message":"Only once"})).unwrap();
+            let run = uuid::Uuid::new_v4().to_string();
+            outbox::send(
+                &sender,
+                json!({"type":"prompt","message":"Only once","runId":run}),
+            )
+            .unwrap();
             let effects = capture.finish();
             assert!(
                 receiver.try_recv().is_err(),
@@ -2194,6 +2225,11 @@ mod tests {
             drop(database);
             let recovered = Database::open(&directory).unwrap();
             assert!(receiver.try_recv().is_err());
+            assert_eq!(
+                recovered.undispatched_prompt_runs().unwrap().contains(&run),
+                !dispatching,
+                "only a pending outbox row proves a run never reached its harness"
+            );
             assert!(matches!(
                 recovered
                     .receipt("device", command.command_id)

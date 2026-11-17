@@ -362,3 +362,24 @@ Focused verification passed: the paired successor test, 91 remote-task
 tests, the task-wide cancellation/restart contract, and the live distinction
 between a target queue receipt and provider acceptance. Full exact-head CI
 and publication are separate gates.
+
+## CI settlement fixes
+
+The first PR #67 run exposed leases that outlived interrupted admission,
+authenticated launch refusal, or a provider stop during shutdown. An interrupted
+admission does not get a new lease. If the task already had a prepared one,
+the failed commit settles it before any provider input can be queued.
+
+Prompt outbox metadata now records the run ID. After restart, only a run
+whose recorded prompt effects were all still pending can use that evidence
+to settle as not dispatched. A dispatching record does not prove non-delivery.
+An ordinary failed status is not provider terminal evidence. Shutdown
+records exact provider terminal events before persisting its final state.
+
+An authenticated launch refusal that proves no executor was allocated also
+settles its exact lease. Deliberate retry then issues a fresh launch and
+generation. If a runtime tick fails execution fencing, captured effects
+are discarded instead of being sent from that failed batch.
+
+All six previously failing integration tests passed locally, along with the
+existing attempt-wide Cancel and provider-queue acceptance tests.

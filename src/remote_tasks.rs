@@ -9732,6 +9732,20 @@ impl State {
             {
                 remote.rejected_launch = Some(remote.launch_command.command_id);
                 rejected_launches.push((task.id.clone(), task.attempt_id.clone()));
+                if let Some(lease) = &remote.execution
+                    && remote.launch_command.params["execution"] == lease.assignment()
+                    && lease.executor_id == remote.server_id
+                    && lease.attempt_id.as_deref() == Some(&task.attempt_id)
+                    && lease.executor_thread_alias.is_none()
+                    && let Ok(settled) = self.execution.terminal(
+                        &lease.lease_id,
+                        "launch_rejected",
+                        lifecycle::now(),
+                        "authenticated exact launch refusal proved no executor was allocated",
+                    )
+                {
+                    remote.execution = Some(settled);
+                }
             }
             let launch_delivery = remote.launch_command.command_id.to_string();
             let send_delivery = (if remote.stop_owed {

@@ -5145,6 +5145,10 @@ impl State {
             .enumerate()
             .filter(|(_, task)| {
                 task.remote.is_none()
+                    && matches!(
+                        task.state,
+                        TaskState::Queued | TaskState::Starting | TaskState::Running
+                    )
                     && (!baseline.task_ids.contains(&task.id)
                         || baseline.attempts.get(&task.id) != Some(&task.attempt_id))
                     && self
@@ -5170,7 +5174,8 @@ impl State {
                 continue;
             };
             let prior = baseline.tasks.get(&task_id);
-            let launch_is_new = prior.is_none();
+            let launch_is_new =
+                prior.is_none_or(|(launch, _, _)| *launch != remote.launch_command.command_id);
             let send_is_new = remote.send_command.as_ref().is_some_and(|command| {
                 prior.and_then(|(_, send, _)| *send) != Some(command.command_id)
             });
@@ -5469,7 +5474,7 @@ impl State {
                 }
             }
         }
-        let dangling: Vec<(usize, String, String)> = self
+        let dangling: Vec<_> = self
             .threads
             .iter()
             .filter(|thread| {
@@ -5478,22 +5483,30 @@ impl State {
                     && thread.pending_prompt.is_none()
                     && thread.queued_prompt.is_none()
             })
-            .filter_map(|thread| {
-                let binding = thread.next_execution.as_ref()?;
-                (self.execution.get(&binding.lease_id)?.phase == crate::execution::Phase::Prepared)
-                    .then(|| {
-                        (
-                            thread.id,
-                            binding.lease_id.clone(),
-                            status_word(thread.status).to_owned(),
-                        )
+            .flat_map(|thread| {
+                thread
+                    .next_execution
+                    .iter()
+                    .chain(&thread.execution)
+                    .filter_map(|binding| {
+                        let lease = self.execution.get(&binding.lease_id)?;
+                        (lease.phase == crate::execution::Phase::Prepared
+                            && lease.executor_id == self.identity.executor_id
+                            && lease.controller_id == self.identity.controller_id)
+                            .then(|| {
+                                (
+                                    thread.id,
+                                    binding.lease_id.clone(),
+                                    status_word(thread.status),
+                                )
+                            })
                     })
             })
             .collect();
         for (thread_id, lease_id, status) in dangling {
             let _ = self.execution.terminal(
                 &lease_id,
-                &status,
+                status,
                 now,
                 "thread reached a terminal state before the prepared generation dispatched",
             );
@@ -5529,23 +5542,12 @@ impl State {
                             .and_then(|result| result["status"].as_str())
                             .map(str::to_owned),
                         thread.run_id.clone(),
-                        matches!(thread.status, Status::Completed | Status::Failed)
-                            .then(|| status_word(thread.status).to_owned()),
                     )
                 })
             })
             .collect();
-        for (
-            thread_id,
-            binding,
-            accepted,
-            running,
-            terminal,
-            terminal_status,
-            peer_result,
-            run,
-            settled,
-        ) in observations
+        for (thread_id, binding, accepted, running, terminal, terminal_status, peer_result, run) in
+            observations
         {
             let Some(lease) = self.execution.get(&binding.lease_id).cloned() else {
                 continue;
@@ -5553,13 +5555,11 @@ impl State {
             let logical_run_matches = run.as_deref() == Some(lease.run_id.as_str());
             let target = if terminal.as_deref() == Some(lease.run_id.as_str())
                 || peer_result.is_some() && logical_run_matches
-                || logical_run_matches && settled.is_some()
             {
                 Some((
                     crate::execution::Phase::Terminal,
                     terminal_status
                         .or(peer_result)
-                        .or(settled)
                         .unwrap_or_else(|| "terminal".into()),
                 ))
             } else if running.as_deref() == Some(lease.run_id.as_str()) {
@@ -5656,6 +5656,52 @@ impl State {
 
     pub(crate) fn mark_execution_restart_uncertain(&mut self) -> bool {
         self.execution.mark_restart_uncertain(lifecycle::now())
+    }
+
+    pub(crate) fn settle_pending_prompt_effects(
+        &mut self,
+        undispatched: &std::collections::HashSet<String>,
+    ) {
+        let leases: Vec<_> = self
+            .execution
+            .leases
+            .iter()
+            .filter(|lease| {
+                lease.executor_id == self.identity.executor_id
+                    && lease.controller_id == self.identity.controller_id
+                    && lease.provider_accepted_at.is_none()
+                    && lease.running_at.is_none()
+                    && lease.phase.blocks_replacement()
+                    && undispatched.contains(&lease.run_id)
+            })
+            .map(|lease| lease.lease_id.clone())
+            .collect();
+        for id in leases {
+            let _ = self.execution.terminal(
+                &id,
+                "not_dispatched",
+                lifecycle::now(),
+                "all committed prompt effects for this run were still pending at restart",
+            );
+        }
+    }
+
+    pub(super) fn settle_prepared_admission_failure(&mut self, child: usize) {
+        let Some(binding) = self.threads[child].next_execution.as_ref() else {
+            return;
+        };
+        let lease_id = &binding.lease_id;
+        if self.execution.get(lease_id).is_some_and(|lease| {
+            lease.phase == crate::execution::Phase::Prepared && lease.binding() == *binding
+        }) {
+            let _ = self.execution.terminal(
+                lease_id,
+                "not_dispatched",
+                lifecycle::now(),
+                "admission commit failed before queuing the provider input",
+            );
+            self.threads[child].next_execution = None;
+        }
     }
 
     pub(crate) fn mark_execution_prompts_dispatched(&mut self, effects: &[crate::outbox::Effect]) {

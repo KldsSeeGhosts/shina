@@ -1569,6 +1569,7 @@ impl State {
                 if self.runtime_enabled
                     && let Err(error) = self.admission_commit()
                 {
+                    self.settle_prepared_admission_failure(child);
                     self.tasks[task_index].state = TaskState::Interrupted;
                     self.tasks[task_index].error_excerpt = error.chars().take(2000).collect();
                     self.storage_error = Some(error);

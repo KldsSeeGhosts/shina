@@ -130,6 +130,9 @@ impl RuntimeState {
         if let Some(previous) = database.projection()? {
             runtime.last_projection = previous;
         }
+        runtime
+            .state
+            .settle_pending_prompt_effects(&database.undispatched_prompt_runs()?);
         runtime.database = Some(database);
         runtime.state.refresh_execution(crate::lifecycle::now());
         runtime.state.mark_execution_restart_uncertain();
@@ -579,20 +582,22 @@ impl RuntimeState {
             let execution_baseline = self.state.execution_baseline();
             let execution_initiator = self.state.identity.controller_id.clone();
             let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default());
-            let execution_prepared = self
+            let execution_changed = self.state.refresh_execution(crate::lifecycle::now());
+            if let Err(error) = self
                 .state
                 .prepare_execution_after_command(&execution_baseline, &execution_initiator)
-                .map(|()| true)
-                .unwrap_or_else(|error| {
-                    self.failure = Some(format!("Execution fence failed before effects: {error}"));
-                    false
-                });
-            let execution_changed = self.state.refresh_execution(crate::lifecycle::now());
+            {
+                let error = format!("Execution fence failed before effects: {error}");
+                database.fail(error.clone());
+                self.state.storage_error = Some(error.clone());
+                self.failure = Some(error);
+                return false;
+            }
             let recovered = self.state.collect_recovered_inputs();
             if recovered || update_changed {
                 self.state.persistence_scope = None;
             }
-            let changed = changed | recovered | execution_changed | execution_prepared;
+            let changed = changed | recovered | execution_changed;
             let effects = capture.finish();
             if !changed
                 && !update_changed
@@ -1026,6 +1031,7 @@ impl RuntimeState {
                 .as_ref()
                 .map(|_| crate::outbox::Capture::begin());
             let running = self.state.drain_runtime_shutdown();
+            self.state.refresh_execution(crate::lifecycle::now());
             if let Some(capture) = capture {
                 self.persist(None, capture.finish())?;
                 self.committed_history.clear();

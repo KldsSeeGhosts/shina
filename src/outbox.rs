@@ -5,6 +5,8 @@ use std::{
     sync::mpsc::{Sender, SyncSender},
 };
 
+pub(crate) const RESTARTED_BEFORE_DISPATCH: &str = "Server restarted before dispatch began.";
+
 /// Private dispatch representation. Public `id`/`payload` stay the durable
 /// record; the live channel and record exist only in memory and are never
 /// persisted or replayed at restart.
@@ -74,11 +76,17 @@ pub fn send(sender: &SyncSender<Value>, record: Value) -> Result<(), String> {
             if effects.len() >= 1024 {
                 return Err("Too many outbound effects in one runtime batch.".into());
             }
+            let mut payload = json!({"type":record["type"],"id":record["id"]});
+            if record["type"] == "prompt"
+                && let Some(run) = record["runId"].as_str().filter(|run| !run.is_empty())
+            {
+                payload["runId"] = json!(run);
+            }
             effects.push(Effect {
                 id: uuid::Uuid::new_v4().to_string(),
                 // The durable input lives in the command/runtime input documents.
                 // Do not retain raw RPC records, which can contain credentials.
-                payload: json!({"type":record["type"],"id":record["id"]}),
+                payload,
                 dispatch: Dispatch::Harness {
                     sender: sender.clone(),
                     record,
