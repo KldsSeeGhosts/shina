@@ -2527,7 +2527,7 @@ impl State {
         changed
     }
 
-    fn task_occupies_slot(&self, task: &Task) -> bool {
+    pub(super) fn task_occupies_slot(&self, task: &Task) -> bool {
         !task.recovering
             && (task.state.occupies_slot()
                 || self

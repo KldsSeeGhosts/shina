@@ -458,6 +458,7 @@ fn spec(source: SessionSource) -> Start {
         workspace: crate::store::directory().unwrap(),
         source,
         instructions: Some("Captain fixture instructions".into()),
+        shina: crate::mcp::INSTRUCTIONS,
         link: Some(HostLink {
             url: "http://127.0.0.1:12345/mcp".into(),
             token: "fixture-thread-token".into(),
@@ -886,6 +887,24 @@ fn http_response_reads_exact_content_length_without_waiting_for_eof() {
 #[test]
 fn mcp_stdio_relay_returns_server_instructions_with_thread_authorization() {
     let server = crate::mcp::server(Arc::new(|| {})).unwrap();
+    // initialize and tools/list ride the same UI-thread queue as tools/call;
+    // answer the queued request the way a running State pump would.
+    let pumper = server.clone();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if let Some(request) = pumper.next_request() {
+                let _ = request.reply.send(Ok(json!({
+                    "protocolVersion": crate::mcp::PROTOCOL,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "Shina"},
+                    "instructions": crate::mcp::INSTRUCTIONS,
+                })));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
     let host = HostLink {
         url: server.url.clone(),
         token: server.token_for(8181),

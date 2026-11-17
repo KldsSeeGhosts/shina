@@ -807,6 +807,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         workspace: crate::store::directory().unwrap(),
         source,
         instructions: Some("Captain profile\nUser-curated essential memory: use Rust".into()),
+        shina: crate::mcp::INSTRUCTIONS,
         link: Some(crate::backend::HostLink {
             url: "http://127.0.0.1:12345/mcp".into(),
             token: "fixture-thread-token".into(),
@@ -1728,6 +1729,7 @@ fn codex_fresh_session_issues_thread_start_and_not_resume() {
         workspace: PathBuf::from("."),
         source: SessionSource::New,
         instructions: None,
+        shina: crate::mcp::INSTRUCTIONS,
         link: Some(crate::backend::HostLink {
             url: "http://127.0.0.1:1/mcp".into(),
             token: "test-token".into(),

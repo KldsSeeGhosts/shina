@@ -727,7 +727,7 @@ impl Client {
         if !self.awareness_sent {
             content.push(json!({"type":"text","text":format!(
                 "<shina_context>\n{}\n{}\n</shina_context>",
-                crate::mcp::INSTRUCTIONS, self.start.instructions.as_deref().unwrap_or("")
+                self.start.shina, self.start.instructions.as_deref().unwrap_or("")
             )}));
         }
         let dispatch = crate::composer_skills::claude_dispatch(text, &self.claude_skills);

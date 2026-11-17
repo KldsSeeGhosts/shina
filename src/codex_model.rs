@@ -1527,6 +1527,7 @@ mod tests {
                 workspace: state.data_dir.clone(),
                 source,
                 instructions: Some(instructions.clone()),
+                shina: crate::mcp::INSTRUCTIONS,
                 link: None,
                 owner: Arc::default(),
                 context_sent: true,

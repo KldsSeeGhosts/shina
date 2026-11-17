@@ -199,6 +199,8 @@ mod scope;
 #[allow(unused_imports)]
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 pub use scope::RemoteProject;
+#[path = "capabilities.rs"]
+mod capabilities;
 #[path = "codex_model.rs"]
 mod codex_model;
 #[path = "placement.rs"]
@@ -1727,6 +1729,7 @@ impl Thread {
                 workspace: path,
                 source,
                 instructions,
+                shina: self.shina_instructions(),
                 link: self.host.clone(),
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
@@ -8241,18 +8244,21 @@ impl State {
             }
         };
         capabilities["caller"] = json!({
-            "role": if caller.delegated {
-                "worker"
-            } else if caller.captain_home {
-                if primary_home { "captain_home" } else { "earlier_home" }
-            } else if captain.is_some() {
-                "crew"
-            } else {
-                "thread"
-            },
+            "role": self.mcp_role(caller_index),
             "captain": captain,
             "primary_home": primary_home,
             "access": caller.native.access.id(),
+            "harness": caller.harness,
+            "machine": caller.machine,
+            "host": if caller.peer_origin.is_some() { "remote" } else { "local" },
+            "delegated": caller.delegated,
+            "crew_member": caller.crew_captain.is_some(),
+            "owner_status": captain.map(|id| match self.captain_phase(id) {
+                CaptainPhase::Active => "active",
+                CaptainPhase::Archived => "archived",
+                CaptainPhase::Retired => "retired",
+                CaptainPhase::Deleted => "deleted",
+            }),
             "may_delegate": owner_active
                 && local
                 && !caller.delegated
@@ -8271,6 +8277,20 @@ impl State {
                 "admission": admission,
             },
         });
+        // The effective record (#32): coordination rights with precise reasons,
+        // interaction support, authorized reads, placement, live capacity and
+        // the per-tool listing `tools/list` now returns. Dispatch revalidates
+        // each gate again at call time.
+        capabilities["contract"] = json!(capabilities::CONTRACT);
+        capabilities["effective"] = json!({
+            "coordination": self.coordination(caller_index),
+            "interaction": self.interaction(caller_index),
+            "reads": self.reads(caller_index),
+            "execution": self.execution(caller_index),
+            "placement": self.placement(caller_index),
+            "capacity": self.capacity(caller_index),
+        });
+        capabilities["tools"] = self.tools_record(caller_index);
         capabilities
     }
 
@@ -8417,6 +8437,9 @@ impl State {
         tool: &str,
         args: &Value,
     ) -> Result<Value, String> {
+        if matches!(tool, "initialize" | "tools/list") {
+            return self.mcp_meta_call(caller, tool, args);
+        }
         if matches!(
             tool,
             "captain_crew_create" | "captain_crew_send" | "captain_crew_stop"
