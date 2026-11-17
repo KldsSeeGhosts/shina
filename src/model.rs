@@ -9429,6 +9429,12 @@ impl State {
         kind: &str,
         result: Result<Vec<u8>, String>,
     ) {
+        let pending: std::collections::HashSet<_> = self
+            .pending_context_imports
+            .iter()
+            .filter(|(machine, thread, _)| machine == target_machine && *thread == target_thread_id)
+            .map(|(_, _, context)| context.clone())
+            .collect();
         let threads = if target_machine == self.machines.selected {
             Some(&mut self.threads)
         } else {
@@ -9444,6 +9450,24 @@ impl State {
         {
             return;
         }
+        // A successful import resolves only its own chip. Keep an earlier
+        // error while a different attachment chip remains unresolved and no
+        // download is pending for it. Completion order must not hide failure.
+        let previous_error = t.attachment_error.clone().filter(|_| {
+            t.draft.pills().any(|(_, href)| {
+                crate::composer_context::parse_composer_context_href(href).is_some_and(
+                    |(kind, context)| {
+                        matches!(kind.as_str(), "image" | "file")
+                            && context != new_context_id
+                            && !pending.contains(&context)
+                            && !t
+                                .draft_context
+                                .iter()
+                                .any(|record| record.context_id == context)
+                    },
+                )
+            })
+        });
         let bytes = match result {
             Ok(bytes) => bytes,
             Err(reason) => {
@@ -9507,6 +9531,9 @@ impl State {
         } else {
             t.draft_context.push(rec);
         }
+        // Also clear a resolved error when the imported bytes deduplicate to
+        // an existing attachment and add_attachment did not run.
+        t.attachment_error = previous_error;
     }
     fn attachment_guard(&self, index: usize) -> Option<String> {
         if self.demo {
