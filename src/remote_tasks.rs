@@ -778,14 +778,214 @@ mod tests {
     fn reply(state: &mut State, method: &str, value: Result<Value, String>) {
         let (send, receive) = mpsc::channel();
         send.send(value).unwrap();
-        state
-            .peer_runtime
-            .pending
-            .insert(state.tasks[0].id.clone(), (method.into(), receive));
+        state.peer_runtime.inject_pending(
+            state.tasks[0].id.clone(),
+            state.tasks[0].remote.as_ref().unwrap(),
+            method.into(),
+            receive,
+        );
         assert!(state.poll_remote_tasks());
     }
     fn accepted(value: Value) -> Result<Value, String> {
         Ok(json!({"status":"accepted","result":value}))
+    }
+
+    fn answer_evidence_fixture() -> (State, Value) {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"revision":"question","finished":false,
+                "request":{"requestId":"question-a","generation":"generation-a",
+                    "kind":"input","payload":{"method":"input"},"threadId":9}})),
+        );
+        let child = state.tasks[0].child_thread_id;
+        state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":child,"message":"answer",
+                    "client_request_id":"evidence-answer","request_id":"question-a",
+                    "runtime_generation":"generation-a"}),
+            )
+            .unwrap();
+        let operation = state.task_operations.last().unwrap();
+        let evidence = json!({"commandId":operation.delivery_id,
+            "attemptId":operation.target_attempt_id,"requestId":operation.request_id,
+            "generation":operation.runtime_generation,"input":"accepted",
+            "realizedDelivery":"follow_up","runId":"observed-run"});
+        (state, evidence)
+    }
+
+    #[test]
+    fn peer_input_evidence_requires_every_saved_request_fence() {
+        let (mut state, evidence) = answer_evidence_fixture();
+        let original = state.task_operations.last().unwrap().clone();
+        for field in ["attemptId", "requestId", "generation"] {
+            for invalid in [
+                None,
+                Some(Value::Null),
+                Some(json!(12)),
+                Some(json!("stale")),
+            ] {
+                let mut candidate = evidence.clone();
+                if let Some(value) = invalid {
+                    candidate[field] = value;
+                } else {
+                    candidate.as_object_mut().unwrap().remove(field);
+                }
+                reply(
+                    &mut state,
+                    "peer.thread.wait",
+                    accepted(json!({"revision":"fence-test","finished":false,
+                        "inputs":[candidate]})),
+                );
+                assert_eq!(
+                    state.task_operations.last().unwrap(),
+                    &original,
+                    "invalid {field} must not change any operation evidence"
+                );
+            }
+        }
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"revision":"valid","finished":false,"inputs":[evidence]})),
+        );
+        assert_eq!(state.task_operations.last().unwrap().acceptance, "accepted");
+    }
+
+    #[test]
+    fn peer_input_evidence_rejects_cross_task_and_cross_peer_replies() {
+        for (different_peer, method) in [
+            (false, "peer.thread.wait"),
+            (true, "peer.thread.wait"),
+            (false, "peer.task.ack"),
+            (true, "peer.task.ack"),
+        ] {
+            let (mut state, evidence) = answer_evidence_fixture();
+            let original = state.task_operations.last().unwrap().clone();
+            let mut other = state.tasks[0].clone();
+            other.id = uuid::Uuid::new_v4().to_string();
+            let remote = other.remote.as_mut().unwrap();
+            remote.thread_id = Some(19);
+            remote.send_command = None;
+            if different_peer {
+                remote.server_id = uuid::Uuid::new_v4().to_string();
+            }
+            let id = other.id.clone();
+            state.tasks.push(other);
+            let (send, receive) = mpsc::channel();
+            send.send(accepted(json!({"revision":"foreign","finished":false,
+                "acknowledged":true,"inputs":[evidence],
+                "result":{"status":"completed","attemptId":state.tasks[1].attempt_id,
+                    "runId":"foreign-run"}})))
+                .unwrap();
+            state.peer_runtime.inject_pending(
+                id,
+                state.tasks[1].remote.as_ref().unwrap(),
+                method.into(),
+                receive,
+            );
+            assert!(state.poll_remote_tasks());
+            assert_eq!(
+                state.task_operations.last().unwrap(),
+                &original,
+                "a reply for another task or peer must not update this operation"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_input_evidence_requires_the_operations_actual_target() {
+        let (mut state, evidence) = answer_evidence_fixture();
+        let original = state.task_operations.last().unwrap().clone();
+        let task_id = state.tasks[0].id.clone();
+        let source = PeerReplySource::new(state.tasks[0].remote.as_ref().unwrap());
+        let mut wrong_peer = source.clone();
+        wrong_peer.server_id = uuid::Uuid::new_v4().to_string();
+        let mut wrong_thread = source.clone();
+        wrong_thread.thread_id = Some(19);
+        for invalid in [wrong_peer, wrong_thread] {
+            assert!(!state.apply_peer_input_evidence(&task_id, &invalid, &evidence));
+            assert_eq!(state.task_operations.last().unwrap(), &original);
+        }
+        assert!(state.apply_peer_input_evidence(&task_id, &source, &evidence));
+        assert_eq!(state.task_operations.last().unwrap().acceptance, "accepted");
+    }
+
+    #[test]
+    fn peer_input_evidence_rejects_unsaved_request_fences() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let child = state.tasks[0].child_thread_id;
+        state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":child,"message":"ordinary follow up",
+                    "client_request_id":"unfenced-evidence"}),
+            )
+            .unwrap();
+        let original = state.task_operations.last().unwrap().clone();
+        assert!(original.request_id.is_none());
+        assert!(original.runtime_generation.is_none());
+        let task_id = state.tasks[0].id.clone();
+        let source = PeerReplySource::new(state.tasks[0].remote.as_ref().unwrap());
+        let evidence = json!({"commandId":original.delivery_id,
+            "attemptId":original.target_attempt_id,"input":"accepted"});
+        for field in ["requestId", "generation"] {
+            for invalid in [json!("unexpected"), json!(12)] {
+                let mut candidate = evidence.clone();
+                candidate[field] = invalid;
+                assert!(!state.apply_peer_input_evidence(&task_id, &source, &candidate));
+                assert_eq!(state.task_operations.last().unwrap(), &original);
+            }
+        }
+        let mut nullable = evidence.clone();
+        nullable["requestId"] = Value::Null;
+        nullable["generation"] = Value::Null;
+        assert!(state.apply_peer_input_evidence(&task_id, &source, &nullable));
+        assert_eq!(state.task_operations.last().unwrap().acceptance, "accepted");
+    }
+
+    #[test]
+    fn peer_input_evidence_drops_late_replies_after_target_changes() {
+        for change_peer in [false, true] {
+            let (mut state, evidence) = answer_evidence_fixture();
+            let original = state.task_operations.last().unwrap().clone();
+            let (send, receive) = mpsc::channel();
+            send.send(accepted(json!({"revision":"late","finished":true,
+                "inputs":[evidence],"result":{"status":"completed"},
+                "placement":{"phase":"late-target"}})))
+                .unwrap();
+            state.peer_runtime.inject_pending(
+                state.tasks[0].id.clone(),
+                state.tasks[0].remote.as_ref().unwrap(),
+                "peer.thread.wait".into(),
+                receive,
+            );
+            let remote = state.tasks[0].remote.as_mut().unwrap();
+            if change_peer {
+                remote.server_id = uuid::Uuid::new_v4().to_string();
+            } else {
+                remote.thread_id = Some(19);
+            }
+            let current_task = serde_json::to_value(&state.tasks[0]).unwrap();
+            state.poll_remote_tasks();
+            assert_eq!(state.task_operations.last().unwrap(), &original);
+            assert_eq!(serde_json::to_value(&state.tasks[0]).unwrap(), current_task);
+            assert!(state.peer_runtime.pending.is_empty());
+        }
     }
 
     #[test]
@@ -839,6 +1039,7 @@ mod tests {
             .find(|operation| operation.request_key == "remote-send")
             .unwrap();
         assert_eq!(state.tasks[0].state, TaskState::Completed);
+        assert_eq!(operation.acceptance, "accepted");
         assert_eq!(operation.completion, "completed");
         let replay = state.mcp_call(1, "task_send", &args).unwrap();
         assert_eq!(replay["replayed"], true);
@@ -3127,11 +3328,38 @@ pub struct RemoteTask {
 #[derive(Default)]
 pub(super) struct PeerRuntime {
     preparing_mcp: Vec<(crate::mcp::Request, Preparation, Option<u64>)>,
-    pending: HashMap<String, (String, mpsc::Receiver<Result<Value, String>>)>,
+    pending: HashMap<String, PendingPeerCall>,
     probe: Option<mpsc::Receiver<Vec<crate::peer::Peer>>>,
     next_probe: u64,
     next_metadata_at: u64,
     followers: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Captured when choosing the authenticated transport, never read from the
+/// peer's response body or inferred from whichever operation names a UUID.
+#[derive(Clone)]
+struct PeerReplySource {
+    server_id: String,
+    thread_id: Option<usize>,
+}
+
+impl PeerReplySource {
+    fn new(remote: &RemoteTask) -> Self {
+        Self {
+            server_id: remote.server_id.clone(),
+            thread_id: remote.thread_id,
+        }
+    }
+
+    fn matches(&self, remote: &RemoteTask) -> bool {
+        self.server_id == remote.server_id && self.thread_id == remote.thread_id
+    }
+}
+
+struct PendingPeerCall {
+    method: String,
+    source: PeerReplySource,
+    receive: mpsc::Receiver<Result<Value, String>>,
 }
 /// Debug-only deterministic barrier for the two-server stale-question test.
 /// It delays only peer.thread.send, in an isolated integration profile, until
@@ -3172,10 +3400,18 @@ impl PeerRuntime {
     pub(crate) fn inject_pending(
         &mut self,
         task_id: String,
+        remote: &RemoteTask,
         method: String,
         receive: mpsc::Receiver<Result<Value, String>>,
     ) {
-        self.pending.insert(task_id, (method, receive));
+        self.pending.insert(
+            task_id,
+            PendingPeerCall {
+                method,
+                source: PeerReplySource::new(remote),
+                receive,
+            },
+        );
     }
 }
 
@@ -5905,7 +6141,7 @@ impl State {
                     .peer_runtime
                     .pending
                     .get(&task.id)
-                    .is_some_and(|(method, _)| method == "peer.thread.wait")
+                    .is_some_and(|pending| pending.method == "peer.thread.wait")
             {
                 if let Some(cancel) = self.peer_runtime.followers.remove(&task.id) {
                     let _ = cancel.send(());
@@ -5943,9 +6179,14 @@ impl State {
             let (cancel, cancelled) = tokio::sync::oneshot::channel();
             self.peer_runtime.followers.insert(task.id.clone(), cancel);
             let (send, receive) = mpsc::channel();
-            self.peer_runtime
-                .pending
-                .insert(task.id.clone(), (command.method.clone(), receive));
+            self.peer_runtime.pending.insert(
+                task.id.clone(),
+                PendingPeerCall {
+                    method: command.method.clone(),
+                    source: PeerReplySource::new(remote),
+                    receive,
+                },
+            );
             if matches!(
                 command.method.as_str(),
                 "peer.thread.send" | "peer.thread.stop"
@@ -6013,9 +6254,6 @@ impl State {
         }
     }
 
-    /// Applies target input evidence only to the operation whose command,
-    /// attempt, request and generation all match. A mismatch is ignored; it
-    /// never promotes newer work into an older operation.
     fn peer_supports_task_evidence(&self, server_id: &str) -> bool {
         self.peers
             .iter()
@@ -6031,20 +6269,35 @@ impl State {
             })
     }
 
-    fn apply_peer_input_evidence(&mut self, evidence: &Value) -> bool {
+    /// Accept evidence only from its operation's authenticated task and target,
+    /// with no omitted saved fences.
+    fn apply_peer_input_evidence(
+        &mut self,
+        task_id: &str,
+        source: &PeerReplySource,
+        evidence: &Value,
+    ) -> bool {
         let Some(command) = evidence["commandId"].as_str() else {
             return false;
         };
         let Some(operation) = self.task_operation_for_delivery(command).cloned() else {
             return false;
         };
-        let receipt_supported = operation.task_id.as_deref().is_some_and(|task_id| {
-            self.tasks
-                .iter()
-                .find(|task| task.id == task_id)
-                .and_then(|task| task.remote.as_ref())
-                .is_some_and(|remote| remote.evidence_supported)
-        });
+        let Some(task) = self.tasks.iter().find(|task| task.id == task_id) else {
+            return false;
+        };
+        let Some(remote) = task.remote.as_ref() else {
+            return false;
+        };
+        if operation.task_id.as_deref() != Some(task_id)
+            || operation.target_server.as_deref() != Some(source.server_id.as_str())
+            || operation.target_thread_id != task.child_thread_id
+            || source.thread_id.is_none()
+            || !source.matches(remote)
+        {
+            return false;
+        }
+        let receipt_supported = remote.evidence_supported;
         if !receipt_supported
             && !operation
                 .target_server
@@ -6053,15 +6306,13 @@ impl State {
         {
             return false;
         }
-        if evidence["attemptId"]
-            .as_str()
-            .is_some_and(|attempt| operation.target_attempt_id.as_deref() != Some(attempt))
-            || evidence["requestId"]
-                .as_str()
-                .is_some_and(|request| operation.request_id.as_deref() != Some(request))
-            || evidence["generation"].as_str().is_some_and(|generation| {
-                operation.runtime_generation.as_deref() != Some(generation)
-            })
+        let matches_fence = |field: &str, expected: Option<&str>| match expected {
+            Some(expected) => evidence.get(field).and_then(Value::as_str) == Some(expected),
+            None => evidence.get(field).is_none_or(Value::is_null),
+        };
+        if !matches_fence("attemptId", operation.target_attempt_id.as_deref())
+            || !matches_fence("requestId", operation.request_id.as_deref())
+            || !matches_fence("generation", operation.runtime_generation.as_deref())
         {
             return false;
         }
@@ -6171,11 +6422,17 @@ impl State {
             .peer_runtime
             .pending
             .iter()
-            .filter_map(|(id, (method, receive))| match receive.try_recv() {
-                Ok(result) => Some((id.clone(), method.clone(), result)),
+            .filter_map(|(id, pending)| match pending.receive.try_recv() {
+                Ok(result) => Some((
+                    id.clone(),
+                    pending.method.clone(),
+                    pending.source.clone(),
+                    result,
+                )),
                 Err(mpsc::TryRecvError::Disconnected) => Some((
                     id.clone(),
-                    method.clone(),
+                    pending.method.clone(),
+                    pending.source.clone(),
                     Err("Peer worker disconnected.".into()),
                 )),
                 _ => None,
@@ -6199,15 +6456,22 @@ impl State {
         // A target receipt accepted here means queued, not provider input.
         let mut accepted_operations: Vec<(String, bool)> = Vec::new();
         let mut rejected_operations: Vec<(String, String)> = Vec::new();
-        let mut peer_inputs: Vec<Value> = Vec::new();
+        let mut peer_inputs: Vec<(String, PeerReplySource, Value)> = Vec::new();
         let mut completed_operations: Vec<(String, String, Option<String>, TaskState)> = Vec::new();
-        for (id, method, result) in ready {
+        for (id, method, source, result) in ready {
             self.peer_runtime.pending.remove(&id);
             self.peer_runtime.followers.remove(&id);
             let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) else {
                 continue;
             };
-            let remote = task.remote.as_mut().expect("remote task");
+            let Some(remote) = task.remote.as_mut() else {
+                continue;
+            };
+            // A late response from a previous target cannot update the task,
+            // including its transport state, completion or input evidence.
+            if !source.matches(remote) {
+                continue;
+            }
             let send_delivery = remote
                 .send_command
                 .as_ref()
@@ -6355,7 +6619,11 @@ impl State {
                                 RemoteState::Running
                             };
                             if let Some(inputs) = value.get("inputs").and_then(Value::as_array) {
-                                peer_inputs.extend(inputs.iter().cloned());
+                                peer_inputs.extend(
+                                    inputs.iter().map(|input| {
+                                        (task.id.clone(), source.clone(), input.clone())
+                                    }),
+                                );
                             }
                             if remote.request.as_ref().is_some_and(|request| {
                                 !request["payload"].is_object()
@@ -6480,7 +6748,11 @@ impl State {
                                 result["error"].as_str().unwrap_or(""),
                             );
                             if let Some(inputs) = value.get("inputs").and_then(Value::as_array) {
-                                peer_inputs.extend(inputs.iter().cloned());
+                                peer_inputs.extend(
+                                    inputs.iter().map(|input| {
+                                        (task.id.clone(), source.clone(), input.clone())
+                                    }),
+                                );
                             }
                             if let Some(attempt) = result["attemptId"].as_str() {
                                 completed_operations.push((
@@ -6601,8 +6873,8 @@ impl State {
         for (delivery, error) in rejected_operations {
             changed |= self.mark_operation_rejected(&delivery, "transport", &error);
         }
-        for evidence in peer_inputs {
-            changed |= self.apply_peer_input_evidence(&evidence);
+        for (task_id, source, evidence) in peer_inputs {
+            changed |= self.apply_peer_input_evidence(&task_id, &source, &evidence);
         }
         for (task_id, attempt, run, state) in completed_operations {
             changed |= self.mark_operation_completion(&task_id, &attempt, run.as_deref(), state);
