@@ -738,6 +738,14 @@ fn rejected_remote_launch_releases_capacity_and_retries_once_after_restart() {
 fn a_cancelled_remote_task_stays_uncertain_until_the_stop_lands() {
     let mut home = Profile::new();
     let mut target = Profile::new();
+    // Stop the executor after launch acceptance but before the first adapter
+    // write. Provider completion cannot settle this generation.
+    let release = target.root.join("release-first-peer-input");
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_PEER_INPUT":release}).to_string(),
+    )
+    .unwrap();
     home.launch(&["serve"]);
     target.launch(&["serve"]);
     let mut there = target.client(uuid::Uuid::new_v4());
@@ -786,8 +794,8 @@ fn a_cancelled_remote_task_stays_uncertain_until_the_stop_lands() {
     );
     assert_eq!(scoped["result"]["status"], "accepted", "{scoped}");
 
-    // A remote delegated run that holds its provider turn occupies one
-    // home reservation the whole time.
+    // An accepted remote launch occupies one home reservation even before its
+    // provider sees the prompt.
     let task = {
         let reply = here.command(
             "task.delegate",
@@ -814,9 +822,18 @@ fn a_cancelled_remote_task_stays_uncertain_until_the_stop_lands() {
             .any(|thread| thread["peerOrigin"]["taskId"].is_string())
     });
 
-    // Kill the target before the cancel: the stop cannot land, so the home
-    // reservation stays held and uncertain instead of freeing a phantom
-    // slot the dead peer may still be occupying.
+    let executor_thread = task_record(&here, &task_id)["remote"]["threadId"]
+        .as_u64()
+        .unwrap();
+    let directory = there.snapshot["directories"][executor_thread.to_string()]
+        .as_str()
+        .map(PathBuf::from)
+        .expect("executor working directory");
+    let provider_prompts = directory.join("fixture-prompts.jsonl");
+    assert!(!provider_prompts.exists());
+
+    // While the executor is offline, the controller cannot know whether the
+    // first prompt was sent. Keep its reservation until the stop settles.
     target.stop();
     let attempt = task_record(&here, &task_id)["attempt_id"]
         .as_str()
@@ -870,6 +887,16 @@ fn a_cancelled_remote_task_stays_uncertain_until_the_stop_lands() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let input = durable_task_inputs(&target)
+        .into_iter()
+        .find(|input| input["kind"] == "input" && input["attempt_id"] == attempt)
+        .expect("the cancelled launch's input");
+    assert_eq!(input["provider_state"], "rejected", "{input}");
+    assert_eq!(
+        input["provider_basis"], "target_cancelled_before_dispatch",
+        "{input}"
+    );
+    assert!(!provider_prompts.exists());
     home.stop();
     target.stop();
 }

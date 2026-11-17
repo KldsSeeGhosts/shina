@@ -383,3 +383,10 @@ are discarded instead of being sent from that failed batch.
 
 All six previously failing integration tests passed locally, along with the
 existing attempt-wide Cancel and provider-queue acceptance tests.
+
+The offline Cancel regression now holds the first peer input before its adapter
+write. After restart the controller sends the saved launch assignment and
+command ID. The executor can settle that lease only if its exact durable input
+still proves no dispatch; otherwise normal run settlement is required. The
+controller keeps the reservation held until it receives that proof. The test
+checks both the durable rejection and that the provider saw no cancelled prompt.

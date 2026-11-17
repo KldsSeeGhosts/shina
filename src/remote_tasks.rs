@@ -5815,6 +5815,7 @@ impl RemoteTask {
             self.send_command
                 .iter()
                 .chain(self.accepted_send.iter())
+                .chain(std::iter::once(&self.launch_command))
                 .find(|command| command.params["execution"]["leaseId"] == execution.lease_id)
         })
     }
@@ -7588,11 +7589,9 @@ impl State {
                 intent.provider_state = "accepted".into();
                 intent.provider_basis = Some("exact_execution_settlement".into());
                 intent.queue_state = "settled".into();
-            } else if intent
-                .execution
-                .as_ref()
-                .is_some_and(|binding| thread.execution.as_ref() != Some(binding))
-            {
+            } else if intent.execution.as_ref().is_some_and(|binding| {
+                thread.execution.as_ref().or(thread.next_execution.as_ref()) != Some(binding)
+            }) {
                 intent.provider_state = "rejected".into();
                 intent.provider_basis = Some("execution_fence".into());
                 intent.queue_state = "settled".into();
@@ -8065,14 +8064,25 @@ impl State {
                 }
                 existing
             } else {
-                // A currently executing or already dispatched input requires
-                // provider settlement. Never turn its stop into a queue edit.
-                if existing.lease_id == binding.lease_id {
+                // A launch can own the current binding before its first
+                // prompt dispatches. Once it has a run, use the normal stop.
+                let current = existing.lease_id == binding.lease_id;
+                if current
+                    && (existing.queued_behind_current
+                        || self.threads[index].run_id.is_some()
+                        || !existing.phase.blocks_replacement())
+                {
                     return Ok(None);
                 }
-                let input_index = self
-                    .peer_task_intent_index(thread_id, &input_id.to_string())
-                    .ok_or("The accepted assignment has no matching durable input.")?;
+                let Some(input_index) =
+                    self.peer_task_intent_index(thread_id, &input_id.to_string())
+                else {
+                    return if current {
+                        Ok(None)
+                    } else {
+                        Err("The accepted assignment has no matching durable input.".into())
+                    };
+                };
                 let mut input = self.peer_task_intents[input_index].clone();
                 if self.threads[index]
                     .peer_input_executions
@@ -8091,6 +8101,9 @@ impl State {
                         .as_ref()
                         .is_some_and(|(_, id)| *id == input_id)
                 {
+                    if current {
+                        return Ok(None);
+                    }
                     return Err("This input may have reached the provider. Reconcile its exact execution; the current writer was not stopped.".into());
                 }
                 let cancelled = execution.terminal(
@@ -8110,12 +8123,23 @@ impl State {
                 self.threads[index]
                     .pending_injections
                     .retain(|injection| injection.peer_input != Some(input_id));
-                if self.threads[index]
+                let thread = &mut self.threads[index];
+                thread.peer_recovery_held &= self
+                    .peer_task_intents
+                    .iter()
+                    .any(|intent| intent.thread_id == thread_id && intent.holds_prompt_recovery());
+                if current {
+                    // The only current binding eligible here is an initial
+                    // launch with no run. Release its idle prewarm, if any.
+                    thread.disconnect();
+                    thread.recovering_task = false;
+                    thread.complete_task("cancelled");
+                } else if thread
                     .next_execution
                     .as_ref()
                     .is_some_and(|binding| binding.lease_id == existing.lease_id)
                 {
-                    self.threads[index].next_execution = None;
+                    thread.next_execution = None;
                 }
                 cancelled
             }
@@ -8584,11 +8608,11 @@ impl State {
                 if let Some(result) = self.cancel_unaccepted_peer_input(index, command)? {
                     return Ok(result);
                 }
-                if let Some(binding) = self.threads[index]
+                let binding = self.threads[index]
                     .execution
                     .clone()
-                    .or_else(|| self.threads[index].next_execution.clone())
-                {
+                    .or_else(|| self.threads[index].next_execution.clone());
+                if let Some(binding) = &binding {
                     let control = args.get("execution").filter(|value| value.is_object()).ok_or(
                         "This lease-managed peer thread requires an exact execution lease and generation to stop.",
                     )?;
@@ -8645,7 +8669,7 @@ impl State {
                     attempt,
                     run,
                 );
-                intent.execution = self.threads[index].execution.clone();
+                intent.execution = binding;
                 self.stage_peer_task_intent(intent)?;
                 let mut result = json!({"stopped":true});
                 if self.peer_evidence_enabled() {
