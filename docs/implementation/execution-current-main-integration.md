@@ -94,13 +94,45 @@ Only the fixture-owned process is terminated.
 
 The four safety/scoped-state tests, initial-run test and committed-discovery
 test pass. The authenticated two-server stale-question/restart test, which
-failed in the combined run, passes after these corrections. A fresh full
-integration run is in progress. The original full run is terminal and was not
-restarted.
+failed in the combined run, passes after these corrections. The fresh full
+integration run passed 121 of 122 tests. Its only failure was
+`peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result`.
+Both full runs are terminal.
+
+## Restart acknowledgement and remaining cancellation case
+
+The remaining integration test exposed two further composition defects.
+A transport acknowledgement without a lease body used the remote mirror's
+older phase, then tried to advance an already uncertain controller record.
+The correction uses the canonical book phase. It accepts the transport receipt
+without releasing uncertainty and continues collecting exact terminal evidence.
+A new regression failed before the correction and passes afterward.
+
+An authenticated valid task reply also left stale offline metadata installed.
+A later run could become uncertain again solely because of that older metadata.
+Valid replies now update reachability without changing the lease's certainty,
+capabilities or authentication-denial state. The narrow database update does not
+recreate a removed peer and never regresses its last-reached timestamp.
+Unit tests cover those restrictions and continued uncertainty until exact
+terminal evidence arrives.
+
+With these corrections the live restart test proceeds further, then fails when
+cancellation overtakes a follow-up before the executor installs its assignment.
+The resulting stop names an unknown lease and is correctly refused. A previous
+same-attempt fallback hid this case by weakening lease validation. Do not restore
+that fallback. Implement an explicit pending-assignment cancellation contract
+that records proved non-delivery without stopping an older provider generation
+or delivering cancelled input just to establish a lease.
+
+After the acknowledgement/reachability corrections, all 72 remote-task units,
+ten lease-book units and the narrow database reachability regression pass.
+Formatting and diff checks pass. The live restart/cancel failure above remains
+open and blocks a green combined-suite claim.
 
 Issue #27 remains open. Queued generations still need distinct current-run and
-queued-run control semantics. Executor quiescence still needs pending-input and
-child-process review. Moving the same logical run between executors remains
+queued-run control semantics and the pending-assignment cancellation contract.
+Pending-input and owned-child quiescence now have regression coverage; restart
+and cross-executor process proof still need review. Moving the same logical run between executors remains
 unproven. Scheduler/catalog composition, exact-head CI, serialized publication
 and downloaded release verification are separate gates. Issue #35 still owns
 conversation and checkout content transfer.

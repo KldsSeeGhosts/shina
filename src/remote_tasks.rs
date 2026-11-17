@@ -427,16 +427,17 @@ fn apply_execution_reply(
         saved.executor_thread_alias = lease.executor_thread_alias;
         saved.executor_thread_uid = lease.executor_thread_uid;
         remote.execution = Some(saved.clone());
-    } else if executor_acknowledgement && expected.phase < crate::execution::Phase::ExecutorAccepted
-    {
-        book.transition(
-            &expected.lease_id,
-            crate::execution::Phase::ExecutorAccepted,
-            lifecycle::now(),
-            "authenticated executor acknowledged the assignment; provider acceptance is not implied",
-        )?;
+    } else if executor_acknowledgement || transport_receipt {
+        if executor_acknowledgement && stored.phase < crate::execution::Phase::ExecutorAccepted {
+            book.transition(
+                &expected.lease_id,
+                crate::execution::Phase::ExecutorAccepted,
+                lifecycle::now(),
+                "authenticated executor acknowledged the assignment; provider acceptance is not implied",
+            )?;
+        }
         remote.execution = book.get(&expected.lease_id).cloned();
-    } else if !executor_acknowledgement && !transport_receipt {
+    } else {
         return Err("Executor progress is missing its exact execution lease.".into());
     }
     Ok(())
@@ -2094,6 +2095,85 @@ mod tests {
                 false,
             )
             .is_err()
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn a_transport_ack_preserves_uncertainty_without_blocking_later_exact_evidence() {
+        let (mut state, lease) = execution_reply_fixture();
+        let uncertain = state
+            .execution
+            .uncertain(&lease.lease_id, 5, "target offline")
+            .unwrap();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        remote.execution.as_mut().unwrap().phase = crate::execution::Phase::Prepared;
+        let before = state.execution.projection();
+        assert!(
+            apply_execution_reply(
+                &mut state.execution,
+                remote,
+                &json!({"threadId":9,"input":"queued"}),
+                true,
+                false,
+            )
+            .is_ok(),
+            "transport acceptance must not try to clear existing uncertainty"
+        );
+        assert_eq!(state.execution.projection(), before);
+        assert_eq!(remote.execution.as_ref().unwrap().phase, uncertain.phase);
+        let mut terminal = lease.clone();
+        terminal.phase = crate::execution::Phase::Terminal;
+        terminal.terminal_status = Some("completed".into());
+        apply_execution_reply(
+            &mut state.execution,
+            remote,
+            &json!({"execution":terminal.value()}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Terminal
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn a_valid_authenticated_reply_clears_stale_offline_metadata_not_lease_uncertainty() {
+        let (mut state, mut lease) = execution_reply_fixture();
+        state.peers[0].last_error = Some("Target offline.".into());
+        lease.phase = crate::execution::Phase::Running;
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"threadId":9,"execution":lease.value(),
+                "revision":"live","finished":false})),
+        );
+        assert!(
+            state.peers[0].last_error.is_none(),
+            "authenticated success is current reachability evidence"
+        );
+        state.refresh_execution(6);
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        state
+            .execution
+            .uncertain(&lease.lease_id, 7, "earlier unverified execution")
+            .unwrap();
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"threadId":9,"execution":lease.value(),
+                "revision":"still-live","finished":false})),
+        );
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Uncertain,
+            "reachability alone cannot release uncertainty"
         );
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
@@ -7825,6 +7905,25 @@ impl State {
                         remote.state = RemoteState::UpdateRequired;
                         remote.last_error = Some(error);
                         continue;
+                    }
+                    let reached_at = lifecycle::now();
+                    if let Some(peer) = self
+                        .peers
+                        .iter_mut()
+                        .find(|peer| peer.server_id == source.server_id)
+                    {
+                        peer.last_reached_at =
+                            Some(peer.last_reached_at.unwrap_or(0).max(reached_at));
+                        if peer.last_error.as_deref() == Some("Target offline.") {
+                            peer.last_error = None;
+                        }
+                    }
+                    if let Some(database) =
+                        crate::database::for_path(&self.data_dir.join("index.json"))
+                        && let Err(error) =
+                            database.note_peer_reached(&source.server_id, reached_at)
+                    {
+                        self.storage_error = Some(error);
                     }
                     remote.retry_attempt = 0;
                     remote.last_error = None;

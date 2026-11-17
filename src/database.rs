@@ -1495,6 +1495,25 @@ impl Database {
         Ok(())
     }
 
+    /// An authenticated task reply is reachability evidence, not a new
+    /// capability exchange or authority to recreate a removed link.
+    pub(crate) fn note_peer_reached(&self, server: &str, now: u64) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        inner
+            .connection
+            .execute(
+                "UPDATE peers SET last_reached_at=max(coalesce(last_reached_at,0),?2),
+             last_error=CASE WHEN last_error='Target offline.' THEN NULL ELSE last_error END
+             WHERE server_id=?1",
+                params![server, now as i64],
+            )
+            .map_err(error)?;
+        Ok(())
+    }
+
     pub fn update_rate_limited(&self, device: &str, now: u64) -> Result<bool, String> {
         self.0.lock().expect("database").connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM update_audit WHERE device_id=?1 AND accepted=1 AND requested_at>?2)",
@@ -1858,6 +1877,35 @@ mod tests {
         );
         assert!(!scoped.to_string().contains("private-owner"));
         assert_eq!(scoped["index"]["threads"][0], index["threads"][0]);
+    }
+
+    #[test]
+    fn task_reply_reachability_keeps_capabilities_auth_denials_and_removed_links() {
+        let database = Database::open(&directory("peer-reachability")).unwrap();
+        let mut peer = crate::peer::Peer {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            host: "127.0.0.1:1".into(),
+            label: "fixture".into(),
+            linked_at: 1,
+            capabilities: json!({"contracts":["exact-contract"]}),
+            last_reached_at: Some(10),
+            last_error: Some("Target offline.".into()),
+        };
+        database.put_peer(&peer).unwrap();
+        database.note_peer_reached(&peer.server_id, 20).unwrap();
+        let reached = database.peers().unwrap().remove(0);
+        assert_eq!(reached.capabilities, peer.capabilities);
+        assert_eq!(reached.last_reached_at, Some(20));
+        assert!(reached.last_error.is_none());
+        peer.last_error = Some("Authentication denied. Re-pair manually.".into());
+        database.put_peer(&peer).unwrap();
+        database.note_peer_reached(&peer.server_id, 30).unwrap();
+        assert_eq!(database.peers().unwrap()[0].last_error, peer.last_error);
+        database.note_peer_reached(&peer.server_id, 5).unwrap();
+        assert_eq!(database.peers().unwrap()[0].last_reached_at, Some(30));
+        database.remove_peer(&peer.server_id).unwrap();
+        database.note_peer_reached(&peer.server_id, 40).unwrap();
+        assert!(database.peers().unwrap().is_empty());
     }
 
     #[test]
