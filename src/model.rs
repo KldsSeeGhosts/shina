@@ -214,6 +214,8 @@ pub(crate) mod placement;
 mod placement_tests;
 #[path = "remote_tasks.rs"]
 mod remote_tasks;
+#[path = "repositories.rs"]
+pub(crate) mod repositories;
 pub(crate) use remote_tasks::Preparation;
 pub use remote_tasks::{
     PeerOrigin, RemoteState, RemoteTask, wait_for_peer_thread, warm_repository_records,
@@ -4970,6 +4972,7 @@ pub struct State {
         usize,
         std::sync::mpsc::Receiver<Result<placement::ProvisionedPlacement, String>>,
     )>,
+    checkout_rxs: Vec<(usize, std::sync::mpsc::Receiver<Result<PathBuf, String>>)>,
     multi_model_batches: Vec<MultiModelBatch>,
     #[cfg(test)]
     pub(crate) test_git_context: Option<crate::vcs::GitContext>,
@@ -4990,6 +4993,11 @@ pub struct State {
     pub captains: Vec<Captain>,
     captain_scopes: std::collections::BTreeMap<usize, Vec<ProjectId>>,
     captain_remote_scopes: std::collections::BTreeMap<usize, Vec<RemoteProject>>,
+    /// The logical repository catalog: durable repository identity separate
+    /// from machine-local checkout paths.
+    pub repositories: Vec<repositories::LogicalRepository>,
+    repository_bindings: Vec<repositories::CheckoutBinding>,
+    captain_repository_scopes: std::collections::BTreeMap<usize, Vec<String>>,
     captain_homes: std::collections::BTreeMap<usize, usize>,
     captain_books: std::collections::BTreeMap<usize, captain_state::CaptainBook>,
     captain_lifecycles: std::collections::BTreeMap<usize, captain_lifecycle::CaptainLifecycle>,
@@ -6035,6 +6043,7 @@ impl State {
             worktree_bootstrap_rxs: Vec::new(),
             worktree_setup_rxs: Vec::new(),
             placement_rxs: Vec::new(),
+            checkout_rxs: Vec::new(),
             multi_model_batches: Vec::new(),
             #[cfg(test)]
             test_git_context: None,
@@ -6051,6 +6060,9 @@ impl State {
             captain_project: None,
             captains: Vec::new(),
             captain_scopes: Default::default(),
+            repositories: Vec::new(),
+            repository_bindings: Vec::new(),
+            captain_repository_scopes: Default::default(),
             captain_remote_scopes: Default::default(),
             captain_homes: Default::default(),
             captain_books: Default::default(),
@@ -9303,6 +9315,7 @@ impl State {
             "caller_selection": caller_selection.map_or(Value::Null, |selection| selection.to_value()),
             "inherit_selection": inherit_selection.map_or(Value::Null, |selection| selection.to_value()),
             "models": model_values,
+            "repositories": self.repository_list_value()["repositories"],
             "notes": [
                 "Pi uses CPA. Codex and ACP use their own configured providers and login.",
                 "Linked peers run workers on their own projects and credentials. Workers cannot delegate further.",
@@ -15912,6 +15925,7 @@ impl State {
             self.captain_inbox.clear();
             self.captain_waits.clear();
             self.projects.entries = projects;
+            self.restore_repository_records(index)?;
             self.restore_captain_records(index, &project_remap)?;
             self.captain_books = self.restore_captain_books(index)?;
             self.restore_crew_reports(index)?;
@@ -16627,6 +16641,9 @@ impl State {
             "captains":self.captains.iter().map(Captain::to_value).collect::<Vec<_>>(),
             "captainScopes":self.captain_scopes,
             "captainRemoteScopes":self.captain_remote_scopes,
+            "repositories":self.repositories,
+            "repositoryBindings":self.repository_bindings,
+            "captainRepositoryScopes":self.captain_repository_scopes,
             "captainHomes":self.captain_homes,
             "captainBooks":self.captain_book_value(),
             "captainLifecycles":self.captain_lifecycles,
@@ -17071,6 +17088,8 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= crate::ui::diff_panel::tick(state, tx);
     changed |= state.poll_worktree_bootstraps();
     changed |= state.poll_worktree_setup();
+    changed |= state.refresh_local_bindings();
+    changed |= state.poll_checkout_provisioning();
     changed |= state.poll_placements();
     changed |= state.poll_question_answers();
     if state.runtime_enabled && state.client.is_none() {
@@ -17349,6 +17368,7 @@ pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationT
             "machine"
                 | "environmentId"
                 | "projectId"
+                | "repository"
                 | "harness"
                 | "provider"
                 | "model"
@@ -17384,6 +17404,23 @@ pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationT
         }
         if args.get("workspace").is_some() {
             return Err("Pass target.projectId or workspace, not both.".into());
+        }
+        if object.get("repository").is_some() {
+            return Err("Pass target.projectId or target.repository, not both.".into());
+        }
+    }
+    if let Some(repository) = object.get("repository") {
+        if repository
+            .as_str()
+            .is_none_or(|selector| selector.trim().is_empty())
+        {
+            return Err("target.repository must name a catalog id or repository URL.".into());
+        }
+        if remote_tasks::target_machine(args)?.is_none_or(|machine| machine == "local") {
+            return Err("target.repository requires a linked target.machine.".into());
+        }
+        if args.get("workspace").is_some() {
+            return Err("Pass target.repository or workspace, not both.".into());
         }
     }
     if !object.contains_key("model")

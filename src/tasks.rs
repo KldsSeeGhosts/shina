@@ -4742,7 +4742,7 @@ mod tests {
         }
         std::fs::write(directory.join("server-id"), &server_id).unwrap();
         let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
-        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TABLE task_input_intents; DROP TABLE task_operations; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TABLE task_input_intents; DROP TABLE task_operations; DROP TABLE IF EXISTS catalog_captain_scopes; DROP TABLE IF EXISTS catalog_checkouts; DROP TABLE IF EXISTS catalog_repository_remotes; DROP TABLE IF EXISTS catalog_repositories; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
         let mut legacy = crate::projection_store::read(&connection, "index.json")
             .unwrap()
             .unwrap();

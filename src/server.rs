@@ -1002,6 +1002,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             capabilities.push(protocol::EXECUTION_LEASES);
                             capabilities.push(protocol::CAPTAIN_CONTINUE_ON);
                         }
+                        if minor >= u64::from(protocol::LOGICAL_REPOSITORIES_MINOR) {
+                            capabilities.push(protocol::LOGICAL_REPOSITORIES);
+                        }
                         scheduling = minor >= u64::from(protocol::SCHEDULING_MINOR);
                         if scheduling { capabilities.push(protocol::SCHEDULING); }
                         match identity_for_read(&shared) {

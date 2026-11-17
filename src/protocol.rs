@@ -3,7 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 47;
+pub const MINOR: u32 = 48;
+/// The logical repository catalog and executor checkout provisioning are
+/// additive at protocol 1.48, after execution leases at 1.47.
+/// The feature marker is authoritative, not the minor.
+pub const LOGICAL_REPOSITORIES_MINOR: u32 = 48;
+pub const LOGICAL_REPOSITORIES: &str = "logical-repositories-v1";
 /// Stable workspace/owner/controller identities are additive at protocol 1.42.
 /// Scheduler and effective-capability minors remain independently owned.
 pub const IDENTITY_MINOR: u32 = 42;
@@ -293,6 +298,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "review.getBranchCommits"
         | "review.getDiffPreview"
         | "review.getDiffFileContents"
+        | "repository.list"
         | "captain.read"
         | "captain.document.read"
         | "captain.crew.list"
@@ -362,6 +368,8 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "queue.returnDraft"
         | "input.claim"
         | "project.put"
+        | "repository.put"
+        | "repository.remove"
         | "project.ensureScratch"
         | "project.remove"
         | "project.clone"
@@ -810,6 +818,7 @@ mod tests {
                 | "captain.promote.preview"
                 | "captain.lifecycle.preview"
                 | "execution.inspect"
+                | "repository.list"
                 | "scheduling.status" => "read",
                 "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus"
