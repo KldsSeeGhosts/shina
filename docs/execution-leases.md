@@ -3,10 +3,10 @@
 Index version 5 stores execution leases in the additive `execution` object.
 Published schema 9 retains the task-operation and input-intent tables unchanged.
 This change adds no SQLite table or migration. The wire contract is the exact
-capability `execution-leases-v1` at tentative protocol minor 48, after the
-separately reserved scheduler 46 and catalog 47. A peer that does not advertise
-that capability receives no managed task or lease. Minor 48 alone does not
-grant any other reserved feature.
+capability `execution-leases-v1` at tentative protocol minor 47, after the
+separately published scheduler 46 and before the separately reserved catalog
+48. A peer that does not advertise that capability receives no managed task or
+lease. Minor 47 alone does not grant any other reserved feature.
 
 ## Identity split
 

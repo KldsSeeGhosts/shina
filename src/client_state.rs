@@ -4553,6 +4553,17 @@ impl State {
         {
             return Err("This is a remote task result. Open its thread on the target machine, or send a follow-up from its parent.".into());
         }
+        if self.current().peer_origin.is_some()
+            && (self.current().execution.is_some() || self.current().next_execution.is_some())
+            && matches!(
+                command.method.as_str(),
+                "thread.send" | "thread.resume" | "thread.retry" | "queue.sendNow"
+            )
+        {
+            return Err(
+                "This executor thread can only receive new work from its controller.".into(),
+            );
+        }
         let number = |key: &str| {
             args[key]
                 .as_u64()

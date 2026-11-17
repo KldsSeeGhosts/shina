@@ -3279,6 +3279,162 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn paired_successor_keeps_the_captain_home_and_requires_source_quiescence() {
+        use crate::execution::{Book, Phase, Prepare, Scope};
+
+        let source = Fixture::configured("continue-on-controller", protocol::MINOR, |runtime| {
+            runtime.state.test_connect_pi = Some(Box::new(|_, _| {
+                let (pi, commands, events) = crate::harness::Session::test_connection();
+                std::mem::forget(commands);
+                std::mem::forget(events);
+                Some(pi)
+            }));
+        })
+        .await;
+        let target = Fixture::new("continue-on-executor").await;
+        let target_user = target.link(&target.shared.directory.join("client")).await;
+        let project = target
+            .local_command(
+                "project.put",
+                json!({"path":target.shared.directory.join("project"),"createFolder":true}),
+            )
+            .await;
+        assert_eq!(project["status"], "accepted", "{project}");
+        let code = target
+            .shared
+            .pairing
+            .lock()
+            .unwrap()
+            .create_scoped(crate::lifecycle::now(), true)
+            .unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let peer = crate::peer::link_peer(
+            &source.shared.directory,
+            &source.shared.database,
+            &target.address.to_string(),
+            &code,
+        )
+        .await
+        .unwrap();
+        let link = peer.credential(&source.shared.directory).unwrap();
+        let created = source
+            .local_command(
+                "captain.put",
+                json!({"record":crate::captains::Captain::presets()[0].to_value(),"project":null}),
+            )
+            .await;
+        assert_eq!(created["status"], "accepted", "{created}");
+        let opened = source
+            .local_command("captain.open", json!({"captain":0}))
+            .await;
+        assert_eq!(opened["status"], "accepted", "{opened}");
+        let home = &opened["result"]["threadId"];
+        let configured = source
+            .local_command(
+                "thread.configure",
+                json!({"threadId":home,"harness":"pi","provider":"cpa","model":"fixture",
+                    "thinking":"off"}),
+            )
+            .await;
+        assert_eq!(configured["status"], "accepted", "{configured}");
+        let sent = source
+            .local_command(
+                "thread.send",
+                json!({"threadId":home,"text":"Start the source turn","attachments":[],"mode":"prompt"}),
+            )
+            .await;
+        assert_eq!(sent["status"], "accepted", "{sent}");
+        let index =
+            || source.shared.database.committed_snapshot().unwrap()["state"]["index"].clone();
+        let book = || serde_json::from_value::<Book>(index()["execution"].clone()).unwrap();
+        let mut before = book();
+        assert_eq!(before.leases.len(), 1);
+        let first = before.leases[0].clone();
+        let next = Prepare {
+            scope: Scope {
+                workspace_id: first.workspace_id.clone(),
+                owner_id: first.owner_id.clone(),
+                run_as_owner_id: first.run_as_owner_id.clone(),
+                controller_id: first.controller_id.clone(),
+                initiating_device_id: first.initiating_device_id.clone(),
+                executor_id: peer.server_id.clone(),
+            },
+            logical_captain_uid: first.logical_captain_uid.clone(),
+            logical_thread_uid: first.logical_thread_uid.clone(),
+            executor_thread_alias: None,
+            executor_thread_uid: None,
+            run_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: Some("next-executor-attempt".into()),
+            delivery_id: None,
+            request_key: None,
+            now: crate::lifecycle::now(),
+            queues_behind_current: false,
+        };
+        assert!(before.prepare(next.clone()).is_err());
+        let fence_args = json!({
+            "threadId":home,"leaseId":first.lease_id,"generation":first.generation,
+            "runId":first.run_id,"outcome":"fence","evidence":"inspect source fixture"
+        });
+        let early = source
+            .local_command("execution.reconcile", fence_args.clone())
+            .await;
+        assert_eq!(early["status"], "rejected", "{early}");
+        let stopped = source
+            .local_command("thread.stop", json!({"threadId":home,"runId":first.run_id}))
+            .await;
+        assert_eq!(stopped["status"], "accepted", "{stopped}");
+        let fenced = source
+            .local_command("execution.reconcile", fence_args)
+            .await;
+        assert_eq!(fenced["status"], "accepted", "{fenced}");
+        let mut after = book();
+        assert_eq!(after.leases[0].phase, Phase::Fenced);
+        let (successor, _) = after.prepare(next).unwrap();
+        assert_eq!(successor.generation, first.generation + 1);
+        let launch = Command::new(
+            "peer.thread.launch",
+            json!({
+                "projectId":project["result"]["projectId"],"harness":"pi","provider":"cpa","model":"fixture",
+                "brief":"Continue the same logical home","execution":successor.assignment(),
+                "origin":{"deviceId":"ignored","serverId":first.controller_id,"serverLabel":"Home",
+                    "parentThreadId":home,"taskId":"continue-on","captain":"Captain","memories":[],
+                    "attemptId":successor.attempt_id}
+            }),
+        );
+        let result = crate::client::remote_command(&link, launch.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "accepted", "{result}");
+        assert_eq!(
+            crate::client::remote_command(&link, launch).await.unwrap(),
+            result
+        );
+        let lease = &result["result"]["execution"];
+        assert_eq!(lease["phase"], "executorAccepted");
+        assert_eq!(lease["logicalCaptainUid"], json!(first.logical_captain_uid));
+        assert_eq!(lease["logicalThreadUid"], first.logical_thread_uid);
+        assert_eq!(lease["generation"], successor.generation);
+        assert_eq!(index()["captainHomes"]["0"], *home);
+        let local_send = crate::client::remote_rpc(
+            &target_user,
+            "thread.send",
+            json!({"threadId":result["result"]["threadId"],"text":"Not assigned by the controller",
+                "attachments":[],"mode":"prompt"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(local_send["status"], "rejected", "{local_send}");
+        assert!(
+            local_send["result"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("from its controller")
+        );
+    }
+
     /// A worker's captain_document_read call, forwarded through the real
     /// transport: the read rides the origin's peer.thread.wait answer and the
     /// page comes back as a fenced peer.captain.document.reply.

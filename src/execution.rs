@@ -206,6 +206,19 @@ impl Lease {
             "attemptId":self.attempt_id
         })
     }
+
+    pub fn assignment(&self) -> Value {
+        let mut value = self.control();
+        value["runAsOwnerId"] = json!(self.run_as_owner_id);
+        value["initiatingDeviceId"] = json!(self.initiating_device_id);
+        value["executorId"] = json!(self.executor_id);
+        value["logicalCaptainUid"] = json!(self.logical_captain_uid);
+        value["deliveryId"] = json!(self.delivery_id);
+        value["requestKey"] = json!(self.request_key);
+        value["preparedAt"] = json!(self.prepared_at);
+        value["queuesBehindCurrent"] = json!(self.queued_behind_current);
+        value
+    }
 }
 
 pub fn lease_from_assignment(

@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 48;
+pub const MINOR: u32 = 47;
 /// Stable workspace/owner/controller identities are additive at protocol 1.42.
 /// Scheduler and effective-capability minors remain independently owned.
 pub const IDENTITY_MINOR: u32 = 42;
 pub const IDENTITY: &str = "identity-v1";
-pub const EXECUTION_LEASES_MINOR: u32 = 48;
+pub const EXECUTION_LEASES_MINOR: u32 = 47;
 pub const EXECUTION_LEASES: &str = "execution-leases-v1";
 pub const EXECUTION_LEASES_UPDATE_REQUIRED: &str =
     "Update required on the target machine before it can bind a controller execution lease.";

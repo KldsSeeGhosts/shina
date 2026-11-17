@@ -3715,6 +3715,73 @@ mod tests {
     }
 
     #[test]
+    fn held_or_fenced_executor_rejects_new_input_without_installing_a_lease() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        let assignment = |state: &State, generation| {
+            assigned_lease(
+                state,
+                child,
+                &state.identity.controller_id,
+                generation,
+                &uuid::Uuid::new_v4().to_string(),
+                &attempt,
+                generation > 1,
+            )
+        };
+        let first = assignment(&state, 1);
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].status = Status::Ready;
+        let next = assignment(&state, 2);
+        let send = |assignment: Value| {
+            Command::new(
+                "peer.thread.send",
+                json!({"threadId":child,"attemptId":attempt,"delivery":"follow_up",
+                    "message":"follow-up for the old executor","execution":assignment}),
+            )
+        };
+        let inputs_before = state.peer_task_intents.len();
+        state.threads[1].peer_recovery_held = true;
+        assert_eq!(
+            state
+                .execute_peer_command("fixture-peer", &send(next.assignment()))
+                .unwrap_err(),
+            PEER_INPUT_RECOVERY_HELD
+        );
+        assert!(state.execution.get(&next.lease_id).is_none());
+        state.threads[1].peer_recovery_held = false;
+        state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.execution.fence",
+                    json!({
+                        "threadId":child,"leaseId":first.lease_id,"generation":first.generation,
+                        "runId":first.run_id,"evidence":"fixture executor verified quiescence"
+                    }),
+                ),
+            )
+            .unwrap();
+        for input in [Value::Null, first.control(), next.assignment()] {
+            let error = state
+                .execute_peer_command("fixture-peer", &send(input))
+                .unwrap_err();
+            assert!(error.contains("was fenced"), "{error}");
+        }
+        assert_eq!(state.peer_task_intents.len(), inputs_before);
+        assert_eq!(state.execution.leases.len(), 1);
+        assert!(state.threads[1].pending_injections.is_empty());
+    }
+
+    #[test]
     fn provider_acceptance_running_and_terminal_are_distinct_durable_evidence() {
         let mut state = fixture();
         let thread = state.threads[0].id;
@@ -8587,12 +8654,12 @@ impl State {
                 Ok(result)
             }
             "peer.thread.send" => {
+                let current_binding = self.threads[index]
+                    .execution
+                    .clone()
+                    .or_else(|| self.threads[index].next_execution.clone());
                 if let Some(request_id) = args["requestId"].as_str() {
-                    if let Some(binding) = self.threads[index]
-                        .execution
-                        .clone()
-                        .or_else(|| self.threads[index].next_execution.clone())
-                    {
+                    if let Some(binding) = &current_binding {
                         let control = args.get("execution").filter(|value| value.is_object()).ok_or(
                             "This lease-managed peer thread requires an exact execution control for a question answer.",
                         )?;
@@ -8608,7 +8675,8 @@ impl State {
                             generation,
                             control["runId"].as_str(),
                         )?;
-                        if controlled.lease_id != binding.lease_id {
+                        if controlled.lease_id != binding.lease_id || !controlled.phase.in_flight()
+                        {
                             return Err(
                                 "Request or execution generation changed before the answer was delivered."
                                     .into(),
@@ -8686,11 +8754,22 @@ impl State {
                     .get("documentReads")
                     .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
                     .transpose()?;
+                let thread = &self.threads[index];
+                if thread.peer_recovery_held {
+                    return Err(PEER_INPUT_RECOVERY_HELD.into());
+                }
+                if let Some(binding) = &current_binding
+                    && self
+                        .execution
+                        .get(&binding.lease_id)
+                        .is_some_and(|lease| lease.phase == crate::execution::Phase::Fenced)
+                {
+                    return Err("This executor thread was fenced. Start a new assignment on the selected executor.".into());
+                }
                 let execution_control = args.get("execution").filter(|value| value.is_object());
-                let current_binding = self.threads[index]
-                    .execution
-                    .clone()
-                    .or_else(|| self.threads[index].next_execution.clone());
+                if current_binding.is_some() && execution_control.is_none() {
+                    return Err("This lease-managed peer thread requires an execution assignment or an exact run control.".into());
+                }
                 let exact_control = delivery == Some("steer") || args.get("requestId").is_some();
                 let next_binding = if exact_control {
                     if let Some(binding) = &current_binding {
@@ -8709,7 +8788,8 @@ impl State {
                             generation,
                             control["runId"].as_str(),
                         )?;
-                        if controlled.lease_id != binding.lease_id {
+                        if controlled.lease_id != binding.lease_id || !controlled.phase.in_flight()
+                        {
                             return Err(
                                 "This control names an earlier execution lease. The current or newer run was not changed."
                                     .into(),
@@ -8730,6 +8810,14 @@ impl State {
                                 .ok_or("Execution assignment is missing generation.")?,
                             control["runId"].as_str(),
                         )?;
+                        if !existing.phase.in_flight()
+                            || existing.executor_thread_alias != Some(self.threads[index].id as u64)
+                            || current_binding.as_ref().is_none_or(|binding| {
+                                binding.logical_thread_uid != existing.logical_thread_uid
+                            })
+                        {
+                            return Err("This input does not name an unsettled assignment for this executor thread.".into());
+                        }
                         Some(existing.binding())
                     } else {
                         let lease = crate::execution::lease_from_assignment(
@@ -8769,9 +8857,6 @@ impl State {
                     current_binding
                 };
                 let thread = &self.threads[index];
-                if thread.peer_recovery_held {
-                    return Err(PEER_INPUT_RECOVERY_HELD.into());
-                }
                 if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
                     return Err("This attempt cannot accept steering.".into());
                 }

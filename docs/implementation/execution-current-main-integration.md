@@ -15,9 +15,10 @@ Observed provider terminal evidence or a separately verified executor fence is
 still required before replacement.
 
 Published migrations 008 and 009 remain unchanged. Execution state stays in the
-additive index-version-5 object. The tentative lease protocol number is 48,
-after the separately reserved scheduler 46 and repository catalog 47. The
-mobile hello golden and exact-capability gate use the same number.
+additive index-version-5 object. The tentative lease protocol number is 47,
+after the separately published scheduler 46 and before the separately reserved
+repository catalog 48. The mobile hello golden and exact-capability gate use
+the same number.
 
 ## Reproduced reply defects
 
@@ -327,10 +328,37 @@ the scheduler reservation and exact input-bound leases. Launch reserves target
 admission while returning the accepted execution binding. Authenticated launch
 rejection proof remains available to release provably unused scheduler capacity.
 
-Protocol minor 48 retains both `execution-leases-v1` and
+Protocol minor 47 retains both `execution-leases-v1` and
 `admission-scheduler-v1`. The all-target compiler check passes after updating the
 two scheduler test fixtures with the additive execution fields.
 
 On the combined source, both queued-provider unit tests pass. The unchanged
 provider-acceptance integration and task-wide cancellation/restart integration
 also pass. No full local suite was repeated.
+
+## Paired executor continuity
+
+The renewed integration branch starts from the parked candidate and includes
+main `a580381`, including the recovery-held refusal from PR #66. The parked
+checkout and its protocol-number edits remain untouched.
+
+The paired-server regression starts a controller-owned Captain turn, rejects
+replacement and a fence while it has pending work, then stops the turn and
+verifies quiescence through the real reconciliation handler. The test prepares
+the successor using the controller's committed lease book and sends it to a
+paired server. The executor accepts one physical worker, replays its receipt
+without a second launch, and keeps the same logical Captain and home IDs at
+the next generation. A local composer send cannot start work independently
+on an executor alias. A fenced alias also refuses delayed inputs, and an
+executor that is holding recovery rejects new input before admitting a lease.
+
+The paired fixture tests the identity and writer-fencing contract; it does not
+exercise a user-facing “Continue on” action. User-facing home placement and
+full production continuity still need verification. Issue #35 owns transfer of
+the conversation, checkout, and provider context. Non-authoritative provider
+history still leaves interrupted input held or unknown.
+
+Focused verification passed: the paired successor test, 91 remote-task
+tests, the task-wide cancellation/restart contract, and the live distinction
+between a target queue receipt and provider acceptance. Full exact-head CI
+and publication are separate gates.

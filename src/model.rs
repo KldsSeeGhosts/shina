@@ -5363,24 +5363,7 @@ impl State {
             .get(&lease.lease_id)
             .cloned()
             .expect("remote lease");
-        let assignment = json!({
-            "leaseId":lease.lease_id,
-            "generation":lease.generation,
-            "workspaceId":lease.workspace_id,
-            "ownerId":lease.owner_id,
-            "runAsOwnerId":lease.run_as_owner_id,
-            "controllerId":lease.controller_id,
-            "initiatingDeviceId":lease.initiating_device_id,
-            "executorId":lease.executor_id,
-            "logicalCaptainUid":lease.logical_captain_uid,
-            "logicalThreadUid":lease.logical_thread_uid,
-            "runId":lease.run_id,
-            "attemptId":lease.attempt_id,
-            "deliveryId":lease.delivery_id,
-            "requestKey":lease.request_key,
-            "preparedAt":lease.prepared_at,
-            "queuesBehindCurrent":lease.queued_behind_current
-        });
+        let assignment = lease.assignment();
         let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
         remote.execution = Some(lease.clone());
         if remote.thread_id.is_none() {
