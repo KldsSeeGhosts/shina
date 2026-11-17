@@ -201,6 +201,11 @@ pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 pub use scope::RemoteProject;
 #[path = "codex_model.rs"]
 mod codex_model;
+#[path = "placement.rs"]
+pub(crate) mod placement;
+#[cfg(test)]
+#[path = "placement_tests.rs"]
+mod placement_tests;
 #[path = "remote_tasks.rs"]
 mod remote_tasks;
 pub(crate) use remote_tasks::Preparation;
@@ -920,6 +925,8 @@ pub struct Thread {
     pub worktree_path: Option<String>,
     /// Project-less role changes retain their original working directory.
     pub(crate) scratch_directory: Option<String>,
+    /// The worker placement reservation and resolved checkout (#20).
+    pub placement: Option<placement::ThreadPlacement>,
     pub branch: Option<String>,
     pub base_branch: Option<String>,
     pub env_mode: Option<ThreadEnvMode>,
@@ -1467,6 +1474,7 @@ impl Thread {
             project: None,
             worktree_path: None,
             scratch_directory: None,
+            placement: None,
             branch: None,
             base_branch: None,
             env_mode: None,
@@ -4516,6 +4524,10 @@ pub struct State {
     vcs_branch_rxs: Vec<std::sync::mpsc::Receiver<VcsBranchResultMsg>>,
     worktree_bootstrap_rxs: Vec<std::sync::mpsc::Receiver<WorktreeBootstrapResult>>,
     worktree_setup_rxs: Vec<std::sync::mpsc::Receiver<WorktreeSetupResultMsg>>,
+    placement_rxs: Vec<(
+        usize,
+        std::sync::mpsc::Receiver<Result<placement::ProvisionedPlacement, String>>,
+    )>,
     multi_model_batches: Vec<MultiModelBatch>,
     #[cfg(test)]
     pub(crate) test_git_context: Option<crate::vcs::GitContext>,
@@ -4817,6 +4829,7 @@ impl State {
             vcs_branch_rxs: Vec::new(),
             worktree_bootstrap_rxs: Vec::new(),
             worktree_setup_rxs: Vec::new(),
+            placement_rxs: Vec::new(),
             multi_model_batches: Vec::new(),
             #[cfg(test)]
             test_git_context: None,
@@ -8109,6 +8122,14 @@ impl State {
             if thread.provider_update_held {
                 return;
             }
+            // A worker's provider never starts before its placement resolves.
+            if thread
+                .placement
+                .as_ref()
+                .is_some_and(|placement| placement.phase != placement::PlacementPhase::Ready)
+            {
+                return;
+            }
         }
         if index < self.threads.len()
             && self
@@ -8500,6 +8521,28 @@ impl State {
                     intent_hash: tasks::delegate_intent_hash(args),
                 });
                 let id = thread.id;
+                #[cfg(test)]
+                let git_ctx = self.test_git_context.clone().unwrap_or_default();
+                #[cfg(not(test))]
+                let git_ctx = crate::vcs::GitContext::default();
+                let placement = self.plan_thread_placement(
+                    &thread,
+                    placement::spec_from_args(args)?.as_ref(),
+                    &format!("delegate:{}/{}", task.id, id),
+                    "local",
+                    &git_ctx,
+                )?;
+                if placement.read_only() {
+                    // A shared reader keeps the parent's dirty checkout visible
+                    // and never gains write access to it.
+                    thread.native.access = AccessMode::ReadOnly;
+                }
+                if placement.uses_worktree() {
+                    thread.worktree_path = placement.checkout.clone();
+                    thread.branch = placement.branch.clone();
+                    thread.env_mode = Some(ThreadEnvMode::Worktree);
+                }
+                thread.placement = Some(placement);
                 self.threads.push(thread);
                 self.tasks.push(task);
                 self.sync_memory_links();
@@ -8547,6 +8590,8 @@ impl State {
                     "task_id": task.map(|task| &task.id),
                     "queue_position": task.and_then(|task| self.task_queue_position(task)),
                     "selection": selection_value(thread),
+                    "placement": task.and_then(|task|task.remote.as_ref()).and_then(|remote|remote.placement.clone())
+                        .or_else(|| thread.placement.as_ref().map(placement::ThreadPlacement::value)),
                     "finished": task.map(|task| task.state.finished()).unwrap_or(thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed))),
                     "phase": thread.phase,
                     "error": task.map(|task| task.error_excerpt.as_str()).filter(|s| !s.is_empty()).or(thread.error.as_deref()),
@@ -11922,7 +11967,11 @@ impl State {
                     match msg.result {
                         Ok(res) if res.status == "no_script" => {
                             self.threads[index].worktree_setup = None;
-                            self.release_after_worktree_setup(index);
+                            if self.threads[index].placement.is_some() {
+                                self.finish_placement_ready(index);
+                            } else {
+                                self.release_after_worktree_setup(index);
+                            }
                         }
                         Ok(res) if res.exit_code == Some(0) && !res.timed_out => {
                             let existing = self.threads[index].worktree_setup.take();
@@ -11941,7 +11990,11 @@ impl State {
                                 duration_ms: res.duration_ms,
                                 skipped: false,
                             });
-                            self.release_after_worktree_setup(index);
+                            if self.threads[index].placement.is_some() {
+                                self.finish_placement_ready(index);
+                            } else {
+                                self.release_after_worktree_setup(index);
+                            }
                         }
                         Ok(res) => {
                             let existing = self.threads[index].worktree_setup.take();
@@ -11960,15 +12013,19 @@ impl State {
                                 script_command: res.script_command.or_else(|| {
                                     existing.as_ref().and_then(|s| s.script_command.clone())
                                 }),
-                                error: Some(error),
+                                error: Some(error.clone()),
                                 output: res.output,
                                 exit_code: res.exit_code,
                                 timed_out: res.timed_out,
                                 duration_ms: res.duration_ms,
                                 skipped: false,
                             });
-                            self.threads[index].worktree_setup_output_open = true;
-                            self.threads[index].native.queue_held = true;
+                            if self.threads[index].placement.is_some() {
+                                self.fail_placement(index, error);
+                            } else {
+                                self.threads[index].worktree_setup_output_open = true;
+                                self.threads[index].native.queue_held = true;
+                            }
                         }
                         Err(error) => {
                             let existing = self.threads[index].worktree_setup.take();
@@ -11978,15 +12035,19 @@ impl State {
                                 script_command: existing
                                     .as_ref()
                                     .and_then(|s| s.script_command.clone()),
-                                error: Some(error),
+                                error: Some(error.clone()),
                                 output: existing.map(|s| s.output).unwrap_or_default(),
                                 exit_code: None,
                                 timed_out: false,
                                 duration_ms: 0,
                                 skipped: false,
                             });
-                            self.threads[index].worktree_setup_output_open = true;
-                            self.threads[index].native.queue_held = true;
+                            if self.threads[index].placement.is_some() {
+                                self.fail_placement(index, error);
+                            } else {
+                                self.threads[index].worktree_setup_output_open = true;
+                                self.threads[index].native.queue_held = true;
+                            }
                         }
                     }
                     self.checkpoint();
@@ -12009,6 +12070,10 @@ impl State {
         };
         if setup.phase != WorktreeSetupPhase::Failed || thread.worktree_path.is_none() {
             return;
+        }
+        if let Some(placement) = thread.placement.as_mut() {
+            placement.phase = placement::PlacementPhase::Pending;
+            placement.error = None;
         }
         setup.phase = WorktreeSetupPhase::Running;
         setup.error = None;
@@ -12039,7 +12104,11 @@ impl State {
         setup.phase = WorktreeSetupPhase::Succeeded;
         setup.skipped = true;
         setup.error = None;
-        self.release_after_worktree_setup(index);
+        if thread.placement.is_some() {
+            self.finish_placement_ready(index);
+        } else {
+            self.release_after_worktree_setup(index);
+        }
         self.checkpoint();
     }
 
@@ -14060,6 +14129,12 @@ impl State {
                             Some(path.to_owned())
                         }
                     };
+                    thread.placement = record
+                        .get("placement")
+                        .filter(|v| !v.is_null())
+                        .map(|v| serde_json::from_value(v.clone()))
+                        .transpose()
+                        .ok()?;
                     thread.branch = record
                         .get("branch")
                         .and_then(Value::as_str)
@@ -14087,6 +14162,10 @@ impl State {
                                 "Worktree setup was interrupted before restart. Retry or skip to continue."
                                     .into(),
                             );
+                            if let Some(placement) = thread.placement.as_mut() {
+                                placement.phase = placement::PlacementPhase::Failed;
+                                placement.error = s.error.clone();
+                            }
                             thread.worktree_setup_output_open = true;
                         }
                         thread.worktree_setup = setup;
@@ -15150,6 +15229,9 @@ impl Thread {
         if let Some(worktree_path) = &self.worktree_path {
             record["worktreePath"] = json!(worktree_path);
         }
+        if let Some(placement) = &self.placement {
+            record["placement"] = placement.value();
+        }
         if let Some(directory) = &self.scratch_directory {
             record["scratchDirectory"] = json!(directory);
         }
@@ -15295,6 +15377,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= crate::ui::diff_panel::tick(state, tx);
     changed |= state.poll_worktree_bootstraps();
     changed |= state.poll_worktree_setup();
+    changed |= state.poll_placements();
     changed |= state.poll_question_answers();
     if state.runtime_enabled && state.client.is_none() {
         for index in 0..state.threads.len() {

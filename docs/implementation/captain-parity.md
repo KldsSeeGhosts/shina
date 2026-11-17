@@ -147,10 +147,42 @@ The #20 backend assignment uses Devin SWE-2. Its placement and
 receipt data must support a separate Claude Opus 5.5 medium UI assignment;
 backend completion alone cannot close that issue.
 
-Devin rate-limited the #20 and #22 assignments on November 16. Their existing
-worktrees and partial work remain intact. Resume those implementation threads
-with the same requested SWE-2 model after the reported reset; do not replace
-them with another provider or publish incomplete changes.
+The original rate-limited #20 and #22 assignments resumed in their existing
+threads and returned candidate commits. The #20 backend rework adds negotiated
+`placement-v1` support at minor 38 and refuses isolated launches on older peers.
+Root review adds setup serialization, interrupted-setup recovery, cancellation
+checks, pinned base commits, remote upstream-id translation, and a shared reader
+using its local parent's dirty worktree without write access. Queued peer
+follow-ups no longer duplicate the preceding message during provisioning.
+
+The root's live two-serve-process test proves distinct peer writer checkouts and
+branches, stable keyed retries, mirrored placement, and preservation of the
+parent's staged and untracked files. Before the final UI corrections the
+integrated #20 branch passed 1,962 unit tests and 102 server-runtime tests,
+with 12 optional unit tests ignored.
+
+Claude Opus 5.5 medium implemented placement display and crew-draft selection,
+with layout tests at 620, 960, 1280 and 1920 pixels. Its separate protocol patch
+was not applied because the backend already advertises the contract at the
+correct negotiated minor. Review required correct labels for shared readers in
+a parent's worktree and access to the base-branch picker in narrow crew drafts.
+The first Opus follow-up exhausted Devin's
+daily quota before making edits. At the user's direction, its replacement uses
+Claude Code with Opus 5.5 at medium effort. Future design and frontend work uses
+that provider; SWE-2 implementation stays on Devin. Both old worktrees remain
+untouched. No plan or authentication changes were made.
+
+Claude Code commit `b0dd03f`, integrated as `d4c3529`, fixes both findings.
+The lock icon and label use the same read-only predicate as the backend.
+The branch selector remains in the footer when machine and workspace controls
+move into overflow, matching KSG's `BranchToolbar`. Headless tests exercise
+pointer and keyboard selection, errors and bounds at all four supported widths.
+The worker's full suite passes 1,964 unit tests and 102 server-runtime tests,
+with 12 optional tests ignored. Root review inspected the actual 620 and 1280
+pixel picker renders. The initial PR #47 head passed CI; the updated UI head
+must pass again before merge.
+
+Issue #22's mandatory cancellation and question-answer fences remain separate.
 
 Any frontend implementation or design decisions are assigned to Claude Opus
 5.5 medium. KSG Code remains the layout and interaction reference, with Shina's

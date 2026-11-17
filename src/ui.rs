@@ -14623,6 +14623,25 @@ fn machine_selector(s: &State, p: Palette, icon_only: bool) -> El {
         .child(icon("chevron", p.muted).size(12.0, 12.0))
 }
 
+/// The workspace choice's name. A crew draft with placement-v1 runs its worker in the project
+/// checkout read only, so "Current checkout" says so there.
+pub(super) fn env_mode_title(s: &State, mode: crate::model::ThreadEnvMode) -> &'static str {
+    if mode == crate::model::ThreadEnvMode::Local && s.crew_draft_placement() {
+        "Read-only checkout"
+    } else {
+        crate::branch_toolbar::resolve_env_mode_label(mode)
+    }
+}
+
+/// What each workspace choice means for a crew worker, under its name in the picker, as KSG's
+/// `PreviousWorktreeItemContent` puts a branch under its label. KSG has no crew placement.
+fn crew_env_mode_detail(mode: crate::model::ThreadEnvMode) -> &'static str {
+    match mode {
+        crate::model::ThreadEnvMode::Worktree => "Writes on its own branch",
+        crate::model::ThreadEnvMode::Local => "Sees uncommitted changes, cannot edit",
+    }
+}
+
 /// Ported from KSG Code's `BranchToolbarEnvModeSelector` and `ComposerControl` size `xs`.
 fn env_mode_trigger(
     s: &State,
@@ -14630,11 +14649,11 @@ fn env_mode_trigger(
     icon_only: bool,
     mode: crate::model::ThreadEnvMode,
 ) -> El {
-    let title = crate::branch_toolbar::resolve_env_mode_label(mode);
-    let glyph = if mode == crate::model::ThreadEnvMode::Worktree {
-        "branch"
-    } else {
-        "folder"
+    let title = env_mode_title(s, mode);
+    let glyph = match mode {
+        crate::model::ThreadEnvMode::Worktree => "branch",
+        _ if s.crew_draft_placement() => "lock",
+        _ => "folder",
     };
     row()
         .key("env-mode-trigger")
@@ -14949,7 +14968,11 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         .role("menu")
         .focus_group()
         .label("Workspace")
-        .w(240.0)
+        .w(if s.crew_draft_placement() {
+            280.0
+        } else {
+            240.0
+        })
         .padding(4.0)
         .gap(1.0)
         .radius(6.0)
@@ -14957,24 +14980,36 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         .border(2.0, p.frame)
         .box_shadow(hard_shadow(p))
         .child(pixel_label("Workspace", p.muted).px(8.0).py(6.0));
+    let crew = s.crew_draft_placement();
     for (mode, slug, glyph) in [
-        (crate::model::ThreadEnvMode::Local, "local", "folder"),
+        (
+            crate::model::ThreadEnvMode::Local,
+            "local",
+            if crew { "lock" } else { "folder" },
+        ),
         (crate::model::ThreadEnvMode::Worktree, "worktree", "branch"),
     ] {
-        let title = crate::branch_toolbar::resolve_env_mode_label(mode);
+        let title = env_mode_title(s, mode);
         let selected = active == mode;
         let disabled = force_worktree && mode == crate::model::ThreadEnvMode::Local;
+        let name = label(title, TextStyle::new(13.0, 450.0), p.ink)
+            .truncate()
+            .min_w(0.0);
         let mut item = row()
             .key(format!("env-mode-option-{slug}"))
             .role("menuitemradio")
             .checked(selected)
-            .label(title)
+            .label(if crew {
+                format!("{title}. {}", crew_env_mode_detail(mode))
+            } else {
+                title.to_owned()
+            })
             .focusable(!disabled)
             .disabled(disabled)
             .opacity(if disabled { 0.55 } else { 1.0 })
             .center_y()
             .gap(8.0)
-            .h(30.0)
+            .h(if crew { 44.0 } else { 30.0 })
             .px(8.0)
             .radius(4.0)
             .fill(if selected {
@@ -14988,12 +15023,16 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
                 p.selected
             })
             .child(icon(glyph, p.muted).size(14.0, 14.0))
-            .child(
-                label(title, TextStyle::new(13.0, 450.0), p.ink)
-                    .truncate()
-                    .grow(1.0)
-                    .min_w(0.0),
-            );
+            .child(if crew {
+                col().gap(2.0).grow(1.0).min_w(0.0).child(name).child(
+                    label(crew_env_mode_detail(mode), SMALL, p.muted)
+                        .key(format!("env-mode-option-{slug}-detail"))
+                        .truncate()
+                        .min_w(0.0),
+                )
+            } else {
+                name.grow(1.0)
+            });
         if !disabled {
             item = item
                 .cursor(rune::Cursor::Pointer)
@@ -15007,12 +15046,21 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         }
         menu = menu.child(item);
     }
-    menu.anchored_fit("env-mode-trigger", rune::Side::Top, rune::Align::Start, 6.0)
-        .focus_return("composer-input")
-        .modal(true, |s: &mut State| {
-            s.env_mode_picker = false;
-            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-        })
+    menu.anchored_fit(
+        if s.composer_ui.visible_blocks.get() == 0 {
+            "composer-overflow"
+        } else {
+            "env-mode-trigger"
+        },
+        rune::Side::Top,
+        rune::Align::Start,
+        6.0,
+    )
+    .focus_return("composer-input")
+    .modal(true, |s: &mut State| {
+        s.env_mode_picker = false;
+        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+    })
 }
 
 /// Ported from KSG Code's `BranchPicker` and `BranchToolbarBranchSelector`.
@@ -15080,7 +15128,13 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
         });
 
     if let Some(err) = entry.and_then(|e| e.error.as_deref()) {
-        list = list.child(label(err, SMALL, p.danger).wrap().px(12.0).py(8.0));
+        list = list.child(
+            label(err, SMALL, p.danger)
+                .key("base-branch-error")
+                .wrap()
+                .px(12.0)
+                .py(8.0),
+        );
     } else if entry.is_none_or(|e| e.loading && e.refs.is_empty()) {
         list = list.child(label("Loading refs...", SMALL, p.muted).px(12.0).py(8.0));
     } else if let Some(entry) = entry {
@@ -24703,6 +24757,251 @@ pub(crate) mod tests {
         }
     }
 
+    fn test_placement(value: serde_json::Value) -> crate::model::placement::ThreadPlacement {
+        let mut base = json!({
+            "requested":"default","mode":"isolated","phase":"ready","executor":"local",
+            "repository":"/Users/someone/projects/shina","baseBranch":"main",
+            "baseCommit":"0123456789abcdef0123456789abcdef01234567","newWorktree":true
+        });
+        for (key, field) in value.as_object().unwrap() {
+            base[key] = field.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn set_placement(rt: &mut Runtime<State>, thread: usize, value: serde_json::Value) {
+        let placement = test_placement(value);
+        rt.state
+            .threads
+            .iter_mut()
+            .find(|t| t.id == thread)
+            .unwrap()
+            .placement = Some(placement);
+    }
+
+    fn contrast(a: Color, b: Color) -> f32 {
+        let (a, b) = (a.luminance(), b.luminance());
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn worker_placements_show_where_each_worker_runs_at_supported_widths() {
+        let long_branch = "shina/delegate-a-very-long-task-name-that-keeps-going-past-the-card";
+        let long_checkout = "/Users/someone/Library/Application Support/Shina/worktrees/shina/delegate-a-very-long-task-name-that-keeps-going-past-the-card";
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            set_placement(
+                &mut rt,
+                16,
+                json!({"branch":long_branch,"checkout":long_checkout}),
+            );
+            set_placement(
+                &mut rt,
+                17,
+                json!({"phase":"pending","branch":"shina/pending-task","checkout":"/tmp/wt/pending-task"}),
+            );
+            set_placement(
+                &mut rt,
+                19,
+                json!({
+                    "phase":"failed","branch":"shina/broken","checkout":"/tmp/wt/broken",
+                    "error":format!("git worktree add failed: fatal: '{long_checkout}' already exists and is not an empty directory")
+                }),
+            );
+            set_placement(
+                &mut rt,
+                18,
+                json!({"mode":"shared","newWorktree":false,"primaryCheckout":true,
+                    "checkout":"/Users/someone/projects/shina","branch":"main"}),
+            );
+            rt.invalidate();
+            rt.frame(1.0);
+            for child in [16, 17, 18, 19] {
+                let card = rt.presented(&format!("task-card-{child}")).unwrap().0;
+                for part in ["", "-mode"] {
+                    let key = format!("task-placement-{child}{part}");
+                    let r = rt
+                        .presented(&key)
+                        .unwrap_or_else(|| panic!("{width}: {key} is missing"))
+                        .0;
+                    assert!(
+                        r[0] >= card[0] && r[0] + r[2] <= card[0] + card[2] + 0.5,
+                        "{width}: {key} {r:?} leaves its card {card:?}"
+                    );
+                }
+            }
+            // A long branch and checkout truncate inside the card, and the tooltip keeps them.
+            let card = rt.presented("task-card-16").unwrap().0;
+            for key in ["task-placement-16-branch", "task-placement-16-checkout"] {
+                let r = rt.presented(key).unwrap().0;
+                assert!(
+                    r[0] + r[2] <= card[0] + card[2] + 0.5,
+                    "{width}: {key} {r:?}"
+                );
+            }
+            assert_eq!(
+                element_text(&rt, "task-placement-16-mode").as_deref(),
+                Some("Worktree")
+            );
+            // The card's status word names the phase, so the line does not repeat it.
+            assert!(rt.presented("task-placement-17-phase").is_none());
+            assert!(
+                element_text(&rt, "task-card-17").is_some_and(|label| label.contains("Preparing"))
+            );
+            assert_eq!(
+                element_text(&rt, "task-placement-18-mode").as_deref(),
+                Some("Read only")
+            );
+            assert!(
+                element_text(&rt, "task-card-19")
+                    .is_some_and(|label| label.contains("Setup failed"))
+            );
+            // The failure and what to do next both wrap inside the card.
+            let card = rt.presented("task-card-19").unwrap().0;
+            for key in ["task-placement-19-error", "task-placement-19-recovery"] {
+                let r = rt.presented(key).unwrap_or_else(|| panic!("{key}")).0;
+                let text = element_text(&rt, key);
+                assert!(
+                    r[0] >= card[0] && r[0] + r[2] <= card[0] + card[2] + 0.5,
+                    "{width}: {key} {r:?} leaves {card:?}"
+                );
+                assert!(text.is_some_and(|t| !t.is_empty()), "{width}: {key}");
+            }
+            assert!(
+                element_text(&rt, "task-placement-19-recovery")
+                    .unwrap()
+                    .contains("same checkout")
+            );
+            // The tray chip carries the placement in its accessible name.
+            let chip = element_text(&rt, "crew-chip-16").unwrap_or_default();
+            assert!(
+                chip.contains("Branch: shina/delegate-a-very-long"),
+                "{chip}"
+            );
+            press(&mut rt, "crew-chip-16");
+            rt.frame(1.0);
+            let bar = rt.presented("parent-bar").unwrap().0;
+            for key in [
+                "parent-bar-placement",
+                "parent-bar-placement-branch",
+                "parent-bar-placement-checkout",
+            ] {
+                let r = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key} is missing"))
+                    .0;
+                assert!(
+                    r[0] >= bar[0] && r[0] + r[2] <= bar[0] + bar[2] + 0.5,
+                    "{width}: {key} {r:?} leaves {bar:?}"
+                );
+            }
+            assert_inside(&mut rt, width, &["parent-bar", "open-captain", "composer"]);
+        }
+    }
+
+    #[test]
+    fn a_crew_root_bar_shows_its_placement_and_a_failed_setup_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            let thread_id = rt.state.next_id;
+            rt.state.next_id += 1;
+            let mut member = Thread::new(thread_id);
+            member.title = "Crew member".into();
+            member.project = Some(1);
+            member.crew_captain = Some(0);
+            member.placement = Some(test_placement(json!({
+                "phase":"failed","branch":"shina/crew-0123456789abcdef","checkout":"C:\\Users\\someone\\AppData\\Local\\Shina\\worktrees\\shina\\crew-0123456789abcdef",
+                "error":"Setup script exited with code 1."
+            })));
+            rt.state.threads.push(member);
+            rt.state.select_thread(rt.state.threads.len() - 1);
+            rt.invalidate();
+            rt.frame(1.0);
+            let bar = rt.presented("crew-bar").expect("crew bar").0;
+            for key in [
+                "crew-bar-name",
+                "crew-bar-placement",
+                "crew-bar-placement-phase",
+                "crew-bar-placement-error",
+                "crew-bar-placement-recovery",
+                "crew-bar-open-captain",
+            ] {
+                let r = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key} is missing"))
+                    .0;
+                assert!(
+                    r[0] >= bar[0] && r[0] + r[2] <= bar[0] + bar[2] + 0.5 && r[2] > 0.0,
+                    "{width}: {key} {r:?} leaves {bar:?}"
+                );
+            }
+            // Windows checkouts keep their own separator in the shortened path.
+            assert_eq!(
+                element_text(&rt, "crew-bar-placement-checkout").as_deref(),
+                Some("…\\shina\\crew-0123456789abcdef")
+            );
+        }
+    }
+
+    #[test]
+    fn a_shared_reader_in_a_parent_worktree_reads_as_read_only_and_scratch_stays_scratch() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            // A reader sharing its parent's existing worktree: a real repository, not the
+            // primary checkout. The worker cannot write there, so the card must not say scratch.
+            set_placement(
+                &mut rt,
+                16,
+                json!({"mode":"shared","newWorktree":false,"primaryCheckout":false,
+                    "checkout":"/Users/someone/Library/Application Support/Shina/worktrees/shina/parent-task",
+                    "branch":"shina/parent-task"}),
+            );
+            // A worker with no project gets a private scratch folder.
+            set_placement(
+                &mut rt,
+                17,
+                json!({"mode":"shared","newWorktree":false,"primaryCheckout":false,
+                    "repository":null,"baseBranch":null,"baseCommit":null,
+                    "checkout":"/tmp/shina/scratch/17"}),
+            );
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_eq!(
+                element_text(&rt, "task-placement-16-mode").as_deref(),
+                Some("Read only"),
+                "{width}"
+            );
+            let label = element_text(&rt, "task-placement-16").unwrap_or_default();
+            assert!(label.starts_with("Read only on "), "{width}: {label}");
+            assert!(
+                label.contains("Branch: shina/parent-task"),
+                "{width}: {label}"
+            );
+            assert_eq!(
+                element_text(&rt, "task-placement-17-mode").as_deref(),
+                Some("Scratch folder"),
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_words_keep_text_contrast_on_cards_in_both_themes() {
+        for dark in [false, true] {
+            let p = palette(dark);
+            for (name, ink) in [
+                ("muted", p.muted),
+                ("faint", p.faint),
+                ("brass", p.brass),
+                ("danger", p.danger),
+                ("ink", p.ink),
+            ] {
+                let ratio = contrast(ink, p.card);
+                assert!(ratio >= 4.5, "dark {dark}: {name} on card is {ratio:.2}:1");
+            }
+        }
+    }
+
     #[test]
     fn the_crew_tray_is_two_equal_columns_from_560_and_one_column_below() {
         let chips = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
@@ -29443,6 +29742,299 @@ pub(crate) mod tests {
         rt.frame(0.75);
         assert!(rt.presented("env-mode-trigger").is_none());
         assert!(rt.presented("base-branch-trigger").is_none());
+    }
+
+    #[test]
+    fn a_crew_draft_picks_its_worker_checkout_by_pointer_and_keyboard_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.current_mut().client_draft = true;
+            rt.state.current_mut().draft.focused = true;
+            rt.state.current_mut().crew_draft = Some(crate::model::CrewDraftTarget {
+                server: "local".into(),
+                captain: 0,
+                name: "Ember".into(),
+            });
+            let project_path = rt
+                .state
+                .project(rt.state.current().project)
+                .unwrap()
+                .path
+                .to_string_lossy()
+                .into_owned();
+            rt.state.vcs_branches.insert(
+                ("local".into(), project_path),
+                crate::model::VcsBranchCacheEntry {
+                    is_repo: true,
+                    loaded: true,
+                    loading: false,
+                    error: None,
+                    refs: vec![crate::vcs::VcsRef {
+                        name: "main".into(),
+                        is_remote: Some(false),
+                        remote_name: None,
+                        upstream_ref: None,
+                        current: true,
+                        is_default: true,
+                        worktree_path: None,
+                    }],
+                },
+            );
+            rt.state
+                .set_draft_env_mode(crate::model::ThreadEnvMode::Worktree);
+            rt.frame(0.0);
+            rt.frame(0.25);
+            assert!(rt.state.crew_draft_placement());
+            let footer = rt.presented("composer-footer").unwrap().0;
+            // A narrow footer moves the workspace choice into its overflow menu.
+            let inline = rt.presented("env-mode-trigger").is_some();
+            let keys: &[&str] = if inline {
+                &[
+                    "composer-crew-chip",
+                    "env-mode-trigger",
+                    "base-branch-trigger",
+                ]
+            } else {
+                &["composer-crew-chip", "composer-overflow"]
+            };
+            for key in keys {
+                let r = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(
+                    r[0] >= footer[0] - 0.5 && r[0] + r[2] <= footer[0] + footer[2] + 0.5,
+                    "{width}: {key} {r:?} leaves {footer:?}"
+                );
+            }
+            if inline {
+                press(&mut rt, "env-mode-trigger");
+            } else {
+                press(&mut rt, "composer-overflow");
+                rt.frame(0.4);
+                press(&mut rt, "overflow-workspace");
+            }
+            rt.frame(0.5);
+            let menu = rt.presented("env-mode-picker").unwrap().0;
+            assert!(
+                menu[0] >= 0.0 && menu[0] + menu[2] <= width + 0.5,
+                "{width}: {menu:?}"
+            );
+            for key in [
+                "env-mode-option-local",
+                "env-mode-option-local-detail",
+                "env-mode-option-worktree",
+                "env-mode-option-worktree-detail",
+            ] {
+                let r = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(
+                    r[0] >= menu[0] && r[0] + r[2] <= menu[0] + menu[2] + 0.5,
+                    "{width}: {key} {r:?} leaves {menu:?}"
+                );
+            }
+            assert!(
+                element_text(&rt, "env-mode-option-local")
+                    .is_some_and(|text| text.starts_with("Read-only checkout")),
+                "{width}"
+            );
+            // The menu takes Tab and arrow keys: reach the read-only checkout and choose it.
+            let mut reached = false;
+            for key in [rune::Key::Tab, rune::Key::Down, rune::Key::Up] {
+                tap(&mut rt, key);
+                if focused(&rt).key.as_deref() == Some("env-mode-option-local") {
+                    reached = true;
+                    break;
+                }
+            }
+            assert!(reached, "{width}: focus is on {:?}", focused(&rt).key);
+            tap(&mut rt, rune::Key::Enter);
+            assert_eq!(
+                rt.state.current().env_mode,
+                Some(crate::model::ThreadEnvMode::Local),
+                "{width}"
+            );
+            rt.frame(1.0);
+            assert!(rt.presented("env-mode-picker").is_none());
+            assert!(rt.presented("base-branch-trigger").is_none());
+            if inline {
+                assert_eq!(
+                    element_text(&rt, "env-mode-trigger-label").as_deref(),
+                    Some("Read-only checkout")
+                );
+            }
+            // This headless state has no captain records; the checkout choice never blocks.
+            assert!(
+                rt.state
+                    .crew_draft_unavailable()
+                    .is_none_or(|reason| !reason.contains("worktree")),
+                "{width}"
+            );
+        }
+    }
+
+    /// A crew draft's worker base branch stays reachable at every width. At 620 px the machine
+    /// and workspace move into the overflow menu, and the base branch stays in the strip as
+    /// KSG Code's `BranchToolbar` keeps `BranchToolbarBranchSelector` beside the collapsed
+    /// `RunContextSelector`.
+    #[test]
+    fn a_crew_draft_chooses_its_worker_base_branch_by_pointer_and_keyboard_at_all_widths() {
+        let git_ref = |name: &str, current: bool| crate::vcs::VcsRef {
+            name: name.into(),
+            is_remote: Some(false),
+            remote_name: None,
+            upstream_ref: None,
+            current,
+            is_default: current,
+            worktree_path: None,
+        };
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.current_mut().client_draft = true;
+            rt.state.current_mut().draft.focused = true;
+            rt.state.current_mut().crew_draft = Some(crate::model::CrewDraftTarget {
+                server: "local".into(),
+                captain: 0,
+                name: "Ember".into(),
+            });
+            let project_path = rt
+                .state
+                .project(rt.state.current().project)
+                .unwrap()
+                .path
+                .to_string_lossy()
+                .into_owned();
+            let repo = ("local".to_owned(), project_path);
+            rt.state.vcs_branches.insert(
+                repo.clone(),
+                crate::model::VcsBranchCacheEntry {
+                    is_repo: true,
+                    loaded: true,
+                    loading: false,
+                    error: None,
+                    refs: vec![
+                        git_ref("main", true),
+                        git_ref("release/very-long-branch-name-for-the-worker", false),
+                        git_ref("shina/feature", false),
+                    ],
+                },
+            );
+            rt.state
+                .set_draft_env_mode(crate::model::ThreadEnvMode::Worktree);
+            rt.frame(0.0);
+            rt.frame(0.25);
+            assert!(rt.state.crew_draft_placement());
+            let footer = rt.presented("composer-footer").unwrap().0;
+            let mut keys = vec!["composer-crew-chip", "base-branch-trigger"];
+            if rt.presented("env-mode-trigger").is_none() {
+                keys.push("composer-overflow");
+            }
+            if width <= 620.0 {
+                assert!(
+                    rt.presented("env-mode-trigger").is_none(),
+                    "{width}: this width exercises the overflow footer"
+                );
+            }
+            let mut previous: Option<[f32; 4]> = None;
+            for key in &keys {
+                let r = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key} is missing"))
+                    .0;
+                assert!(
+                    r[0] >= footer[0] - 0.5 && r[0] + r[2] <= footer[0] + footer[2] + 0.5,
+                    "{width}: {key} {r:?} leaves {footer:?}"
+                );
+                if let Some(prev) = previous {
+                    assert!(r[0] >= prev[0] + prev[2] - 0.5, "{width}: {key} overlaps");
+                }
+                previous = Some(r);
+            }
+
+            // Pointer: open the picker from the strip and choose a branch.
+            press(&mut rt, "base-branch-trigger");
+            rt.frame(0.5);
+            let picker = rt.presented("base-branch-picker").expect("base picker").0;
+            assert!(
+                picker[0] >= 0.0 && picker[0] + picker[2] <= width + 0.5,
+                "{width}: {picker:?}"
+            );
+            for key in [
+                "base-branch-search",
+                "base-branch-option-main",
+                "base-branch-option-shina/feature",
+                "start-from-remote-row",
+            ] {
+                let r = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(
+                    r[0] >= picker[0] && r[0] + r[2] <= picker[0] + picker[2] + 0.5,
+                    "{width}: {key} {r:?} leaves {picker:?}"
+                );
+            }
+            press(&mut rt, "base-branch-option-shina/feature");
+            rt.frame(1.0);
+            assert!(rt.presented("base-branch-picker").is_none(), "{width}");
+            assert_eq!(
+                rt.state.current().base_branch.as_deref(),
+                Some("shina/feature"),
+                "{width}"
+            );
+            assert!(
+                element_text(&rt, "base-branch-trigger-label")
+                    .is_some_and(|label| label.starts_with("From shina/feature")),
+                "{width}"
+            );
+
+            // Keyboard: Tab reaches the trigger, Enter opens it, Down leaves the search field
+            // for the list and Enter picks the focused branch.
+            tab_to(&mut rt, "base-branch-trigger");
+            tap(&mut rt, rune::Key::Enter);
+            assert!(rt.presented("base-branch-picker").is_some(), "{width}");
+            assert_eq!(focused(&rt).key.as_deref(), Some("base-branch-search"));
+            tap(&mut rt, rune::Key::Down);
+            let mut chose = None;
+            for _ in 0..6 {
+                if focused(&rt).key.as_deref() == Some("base-branch-option-main") {
+                    chose = Some("main");
+                    break;
+                }
+                tap(&mut rt, rune::Key::Down);
+            }
+            assert_eq!(chose, Some("main"), "{width}: focus {:?}", focused(&rt).key);
+            tap(&mut rt, rune::Key::Enter);
+            assert_eq!(
+                rt.state.current().base_branch.as_deref(),
+                Some("main"),
+                "{width}"
+            );
+            assert!(rt.presented("base-branch-picker").is_none(), "{width}");
+
+            // A failed ref listing shows its error inside the picker instead of an empty list.
+            rt.state.vcs_branches.get_mut(&repo).unwrap().error =
+                Some("git for-each-ref failed: not a git repository".into());
+            press(&mut rt, "base-branch-trigger");
+            rt.frame(0.5);
+            let picker = rt.presented("base-branch-picker").expect("base picker").0;
+            let error = rt.presented("base-branch-error").expect("ref error").0;
+            assert!(
+                error[0] >= picker[0] && error[0] + error[2] <= picker[0] + picker[2] + 0.5,
+                "{width}: {error:?} leaves {picker:?}"
+            );
+            assert!(
+                element_text(&rt, "base-branch-error")
+                    .is_some_and(|text| text.contains("for-each-ref failed")),
+                "{width}"
+            );
+            assert!(rt.presented("base-branch-option-main").is_none(), "{width}");
+            assert!(picker[0] + picker[2] <= width + 0.5, "{width}: {picker:?}");
+        }
     }
 
     #[test]

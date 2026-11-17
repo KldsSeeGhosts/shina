@@ -62,7 +62,8 @@
       "captain-crew-control-v1",
       "captain-events-v1",
       "provider-updates-v1",
-      "captain-peer-documents-v1"
+      "captain-peer-documents-v1",
+      "placement-v1"
     ],
     "deviceId": "<uuid>",
     "epoch": "<epoch>",
@@ -80,7 +81,7 @@
     },
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 37,
+    "protocolMinor": 38,
     "serverId": "<serverId>",
     "serverTime": "<time>"
   }

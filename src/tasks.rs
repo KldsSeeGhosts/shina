@@ -1033,6 +1033,7 @@ impl State {
         task.state = TaskState::Queued;
         task.delivered = false;
         task.delivery_id = format!("{}-result-{}", task.id, unique_id());
+        let child_thread_id = task.child_thread_id;
         task.attempt_message = delivery_text(
             &format!("{}-brief-{}", task.id, unique_id()),
             &format!("Shina: message from parent #{parent}\n\n{message}"),
@@ -1044,6 +1045,13 @@ impl State {
         task.started_at = None;
         task.finished_at = None;
         task.hold_delivery = false;
+        if let Some(child) = self
+            .threads
+            .iter()
+            .position(|thread| thread.id == child_thread_id)
+        {
+            self.request_reprovision(child);
+        }
         Ok(())
     }
 
@@ -1186,6 +1194,10 @@ impl State {
             };
             if self.threads[child].status.busy()
                 || self.threads[child].phase == "Stopping"
+                || self.threads[child]
+                    .placement
+                    .as_ref()
+                    .is_some_and(|placement| placement.phase != placement::PlacementPhase::Ready)
                 || (self.threads[child].machine == "local"
                     && self
                         .provider_update_drivers
@@ -1354,6 +1366,16 @@ impl State {
             }
             task.hold_delivery = true;
             if task.remote.is_some() {
+                continue;
+            }
+            if self.threads.iter().any(|thread| {
+                thread.id == task.child_thread_id
+                    && thread.placement.as_ref().is_some_and(|placement| {
+                        placement.phase != placement::PlacementPhase::Ready
+                    })
+            }) {
+                // The worker never reached a provider. Leave it queued so its
+                // recorded reservation provisions again after the restart.
                 continue;
             }
             task.recovering = true;
