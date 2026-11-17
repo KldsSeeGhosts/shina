@@ -3578,6 +3578,47 @@ mod tests {
     }
 
     #[test]
+    fn replay_requires_fresh_provider_history_not_a_restored_transcript() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let command = uuid::Uuid::new_v4().to_string();
+        let mut intent = PeerTaskIntent::input(
+            command.clone(),
+            child,
+            Some("attempt-a".into()),
+            None,
+            None,
+            "follow_up",
+            tasks::delivery_text(&command, "saved before restart"),
+            None,
+        );
+        intent.recovery = "awaiting_history".into();
+        state.stage_peer_task_intent(intent).unwrap();
+        // Installing saved thread views marks the transcript loaded even
+        // when admission or placement has not yet allowed a provider read.
+        state.threads[1].history_loaded = true;
+        state.threads[1].peer_recovery_held = true;
+        state.reconcile_peer_task_intents();
+        assert!(state.threads[1].peer_recovery_held);
+        assert_eq!(state.peer_task_intents[0].recovery, "awaiting_history");
+
+        state.threads[1].apply(json!({"type":"response","id":"history",
+            "command":"get_messages","success":true,
+            "data":{"historyReplayed":false,"messages":[]}}));
+        state.reconcile_peer_task_intents();
+        assert!(state.threads[1].peer_recovery_held);
+        assert_eq!(state.peer_task_intents[0].recovery, "awaiting_history");
+
+        state.threads[1].apply(json!({"type":"response","id":"history",
+            "command":"get_messages","success":true,"data":{"messages":[]}}));
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.peer_task_intents[0].recovery, "history_absent");
+        assert!(!state.threads[1].peer_recovery_held);
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn non_authoritative_history_holds_restored_peer_input_as_unknown() {
         let mut state = fixture();
         let child = peer_worker(&mut state);
@@ -5265,7 +5306,8 @@ impl State {
                 .any(|injection| injection.text == *message)
             && !self.threads[index]
                 .peer_input_history
-                .contains(&input_history_key(message))
+                .as_ref()
+                .is_some_and(|history| history.contains(&input_history_key(message)))
         {
             self.threads[index].pending_injections.push_back(Injection {
                 text: message.clone(),
@@ -5529,7 +5571,8 @@ impl State {
             let marker_present = intent.message.as_deref().is_some_and(|message| {
                 thread
                     .peer_input_history
-                    .contains(&input_history_key(message))
+                    .as_ref()
+                    .is_some_and(|history| history.contains(&input_history_key(message)))
             });
             let origin_input = thread.peer_origin.as_ref().and_then(|origin| {
                 origin
@@ -5649,7 +5692,8 @@ impl State {
                     intent.recovery = "awaiting_adapter".into();
                 }
             } else if intent.recovery == "awaiting_history"
-                && thread.history_loaded
+                && (thread.peer_input_history.is_some()
+                    || thread.harness != "pi" && thread.history_loaded)
                 && !marker_present
             {
                 if thread.harness == "pi" {

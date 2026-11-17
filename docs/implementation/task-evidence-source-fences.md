@@ -46,3 +46,8 @@ is incomplete. The target then removes that exact restored input from its
 queue. It releases the thread hold only after all held prompt intents are
 resolved. Missing history from a non-authoritative adapter is still unknown,
 and never authorizes automatic replay.
+
+The saved server transcript is separate from a fresh provider history read.
+Even on Pi, Shina waits for a successful history response with a message list
+before treating a missing marker as nonacceptance. A response that says history
+was not replayed supplies no such proof.
