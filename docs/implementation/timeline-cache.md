@@ -34,6 +34,17 @@ The raw tool handler now resolves its stable tool id, not its captured vector
 index. Missing message identities no longer make thought/work handlers act on
 an unrelated positional replacement.
 
+Message prose, user bubbles and work containers now use stable message ids in
+their element keys. Citation selection resolves that id after a prepend, and
+Cite resolves the current message by id instead of using a captured ordinal.
+The cached four-width regression retains native selected text across a
+prepend. The existing citation round-trip test now prepends history before
+Cite and still inserts the right message's citation.
+
+Live status reads a cached set of unfinished tools. Item updates maintain that
+set without rescanning completed tools. Deferred-work flags use the structural
+index, and nonempty conversations do not scan tools for the empty-state check.
+
 The four-width cached-turn regression passes. Background streaming rebuilds
 zero completed turns, keys or indexes; disclosure, theme and width changes
 invalidate the cached presentation. The existing combined reconnect/cache-reset
@@ -68,5 +79,19 @@ window is 30 rows at all sizes. Prepending rebuilds the structure as required.
 | 5,000 | 2.078 / 6.801 | 4.811 / 5.181 | 34.935 / 40.928 |
 
 These are debug-build CPU measurements, not production frame-rate claims.
-Remaining acceptance work includes stable selection identities during
-prepends and the normal CI/release gates. This branch does not yet complete #25.
+The existing search-navigation and sticky-bottom tests pass, as do the
+four-width cached-turn test, citation round-trip and combined reconnect/cache
+reset regression. All-target checking, formatting and diff checks pass.
+
+| Acceptance | Evidence |
+| --- | --- |
+| Scroll without a full view/key walk per wheel frame | Callback-based position capture and benchmark view/key/index counters |
+| Active-turn content does not rebuild completed turns or row keys | Per-item owning-turn revisions, cached unfinished tools and cached-turn counters |
+| Prepends, boundaries, retries, compactions and return/reconnect invalidate correctly | Structural input keys, indexed events, structure regression and existing reconnect/anchor coverage |
+| Stable handlers after prepending | Stable message/tool ids; native selection/prepend and citation/reply coverage |
+| Separate scroll, stream and prepend benchmark | Recorded fixture sizes, CPU p50/p95 and view/key/row/turn/index counts |
+| Search, selection, sticky bottom and reader anchor | Existing search/sticky-bottom tests plus four-width cache and reconnect regressions |
+
+Exact-head CI and downloaded release verification remain required. Issue25
+stays open. This does not claim finer tool-row virtualization or completion
+of issue26.

@@ -277,7 +277,8 @@ fn a_500_record_fold_mounts_no_work_rows_and_shows_deferred_loading_and_error_st
         t.deferred_work = vec![marker];
         rt.frame(0.0);
         assert!(
-            rt.find("work-rows-1-0").is_none(),
+            rt.find(&format!("work-rows-{}", message_key(rt.state.current(), 0)))
+                .is_none(),
             "{width}: folded work rows"
         );
         assert!(rt.find("tool-1-0").is_none(), "{width}: folded tool rows");
@@ -311,7 +312,10 @@ fn a_500_record_fold_mounts_no_work_rows_and_shows_deferred_loading_and_error_st
         rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("work-loading-1-0").is_none());
-        assert!(rt.find("work-rows-1-0").is_some());
+        assert!(
+            rt.find(&format!("work-rows-{}", message_key(rt.state.current(), 0)))
+                .is_some()
+        );
     }
 }
 
@@ -565,7 +569,10 @@ fn positional_cards_and_events_before_prose_are_not_moved_below_the_preamble() {
             _ => format!("provider-retry-{id}-0"),
         };
         let event = rt.presented(&event_key).unwrap().0;
-        let prose = rt.presented(&format!("message-{id}-0-body-0")).unwrap().0;
+        let prose = rt
+            .presented(&assistant_body_key(rt.state.current(), 0, 0))
+            .unwrap()
+            .0;
         assert!(event[1] < prose[1], "{kind} moved after prose");
     }
 }

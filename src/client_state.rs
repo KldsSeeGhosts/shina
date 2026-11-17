@@ -816,10 +816,7 @@ impl ThreadView {
         let tool_started_at = std::mem::take(&mut self.tool_started_at);
         let deser_tool = |index: usize, raw: &Value| -> Result<Tool, String> {
             let mut tool: Tool = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
-            thread
-                .timeline_cache
-                .borrow_mut()
-                .touch_item("tools", index);
+            thread.timeline_cache.borrow_mut().touch_tool(index, &tool);
             if !tool.done {
                 tool.started = tool_started_at
                     .get(&tool.id)

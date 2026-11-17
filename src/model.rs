@@ -5644,7 +5644,11 @@ impl State {
         {
             return false;
         }
-        let Some(message) = current.messages.get(sel.message_index) else {
+        let Some(message) = current
+            .messages
+            .iter()
+            .find(|message| message.id == sel.message_id)
+        else {
             return false;
         };
         if message.id != sel.message_id || message.role != "Pi" {

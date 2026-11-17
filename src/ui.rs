@@ -9932,6 +9932,17 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     group
 }
 
+fn message_key(thread: &Thread, index: usize) -> String {
+    match thread.messages.get(index) {
+        Some(message) => format!("message-{}-id-{}", thread.id, message.id),
+        None => format!("message-{}-boundary-{index}", thread.id),
+    }
+}
+
+fn assistant_body_key(thread: &Thread, index: usize, from: usize) -> String {
+    format!("{}-body-{from}", message_key(thread, index))
+}
+
 fn transcript_part(
     s: &State,
     p: Palette,
@@ -9947,7 +9958,6 @@ fn transcript_part(
         TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
-            let message_index = *message;
             let message_id = &t.messages[*message].id;
             let offset = *from;
             let thread_id = t.id;
@@ -9992,7 +10002,7 @@ fn transcript_part(
             };
             let memo_find = find_param.map(|(q, occ)| (q.to_owned(), occ));
             let rendered = memo(
-                format!("message-{}-{message}-body-{from}", t.id),
+                assistant_body_key(t, *message, *from),
                 (chunk, s.dark, streaming, wide, memo_find),
                 || {
                     markdown_ui::render_with_find(
@@ -10002,7 +10012,7 @@ fn transcript_part(
                         wide,
                         false,
                         streaming,
-                        &format!("{thread_id}-{message_index}-{offset}"),
+                        &format!("{thread_id}-{message_id}-{offset}"),
                         find_param,
                     )
                 },
@@ -10019,7 +10029,8 @@ fn transcript_part(
 /// What the agent is doing right now, for the live status line at the end of a turn. A
 /// running tool or thought already names itself in its own row, so the line says Working.
 fn live_status(t: &Thread) -> String {
-    if t.tools.iter().any(|tool| !tool.done && !tool.failed)
+    let _ = timeline_structure(t);
+    if !t.timeline_cache.borrow().unfinished_tools.is_empty()
         || t.thoughts.last().is_some_and(|thought| !thought.done)
     {
         return "Working".into();
@@ -10063,7 +10074,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         .as_ref()
         .map(|h| (&h.machine, h.thread_id, &h.message_id, &h.text));
     memo(
-        format!("assistant-turn-{}-{start}", t.id),
+        format!("assistant-turn-{}", message_key(t, start)),
         (
             (structure.version, revision, start, end),
             (
@@ -10124,7 +10135,7 @@ fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: us
         .get(&start)
         .and_then(|index| t.work.get(*index));
     let mut response = col()
-        .key(format!("assistant-turn-{}-{start}", t.id))
+        .key(format!("assistant-turn-{}", message_key(t, start)))
         .gap(12.0);
     // Captains sign their turns. A lone Pi thread needs no speaker label.
     if let Some(captain) = t.captain {
@@ -10198,7 +10209,9 @@ fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: us
         // While Pi works, its steps show as they happen, and one status line says what it
         // is doing now. The turn folds into "Worked for" when it ends.
         let mut rows = work_rows(
-            col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+            col()
+                .key(format!("work-rows-{}", message_key(t, start)))
+                .gap(2.0),
             false,
         );
         let seconds = t.started.map(|start| start.elapsed().as_secs());
@@ -10236,14 +10249,12 @@ fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: us
         response = response.child(rows);
     } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
-        let work_failed = t
+        let (work_failed, loading) = structure
             .deferred_work
-            .iter()
-            .any(|marker| marker["start"] == start && marker["error"].is_string());
-        let work_loading = expanded
-            && t.deferred_work
-                .iter()
-                .any(|marker| marker["start"] == start && !marker["error"].is_string());
+            .get(&start)
+            .copied()
+            .unwrap_or_default();
+        let work_loading = expanded && loading;
         let mut title = match (
             work.is_some_and(|work| work.stopped),
             work.and_then(|work| work.elapsed),
@@ -10260,7 +10271,7 @@ fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: us
         let press_key = toggle_key.clone();
         let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
         let mut section = col()
-            .key(format!("work-section-{}-{start}", t.id))
+            .key(format!("work-section-{}", message_key(t, start)))
             .gap(4.0)
             .child(
                 activity_line(
@@ -10337,7 +10348,7 @@ fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: us
             // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
             if work_loading {
                 let mut skeleton = col()
-                    .key(format!("work-loading-{}-{start}", t.id))
+                    .key(format!("work-loading-{}", message_key(t, start)))
                     .role("status")
                     .label("Loading work history")
                     .pt(12.0)
@@ -10360,7 +10371,9 @@ fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: us
                 section = section.child(skeleton);
             } else if !work_failed {
                 section = section.child(work_rows(
-                    col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+                    col()
+                        .key(format!("work-rows-{}", message_key(t, start)))
+                        .gap(2.0),
                     true,
                 ));
             }
@@ -10475,6 +10488,7 @@ pub(crate) struct TimelineCache {
     input: Option<(u64, bool, bool, bool, Vec<(String, usize)>)>,
     structure: std::sync::Arc<TimelineStructure>,
     content: std::collections::HashMap<usize, u64>,
+    unfinished_tools: std::collections::HashSet<usize>,
 }
 
 impl TimelineCache {
@@ -10499,6 +10513,15 @@ impl TimelineCache {
         self.touch_item("messages", message);
     }
 
+    pub(crate) fn touch_tool(&mut self, index: usize, tool: &Tool) {
+        self.touch_item("tools", index);
+        if tool.done || tool.failed {
+            self.unfinished_tools.remove(&index);
+        } else {
+            self.unfinished_tools.insert(index);
+        }
+    }
+
     fn turn_revision(&self, start: usize) -> u64 {
         self.content.get(&start).copied().unwrap_or(0)
     }
@@ -10511,6 +10534,7 @@ struct TimelineStructure {
     boundaries: std::collections::HashMap<usize, Vec<BoundaryEvent>>,
     item_turns: std::collections::HashMap<&'static str, Vec<usize>>,
     work_index: std::collections::HashMap<usize, usize>,
+    deferred_work: std::collections::HashMap<usize, (bool, bool)>,
     external_turns: std::collections::HashSet<usize>,
     version: u64,
 }
@@ -10535,6 +10559,7 @@ fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
     #[cfg(test)]
     timeline_count(|counts| counts.index_builds += 1);
     let mut structure = TimelineStructure::default();
+    cache.unfinished_tools.clear();
     let mut turn = 0;
     let mut message_turns = Vec::with_capacity(t.messages.len() + 1);
     for (index, message) in t.messages.iter().enumerate() {
@@ -10576,6 +10601,9 @@ fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
         structure.item_turns.insert(field, turns);
     }
     for (index, tool) in t.tools.iter().enumerate() {
+        if !tool.done && !tool.failed {
+            cache.unfinished_tools.insert(index);
+        }
         if crew_ui::is_delegation(tool)
             || !tool.subagents.is_empty()
             || matches!(
@@ -10648,6 +10676,16 @@ fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
                 .entry(work.start)
                 .or_default()
                 .push((order, 2, 0));
+        }
+    }
+    for marker in &t.deferred_work {
+        if let Some(start) = marker["start"]
+            .as_u64()
+            .and_then(|start| usize::try_from(start).ok())
+        {
+            let flags = structure.deferred_work.entry(start).or_default();
+            flags.0 |= marker["error"].is_string();
+            flags.1 |= !marker["error"].is_string();
         }
     }
     structure.events.sort_by_key(|event| (event.0, event.1));
@@ -10885,7 +10923,7 @@ fn build_user_or_system_row(
 ) -> El {
     let t = s.current();
     let message = &t.messages[index];
-    let key = format!("message-{}-{index}", t.id);
+    let key = message_key(t, index);
     let body = if message.role == "You" {
         // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
         let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
@@ -10925,7 +10963,7 @@ fn build_user_or_system_row(
                             wide,
                             true,
                             false,
-                            &format!("user-{}-{index}", t.id),
+                            &format!("user-{}-{message_id}", t.id),
                             find_query.map(|q| (q, active_occ)),
                         )
                     },
@@ -11269,10 +11307,10 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let gutter = lane_gutter(pane_width);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
-    let visible_tools = t
-        .tools
-        .iter()
-        .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
+    let visible_tools = t.messages.is_empty()
+        && t.tools
+            .iter()
+            .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
     if t.messages.is_empty()
         && !visible_tools
         && !t.status.busy()
@@ -17860,7 +17898,10 @@ pub(crate) mod tests {
             rt.state.threads.push(Thread::new(2));
             rt.frame(0.0);
             let key = "context-text-1-context-row-0";
-            let bubble = rt.presented("message-1-0-text").unwrap().0;
+            let bubble = rt
+                .presented(&format!("{}-text", message_key(rt.state.current(), 0)))
+                .unwrap()
+                .0;
             let text = rt
                 .elements()
                 .into_iter()
@@ -18019,7 +18060,10 @@ pub(crate) mod tests {
             });
             rt.frame(0.0);
             rt.frame(0.0);
-            let bubble = rt.presented("message-1-0-text").unwrap().0;
+            let bubble = rt
+                .presented(&format!("{}-text", message_key(rt.state.current(), 0)))
+                .unwrap()
+                .0;
             let chip = rt
                 .elements()
                 .into_iter()
@@ -18054,7 +18098,10 @@ pub(crate) mod tests {
             let bubble = rt
                 .elements()
                 .into_iter()
-                .find(|element| element.key.as_deref() == Some("message-1-0-text"))
+                .find(|element| {
+                    element.key.as_deref()
+                        == Some(&format!("{}-text", message_key(rt.state.current(), 0)))
+                })
                 .unwrap();
             let text: Vec<_> = rt
                 .elements()
@@ -23187,7 +23234,9 @@ pub(crate) mod tests {
                 "{key} overflows the window"
             );
         }
-        let (bubble, _) = rt.presented("message-1-0-text").unwrap();
+        let (bubble, _) = rt
+            .presented(&format!("{}-text", message_key(rt.state.current(), 0)))
+            .unwrap();
         assert!(
             bubble[0] >= 0.0 && bubble[0] + bubble[2] <= 620.0,
             "user message overflows its pane: {bubble:?}"
@@ -24322,6 +24371,58 @@ pub(crate) mod tests {
                 take_timeline_counts().built_turns > 0,
                 "width must invalidate memos"
             );
+            let body = assistant_body_key(rt.state.current(), 101, 0);
+            rt.update(|_, tx| {
+                tx.blur();
+                tx.select_all_text(body);
+            });
+            rt.frame(1.0 / 60.0);
+            let selected = rt
+                .selected_text()
+                .expect("assistant text selected")
+                .to_owned();
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                for tool in &mut t.tools {
+                    tool.anchor.message += 2;
+                }
+                for work in &mut t.work {
+                    work.start += 2;
+                }
+                t.messages.splice(
+                    0..0,
+                    [
+                        crate::model::Message {
+                            id: "earlier-user".into(),
+                            role: "You",
+                            text: "Earlier question.".into(),
+                            images: vec![],
+                            context: None,
+                        },
+                        crate::model::Message {
+                            id: "earlier-answer".into(),
+                            role: "Pi",
+                            text: "Earlier answer.".into(),
+                            images: vec![],
+                            context: None,
+                        },
+                    ],
+                );
+                t.transcript_structure += 1;
+            });
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert_eq!(rt.selected_text().as_deref(), Some(selected.as_str()));
+            assert_eq!(
+                rt.state
+                    .assistant_selection
+                    .as_ref()
+                    .map(|selection| selection.message_id.as_str()),
+                Some("cache-answer-50"),
+            );
         }
     }
 
@@ -24526,17 +24627,25 @@ pub(crate) mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         let y = |rt: &Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
-        assert!(y(&rt, "message-1-1-body-0") < y(&rt, "toggle-work-1-1"));
+        assert!(y(&rt, &assistant_body_key(rt.state.current(), 1, 0)) < y(&rt, "toggle-work-1-1"));
         assert!(y(&rt, "toggle-work-1-1") < y(&rt, "toggle-tool-group-1-0"));
         assert!(y(&rt, "toggle-tool-group-1-0") < y(&rt, "inline-thought-1-0"));
-        assert!(y(&rt, "inline-thought-1-0") < y(&rt, "message-1-3-body-0"));
+        assert!(
+            y(&rt, "inline-thought-1-0") < y(&rt, &assistant_body_key(rt.state.current(), 3, 0))
+        );
         press(&mut rt, "inline-thought-1-0");
         assert!(rt.presented("thought-output-1-0").is_some());
         press(&mut rt, "toggle-work-1-1");
         rt.frame(2.0);
         assert!(!rt.state.current().work[0].expanded);
-        assert!(rt.presented("work-rows-1-1").is_none());
-        assert!(rt.presented("message-1-3-body-0").is_some());
+        assert!(
+            rt.presented(&format!("work-rows-{}", message_key(rt.state.current(), 1)))
+                .is_none()
+        );
+        assert!(
+            rt.presented(&assistant_body_key(rt.state.current(), 3, 0))
+                .is_some()
+        );
         press(&mut rt, "toggle-work-1-1");
         rt.frame(4.0);
         assert!(rt.state.current().thoughts[0].expanded);
@@ -24556,8 +24665,17 @@ pub(crate) mod tests {
             .current_mut()
             .apply(json!({"type":"agent_settled"}));
         rt.frame(0.0);
-        assert!(rt.presented("message-1-0-body-0").is_some());
-        assert!(rt.presented("work-section-1-0").is_none());
+        assert!(
+            rt.presented(&assistant_body_key(rt.state.current(), 0, 0))
+                .is_some()
+        );
+        assert!(
+            rt.presented(&format!(
+                "work-section-{}",
+                message_key(rt.state.current(), 0)
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -24570,7 +24688,10 @@ pub(crate) mod tests {
                 "type":"text_delta","contentIndex":0,"delta":"I'll check the file."
             }}));
         rt.frame(0.0);
-        let text_y = rt.presented("message-1-0-body-0").unwrap().0[1];
+        let text_y = rt
+            .presented(&assistant_body_key(rt.state.current(), 0, 0))
+            .unwrap()
+            .0[1];
         assert!(text_y < rt.presented("live-status-1").unwrap().0[1]);
         assert!(
             rt.presented("toggle-work-1-0").is_none(),
@@ -24587,7 +24708,12 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         rt.frame(2.0);
-        assert_eq!(rt.presented("message-1-0-body-0").unwrap().0[1], text_y);
+        assert_eq!(
+            rt.presented(&assistant_body_key(rt.state.current(), 0, 0))
+                .unwrap()
+                .0[1],
+            text_y
+        );
         let tool_y = rt.presented("inline-tool-1-0").unwrap().0[1];
         assert!(tool_y < rt.presented("live-status-1").unwrap().0[1]);
     }
@@ -24608,7 +24734,10 @@ pub(crate) mod tests {
             rt.invalidate();
             rt.frame(1.0);
             rt.frame(2.0);
-            let prose = rt.presented("message-1-0-body-0").unwrap().0;
+            let prose = rt
+                .presented(&assistant_body_key(rt.state.current(), 0, 0))
+                .unwrap()
+                .0;
             let live_tool = rt.presented("inline-tool-1-0").unwrap().0;
             let (status, _) = rt.presented("live-status-1").unwrap();
             assert_eq!(
@@ -29759,7 +29888,7 @@ pub(crate) mod tests {
         rt.frame(1.0);
 
         // Select text inside the assistant message and verify the floating toolbar appears.
-        let body_key = "message-1-0-body-0";
+        let body_key = &assistant_body_key(rt.state.current(), 0, 0);
         rt.update(|_, tx| {
             tx.blur();
             tx.select_all_text(body_key);
@@ -29772,6 +29901,21 @@ pub(crate) mod tests {
             rt.state.assistant_selection
         );
         assert!(rt.presented("assistant-selection-cite").is_some());
+
+        // Prepending history must not make Cite use the old message ordinal.
+        rt.update(|s, _| {
+            s.current_mut().messages.insert(
+                0,
+                crate::model::Message {
+                    id: "earlier-citation-context".into(),
+                    role: "You",
+                    text: "Earlier context.".into(),
+                    images: vec![],
+                    context: None,
+                },
+            );
+        });
+        rt.frame(1.0);
 
         // Press Cite: inserts one chip and one draft record, opens the comment
         // editor (KSG auto-opens it on cite), clears selection and hides toolbar.
@@ -30248,9 +30392,10 @@ pub(crate) mod tests {
             );
 
             // Now select text on the assistant message and verify the selection toolbar fits.
+            let body_key = assistant_body_key(rt.state.current(), 0, 0);
             rt.update(|_, tx| {
                 tx.blur();
-                tx.select_all_text("message-1-0-body-0");
+                tx.select_all_text(body_key);
             });
             rt.frame(1.0);
             rt.frame(1.0);
