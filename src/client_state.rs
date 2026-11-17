@@ -5547,6 +5547,11 @@ impl State {
             "captain.inbox.list" => {
                 return self.captain_inbox_value(number("captain")?, &args);
             }
+            "captain.inbox.capture" => return self.record_captain_event(args),
+            "captain.inbox.await" => return self.await_captain_event(args),
+            "captain.inbox.cancel" => {
+                return self.cancel_captain_inbox_entry(number("captain")?, args);
+            }
             "captain.report.answer" => {
                 return self.captain_report_answer(
                     "local",

@@ -29,6 +29,9 @@ pub const CAPTAIN_EVENTS_MINOR: u32 = 35;
 pub const CAPTAIN_EVENTS: &str = "captain-events-v1";
 pub const CAPTAIN_EVENTS_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the server to change Captain report policies.";
+pub const CAPTAIN_INBOX: &str = "captain-inbox-v1";
+pub const CAPTAIN_INBOX_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the server to use the Captain inbox.";
 pub const CAPTAIN_CREW_CONTROL_MINOR: u32 = 34;
 pub const CAPTAIN_CREW_CONTROL: &str = "captain-crew-control-v1";
 pub const CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED: &str =
@@ -406,6 +409,9 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.crew.stop"
         | "captain.reportPolicy"
         | "captain.recoveryMode"
+        | "captain.inbox.capture"
+        | "captain.inbox.await"
+        | "captain.inbox.cancel"
         | "captain.archive"
         | "captain.unarchive"
         | "captain.promote"
