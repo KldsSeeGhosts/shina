@@ -2471,6 +2471,7 @@ mod tests {
             new_worktree: true,
             capability: None,
             error: None,
+            binding: None,
         });
         state.admission_pump();
         let snapshot = state.snapshot();
@@ -2550,6 +2551,7 @@ mod tests {
         state.tasks[0].remote = Some(RemoteTask {
             server_id: "peer-1".into(),
             project: json!({}),
+            repository: None,
             label: "Peer".into(),
             thread_id: Some(41),
             launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),
@@ -2652,6 +2654,7 @@ mod tests {
             new_worktree: true,
             capability: None,
             error: None,
+            binding: None,
         });
         state.admission_pump();
         let id = state.threads[index].id;
@@ -3262,6 +3265,7 @@ mod tests {
         RemoteTask {
             server_id: server.into(),
             project: json!({}),
+            repository: None,
             label: "Peer".into(),
             thread_id: Some(41),
             launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),

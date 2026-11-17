@@ -5349,6 +5349,13 @@ impl State {
                 return Ok(json!({"projectId":id}));
             }
             "project.remove" => self.remove_project(number("projectId")?),
+            "repository.put" => {
+                return self.put_repository(args);
+            }
+            "repository.remove" => self.remove_repository(&args["repository"])?,
+            "repository.list" => {
+                return Ok(self.repository_list_value());
+            }
             "project.clone" => {
                 self.projects.clone_source.replace_text(text("source")?);
                 self.projects.clone_parent = PathBuf::from(text("parent")?);
@@ -5431,6 +5438,9 @@ impl State {
                 )?;
                 if let Some(remote) = remote {
                     self.set_remote_captain_scope(captain, remote)?;
+                }
+                if let Some(repositories) = args.get("repositories") {
+                    self.set_captain_repository_scope(captain, repositories)?;
                 }
             }
             "captain.reset" => self.reset_captain_conversation(number("captain")?)?,
