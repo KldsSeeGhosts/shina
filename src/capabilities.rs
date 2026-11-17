@@ -691,8 +691,7 @@ impl State {
     pub(crate) fn require_harness_executable(&self, harness: &str) -> Result<(), String> {
         match harness {
             "pi" => Ok(()),
-            "codex" => crate::codex::process().map(drop),
-            "claude" => crate::claude::process().map(drop),
+            "codex" | "claude" => self.native_harness_executable(harness),
             _ => {
                 let agent = self.harnesses.find(harness)?;
                 let capabilities = crate::acp::probe_live(&agent)?;
@@ -703,6 +702,20 @@ impl State {
                     Err("This ACP agent supports neither HTTP nor stdio MCP. Shina cannot register its tools, so no thread was allocated.".into())
                 }
             }
+        }
+    }
+
+    fn native_harness_executable(&self, harness: &str) -> Result<(), String> {
+        // Unit tests can supply the same fake connection connect_thread uses.
+        // Discovery and dispatch must agree about that isolated executor too.
+        #[cfg(test)]
+        if self.test_connect_pi.is_some() {
+            return Ok(());
+        }
+        match harness {
+            "codex" => crate::codex::process().map(drop),
+            "claude" => crate::claude::process().map(drop),
+            _ => unreachable!("native harness checked by caller"),
         }
     }
 
@@ -805,11 +818,7 @@ impl State {
                 self.catalog.error.is_none() || !self.catalog.models.is_empty(),
                 self.catalog.error.clone(),
             ),
-            "codex" => match crate::codex::process() {
-                Ok(_) => (true, None),
-                Err(error) => (false, Some(error)),
-            },
-            "claude" => match crate::claude::process() {
+            "codex" | "claude" => match self.native_harness_executable(harness) {
                 Ok(_) => (true, None),
                 Err(error) => (false, Some(error)),
             },

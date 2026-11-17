@@ -59,3 +59,10 @@ this integration reserves no additional number and changes no migration.
 
 No new tests, provider configuration or feature scope was added. PR59 must
 finish its own CI and publication before this candidate can merge into main.
+
+The combined-head Linux CI exposed two older native model-inheritance tests
+that depended on Claude/Codex being installed on the build host. They now use
+the existing per-state fake connection hook. Native executable discovery and
+dispatch share that test-only executor proof. Production probing and the real
+fixture-adapter integration tests remain unchanged. No CLI installation,
+provider configuration, authentication change or test skip is required.

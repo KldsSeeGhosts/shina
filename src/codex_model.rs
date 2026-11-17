@@ -1334,6 +1334,7 @@ mod tests {
     fn claude_delegation_capabilities_and_harness_inheritance() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.test_connect_pi = Some(Box::new(|_, _| Some(Pi::test_connection().0)));
         state.threads[0].harness = "claude".into();
         state.threads[0].models = vec![
             AgentModel::from_harness_value(
@@ -1412,6 +1413,7 @@ mod tests {
     fn codex_delegation_targets_inheritance_and_capabilities() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.test_connect_pi = Some(Box::new(|_, _| Some(Pi::test_connection().0)));
         state.threads[0].harness = "codex".into();
         state.threads[0].models = vec![
             AgentModel::from_harness_value(
