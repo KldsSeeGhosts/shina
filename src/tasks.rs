@@ -359,7 +359,7 @@ fn unique_id() -> String {
     )
 }
 
-fn delivery_text(id: &str, body: &str) -> String {
+pub(super) fn delivery_text(id: &str, body: &str) -> String {
     format!("{INJECTION_PREFIX}[delivery {id}]\n{body}")
 }
 
@@ -2269,6 +2269,17 @@ impl State {
                         .into(),
                 );
             }
+            if self.tasks[task_index].state == TaskState::Cancelled
+                && self.tasks[task_index]
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.state != RemoteState::Done)
+            {
+                return Err(
+                    "Wait for the target to report the cancelled attempt's provider settlement before starting newer work."
+                        .into(),
+                );
+            }
             if delivery == Some("steer")
                 && (self.tasks[task_index].state.finished()
                     || self.tasks[task_index]
@@ -2691,6 +2702,7 @@ impl State {
             // index. Import it once; from here the durable table is canonical.
             self.stage_task_operations();
         }
+        self.restore_peer_task_intents()?;
         Ok(())
     }
 
@@ -2905,6 +2917,7 @@ impl State {
         }
         changed |= self.start_queued_tasks();
         changed |= self.reconcile_task_operations();
+        changed |= self.reconcile_peer_task_intents();
         changed | self.poll_legacy_tasks(now)
     }
 
@@ -4566,15 +4579,15 @@ mod tests {
         let first;
         let stored_receipt;
         let server_id;
+        let stored_identity;
         {
             let mut runtime =
                 crate::runtime::RuntimeState::open(directory.clone(), Arc::new(|| {})).unwrap();
             runtime.state.demo = true;
             let database = runtime.database.clone().unwrap();
-            server_id = database.identity().unwrap()["controllerId"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+            let identity = database.identity().unwrap();
+            server_id = identity["controllerId"].as_str().unwrap().to_owned();
+            stored_identity = identity;
             database.begin().unwrap();
             let capture = crate::outbox::Capture::begin();
             first = runtime
@@ -4592,7 +4605,7 @@ mod tests {
         }
         std::fs::write(directory.join("server-id"), &server_id).unwrap();
         let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
-        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TABLE task_input_intents; DROP TABLE task_operations; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
         let mut legacy = crate::projection_store::read(&connection, "index.json")
             .unwrap()
             .unwrap();
@@ -4627,6 +4640,10 @@ mod tests {
         );
         assert_eq!(runtime.state.tasks.len(), 1);
         assert_eq!(runtime.state.threads.len(), 2);
+        let identity = runtime.database.as_ref().unwrap().identity().unwrap();
+        for field in ["workspaceId", "ownerId", "controllerId"] {
+            assert_eq!(identity[field], stored_identity[field], "{field}");
+        }
     }
 
     #[test]

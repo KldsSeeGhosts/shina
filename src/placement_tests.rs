@@ -769,6 +769,7 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
             &Command::new("peer.thread.stop", json!({"threadId":child_id})),
         )
         .unwrap();
+    target.reconcile_peer_task_intents();
     assert_eq!(target.threads[1].task_result, Some("cancelled"));
     let deadline = Instant::now() + Duration::from_secs(20);
     while !target.placement_rxs.is_empty() {
@@ -802,7 +803,16 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
         child_placement(&target, 1).phase,
         placement::PlacementPhase::Ready
     );
-    assert_eq!(target.threads[1].pending_injections.len(), 1);
+    assert_eq!(
+        target.threads[1].pending_injections.len(),
+        1,
+        "{:?}",
+        target.threads[1]
+            .pending_injections
+            .iter()
+            .map(|injection| injection.text.as_str())
+            .collect::<Vec<_>>()
+    );
     assert!(
         target.threads[1].pending_injections[0]
             .text

@@ -46,9 +46,29 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     fs.appendFileSync(path.join(process.cwd(), "fixture-behavior.jsonl"), JSON.stringify({
       message: request.message, streamingBehavior: request.streamingBehavior ?? null }) + "\n");
     messages.push({ role: "user", content: [{ type: "text", text: request.message }] }); save();
-    running = true; response(request, {}); emit({ type: "agent_start" });
+    running = true;
+    // The provider has durably accepted and saved this input, but the server
+    // dies before it observes the prompt response.
+    if (request.message.includes("peer-crash-after-accept-fixture")) return;
+    response(request, {}); emit({ type: "agent_start" });
     // Keep a remote provider turn active while the integration test issues its MCP reads.
     if (request.message.includes("peer-documents-hold-fixture")) return;
+    if (request.message.includes("peer-steer-race-fixture")) {
+      const release = process.env.SHINA_TEST_STEER_END || path.join(process.cwd(), "peer-steer-end");
+      const ended = process.env.SHINA_TEST_STEER_ENDED || path.join(process.cwd(), "peer-steer-ended");
+      const armed = process.env.SHINA_TEST_STEER_ARMED || path.join(process.cwd(), "peer-steer-armed");
+      fs.writeFileSync(armed, "armed\n");
+      const timer = setInterval(() => {
+        if (!fs.existsSync(release)) return;
+        clearInterval(timer);
+        const message = { role: "assistant", content: [{ type: "text", text: "Steer race fixture ended" }], stopReason: "stop", timestamp: Date.now() };
+        messages.push(message); save();
+        emit({ type: "message_end", message });
+        running = false; emit({ type: "agent_end", messages }); emit({ type: "agent_settled" });
+        fs.writeFileSync(ended, "ended\n");
+      }, 25);
+      return;
+    }
     // An integration test owns settlement through a later steer or abort, not a timer.
     if (request.message.includes("queue-wait-fixture")) return;
     if (request.message.includes("stale-question-fixture")) {

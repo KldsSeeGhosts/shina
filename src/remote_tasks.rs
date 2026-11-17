@@ -254,6 +254,15 @@ pub struct PeerInputEvidence {
     #[serde(default)]
     pub generation: Option<String>,
     pub delivery: String,
+    /// The exact target-side queue state. `queued` is not provider input.
+    #[serde(default)]
+    pub queue_state: String,
+    /// not_observed | requested | accepted | rejected | unknown
+    #[serde(default)]
+    pub provider_state: String,
+    /// ready | awaiting_history | history_absent | accepted_from_history | held_unknown
+    #[serde(default)]
+    pub recovery: String,
     /// accepted means the target stored the command. It is not provider input.
     pub transport: String,
     /// queued | accepted | rejected | unknown
@@ -264,9 +273,115 @@ pub struct PeerInputEvidence {
     pub realized_delivery: Option<String>,
     #[serde(default)]
     pub run_id: Option<String>,
+    /// The run a steering command named before a late delivery became follow-up.
+    #[serde(default)]
+    pub target_run_id: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
     pub observed_at: u64,
+}
+
+/// Target-owned accepted peer work. The row and its command receipt commit
+/// together before a provider process is asked to read the input or stop a run.
+/// Recovery may prove an input was already present in stable provider history,
+/// but an absent or unavailable history leaves the intent visibly held.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PeerTaskIntent {
+    pub command_id: String,
+    pub thread_id: usize,
+    /// input | cancel
+    pub kind: String,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub runtime_generation: Option<String>,
+    pub requested_delivery: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub target_run_id: Option<String>,
+    /// queued | stop_pending | applied | settled
+    pub queue_state: String,
+    /// not_observed | requested | accepted | rejected | unknown
+    pub provider_state: String,
+    #[serde(default)]
+    pub provider_basis: Option<String>,
+    #[serde(default)]
+    pub realized_delivery: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub recovery: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl PeerTaskIntent {
+    fn input(
+        command_id: String,
+        thread_id: usize,
+        attempt_id: Option<String>,
+        request_id: Option<String>,
+        runtime_generation: Option<String>,
+        requested_delivery: &str,
+        message: String,
+        target_run_id: Option<String>,
+    ) -> Self {
+        let now = lifecycle::now();
+        Self {
+            command_id,
+            thread_id,
+            kind: "input".into(),
+            attempt_id,
+            request_id,
+            runtime_generation,
+            requested_delivery: requested_delivery.into(),
+            message: Some(message),
+            target_run_id,
+            queue_state: "queued".into(),
+            provider_state: "not_observed".into(),
+            provider_basis: None,
+            realized_delivery: None,
+            run_id: None,
+            error: None,
+            recovery: "ready".into(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn cancel(
+        command_id: String,
+        thread_id: usize,
+        attempt_id: Option<String>,
+        target_run_id: Option<String>,
+    ) -> Self {
+        let now = lifecycle::now();
+        Self {
+            command_id,
+            thread_id,
+            kind: "cancel".into(),
+            attempt_id,
+            request_id: None,
+            runtime_generation: None,
+            requested_delivery: "cancel".into(),
+            message: None,
+            target_run_id,
+            queue_state: "stop_pending".into(),
+            provider_state: "not_observed".into(),
+            provider_basis: None,
+            realized_delivery: Some("cancel".into()),
+            run_id: None,
+            error: None,
+            recovery: "ready".into(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1301,6 +1416,7 @@ mod tests {
                 ),
             )
             .unwrap();
+        state.reconcile_peer_task_intents();
         assert!(state.threads[1].task_result.is_some());
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
@@ -2731,6 +2847,51 @@ mod tests {
         assert!(!message.contains("captain_document_read"), "{message}");
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
+
+    #[test]
+    fn non_authoritative_history_holds_restored_peer_input_as_unknown() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        state.threads[1].harness = "fixture-acp".into();
+        state.threads[1].history_loaded = true;
+        state.threads[1].peer_recovery_held = true;
+        let command = uuid::Uuid::new_v4();
+        let message = tasks::delivery_text(&command.to_string(), "held peer input");
+        let mut intent = PeerTaskIntent::input(
+            command.to_string(),
+            child,
+            Some("attempt-a".into()),
+            None,
+            None,
+            "follow_up",
+            message.clone(),
+            None,
+        );
+        intent.recovery = "awaiting_history".into();
+        state.stage_peer_task_intent(intent).unwrap();
+        state.threads[1].pending_injections.push_back(Injection {
+            text: message,
+            shown: false,
+            steer: None,
+            peer_input: Some(command),
+        });
+
+        state.reconcile_peer_task_intents();
+        let intent = state
+            .peer_task_intents
+            .iter()
+            .find(|intent| intent.command_id == command.to_string())
+            .unwrap();
+        assert_eq!(intent.provider_state, "unknown");
+        assert_eq!(
+            intent.provider_basis.as_deref(),
+            Some("history_not_authoritative")
+        );
+        assert_eq!(intent.recovery, "held_unknown");
+        assert!(state.threads[1].peer_recovery_held);
+        assert!(state.threads[1].pi.is_none());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2820,7 +2981,10 @@ pub(super) struct PeerRuntime {
 /// the test creates the release file. It never changes a production build.
 #[cfg(debug_assertions)]
 fn test_peer_send_barrier(command: &Command) {
-    if command.method != "peer.thread.send" {
+    if !matches!(
+        command.method.as_str(),
+        "peer.thread.send" | "peer.thread.stop"
+    ) {
         return;
     }
     let Some(gate) = std::env::var_os("SHINA_TEST_PEER_SEND_BARRIER") else {
@@ -4203,18 +4367,529 @@ impl State {
         }
     }
 
-    fn record_peer_input(&mut self, index: usize, evidence: PeerInputEvidence) {
-        let Some(origin) = self.threads[index].peer_origin.as_mut() else {
+    fn peer_task_intent_index(&self, thread: usize, command: &str) -> Option<usize> {
+        self.peer_task_intents
+            .iter()
+            .position(|intent| intent.thread_id == thread && intent.command_id == command)
+    }
+
+    fn stage_peer_task_intent(&mut self, intent: PeerTaskIntent) -> Result<(), String> {
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            let payload = serde_json::to_value(&intent)
+                .map_err(|error| format!("Could not encode task input intent: {error}"))?;
+            if let Err(error) = database.stage_task_input_intent(payload) {
+                if error.contains("durable runtime transaction") {
+                    self.peer_task_intents_dirty = true;
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(index) = self.peer_task_intents.iter().position(|existing| {
+            existing.thread_id == intent.thread_id && existing.command_id == intent.command_id
+        }) {
+            self.peer_task_intents[index] = intent;
+        } else {
+            self.peer_task_intents.push(intent);
+        }
+        Ok(())
+    }
+
+    fn peer_intent_evidence(intent: &PeerTaskIntent) -> PeerInputEvidence {
+        let (input, input_basis) = match intent.provider_state.as_str() {
+            "accepted" => ("accepted", "provider_ack"),
+            "rejected" => ("rejected", "provider_receipt"),
+            "requested" | "unknown" => ("unknown", "adapter_write"),
+            _ if intent.queue_state == "queued" || intent.queue_state == "stop_pending" => {
+                ("queued", "target_queue")
+            }
+            _ => ("unknown", "target_state"),
+        };
+        PeerInputEvidence {
+            command_id: intent.command_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
+            request_id: intent.request_id.clone(),
+            generation: intent.runtime_generation.clone(),
+            delivery: intent.requested_delivery.clone(),
+            queue_state: intent.queue_state.clone(),
+            provider_state: intent.provider_state.clone(),
+            recovery: intent.recovery.clone(),
+            transport: "accepted".into(),
+            input: input.into(),
+            input_basis: intent
+                .provider_basis
+                .clone()
+                .unwrap_or_else(|| input_basis.into()),
+            realized_delivery: intent.realized_delivery.clone(),
+            run_id: intent.run_id.clone(),
+            target_run_id: intent.target_run_id.clone(),
+            error: intent.error.clone(),
+            observed_at: intent.updated_at,
+        }
+    }
+
+    pub(super) fn provision_peer_task_intent(&mut self, intent: &PeerTaskIntent) {
+        let Some(index) = self
+            .threads
+            .iter()
+            .position(|thread| thread.id == intent.thread_id)
+        else {
             return;
         };
-        if let Some(existing) = origin
-            .inputs
-            .iter_mut()
-            .find(|existing| existing.command_id == evidence.command_id)
+        if intent.kind == "input"
+            && intent.queue_state == "queued"
+            && self.threads[index]
+                .placement
+                .as_ref()
+                .is_none_or(|placement| placement.phase == placement::PlacementPhase::Ready)
+            && let Some(message) = &intent.message
+            && !self.threads[index]
+                .pending_injections
+                .iter()
+                .any(|injection| injection.text == *message)
+            && !self.threads[index]
+                .messages
+                .iter()
+                .any(|message| message.text == *intent.message.as_ref().expect("message"))
         {
-            *existing = evidence;
-        } else {
-            origin.inputs.push(evidence);
+            self.threads[index].pending_injections.push_back(Injection {
+                text: message.clone(),
+                shown: false,
+                steer: intent
+                    .requested_delivery
+                    .eq("steer")
+                    .then(|| intent.target_run_id.clone())
+                    .flatten(),
+                peer_input: uuid::Uuid::parse_str(&intent.command_id).ok(),
+            });
+        }
+    }
+
+    pub(super) fn restore_peer_task_intents(&mut self) -> Result<(), String> {
+        let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) else {
+            return Ok(());
+        };
+        let intents: Vec<PeerTaskIntent> = database
+            .task_input_intents()?
+            .into_iter()
+            .map(|value| {
+                serde_json::from_value(value)
+                    .map_err(|error| format!("Invalid durable task input intent: {error}"))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut keys = HashSet::new();
+        for intent in &intents {
+            if intent.command_id.is_empty()
+                || uuid::Uuid::parse_str(&intent.command_id).is_err()
+                || !matches!(intent.kind.as_str(), "input" | "cancel")
+            {
+                return Err("The durable task input ledger contains an invalid record.".into());
+            }
+            if !keys.insert((intent.thread_id, intent.command_id.clone())) {
+                return Err("The durable task input ledger contains duplicate identities.".into());
+            }
+        }
+        self.peer_task_intents = intents;
+        for index in 0..self.peer_task_intents.len() {
+            let mut intent = self.peer_task_intents[index].clone();
+            let Some(thread) = self
+                .threads
+                .iter()
+                .find(|thread| thread.id == intent.thread_id)
+            else {
+                continue;
+            };
+            if intent.kind == "input"
+                && intent
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| thread.messages.iter().any(|row| row.text == message))
+            {
+                intent.provider_state = "accepted".into();
+                intent.provider_basis = Some("history_replay".into());
+                intent.queue_state = "settled".into();
+                intent.recovery = "accepted_from_history".into();
+            } else if intent.kind == "input" && intent.provider_state == "prepared" {
+                // An extension answer is not a prompt and has no stable history
+                // marker. A crash after preparing its adapter write is unknown,
+                // so restart never repeats it.
+                intent.provider_state = "unknown".into();
+                intent.provider_basis = Some("interrupted_adapter_write".into());
+                intent.queue_state = "applied".into();
+                intent.recovery = "held_unknown".into();
+            } else if intent.kind == "input" && intent.queue_state == "queued" {
+                intent.recovery = "awaiting_history".into();
+            } else if intent.kind == "cancel" && intent.provider_state != "accepted" {
+                // Abort is fenced to the named attempt and safe to repeat once
+                // after restart. It still does nothing to a newer attempt.
+                intent.queue_state = "stop_pending".into();
+                intent.recovery = "recover_stop".into();
+            }
+            if self.peer_task_intents[index] == intent {
+                continue;
+            }
+            intent.updated_at = lifecycle::now();
+            self.stage_peer_task_intent(intent.clone())?;
+            self.sync_peer_intent_evidence(index);
+            self.provision_peer_task_intent(&intent);
+            if intent.kind == "input" && intent.recovery == "awaiting_history" {
+                self.threads[index].peer_recovery_held = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn reconcile_peer_task_intents(&mut self) -> bool {
+        let mut changed = false;
+        if std::mem::take(&mut self.peer_task_intents_dirty) {
+            let intents = self.peer_task_intents.clone();
+            for intent in intents {
+                if let Err(error) = self.stage_peer_task_intent(intent) {
+                    self.storage_error = Some(error);
+                    return changed;
+                }
+            }
+        }
+
+        // Stops run before any later input from the same peer can reach a
+        // provider. Repeating an abort for the exact fenced attempt is safe;
+        // an abort for a different attempt is never issued.
+        let cancels: Vec<(usize, PeerTaskIntent)> = self
+            .peer_task_intents
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, intent)| intent.kind == "cancel" && intent.provider_state != "accepted")
+            .collect();
+        for (index, mut intent) in cancels {
+            let Some(thread) = self
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == intent.thread_id)
+            else {
+                continue;
+            };
+            let current = thread
+                .peer_origin
+                .as_ref()
+                .and_then(|origin| origin.attempt_id.as_deref());
+            if intent.attempt_id.as_deref().is_some() && intent.attempt_id.as_deref() != current {
+                intent.provider_state = "rejected".into();
+                intent.provider_basis = Some("attempt_fence".into());
+                intent.queue_state = "settled".into();
+                intent.error = Some("The target moved to a different attempt.".into());
+            } else if thread.task_result == Some("cancelled")
+                && !thread.status.busy()
+                && thread.phase != "Stopping"
+            {
+                intent.provider_state = "accepted".into();
+                intent.provider_basis = Some("provider_settlement".into());
+                intent.queue_state = "settled".into();
+                intent.run_id = thread.run_id.clone().or(intent.run_id);
+            } else if thread.injection_id.is_some() {
+                // The prompt command is in flight. The adapter may already
+                // have accepted it, so wait for the response and one start
+                // boundary before deciding whether an abort is required.
+                intent.provider_state = "prepared".into();
+                intent.provider_basis = Some("awaiting_prompt_ack".into());
+                intent.queue_state = "applied".into();
+                intent.recovery = "waiting_prompt_ack".into();
+            } else if intent.recovery == "waiting_prompt_ack" {
+                intent.provider_state = "prepared".into();
+                intent.provider_basis = Some("awaiting_provider_start".into());
+                intent.recovery = "waiting_provider_start".into();
+            } else if intent.recovery != "stop_applied" {
+                // The accepted stop intent is durable. Any uncertainty is in
+                // provider settlement, which stays unknown until the exact
+                // attempt observes it.
+                let _ = thread.stop_task();
+                let settled_locally = !thread.status.busy()
+                    && thread.phase != "Stopping"
+                    && thread.injection_id.is_none()
+                    && thread.pending_injections.is_empty();
+                if settled_locally {
+                    thread.task_result = Some("cancelled");
+                    thread.completion_notified = true;
+                    let attempt = intent.attempt_id.clone();
+                    if let Some(origin) = &mut thread.peer_origin {
+                        origin.result = Some(json!({
+                            "status":"cancelled","resultId":uuid::Uuid::new_v4().to_string(),
+                            "replyItemId":null,"attemptId":attempt,"runId":null,
+                            "error":null,"memorySuggestions":[]
+                        }));
+                    }
+                    intent.provider_state = "accepted".into();
+                    intent.provider_basis = Some("target_cancelled_before_dispatch".into());
+                    intent.queue_state = "settled".into();
+                } else {
+                    intent.provider_state = if intent.provider_state == "requested" {
+                        "unknown".into()
+                    } else {
+                        "requested".into()
+                    };
+                    intent.provider_basis = Some("adapter_stop".into());
+                    intent.queue_state = "applied".into();
+                    intent.run_id = thread.run_id.clone().or(intent.run_id);
+                    intent.recovery = "stop_applied".into();
+                }
+            }
+            if self.peer_task_intents[index] == intent {
+                continue;
+            }
+            intent.updated_at = lifecycle::now();
+            if self.stage_peer_task_intent(intent).is_ok() {
+                self.sync_peer_intent_evidence(index);
+                changed = true;
+            }
+        }
+
+        // A stop clears inputs that had not crossed the adapter boundary. That
+        // is a proved non-delivery, not a lost prompt, and must not remain in
+        // the recovery set forever. Dispatched or prepared inputs stay unknown.
+        let cleared_inputs: Vec<(usize, PeerTaskIntent)> = self
+            .peer_task_intents
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, input)| {
+                input.kind == "input"
+                    && input.provider_state == "not_observed"
+                    && self.peer_task_intents.iter().any(|stop| {
+                        stop.kind == "cancel"
+                            && stop.thread_id == input.thread_id
+                            && stop.attempt_id == input.attempt_id
+                            && (stop.queue_state == "applied"
+                                || (stop.queue_state == "settled"
+                                    && stop.provider_basis.as_deref()
+                                        == Some("target_cancelled_before_dispatch")))
+                            && self
+                                .threads
+                                .iter()
+                                .find(|thread| thread.id == input.thread_id)
+                                .is_none_or(|thread| {
+                                    !thread
+                                        .peer_dispatches
+                                        .iter()
+                                        .any(|(command, _, _)| command == &input.command_id)
+                                })
+                    })
+            })
+            .collect();
+        for (index, mut input) in cleared_inputs {
+            input.provider_state = "rejected".into();
+            input.provider_basis = Some("target_cancelled_before_dispatch".into());
+            input.queue_state = "settled".into();
+            input.recovery = "cancelled_before_dispatch".into();
+            input.error = Some("Cancelled before the provider received this input.".into());
+            if self.peer_task_intents[index] == input {
+                continue;
+            }
+            input.updated_at = lifecycle::now();
+            if self.stage_peer_task_intent(input).is_ok() {
+                self.sync_peer_intent_evidence(index);
+                changed = true;
+            }
+        }
+
+        let inputs: Vec<(usize, PeerTaskIntent)> = self
+            .peer_task_intents
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, intent)| intent.kind == "input" && intent.queue_state != "settled")
+            .collect();
+        for (index, mut intent) in inputs {
+            let Some(thread_index) = self
+                .threads
+                .iter()
+                .position(|thread| thread.id == intent.thread_id)
+            else {
+                continue;
+            };
+            let thread = &self.threads[thread_index];
+            let marker_present = intent
+                .message
+                .as_deref()
+                .is_some_and(|message| thread.messages.iter().any(|row| row.text == message));
+            let origin_input = thread.peer_origin.as_ref().and_then(|origin| {
+                origin
+                    .inputs
+                    .iter()
+                    .find(|input| input.command_id == intent.command_id)
+                    .cloned()
+            });
+            let dispatched = thread
+                .peer_dispatches
+                .iter()
+                .find(|(command, _, _)| command == &intent.command_id)
+                .cloned();
+            let accepted = thread
+                .accepted_deliveries
+                .iter()
+                .any(|delivery| delivery == &intent.command_id);
+            let rejected = thread
+                .rejected_injections
+                .iter()
+                .find(|(delivery, _)| delivery == &intent.command_id)
+                .cloned();
+
+            if marker_present {
+                intent.provider_state = "accepted".into();
+                intent.provider_basis = Some("history_replay".into());
+                intent.queue_state = "settled".into();
+                if let Some((_, realized, run)) = dispatched.as_ref() {
+                    intent.realized_delivery = Some(if realized == "followUp" {
+                        "follow_up".into()
+                    } else {
+                        realized.clone()
+                    });
+                    intent.run_id = run.clone();
+                }
+                if intent.recovery != "history_absent" {
+                    intent.recovery = "accepted_from_history".into();
+                }
+            } else if accepted
+                || origin_input
+                    .as_ref()
+                    .is_some_and(|input| input.input == "accepted")
+            {
+                intent.provider_state = "accepted".into();
+                intent.provider_basis = Some("provider_ack".into());
+                intent.queue_state = "settled".into();
+                intent.recovery = "accepted".into();
+                if let Some((_, realized, run)) = dispatched.as_ref() {
+                    intent.realized_delivery = Some(if realized == "followUp" {
+                        "follow_up".into()
+                    } else {
+                        realized.clone()
+                    });
+                    intent.run_id = run.clone();
+                }
+            } else if rejected.is_some()
+                || origin_input
+                    .as_ref()
+                    .is_some_and(|input| input.input == "rejected")
+            {
+                let error = rejected.map(|(_, error)| error);
+                intent.provider_state = "rejected".into();
+                intent.provider_basis = Some("provider_ack".into());
+                intent.queue_state = "settled".into();
+                intent.recovery = "rejected".into();
+                intent.error = error.or_else(|| origin_input.and_then(|input| input.error));
+            } else if let Some((_, realized, run)) = dispatched {
+                intent.provider_state = "requested".into();
+                intent.provider_basis = Some("adapter_write".into());
+                intent.queue_state = "applied".into();
+                intent.realized_delivery = Some(if realized == "followUp" {
+                    "follow_up".into()
+                } else {
+                    realized
+                });
+                intent.run_id = run;
+                if intent.recovery == "awaiting_history" {
+                    intent.recovery = "history_absent".into();
+                }
+            } else if intent.requested_delivery == "answer" {
+                if intent.provider_state == "prepared" {
+                    let request_matches = thread.request.as_ref().is_some_and(|request| {
+                        request["id"].as_str() == intent.request_id.as_deref()
+                            && Some(thread.request_generation.as_str())
+                                == intent.runtime_generation.as_deref()
+                    });
+                    if !request_matches {
+                        intent.provider_state = "rejected".into();
+                        intent.provider_basis = Some("request_fence".into());
+                        intent.queue_state = "settled".into();
+                        intent.error = Some("Request or runtime generation changed.".into());
+                    } else {
+                        let message = intent.message.clone().unwrap_or_default();
+                        match self.respond_to_request(thread.id, json!({"value":message})) {
+                            Ok(()) => {
+                                intent.provider_state = "unknown".into();
+                                intent.provider_basis = Some("adapter_write".into());
+                                intent.queue_state = "applied".into();
+                                intent.recovery = "held_unknown".into();
+                                intent.realized_delivery = Some("answer".into());
+                            }
+                            Err(error) => {
+                                intent.provider_state = "rejected".into();
+                                intent.provider_basis = Some("target_rejection".into());
+                                intent.queue_state = "settled".into();
+                                intent.error = Some(error);
+                            }
+                        }
+                    }
+                } else if intent.provider_state == "not_observed" {
+                    // Persist the prepared write in one transaction. A restart
+                    // can prove this state but not whether the adapter saw it.
+                    intent.provider_state = "prepared".into();
+                    intent.provider_basis = Some("adapter_prepare".into());
+                    intent.recovery = "awaiting_adapter".into();
+                }
+            } else if intent.recovery == "awaiting_history"
+                && thread.history_loaded
+                && !marker_present
+            {
+                if thread.harness == "pi" {
+                    // Pi's saved session is the authoritative prompt history
+                    // used by this target. Absence there proves the marker was
+                    // never accepted and makes one safe retry possible.
+                    intent.recovery = "history_absent".into();
+                    self.threads[thread_index].peer_recovery_held = false;
+                    self.provision_peer_task_intent(&intent);
+                } else {
+                    // Other harnesses may replay without history or omit
+                    // nonterminal input. Keep the intent visible and held
+                    // instead of claiming nonacceptance.
+                    intent.provider_state = "unknown".into();
+                    intent.provider_basis = Some("history_not_authoritative".into());
+                    intent.recovery = "held_unknown".into();
+                }
+            } else if intent.queue_state == "queued" {
+                self.provision_peer_task_intent(&intent);
+            }
+
+            if self.peer_task_intents[index] != intent {
+                intent.updated_at = lifecycle::now();
+                if self.stage_peer_task_intent(intent.clone()).is_ok() {
+                    self.sync_peer_intent_evidence(index);
+                    changed = true;
+                }
+            }
+            if intent.kind == "input"
+                && matches!(
+                    intent.recovery.as_str(),
+                    "ready" | "awaiting_history" | "history_absent"
+                )
+                && self.threads[thread_index].pi.is_none()
+            {
+                self.connect_thread(thread_index);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn sync_peer_intent_evidence(&mut self, index: usize) {
+        let thread_id = self.peer_task_intents[index].thread_id;
+        let intent = Self::peer_intent_evidence(&self.peer_task_intents[index]);
+        let Some(thread) = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        else {
+            return;
+        };
+        if let Some(origin) = &mut thread.peer_origin {
+            if let Some(existing) = origin
+                .inputs
+                .iter_mut()
+                .find(|existing| existing.command_id == intent.command_id)
+            {
+                *existing = intent;
+            } else {
+                origin.inputs.push(intent);
+            }
         }
     }
 
@@ -4335,7 +5010,8 @@ impl State {
                 .as_str()
                 .filter(|s| !s.trim().is_empty() && s.len() <= 64 * 1024)
                 .ok_or("A bounded brief is required.")?;
-            origin.attempt_message = brief.into();
+            let marked_brief = tasks::delivery_text(&command.command_id.to_string(), brief);
+            origin.attempt_message = marked_brief.clone();
             let mut thread = Thread::new(self.next_id);
             thread.native.access = match args.get("access") {
                 None | Some(Value::Null) => AccessMode::Supervised,
@@ -4388,19 +5064,30 @@ impl State {
             }
             thread.placement = Some(resolved.clone());
             if !pending {
+                thread.peer_recovery_held = false;
                 thread.pending_injections.push_back(Injection {
-                    text: brief.into(),
+                    text: marked_brief.clone(),
                     shown: false,
                     steer: None,
-                    peer_input: None,
+                    peer_input: Some(command.command_id),
                 });
             }
             let id = thread.id;
+            self.stage_peer_task_intent(PeerTaskIntent::input(
+                command.command_id.to_string(),
+                id,
+                thread
+                    .peer_origin
+                    .as_ref()
+                    .and_then(|origin| origin.attempt_id.clone()),
+                None,
+                None,
+                "attempt",
+                marked_brief,
+                None,
+            ))?;
             self.next_id += 1;
             self.threads.push(thread);
-            if !pending {
-                self.connect_thread(self.threads.len() - 1);
-            }
             return Ok(json!({"threadId":id,"placement":resolved.value()}));
         }
         if command.method == "peer.thread.list" {
@@ -4521,30 +5208,18 @@ impl State {
                     .as_ref()
                     .and_then(|origin| origin.attempt_id.clone());
                 let run = self.threads[index].run_id.clone();
-                // The target owns the stop even if its provider pipe already disappeared.
-                let _ = self.threads[index].stop_task();
-                self.record_peer_input(
-                    index,
-                    PeerInputEvidence {
-                        command_id: command.command_id.to_string(),
-                        attempt_id: attempt,
-                        request_id: None,
-                        generation: None,
-                        delivery: "cancel".into(),
-                        transport: "accepted".into(),
-                        // The abort request was submitted, but only the exact
-                        // run's settlement proves the provider stopped.
-                        input: "unknown".into(),
-                        input_basis: "adapter_stop".into(),
-                        realized_delivery: Some("cancel".into()),
-                        run_id: run,
-                        error: None,
-                        observed_at: lifecycle::now(),
-                    },
-                );
+                // Persist the exact stop intent with this accepted command.
+                // The reducer applies it after the commit, so a crash cannot
+                // lose an acknowledged stop before the adapter sees it.
+                self.stage_peer_task_intent(PeerTaskIntent::cancel(
+                    command.command_id.to_string(),
+                    self.threads[index].id,
+                    attempt,
+                    run,
+                ))?;
                 let mut result = json!({"stopped":true});
                 if self.peer_evidence_enabled() {
-                    result["input"] = json!("unknown");
+                    result["input"] = json!("queued");
                 }
                 Ok(result)
             }
@@ -4572,44 +5247,24 @@ impl State {
                         .as_ref()
                         .and_then(|origin| origin.attempt_id.clone());
                     let run = thread.run_id.clone();
-                    let mut evidence = PeerInputEvidence {
-                        command_id: command.command_id.to_string(),
-                        attempt_id: attempt,
-                        request_id: Some(request_id.into()),
-                        generation: Some(generation),
-                        delivery: "answer".into(),
-                        transport: "accepted".into(),
-                        input: "unknown".into(),
-                        // The adapter accepted a write to the provider
-                        // process. Pi does not acknowledge
-                        // extension_ui_response, so provider acceptance stays
-                        // unknown rather than being inferred from the write.
-                        input_basis: "adapter_write".into(),
-                        realized_delivery: Some("answer".into()),
-                        run_id: run,
-                        error: None,
-                        observed_at: lifecycle::now(),
-                    };
-                    return match self
-                        .respond_to_request(self.threads[index].id, json!({"value":message}))
-                    {
-                        Ok(()) => {
-                            self.record_peer_input(index, evidence);
-                            let mut result = json!({"threadId":self.threads[index].id,
-                                "answered":true});
-                            if self.peer_evidence_enabled() {
-                                result["input"] = json!("unknown");
-                            }
-                            Ok(result)
-                        }
-                        Err(error) => {
-                            evidence.input = "rejected".into();
-                            evidence.input_basis = "target_rejection".into();
-                            evidence.error = Some(error.clone());
-                            self.record_peer_input(index, evidence);
-                            Err(error)
-                        }
-                    };
+                    let thread_id = self.threads[index].id;
+                    let mut intent = PeerTaskIntent::input(
+                        command.command_id.to_string(),
+                        thread_id,
+                        attempt,
+                        Some(request_id.into()),
+                        Some(generation),
+                        "answer",
+                        message.into(),
+                        run,
+                    );
+                    intent.queue_state = "answer_pending".into();
+                    self.stage_peer_task_intent(intent)?;
+                    let mut result = json!({"threadId":thread_id,"answered":true,"queued":true});
+                    if self.peer_evidence_enabled() {
+                        result["input"] = json!("queued");
+                    }
+                    return Ok(result);
                 }
                 if self.threads[index]
                     .peer_origin
@@ -4641,40 +5296,70 @@ impl State {
                     .get("documentReads")
                     .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
                     .transpose()?;
-                let thread = &mut self.threads[index];
+                let thread = &self.threads[index];
                 if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
                     return Err("This attempt cannot accept steering.".into());
                 }
+                let origin = thread.peer_origin.as_ref().expect("origin");
+                match delivery {
+                    // A new attempt is authoritative: the home allocated
+                    // this identity before dispatching the send.
+                    Some("attempt") => {}
+                    // Follow-up and steering inputs name the attempt they
+                    // observed. A target that moved on refuses them rather
+                    // than attaching them to newer work.
+                    _ => {
+                        if let (Some(current), Some(observed)) =
+                            (origin.attempt_id.as_deref(), attempt)
+                            && current != observed
+                        {
+                            return Err(format!(
+                                "Attempt changed: {observed} is no longer the current attempt ({current})."
+                            ));
+                        }
+                        if attempt.is_some() && origin.attempt_id.is_none() {
+                            return Err("Attempt changed: this legacy worker has no tracked attempt. Use Shina's thread controls instead.".into());
+                        }
+                    }
+                }
+                if self.peer_task_intents.iter().any(|intent| {
+                    intent.thread_id == thread.id
+                        && intent.kind == "cancel"
+                        && matches!(intent.queue_state.as_str(), "stop_pending" | "applied")
+                        && intent.provider_state != "accepted"
+                        && intent.attempt_id.as_deref() == origin.attempt_id.as_deref()
+                }) && delivery == Some("attempt")
                 {
-                    let origin = thread.peer_origin.as_mut().expect("origin");
-                    match delivery {
-                        // A new attempt is authoritative: the home allocated
-                        // this identity before dispatching the send.
-                        Some("attempt") => {
-                            if let Some(attempt) = attempt {
-                                origin.attempt_id = Some(attempt.into());
-                            }
-                        }
-                        // Follow-up and steering inputs name the attempt they
-                        // observed. A target that moved on refuses them rather
-                        // than attaching them to newer work.
-                        _ => {
-                            if let (Some(current), Some(observed)) =
-                                (origin.attempt_id.as_deref(), attempt)
-                                && current != observed
-                            {
-                                return Err(format!(
-                                    "Attempt changed: {observed} is no longer the current attempt ({current})."
-                                ));
-                            }
-                            if attempt.is_some() && origin.attempt_id.is_none() {
-                                return Err("Attempt changed: this legacy worker has no tracked attempt. Use Shina's thread controls instead.".into());
-                            }
-                        }
-                    }
-                    if let Some(reads) = document_reads {
-                        origin.document_reads = reads;
-                    }
+                    return Err("The previous attempt's cancellation is still awaiting provider settlement.".into());
+                }
+                let target_attempt = match delivery {
+                    Some("attempt") => attempt
+                        .map(str::to_owned)
+                        .or_else(|| origin.attempt_id.clone()),
+                    _ => origin.attempt_id.clone(),
+                };
+                let target_run = (delivery == Some("steer"))
+                    .then(|| thread.run_id.clone())
+                    .flatten();
+                let marked_message = tasks::delivery_text(&command.command_id.to_string(), message);
+                self.stage_peer_task_intent(PeerTaskIntent::input(
+                    command.command_id.to_string(),
+                    thread.id,
+                    target_attempt.clone(),
+                    None,
+                    None,
+                    delivery.unwrap_or("attempt"),
+                    marked_message.clone(),
+                    target_run,
+                ))?;
+                let thread = &mut self.threads[index];
+                let thread_id = thread.id;
+                thread.peer_recovery_held = false;
+                if let Some(reads) = document_reads {
+                    thread.peer_origin.as_mut().expect("origin").document_reads = reads;
+                }
+                if delivery == Some("attempt") {
+                    thread.peer_origin.as_mut().expect("origin").attempt_id = target_attempt;
                 }
                 if thread
                     .peer_origin
@@ -4691,7 +5376,8 @@ impl State {
                     .clone();
                 thread.peer_origin.as_mut().expect("origin").result = None;
                 thread.peer_origin.as_mut().expect("origin").acknowledged = false;
-                thread.peer_origin.as_mut().expect("origin").attempt_message = message.into();
+                thread.peer_origin.as_mut().expect("origin").attempt_message =
+                    marked_message.clone();
                 thread
                     .peer_origin
                     .as_mut()
@@ -4711,31 +5397,6 @@ impl State {
                     .placement
                     .as_ref()
                     .is_some_and(|placement| placement.phase == placement::PlacementPhase::Failed);
-                let evidence = PeerInputEvidence {
-                    command_id: command.command_id.to_string(),
-                    attempt_id: thread
-                        .peer_origin
-                        .as_ref()
-                        .and_then(|origin| origin.attempt_id.clone()),
-                    request_id: None,
-                    generation: None,
-                    delivery: delivery.unwrap_or("attempt").into(),
-                    transport: "accepted".into(),
-                    // The target stored the input. This is not provider
-                    // acceptance; the prompt flush will report that later.
-                    input: "queued".into(),
-                    input_basis: "target_queue".into(),
-                    realized_delivery: Some(
-                        match delivery {
-                            Some("steer") => "steer",
-                            _ => "follow_up",
-                        }
-                        .into(),
-                    ),
-                    run_id: thread.run_id.clone(),
-                    error: None,
-                    observed_at: lifecycle::now(),
-                };
                 if !placement_ready {
                     // Queue the recorded brief ahead of this follow-up until
                     // the reservation provisions, then deliver both in order.
@@ -4755,7 +5416,7 @@ impl State {
                         });
                     }
                     thread.pending_injections.push_back(Injection {
-                        text: message.into(),
+                        text: marked_message,
                         shown: false,
                         steer: None,
                         peer_input: Some(command.command_id),
@@ -4763,8 +5424,11 @@ impl State {
                     if placement_failed {
                         self.request_reprovision(index);
                     }
-                    self.record_peer_input(index, evidence);
-                    let mut result = json!({"threadId":self.threads[index].id,
+                    self.sync_peer_intent_evidence(
+                        self.peer_task_intent_index(thread_id, &command.command_id.to_string())
+                            .expect("staged peer intent"),
+                    );
+                    let mut result = json!({"threadId":thread_id,
                         "queued":true});
                     if self.peer_evidence_enabled() {
                         result["input"] = json!("queued");
@@ -4772,14 +5436,16 @@ impl State {
                     return Ok(result);
                 }
                 thread.pending_injections.push_back(Injection {
-                    text: message.into(),
+                    text: marked_message,
                     shown: false,
                     steer,
                     peer_input: Some(command.command_id),
                 });
-                self.record_peer_input(index, evidence);
-                self.connect_thread(index);
-                let mut result = json!({"threadId":self.threads[index].id});
+                self.sync_peer_intent_evidence(
+                    self.peer_task_intent_index(thread_id, &command.command_id.to_string())
+                        .expect("staged peer intent"),
+                );
+                let mut result = json!({"threadId":thread_id});
                 if self.peer_evidence_enabled() {
                     result["input"] = json!("queued");
                 }
@@ -4791,8 +5457,27 @@ impl State {
 
     pub(super) fn capture_peer_results(&mut self) -> bool {
         let mut changed = false;
+        let pending_inputs: HashSet<usize> = self
+            .peer_task_intents
+            .iter()
+            .filter(|intent| {
+                intent.kind == "input"
+                    && intent.queue_state != "settled"
+                    && intent.provider_state != "rejected"
+            })
+            .map(|intent| intent.thread_id)
+            .collect();
         for thread in &mut self.threads {
             if thread.peer_origin.is_some() && thread.recovering_task {
+                if pending_inputs.contains(&thread.id) {
+                    // A saved task record describes the previous attempt. The
+                    // durable peer input names the next one; do not turn its
+                    // absence from the previous history into a failure.
+                    thread.task_history = None;
+                    thread.recovering_task = false;
+                    changed = true;
+                    continue;
+                }
                 if let Some(history) = thread.task_history.take() {
                     let mut recovered = Task::new(thread, "", None);
                     recovered.attempt_message = thread
@@ -5068,7 +5753,9 @@ impl State {
             if self.peer_runtime.pending.contains_key(&task.id)
                 || now < remote.next_retry_at
                 || task.state == TaskState::Queued
-                || task.state.finished() && !remote.stop_owed
+                || task.state.finished()
+                    && !remote.stop_owed
+                    && !(task.state == TaskState::Cancelled && remote.state != RemoteState::Done)
             {
                 continue;
             }
@@ -5396,6 +6083,24 @@ impl State {
                     remote.retry_attempt = 0;
                     remote.last_error = None;
                     remote.next_retry_at = 0;
+                    if method == "peer.thread.wait"
+                        && value["acknowledged"] == true
+                        && task.state == TaskState::Cancelled
+                    {
+                        let result = &value["result"];
+                        if let Some(attempt) = result["attemptId"].as_str() {
+                            completed_operations.push((
+                                task.id.clone(),
+                                attempt.to_owned(),
+                                result["runId"].as_str().map(str::to_owned),
+                                TaskState::Cancelled,
+                            ));
+                        }
+                        remote.request = None;
+                        remote.needs_you = false;
+                        remote.state = RemoteState::Done;
+                        continue;
+                    }
                     let method = if method == "peer.thread.wait" && value["acknowledged"] == true {
                         "peer.task.ack"
                     } else {
@@ -5428,9 +6133,9 @@ impl State {
                             remote.stop_owed = false;
                             remote.stop_command_id = None;
                             remote.stop_attempt_id = None;
-                            if task.state == TaskState::Cancelled {
-                                remote.state = RemoteState::Done;
-                            }
+                            // A stop receipt proves transport acceptance only.
+                            // Keep waiting for this attempt's provider settlement.
+                            remote.state = RemoteState::Running;
                         }
                         "peer.captain.document.reply" => {
                             remote.document_replies.pop_front();
@@ -5479,7 +6184,11 @@ impl State {
                                         state,
                                     ));
                                 }
-                                RemoteState::ResultPendingDelivery
+                                if task.state == TaskState::Cancelled {
+                                    RemoteState::Done
+                                } else {
+                                    RemoteState::ResultPendingDelivery
+                                }
                             } else {
                                 RemoteState::Running
                             };
@@ -5541,6 +6250,26 @@ impl State {
                                     ));
                                 }
                             }
+                        }
+                        "peer.task.ack" if task.state == TaskState::Cancelled => {
+                            let result = &value["result"];
+                            let state = match result["status"].as_str() {
+                                Some("cancelled") => TaskState::Cancelled,
+                                Some("completed") => TaskState::Completed,
+                                Some("failed") => TaskState::Failed,
+                                _ => TaskState::Cancelled,
+                            };
+                            if let Some(attempt) = result["attemptId"].as_str() {
+                                completed_operations.push((
+                                    task.id.clone(),
+                                    attempt.to_owned(),
+                                    result["runId"].as_str().map(str::to_owned),
+                                    state,
+                                ));
+                            }
+                            remote.request = None;
+                            remote.needs_you = false;
+                            remote.state = RemoteState::Done;
                         }
                         "peer.task.ack"
                             if !task.state.finished()

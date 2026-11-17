@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -116,6 +116,31 @@ fn question_dismissal_is_negotiated_idempotent_and_starts_no_provider_turn() {
             .exists()
     );
     assert_eq!(client.snapshot["threads"][0]["status"], "Completed");
+    profile.stop();
+}
+
+#[test]
+fn peer_task_evidence_requires_its_contract_minor_not_an_identity_number() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let capability = |client: &mut Client, minor: u32| {
+        client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("peer-evidence-{minor}")),
+        )["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == protocol::PEER_TASK_EVIDENCE)
+    };
+    assert!(!capability(&mut client, protocol::IDENTITY_MINOR));
+    assert!(!capability(
+        &mut client,
+        protocol::PEER_TASK_EVIDENCE_MINOR - 1
+    ));
+    assert!(capability(&mut client, protocol::PEER_TASK_EVIDENCE_MINOR));
     profile.stop();
 }
 
@@ -1546,6 +1571,14 @@ impl Profile {
             }
         }
     }
+
+    fn crash_child(&mut self, index: usize) {
+        let child = self.children.get_mut(index).expect("fixture server index");
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+        }
+        let _ = child.wait();
+    }
 }
 impl Drop for Profile {
     fn drop(&mut self) {
@@ -1575,6 +1608,142 @@ impl Drop for Profile {
         }
         // This path was created under temp_dir with a fresh UUID, never the real profile.
         let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn durable_task_inputs(profile: &Profile) -> Vec<Value> {
+    let connection = rusqlite::Connection::open(profile.root.join("Shina/state.sqlite")).unwrap();
+    connection.busy_timeout(Duration::from_secs(2)).unwrap();
+    let mut statement = connection
+        .prepare("SELECT payload FROM task_input_intents ORDER BY updated_at, command_id")
+        .unwrap();
+    statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+        .collect()
+}
+
+/// Pair live home and target serve processes over loopback, register matching
+/// repositories, and return the target identity, both clients and a parent
+/// home thread. The caller owns launching and stopping both profiles.
+fn link_peer_servers(
+    target: &mut Profile,
+    home: &mut Profile,
+    repository: &str,
+) -> (Value, Client, Client, Value) {
+    let target_discovery = target.discovery();
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    let target_workspace = target.root.join("workspace");
+    fs::create_dir_all(&target_workspace).unwrap();
+    let home_workspace = home.root.join("workspace");
+    for path in [&target_workspace, &home_workspace] {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["remote", "add", "origin", repository])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(
+        target_client.command(
+            "project.put",
+            json!({"path":target_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(
+        code.status.success(),
+        "{}",
+        String::from_utf8_lossy(&code.stderr)
+    );
+    let code = String::from_utf8(code.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let mut client = home.client(uuid::Uuid::new_v4());
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!(format!("peer-home-{}", uuid::Uuid::new_v4())),
+    );
+    assert_eq!(
+        client.command(
+            "project.put",
+            json!({"path":home_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let parent = client.command(
+        "thread.create",
+        json!({"project":1}),
+        uuid::Uuid::new_v4(),
+    )["result"]["result"]["threadId"]
+        .clone();
+    (target_discovery, target_client, client, parent)
+}
+
+fn delegate_fixture(
+    client: &mut Client,
+    parent: &Value,
+    prompt: &str,
+    key: &str,
+    target: &Value,
+) -> Value {
+    let args = json!({"prompt":prompt,"client_request_id":key,
+        "target":{"machine":target["serverId"],"model":"fixture"}});
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = client.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args}),
+            uuid::Uuid::new_v4(),
+        );
+        let waiting = response["result"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not advertise this model"));
+        if !waiting {
+            assert_eq!(response["result"]["status"], "accepted", "{response}");
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "target did not advertise fixture model: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1624,7 +1793,19 @@ impl Client {
         request
             .headers_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
-        let (mut socket, _) = tungstenite::connect(request).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match tungstenite::connect(request.clone()) {
+                Ok(connected) => break connected,
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "WebSocket listener did not become ready: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        };
         if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
@@ -4047,6 +4228,22 @@ fn remote_task_cancel_fences_the_observed_attempt_over_peer_transport() {
 
     // The owed stop must be acknowledged before further work is owed.
     client.until(|state| state["index"]["tasks"][0]["remote"]["stopOwed"] == false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let replay = client.command(
+            "task.cancel",
+            json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"cancel-1","attempt_id":attempt_a}}),
+            uuid::Uuid::new_v4(),
+        );
+        if replay["result"]["result"]["operation"]["completion"] == "cancelled" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "target cancellation remained unobserved: {replay}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     // A new keyed send starts attempt B on the same remote thread; the target
     // records the attempt identity the home committed.
@@ -4640,6 +4837,623 @@ fn queued_target_response_is_not_provider_acceptance_until_flushed() {
         1,
         "the queued input reached the provider exactly once: {delivered}"
     );
+    home.stop();
+    target.stop();
+}
+
+/// The target stores peer input with its accepted command. A crash before the
+/// provider flush, followed by a home crash and the same keyed task_send retry,
+/// restores one logical input and delivers it once after stable history proves
+/// the marker was absent.
+#[test]
+fn target_queued_input_survives_restart_and_keyed_retry_without_loss_or_duplication() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let port = free_port();
+    let port_arg = port.to_string();
+    let gate = target.root.join("peer-input-release");
+    // The first delegated brief may flush normally. Removing the gate before
+    // the follow-up holds that exact peer input before its provider write.
+    fs::write(&gate, b"ready").unwrap();
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_PEER_INPUT":gate}).to_string(),
+    )
+    .unwrap();
+    target.launch(&["serve", "--port", &port_arg]);
+    home.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let (_, _target_client, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/durable-target-input.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "durable-target-initial",
+        "durable-target-input-launch",
+        &target_discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "completed")
+            && state["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| thread["id"] == parent && thread["status"] == "Completed")
+    });
+    let prompts = target.root.join("workspace/fixture-prompts.jsonl");
+    assert_eq!(fs::read_to_string(&prompts).unwrap().lines().count(), 1);
+
+    fs::remove_file(&gate).unwrap();
+    let send = json!({"thread_id":child,"message":"durable-target-input-followup",
+        "client_request_id":"durable-target-input-send"});
+    let queued = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":send.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(queued["result"]["status"], "accepted", "{queued}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let durable = durable_task_inputs(&target);
+        if durable.iter().any(|input| {
+            input["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("durable-target-input-followup"))
+                && input["queue_state"] == "queued"
+                && input["provider_state"] == "not_observed"
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "target did not persist input: {durable:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        fs::read_to_string(&prompts).unwrap().lines().count(),
+        1,
+        "the held follow-up must not have reached the provider"
+    );
+
+    // Both sides lose their process state after the target command committed.
+    target.crash_child(0);
+    home.stop();
+    // A fixed listener keeps the peer address stable. Remove the stale
+    // discovery document so clients wait for the restarted server's new
+    // bootstrap token instead of racing the previous process.
+    let _ = fs::remove_file(target.root.join("Shina/server.json"));
+    let _ = fs::remove_file(home.root.join("Shina/server.json"));
+    fs::write(&gate, b"release").unwrap();
+    target.launch(&["serve", "--port", &port_arg]);
+    home.launch(&["serve"]);
+    let _target_client = target.client(uuid::Uuid::new_v4());
+    let mut client = home.client(uuid::Uuid::new_v4());
+    let retried = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":send.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(retried["result"]["status"], "accepted", "{retried}");
+    assert_eq!(retried["result"]["result"]["replayed"], true, "{retried}");
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let text = fs::read_to_string(&prompts).unwrap_or_default();
+        let accepted = durable_task_inputs(&target).iter().any(|input| {
+            input["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("durable-target-input-followup"))
+                && input["provider_state"] == "accepted"
+                && input["recovery"] == "history_absent"
+        });
+        if accepted
+            && text
+                .lines()
+                .filter(|line| line.contains("durable-target-input-followup"))
+                .count()
+                == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "target input was neither accepted nor uniquely delivered: {text}\n{:?}",
+            durable_task_inputs(&target)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "completed")
+    });
+    let replay = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":send}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    assert_eq!(
+        replay["result"]["result"]["operation"]["acceptance"],
+        "accepted"
+    );
+    assert_eq!(
+        fs::read_to_string(&prompts)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("durable-target-input-followup"))
+            .count(),
+        1
+    );
+    home.stop();
+    target.stop();
+}
+
+/// The adapter durably accepted and saved the prompt, but the target died
+/// before observing the response. Stable provider history identifies that
+/// exact input after restart, so recovery settles it without a second prompt.
+#[test]
+fn target_acceptance_before_receipt_observation_is_reconciled_without_replay() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let port = free_port();
+    let port_arg = port.to_string();
+    target.launch(&["serve", "--port", &port_arg]);
+    home.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let (_, _target_client, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/target-acceptance-history.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "durable-target-accept-initial",
+        "target-acceptance-launch",
+        &target_discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "completed")
+            && state["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| thread["id"] == parent && thread["status"] == "Completed")
+    });
+
+    let send = json!({"thread_id":child,"message":"peer-crash-after-accept-fixture",
+        "client_request_id":"target-acceptance-send"});
+    let accepted = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":send.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    let prompts = target.root.join("workspace/fixture-prompts.jsonl");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let text = fs::read_to_string(&prompts).unwrap_or_default();
+        if text
+            .lines()
+            .filter(|line| line.contains("peer-crash-after-accept-fixture"))
+            .count()
+            == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider never accepted input: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    target.crash_child(0);
+    let _ = fs::remove_file(target.root.join("Shina/server.json"));
+    target.launch(&["serve", "--port", &port_arg]);
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let reconciled = durable_task_inputs(&target).iter().any(|input| {
+            input["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("peer-crash-after-accept-fixture"))
+                && input["provider_state"] == "accepted"
+                && input["recovery"] == "accepted_from_history"
+                && input["provider_basis"] == "history_replay"
+        });
+        if reconciled {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "provider acceptance was not reconciled from history: {:?}",
+            durable_task_inputs(&target)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let replay = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":send}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    let text = fs::read_to_string(&prompts).unwrap();
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("peer-crash-after-accept-fixture"))
+            .count(),
+        1,
+        "the accepted prompt must not be replayed: {text}"
+    );
+    home.stop();
+    target.stop();
+}
+
+/// Rejecting the target's durable intent insert rolls back the accepted peer
+/// command before the provider can be touched. The replay row and prompt log
+/// both remain unchanged.
+#[test]
+fn target_intent_transaction_failure_has_no_adapter_or_peer_effect() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    target.launch(&["serve"]);
+    home.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let (_, _target_client, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/target-intent-rollback.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "target-rollback-initial",
+        "target-rollback-launch",
+        &target_discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "completed")
+    });
+    let prompts = target.root.join("workspace/fixture-prompts.jsonl");
+    let before_rows = durable_task_inputs(&target);
+    let before_prompts = fs::read_to_string(&prompts).unwrap();
+    let connection = rusqlite::Connection::open(target.root.join("Shina/state.sqlite")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_task_input
+             BEFORE INSERT ON task_input_intents
+             BEGIN SELECT RAISE(ABORT,'injected target transaction failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let sent = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,
+            "message":"target-rollback-followup","client_request_id":"target-rollback-send"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(sent["result"]["status"], "accepted", "{sent}");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline {
+        assert_eq!(durable_task_inputs(&target).len(), before_rows.len());
+        assert_eq!(fs::read_to_string(&prompts).unwrap(), before_prompts);
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !fs::read_to_string(&prompts)
+            .unwrap()
+            .contains("target-rollback-followup")
+    );
+    target.crash_child(0);
+    home.stop();
+}
+
+/// A steer accepted for run A but held until A settles is delivered to run B
+/// as an ordinary follow-up. The target records that realized mode and both
+/// run identities against the same observed task attempt.
+#[test]
+fn late_steer_records_follow_up_and_exact_run_attribution() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let gate = target.root.join("peer-input-release");
+    let steer_armed = target.root.join("peer-steer-armed");
+    let steer_end = target.root.join("peer-steer-end");
+    let steer_ended = target.root.join("peer-steer-ended");
+    fs::write(&gate, b"ready").unwrap();
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_PEER_INPUT":gate,
+            "SHINA_TEST_STEER_ARMED":steer_armed,"SHINA_TEST_STEER_END":steer_end,
+            "SHINA_TEST_STEER_ENDED":steer_ended})
+        .to_string(),
+    )
+    .unwrap();
+    target.launch(&["serve"]);
+    home.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let (_, _target_client, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/late-steer-attribution.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "peer-steer-race-fixture",
+        "late-steer-launch",
+        &target_discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "running")
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !steer_armed.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture never armed steer release"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let attempt = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
+    assert!(attempt.is_string(), "the observed attempt is required");
+
+    fs::remove_file(&gate).unwrap();
+    let steer = json!({"thread_id":child,"message":"late-steer-followup",
+        "client_request_id":"late-steer-command","delivery":"steer","attempt_id":attempt});
+    let accepted = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":steer.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    let target_attempt = accepted["result"]["result"]["attempt_id"].clone();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let durable = durable_task_inputs(&target);
+        if durable.iter().any(|input| {
+            input["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("late-steer-followup"))
+                && input["requested_delivery"] == "steer"
+                && input["queue_state"] == "queued"
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "steer was not stored: {durable:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let workspace = target.root.join("workspace");
+    fs::write(&steer_end, b"end").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !steer_ended.exists() {
+        assert!(Instant::now() < deadline, "fixture run A did not settle");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    fs::write(&gate, b"release").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (target_run, realized_run) = loop {
+        let durable = durable_task_inputs(&target);
+        if let Some(input) = durable.iter().find(|input| {
+            input["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("late-steer-followup"))
+                && input["provider_state"] == "accepted"
+                && input["realized_delivery"] == "follow_up"
+        }) {
+            assert_eq!(input["attempt_id"], target_attempt, "{input}");
+            assert!(input["target_run_id"].is_string(), "{input}");
+            assert!(input["run_id"].is_string(), "{input}");
+            assert_ne!(input["target_run_id"], input["run_id"], "{input}");
+            break (input["target_run_id"].clone(), input["run_id"].clone());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late steer did not reach provider as follow-up: {durable:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_ne!(target_run, realized_run);
+    let behavior = fs::read_to_string(workspace.join("fixture-behavior.jsonl")).unwrap();
+    let record = behavior
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|record| {
+            record["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("late-steer-followup"))
+        })
+        .expect("late steer provider record");
+    assert_eq!(record["streamingBehavior"], "followUp");
+    home.stop();
+    target.stop();
+}
+
+/// A cancel accepted while the fixed-link target is offline stays unobserved
+/// and blocks a newer send. Restarting the target at the same listener and
+/// identity lets the fenced stop settle without affecting later work.
+#[test]
+fn offline_cancel_stays_uncertain_until_target_settlement_and_never_stops_newer_attempt() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let port = free_port();
+    let port_arg = port.to_string();
+    let gate = home.root.join("peer-stop-release");
+    fs::write(&gate, b"ready").unwrap();
+    fs::write(
+        home.root.join("extra-env.json"),
+        json!({"SHINA_TEST_PEER_SEND_BARRIER":gate}).to_string(),
+    )
+    .unwrap();
+    target.launch(&["serve", "--port", &port_arg]);
+    home.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let (_, _target_client, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/offline-cancel-newer-attempt.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "peer-documents-hold-fixture",
+        "offline-cancel-launch",
+        &target_discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "running")
+    });
+    let attempt_a = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
+    fs::remove_file(&gate).unwrap();
+    let cancel_args = json!({"thread_id":child,"client_request_id":"offline-cancel",
+        "attempt_id":attempt_a});
+    let cancelled = client.command(
+        "task.cancel",
+        json!({"threadId":parent,"args":cancel_args.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(cancelled["result"]["status"], "accepted", "{cancelled}");
+    client.until(|state| {
+        state["index"]["taskOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation["request_key"] == "offline-cancel")
+    });
+    let operation = client.snapshot["index"]["taskOperations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["request_key"] == "offline-cancel")
+        .unwrap()
+        .clone();
+    assert_eq!(operation["completion"], "not_observed");
+    assert_ne!(operation["transport"], "accepted");
+    assert_eq!(client.snapshot["index"]["tasks"][0]["state"], "cancelled");
+
+    let blocked = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,
+            "message":"offline-cancel-newer-attempt","client_request_id":"offline-cancel-next"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        blocked.to_string().contains("owed stop") || blocked.to_string().contains("acknowledge"),
+        "{blocked}"
+    );
+
+    fs::write(&gate, b"release").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !durable_task_inputs(&target)
+        .iter()
+        .any(|intent| intent["kind"] == "cancel")
+    {
+        assert!(Instant::now() < deadline, "target never received the stop");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Reset only the controller's retry schedule after the target has the
+    // durable stop. The same target listener and peer credential stay in use.
+    home.stop();
+    let _ = fs::remove_file(home.root.join("Shina/server.json"));
+    home.launch(&["serve"]);
+    let mut client = home.client(uuid::Uuid::new_v4());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let replay = client.command(
+            "task.cancel",
+            json!({"threadId":parent,"args":cancel_args.clone()}),
+            uuid::Uuid::new_v4(),
+        );
+        if replay["result"]["result"]["replayed"] == true
+            && replay["result"]["result"]["operation"]["completion"] == "cancelled"
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "stop settlement was not observed: {replay}\nTarget inputs: {:?}",
+                durable_task_inputs(&target),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let next = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,
+            "message":"offline-cancel-newer-attempt","client_request_id":"offline-cancel-next"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(next["result"]["status"], "accepted", "{next}");
+    assert_ne!(next["result"]["result"]["attempt_id"], attempt_a);
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "running" || task["state"] == "completed")
+    });
+    let stale = client.command(
+        "task.cancel",
+        json!({"threadId":parent,"args":cancel_args}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(stale["result"]["result"]["replayed"], true, "{stale}");
+    assert_ne!(client.snapshot["index"]["tasks"][0]["state"], "cancelled");
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["state"] == "completed")
+    });
+    target.stop();
+    let _ = fs::remove_file(target.root.join("Shina/server.json"));
+    target.launch(&["serve", "--port", &port_arg]);
+    let replay = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,
+            "message":"offline-cancel-newer-attempt","client_request_id":"offline-cancel-next"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
     home.stop();
     target.stop();
 }

@@ -36,6 +36,7 @@ struct Inner {
     staged_push: Vec<crate::mobile_push::Staged>,
     staged_tool_receipts: Vec<Receipt>,
     staged_task_operations: Vec<Value>,
+    staged_task_input_intents: Vec<Value>,
     revocations: Vec<String>,
     failure: Option<String>,
     dispatch_fenced: bool,
@@ -261,6 +262,7 @@ impl Database {
             staged_push: Vec::new(),
             staged_tool_receipts: Vec::new(),
             staged_task_operations: Vec::new(),
+            staged_task_input_intents: Vec::new(),
             revocations: Vec::new(),
             failure: None,
             dispatch_fenced: false,
@@ -492,6 +494,7 @@ impl Database {
         let staged = std::mem::take(&mut inner.staged);
         let tool_receipts = std::mem::take(&mut inner.staged_tool_receipts);
         let task_operations = std::mem::take(&mut inner.staged_task_operations);
+        let task_input_intents = std::mem::take(&mut inner.staged_task_input_intents);
         let history_events = std::mem::take(&mut inner.history_events);
         let metrics_path = if cfg!(debug_assertions) {
             std::env::var_os("SHINA_TEST_STORAGE_METRICS").map(PathBuf::from)
@@ -576,6 +579,38 @@ impl Database {
                         operation["target_thread_id"].as_u64().unwrap_or(0) as i64,
                         crate::lifecycle::now() as i64,
                         operation.to_string()
+                    ],
+                )
+                .map_err(error)?;
+            }
+            // Target input/control intent is written before any provider
+            // command. A later effect may still be uncertain, but the exact
+            // command and queue intent can no longer disappear with memory.
+            for intent in task_input_intents {
+                let thread_id = intent["thread_id"]
+                    .as_u64()
+                    .and_then(|id| i64::try_from(id).ok())
+                    .ok_or("Invalid task input thread.")?;
+                let command_id = intent["command_id"]
+                    .as_str()
+                    .ok_or("Invalid task input command.")?;
+                let kind = intent["kind"].as_str().ok_or("Invalid task input kind.")?;
+                tx.execute(
+                    "INSERT INTO task_input_intents(thread_id,command_id,kind,attempt_id,request_id,runtime_generation,updated_at,payload)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                     ON CONFLICT(thread_id,command_id) DO UPDATE SET
+                        kind=excluded.kind,attempt_id=excluded.attempt_id,
+                        request_id=excluded.request_id,runtime_generation=excluded.runtime_generation,
+                        updated_at=excluded.updated_at,payload=excluded.payload",
+                    params![
+                        thread_id,
+                        command_id,
+                        kind,
+                        intent["attempt_id"].as_str(),
+                        intent["request_id"].as_str(),
+                        intent["runtime_generation"].as_str(),
+                        crate::lifecycle::now() as i64,
+                        intent.to_string()
                     ],
                 )
                 .map_err(error)?;
@@ -930,6 +965,46 @@ impl Database {
         let mut statement = inner
             .connection
             .prepare("SELECT payload FROM task_operations ORDER BY updated_at, scope, request_key")
+            .map_err(error)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(error)?
+            .map(|row| {
+                let text = row.map_err(error)?;
+                serde_json::from_str(&text).map_err(error)
+            })
+            .collect()
+    }
+
+    /// Durable target-side peer input and stop intent. This table is separate
+    /// from the controller operation ledger because the target owns the queue
+    /// and provider observations, not the caller's saved receipt.
+    pub fn stage_task_input_intent(&self, intent: Value) -> Result<(), String> {
+        self.require_batch()?;
+        if !intent["thread_id"].is_u64()
+            || intent["command_id"].as_str().is_none_or(str::is_empty)
+            || !matches!(intent["kind"].as_str(), Some("input" | "cancel"))
+        {
+            return Err("Invalid task input intent.".into());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_task_input_intents
+            .push(intent);
+        Ok(())
+    }
+
+    pub fn task_input_intents(&self) -> Result<Vec<Value>, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(error) = &inner.failure {
+            return Err(error.clone());
+        }
+        let mut statement = inner
+            .connection
+            .prepare(
+                "SELECT payload FROM task_input_intents ORDER BY updated_at, thread_id, command_id",
+            )
             .map_err(error)?;
         statement
             .query_map([], |row| row.get::<_, String>(0))

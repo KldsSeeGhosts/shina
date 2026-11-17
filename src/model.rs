@@ -236,6 +236,30 @@ fn test_hold_injection_flush() -> bool {
     held
 }
 
+/// Debug-only barrier for a peer input that has already crossed the failed
+/// observation boundary. Ordinary task injections are not held by it.
+#[cfg(debug_assertions)]
+fn test_hold_peer_input_flush() -> bool {
+    let Some(release) = std::env::var_os("SHINA_TEST_HOLD_PEER_INPUT") else {
+        return false;
+    };
+    let release = std::path::PathBuf::from(release);
+    release.starts_with(std::env::temp_dir())
+        && release
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("shina-server-integration-")
+            })
+        && !release.exists()
+}
+
+#[cfg(not(debug_assertions))]
+fn test_hold_peer_input_flush() -> bool {
+    false
+}
+
 struct Injection {
     text: String,
     shown: bool,
@@ -1082,6 +1106,12 @@ pub struct Thread {
     pub(super) rejected_injections: Vec<(String, String)>,
     /// The provider prompt command currently proving a peer input's acceptance.
     pub(super) peer_prompt: Option<(String, uuid::Uuid)>,
+    /// A restored peer input whose absence must be proven by authoritative
+    /// provider history before it can be dispatched again.
+    pub(super) peer_recovery_held: bool,
+    /// Peer input commands actually written to the adapter, with the realized
+    /// delivery and run. Absence here never proves the provider did not read it.
+    pub(super) peer_dispatches: Vec<(String, String, Option<String>)>,
     injection_retry_at: Option<Instant>,
     operation_deadline: Option<(&'static str, Instant)>,
     task_result: Option<&'static str>,
@@ -1617,6 +1647,8 @@ impl Thread {
             injection_dispatches: Vec::new(),
             rejected_injections: Vec::new(),
             peer_prompt: None,
+            peer_recovery_held: false,
+            peer_dispatches: Vec::new(),
             injection_retry_at: None,
             operation_deadline: None,
             task_result: None,
@@ -2748,6 +2780,13 @@ impl Thread {
         {
             return false;
         }
+        if self.pending_injections[0].peer_input.is_some()
+            && (!self.history_loaded || self.peer_recovery_held || test_hold_peer_input_flush())
+        {
+            // Recovery needs a completed stable-history read before an input
+            // that may have crossed the crash boundary can be retried.
+            return false;
+        }
         if self.harness == "pi" && self.model_provider != "cpa" {
             self.error =
                 Some("Choose a CPA model before Shina can deliver queued messages.".into());
@@ -2779,6 +2818,8 @@ impl Thread {
         self.injection_id = Some(prompt_command.clone());
         if let Some(peer) = peer_input {
             self.peer_prompt = Some((prompt_command, peer));
+            self.peer_dispatches
+                .push((peer.to_string(), behavior.into(), self.run_id.clone()));
             if let Some(origin) = &mut self.peer_origin
                 && let Some(evidence) = origin
                     .inputs
@@ -4688,6 +4729,9 @@ pub struct State {
     pub(crate) identity: crate::identity::Catalog,
     /// Keyed control evidence, separate from the immutable saved receipts.
     pub(crate) task_operations: Vec<tasks::TaskOperation>,
+    /// Target-side accepted input and stop intent. The database is canonical;
+    /// this in-memory copy drives queue restoration and provider evidence.
+    pub(crate) peer_task_intents: Vec<remote_tasks::PeerTaskIntent>,
     pub recovery_notice: Option<String>,
     run_marker: Option<crate::store::RunMarker>,
     /// Recent projects, the switcher menu, and the clone sheet.
@@ -4705,6 +4749,7 @@ pub struct State {
     /// Set when peer dispatch runs before the runtime opens its next database
     /// batch. The next reconcile stages these exact operations in that batch.
     pub(super) task_operations_dirty: bool,
+    pub(super) peer_task_intents_dirty: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
     // Drop the owner only after every store has flushed and stopped its writer.
@@ -4995,6 +5040,7 @@ impl State {
             runtime_enabled: false,
             durable_task_controls: false,
             task_operations_dirty: false,
+            peer_task_intents_dirty: false,
             ownership_denied: false,
             runtime_stop_requested: false,
             tasks: Vec::new(),
@@ -5002,6 +5048,7 @@ impl State {
                 &crate::store::directory().unwrap_or_default(),
             ),
             task_operations: Vec::new(),
+            peer_task_intents: Vec::new(),
             recovery_notice: None,
             run_marker: None,
         };
