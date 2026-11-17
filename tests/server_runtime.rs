@@ -3871,7 +3871,18 @@ fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
     );
 
     // The single accepted input reaches the child harness exactly once.
-    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    client.until_sequence(first["result"]["seq"].as_u64().unwrap(), |state| {
+        state["index"]["tasks"][0]["attempt_id"] == attempt_b
+            && state["index"]["tasks"][0]["state"] == "completed"
+            && state["index"]["taskOperations"]
+                .as_array()
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| {
+                        operation["request_key"] == "send-wire-1"
+                            && operation["completion"] == "completed"
+                    })
+                })
+    });
     let child_prompts = profile
         .root
         .join(format!("Shina/chats/{child}/fixture-prompts.jsonl"));
@@ -3953,7 +3964,18 @@ fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
         uuid::Uuid::new_v4(),
     );
     assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
-    client.until(|state| state["index"]["tasks"][0]["state"] == "cancelled");
+    client.until_sequence(cancel["result"]["seq"].as_u64().unwrap(), |state| {
+        state["index"]["tasks"][0]["attempt_id"] == attempt_c
+            && state["index"]["tasks"][0]["state"] == "cancelled"
+            && state["index"]["taskOperations"]
+                .as_array()
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| {
+                        operation["request_key"] == "cancel-wire-1"
+                            && operation["completion"] == "cancelled"
+                    })
+                })
+    });
     let replay = client.command(
         "task.cancel",
         json!({"threadId":1,"args":{"thread_id":child,"client_request_id":"cancel-wire-1","attempt_id":attempt_c}}),
@@ -4974,12 +4996,23 @@ fn target_queued_input_survives_restart_and_keyed_retry_without_loss_or_duplicat
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    client.until(|state| {
+    client.until_sequence(retried["result"]["seq"].as_u64().unwrap(), |state| {
         state["index"]["tasks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|task| task["state"] == "completed")
+            .any(|task| {
+                task["attempt_id"] == queued["result"]["result"]["attempt_id"]
+                    && task["state"] == "completed"
+            })
+            && state["index"]["taskOperations"]
+                .as_array()
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| {
+                        operation["request_key"] == "durable-target-input-send"
+                            && operation["acceptance"] == "accepted"
+                    })
+                })
     });
     let replay = client.command(
         "task.send",

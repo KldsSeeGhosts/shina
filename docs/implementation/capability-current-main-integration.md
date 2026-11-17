@@ -72,3 +72,27 @@ between the mobile SDK's receipt/replay and resume subtests. Those cases now
 wait for their own committed completion before the next case starts. The
 resume, prompt-count and history assertions are unchanged. The original live
 SDK integration test and TypeScript check pass with these completion barriers.
+
+## Release follow-up
+
+PR61 passed exact-head CI and merged as `64b11b7`. Its main run built all three
+platforms but stopped publication when the keyed-control restart test read a
+stale completed attempt. That test waited only for `state == completed`, which
+could still describe the previous attempt. Its prompt-log check proved input
+delivery, not completion, so it could stop the server before the new turn ended.
+
+The existing test now waits past the send receipt's sequence for that exact
+attempt and its committed operation completion before restarting. Cancellation
+uses the same exact-attempt and committed-evidence barrier. All original replay,
+fencing, completion and exactly-one fixture-input assertions remain enabled.
+No production implementation or gate is changed.
+
+The unchanged live restart/replay scenario passes with the corrected
+settlement barriers. Formatting and diff checks pass. Exact-head CI and the
+new main release remain required before closing #32.
+
+PR62 CI passed that scenario but exposed the same stale-state wait in the
+queued remote-input restart case. The target's durable acceptance was already
+proved; the home server had not yet observed it. That case now waits for the
+matching home attempt and operation acceptance before replaying the receipt.
+The original queued-input restart test passes with no assertion removed.
