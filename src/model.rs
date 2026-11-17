@@ -5634,6 +5634,16 @@ impl State {
             return false;
         }
         self.thread_find.pending_reveal = None;
+        // A long open turn is split into rows; reveal the one holding the match.
+        let t = self.current();
+        let query = self.thread_find.query.text.trim().to_owned();
+        let mut seen = 0;
+        let row_key = crate::ui::timeline_text_row(t, msg_idx, |chunk| {
+            let hits = crate::thread_find::find_markdown_occurrences(chunk, &query).len();
+            seen += hits;
+            matched.occurrence < seen
+        })
+        .unwrap_or(row_key);
         tx.scroll_center_in_instant(
             format!("conversation-{tid}"),
             format!("{row_key}/thread-find-active"),
@@ -5724,6 +5734,15 @@ impl State {
             }
             _ => format!("row-{id}-{}", citation.message_id),
         };
+        // A long open turn is split into rows; scroll to the one holding the quote.
+        let row_key = msg_idx
+            .and_then(|message| {
+                crate::ui::timeline_text_row(t, message, |chunk| {
+                    !crate::thread_find::find_markdown_occurrences(chunk, citation.text.trim())
+                        .is_empty()
+                })
+            })
+            .unwrap_or(row_key);
         self.citation_highlight = Some(CitationHighlight {
             machine,
             thread_id: id,
