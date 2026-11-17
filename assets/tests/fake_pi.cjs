@@ -18,15 +18,27 @@ const save = () => { if (!ephemeral) fs.writeFileSync(session, JSON.stringify(me
 if (process.env.SHINA_MCP_URL) fs.writeFileSync(path.join(process.cwd(), "fixture-mcp.json"), JSON.stringify({
   url: process.env.SHINA_MCP_URL, token: process.env.SHINA_MCP_TOKEN
 }));
-async function delegate() {
-  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "delegate_task", arguments: { title: "Fixture child", prompt: "child-fixture" } } });
-  await new Promise((resolve, reject) => {
+async function call(name, args) {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name, arguments: args } });
+  return await new Promise(resolve => {
     const req = http.request(process.env.SHINA_MCP_URL, { method: "POST", headers: { Authorization: `Bearer ${process.env.SHINA_MCP_TOKEN}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } }, res => {
       let text = ""; res.on("data", data => { text += data; });
-      res.on("end", () => { if (JSON.parse(text).result?.isError) reject(new Error("Fixture delegation failed")); else resolve(); });
+      res.on("end", () => resolve(text));
     });
-    req.on("error", reject); req.end(body);
+    req.on("error", error => resolve(`error: ${error.message}`)); req.end(body);
   });
+}
+async function delegate() {
+  const text = await call("delegate_task", { title: "Fixture child", prompt: "child-fixture" });
+  if (JSON.parse(text).result?.isError) throw new Error("Fixture delegation failed");
+}
+async function workflow() {
+  for (const name of ["orchestrator_capabilities", "list_threads"]) {
+    const text = await call(name, {});
+    fs.appendFileSync(path.join(process.cwd(), "pi-mcp-dispatch.jsonl"),
+      JSON.stringify({ name, url: process.env.SHINA_MCP_URL,
+        authorization: `Bearer ${process.env.SHINA_MCP_TOKEN}`, result: text }) + "\n");
+  }
 }
 readline.createInterface({ input: process.stdin }).on("line", async line => {
   const request = JSON.parse(line);
@@ -102,6 +114,7 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
       return;
     }
     if (request.message === "delegate-fixture") await delegate();
+    if (request.message.includes("shina-dispatch-fixture")) await workflow();
     if (request.message.includes("remote-confirm-fixture")) {
       emit({ type: "extension_ui_request", id: "remote-confirm", method: "confirm", title: "Run fixture command?", message: "A remote confirmation" });
       return;

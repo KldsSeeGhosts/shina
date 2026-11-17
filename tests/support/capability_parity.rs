@@ -116,6 +116,14 @@ fn mcp_initialize(directory: &std::path::Path) -> Value {
 /// Waits for the thread's session directory to contain the fake harness's
 /// token-scoped endpoint record. Captain homes and crew run outside chats/,
 /// so the server's reported directory wins over the default.
+fn jsonl(path: &std::path::Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 fn directory_of(client: &mut Client, profile: &Profile, thread: u64) -> PathBuf {
     let chats = profile.root.join(format!("Shina/chats/{thread}"));
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -346,11 +354,16 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
     // The same worker contract binds through each harness adapter's real MCP
     // wiring: native Claude --mcp-config, Codex config overrides, ACP session
     // mcpServers.
-    for harness in ["claude", "codex", "fixture-acp"] {
+    for harness in ["pi", "claude", "codex", "fixture-acp"] {
+        let prompt = if harness == "claude" {
+            "Parity claude leaf"
+        } else {
+            "shina-dispatch-fixture"
+        };
         let launched = fixture_call(
             &home_directory,
             "delegate_task",
-            json!({"prompt":format!("Parity {harness} leaf"),"title":harness,
+            json!({"prompt":prompt,"title":harness,
                 "client_request_id":format!("parity-{harness}"),
                 "target":{"harness":harness}}),
         );
@@ -369,6 +382,72 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
             !worker_tools.iter().any(|tool| tool == "delegate_task"),
             "{harness} leaf must not list delegate_task: {worker_tools:?}"
         );
+        client.until(|state| {
+            state["threads"].as_array().is_some_and(|threads| {
+                threads.iter().any(|thread| {
+                    thread["id"] == worker
+                        && matches!(
+                            thread["status"].as_str(),
+                            Some("Completed" | "Failed" | "Interrupted")
+                        )
+                })
+            })
+        });
+        let worker_thread = client.snapshot["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|thread| thread["id"] == worker)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            worker_thread["status"], "Completed",
+            "{harness} workflow did not complete: {worker_thread}"
+        );
+        let (url, token) = endpoint(&worker_directory);
+        let auth = format!("Bearer {token}");
+        match harness {
+            "claude" => {
+                let records = jsonl(&worker_directory.join("claude-requests.jsonl"));
+                let status = records
+                    .iter()
+                    .find(|record| record["mcp_status"].is_object())
+                    .expect("Claude mcp_status resolution");
+                assert_eq!(status["mcp_status"]["config"]["url"], url);
+                assert_eq!(
+                    status["mcp_status"]["config"]["headers"]["Authorization"],
+                    auth
+                );
+            }
+            "pi" | "codex" | "fixture-acp" => {
+                let path = match harness {
+                    "pi" => worker_directory.join("pi-mcp-dispatch.jsonl"),
+                    "codex" => worker_directory.join("codex-mcp-dispatch.jsonl"),
+                    _ => worker_directory.join("acp-mcp-dispatch.jsonl"),
+                };
+                let records = jsonl(&path);
+                for name in ["orchestrator_capabilities", "list_threads"] {
+                    let call = records
+                        .iter()
+                        .find(|record| record["name"] == name)
+                        .unwrap_or_else(|| panic!("{harness} did not dispatch {name}"));
+                    assert_eq!(call["url"], url, "{harness} {name} endpoint");
+                    assert_eq!(call["authorization"], auth, "{harness} {name} bearer");
+                    assert!(
+                        call["result"]
+                            .as_str()
+                            .unwrap()
+                            .contains(if name == "list_threads" {
+                                "\"threads\""
+                            } else {
+                                "\"caller\""
+                            }),
+                        "{harness} {name}: {call}"
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     // Crew threads are coordinators of their own work but not the Captain's:
@@ -758,4 +837,168 @@ fn remote_worker_capability_contract_over_a_real_pairing() {
             .contains("remote worker")
     );
     target.stop();
+}
+
+#[test]
+fn acp_without_mcp_is_refused_before_thread_allocation() {
+    let mut profile = Profile::new();
+    fs::write(
+        profile.root.join("Shina/harnesses.json"),
+        json!([
+            {"id":"fixture-acp","name":"Fixture ACP",
+            "command":if cfg!(windows) { "python" } else { "python3" },
+            "args":["-u",profile.root.join("fake_acp.py"),"--log",
+                profile.root.join("acp-log.jsonl"),"--resume","--no-history"]},
+            {"id":"fixture-acp-nomcp","name":"Fixture ACP without MCP",
+            "command":if cfg!(windows) { "python" } else { "python3" },
+            "args":["-u",profile.root.join("fake_acp.py"),"--log",
+                profile.root.join("acp-nomcp-log.jsonl"),"--no-mcp"]}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    hello(&mut client, "acp-preflight");
+    let home = captain_open(&mut client, "Preflight");
+    let send = client.command(
+        "thread.send",
+        json!({"threadId":home,"text":"Initialize preflight","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(send["result"]["status"], "accepted", "{send}");
+    let directory = directory_of(&mut client, &profile, home);
+    client.rpc("workspace.subscribe", json!({}), json!("before"));
+    let before = client.snapshot["threads"].as_array().unwrap().len();
+    let error = fixture_refusal(
+        &directory,
+        "delegate_task",
+        json!({"prompt":"must not allocate","client_request_id":"no-mcp",
+            "target":{"harness":"fixture-acp-nomcp"}}),
+    );
+    assert!(error.contains("MCP"), "{error}");
+    assert!(
+        error.contains("no thread was allocated") || error.contains("neither HTTP nor stdio"),
+        "{error}"
+    );
+    client.rpc("workspace.subscribe", json!({}), json!("after"));
+    assert_eq!(
+        client.snapshot["threads"].as_array().unwrap().len(),
+        before,
+        "an unsupported ACP harness must be refused before a thread is allocated"
+    );
+    let record = capability_record(&directory);
+    let harnesses = record["effective"]["execution"]["local"]["harnesses"]
+        .as_array()
+        .unwrap();
+    let unsupported = harnesses
+        .iter()
+        .find(|harness| harness["id"] == "fixture-acp-nomcp")
+        .unwrap();
+    assert_eq!(unsupported["executable"], false, "{unsupported}");
+    assert_eq!(unsupported["discovery"], "probed", "{unsupported}");
+    assert_eq!(unsupported["mcp"]["available"], false, "{unsupported}");
+    let supported = harnesses
+        .iter()
+        .find(|harness| harness["id"] == "fixture-acp")
+        .unwrap();
+    assert_eq!(supported["executable"], true, "{supported}");
+    assert_eq!(supported["discovery"], "probed", "{supported}");
+    assert_eq!(supported["mcp"]["available"], true, "{supported}");
+}
+
+#[test]
+fn read_only_claude_crew_dispatches_through_can_use_tool_and_hook_binding() {
+    let mut profile = Profile::new();
+    fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    hello(&mut client, "claude-crew-dispatch");
+    let home = captain_open(&mut client, "Claude binding");
+    let send = client.command(
+        "thread.send",
+        json!({"threadId":home,"text":"Initialize Claude binding",
+            "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(send["result"]["status"], "accepted", "{send}");
+    let _home_directory = directory_of(&mut client, &profile, home);
+    let created = client.command(
+        "captain.crew.create",
+        json!({"captain":0,"access":"read-only","target":{"harness":"claude"},
+            "input":{"text":"shina-dispatch-fixture","attachments":[]}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(created["result"]["status"], "accepted", "{created}");
+    let worker = created["result"]["result"]["threadId"].as_u64().unwrap();
+    let directory = directory_of(&mut client, &profile, worker);
+    client.until(|state| {
+        state["threads"].as_array().is_some_and(|threads| {
+            threads.iter().any(|thread| {
+                thread["id"] == worker
+                    && matches!(
+                        thread["status"].as_str(),
+                        Some("Completed" | "Failed" | "Interrupted")
+                    )
+            })
+        })
+    });
+    assert_eq!(
+        client.snapshot["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|thread| thread["id"] == worker)
+            .unwrap()["status"],
+        "Completed"
+    );
+    let (url, token) = endpoint(&directory);
+    let auth = format!("Bearer {token}");
+    let records = jsonl(&directory.join("claude-requests.jsonl"));
+    let status = records
+        .iter()
+        .find(|record| record["mcp_status"].is_object())
+        .expect("Claude mcp_status resolution");
+    assert_eq!(status["mcp_status"]["config"]["url"], url);
+    assert_eq!(
+        status["mcp_status"]["config"]["headers"]["Authorization"],
+        auth
+    );
+    let decision = |name: &str| {
+        let response = records
+            .iter()
+            .find(|record| record["response"]["request_id"] == format!("callback-{name}"))
+            .unwrap_or_else(|| panic!("no Claude permission response for {name}"));
+        response["response"]["response"].clone()
+    };
+    assert_eq!(
+        decision("mcp__shina__orchestrator_capabilities")["behavior"],
+        "allow"
+    );
+    assert_eq!(
+        decision("mcp__shina__list_threads")["hookSpecificOutput"]["permissionDecision"],
+        "allow"
+    );
+    assert_eq!(decision("mcp__shina__exec_shell")["behavior"], "deny");
+    assert_eq!(
+        decision("mcp__shina_evil__list_threads")["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    for (name, expected) in [
+        ("mcp__shina__orchestrator_capabilities", "\"caller\""),
+        ("mcp__shina__list_threads", "\"threads\""),
+    ] {
+        let dispatch = records
+            .iter()
+            .find(|record| record["dispatch"] == name)
+            .unwrap_or_else(|| panic!("Claude did not dispatch {name}"));
+        assert!(dispatch["result"].as_str().unwrap().contains(expected));
+    }
+    for name in ["mcp__shina__exec_shell", "mcp__shina_evil__list_threads"] {
+        let dispatch = records
+            .iter()
+            .find(|record| record["dispatch"] == name)
+            .expect("denied dispatch record");
+        assert_eq!(dispatch["denied"], true, "{name}");
+    }
 }

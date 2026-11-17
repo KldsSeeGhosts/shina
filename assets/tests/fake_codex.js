@@ -5,17 +5,45 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const readline = require("node:readline");
+const http = require("node:http");
 if (process.argv.includes("--version")) {
   console.log("codex-cli 0.167.2");
   process.exit(0);
 }
 const threadId = "codex-fixture-thread";
 let turns = 0;
+let shina = null;
 const emit = record => process.stdout.write(JSON.stringify(record) + "\n");
 const log = record =>
   fs.appendFileSync(path.join(process.cwd(), "codex-requests.jsonl"),
     JSON.stringify(record) + "\n");
 const notify = (method, params) => emit({ method, params: { threadId, ...params } });
+const dispatchWorkflow = async server => {
+  const authorization = (server.http_headers || {}).Authorization || "";
+  for (const name of ["orchestrator_capabilities", "list_threads"]) {
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call",
+      params: { name, arguments: {} } });
+    await new Promise(resolve => {
+      const request = http.request(server.url, { method: "POST", headers: {
+        authorization, "content-type": "application/json",
+        "content-length": Buffer.byteLength(body) } }, response => {
+        let text = "";
+        response.on("data", chunk => text += chunk);
+        response.on("end", () => {
+          fs.appendFileSync(path.join(process.cwd(), "codex-mcp-dispatch.jsonl"),
+            JSON.stringify({ name, url: server.url, authorization, result: text }) + "\n");
+          resolve();
+        });
+      });
+      request.on("error", error => {
+        fs.appendFileSync(path.join(process.cwd(), "codex-mcp-dispatch.jsonl"),
+          JSON.stringify({ name, url: server.url, authorization, error: error.message }) + "\n");
+        resolve();
+      });
+      request.end(body);
+    });
+  }
+};
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const record = JSON.parse(line);
   log(record);
@@ -45,6 +73,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     const server = (params.config || {})["mcp_servers.shina"] || {};
     const authorization = (server.http_headers || {}).Authorization || "";
     if (server.url && authorization.startsWith("Bearer ")) {
+      shina = server;
       fs.writeFileSync(path.join(params.cwd || process.cwd(), "fixture-mcp.json"),
         JSON.stringify({ url: server.url, token: authorization.slice(7) }));
     }
@@ -60,6 +89,15 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       content: params.input } });
     const text = (params.input || []).map(item => item.text || "").join("\n");
     if (text.includes("hold")) return;
+    if (text.includes("shina-dispatch-fixture") && shina) {
+      dispatchWorkflow(shina).then(() => {
+        notify("item/agentMessage/delta", { itemId: "dispatch", delta: "MCP workflow complete" });
+        notify("item/completed", { item: { type: "agentMessage", id: "dispatch",
+          text: "MCP workflow complete" } });
+        notify("turn/completed", { turn: { id: turnId, status: "completed", items: [] } });
+      });
+      return;
+    }
     notify("item/agentMessage/delta", { itemId: "answer", delta: "Hello Codex" });
     notify("item/completed", { item: { type: "agentMessage", id: "answer",
       text: "Hello Codex" } });

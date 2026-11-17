@@ -48,6 +48,7 @@ const ask = (name, input, hook) => {
       tool_use_id: id } }
     : { subtype: "can_use_tool", tool_name: name, input, tool_use_id: id } });
 };
+const queue = [];
 let completionTimer;
 const finish = () => {
   emit({ type: "assistant", uuid: crypto.randomUUID(),
@@ -60,11 +61,24 @@ const scheduleFinish = () => {
   clearTimeout(completionTimer);
   completionTimer = setTimeout(finish, 100);
 };
+const pump = () => {
+  if (queue.length === 0) {
+    scheduleFinish();
+    return;
+  }
+  const [name, input, hook] = queue.shift();
+  ask(name, input, hook);
+};
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const record = JSON.parse(line);
   fs.appendFileSync(log, JSON.stringify(record) + "\n");
   if (record.type === "control_request") {
     const request = record.request;
+    if (request.subtype === "mcp_status") {
+      fs.appendFileSync(log, JSON.stringify({ mcp_status: {
+        request_id: record.request_id,
+        config: { type: "http", url: shinaUrl, headers: shinaHeaders } } }) + "\n");
+    }
     const data = request.subtype === "initialize" ? {
       hook_on_failure_supported: true, hooks_applied: true, commands: [],
       models: [{ value: "default", displayName: "Claude fixture" }],
@@ -94,10 +108,11 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
         input: { command: "echo fixture" }, title: "Run fixture command?",
       } });
     } else if (text.includes("shina-dispatch-fixture")) {
-      ask("mcp__shina__orchestrator_capabilities", {}, false);
-      ask("mcp__shina__list_threads", {}, true);
-      ask("mcp__shina__exec_shell", { command: "echo hi" }, false);
-      ask("mcp__shina_evil__list_threads", {}, true);
+      queue.push(["mcp__shina__orchestrator_capabilities", {}, false]);
+      queue.push(["mcp__shina__list_threads", {}, true]);
+      queue.push(["mcp__shina__exec_shell", { command: "echo hi" }, false]);
+      queue.push(["mcp__shina_evil__list_threads", {}, true]);
+      pump();
     } else {
       scheduleFinish();
     }
@@ -112,14 +127,16 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
         emit({ type: "user", uuid: crypto.randomUUID(), parent_tool_use_id: null,
           message: { role: "user", content: [{ type: "tool_result",
             tool_use_id: record.response.request_id, content: result }] } });
-        scheduleFinish();
+        pump();
       });
     } else {
       if (callback) {
         fs.appendFileSync(log, JSON.stringify({ dispatch: callback.name,
           result: "", denied: true }) + "\n");
+        pump();
+      } else {
+        scheduleFinish();
       }
-      scheduleFinish();
     }
   }
 });
