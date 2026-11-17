@@ -60,10 +60,9 @@ checks passed. The 15 catalog, 58 remote-task, 26 placement and one live
 repository-contract tests passed again. The new branch-resolution unit test
 also checks that the executor's current branch does not change.
 
-Credential failures still have a bounded Git error string rather than a typed
-failure category. Final exact-head CI, schema/protocol publication and #27
-execution ownership integration also remain required. No universal exactly-once
-remote-provider, cross-runtime speed or complete issue-28 claim is made.
+Final exact-head CI, schema/protocol publication and #27 execution ownership
+integration remain required. No universal exactly-once remote-provider,
+cross-runtime speed or complete issue-28 claim is made.
 
 No production CPA, provider login, authentication configuration, real profile or
 paid-provider request changed. No worker was replaced.
@@ -129,3 +128,27 @@ command. It is not executed or copied as provider instructions.
 
 The existing two-executor clone/restart test now includes a repository setup
 script and checks one setup run per worktree before and after keyed replay.
+
+## Provisioning states
+
+| Condition | Observable state |
+| --- | --- |
+| No clone on the selected executor | Placement binding `pending`, catalog binding `provisioning` |
+| Git reports unavailable HTTP/SSH credentials | Binding `failed`, placement `errorCode` and catalog `reasonCode` are `credentials_unavailable` |
+| Other checkout failure | Binding `failed`, code `provisioning_failed`, with the bounded Git reason |
+| Missing harness or negotiated repository contract | Launch preflight refuses before allocating the executor thread, with the missing requirement |
+| Offline executor | Remote task reports `target_offline`, not a checkout or authentication failure |
+| Multiple eligible checkouts | Selection refuses as ambiguous and requires an explicit executor-local project |
+
+Authentication classification uses Git's explicit authentication, disabled
+prompt and HTTP authorization errors. An unclassified error remains
+`provisioning_failed`; it does not pretend to prove why a private repository
+is inaccessible. No credential helper, login or provider setting is changed.
+
+Failure codes persist in the authoritative index and placement record.
+Retry clears the failure code and reuses the recorded checkout target.
+The catalog now leaves `provisioning` when cloning fails; a successfully bound
+clone remains bound if only later placement planning fails.
+`credential_failures_are_distinct_and_retry_the_recorded_checkout` checks these
+ordinary authentication failures against a transport failure, snapshot
+round-trip and retry without starting a provider.

@@ -101,6 +101,37 @@ pub enum BindingPhase {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingFailure {
+    CredentialsUnavailable,
+    ProvisioningFailed,
+}
+
+impl BindingFailure {
+    pub(super) fn from_error(error: &str) -> Self {
+        let error = error.to_ascii_lowercase();
+        if [
+            "authentication failed",
+            "could not read username",
+            "could not read password",
+            "terminal prompts disabled",
+            "permission denied (publickey",
+            "http 401",
+            "http 403",
+            "requested url returned error: 401",
+            "requested url returned error: 403",
+        ]
+        .iter()
+        .any(|message| error.contains(message))
+        {
+            Self::CredentialsUnavailable
+        } else {
+            Self::ProvisioningFailed
+        }
+    }
+}
+
 /// The logical-repository binding a placement resolved or is still resolving.
 /// `spec` holds the caller's deferred placement selection while the executor
 /// provisions the checkout; it is cleared once planning runs.
@@ -125,6 +156,8 @@ pub struct PlacementBinding {
     /// directory, an ambiguous binding, or a failed clone.
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<BindingFailure>,
 }
 
 /// The durable reservation and resolved placement of one worker thread. It is
@@ -947,17 +980,37 @@ impl State {
     /// again instead of allocating a second checkout. A failed checkout
     /// binding retries its clone into the same recorded target first.
     pub(super) fn request_reprovision(&mut self, index: usize) {
+        let mut retry_binding = None;
         if let Some(placement) = self.threads[index].placement.as_mut() {
             if let Some(binding) = placement.binding.as_mut()
                 && binding.state == BindingPhase::Failed
             {
                 binding.state = BindingPhase::Pending;
                 binding.error = None;
+                binding.error_code = None;
+                retry_binding = Some((binding.repository.clone(), binding.checkout.clone()));
             }
             if placement.phase == PlacementPhase::Failed {
                 placement.phase = PlacementPhase::Pending;
                 placement.error = None;
             }
+        }
+        if let Some((repository, checkout)) = retry_binding
+            && self.repository_bindings.iter().any(|binding| {
+                binding.repository == repository
+                    && binding.machine == "local"
+                    && binding.path == checkout
+                    && binding.state == repositories::BindingState::Failed
+            })
+        {
+            self.record_binding(
+                &repository,
+                "local",
+                None,
+                &checkout,
+                repositories::BindingState::Provisioning,
+                Some("Retrying checkout provisioning on this executor.".into()),
+            );
         }
     }
 }

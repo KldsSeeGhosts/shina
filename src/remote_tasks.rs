@@ -4857,6 +4857,7 @@ impl State {
                             },
                             spec: None,
                             error: None,
+                            error_code: None,
                         }
                     }),
                 }
@@ -5704,6 +5705,7 @@ impl State {
                         state: placement::BindingPhase::Pending,
                         spec: spec.clone(),
                         error: None,
+                        error_code: None,
                     }),
                 }
             } else {
@@ -5745,6 +5747,7 @@ impl State {
                         state: placement::BindingPhase::Ready,
                         spec: None,
                         error: None,
+                        error_code: None,
                     });
                     resolved
                 } else {

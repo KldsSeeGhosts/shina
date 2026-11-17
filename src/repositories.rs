@@ -64,6 +64,8 @@ pub struct CheckoutBinding {
     /// unavailable credentials, a conflicting directory or a clone error.
     #[serde(default)]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<placement::BindingFailure>,
     pub updated_at: u64,
 }
 
@@ -979,6 +981,9 @@ impl State {
         reason: Option<String>,
     ) {
         let now = lifecycle::now();
+        let reason_code = (state == BindingState::Failed)
+            .then(|| reason.as_deref().map(placement::BindingFailure::from_error))
+            .flatten();
         if let Some(binding) = self
             .repository_bindings
             .iter_mut()
@@ -987,6 +992,7 @@ impl State {
             binding.project = project.or(binding.project);
             binding.state = state;
             binding.reason = reason;
+            binding.reason_code = reason_code;
             binding.updated_at = now;
         } else {
             self.repository_bindings.push(CheckoutBinding {
@@ -996,6 +1002,7 @@ impl State {
                 path: path.into(),
                 state,
                 reason,
+                reason_code,
                 updated_at: now,
             });
         }
@@ -1004,6 +1011,7 @@ impl State {
                 .sort_by_key(|b| std::cmp::Reverse(b.updated_at));
             self.repository_bindings.truncate(MAX_BINDINGS);
         }
+        self.persistence_scope = None;
     }
 
     /// Attach every warm local checkout identity to a matching repository.
@@ -1292,6 +1300,7 @@ impl State {
                     binding.clone_url.clear();
                     binding.spec = None;
                     binding.error = None;
+                    binding.error_code = None;
                     self.persistence_scope = None;
                     return;
                 }
@@ -1333,6 +1342,7 @@ impl State {
                             state: placement::BindingPhase::Ready,
                             spec: None,
                             error: None,
+                            error_code: None,
                         });
                         if resolved.read_only() {
                             self.threads[index].native.access = AccessMode::ReadOnly;
@@ -1362,13 +1372,33 @@ impl State {
     /// The thread keeps its binding and the failure reason; a delivery retry
     /// reprovisions the same recorded target.
     fn fail_checkout_binding(&mut self, index: usize, error: String) {
+        let mut failed_binding = None;
         if let Some(placement) = self.threads[index].placement.as_mut() {
             placement.phase = placement::PlacementPhase::Failed;
             placement.error = Some(error.clone());
             if let Some(binding) = placement.binding.as_mut() {
                 binding.state = placement::BindingPhase::Failed;
                 binding.error = Some(error.clone());
+                binding.error_code = Some(placement::BindingFailure::from_error(&error));
+                failed_binding = Some((binding.repository.clone(), binding.checkout.clone()));
             }
+        }
+        if let Some((repository, checkout)) = failed_binding
+            && self.repository_bindings.iter().any(|binding| {
+                binding.repository == repository
+                    && binding.machine == "local"
+                    && binding.path == checkout
+                    && binding.state != BindingState::Bound
+            })
+        {
+            self.record_binding(
+                &repository,
+                "local",
+                None,
+                &checkout,
+                BindingState::Failed,
+                Some(error.chars().take(MAX_REASON).collect()),
+            );
         }
         self.threads[index].fail_session(format!("Checkout provisioning failed: {error}"));
     }
@@ -1947,6 +1977,77 @@ mod tests {
                 "placement":placement
             }),
         )
+    }
+
+    #[test]
+    fn credential_failures_are_distinct_and_retry_the_recorded_checkout() {
+        for (error, code) in [
+            (
+                "Clone failed: fatal: Authentication failed",
+                "credentials_unavailable",
+            ),
+            (
+                "Clone failed: Permission denied (publickey).",
+                "credentials_unavailable",
+            ),
+            (
+                "Clone failed: could not read Username: terminal prompts disabled",
+                "credentials_unavailable",
+            ),
+            ("Clone failed: Connection refused", "provisioning_failed"),
+        ] {
+            let mut state = state();
+            let command = catalog_launch(Value::Null, json!({"mode":"shared"}));
+            let response = state.execute_peer_command("device-1", &command).unwrap();
+            let index = state
+                .threads
+                .iter()
+                .position(|thread| Some(thread.id as u64) == response["threadId"].as_u64())
+                .unwrap();
+            let thread = state.threads[index].id;
+            let checkout = state.threads[index]
+                .placement
+                .as_ref()
+                .unwrap()
+                .binding
+                .as_ref()
+                .unwrap()
+                .checkout
+                .clone();
+            state.apply_checkout_outcome(thread, Err(error.into()));
+            let placement = state.threads[index].placement.as_ref().unwrap().value();
+            assert_eq!(placement["binding"]["state"], "failed");
+            assert_eq!(placement["binding"]["errorCode"], code);
+            assert!(state.threads[index].pending_injections.is_empty());
+            let snapshot = json!({
+                "repositories": state.repositories,
+                "repositoryBindings": state.repository_bindings,
+            });
+            let (_, bindings, _) = catalog_from_index(&snapshot).unwrap();
+            assert_eq!(bindings[0].state, BindingState::Failed);
+            assert_eq!(
+                serde_json::to_value(&bindings[0]).unwrap()["reasonCode"],
+                code
+            );
+
+            state.request_reprovision(index);
+            let binding = state.threads[index]
+                .placement
+                .as_ref()
+                .unwrap()
+                .binding
+                .as_ref()
+                .unwrap();
+            assert_eq!(binding.checkout, checkout);
+            assert_eq!(binding.state, placement::BindingPhase::Pending);
+            assert_eq!(binding.error_code, None);
+            assert_eq!(
+                state.repository_bindings[0].state,
+                BindingState::Provisioning
+            );
+            assert_eq!(state.repository_bindings[0].reason_code, None);
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
     }
 
     #[test]
