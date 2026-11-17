@@ -13563,8 +13563,18 @@ impl State {
         {
             self.current_mut().request = None;
         }
+        if self.thread_admission_managed(self.active)
+            && let Err(error) = self.check_thread_admission(self.active)
+        {
+            self.current_mut().submission_error = Some(error);
+            return false;
+        }
         self.release_task_results(self.current().id);
         if let Some(sent) = self.try_worktree_bootstrap_send(fresh_context, fresh_arm) {
+            if sent && self.thread_admission_managed(self.active) {
+                let peer_worker = self.current().peer_origin.is_some();
+                self.ensure_thread_admission(self.active, peer_worker, false);
+            }
             return sent;
         }
         if compact_before_send && !self.current().status.busy() {
@@ -13623,6 +13633,10 @@ impl State {
                 return false;
             }
             self.current_mut().submission_error = None;
+            if self.thread_admission_managed(self.active) {
+                let peer_worker = self.current().peer_origin.is_some();
+                self.ensure_thread_admission(self.active, peer_worker, false);
+            }
             let thread = self.current_mut();
             thread.prompt_history.reset();
             thread.typing_guard.on_blur_or_send();
@@ -13649,6 +13663,10 @@ impl State {
             return true;
         }
         if self.current().status.busy() {
+            if self.thread_admission_managed(self.active) {
+                let peer_worker = self.current().peer_origin.is_some();
+                self.ensure_thread_admission(self.active, peer_worker, false);
+            }
             if !self.headless {
                 if let Ok(prompt) = crate::composer_tokens::prompt_for_target_with_reply(
                     &self.current().draft,
@@ -13728,6 +13746,13 @@ impl State {
             .iter()
             .map(|p| (p.server_id.clone(), p.label.clone()))
             .collect();
+        let managed = self.thread_admission_managed(self.active);
+        if managed {
+            // Reserve while the provider is still idle. begin_prompt drives
+            // an existing connection and marks Running before it returns.
+            let peer_worker = self.current().peer_origin.is_some();
+            self.ensure_thread_admission(self.active, peer_worker, false);
+        }
         self.current_mut().send_with_fresh(
             Some(&local_server_id),
             &peers,
@@ -13745,6 +13770,9 @@ impl State {
             fresh_context,
         );
         if self.current().has_draft_content() || self.current().status != Status::Running {
+            if managed {
+                self.admission_pump();
+            }
             return false;
         }
         let id = self.current().id;
@@ -13757,19 +13785,8 @@ impl State {
         if let Some(arm) = fresh_arm {
             self.disarm_fresh_session(id, Some(arm));
         }
-        if self.current().queued_prompt.is_some() {
-            // An ordinary send to a managed thread is a run like
-            // crew.send's: it reserves admission before any delivery, so
-            // direct input cannot ride an idle provider connection around
-            // the scheduler. Unmanaged interactive threads skip this path.
-            let index = self.active;
-            if self.threads[index].peer_origin.is_some()
-                || self.threads[index].crew_captain.is_some()
-            {
-                let peer_worker = self.threads[index].peer_origin.is_some();
-                self.ensure_thread_admission(index, peer_worker, false);
-                self.admission_pump();
-            }
+        if managed {
+            self.admission_pump();
         }
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);

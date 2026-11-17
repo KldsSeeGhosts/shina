@@ -99,11 +99,21 @@ releases, restarts the home, and explicitly retries after target capacity is
 available. The new command starts once, and a keyed replay does not start it
 again. This test uses fixture-owned profiles and the fake provider only.
 
-These corrections do not complete #23. The review's direct-input path for a
-finished delegated child and pending-bound checks on thread re-admission still
-need resolution. Exact-head aggregate CI, publication and the final acceptance
-audit remain gates. Published migrations 008/009 and production authentication
-and CPA configuration are unchanged.
+Direct input to a finished delegated child now reserves before `begin_prompt`
+can write to its idle provider connection. Its new reservation inherits the
+task's coordinator and Captain scopes. A delivered historical result does not
+occupy a new slot. Task-owned children do not backfill from old residual input.
+
+New direct sends, crew sends and peer follow-ups check the pending bound before
+clearing drafts, staging files or recording target intent. Existing reservations
+reuse their queue slot. Restored input accepted before a limit change remains
+preserved and accounted for, even when that puts the queue above its new bound.
+Task status queue positions now use the scheduler's global priority and fairness
+order rather than the old per-home task-list order.
+
+These corrections do not complete #23. Exact-head aggregate CI, publication and
+the final acceptance audit remain gates. Published migrations 008/009 and
+production authentication and CPA configuration are unchanged.
 
 At this checkpoint, the all-target build, formatting and diff checks pass.
 All 24 scheduler unit tests, 63 remote-task tests and 47 task tests pass, as

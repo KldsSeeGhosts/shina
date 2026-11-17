@@ -997,16 +997,15 @@ impl State {
     }
 
     pub(super) fn task_queue_position(&self, task: &Task) -> Option<usize> {
-        (task.state == TaskState::Queued).then(|| {
-            self.tasks
-                .iter()
-                .filter(|other| {
-                    self.task_home(other) == self.task_home(task)
-                        && other.state == TaskState::Queued
-                })
-                .position(|other| other.id == task.id)
-                .unwrap_or(0)
-                + 1
+        if task.state != TaskState::Queued {
+            return None;
+        }
+        self.scheduler.reservations.iter().find_map(|reservation| {
+            matches!(&reservation.subject,
+                super::admission::Subject::Task { task_id, attempt_id }
+                if task_id == &task.id && attempt_id == &task.attempt_id)
+            .then(|| self.scheduler.queue_position(&reservation.id))
+            .flatten()
         })
     }
 

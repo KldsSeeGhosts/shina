@@ -382,6 +382,7 @@ impl State {
             .checked_add(1)
             .ok_or("Queued input IDs are exhausted.")?;
         self.crew_database()?;
+        self.check_thread_admission(index)?;
         attachments::stage_prompt_files(&mut prompt)?;
         let thread = &mut self.threads[index];
         if placement_failed {
@@ -1035,6 +1036,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn independent_crew_readmission_checks_pending_capacity_before_staging_input() {
+        let (mut runtime, _) = fixture();
+        runtime.state.scheduler.limits.account_running = Some(1);
+        create(&mut runtime, "running");
+        create(&mut runtime, "waiting");
+        let id = create(&mut runtime, "will finish without work");
+        let index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|thread| thread.id == id)
+            .unwrap();
+        let thread = &mut runtime.state.threads[index];
+        thread.queued_prompt = None;
+        thread.pending_prompt = None;
+        thread.pending_injections.clear();
+        thread.native.queue.clear();
+        thread.status = Status::Completed;
+        runtime.state.admission_pump();
+        runtime.state.scheduler.limits.account_pending = Some(1);
+        let serial = runtime.state.threads[index].serial;
+        let before = runtime.state.scheduler.reservations.len();
+        let receipt = runtime
+            .command(
+                "maintainer",
+                Command::new(
+                    "captain.crew.send",
+                    json!({"captain":0,"threadId":id,"input":{"text":"must not stage"}}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(receipt["status"], "rejected", "{receipt}");
+        let error = receipt["result"]["error"].as_str().unwrap();
+        assert!(error.contains("queue is full"), "{error}");
+        assert_eq!(runtime.state.threads[index].serial, serial);
+        assert!(runtime.state.threads[index].native.queue.is_empty());
+        assert_eq!(runtime.state.scheduler.reservations.len(), before);
     }
 
     #[test]

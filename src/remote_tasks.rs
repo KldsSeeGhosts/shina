@@ -1964,6 +1964,34 @@ mod tests {
     }
 
     #[test]
+    fn peer_readmission_rejects_a_full_queue_before_recording_target_input() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        // Keep a different queued subject, but no active task covering this
+        // executor-owned thread. Its next input needs a fresh reservation.
+        state.tasks.clear();
+        state.threads[1].admission = None;
+        state.threads[1].status = Status::Completed;
+        state.scheduler.limits.account_pending = Some(1);
+        state.scheduler.reservations[0].state = super::super::admission::ReservationState::Queued;
+        let before = state.peer_task_intents.len();
+        let origin = state.threads[1].peer_origin.clone();
+        let error = state.execute_peer_command(
+            "fixture-peer",
+            &Command::new("peer.thread.send",
+                json!({"threadId":child,"message":"must not stage","delivery":"attempt","attemptId":"new-attempt"})),
+        ).unwrap_err();
+        assert!(error.contains("queue is full"), "{error}");
+        assert_eq!(state.peer_task_intents.len(), before);
+        assert_eq!(
+            state.threads[1].peer_origin.as_ref().unwrap().attempt_id,
+            origin.as_ref().unwrap().attempt_id
+        );
+        assert!(state.threads[1].pending_injections.is_empty());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn fenced_sends_reject_stale_attempts_and_unsupported_delivery() {
         let mut state = fixture();
         let child = peer_worker(&mut state);
@@ -6093,6 +6121,7 @@ impl State {
                     .then(|| thread.run_id.clone())
                     .flatten();
                 let marked_message = tasks::delivery_text(&command.command_id.to_string(), message);
+                self.check_thread_admission(index)?;
                 self.stage_peer_task_intent(PeerTaskIntent::input(
                     command.command_id.to_string(),
                     thread.id,

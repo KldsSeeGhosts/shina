@@ -282,7 +282,8 @@ pub struct Reservation {
     pub release_reason: Option<String>,
     /// Why a queued reservation has not started: offline, recovering,
     /// placement, placement_failed, provider_update, owner_inactive,
-    /// worker_busy, backoff, provider_backoff, or a scope name.
+    /// worker_busy, backoff, provider_backoff, subject_gone, superseded,
+    /// start_refused, or a scope name.
     #[serde(default)]
     pub blocked_by: Option<String>,
     #[serde(default)]
@@ -833,6 +834,52 @@ impl State {
             .any(|task| task.child_thread_id == thread_id && !task.state.finished())
     }
 
+    pub(super) fn thread_admission_managed(&self, index: usize) -> bool {
+        let thread = &self.threads[index];
+        thread.delegated || thread.peer_origin.is_some() || thread.crew_captain.is_some()
+    }
+
+    /// Check new input before staging files, clearing a draft, or recording
+    /// target intent. Existing reservations can accept more input without
+    /// another queue slot. Backfill preserves input accepted before a limit
+    /// changed and deliberately does not use this pre-acceptance check.
+    pub(super) fn check_thread_admission(&self, index: usize) -> Result<(), String> {
+        let thread = &self.threads[index];
+        if self.thread_has_task(thread.id)
+            || thread.admission.as_ref().is_some_and(|id| {
+                self.scheduler.reservations.iter().any(|reservation| {
+                    reservation.id == *id && reservation.state != ReservationState::Released
+                })
+            })
+        {
+            return Ok(());
+        }
+        self.scheduler.check_pending()
+    }
+
+    fn thread_admission_scopes(
+        &self,
+        index: usize,
+        peer_worker: bool,
+    ) -> (Option<usize>, Option<usize>) {
+        if peer_worker {
+            return (None, None);
+        }
+        let thread = &self.threads[index];
+        if let Some(task) = self
+            .tasks
+            .iter()
+            .find(|task| task.child_thread_id == thread.id)
+        {
+            return (task.coordinator_captain, self.task_home(task));
+        }
+        let captain = thread.crew_captain;
+        (
+            captain,
+            captain.and_then(|captain| self.captain_home(captain)),
+        )
+    }
+
     pub(super) fn ensure_thread_admission(
         &mut self,
         index: usize,
@@ -863,12 +910,7 @@ impl State {
                 // released but the new one not yet issued.
                 self.threads[index].admission_run += 1;
                 let run = self.threads[index].admission_run;
-                let captain = if peer_worker {
-                    None
-                } else {
-                    self.threads[index].crew_captain
-                };
-                let coordinator = captain.and_then(|captain| self.captain_home(captain));
+                let (captain, coordinator) = self.thread_admission_scopes(index, peer_worker);
                 let fair = if let Some(origin) = self.threads[index].peer_origin.as_ref() {
                     format!("origin:{}", origin.server_id)
                 } else if let Some(home) = coordinator {
@@ -897,12 +939,7 @@ impl State {
         self.threads[index].admission_run += 1;
         let run = self.threads[index].admission_run;
         let thread = &self.threads[index];
-        let captain = if peer_worker {
-            None
-        } else {
-            thread.crew_captain
-        };
-        let coordinator = captain.and_then(|captain| self.captain_home(captain));
+        let (captain, coordinator) = self.thread_admission_scopes(index, peer_worker);
         let fair = if let Some(origin) = thread.peer_origin.as_ref() {
             format!("origin:{}", origin.server_id)
         } else if let Some(home) = coordinator {
@@ -956,7 +993,7 @@ impl State {
         let thread = &self.threads[index];
         thread.status.busy()
             || thread.queued()
-            || thread.task_result.is_some()
+            || thread.task_result.is_some() && !thread.completion_notified
             || thread
                 .peer_origin
                 .as_ref()
@@ -973,8 +1010,7 @@ impl State {
     /// set it, so their sends behave exactly as before.
     fn sync_admission_flag(&mut self, index: usize) {
         let thread_id = self.threads[index].id;
-        let managed =
-            self.threads[index].peer_origin.is_some() || self.threads[index].crew_captain.is_some();
+        let managed = self.thread_admission_managed(index);
         let blocked = match self.reservation_covering_thread(thread_id) {
             Some(reservation) => reservation.state == ReservationState::Queued,
             None => managed,
@@ -1619,12 +1655,10 @@ impl State {
             // its id on `admission`, and re-admitting it here would mint a
             // phantom subject for work that is merely winding down. Its next
             // run enters through an explicit send, not the pump.
-            // A delegated child is covered by its task reservation even
-            // after that task finishes; admitting it again as crew would
-            // double-count it. Any other managed thread with a released
-            // line re-admits when fresh input arrives.
-            let managed = (self.threads[index].peer_origin.is_some()
-                || self.threads[index].crew_captain.is_some())
+            // Task-owned children can retain old input while a remote result
+            // settles. Their direct continuations reserve in the send path,
+            // never by interpreting that old input as new backfill work.
+            let managed = self.thread_admission_managed(index)
                 && !self
                     .tasks
                     .iter()
@@ -2169,6 +2203,135 @@ mod tests {
             .expect("reservation")
     }
 
+    fn finished_child(state: &mut State) -> usize {
+        state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"initial task"}))
+            .unwrap();
+        let child = state
+            .threads
+            .iter()
+            .position(|thread| thread.id == state.tasks[0].child_thread_id)
+            .unwrap();
+        state.tasks[0].finish(TaskState::Completed, "done", "");
+        state.tasks[0].delivered = true;
+        state.threads[child].pending_injections.clear();
+        state.threads[child].status = Status::Completed;
+        state.threads[child].task_result = Some("done");
+        state.threads[child].completion_notified = true;
+        state.admission_pump();
+        child
+    }
+
+    #[test]
+    fn direct_input_to_a_finished_child_waits_for_admission_on_an_idle_connection() {
+        let mut state = demo();
+        let child = finished_child(&mut state);
+        state.scheduler.limits.account_running = Some(1);
+        let busy = worker(&mut state, "occupies capacity");
+        state.admission_pump();
+        let (pi, commands, _events) = Pi::test_connection();
+        state.threads[child].pi = Some(pi);
+        state.threads[child].selected_model = Some(("cpa".into(), "fixture".into()));
+        state.threads[child].startup_selection_verified = true;
+        state.threads[child].initializing = false;
+        state.threads[child].model_provider = "cpa".into();
+        state.threads[child]
+            .draft
+            .replace_text("direct continuation");
+        state.active = child;
+        state.demo = false;
+        assert!(state.dispatch_send_with_options(Some(false), Some(false)));
+        let reservation = reservation_for(&state, state.threads[child].id);
+        assert_eq!(reservation.state, ReservationState::Queued);
+        assert_eq!(reservation.coordinator, Some(state.effective_home(1)));
+        assert!(state.threads[child].admission_blocked);
+        assert!(
+            commands
+                .try_iter()
+                .all(|command| command["type"] != "prompt")
+        );
+        state.threads[busy].pending_injections.clear();
+        state.admission_pump();
+        state.threads[child].drive_session();
+        assert_eq!(
+            commands
+                .try_iter()
+                .filter(|command| command["type"] == "prompt")
+                .count(),
+            1
+        );
+        state.threads[child].queued_prompt = None;
+        state.threads[child].pending_prompt = None;
+        state.threads[child].status = Status::Completed;
+        state.threads[child].task_result = Some("done");
+        state.threads[child].completion_notified = true;
+        state.admission_pump();
+        assert_eq!(
+            reservation_for(&state, state.threads[child].id).state,
+            ReservationState::Released
+        );
+    }
+
+    #[test]
+    fn a_full_pending_queue_keeps_direct_child_input_in_the_draft() {
+        let mut state = demo();
+        let child = finished_child(&mut state);
+        state.scheduler.limits.account_running = Some(1);
+        state.scheduler.limits.account_pending = Some(1);
+        worker(&mut state, "running");
+        state.admission_pump();
+        worker(&mut state, "queued");
+        state.admission_pump();
+        state.threads[child].draft.replace_text("keep this draft");
+        state.active = child;
+        state.demo = false;
+        let before = state.scheduler.reservations.len();
+        assert!(!state.dispatch_send_with_options(Some(false), Some(false)));
+        assert_eq!(state.current().draft.text, "keep this draft");
+        assert!(state.current().queued_prompt.is_none());
+        assert_eq!(state.scheduler.reservations.len(), before);
+        assert!(
+            state
+                .current()
+                .submission_error
+                .as_deref()
+                .unwrap()
+                .contains("queue is full")
+        );
+    }
+
+    #[test]
+    fn pending_backpressure_preserves_accepted_input_and_reuses_its_reservation() {
+        let mut state = demo();
+        state.scheduler.limits.account_running = Some(1);
+        worker(&mut state, "running");
+        state.admission_pump();
+        let waiting = worker(&mut state, "already accepted");
+        state.admission_pump();
+        state.scheduler.limits.account_pending = Some(1);
+        assert!(state.check_thread_admission(waiting).is_ok());
+        let id = state.threads[waiting].admission.clone();
+        state.ensure_thread_admission(waiting, false, false);
+        assert_eq!(state.threads[waiting].admission, id);
+        let new = state.next_id;
+        state.next_id += 1;
+        let mut restored = Thread::new(new);
+        restored.delegated = true;
+        restored.pending_injections.push_back(Injection {
+            text: "accepted before restoring a lower limit".into(),
+            shown: false,
+            steer: None,
+            peer_input: None,
+        });
+        state.threads.push(restored);
+        let restored = state.threads.len() - 1;
+        assert!(state.check_thread_admission(restored).is_err());
+        // Backfill must account for existing work, even above the new bound.
+        state.admission_pump();
+        assert_eq!(reservation_for(&state, new).state, ReservationState::Queued);
+        assert_eq!(state.threads[restored].pending_injections.len(), 1);
+    }
+
     #[test]
     fn independent_roots_share_the_account_limit() {
         let mut state = demo();
@@ -2462,6 +2625,26 @@ mod tests {
             .mcp_call(1, "delegate_task", &json!({"prompt":"One too many"}))
             .unwrap_err();
         assert!(error.contains("admission queue is full"), "{error}");
+    }
+
+    #[test]
+    fn task_queue_positions_use_scheduler_priority_and_global_order() {
+        let mut state = demo();
+        state.scheduler.limits.account_running = Some(1);
+        worker(&mut state, "running");
+        state.admission_pump();
+        for prompt in ["first queued task", "higher priority task"] {
+            state
+                .mcp_call(1, "delegate_task", &json!({"prompt":prompt}))
+                .unwrap();
+        }
+        let task = &state.tasks[1];
+        let reservation = state.scheduler.reservations.iter_mut().find(|reservation| {
+            matches!(&reservation.subject, Subject::Task { task_id, .. } if task_id == &task.id)
+        }).unwrap();
+        reservation.priority = 10;
+        assert_eq!(state.task_queue_position(&state.tasks[1]), Some(1));
+        assert_eq!(state.task_queue_position(&state.tasks[0]), Some(2));
     }
 
     #[test]
