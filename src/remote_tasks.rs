@@ -339,6 +339,13 @@ pub(crate) struct PeerTaskIntent {
 }
 
 impl PeerTaskIntent {
+    fn holds_prompt_recovery(&self) -> bool {
+        self.kind == "input"
+            && self.requested_delivery != "answer"
+            && self.queue_state != "settled"
+            && matches!(self.recovery.as_str(), "awaiting_history" | "held_unknown")
+    }
+
     fn input(
         command_id: String,
         thread_id: usize,
@@ -3592,7 +3599,7 @@ mod tests {
         intent.recovery = "awaiting_history".into();
         state.stage_peer_task_intent(intent).unwrap();
         state.threads[1].pending_injections.push_back(Injection {
-            text: message,
+            text: message.clone(),
             shown: false,
             steer: None,
             peer_input: Some(command),
@@ -3612,6 +3619,43 @@ mod tests {
         assert_eq!(intent.recovery, "held_unknown");
         assert!(state.threads[1].peer_recovery_held);
         assert!(state.threads[1].pi.is_none());
+
+        // A new request must not clear the hold and flush the older input.
+        let send = Command::new(
+            "peer.thread.send",
+            json!({"threadId":child,"message":"next attempt","delivery":"attempt",
+                "attemptId":"attempt-b"}),
+        );
+        let previous_attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone();
+        let error = state
+            .execute_peer_command("fixture-peer", &send)
+            .unwrap_err();
+        assert!(error.contains("Recovery is held"), "{error}");
+        assert!(state.threads[1].peer_recovery_held);
+        assert_eq!(state.peer_task_intents.len(), 1);
+        assert_eq!(
+            state.threads[1].pending_injections[0].peer_input,
+            Some(command)
+        );
+        assert_eq!(
+            state.threads[1].peer_origin.as_ref().unwrap().attempt_id,
+            previous_attempt
+        );
+
+        // Partial history cannot establish absence, but an exact positive
+        // marker settles this input and removes it from the restored queue.
+        state.threads[1].apply(json!({"type":"response","id":"history",
+            "command":"get_messages","success":true,
+            "data":{"messages":[{"role":"user","content":message}]}}));
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.peer_task_intents[0].provider_state, "accepted");
+        assert!(!state.threads[1].peer_recovery_held);
+        assert!(state.threads[1].pending_injections.is_empty());
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 }
@@ -5480,6 +5524,7 @@ impl State {
             else {
                 continue;
             };
+            let was_held = intent.holds_prompt_recovery();
             let thread = &self.threads[thread_index];
             let marker_present = intent.message.as_deref().is_some_and(|message| {
                 thread
@@ -5612,7 +5657,6 @@ impl State {
                     // used by this target. Absence there proves the marker was
                     // never accepted and makes one safe retry possible.
                     intent.recovery = "history_absent".into();
-                    self.threads[thread_index].peer_recovery_held = false;
                     self.provision_peer_task_intent(&intent);
                 } else {
                     // Other harnesses may replay without history or omit
@@ -5629,6 +5673,17 @@ impl State {
             if self.peer_task_intents[index] != intent {
                 intent.updated_at = lifecycle::now();
                 if self.stage_peer_task_intent(intent.clone()).is_ok() {
+                    if was_held && intent.provider_state == "accepted" {
+                        // This is the recovered queue entry, not a new input.
+                        // Remove it before the history hold can be released.
+                        self.threads[thread_index]
+                            .pending_injections
+                            .retain(|input| {
+                                input
+                                    .peer_input
+                                    .is_none_or(|id| id.to_string() != intent.command_id)
+                            });
+                    }
                     self.sync_peer_intent_evidence(index);
                     changed = true;
                 }
@@ -5642,6 +5697,17 @@ impl State {
             {
                 self.connect_thread(thread_index);
                 changed = true;
+            }
+        }
+        if changed && self.threads.iter().any(|thread| thread.peer_recovery_held) {
+            let held: HashSet<_> = self
+                .peer_task_intents
+                .iter()
+                .filter(|intent| intent.holds_prompt_recovery())
+                .map(|intent| intent.thread_id)
+                .collect();
+            for thread in &mut self.threads {
+                thread.peer_recovery_held &= held.contains(&thread.id);
             }
         }
         changed
@@ -6083,6 +6149,9 @@ impl State {
                     .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
                     .transpose()?;
                 let thread = &self.threads[index];
+                if thread.peer_recovery_held {
+                    return Err("An earlier input may have reached the provider. Recovery is held; no new input was queued.".into());
+                }
                 if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
                     return Err("This attempt cannot accept steering.".into());
                 }
@@ -6141,7 +6210,6 @@ impl State {
                 ))?;
                 let thread = &mut self.threads[index];
                 let thread_id = thread.id;
-                thread.peer_recovery_held = false;
                 if let Some(reads) = document_reads {
                     thread.peer_origin.as_mut().expect("origin").document_reads = reads;
                 }
