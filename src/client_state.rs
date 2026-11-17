@@ -722,6 +722,10 @@ impl ThreadView {
         view: Option<&crate::client_history::ThreadProjection>,
         stats: &mut ApplyStats,
     ) -> Result<(), String> {
+        thread
+            .timeline_cache
+            .get_mut()
+            .prepare_projection(view.map(|view| view.structure));
         if view.is_some_and(|view| !view.history_loaded) {
             thread.transcript_disclosures.capture(
                 &thread.messages,
@@ -791,9 +795,13 @@ impl ThreadView {
                 view,
                 stats,
                 std::mem::take(&mut thread.messages),
-                |_, raw| {
+                |index, raw| {
                     let view: MessageView =
                         serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+                    thread
+                        .timeline_cache
+                        .borrow_mut()
+                        .touch_item("messages", index);
                     message_from_view(view)
                 },
                 |_| None,
@@ -806,8 +814,12 @@ impl ThreadView {
                 .collect::<Result<_, String>>()?
         };
         let tool_started_at = std::mem::take(&mut self.tool_started_at);
-        let deser_tool = |_: usize, raw: &Value| -> Result<Tool, String> {
+        let deser_tool = |index: usize, raw: &Value| -> Result<Tool, String> {
             let mut tool: Tool = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            thread
+                .timeline_cache
+                .borrow_mut()
+                .touch_item("tools", index);
             if !tool.done {
                 tool.started = tool_started_at
                     .get(&tool.id)
@@ -874,6 +886,10 @@ impl ThreadView {
         let deser_thought = |index: usize, raw: &Value| -> Result<Thought, String> {
             let mut thought: Thought =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            thread
+                .timeline_cache
+                .borrow_mut()
+                .touch_item("thoughts", index);
             if !thought.done {
                 thought.started = thought_clocks
                     .get(&thought_clock_key(&thought))
@@ -959,7 +975,8 @@ impl ThreadView {
                 view,
                 stats,
                 std::mem::take(&mut thread.work),
-                |_, raw| {
+                |index, raw| {
+                    thread.timeline_cache.borrow_mut().touch_item("work", index);
                     serde_json::from_value::<AssistantWork>(raw.clone()).map_err(|e| e.to_string())
                 },
                 |item| {
@@ -1261,7 +1278,13 @@ impl ThreadView {
                 view,
                 stats,
                 std::mem::take(&mut thread.native.compactions),
-                |_, raw| Ok(raw.clone()),
+                |index, raw| {
+                    thread
+                        .timeline_cache
+                        .borrow_mut()
+                        .touch_item("compactions", index);
+                    Ok(raw.clone())
+                },
                 |_| None::<usize>,
                 |_, _| {},
             )?

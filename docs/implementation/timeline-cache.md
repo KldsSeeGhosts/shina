@@ -22,8 +22,27 @@ Structural invalidation also includes tool-name and stopped-work changes.
 History prepends, retry/compaction changes, role/anchor/order changes and
 snapshot replacement rebuild the indexes. Existing row keys remain unchanged.
 
-Remaining acceptance work is visible-turn memoization with complete
-presentation/disclosure invalidation, stable handler verification and the
-scroll/stream/prepend benchmark with view, mount and key-call counters. Existing
-search, selection, sticky-bottom and anchor tests must still pass. This first
-change alone does not complete #25 and makes no native frame-rate claim.
+Completed visible turns now use Rune memos. Projection item deserialization
+notifies only the owning turn, so it stays correct across coalesced emissions
+without rescanning other turns. Work, tool/group/raw and thought disclosure
+handlers update that turn's presentation revision. Width, theme, role,
+archival, Captain header, search/citation and compaction disclosure also join
+the memo version. Live turns and externally changing task/plan/HTML cards
+remain dynamic. Work records use the same indexed lookup.
+
+The raw tool handler now resolves its stable tool id, not its captured vector
+index. Missing message identities no longer make thought/work handlers act on
+an unrelated positional replacement.
+
+The four-width cached-turn regression passes. Background streaming rebuilds
+zero completed turns, keys or indexes; disclosure, theme and width changes
+invalidate the cached presentation. The existing combined reconnect/cache-reset
+regression and independent tool/group-output test also pass.
+
+`timeline_view_benchmark` is an opt-in headless CPU benchmark with separate
+scroll, stream-while-scroll and prepend phases and view/key/row/turn/index
+counters. It does not measure server receive, GPU timing or FPS.
+
+Remaining acceptance work includes running and recording that benchmark,
+checking stable selection identities during prepends and the normal CI/release
+gates. This branch does not yet complete #25.

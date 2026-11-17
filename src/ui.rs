@@ -11,6 +11,35 @@ use rune::{
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 use std::time::Duration;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct TimelineCounts {
+    views: u64,
+    keys: u64,
+    row_builders: u64,
+    built_turns: u64,
+    index_builds: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TIMELINE_COUNTS: std::cell::Cell<TimelineCounts> = Default::default();
+}
+
+#[cfg(test)]
+fn timeline_count(f: impl FnOnce(&mut TimelineCounts)) {
+    TIMELINE_COUNTS.with(|cell| {
+        let mut counts = cell.get();
+        f(&mut counts);
+        cell.set(counts);
+    });
+}
+
+#[cfg(test)]
+fn take_timeline_counts() -> TimelineCounts {
+    TIMELINE_COUNTS.with(|cell| cell.replace(TimelineCounts::default()))
+}
 #[path = "attachment_archive_preview.rs"]
 mod attachment_archive_preview;
 #[path = "attachment_notebook_preview.rs"]
@@ -792,6 +821,8 @@ fn timer_label(seconds: u64) -> String {
 const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    #[cfg(test)]
+    timeline_count(|counts| counts.views += 1);
     let unloaded = s
         .current()
         .transcript_projection
@@ -9838,13 +9869,11 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         )
         .on_press_tx(move |s: &mut State, tx| {
             tx.keep_on_screen(press_key.clone());
-            if let Some(tool) = s
-                .current_mut()
-                .tools
-                .iter_mut()
-                .find(|tool| tool.id == tool_id)
-            {
+            let thread = s.current_mut();
+            if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == tool_id) {
                 tool.expanded = !tool.expanded;
+                let message = tool.anchor.message;
+                thread.timeline_cache.get_mut().touch_message(message);
             }
         }),
     );
@@ -9885,13 +9914,11 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
             )
             .on_press_tx(move |s: &mut State, tx| {
                 tx.keep_on_screen(press_key.clone());
-                if let Some(tool) = s
-                    .current_mut()
-                    .tools
-                    .iter_mut()
-                    .find(|tool| tool.id == first_id)
-                {
+                let thread = s.current_mut();
+                if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == first_id) {
                     tool.group_expanded = !tool.group_expanded;
+                    let message = tool.anchor.message;
+                    thread.timeline_cache.get_mut().touch_message(message);
                 }
             }),
         );
@@ -10010,6 +10037,58 @@ const WORK_INDENT: f32 = 14.0;
 
 fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
     let t = s.current();
+    let structure = timeline_structure(t);
+    if t.transcript_structure == 0
+        || end == t.messages.len() && t.status.busy()
+        || structure.external_turns.contains(&start)
+    {
+        return build_assistant_turn(s, p, wide, start, end);
+    }
+    let revision = t.timeline_cache.borrow().turn_revision(start);
+    let captain = t
+        .captain
+        .and_then(|id| s.captains.get(id))
+        .map(|c| (&c.name, c.portrait));
+    let find = s.thread_find_active().then(|| {
+        (
+            s.thread_find.query.text.as_str(),
+            s.thread_find
+                .active_match
+                .as_ref()
+                .map(|m| (&m.entry_id, m.occurrence)),
+        )
+    });
+    let cite = s
+        .citation_highlight
+        .as_ref()
+        .map(|h| (&h.machine, h.thread_id, &h.message_id, &h.text));
+    memo(
+        format!("assistant-turn-{}-{start}", t.id),
+        (
+            (structure.version, revision, start, end),
+            (
+                s.dark,
+                wide,
+                rune::memo::layout_size("chat-lane").map(|size| size[0].to_bits()),
+                s.viewport_width.to_bits(),
+                s.demo,
+            ),
+            (
+                captain,
+                t.captain_home,
+                t.archived(),
+                t.native.compaction_expanded,
+            ),
+            (t.harness.as_str(), s.working_directory(), find, cite),
+        ),
+        || build_assistant_turn(s, p, wide, start, end),
+    )
+}
+
+fn build_assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
+    #[cfg(test)]
+    timeline_count(|counts| counts.built_turns += 1);
+    let t = s.current();
     let parts = turn_parts(t, start, end);
     // A captain's delegations are its answer, not its working: their task cards stay in view
     // when the rest of the turn folds into "Worked for".
@@ -10039,7 +10118,11 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             })
     });
     let live = end == t.messages.len() && t.status.busy();
-    let work = t.work.iter().find(|work| work.start == start);
+    let structure = timeline_structure(t);
+    let work = structure
+        .work_index
+        .get(&start)
+        .and_then(|index| t.work.get(*index));
     let mut response = col()
         .key(format!("assistant-turn-{}-{start}", t.id))
         .gap(12.0);
@@ -10195,10 +10278,16 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 .on_press_tx(move |s: &mut State, tx| {
                     tx.keep_on_screen(press_key.clone());
                     let t = s.current_mut();
-                    let current_start = turn_msg_id
-                        .as_deref()
-                        .and_then(|id| t.messages.iter().position(|m| m.id == id))
-                        .unwrap_or(start);
+                    let current_start = match turn_msg_id.as_deref() {
+                        Some(id) => {
+                            let Some(index) = t.messages.iter().position(|m| m.id == id) else {
+                                return;
+                            };
+                            index
+                        }
+                        None => start,
+                    };
+                    t.timeline_cache.get_mut().touch_message(current_start);
                     let retry = t
                         .work
                         .iter()
@@ -10385,6 +10474,34 @@ type BoundaryEvent = (u64, u8, usize);
 pub(crate) struct TimelineCache {
     input: Option<(u64, bool, bool, bool, Vec<(String, usize)>)>,
     structure: std::sync::Arc<TimelineStructure>,
+    content: std::collections::HashMap<usize, u64>,
+}
+
+impl TimelineCache {
+    pub(crate) fn prepare_projection(&mut self, structure: Option<u64>) {
+        if self.input.as_ref().map(|input| input.0) != structure {
+            *self = Self::default();
+        }
+    }
+
+    pub(crate) fn touch_item(&mut self, field: &'static str, index: usize) {
+        if let Some(turn) = self
+            .structure
+            .item_turns
+            .get(field)
+            .and_then(|turns| turns.get(index))
+        {
+            *self.content.entry(*turn).or_default() += 1;
+        }
+    }
+
+    pub(crate) fn touch_message(&mut self, message: usize) {
+        self.touch_item("messages", message);
+    }
+
+    fn turn_revision(&self, start: usize) -> u64 {
+        self.content.get(&start).copied().unwrap_or(0)
+    }
 }
 
 #[derive(Default)]
@@ -10392,6 +10509,9 @@ struct TimelineStructure {
     rows: std::sync::Arc<Vec<TimelineRow>>,
     events: Vec<TimelineEvent>,
     boundaries: std::collections::HashMap<usize, Vec<BoundaryEvent>>,
+    item_turns: std::collections::HashMap<&'static str, Vec<usize>>,
+    work_index: std::collections::HashMap<usize, usize>,
+    external_turns: std::collections::HashSet<usize>,
     version: u64,
 }
 
@@ -10412,8 +10532,61 @@ fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
     if t.transcript_structure != 0 && cache.input.as_ref() == Some(&input) {
         return cache.structure.clone();
     }
+    #[cfg(test)]
+    timeline_count(|counts| counts.index_builds += 1);
     let mut structure = TimelineStructure::default();
+    let mut turn = 0;
+    let mut message_turns = Vec::with_capacity(t.messages.len() + 1);
+    for (index, message) in t.messages.iter().enumerate() {
+        if message.role != "Pi" || index == 0 || t.messages[index - 1].role != "Pi" {
+            turn = index;
+        }
+        message_turns.push(turn);
+    }
+    message_turns.push(t.messages.len());
+    let owner = |message: usize| message_turns.get(message).copied().unwrap_or(message);
+    for (field, turns) in [
+        (
+            "tools",
+            t.tools
+                .iter()
+                .map(|tool| owner(tool.anchor.message))
+                .collect(),
+        ),
+        (
+            "thoughts",
+            t.thoughts
+                .iter()
+                .map(|thought| owner(thought.anchor.message))
+                .collect(),
+        ),
+        (
+            "work",
+            t.work.iter().map(|work| owner(work.start)).collect(),
+        ),
+        (
+            "compactions",
+            t.native
+                .compactions
+                .iter()
+                .map(|item| owner(crate::work::compaction_anchor(t, item).message))
+                .collect(),
+        ),
+    ] {
+        structure.item_turns.insert(field, turns);
+    }
     for (index, tool) in t.tools.iter().enumerate() {
+        if crew_ui::is_delegation(tool)
+            || !tool.subagents.is_empty()
+            || matches!(
+                tool.resolved_kind(),
+                crate::work::ToolKind::Plan
+                    | crate::work::ToolKind::Html
+                    | crate::work::ToolKind::Subagent
+            )
+        {
+            structure.external_turns.insert(owner(tool.anchor.message));
+        }
         if tool.name.rsplit("__").next() != Some("html_preview") {
             structure.events.push((
                 tool.anchor,
@@ -10462,7 +10635,8 @@ fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
                 .push((order, 1, index));
         }
     }
-    for work in &t.work {
+    for (index, work) in t.work.iter().enumerate() {
+        structure.work_index.entry(work.start).or_insert(index);
         if work.stopped && (work.start < t.messages.len() || !t.status.busy()) {
             let order = if work.stopped_order == 0 {
                 u64::MAX
@@ -10481,9 +10655,11 @@ fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
         events.sort_by_key(|event| event.0);
     }
     structure.rows = std::sync::Arc::new(derive_timeline_rows(t, &structure.boundaries));
+    structure.item_turns.insert("messages", message_turns);
     static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     structure.version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cache.input = Some(input);
+    cache.content.clear();
     cache.structure = std::sync::Arc::new(structure);
     cache.structure.clone()
 }
@@ -11160,8 +11336,14 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .virtual_rows(
             rows.len(),
             90.0,
-            move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
+            move |_: &State, index| {
+                #[cfg(test)]
+                timeline_count(|counts| counts.keys += 1);
+                std::borrow::Cow::Owned(key_rows[index].key().to_owned())
+            },
             move |s: &State, index| {
+                #[cfg(test)]
+                timeline_count(|counts| counts.row_builders += 1);
                 let row = match &build_rows[index] {
                     TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
                     TimelineRow::WorktreeSetup { .. } => {
@@ -23983,6 +24165,227 @@ pub(crate) mod tests {
         assert!(boundary.boundaries.contains_key(&start));
         assert!(boundary.events.iter().any(|event| event.2 == 2));
         assert_ne!(boundary.version, prepended.version);
+    }
+
+    fn cached_timeline_runtime(width: f32, turns: usize) -> Runtime<State> {
+        let mut rt = runtime(width);
+        rt.state.populate_demo();
+        rt.state.compact_sidebar = true;
+        let t = rt.state.current_mut();
+        let template = t.tools[0].clone();
+        t.captain = None;
+        t.messages.clear();
+        t.tools.clear();
+        t.thoughts.clear();
+        t.work.clear();
+        t.native.compactions.clear();
+        t.harness_state["workRetries"] = json!([]);
+        t.status = Status::Running;
+        t.started = None;
+        t.transcript_structure = 1;
+        for index in 0..turns {
+            t.messages.push(crate::model::Message {
+                id: format!("cache-user-{index}"),
+                role: "You",
+                text: format!("Question {index}."),
+                images: vec![],
+                context: None,
+            });
+            let start = t.messages.len();
+            t.messages.push(crate::model::Message {
+                id: format!("cache-answer-{index}"),
+                role: "Pi",
+                text: format!("Answer {index}. {}", "Readable history. ".repeat(8)),
+                images: vec![],
+                context: None,
+            });
+            let mut tool = template.clone();
+            tool.id = format!("cache-tool-{index}");
+            tool.anchor.message = start;
+            tool.anchor.offset = 0;
+            t.tools.push(tool);
+            t.work.push(crate::model::AssistantWork {
+                start,
+                stopped: false,
+                stopped_order: 0,
+                expanded: false,
+                elapsed: Some(1),
+                outcome: Some(Status::Completed),
+            });
+        }
+        rt.frame(0.0);
+        rt.update(|_, tx| {
+            tx.scroll_center_in_instant(
+                "conversation-1",
+                format!("turn-1-cache-answer-{}", turns / 2),
+            );
+        });
+        for _ in 0..60 {
+            if !rt.frame(1.0 / 60.0) {
+                break;
+            }
+        }
+        rt
+    }
+
+    #[test]
+    fn cached_completed_turns_survive_background_streaming_and_disclosure_changes() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = cached_timeline_runtime(width, 100);
+            take_timeline_counts();
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                let last = t.messages.len() - 1;
+                t.messages[last].text.push_str(" A streamed fragment.");
+                t.timeline_cache.get_mut().touch_message(last);
+                t.transcript_content += 1;
+            });
+            rt.frame(1.0 / 60.0);
+            let streamed = take_timeline_counts();
+            assert!(streamed.views > 0);
+            assert_eq!(streamed.index_builds, 0, "{width}: {streamed:?}");
+            assert_eq!(streamed.keys, 0, "{width}: {streamed:?}");
+            assert_eq!(streamed.built_turns, 0, "{width}: {streamed:?}");
+
+            press(&mut rt, "toggle-work-1-101");
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.current().work[50].expanded);
+            let disclosed = take_timeline_counts();
+            assert!(
+                disclosed.built_turns > 0,
+                "{width}: disclosure was memoized away"
+            );
+            assert_eq!(disclosed.index_builds, 0);
+            assert_eq!(disclosed.keys, 0);
+
+            rt.update(|s, _| s.dark = !s.dark);
+            rt.frame(1.0 / 60.0);
+            assert!(
+                take_timeline_counts().built_turns > 0,
+                "theme must invalidate memos"
+            );
+            rt.set_viewport((width + 60.0, 800.0), 1.0);
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                take_timeline_counts().built_turns > 0,
+                "width must invalidate memos"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual headless timeline CPU benchmark"]
+    fn timeline_view_benchmark() {
+        let mut results = Vec::new();
+        for turns in [100, 1_000, 5_000] {
+            let mut rt = cached_timeline_runtime(1280.0, turns);
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            for phase in ["scroll_only", "stream_while_scrolling", "history_prepend"] {
+                let mut samples = Vec::new();
+                take_timeline_counts();
+                for sample in 0..20 {
+                    let begin = std::time::Instant::now();
+                    if phase == "stream_while_scrolling" {
+                        rt.update(|s, _| {
+                            let t = s.current_mut();
+                            let last = t.messages.len() - 1;
+                            t.messages[last].text.push_str(" streamed");
+                            t.timeline_cache.get_mut().touch_message(last);
+                            t.transcript_content += 1;
+                        });
+                    } else if phase == "history_prepend" {
+                        rt.update(|s, _| {
+                            let t = s.current_mut();
+                            for tool in &mut t.tools {
+                                tool.anchor.message += 2;
+                            }
+                            for work in &mut t.work {
+                                work.start += 2;
+                            }
+                            let mut tool = t.tools[0].clone();
+                            tool.id = format!("prepend-tool-{sample}");
+                            tool.anchor.message = 1;
+                            t.tools.insert(0, tool);
+                            t.messages.splice(
+                                0..0,
+                                [
+                                    crate::model::Message {
+                                        id: format!("prepend-user-{sample}"),
+                                        role: "You",
+                                        text: "Earlier question.".into(),
+                                        images: vec![],
+                                        context: None,
+                                    },
+                                    crate::model::Message {
+                                        id: format!("prepend-answer-{sample}"),
+                                        role: "Pi",
+                                        text: "Earlier response.".into(),
+                                        images: vec![],
+                                        context: None,
+                                    },
+                                ],
+                            );
+                            t.work.insert(
+                                0,
+                                crate::model::AssistantWork {
+                                    start: 1,
+                                    stopped: false,
+                                    stopped_order: 0,
+                                    expanded: false,
+                                    elapsed: Some(1),
+                                    outcome: Some(Status::Completed),
+                                },
+                            );
+                            t.transcript_structure += 1;
+                        });
+                    }
+                    if phase != "history_prepend" {
+                        rt.wheel(
+                            viewport[0] + viewport[2] * 0.5,
+                            viewport[1] + viewport[3] * 0.5,
+                            if sample % 2 == 0 { 8.0 } else { -8.0 },
+                        );
+                    }
+                    rt.frame(1.0 / 60.0);
+                    samples.push(begin.elapsed().as_secs_f64() * 1_000.0);
+                }
+                samples.sort_by(f64::total_cmp);
+                let mounted = rt
+                    .elements()
+                    .iter()
+                    .filter(|element| {
+                        element.key.as_deref().is_some_and(|key| {
+                            key.starts_with("turn-1-cache-") || key.starts_with("row-1-cache-")
+                        })
+                    })
+                    .count();
+                results.push(json!({
+                    "turns": turns, "messages": turns * 2, "tools": turns,
+                    "phase": phase, "samples": samples.len(),
+                    "p50_ms": samples[samples.len() / 2],
+                    "p95_ms": samples[samples.len() * 95 / 100],
+                    "counts": take_timeline_counts(), "mounted_rows_at_end": mounted,
+                }));
+            }
+        }
+        let revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        println!(
+            "TIMELINE_BENCHMARK {}",
+            json!({
+                "source_revision": String::from_utf8_lossy(&revision.stdout).trim(),
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "platform": std::env::consts::OS, "arch": std::env::consts::ARCH,
+                "scope": "headless native view/commit/layout CPU; no server receive, GPU or FPS measurement",
+                "width": 1280, "height": 720, "results": results,
+            })
+        );
     }
 
     #[test]
