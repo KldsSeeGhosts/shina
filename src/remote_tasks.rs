@@ -2303,6 +2303,15 @@ mod tests {
 
     #[test]
     fn an_exact_writer_stop_preserves_later_inputs_and_cannot_replay_on_them() {
+        writer_stop_preserves_later_input(false);
+    }
+
+    #[test]
+    fn a_delayed_writer_stop_preserves_its_completed_result_and_later_input() {
+        writer_stop_preserves_later_input(true);
+    }
+
+    fn writer_stop_preserves_later_input(completed_before_stop: bool) {
         let mut state = fixture();
         let child = peer_worker(&mut state);
         let controller = state.identity.controller_id.clone();
@@ -2339,6 +2348,37 @@ mod tests {
             }),
         );
         state.execute_peer_command("fixture-peer", &send).unwrap();
+        // An input accepted before per-input execution bindings existed must
+        // not remain queued in the durable ledger after stop removes it.
+        let legacy_input = uuid::Uuid::new_v4();
+        state
+            .stage_peer_task_intent(PeerTaskIntent::input(
+                legacy_input.to_string(),
+                child,
+                first.attempt_id.clone(),
+                None,
+                None,
+                "follow_up",
+                "legacy queued input".into(),
+                Some(first.run_id.clone()),
+            ))
+            .unwrap();
+        state.threads[1].pending_injections.push_front(Injection {
+            text: "legacy queued input".into(),
+            shown: false,
+            steer: None,
+            peer_input: Some(legacy_input),
+        });
+        let completed_result = json!({
+            "status":"completed","resultId":"original-completed-result",
+            "replyItemId":null,"attemptId":"shared-attempt","runId":first.run_id,
+            "error":null,"memorySuggestions":[]
+        });
+        if completed_before_stop {
+            state.threads[1].status = Status::Completed;
+            state.threads[1].task_result = Some("done");
+            state.threads[1].peer_origin.as_mut().unwrap().result = Some(completed_result.clone());
+        }
         let stop = Command::new(
             "peer.thread.stop",
             json!({
@@ -2354,9 +2394,38 @@ mod tests {
         );
         assert_eq!(state.peer_task_intents[0].provider_state, "not_observed");
         assert_eq!(state.peer_task_intents[0].queue_state, "queued");
-        state.threads[1].execution = Some(next.binding());
-        state.threads[1].run_id = Some(next.run_id.clone());
-        state.threads[1].task_result = None;
+        let legacy = state
+            .peer_task_intent_index(child, &legacy_input.to_string())
+            .unwrap();
+        assert_eq!(state.peer_task_intents[legacy].provider_state, "rejected");
+        assert_eq!(state.peer_task_intents[legacy].queue_state, "settled");
+        if completed_before_stop {
+            assert_eq!(state.threads[1].task_result, Some("done"));
+            assert_eq!(
+                state.threads[1].peer_origin.as_ref().unwrap().result,
+                Some(completed_result)
+            );
+        }
+        let (pi, commands, _events) = Pi::test_connection();
+        let thread = &mut state.threads[1];
+        thread.pi = Some(pi);
+        thread.status = Status::Completed;
+        thread.phase.clear();
+        thread.initializing = false;
+        thread.history_loaded = true;
+        thread.model_provider = "cpa".into();
+        let reply_after_position = thread.messages.len();
+        assert!(thread.flush_injection());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["runId"], next.run_id);
+        assert_eq!(thread.execution, Some(next.binding()));
+        assert!(thread.peer_origin.as_ref().unwrap().result.is_none());
+        assert!(!thread.peer_origin.as_ref().unwrap().acknowledged);
+        assert_eq!(
+            thread.peer_origin.as_ref().unwrap().reply_after_position,
+            reply_after_position
+        );
+        assert_eq!(thread.task_result, None);
         let input_count = state.threads[1].pending_injections.len();
         let cancel_index = state
             .peer_task_intent_index(child, &stop.command_id.to_string())
@@ -2375,6 +2444,23 @@ mod tests {
         );
         assert_eq!(state.threads[1].pending_injections.len(), input_count);
         assert_eq!(state.threads[1].task_result, None);
+        state.threads[1].apply(json!({
+            "type":"response","command":"prompt","id":prompt["id"],
+            "success":true,"data":{"disposition":"queued"}
+        }));
+        state.threads[1].status = Status::Completed;
+        state.threads[1].task_result = Some("done");
+        assert!(state.capture_peer_results());
+        let result = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["runId"], next.run_id);
+        assert_ne!(result["resultId"], "original-completed-result");
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
@@ -6527,18 +6613,33 @@ impl State {
                     && thread.pending_injections.is_empty();
                 thread.pending_injections.extend(future_inputs);
                 if settled_locally {
-                    thread.task_result = Some("cancelled");
-                    thread.completion_notified = true;
-                    let attempt = intent.attempt_id.clone();
-                    if let Some(origin) = &mut thread.peer_origin {
-                        origin.result = Some(json!({
-                            "status":"cancelled","resultId":uuid::Uuid::new_v4().to_string(),
-                            "replyItemId":null,"attemptId":attempt,"runId":null,
-                            "error":null,"memorySuggestions":[]
-                        }));
+                    // The provider may have completed before this delayed stop
+                    // reached the intent driver, but before lease refresh.
+                    // Cancellation cannot rewrite that terminal outcome.
+                    thread.task_result.get_or_insert("cancelled");
+                    let cancelled = thread.task_result == Some("cancelled");
+                    if cancelled {
+                        thread.completion_notified = true;
+                        let attempt = intent.attempt_id.clone();
+                        if let Some(origin) = &mut thread.peer_origin
+                            && origin.result.is_none()
+                        {
+                            origin.result = Some(json!({
+                                "status":"cancelled","resultId":uuid::Uuid::new_v4().to_string(),
+                                "replyItemId":null,"attemptId":attempt,"runId":null,
+                                "error":null,"memorySuggestions":[]
+                            }));
+                        }
                     }
                     intent.provider_state = "accepted".into();
-                    intent.provider_basis = Some("target_cancelled_before_dispatch".into());
+                    intent.provider_basis = Some(
+                        if cancelled {
+                            "target_cancelled_before_dispatch"
+                        } else {
+                            "provider_settlement"
+                        }
+                        .into(),
+                    );
                     intent.queue_state = "settled".into();
                 } else {
                     intent.provider_state = if intent.provider_state == "requested" {
@@ -6581,21 +6682,36 @@ impl State {
                                 self.threads
                                     .iter()
                                     .find(|thread| thread.id == input.thread_id)
-                                    .and_then(|thread| {
-                                        thread.peer_input_executions.get(&input.command_id)
+                                    // Older accepted inputs predate per-input
+                                    // bindings. The exact-attempt stop and
+                                    // removed-queue check below still prove
+                                    // non-delivery for those legacy rows.
+                                    .is_some_and(|thread| {
+                                        thread
+                                            .peer_input_executions
+                                            .get(&input.command_id)
+                                            .is_none_or(|input_binding| input_binding == binding)
                                     })
-                                    == Some(binding)
                             })
                             && (stop.queue_state == "applied"
                                 || (stop.queue_state == "settled"
-                                    && stop.provider_basis.as_deref()
-                                        == Some("target_cancelled_before_dispatch")))
+                                    && matches!(
+                                        stop.provider_basis.as_deref(),
+                                        Some(
+                                            "target_cancelled_before_dispatch"
+                                                | "provider_settlement"
+                                        )
+                                    )))
                             && self
                                 .threads
                                 .iter()
                                 .find(|thread| thread.id == input.thread_id)
                                 .is_none_or(|thread| {
-                                    !thread
+                                    !thread.pending_injections.iter().any(|injection| {
+                                        injection.peer_input.as_ref().is_some_and(|command| {
+                                            command.to_string() == input.command_id
+                                        })
+                                    }) && !thread
                                         .peer_dispatches
                                         .iter()
                                         .any(|(command, _, _)| command == &input.command_id)

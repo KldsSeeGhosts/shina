@@ -2932,6 +2932,14 @@ impl Thread {
             } else {
                 self.run_id = Some(uuid::Uuid::new_v4().to_string());
             }
+            if let Some(origin) = &mut self.peer_origin {
+                // A preserved follow-up starts a distinct turn. A prior stop
+                // or completion result must not mask this turn's result.
+                origin.result = None;
+                origin.acknowledged = false;
+                origin.attempt_message = text.clone();
+                origin.reply_after_position = self.messages.len();
+            }
             self.prompt_suggestion = None;
             self.arm_task();
         }

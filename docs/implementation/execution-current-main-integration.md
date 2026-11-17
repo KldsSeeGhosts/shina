@@ -214,3 +214,40 @@ and cross-executor process proof still need review. Moving the same logical run 
 unproven. Scheduler/catalog composition, exact-head CI, serialized publication
 and downloaded release verification are separate gates. Issue #35 still owns
 conversation and checkout content transfer.
+
+## Delayed-stop replay and preserved input results
+
+The full run at `187a69c` passed 2,095 unit tests with 13 ignored tests, but
+failed one of 124 integration tests. The unchanged
+`queued_target_response_is_not_provider_acceptance_until_flushed` requires
+provider acceptance into its follow-up queue while the earlier turn remains
+active. Holding all later managed input outside the adapter breaks that
+contract. That failure remains a publication blocker.
+
+The subsequent independent review also found delayed stop reconciliation
+rewriting a completed provider result as cancelled. A preserved future input
+could then inherit that cancellation result and never report its own completion.
+Both regressions failed before this correction.
+
+Stop reconciliation now preserves an existing terminal task outcome and result
+id, even before lease refresh observes that outcome. When a preserved input
+starts its own run, it clears prior result and acknowledgement state and records
+its own reply boundary and attempt message. Replaying the older stop after that
+transition fails the execution fence and cannot modify the new turn.
+
+The regression also includes an undispatched input accepted before per-input
+execution bindings existed. The exact-attempt stop removes that input, and the
+ledger now marks it rejected instead of reconstructing it on the next pass.
+The proof requires no provider dispatch and absence from the remaining queue.
+An input bound to a later generation remains queued and is not rejected.
+
+The all-target build, formatting and diff checks pass. All 77 remote-task tests,
+11 lease-book tests and four injection tests pass. The existing live
+accepted-queue cancellation/restart and late-steer attribution tests also pass.
+These focused checks do not replace a new full aggregate run.
+
+Task-wide cancellation still needs to include the observed attempt's running
+writer rather than only cancelling its newest queued input. Provider-queued
+acceptance and exact writer activation need separate attribution. Neither
+problem is resolved by this result-preservation correction. No PR or publication
+is authorized by these results, and issue #27 remains open.
