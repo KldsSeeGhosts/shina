@@ -15744,7 +15744,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     changed |= crate::ui::diff_panel::tick(state, tx);
     changed |= state.poll_worktree_bootstraps();
     changed |= state.poll_worktree_setup();
-    state.refresh_local_bindings();
+    changed |= state.refresh_local_bindings();
     changed |= state.poll_checkout_provisioning();
     changed |= state.poll_placements();
     changed |= state.poll_question_answers();

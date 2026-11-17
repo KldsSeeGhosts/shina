@@ -77,17 +77,30 @@ fix. Resolution now probes only `refs/heads/<branch>` and
 `refs/remotes/origin/<branch>`. It never interprets a tag as the selected branch.
 All 15 catalog units and the paired two-executor fresh-clone/restart test pass.
 
+Further root regressions reproduced the cold-identity and rejected-launch
+pollution findings. An explicit project/repository pair now waits for its
+selected checkout identity and fails closed on missing, failed or mismatched
+identity. Placement validation runs before learning the repository or recording
+a provisioning binding. Neither rejection allocates a worker or input intent.
+
+Unresolved identity still produces a terminal rejected receipt. Its message now
+states that no worker was created and directs a fresh delegation after executor
+discovery, rather than promising that retrying the rejected command can work.
+
+Two more regressions reproduced idle discovery without a full commit and clone
+completion after cancellation with a permanent provisioning binding. Binding
+discovery now reports a changed batch and requests a full catalog projection.
+A clone that finishes after cancellation becomes an available bound checkout.
+The cancelled task's placement fails without creating its worktree or starting
+a provider. Its clone remains on disk for later use.
+
+The all-target build, formatting and diff checks pass after these corrections.
+All 19 catalog units, 58 remote-task units and the live paired two-executor
+clone/restart contract pass. The four new catalog regressions failed against
+the prior candidate before the corresponding corrections.
+
 The review also identified unresolved work before issue #28 can close:
 
-- Cold or failed identity lookup must not approve an explicit project/repository
-  pair. Warm this route and validate it before recording a checkout binding.
-- A slow binding lookup currently creates a durable rejected launch receipt.
-  Its message must not promise retry of that same command. The operation needs
-  an explicit retryable outcome or an honest terminal failure contract.
-- Validate placement before catalog mutations. Cancelled clone completion must
-  also settle its catalog binding rather than leave permanent provisioning.
-- Idle binding discovery must mark its batch changed and request a full catalog
-  projection.
 - Repository updates cannot clear fields or replace the clone URL. Remote
   checkout bindings are visible in task placement, not the controller catalog.
 - Catalog setup metadata is not carried in the launch payload. Do not claim

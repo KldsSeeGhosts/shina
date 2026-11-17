@@ -3674,12 +3674,9 @@ impl State {
             return self
                 .prepare_remote_delegation(args["threadId"].as_u64()? as usize, &args["args"]);
         }
-        // A repository launch with no projectId resolves checkout bindings
-        // here; cold Git identities wait so the answer is a real miss, not a
-        // spurious provisioning of a checkout the executor already has.
-        let launch_needs_bindings = method == "peer.thread.launch"
-            && args["projectId"].is_null()
-            && !args["repository"].is_null();
+        // Every repository launch verifies its checkout identity, including an
+        // explicit projectId. A cold cache is not proof of repository membership.
+        let launch_needs_bindings = method == "peer.thread.launch" && !args["repository"].is_null();
         if method != "peer.capabilities" && !launch_needs_bindings {
             return None;
         }
@@ -3688,6 +3685,12 @@ impl State {
             .entries
             .iter()
             .filter(|p| !p.hidden)
+            .filter(|p| {
+                !launch_needs_bindings
+                    || args["projectId"]
+                        .as_u64()
+                        .is_none_or(|id| p.id as u64 == id)
+            })
             .map(|p| repository_lookup(&p.path))
             .collect();
         if lookups
@@ -5529,14 +5532,20 @@ impl State {
                         .iter()
                         .find(|p| !p.hidden && p.id == id)
                         .ok_or("Unknown target project.")?;
-                    if let Some(repository) = &launch_repository
-                        && let Some(Ok(Some(remote))) = repository_result(&entry.path)
-                        && !repository.remotes.contains(&remote)
-                    {
-                        return Err(format!(
-                            "Project {} is not a checkout of repository {}.",
-                            entry.name, repository.id
-                        ));
+                    if let Some(repository) = &launch_repository {
+                        match repository_result(&entry.path) {
+                            Some(Ok(Some(remote))) if repository.remotes.contains(&remote) => {}
+                            Some(Ok(_)) => return Err(format!(
+                                "Project {} is not a checkout of repository {}.",
+                                entry.name, repository.id
+                            )),
+                            Some(Err(_)) => return Err(
+                                "The selected checkout's Git identity could not be verified. No repository binding or worker was created.".into()
+                            ),
+                            None => return Err(
+                                "The selected checkout's Git identity is unresolved. No repository binding or worker was created. Refresh executor discovery before submitting a new delegation request.".into()
+                            ),
+                        }
                     }
                     Some(entry.id)
                 }
@@ -5572,7 +5581,7 @@ impl State {
                     }
                     if bound.is_empty() && resolving {
                         return Err(
-                            "Checkout bindings are still resolving on this machine. The controller can retry the launch.".into(),
+                            "Checkout bindings could not be resolved before launch. No worker was created. Refresh executor discovery before submitting a new delegation request.".into(),
                         );
                     }
                     bound.into_iter().next().map(|(id, _)| id)
@@ -5651,6 +5660,11 @@ impl State {
                 let repository = launch_repository
                     .as_ref()
                     .expect("repository checked above");
+                let mode = spec
+                    .as_ref()
+                    .map(placement::validate_spec)
+                    .transpose()?
+                    .flatten();
                 let target =
                     repositories::checkout_target(&self.data_dir, &repository.id, &repository.name);
                 let checkout = target.to_string_lossy().into_owned();
@@ -5663,11 +5677,6 @@ impl State {
                     repositories::BindingState::Provisioning,
                     Some("No bound checkout on this machine; provisioning one.".into()),
                 );
-                let mode = spec
-                    .as_ref()
-                    .map(placement::validate_spec)
-                    .transpose()?
-                    .flatten();
                 placement::ThreadPlacement {
                     requested: placement::PlacementRequest::from_mode(mode),
                     mode: mode.unwrap_or(placement::PlacementMode::Isolated),

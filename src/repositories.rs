@@ -1008,11 +1008,12 @@ impl State {
 
     /// Attach every warm local checkout identity to a matching repository.
     /// Cold lookups warm in the background and bind on the next pass.
-    pub(super) fn refresh_local_bindings(&mut self) {
+    pub(super) fn refresh_local_bindings(&mut self) -> bool {
         if self.client.is_some() {
             // A client never probes the owning server's paths.
-            return;
+            return false;
         }
+        let mut changed = false;
         let checkouts: Vec<(u64, String, String)> = self
             .projects
             .entries
@@ -1045,9 +1046,14 @@ impl State {
                         BindingState::Bound,
                         None,
                     );
+                    changed = true;
                 }
             }
         }
+        if changed {
+            self.persistence_scope = None;
+        }
+        changed
     }
 
     /// Executor side: keep a local catalog row for the repository a peer
@@ -1243,9 +1249,7 @@ impl State {
         }
         match result {
             Ok(path) => {
-                if !self.placement_wanted(&self.threads[index]) {
-                    return;
-                }
+                let wanted = self.placement_wanted(&self.threads[index]);
                 let project_path = crate::projects::clean_path(
                     &path.canonicalize().unwrap_or_else(|_| path.clone()),
                 );
@@ -1276,6 +1280,21 @@ impl State {
                     BindingState::Bound,
                     None,
                 );
+                if !wanted {
+                    let placement = self.threads[index]
+                        .placement
+                        .as_mut()
+                        .expect("binding placement");
+                    placement.phase = placement::PlacementPhase::Failed;
+                    placement.error = Some("Placement was cancelled after the repository checkout completed. The checkout remains available.".into());
+                    let binding = placement.binding.as_mut().expect("checkout binding");
+                    binding.state = placement::BindingPhase::Ready;
+                    binding.clone_url.clear();
+                    binding.spec = None;
+                    binding.error = None;
+                    self.persistence_scope = None;
+                    return;
+                }
                 let seed = self.threads[index]
                     .peer_origin
                     .as_ref()
@@ -1911,6 +1930,144 @@ mod tests {
             state.threads[index].pending_injections[0].peer_input,
             Some(launch.command_id)
         );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    fn catalog_launch(project: Value, placement: Value) -> Command {
+        Command::new(
+            "peer.thread.launch",
+            json!({
+                "projectId":project,
+                "repository":{"id":"repo-validation","name":"repo",
+                    "remotes":["example.com/team/repo"],"cloneUrl":"https://example.com/team/repo.git"},
+                "harness":"pi","provider":"cpa","model":"fixture","brief":"Validate the binding",
+                "origin":{"deviceId":"asserted","serverId":uuid::Uuid::new_v4().to_string(),
+                    "serverLabel":"Home","parentThreadId":1,"taskId":"validation-task",
+                    "captain":"Captain","memories":[]},
+                "placement":placement
+            }),
+        )
+    }
+
+    #[test]
+    fn a_cold_explicit_project_cannot_claim_a_different_catalog_repository() {
+        let mut state = state();
+        let path = state.data_dir.join("wrong-project");
+        git_checkout(&path, "https://example.com/other/repo.git");
+        state
+            .projects
+            .entries
+            .push(crate::projects::Project::new(9, path.clone()));
+        let command = catalog_launch(json!(9), json!({"mode":"shared"}));
+        let before = state.threads.len();
+        assert!(
+            state.execute_peer_command("device-1", &command).is_err(),
+            "cold identity must not approve a catalog binding"
+        );
+        assert!(state.repositories.is_empty());
+        assert!(state.repository_bindings.is_empty());
+        assert_eq!(state.threads.len(), before);
+        let preparation = state.prepare_peer_call("peer.thread.launch", &command.params);
+        if let Some(preparation) = preparation {
+            preparation
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+        assert!(state.execute_peer_command("device-1", &command).is_err());
+        assert!(state.repositories.is_empty());
+        assert!(state.repository_bindings.is_empty());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_placement_does_not_learn_or_provision_a_repository() {
+        let mut state = state();
+        let command = catalog_launch(
+            Value::Null,
+            json!({"mode":"isolated","baseBranch":"main","baseCommit":"abc"}),
+        );
+        assert!(state.execute_peer_command("device-1", &command).is_err());
+        assert!(
+            state.repositories.is_empty(),
+            "a rejected launch learned a repository"
+        );
+        assert!(
+            state.repository_bindings.is_empty(),
+            "a rejected launch left provisioning"
+        );
+        assert!(state.peer_task_intents.is_empty());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn idle_checkout_discovery_requests_a_full_catalog_commit() {
+        let mut state = state();
+        state
+            .put_repository(&json!({"url":"https://example.com/team/repo.git"}))
+            .unwrap();
+        let path = state.data_dir.join("existing-checkout");
+        git_checkout(&path, "https://example.com/team/repo.git");
+        state
+            .projects
+            .entries
+            .push(crate::projects::Project::new(9, path.clone()));
+        let path = state.projects.entries[0].path.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while remote_tasks::repository(&path).is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        state.persistence_scope = Some(Default::default());
+        state.refresh_local_bindings();
+        assert_eq!(state.repository_bindings.len(), 1);
+        assert!(
+            state.persistence_scope.is_none(),
+            "catalog changes cannot use a thread-only commit"
+        );
+        let saved = state.repository_bindings.clone();
+        state.refresh_local_bindings();
+        assert_eq!(state.repository_bindings, saved);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn a_clone_finishing_after_cancellation_records_its_available_checkout_without_launching() {
+        let mut state = state();
+        let command = catalog_launch(Value::Null, json!({"mode":"shared"}));
+        let response = state.execute_peer_command("device-1", &command).unwrap();
+        let thread_id = response["threadId"].as_u64().unwrap() as usize;
+        let index = state
+            .threads
+            .iter()
+            .position(|thread| thread.id == thread_id)
+            .unwrap();
+        let clone = PathBuf::from(
+            state.threads[index]
+                .placement
+                .as_ref()
+                .unwrap()
+                .binding
+                .as_ref()
+                .unwrap()
+                .checkout
+                .clone(),
+        );
+        git_checkout(&clone, "https://example.com/team/repo.git");
+        state.threads[index].task_result = Some("cancelled");
+        state.apply_checkout_outcome(thread_id, Ok(clone.clone()));
+        assert_eq!(state.repository_bindings.len(), 1);
+        assert_eq!(state.repository_bindings[0].state, BindingState::Bound);
+        assert_eq!(state.repository_bindings[0].path, clone.to_string_lossy());
+        let placement = state.threads[index].placement.as_ref().unwrap();
+        assert_eq!(
+            placement.binding.as_ref().unwrap().state,
+            placement::BindingPhase::Ready
+        );
+        assert_eq!(placement.phase, placement::PlacementPhase::Failed);
+        assert!(state.threads[index].pi.is_none());
+        assert!(state.threads[index].pending_injections.is_empty());
+        assert!(clone.join(".git").exists());
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 }
