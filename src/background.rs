@@ -640,6 +640,7 @@ impl State {
                                 text: message,
                                 shown: false,
                                 steer: None,
+                                peer_input: None,
                             });
                             if self.threads[index].pi.is_none() {
                                 self.connect_thread(index);
@@ -926,6 +927,7 @@ mod tests {
             text: messages[0].1.clone(),
             shown: false,
             steer: None,
+            peer_input: None,
         });
         assert!(state.current_mut().flush_injection());
         let prompt = commands.try_recv().unwrap();

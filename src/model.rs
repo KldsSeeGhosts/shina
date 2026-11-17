@@ -215,6 +215,27 @@ pub use remote_tasks::{
 #[path = "runtime_poll.rs"]
 mod runtime_poll;
 
+/// Debug-only deterministic barrier for the queued-input integration test.
+/// It blocks the provider slot in an isolated profile until the test creates
+/// the release file. Production builds and ordinary profiles never see it.
+#[cfg(debug_assertions)]
+fn test_hold_injection_flush() -> bool {
+    let Some(release) = std::env::var_os("SHINA_TEST_HOLD_INJECTION_FLUSH") else {
+        return false;
+    };
+    let release = std::path::PathBuf::from(release);
+    let held = release.starts_with(std::env::temp_dir())
+        && release
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("shina-server-integration-")
+            })
+        && !release.exists();
+    held
+}
+
 struct Injection {
     text: String,
     shown: bool,
@@ -223,6 +244,8 @@ struct Injection {
     /// the steering input goes to the follow-up queue instead of interrupting
     /// work the caller never saw.
     steer: Option<String>,
+    /// The peer command whose provider acceptance this injection can prove.
+    peer_input: Option<uuid::Uuid>,
 }
 
 struct TaskWaiter {
@@ -1054,6 +1077,11 @@ pub struct Thread {
     /// Delivery markers whose prompt command reached the provider, with the
     /// behavior actually used. Consumed into the durable operation ledger.
     pub(super) injection_dispatches: Vec<(String, String)>,
+    /// Provider rejections for exact internal delivery ids. This is separate
+    /// from `accepted_deliveries`; a rejected prompt is never retried blindly.
+    pub(super) rejected_injections: Vec<(String, String)>,
+    /// The provider prompt command currently proving a peer input's acceptance.
+    pub(super) peer_prompt: Option<(String, uuid::Uuid)>,
     injection_retry_at: Option<Instant>,
     operation_deadline: Option<(&'static str, Instant)>,
     task_result: Option<&'static str>,
@@ -1587,6 +1615,8 @@ impl Thread {
             pending_injections: VecDeque::new(),
             injection_id: None,
             injection_dispatches: Vec::new(),
+            rejected_injections: Vec::new(),
+            peer_prompt: None,
             injection_retry_at: None,
             operation_deadline: None,
             task_result: None,
@@ -2681,12 +2711,17 @@ impl Thread {
             text: format!("{INJECTION_PREFIX}[delivery {delivery}]\n{text}"),
             shown: false,
             steer: None,
+            peer_input: None,
         });
         delivery
     }
 
     fn flush_injection(&mut self) -> bool {
         if self.offline_blocked || self.provider_update_held || self.status == Status::Paused {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        if test_hold_injection_flush() {
             return false;
         }
         if self
@@ -2719,6 +2754,7 @@ impl Thread {
             return false;
         }
         let text = self.pending_injections[0].text.clone();
+        let peer_input = self.pending_injections[0].peer_input;
         // A steer injection pins the run it was declared against. If that run
         // already ended, the message becomes ordinary follow-up input so it
         // queues behind the newer work rather than vanishing.
@@ -2739,7 +2775,28 @@ impl Thread {
         ) {
             return false;
         }
-        self.injection_id = Some(format!("{}-{}", self.id, self.serial));
+        let prompt_command = format!("{}-{}", self.id, self.serial);
+        self.injection_id = Some(prompt_command.clone());
+        if let Some(peer) = peer_input {
+            self.peer_prompt = Some((prompt_command, peer));
+            if let Some(origin) = &mut self.peer_origin
+                && let Some(evidence) = origin
+                    .inputs
+                    .iter_mut()
+                    .find(|evidence| evidence.command_id == peer.to_string())
+            {
+                evidence.realized_delivery = Some(
+                    if behavior == "steer" {
+                        "steer"
+                    } else {
+                        "follow_up"
+                    }
+                    .into(),
+                );
+                evidence.run_id = self.run_id.clone();
+                evidence.observed_at = lifecycle::now();
+            }
+        }
         if let Some(delivery) = tasks::delivery_id(&text) {
             self.injection_dispatches
                 .push((delivery.to_owned(), behavior.to_owned()));
@@ -4641,6 +4698,13 @@ pub struct State {
     pub harnesses: crate::harness::Registry,
     pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
+    /// True only when this reducer runs under the durable server batch (or a
+    /// test explicitly simulates that profile). A live file-only reducer
+    /// leaves it false and refuses keyed controls before any effect.
+    pub(crate) durable_task_controls: bool,
+    /// Set when peer dispatch runs before the runtime opens its next database
+    /// batch. The next reconcile stages these exact operations in that batch.
+    pub(super) task_operations_dirty: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
     // Drop the owner only after every store has flushed and stopped its writer.
@@ -4929,6 +4993,8 @@ impl State {
                 read_managed_policy()
             },
             runtime_enabled: false,
+            durable_task_controls: false,
+            task_operations_dirty: false,
             ownership_denied: false,
             runtime_stop_requested: false,
             tasks: Vec::new(),
@@ -8736,6 +8802,13 @@ impl State {
                             return Err(error);
                         }
                         self.mark_caller_operation_dispatched(caller_index, request_key, "answer");
+                        // The local adapter can prove it accepted the write, not
+                        // that the provider consumed the answer.
+                        self.mark_caller_operation_input_unknown(
+                            caller_index,
+                            request_key,
+                            "adapter_write",
+                        );
                         let status = self.mcp_call(
                             caller,
                             "task_status",
@@ -15165,7 +15238,19 @@ impl State {
         });
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
-        index["taskOperations"] = json!(self.task_operations);
+        // Bounded projection only. The durable table keeps every operation;
+        // task_status keeps the latest 16 for the model payload.
+        let projected_operations: Vec<_> = self
+            .task_operations
+            .iter()
+            .rev()
+            .take(64)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        index["taskOperations"] = json!(projected_operations);
         index["serverEpoch"] = json!(self.server_epoch);
         index["serverSeq"] = json!(self.server_seq);
         index["recoveredInputs"] = json!(self.recovered_inputs);
@@ -18917,6 +19002,7 @@ mod tests {
             text: "Shina: input for the ended run".into(),
             shown: false,
             steer: Some("run-a".into()),
+            peer_input: None,
         });
         assert!(thread.flush_injection());
         let prompt = commands.try_recv().unwrap();
@@ -18931,6 +19017,7 @@ mod tests {
             text: "Shina: steer the live run".into(),
             shown: false,
             steer: Some("run-b".into()),
+            peer_input: None,
         });
         assert!(thread.flush_injection());
         let prompt = commands

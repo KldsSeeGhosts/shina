@@ -1450,6 +1450,15 @@ impl Profile {
         if let Some(fault) = fault {
             command.env("SHINA_TEST_CRASH_EFFECT", fault);
         }
+        if let Ok(extra) = fs::read(self.root.join("extra-env.json"))
+            && let Ok(Value::Object(extra)) = serde_json::from_slice::<Value>(&extra)
+        {
+            for (name, value) in extra {
+                if let Some(value) = value.as_str() {
+                    command.env(name, value);
+                }
+            }
+        }
         if self.root.join("use-native-approval-fixture").exists() {
             command
                 .env(
@@ -4082,6 +4091,559 @@ fn remote_task_cancel_fences_the_observed_attempt_over_peer_transport() {
     target.stop();
 }
 
+/// A delayed answer fenced to question A is rejected after the target moves to
+/// question B. The home keeps the rejection, refreshes B, never answers B with
+/// A, and retains the same outcome after a home restart.
+#[test]
+fn two_server_stale_question_rejection_survives_refresh_and_restart() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let gate = home.root.join("peer-send-release");
+    fs::write(
+        home.root.join("extra-env.json"),
+        json!({"SHINA_TEST_PEER_SEND_BARRIER":gate}).to_string(),
+    )
+    .unwrap();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    target_client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("stale-question-target"),
+    );
+    let workspace = target.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let home_workspace = home.root.join("workspace");
+    for path in [&workspace, &home_workspace] {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/stale-question.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(
+        target_client.command(
+            "project.put",
+            json!({"path":workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(
+        code.status.success(),
+        "{}",
+        String::from_utf8_lossy(&code.stderr)
+    );
+    let code = String::from_utf8(code.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let device = uuid::Uuid::new_v4();
+    let mut client = home.client(device);
+    client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("stale-question-home"),
+    );
+    assert_eq!(
+        client.command(
+            "project.put",
+            json!({"path":home_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let parent = client.command(
+        "thread.create",
+        json!({"project":1}),
+        uuid::Uuid::new_v4(),
+    )["result"]["result"]["threadId"]
+        .clone();
+    let args = json!({"prompt":"stale-question-fixture","client_request_id":"stale-live-delegate",
+        "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
+    let mut delegated = Value::Null;
+    for _ in 0..100 {
+        delegated = client.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args.clone()}),
+            uuid::Uuid::new_v4(),
+        );
+        let waiting = delegated["result"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not advertise this model"));
+        if !waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(delegated["result"]["status"], "accepted", "{delegated}");
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["remote"]["request"]["requestId"] == "question-a")
+    });
+    let request_a = client.snapshot["index"]["tasks"][0]["remote"]["request"].clone();
+    let answer = json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"stale home answer A","client_request_id":"stale-live-answer",
+        "request_id":request_a["requestId"],"runtime_generation":request_a["generation"]}});
+    let saved = client.command("task.send", answer.clone(), uuid::Uuid::new_v4());
+    assert_eq!(saved["result"]["status"], "accepted", "{saved}");
+    assert_eq!(
+        saved["result"]["result"]["operation"]["transport"], "not_observed",
+        "the barrier holds the peer command"
+    );
+    client.until(|state| {
+        state["index"]["taskOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation["request_key"] == "stale-live-answer"
+                    && operation["dispatch"] == "dispatched"
+            })
+    });
+
+    // The target's user answers A directly. That advances the provider to B
+    // while the home's fenced answer A is still behind the barrier.
+    target_client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["request"]["id"] == "question-a")
+    });
+    let worker = target_client.snapshot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["request"]["id"] == "question-a")
+        .unwrap()["id"]
+        .clone();
+    let target_request_a = target_client.snapshot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == worker)
+        .unwrap()["request"]
+        .clone();
+    let answered = target_client.command(
+        "request.respond",
+        json!({"threadId":worker,"requestId":target_request_a["id"],
+            "generation":target_request_a["runtimeGeneration"],
+            "requestContract":true,"response":{"value":"target user answer A"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(answered["result"]["status"], "accepted", "{answered}");
+    target_client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| thread["id"] == worker && thread["request"]["id"] == "question-b")
+    });
+
+    fs::write(&gate, b"release").unwrap();
+    client.until(|state| {
+        state["index"]["taskOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation["request_key"] == "stale-live-answer"
+                    && operation["transport"] == "rejected"
+            })
+            && state["index"]["tasks"][0]["remote"]["request"]["requestId"] == "question-b"
+    });
+    let operation = client.snapshot["index"]["taskOperations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["request_key"] == "stale-live-answer")
+        .cloned()
+        .unwrap();
+    assert_eq!(operation["transport"], "rejected");
+    assert_eq!(operation["rejection_stage"], "transport");
+    assert_eq!(operation["acceptance"], "not_observed");
+    assert_eq!(operation["completion"], "not_observed");
+    let replay = client.command("task.send", answer.clone(), uuid::Uuid::new_v4());
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    assert_eq!(
+        replay["result"]["result"]["operation"]["transport"],
+        "rejected"
+    );
+    assert_eq!(
+        replay["result"]["result"]["current"]["request"]["requestId"],
+        "question-b"
+    );
+    let worker_dir = PathBuf::from(
+        target_client.snapshot["directories"][worker.to_string()]
+            .as_str()
+            .unwrap(),
+    );
+    let replies = fs::read_to_string(worker_dir.join("fixture-question-replies.jsonl")).unwrap();
+    assert_eq!(
+        replies.lines().count(),
+        1,
+        "only the target user's A reached Pi: {replies}"
+    );
+    assert!(
+        !replies.contains("stale home answer A"),
+        "the stale answer never reached Pi: {replies}"
+    );
+
+    // A home restart reloads the same operation evidence from SQLite.
+    home.stop();
+    home.launch(&["serve"]);
+    let mut client = home.client(device);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let replay = client.command("task.send", answer.clone(), uuid::Uuid::new_v4());
+        let ok = replay["result"]["result"]["operation"]["transport"] == "rejected"
+            && replay["result"]["result"]["current"]["request"]["requestId"] == "question-b";
+        if ok {
+            assert_eq!(
+                replay["result"]["result"]["operation"]["rejection_stage"],
+                "transport"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replay did not retain rejection: {replay}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    home.stop();
+    target.stop();
+}
+
+/// A peer without the input-evidence contract cannot prove provider
+/// acceptance. The home keeps the target receipt as transport acceptance and
+/// reports provider acceptance as unknown instead of promoting the receipt.
+#[test]
+fn old_peer_receipt_leaves_provider_acceptance_unknown() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_OMIT_PEER_EVIDENCE":"1"}).to_string(),
+    )
+    .unwrap();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    let workspace = target.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let home_workspace = home.root.join("workspace");
+    for path in [&workspace, &home_workspace] {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/old-peer.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(
+        target_client.command(
+            "project.put",
+            json!({"path":workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(
+        code.status.success(),
+        "{}",
+        String::from_utf8_lossy(&code.stderr)
+    );
+    let code = String::from_utf8(code.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let mut client = home.client(uuid::Uuid::new_v4());
+    assert_eq!(
+        client.command(
+            "project.put",
+            json!({"path":home_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let parent = client.command("thread.create", json!({"project":1}), uuid::Uuid::new_v4())["result"]["result"]["threadId"].clone();
+    let args = json!({"prompt":"queue-wait-fixture","client_request_id":"old-peer-delegate",
+        "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
+    let mut delegated = Value::Null;
+    for _ in 0..100 {
+        delegated = client.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args.clone()}),
+            uuid::Uuid::new_v4(),
+        );
+        let waiting = delegated["result"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not advertise this model"));
+        if !waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(delegated["result"]["status"], "accepted", "{delegated}");
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| state["index"]["tasks"][0]["remote"]["threadId"].is_number());
+    let send = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"legacy follow-up","client_request_id":"old-peer-send"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(send["result"]["status"], "accepted", "{send}");
+    client.until(|state| {
+        state["index"]["taskOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation["request_key"] == "old-peer-send"
+                    && operation["transport"] == "accepted"
+                    && operation["acceptance"] == "unknown"
+                    && operation["acceptance_basis"] == "legacy_peer"
+            })
+    });
+    let operation = client.snapshot["index"]["taskOperations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["request_key"] == "old-peer-send")
+        .cloned()
+        .unwrap();
+    assert_eq!(operation["transport"], "accepted");
+    assert_eq!(operation["acceptance"], "unknown");
+    assert_eq!(operation["completion"], "not_observed");
+    home.stop();
+    target.stop();
+}
+
+/// A target receipt for a queued follow-up is transport acceptance only. The
+/// second follow-up remains not observed while the first prompt is held, then
+/// becomes accepted only after the provider acknowledges its own prompt.
+/// A target receipt for a queued follow-up is transport acceptance only. The
+/// follow-up remains not observed while the provider slot is held, then
+/// becomes accepted only after the provider acknowledges its own prompt.
+#[test]
+fn queued_target_response_is_not_provider_acceptance_until_flushed() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let release = target.root.join("release-injection");
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_INJECTION_FLUSH":release}).to_string(),
+    )
+    .unwrap();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    let workspace = target.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let home_workspace = home.root.join("workspace");
+    for path in [&workspace, &home_workspace] {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/queued-target.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(
+        target_client.command(
+            "project.put",
+            json!({"path":workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(
+        code.status.success(),
+        "{}",
+        String::from_utf8_lossy(&code.stderr)
+    );
+    let code = String::from_utf8(code.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let mut client = home.client(uuid::Uuid::new_v4());
+    assert_eq!(
+        client.command(
+            "project.put",
+            json!({"path":home_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let parent = client.command("thread.create", json!({"project":1}), uuid::Uuid::new_v4())["result"]["result"]["threadId"].clone();
+    let args = json!({"prompt":"peer-documents-hold-fixture","client_request_id":"queued-delegate",
+        "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
+    let mut delegated = Value::Null;
+    for _ in 0..100 {
+        delegated = client.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args.clone()}),
+            uuid::Uuid::new_v4(),
+        );
+        let waiting = delegated["result"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not advertise this model"));
+        if !waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(delegated["result"]["status"], "accepted", "{delegated}");
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| state["index"]["tasks"][0]["remote"]["threadId"].is_number());
+    let second = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"queued-two-live","client_request_id":"queued-two"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(second["result"]["status"], "accepted", "{second}");
+    client.until(|state| {
+        state["index"]["taskOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation["request_key"] == "queued-two"
+                    && operation["transport"] == "accepted"
+                    && operation["acceptance"] == "not_observed"
+            })
+    });
+    let prompts = workspace.join("fixture-prompts.jsonl");
+    assert_eq!(
+        fs::read_to_string(&prompts)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        0,
+        "the target stored both inputs but the provider slot is held"
+    );
+    fs::write(&release, b"release").unwrap();
+    client.until(|state| {
+        state["index"]["taskOperations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation["request_key"] == "queued-two"
+                    && operation["acceptance"] == "accepted"
+                    && operation["acceptance_basis"] == "provider_ack"
+            })
+    });
+    let delivered = fs::read_to_string(&prompts).unwrap();
+    assert_eq!(
+        delivered
+            .lines()
+            .filter(|line| line.contains("queued-two-live"))
+            .count(),
+        1,
+        "the queued input reached the provider exactly once: {delivered}"
+    );
+    home.stop();
+    target.stop();
+}
+
 #[test]
 fn receipts_and_server_transcripts_survive_restart_without_replaying_a_send() {
     let mut profile = Profile::new();
@@ -5582,6 +6144,16 @@ fn process_crashes_at_dispatch_boundaries_never_repeat_the_prompt() {
             )
             .unwrap();
         assert!(interrupted > 0);
+        let prompts = fs::read_to_string(profile.root.join("Shina/chats/1/fixture-prompts.jsonl"))
+            .unwrap_or_default();
+        // A lost response after the prompt reached the harness is retried by
+        // receipt replay, so exactly one prompt exists. Earlier boundaries
+        // never sent one.
+        assert_eq!(
+            prompts.lines().count(),
+            usize::from(phase == "sent"),
+            "{phase}: {prompts}"
+        );
         profile.stop();
     }
 }

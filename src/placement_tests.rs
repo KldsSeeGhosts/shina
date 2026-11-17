@@ -153,6 +153,7 @@ impl Fixture {
         std::fs::create_dir_all(&state.data_dir).unwrap();
         state.load_global_for_test();
         state.runtime_enabled = true;
+        state.durable_task_controls = true;
         state.test_git_context = Some(crate::vcs::GitContext {
             git_config_global: Some(self.empty_cfg.clone()),
             git_config_system: Some(self.empty_cfg.clone()),
@@ -548,6 +549,7 @@ fn restart_preserves_and_reuses_the_recorded_reservation() {
     restored.data_dir = state.data_dir.clone();
     restored.restore_global(&snapshot).unwrap();
     restored.runtime_enabled = true;
+    restored.durable_task_controls = true;
     restored.test_git_context = state.test_git_context.clone();
     poll_until_ready(&mut restored, 15);
     let placement = child_placement(&restored, 1);
@@ -949,6 +951,7 @@ fn peer_origin() -> remote_tasks::PeerOrigin {
         cancelled_commands: Vec::new(),
         reply_after_position: 0,
         document_reads: false,
+        inputs: Vec::new(),
     }
 }
 

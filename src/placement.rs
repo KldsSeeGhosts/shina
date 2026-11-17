@@ -876,6 +876,7 @@ impl State {
                     text,
                     shown: false,
                     steer: None,
+                    peer_input: None,
                 });
             }
             self.connect_thread(index);

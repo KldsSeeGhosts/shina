@@ -50,7 +50,12 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     // Keep a remote provider turn active while the integration test issues its MCP reads.
     if (request.message.includes("peer-documents-hold-fixture")) return;
     // An integration test owns settlement through a later steer or abort, not a timer.
-    if (request.message === "queue-wait-fixture") return;
+    if (request.message.includes("queue-wait-fixture")) return;
+    if (request.message.includes("stale-question-fixture")) {
+      emit({ type: "extension_ui_request", id: "question-a", method: "input",
+        questions: [{ id: "one", question: "Answer question A?", options: [] }] });
+      return;
+    }
     if (request.message === "dismiss-question-fixture") {
       emit({ type: "extension_ui_request", id: "dismiss-question", method: "input",
         responseCapability: { type: "message" }, responseMode: "message",
@@ -94,6 +99,17 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
   } else if (request.type === "extension_ui_response") {
     fs.appendFileSync(path.join(process.cwd(), "fixture-question-replies.jsonl"), JSON.stringify(request) + "\n");
     response(request, {});
+    if (request.id === "question-a") {
+      // Advance to a different request before any delayed answer A arrives.
+      emit({ type: "extension_ui_request", id: "question-b", method: "input",
+        questions: [{ id: "one", question: "Answer question B?", options: [] }] });
+    } else if (request.id === "question-b") {
+      const text = `Question B accepted ${JSON.stringify(request.value ?? null)}`;
+      const message = { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", timestamp: Date.now() };
+      messages.push(message); save();
+      emit({ type: "message_end", message });
+      running = false; emit({ type: "agent_end", messages }); emit({ type: "agent_settled" });
+    }
   } else if (request.type === "abort") { running = false; response(request, {}); emit({ type: "agent_settled", aborted: true }); }
   else if (request.type === "clear_queue") response(request, { steering: [], followUp: [] });
   else response(request, {});

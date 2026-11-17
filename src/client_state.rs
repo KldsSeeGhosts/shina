@@ -887,6 +887,8 @@ impl State {
                 thread.recovering_task = true;
             }
         }
+        self.durable_task_controls =
+            crate::database::for_path(&self.data_dir.join("index.json")).is_some();
         self.setup_headless_background();
         if let Some(error) = &self.background.routines.error {
             return Err(error.clone());
