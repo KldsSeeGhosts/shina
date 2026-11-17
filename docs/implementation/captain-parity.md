@@ -271,6 +271,36 @@ The live serve-process test client now assembles snapshot pages and calls
 to accept invalid patches. This prerequisite does not include #32 capability
 policy or #24 client item caching, and it makes no performance claim.
 
+### Item-level projection candidate for #24
+
+The candidate adds immutable, source-ID-keyed item fields alongside compact
+thread records. Unchanged fields and item payloads share `Arc` allocations.
+The client deserializes only changed items while retaining local disclosure
+state, drafts and selection. Separate structure and content tokens support the
+later timeline cache. Source identity, item order, anchors, deferred markers and
+snapshot recovery invalidate structure; ordinary text edits invalidate content.
+
+Root review reproduced two failures when the client's single-slot mailbox
+overwrote an intermediate projection. The latest emission's thread and item
+change sets omitted earlier unapplied changes. Application now compares each
+incoming projection and item against its last successful apply. Both the
+cross-thread and same-thread coalescing regressions fail before the correction
+and pass afterward.
+
+Review also reproduced missing structure invalidation on an anchor edit and
+missing content invalidation on metadata changes. Emission tokens now cover
+those cases and cannot repeat after snapshot or cache replacement. A content
+edit still preserves structure. Item replacement also releases its old byte
+budget instead of retaining the larger estimate after content shrinks.
+
+The benchmark keeps separate clients for delta, materialized full apply and a
+legacy cache reference. The legacy reference uses the pinned `269a2d0` cache
+algorithms with the current full-apply implementation, not an old executable.
+Every reference starts with all thread histories loaded. KSG measurements are
+logical workload comparisons only; do not claim a cross-runtime speed ratio.
+Native UI-frame performance and finer virtualization remain #25 and #26 work.
+This candidate is not yet publication or issue-closure evidence.
+
 ## Capy package investigation
 
 Inspected on November 16, 2026 without installing or launching Capy. The official

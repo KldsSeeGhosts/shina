@@ -4,6 +4,19 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+/// Process-local revision tokens cannot repeat after a cache replacement or
+/// history snapshot. They are invalidation tokens, never durable sequence IDs.
+fn next_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVISION: AtomicU64 = AtomicU64::new(0);
+    REVISION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .expect("Transcript revision exhausted")
+        + 1
+}
+
 /// Ordered items for one history field, shared between emissions. `ids` are
 /// the server's durable source item ids, parallel to `items`; `ords` are the
 /// server ordinals in the same order. A whole `FieldItems` is immutable once
@@ -32,7 +45,11 @@ pub(crate) type FieldChanges = HashMap<&'static str, HashSet<Arc<str>>>;
 /// thread's previous emission and `items_changed` names the payloads that
 /// moved content (`None` = everything may differ: snapshot, first emission,
 /// untracked source). `record_changed` covers history meta, retry and
-/// record-level fields. Thread keys stay the numeric projection ids.
+/// record-level fields. Change sets refer to consecutive emissions only.
+/// A coalescing consumer must compare shared item Arcs with its last applied
+/// projection rather than using a skipped emission's change set as its base.
+/// Revision tokens do not repeat when a cache or history snapshot is replaced.
+/// Thread keys stay the numeric projection ids.
 pub(crate) struct ThreadProjection {
     /// Compact record: workspace fields + non-array history fields +
     /// `historyMeta`/`historyRetry`. `HISTORY_FIELDS` arrays stay empty here;
@@ -45,6 +62,7 @@ pub(crate) struct ThreadProjection {
     /// The apply path reads item identity diffs; the timeline reads these.
     #[allow(dead_code)]
     pub(crate) structural: bool,
+    #[allow(dead_code)]
     pub(crate) items_changed: Option<Arc<FieldChanges>>,
     #[allow(dead_code)]
     pub(crate) record_changed: bool,
@@ -130,6 +148,7 @@ impl ThreadProjection {
     /// fields. No durable identities exist here, so consumers take the
     /// everything-changed path.
     fn from_record(mut record: Value) -> Self {
+        let revision = next_revision();
         let mut fields = HashMap::new();
         for field in protocol::HISTORY_FIELDS {
             if let Some(items) = record.get_mut(field).and_then(Value::as_array_mut) {
@@ -147,8 +166,8 @@ impl ThreadProjection {
         Self {
             record: Arc::new(record),
             fields,
-            structure: 0,
-            content: 0,
+            structure: revision,
+            content: revision,
             structural: true,
             items_changed: None,
             record_changed: true,
@@ -274,10 +293,6 @@ struct View {
     installed: Option<Installed>,
     /// Change markers accumulated since this thread's last emission.
     pending: PendingDelta,
-    /// Per-view monotonic clock; revisions point at the install that moved.
-    clock: u64,
-    structure_rev: u64,
-    content_rev: u64,
     fields: Value,
     fields_sequence: u64,
     cursor: Option<String>,
@@ -500,7 +515,19 @@ impl ProjectionCache {
                 let items = Arc::make_mut(installed.fields.get_mut(field).unwrap());
                 counters.fields_spliced += 1;
                 let pos = Self::item_pos(items, ordinal, &sid).expect("installed position");
-                installed.item_bytes += bytes.saturating_sub(slot.bytes);
+                pending.structural |= [
+                    "anchor",
+                    "start",
+                    "offset",
+                    "block",
+                    "order",
+                    "deferredWork",
+                    "role",
+                    "kind",
+                ]
+                .iter()
+                .any(|key| items.items[pos].get(*key) != item.get(*key));
+                installed.item_bytes = installed.item_bytes.saturating_sub(slot.bytes) + bytes;
                 items.items[pos] = Arc::new(item);
                 installed.slot.get_mut(&sid).unwrap().bytes = bytes;
                 pending.items.entry(field).or_default().insert(sid);
@@ -619,7 +646,6 @@ impl ProjectionCache {
         installed: &mut Installed,
         counters: &mut ProjectionCounters,
         structural: &mut bool,
-        content: &mut bool,
     ) {
         for field in ["tools", "thoughts", "compactions", "work"] {
             let Some(items) = installed.fields.get_mut(field) else {
@@ -682,10 +708,12 @@ impl ProjectionCache {
                             }
                             let bytes = serde_json::to_string(&item).map(|t| t.len()).unwrap_or(0);
                             if let Some(slot) = installed.slot.get_mut(&sid) {
-                                installed.item_bytes += bytes.saturating_sub(slot.bytes);
+                                installed.item_bytes =
+                                    installed.item_bytes.saturating_sub(slot.bytes) + bytes;
                                 slot.bytes = bytes;
                             }
                             items.items[index] = Arc::new(item);
+                            view.pending.structural = true;
                             view.pending.items.entry(field).or_default().insert(sid);
                             counters.items_written += 1;
                             index += 1;
@@ -696,7 +724,6 @@ impl ProjectionCache {
             installed.fields.insert(field, items);
         }
         *structural |= view.pending.structural;
-        *content |= !view.pending.items.is_empty();
         // Anchored rows that were held back retry against the new window.
         let held: Vec<Arc<str>> = installed.held.iter().cloned().collect();
         for sid in held {
@@ -840,7 +867,6 @@ impl ProjectionCache {
         };
         let mut installed = view.installed.take().unwrap_or_default();
         let mut structural = false;
-        let mut content = false;
         if installed.scalars.is_null() {
             installed.scalars = view.fields.clone();
             installed.scalars_sequence = view.fields_sequence;
@@ -850,14 +876,12 @@ impl ProjectionCache {
             view.pending.structural = true;
             view.pending.record = true;
             structural = true;
-            content = true;
         }
         if installed.scalars_sequence != view.fields_sequence {
             installed.scalars = view.fields.clone();
             installed.scalars_sequence = view.fields_sequence;
             installed.scalars_bytes = view.fields.to_string().len();
             view.pending.record = true;
-            content = true;
         }
         let reconcile = std::mem::take(&mut view.reconcile);
         if !reconcile.is_empty() {
@@ -888,28 +912,15 @@ impl ProjectionCache {
                 }
             }
             if messages_moved {
-                Self::reanchor(
-                    view,
-                    &mut installed,
-                    &mut self.counters,
-                    &mut structural,
-                    &mut content,
-                );
+                Self::reanchor(view, &mut installed, &mut self.counters, &mut structural);
             }
             for sid in anchored {
                 Self::upsert_row(view, &mut installed, &mut self.counters, &sid);
             }
             structural |= view.pending.structural;
-            content |= !view.pending.items.is_empty();
         }
         Self::recompute_deferred(view, &mut installed, self.deferred_work);
-        view.clock += 1;
-        if structural {
-            view.structure_rev = view.clock;
-        }
-        if content || structural {
-            view.content_rev = view.clock;
-        }
+        view.pending.structural |= structural;
         installed.bytes = installed
             .scalars_bytes
             .saturating_add(installed.item_bytes)
@@ -1612,8 +1623,6 @@ impl ProjectionCache {
                         }
                         let mut fields = HashMap::new();
                         let mut deferred: Option<Vec<Value>> = None;
-                        let mut structure_rev = 0;
-                        let mut content_rev = 0;
                         let mut structural = true;
                         let mut items_changed = None;
                         let mut record_changed = true;
@@ -1636,8 +1645,6 @@ impl ProjectionCache {
                                 "workLoading": if self.deferred_work { "deferred" } else { "inline-legacy" },
                             });
                             let pending = std::mem::take(&mut view.pending);
-                            structure_rev = view.structure_rev;
-                            content_rev = view.content_rev;
                             structural = pending.structural;
                             items_changed = (!pending.all).then(|| Arc::new(pending.items));
                             record_changed = pending.record;
@@ -1646,6 +1653,26 @@ impl ProjectionCache {
                             thread["historyRetry"] = json!({"count":retry.attempts,"limit":1,"fullRestarts":retry.restarts,
                                 "stopped":retry.blocked,"error":retry.error});
                         }
+                        // Invalidation is relative to emitted state, while UI
+                        // application compares Arcs to its own last apply.
+                        // A full snapshot invalidates even unchanged item IDs.
+                        structural |= rebuild;
+                        if let Some(previous) = self.emitted.get(&id) {
+                            structural |= previous.record["harness_state"]["workRetries"]
+                                != thread["harness_state"]["workRetries"];
+                        }
+                        if rebuild {
+                            items_changed = None;
+                            record_changed = true;
+                        }
+                        let content_rev = next_revision();
+                        let structure_rev = if structural {
+                            content_rev
+                        } else {
+                            self.emitted
+                                .get(&id)
+                                .map_or(content_rev, |old| old.structure)
+                        };
                         if let Some(previous) = self.emitted.get(&id) {
                             for (name, items) in &fields {
                                 if previous

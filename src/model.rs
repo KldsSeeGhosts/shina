@@ -958,6 +958,9 @@ pub struct Thread {
     /// rebuilds items that did not change.
     pub(crate) transcript_fields:
         std::collections::HashMap<&'static str, std::sync::Arc<crate::client_history::FieldItems>>,
+    /// Last successfully applied source, not the network's previous emission.
+    pub(crate) transcript_projection:
+        Option<std::sync::Arc<crate::client_history::ThreadProjection>>,
     /// Structure and content revisions of the last applied emission; the
     /// timeline consumer (#25) diffs these instead of rescanning items.
     pub(crate) transcript_structure: u64,
@@ -1511,6 +1514,7 @@ impl Thread {
             thoughts: vec![],
             work: vec![],
             transcript_fields: std::collections::HashMap::new(),
+            transcript_projection: None,
             transcript_structure: 0,
             transcript_content: 0,
             draft: crate::composer_rich::draft(""),
