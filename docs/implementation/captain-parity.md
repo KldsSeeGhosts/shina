@@ -422,11 +422,24 @@ patch parents or grows arrays. Regression tests compare the committed snapshot,
 the runtime baseline and a strict subscriber across a full create followed by a
 scoped change, plus a new thread discovered inside a scoped poll.
 
-## Verification baseline
+## Verification
 
-At commit `c710261`, before integration of this batch, `cargo build`,
-`cargo fmt --check` and the full `cargo test` suite passed on the local Apple
-Silicon Mac. The test run included 98 passing server-runtime integration tests.
-Paid provider smoke tests remain opt-in. Re-run the required checks after
-integrating implementation commits; this baseline is not verification of those
-changes.
+The acceptance tree after `6a379b8` (projection invariant), `25e1085`
+(capability corrections) and `fc34741` (four-adapter workflow coverage) passed
+on the local Apple Silicon Mac:
+
+- `cargo build`
+- `cargo fmt --check`
+- `cargo test`: 2,004 unit tests and 109 server-runtime integration tests, zero
+  failures. `npm ci` installed the locked `ws` dev dependency under
+  `packages/mobile-client` so the live mobile SDK test could run.
+
+The strict-subscriber reproduction failed before the projection fix at
+sequence 48 with `index/threads/5/lifecycle` against a baseline containing
+thread ids 1 through 5. The fixed runtime promotes the scoped new-thread batch
+to a full projection and merges index metadata by id; the same scenario now
+installs through strict `protocol::apply` and matches the committed snapshot,
+the runtime baseline and the subscriber.
+
+Paid provider smoke tests remain opt-in. No issue was closed and no PR was
+published from this worktree.
