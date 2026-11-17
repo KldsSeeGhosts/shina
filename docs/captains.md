@@ -6,6 +6,10 @@ A Thread is a conversation backed by Pi or an ACP session. A captain's home is a
 
 When machines are linked, the new captain editor's "Lives on" row chooses its home server. The choice is read-only after creation. Folder browsing stays on that server. The Brief scope picker also lists projects on linked peers, grouped by machine. Switching the home server while creating a captain retains the profile fields and clears the previous server's workspace choice. It does not copy folders.
 
+Use **Continue on** in the active home's thread menu to send the current plain-text draft to a linked project in the Captain's scope. This selects where one turn runs. The controller keeps the same Captain, conversation, crew, and documents. The executor starts a fresh provider session in the selected project's read-only workspace using bounded recent text. The reply returns to the controller transcript. Files, attachments, and full provider session or checkout transfer are outside this action.
+
+Both servers must support `captain-continue-on-v1`. The controller must be reachable to start the turn, use controller tools, or retrieve its result. An unreachable executor doesn't release the current turn or make it safe to start another. Cancel asks the named executor to stop that run. If the executor needs the user's approval, answer through the user's own device link to that machine.
+
 ## Continuous homes and migration
 
 Opening a captain opens its primary home regardless of the sidebar's workspace filter. The index stores `captainHomes` and `captainScopes` separately from the profile. Captain ids stay stable so `memory.json` can refer to them. Migration retains unused preset profiles too, rather than deleting profiles and renumbering the roster.

@@ -171,8 +171,12 @@ impl State {
     /// The caller-facing role used by the record and by instruction selection.
     pub(crate) fn mcp_role(&self, index: usize) -> &'static str {
         let thread = &self.threads[index];
-        if thread.peer_origin.is_some() {
-            return "remote_worker";
+        if let Some(origin) = &thread.peer_origin {
+            return if origin.captain_turn {
+                "remote_captain"
+            } else {
+                "remote_worker"
+            };
         }
         let owner = thread.crew_captain.or(thread.captain);
         let phase = owner.map_or(CaptainPhase::Active, |id| self.captain_phase(id));
@@ -216,6 +220,9 @@ impl State {
             "retired_home" | "retired_crew" | "retired_worker" => RETIRED_INSTRUCTIONS,
             "worker" => WORKER_INSTRUCTIONS,
             "remote_worker" => REMOTE_WORKER_INSTRUCTIONS,
+            "remote_captain" => {
+                "This is a Captain turn on a linked executor. The controller owns the Captain, its home conversation, and crew. Use the advertised Shina tools to read state or delegate work through the controller."
+            }
             _ => THREAD_INSTRUCTIONS,
         }
     }
@@ -995,6 +1002,7 @@ mod tests {
         let id = push(state);
         let i = index(state, id);
         state.threads[i].peer_origin = Some(PeerOrigin {
+            captain_turn: false,
             device_id: "origin-device".into(),
             server_id: "origin-server".into(),
             server_label: "Origin".into(),

@@ -117,7 +117,8 @@ impl State {
                         .get(&thread.id)
                         .is_some_and(|known| known.contains(&injection.text))
                 });
-            if thread.status.busy()
+            if self.has_remote_captain_turn(thread.id)
+                || thread.status.busy()
                 || thread.native.operating()
                 || thread.worktree_bootstrapping()
                 || thread.staged_handoff.is_some()

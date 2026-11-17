@@ -208,6 +208,34 @@ pub fn render_history(items: &[&HistoricalItem], thread_id: &str, context: &str)
     parts.join("\n\n")
 }
 
+/// A linked executor starts a new provider session. Keep the recent text
+/// bounded; the controller still owns the full conversation.
+pub(crate) fn bounded_transcript_context(messages: &[crate::model::Message]) -> String {
+    let mut lines = messages
+        .iter()
+        .rev()
+        .filter(|message| matches!(message.role, "You" | "Pi"))
+        .take(12)
+        .map(|message| {
+            let end = message
+                .text
+                .floor_char_boundary(800.min(message.text.len()));
+            format!(
+                "{}: {}{}",
+                message.role,
+                &message.text[..end],
+                if end < message.text.len() {
+                    " [truncated]"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
 /// `historyResponseItems` for one message (KSG indexes `[1]` for the message itself).
 fn response_item(item: &HistoricalItem, thread_id: &str) -> Value {
     json!({

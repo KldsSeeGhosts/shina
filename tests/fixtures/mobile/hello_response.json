@@ -68,6 +68,7 @@
       "placement-v1",
       "identity-v1",
       "execution-leases-v1",
+      "captain-continue-on-v1",
       "admission-scheduler-v1"
     ],
     "controllerId": "<uuid>",

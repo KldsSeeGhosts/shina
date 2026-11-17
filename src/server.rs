@@ -1000,6 +1000,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         }
                         if minor >= u64::from(protocol::EXECUTION_LEASES_MINOR) {
                             capabilities.push(protocol::EXECUTION_LEASES);
+                            capabilities.push(protocol::CAPTAIN_CONTINUE_ON);
                         }
                         scheduling = minor >= u64::from(protocol::SCHEDULING_MINOR);
                         if scheduling { capabilities.push(protocol::SCHEDULING); }

@@ -1356,6 +1356,7 @@ mod tests {
         let remote = push(&mut runtime, &|thread| {
             thread.delegated = true;
             thread.peer_origin = Some(crate::model::remote_tasks::PeerOrigin {
+                captain_turn: false,
                 device_id: "fixture-peer".into(),
                 server_id: "fixture-server".into(),
                 server_label: "Fixture".into(),

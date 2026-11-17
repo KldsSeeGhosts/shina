@@ -951,6 +951,7 @@ fn existing_worktree_selection_runs_in_the_selected_checkout() {
 
 fn peer_origin() -> remote_tasks::PeerOrigin {
     remote_tasks::PeerOrigin {
+        captain_turn: false,
         device_id: String::new(),
         server_id: uuid::Uuid::new_v4().to_string(),
         server_label: "Home".into(),

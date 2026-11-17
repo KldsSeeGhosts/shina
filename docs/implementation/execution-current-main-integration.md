@@ -397,3 +397,20 @@ fence. During restart recovery, a fresh Pi replay with the matching brief and
 final reply can supply that observation. Missing, inconclusive, or explicitly
 non-replayed history leaves the lease uncertain. A result acknowledgement
 cannot upgrade it.
+
+## Continue on a linked executor
+
+`captain.continueOn` uses the existing controller home as the logical thread.
+Only the executor has a separate physical alias. The controller commits the
+turn and lease before peer dispatch. The same command ID replays its receipt
+without launching again. A queued or unsettled turn blocks another writer and
+blocks replacing or archiving the home. Cancel before admission proves no
+dispatch. Once admitted, the existing exact-generation stop and settlement
+rules apply.
+
+The paired fixture exercises a linked turn, checks the executor's authenticated
+controller tool call, and verifies that the controller retains its home ID and
+transcript when sending a later local turn. The controller starts a new local
+provider session for that return so stale provider history cannot overwrite the
+linked turn. The action shares bounded transcript text. It does not move
+session directories, credentials, or checkouts. Full transfer remains #35.

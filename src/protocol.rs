@@ -10,6 +10,7 @@ pub const IDENTITY_MINOR: u32 = 42;
 pub const IDENTITY: &str = "identity-v1";
 pub const EXECUTION_LEASES_MINOR: u32 = 47;
 pub const EXECUTION_LEASES: &str = "execution-leases-v1";
+pub const CAPTAIN_CONTINUE_ON: &str = "captain-continue-on-v1";
 pub const EXECUTION_LEASES_UPDATE_REQUIRED: &str =
     "Update required on the target machine before it can bind a controller execution lease.";
 pub const CAPTAIN_PEER_DOCUMENTS_MINOR: u32 = 37;
@@ -369,6 +370,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.open"
         | "captain.put"
         | "captain.scope"
+        | "captain.continueOn"
         | "captain.reset"
         | "memory.put"
         | "memory.remove"

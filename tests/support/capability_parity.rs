@@ -214,6 +214,180 @@ fn tool_names_as(url: &str, token: &str) -> Vec<String> {
 }
 
 #[test]
+fn captain_continues_on_a_linked_executor_without_creating_a_second_home() {
+    let mut home = Profile::new();
+    let mut target = Profile::new();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let (target_identity, _, mut client, _) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/continue-captain.git",
+    );
+    let thread = captain_open(&mut client, "Continue on");
+    let scope = client.command(
+        "captain.scope",
+        json!({"captain":0,"projects":[1],
+        "remoteProjects":[{"server":target_identity["serverId"],"projectId":1}]}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(scope["result"]["status"], "accepted", "{scope}");
+    let local = client.command(
+        "thread.send",
+        json!({"threadId":thread,"text":"Earlier controller turn",
+        "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(local["result"]["status"], "accepted", "{local}");
+    client.until(|state| {
+        state["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == thread && entry["status"] == "Completed")
+    });
+    let before = client.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .len();
+    let home_uid = client.snapshot["index"]["identity"]["threadIds"][thread.to_string()].clone();
+    let captain_uid = client.snapshot["index"]["identity"]["captainIds"]["0"].clone();
+
+    let id = uuid::Uuid::new_v4();
+    let action = json!({"threadId":thread,"prompt":"shina-dispatch-fixture",
+        "target":{"machine":target_identity["serverId"],"projectId":1},
+        "placement":{"mode":"shared"}});
+    let accepted = client.command("captain.continueOn", action.clone(), id);
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    assert_eq!(accepted["result"]["result"]["threadId"], thread);
+    let replay = client.command("captain.continueOn", action, id);
+    assert_eq!(replay["result"], accepted["result"]);
+    client.until(|state| {
+        state["index"]["execution"]["leases"]
+            .as_array()
+            .is_some_and(|leases| {
+                leases.iter().any(|lease| {
+                    lease["logicalThreadUid"] == home_uid
+                        && lease["logicalCaptainUid"] == captain_uid
+                        && lease["executorId"] == target_identity["serverId"]
+                        && lease["phase"] == "terminal"
+                })
+            })
+            && state["index"]["tasks"]
+                .as_array()
+                .is_some_and(|tasks| tasks.iter().all(|task| task["child_thread_id"] != thread))
+    });
+    assert_eq!(
+        client.snapshot["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before
+    );
+    assert_eq!(client.snapshot["index"]["captainHomes"]["0"], thread);
+    let records = jsonl(&target.root.join("workspace/pi-mcp-dispatch.jsonl"));
+    let probe = records
+        .iter()
+        .find(|call| call["name"] == "orchestrator_capabilities")
+        .unwrap();
+    let response: Value = serde_json::from_str(probe["result"].as_str().unwrap()).unwrap();
+    let capabilities: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        capabilities["caller"]["role"], "captain_home",
+        "{capabilities}"
+    );
+    assert_eq!(
+        capabilities["caller"]["primary_home"], true,
+        "{capabilities}"
+    );
+    let prompts = fs::read_to_string(target.root.join("workspace/fixture-prompts.jsonl")).unwrap();
+    assert_eq!(
+        prompts
+            .lines()
+            .filter(|line| line.contains("shina-dispatch-fixture"))
+            .count(),
+        1
+    );
+    assert!(prompts.contains("Earlier controller turn"), "{prompts}");
+    let mut other_device = home.client(uuid::Uuid::new_v4());
+    hello(&mut other_device, "continue-on-second-device");
+    other_device.until(|state| state["index"]["captainHomes"]["0"] == thread);
+    assert_eq!(
+        other_device.snapshot["index"]["identity"]["threadIds"][thread.to_string()],
+        home_uid
+    );
+    assert_eq!(
+        other_device.snapshot["index"]["identity"]["captainIds"]["0"],
+        captain_uid
+    );
+    let returned = other_device.command(
+        "thread.send",
+        json!({"threadId":thread,"text":"Back on the controller",
+            "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(returned["result"]["status"], "accepted", "{returned}");
+    client.until(|state| {
+        state["index"]["execution"]["leases"]
+            .as_array()
+            .is_some_and(|leases| {
+                leases.iter().any(|lease| {
+                    lease["logicalThreadUid"] == home_uid
+                        && lease["executorId"] == lease["controllerId"]
+                        && lease["generation"] == 3
+                        && lease["phase"] == "terminal"
+                })
+            })
+    });
+    let history = read_thread_history(&mut client, thread, 48_000);
+    let messages = history["messages"].as_array().unwrap();
+    let remote = messages
+        .iter()
+        .position(|message| message["text"] == "shina-dispatch-fixture")
+        .expect("remote prompt in the same home");
+    assert!(messages.len() >= remote + 4, "{history}");
+    assert_eq!(
+        messages[remote + 1]["text"],
+        "Fixture complete",
+        "{history}"
+    );
+    assert_eq!(
+        messages[remote + 2]["text"],
+        "Back on the controller",
+        "{history}"
+    );
+    assert_eq!(
+        messages[remote + 3]["text"],
+        "Fixture complete",
+        "{history}"
+    );
+    let prompts = jsonl(&home.root.join("workspace/fixture-prompts.jsonl"));
+    let local = prompts.last().unwrap().as_str().unwrap();
+    assert!(
+        local.contains("Pi: Fixture complete") && local.contains("You: shina-dispatch-fixture"),
+        "{local}"
+    );
+    assert!(local.ends_with("Back on the controller"), "{local}");
+
+    let held = client.command(
+        "thread.send",
+        json!({"threadId":thread,"text":"queue-wait-fixture","attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(held["result"]["status"], "accepted", "{held}");
+    let blocked = client.command(
+        "captain.continueOn",
+        json!({"threadId":thread,"prompt":"Must not start",
+            "target":{"machine":target_identity["serverId"],"projectId":1,"model":"fixture"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(blocked["result"]["status"], "rejected", "{blocked}");
+    home.stop();
+    target.stop();
+}
+
+#[test]
 fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
     let mut profile = Profile::new();
     fs::write(profile.root.join("use-native-approval-fixture"), "").unwrap();

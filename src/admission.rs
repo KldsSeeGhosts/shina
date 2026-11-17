@@ -1387,7 +1387,9 @@ impl State {
                 if child.archived() {
                     return Some("subject_gone".into());
                 }
-                if child.status.busy() || child.phase == "Stopping" {
+                // A linked Captain turn reports its own queue on the home.
+                // That status doesn't represent a separate provider there.
+                if !task.captain_turn() && (child.status.busy() || child.phase == "Stopping") {
                     return Some("worker_busy".into());
                 }
                 match child.placement.as_ref().map(|p| &p.phase) {
