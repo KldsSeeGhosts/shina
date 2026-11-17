@@ -1051,6 +1051,9 @@ pub struct Thread {
     pending_prompt: Option<(String, Prompt, usize)>,
     pending_injections: VecDeque<Injection>,
     injection_id: Option<String>,
+    /// Delivery markers whose prompt command reached the provider, with the
+    /// behavior actually used. Consumed into the durable operation ledger.
+    pub(super) injection_dispatches: Vec<(String, String)>,
     injection_retry_at: Option<Instant>,
     operation_deadline: Option<(&'static str, Instant)>,
     task_result: Option<&'static str>,
@@ -1583,6 +1586,7 @@ impl Thread {
             pending_prompt: None,
             pending_injections: VecDeque::new(),
             injection_id: None,
+            injection_dispatches: Vec::new(),
             injection_retry_at: None,
             operation_deadline: None,
             task_result: None,
@@ -2666,20 +2670,19 @@ impl Thread {
         }
     }
 
-    fn enqueue_injection(&mut self, text: String) {
+    fn enqueue_injection(&mut self, text: String) -> String {
         self.serial += 1;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let delivery = format!("{}-{}-{stamp}", self.id, self.serial);
         self.pending_injections.push_back(Injection {
-            text: format!(
-                "{INJECTION_PREFIX}[delivery {}-{}-{stamp}]\n{text}",
-                self.id, self.serial
-            ),
+            text: format!("{INJECTION_PREFIX}[delivery {delivery}]\n{text}"),
             shown: false,
             steer: None,
         });
+        delivery
     }
 
     fn flush_injection(&mut self) -> bool {
@@ -2737,6 +2740,10 @@ impl Thread {
             return false;
         }
         self.injection_id = Some(format!("{}-{}", self.id, self.serial));
+        if let Some(delivery) = tasks::delivery_id(&text) {
+            self.injection_dispatches
+                .push((delivery.to_owned(), behavior.to_owned()));
+        }
         let at = lifecycle::now();
         if self.life.settled() {
             self.life.unsettle(at, false);
@@ -4622,6 +4629,8 @@ pub struct State {
     task_waiters: Vec<TaskWaiter>,
     tasks: Vec<Task>,
     pub(crate) identity: crate::identity::Catalog,
+    /// Keyed control evidence, separate from the immutable saved receipts.
+    pub(crate) task_operations: Vec<tasks::TaskOperation>,
     pub recovery_notice: Option<String>,
     run_marker: Option<crate::store::RunMarker>,
     /// Recent projects, the switcher menu, and the clone sheet.
@@ -4926,6 +4935,7 @@ impl State {
             identity: crate::identity::Catalog::local(
                 &crate::store::directory().unwrap_or_default(),
             ),
+            task_operations: Vec::new(),
             recovery_notice: None,
             run_marker: None,
         };
@@ -8569,8 +8579,6 @@ impl State {
                 self.threads.push(thread);
                 self.tasks.push(task);
                 self.sync_memory_links();
-                self.start_queued_tasks();
-                self.checkpoint();
                 let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
                 if let Some(key) = request_key
                     && let Err(error) =
@@ -8578,10 +8586,14 @@ impl State {
                 {
                     return Err(self.fail_delegate_receipt(error));
                 }
+                self.checkpoint();
+                self.start_queued_tasks();
                 Ok(status)
             }
             "task_status" => {
-                let thread = &self.threads[find(self)?];
+                let thread_index = find(self)?;
+                self.reconcile_task_operations();
+                let thread = &self.threads[thread_index];
                 let task = self
                     .tasks
                     .iter()
@@ -8599,6 +8611,20 @@ impl State {
                         status_word(thread.status)
                     }
                 });
+                let mut operations: Vec<_> = task
+                    .map(|task| {
+                        self.task_operations
+                            .iter()
+                            .filter(|operation| {
+                                operation.task_id.as_deref() == Some(task.id.as_str())
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if operations.len() > 16 {
+                    operations.drain(..operations.len() - 16);
+                }
                 Ok(json!({
                     "remote":task.and_then(|task|task.remote.as_ref()),
                     "remote_state":task.and_then(|task|task.remote.as_ref()).map(|remote|remote.state.word()),
@@ -8639,6 +8665,8 @@ impl State {
                     "finished": task.map(|task| task.state.finished()).unwrap_or(thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed))),
                     "phase": thread.phase,
                     "error": task.map(|task| task.error_excerpt.as_str()).filter(|s| !s.is_empty()).or(thread.error.as_deref()),
+                    "remote_error": task.and_then(|task|task.remote.as_ref()).and_then(|remote|remote.last_error.as_deref()),
+                    "operations": operations,
                     "latest_reply": task.map(|task| task.result_excerpt.as_str()).filter(|s| !s.is_empty()).map(str::to_owned).or(reply),
                 }))
             }
@@ -8661,13 +8689,15 @@ impl State {
                         "task_status",
                         &json!({"thread_id":self.threads[index].id}),
                     )?;
-                    return self.record_task_control_receipt(
+                    let result = self.record_task_control_receipt(
                         caller_index,
                         tool,
                         request_key,
                         args,
                         &status,
-                    );
+                    )?;
+                    self.start_queued_tasks();
+                    return Ok(result);
                 }
                 if !self.owns_child(caller, index) {
                     return Err(format!(
@@ -8675,18 +8705,18 @@ impl State {
                         self.threads[index].id
                     ));
                 }
-                let thread = &mut self.threads[index];
                 if tool == "task_cancel" {
-                    thread.stop_task()?;
+                    self.threads[index].stop_task()?;
                 } else {
                     let message = args["message"]
                         .as_str()
                         .map(str::trim)
                         .filter(|m| !m.is_empty())
                         .ok_or("message must contain a correction or follow-up brief.")?;
-                    if let Some(request) = thread.request.as_ref().filter(|r| {
+                    let request = self.threads[index].request.clone().filter(|r| {
                         matches!(r["method"].as_str(), Some("input" | "editor" | "select"))
-                    }) {
+                    });
+                    if let Some(request) = request {
                         if request["method"] == "select"
                             && !request["options"].as_array().is_some_and(|choices| {
                                 choices
@@ -8696,13 +8726,16 @@ impl State {
                         {
                             return Err("Choose one of the crew question's listed options.".into());
                         }
-                        thread.respond(json!({"value":message}));
-                        if thread.request.is_some() {
-                            return Err(thread
+                        self.threads[index].respond(json!({"value":message}));
+                        if self.threads[index].request.is_some() {
+                            let error = self.threads[index]
                                 .error
                                 .clone()
-                                .unwrap_or_else(|| "Could not answer the crew question.".into()));
+                                .unwrap_or_else(|| "Could not answer the crew question.".into());
+                            self.reject_caller_operation(caller_index, request_key, &error);
+                            return Err(error);
                         }
+                        self.mark_caller_operation_dispatched(caller_index, request_key, "answer");
                         let status = self.mcp_call(
                             caller,
                             "task_status",
@@ -8716,17 +8749,20 @@ impl State {
                             &status,
                         );
                     }
-                    if !thread.status.busy() {
-                        thread.arm_task();
-                        if thread.status == Status::Failed && thread.pi.is_some() {
-                            thread.status = Status::Ready;
-                            thread.error = None;
+                    if !self.threads[index].status.busy() {
+                        self.threads[index].arm_task();
+                        if self.threads[index].status == Status::Failed
+                            && self.threads[index].pi.is_some()
+                        {
+                            self.threads[index].status = Status::Ready;
+                            self.threads[index].error = None;
                         }
                     }
-                    thread.enqueue_injection(format!(
+                    let delivery = self.threads[index].enqueue_injection(format!(
                         "Shina: message from parent #{caller}\n\n{message}"
                     ));
-                    if thread.pi.is_none() {
+                    self.attach_caller_operation_delivery(caller_index, request_key, &delivery);
+                    if self.threads[index].pi.is_none() {
                         self.connect_thread(index);
                     }
                 }
@@ -8893,6 +8929,7 @@ impl State {
         for thread in &mut self.threads {
             changed |= thread.flush_injection();
         }
+        changed |= self.reconcile_task_operations();
         changed |= self.poll_context_imports();
         changed
     }
@@ -15128,6 +15165,7 @@ impl State {
         });
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
+        index["taskOperations"] = json!(self.task_operations);
         index["serverEpoch"] = json!(self.server_epoch);
         index["serverSeq"] = json!(self.server_seq);
         index["recoveredInputs"] = json!(self.recovered_inputs);

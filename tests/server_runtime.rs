@@ -3644,6 +3644,15 @@ fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
     assert_eq!(first["result"]["status"], "accepted", "{first}");
     assert_eq!(first["result"]["result"]["task_id"], task_id);
     assert_ne!(first["result"]["result"]["attempt_id"], first_attempt);
+    assert_eq!(first["result"]["result"]["operation"]["saved"], true);
+    assert_eq!(
+        first["result"]["result"]["operation"]["requested_delivery"],
+        "follow_up"
+    );
+    assert_eq!(
+        first["result"]["result"]["operation"]["acceptance"],
+        "not_observed"
+    );
     let attempt_b = first["result"]["result"]["attempt_id"].clone();
 
     // An identical retry replays the committed receipt without another delivery.
@@ -3700,6 +3709,14 @@ fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
         uuid::Uuid::new_v4(),
     );
     assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    assert_eq!(
+        replay["result"]["result"]["operation"]["completion"],
+        "completed"
+    );
+    assert_eq!(
+        replay["result"]["result"]["control"],
+        first["result"]["result"]["control"]
+    );
     let delivered = fs::read_to_string(&child_prompts).unwrap();
     assert_eq!(
         delivered
@@ -3744,6 +3761,15 @@ fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
     );
     assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
     client.until(|state| state["index"]["tasks"][0]["state"] == "cancelled");
+    let replay = client.command(
+        "task.cancel",
+        json!({"threadId":1,"args":{"thread_id":child,"client_request_id":"cancel-wire-1","attempt_id":attempt_c}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(
+        replay["result"]["result"]["operation"]["completion"],
+        "cancelled"
+    );
     profile.stop();
 }
 

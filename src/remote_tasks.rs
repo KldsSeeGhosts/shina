@@ -631,6 +631,217 @@ mod tests {
         Ok(json!({"status":"accepted","result":value}))
     }
 
+    #[test]
+    fn remote_send_operation_keeps_transport_acceptance_separate_from_completion() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let child = state.tasks[0].child_thread_id;
+        let args = json!({"thread_id":child,"message":"remote work",
+            "client_request_id":"remote-send"});
+        let first = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(first["operation"]["dispatch"], "queued");
+        assert_eq!(first["operation"]["acceptance"], "not_observed");
+        reply(
+            &mut state,
+            "peer.thread.send",
+            accepted(json!({"threadId":9})),
+        );
+        let operation = state
+            .task_operations
+            .iter()
+            .find(|operation| operation.request_key == "remote-send")
+            .unwrap();
+        assert_eq!(operation.dispatch, "dispatched");
+        assert_eq!(operation.acceptance, "accepted");
+        assert_eq!(operation.completion, "not_observed");
+
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"acknowledged":true,"result":{"status":"completed",
+                "reply":"remote done","error":"","memorySuggestions":[]}})),
+        );
+        let operation = state
+            .task_operations
+            .iter()
+            .find(|operation| operation.request_key == "remote-send")
+            .unwrap();
+        assert_eq!(state.tasks[0].state, TaskState::Completed);
+        assert_eq!(operation.completion, "completed");
+        let replay = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["operation"]["completion"], "completed");
+    }
+
+    #[test]
+    fn remote_cancel_operation_keeps_its_attempt_after_transport_acceptance() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let child = state.tasks[0].child_thread_id;
+        let attempt = state.tasks[0].attempt_id.clone();
+        let args = json!({"thread_id":child,"client_request_id":"remote-cancel",
+            "attempt_id":attempt});
+        let first = state.mcp_call(1, "task_cancel", &args).unwrap();
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+        assert_eq!(first["operation"]["requested_delivery"], "cancel");
+        assert_eq!(first["operation"]["completion"], "not_observed");
+        assert_eq!(first["operation"]["acceptance"], "not_observed");
+        let stop_id = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .stop_command_id
+            .unwrap()
+            .to_string();
+        reply(
+            &mut state,
+            "peer.thread.stop",
+            accepted(json!({"stopped":true})),
+        );
+        let operation = state
+            .task_operations
+            .iter()
+            .find(|operation| operation.request_key == "remote-cancel")
+            .unwrap();
+        assert_eq!(operation.delivery_id.as_deref(), Some(stop_id.as_str()));
+        assert_eq!(operation.acceptance, "accepted");
+        assert_eq!(operation.completion, "cancelled");
+        assert_eq!(
+            operation.target_attempt_id.as_deref(),
+            Some(attempt.as_str())
+        );
+    }
+
+    #[test]
+    fn stale_remote_answer_is_rejected_preserved_and_refreshes_the_current_request() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let request_a = json!({"requestId":"question-a","generation":"generation-a",
+            "kind":"input","payload":{"method":"input","options":[]},"threadId":9});
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"revision":"r1","finished":false,"needsYou":true,
+                "request":request_a})),
+        );
+        let child = state.tasks[0].child_thread_id;
+        let args = json!({"thread_id":child,"message":"answer a",
+            "client_request_id":"stale-answer","request_id":"question-a",
+            "runtime_generation":"generation-a"});
+        let first = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(first["operation"]["dispatch"], "queued");
+        let send_id = state.tasks[0]
+            .remote
+            .as_ref()
+            .unwrap()
+            .send_command
+            .as_ref()
+            .unwrap()
+            .command_id
+            .to_string();
+
+        reply(
+            &mut state,
+            "peer.thread.send",
+            Err("Rejected peer.thread.send: Request or runtime generation changed.".into()),
+        );
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert!(
+            remote.send_command.is_none(),
+            "the stale answer is not retried"
+        );
+        assert!(remote.request.is_none());
+        assert!(
+            remote
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("generation changed")
+        );
+        let operation = state
+            .task_operations
+            .iter()
+            .find(|operation| operation.request_key == "stale-answer")
+            .unwrap();
+        assert_eq!(operation.acceptance, "rejected");
+        assert_eq!(operation.delivery_id.as_deref(), Some(send_id.as_str()));
+        assert!(
+            operation
+                .rejection
+                .as_deref()
+                .unwrap()
+                .contains("generation changed")
+        );
+        assert_eq!(operation.completion, "not_observed");
+        let rejection = operation.rejection.clone().unwrap();
+        let status = state
+            .mcp_call(1, "task_status", &json!({"thread_id":child}))
+            .unwrap();
+        assert!(
+            status["remote_error"]
+                .as_str()
+                .unwrap()
+                .contains("generation changed")
+        );
+        assert!(
+            status["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| {
+                    operation["request_key"] == "stale-answer"
+                        && operation["acceptance"] == "rejected"
+                })
+        );
+
+        // The next wait refreshes the live question, never the stale answer.
+        let request_b = json!({"requestId":"question-b","generation":"generation-a",
+            "kind":"input","payload":{"method":"input","options":[]},"threadId":9});
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"revision":"r2","finished":false,"needsYou":true,
+                "request":request_b})),
+        );
+        let status = state
+            .mcp_call(1, "task_status", &json!({"thread_id":child}))
+            .unwrap();
+        assert_eq!(status["request"]["requestId"], "question-b");
+        assert!(
+            state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .send_command
+                .is_none()
+        );
+
+        let replay = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["control"], first["control"]);
+        assert_eq!(replay["operation"]["acceptance"], "rejected");
+        assert_eq!(replay["current"]["request"]["requestId"], "question-b");
+
+        let snapshot = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&snapshot).unwrap();
+        let replay = restored.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["operation"]["rejection"], rejection);
+        assert_eq!(replay["current"]["request"]["requestId"], "question-b");
+    }
+
     fn captain_fixture() -> State {
         let mut state = fixture();
         state.tasks.clear();
@@ -3851,14 +4062,14 @@ impl State {
         self.next_id += 1;
         self.threads.push(thread);
         self.tasks.push(task);
-        self.start_queued_tasks();
-        self.checkpoint();
         let status = self.mcp_call(parent, "task_status", &json!({"thread_id":id}))?;
         if let Some(request) = request
             && let Err(error) = self.record_delegate_receipt(caller, request, args, &status)
         {
             return Err(self.fail_delegate_receipt(error));
         }
+        self.checkpoint();
+        self.start_queued_tasks();
         Ok(status)
     }
 
@@ -4548,6 +4759,7 @@ impl State {
             });
         }
         let peers = database.peers().unwrap_or_default();
+        let mut dispatched_operations = Vec::new();
         for task in &self.tasks {
             let Some(remote) = &task.remote else { continue };
             if (remote.stop_owed || remote.send_command.is_some())
@@ -4594,6 +4806,12 @@ impl State {
             self.peer_runtime
                 .pending
                 .insert(task.id.clone(), (command.method.clone(), receive));
+            if matches!(
+                command.method.as_str(),
+                "peer.thread.send" | "peer.thread.stop"
+            ) {
+                dispatched_operations.push(command.command_id.to_string());
+            }
             let peer = peers
                 .iter()
                 .find(|p| p.server_id == remote.server_id)
@@ -4647,6 +4865,9 @@ impl State {
                 let _ = send.send(result);
                 wake();
             });
+        }
+        for delivery in dispatched_operations {
+            self.mark_operation_dispatched(&delivery);
         }
     }
 
@@ -4739,6 +4960,8 @@ impl State {
             })
             .collect();
         let mut document_requests = Vec::new();
+        let mut accepted_operations = Vec::new();
+        let mut rejected_operations: Vec<(String, String)> = Vec::new();
         for (id, method, result) in ready {
             self.peer_runtime.pending.remove(&id);
             self.peer_runtime.followers.remove(&id);
@@ -4746,6 +4969,11 @@ impl State {
                 continue;
             };
             let remote = task.remote.as_mut().expect("remote task");
+            let send_delivery = remote
+                .send_command
+                .as_ref()
+                .map(|command| command.command_id.to_string());
+            let stop_delivery = remote.stop_command_id.map(|id| id.to_string());
             let result = result.and_then(|receipt| {
                 if receipt["status"] == "accepted"
                     || method == "peer.thread.launch"
@@ -4799,6 +5027,9 @@ impl State {
                             }
                         }
                         "peer.thread.stop" => {
+                            if let Some(delivery) = &stop_delivery {
+                                accepted_operations.push(delivery.clone());
+                            }
                             remote.stop_owed = false;
                             remote.stop_command_id = None;
                             remote.stop_attempt_id = None;
@@ -4811,6 +5042,9 @@ impl State {
                             remote.next_retry_at = 0;
                         }
                         "peer.thread.send" => {
+                            if let Some(delivery) = &send_delivery {
+                                accepted_operations.push(delivery.clone());
+                            }
                             remote.send_command = None;
                             remote.request = None;
                             remote.needs_you = false;
@@ -4942,7 +5176,17 @@ impl State {
                     }
                 }
                 Err(error) => {
+                    let operation_delivery = if method == "peer.thread.send" {
+                        send_delivery.as_ref()
+                    } else if method == "peer.thread.stop" {
+                        stop_delivery.as_ref()
+                    } else {
+                        None
+                    };
                     if error.contains("Update required on ") {
+                        if let Some(delivery) = operation_delivery {
+                            rejected_operations.push((delivery.clone(), error.clone()));
+                        }
                         remote.state = RemoteState::UpdateRequired;
                         remote.last_error = Some(error);
                         remote.next_retry_at = lifecycle::now() + 30_000;
@@ -4952,6 +5196,9 @@ impl State {
                         // The owed stop named an attempt the target already
                         // left behind. Clearing it is a decision, not a retry:
                         // the newer work the caller did not observe stays live.
+                        if let Some(delivery) = &stop_delivery {
+                            rejected_operations.push((delivery.clone(), error.clone()));
+                        }
                         remote.stop_owed = false;
                         remote.stop_command_id = None;
                         remote.stop_attempt_id = None;
@@ -4963,9 +5210,14 @@ impl State {
                         && (error.contains("generation changed")
                             || error.contains("Request expired"))
                     {
+                        if let Some(delivery) = &send_delivery {
+                            rejected_operations.push((delivery.clone(), error.clone()));
+                        }
                         remote.send_command = None;
                         remote.request = None;
                         remote.wait_revision = None;
+                        remote.last_error = Some(error.chars().take(1000).collect());
+                        remote.state = RemoteState::Running;
                         remote.next_retry_at = 0;
                         continue;
                     }
@@ -4984,6 +5236,9 @@ impl State {
                             || error.contains("cannot accept steering")
                             || error.contains("Unknown peer delivery mode"))
                     {
+                        if let Some(delivery) = &send_delivery {
+                            rejected_operations.push((delivery.clone(), error.clone()));
+                        }
                         remote.send_command = None;
                         remote.last_error = Some(error);
                         remote.next_retry_at = 0;
@@ -4994,6 +5249,9 @@ impl State {
                         || error.contains("Unknown peer thread.")
                         || error.starts_with("Rejected peer.thread.launch")
                         || error.contains("Permission denied");
+                    if final_error && let Some(delivery) = operation_delivery {
+                        rejected_operations.push((delivery.clone(), error.clone()));
+                    }
                     remote.last_error = Some(error.chars().take(1000).collect());
                     if final_error {
                         remote.state = if error.contains("Authentication denied") {
@@ -5012,6 +5270,21 @@ impl State {
                     }
                 }
             }
+        }
+        for delivery in accepted_operations {
+            changed |= self.mark_operation_accepted_requested(&delivery);
+        }
+        for (delivery, error) in rejected_operations {
+            changed |= self.mark_operation_rejected(&delivery, "acceptance", &error);
+        }
+        let terminal: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|task| task.state.finished())
+            .map(|task| (task.id.clone(), task.attempt_id.clone(), task.state))
+            .collect();
+        for (task_id, attempt, state) in terminal {
+            changed |= self.mark_operation_completion(&task_id, &attempt, state);
         }
         // Every page or denial is queued as a reply the target can deliver to
         // the held MCP call; nothing here writes the worker's thread.
