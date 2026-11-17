@@ -251,6 +251,33 @@ Any frontend implementation or design decisions are assigned to Claude Opus
 Pixel Voyage skin. Capy observations below are behavioral evidence, not
 permission to replace that design contract.
 
+### Identity storage prerequisite for #27
+
+Candidate `7c26012` adds a schema 8 sidecar and index version 5 with additive
+workspace, owner and logical record IDs. Root integration preserves the
+original worktree and keeps the candidate's changes separate from review fixes.
+This is not completion of #27. Execution leases, generation fencing and
+executor changes still need implementation.
+
+The independent review reproduced a future-version overwrite in the SQLite
+path and public record enumeration through pairing discovery. It also found
+that file-only migration wrote before full model validation. Root regressions
+reproduce these gaps before the corrections. Public discovery now retains only
+its existing bootstrap fields; authenticated `hello` retains the domain maps.
+SQLite rejects future index versions without dropping unknown fields.
+File-only migration uses the model's record, history and queued-input validators
+before writing, without starting a runtime or opening stores.
+
+Further checks reject distinct canonical checkouts sharing an ID and a changed
+controller `server-id`. Migration tests compare every original index field
+after stripping only the documented identity additions. Duplicate aliases for
+the same checkout remain supported. The owner/controller documentation now
+matches their distinct identities.
+
+Protocol minor 42 and migration 008 remain unpublished. Serialize them with
+the pending scheduler, operation-evidence and repository changes before merge.
+Do not edit a published migration to resolve a later collision.
+
 ### Strict subscriber baseline prerequisite for #32 and #24
 
 The #32 parity review reproduced a missing-parent patch after thread creation.

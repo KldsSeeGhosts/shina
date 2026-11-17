@@ -954,7 +954,7 @@ async fn supervise(
                     _ = stopped(&stop) => break,
                 } {
                     Ok((mut connected, hello)) => {
-                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"canApprove":hello["canApprove"],"canOperate":hello["canOperate"],"capabilities":hello["capabilities"]});
+                        let metadata = json!({"serverId":hello["serverId"],"binaryVersion":hello["binaryVersion"],"protocolMinor":hello["protocolMinor"],"canUpdate":hello["canUpdate"],"canApprove":hello["canApprove"],"canOperate":hello["canOperate"],"capabilities":hello["capabilities"],"workspaceId":hello["workspaceId"],"ownerId":hello["ownerId"],"controllerId":hello["controllerId"],"executorId":hello["executorId"],"identity":hello["identity"]});
                         *info.lock().expect("connection info") = metadata.clone();
                         let _ =
                             crate::store::write_atomic(&info_file, metadata.to_string().as_bytes());
@@ -2620,6 +2620,17 @@ pub fn supports_review_diff(hello: &Value) -> bool {
             capabilities
                 .iter()
                 .any(|capability| capability == protocol::REVIEW_DIFF)
+        })
+}
+
+#[allow(dead_code)] // Wire-shape helper for clients that inspect the additive identity fields.
+pub fn supports_identity(hello: &Value) -> bool {
+    hello["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == protocol::IDENTITY)
         })
 }
 

@@ -208,6 +208,42 @@ pub fn load_global(
     if let Some(database) = crate::database::for_path(&global_path) {
         return database.read("index.json");
     }
+    let index = load_global_source(directory, launch)?;
+    let persisted = global_path.is_file();
+    match index {
+        Some(index)
+            if (index["version"] == 3 || index["version"] == 4)
+                && persisted
+                && !directory.join("state.sqlite").exists() =>
+        {
+            crate::identity::migrate_file_index(directory, &index).map(Some)
+        }
+        index => Ok(index),
+    }
+}
+
+/// Non-persisting snapshot load. A v3/v4 index is upgraded in memory only.
+pub fn load_global_readonly(
+    directory: &std::path::Path,
+    launch: Option<&std::path::Path>,
+) -> Result<Option<Value>, String> {
+    let global_path = directory.join("index.json");
+    if let Some(database) = crate::database::for_path(&global_path) {
+        return database.read("index.json");
+    }
+    match load_global_source(directory, launch)? {
+        Some(index) if index["version"] == 3 || index["version"] == 4 => {
+            crate::identity::migrate_index_in_memory(directory, &index).map(Some)
+        }
+        index => Ok(index),
+    }
+}
+
+pub(crate) fn load_global_source(
+    directory: &std::path::Path,
+    launch: Option<&std::path::Path>,
+) -> Result<Option<Value>, String> {
+    let global_path = directory.join("index.json");
     if let Some(mut index) = load(&global_path)? {
         let projects = index["projects"].as_array().cloned().unwrap_or_default();
         if let Some(threads) = index["threads"].as_array_mut() {
@@ -892,7 +928,12 @@ mod tests {
         assert_eq!(global["threads"][0]["captain"], 2);
         fs::write(directory.join("index.json"), global.to_string()).unwrap();
         fs::write(&legacy, "{bad later").unwrap();
-        assert_eq!(load_global(&directory, None).unwrap().unwrap(), global);
+        let migrated = load_global(&directory, None).unwrap().unwrap();
+        assert_eq!(migrated["version"], crate::identity::INDEX_VERSION);
+        assert_eq!(migrated["threads"][0]["session"], "keep.jsonl");
+        assert_eq!(migrated["threads"][0]["captain"], 2);
+        assert_eq!(migrated["projects"].as_array().unwrap().len(), 2);
+        assert!(migrated["identity"]["workspaceId"].is_string());
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]

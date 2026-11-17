@@ -99,6 +99,13 @@ impl Database {
             return Err(error("This profile already has an open database owner."));
         }
         std::fs::create_dir_all(directory).map_err(error)?;
+        // Reject a newer file profile before creating a SQLite file that an
+        // older binary could mistake for a completed durable migration.
+        if !directory.join("state.sqlite").exists()
+            && let Some(index) = crate::store::load(&directory.join("index.json")).map_err(error)?
+        {
+            crate::identity::validate_index_version(&index).map_err(error)?;
+        }
         let mut connection = Connection::open(directory.join("state.sqlite")).map_err(error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -117,8 +124,16 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 7 {
+        if version > 8 {
             return Err(error("This schema requires a newer Shina binary."));
+        }
+        // Check the authoritative saved format before any schema migration.
+        if let Some((index, _)) = crate::identity::read_index(&connection).map_err(error)? {
+            crate::identity::validate_index_version(&index).map_err(error)?;
+        } else if let Some(index) =
+            crate::store::load(&directory.join("index.json")).map_err(error)?
+        {
+            crate::identity::validate_index_version(&index).map_err(error)?;
         }
         connection
             .execute_batch(
@@ -184,6 +199,13 @@ impl Database {
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
+        if version < 8 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/008.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
         let imported: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='legacy-import-v1')",
@@ -194,6 +216,7 @@ impl Database {
         if !imported {
             Self::import(&mut connection, directory)?;
         }
+        crate::identity::ensure_database(directory, &mut connection).map_err(error)?;
         // Process-bound effects, including committed but undispatched prompts, cannot
         // be retried safely. Honcho keeps its reconciled, stable-ID ledger separately.
         {
@@ -268,7 +291,7 @@ impl Database {
             }
         }
         // Preserve store.rs's project alias/collision migration for pre-index profiles.
-        if let Some(index) = crate::store::load_global(directory, None)? {
+        if let Some(index) = crate::store::load_global_source(directory, None)? {
             values.insert("index.json".into(), index);
         }
         crate::model::State::validate_import(directory, &values).map_err(error)?;
@@ -338,6 +361,7 @@ impl Database {
             && let Some(mut value) = crate::projection_store::read(&inner.connection, name)?
         {
             if name == "index.json" {
+                crate::identity::decorate_index(&inner.connection, &mut value)?;
                 value["serverSeq"] = json!(
                     inner
                         .connection
@@ -360,6 +384,16 @@ impl Database {
         value
             .map(|value| serde_json::from_str(&value).map_err(error))
             .transpose()
+            .and_then(|value| {
+                value
+                    .map(|mut value| {
+                        if name == "index.json" {
+                            crate::identity::decorate_index(&inner.connection, &mut value)?;
+                        }
+                        Ok(value)
+                    })
+                    .transpose()
+            })
     }
 
     pub fn write(&self, name: &str, value: Value) -> Result<(), String> {
@@ -379,6 +413,9 @@ impl Database {
         }
         let result = (|| {
             let tx = inner.connection.transaction().map_err(error)?;
+            if name == "index.json" {
+                crate::identity::sync_index(&tx, &value)?;
+            }
             tx.execute(
                 "INSERT INTO documents(name,payload) VALUES(?1,?2)
                  ON CONFLICT(name) DO UPDATE SET payload=excluded.payload",
@@ -481,6 +518,9 @@ impl Database {
             }
             for (name, value) in staged {
                 if matches!(name.as_str(), "index.json" | "server-inputs.json") {
+                    if name == "index.json" {
+                        crate::identity::sync_index(&tx, &value)?;
+                    }
                     crate::projection_store::write(&tx, &name, &value)?;
                     continue;
                 }
@@ -1367,6 +1407,15 @@ impl Database {
             .map_err(error)
     }
 
+    pub fn identity(&self) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        crate::identity::identity_value(&inner.connection)?
+            .ok_or_else(|| error("The identity sidecar is missing. Restore the matched backup."))
+    }
+
     pub fn projection(&self) -> Result<Option<Value>, String> {
         let inner = self.0.lock().expect("database");
         self.projection_locked(&inner.connection)
@@ -1375,6 +1424,12 @@ impl Database {
         if let Some(mut value) = crate::projection_store::read(connection, "workspace")? {
             value["index"] = crate::projection_store::read(connection, "workspace-index")?
                 .ok_or("Missing workspace index.")?;
+            crate::identity::decorate_index(
+                connection,
+                value
+                    .get_mut("index")
+                    .expect("workspace index inserted above"),
+            )?;
             return Ok(Some(value));
         }
         let text: Option<String> = self.read_projection_legacy(connection)?;
@@ -1527,6 +1582,7 @@ fn sync_honcho(connection: &Connection, value: &Value) -> Result<(), String> {
 }
 
 fn put_receipt(connection: &Connection, receipt: &Receipt) -> Result<(), String> {
+    crate::identity::sync_audit_subject(connection, &receipt.device_id)?;
     connection
         .execute(
             "INSERT INTO command_receipts(device,command_id,hash,payload) VALUES(?1,?2,?3,?4)
@@ -1736,19 +1792,25 @@ mod tests {
                     .unwrap()
                     .contains("Writes are blocked")
             );
-            let connection = Connection::open(directory.join("state.sqlite")).unwrap();
-            let count: i64 = connection
-                .query_row(
-                    "SELECT (SELECT count(*) FROM documents)+(SELECT count(*) FROM metadata)",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 0);
-            drop(connection);
+            if name == "index.json" {
+                assert!(!directory.join("state.sqlite").exists());
+            } else {
+                let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT (SELECT count(*) FROM documents)+(SELECT count(*) FROM metadata)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
             // A valid JSON object with the wrong version also cannot complete import.
             crate::store::write_atomic(&directory.join(name), b"{\"version\":999}").unwrap();
             assert!(Database::open(&directory).is_err());
+            if name == "index.json" {
+                assert!(!directory.join("state.sqlite").exists());
+            }
         }
     }
 
@@ -1779,12 +1841,11 @@ mod tests {
                 seq: 1,
             };
             database.begin().unwrap();
-            database
-                .write(
-                    "index.json",
-                    json!({"runtimeInputs":{"1":[{"text":"Only once"}]}}),
-                )
-                .unwrap();
+            // Vary the input payload without replacing the identity-bearing
+            // index with an incomplete document.
+            let mut index = database.read("index.json").unwrap().unwrap();
+            index["runtimeInputs"] = json!({"1":[{"text":"Only once"}]});
+            database.write("index.json", index).unwrap();
             let capture = outbox::Capture::begin();
             let (sender, receiver) = std::sync::mpsc::sync_channel(8);
             outbox::send(&sender, json!({"type":"prompt","message":"Only once"})).unwrap();
@@ -1986,7 +2047,7 @@ mod tests {
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         database
             .commit(
                 1,

@@ -4621,6 +4621,7 @@ pub struct State {
     pub restart_notice: Option<String>,
     task_waiters: Vec<TaskWaiter>,
     tasks: Vec<Task>,
+    pub(crate) identity: crate::identity::Catalog,
     pub recovery_notice: Option<String>,
     run_marker: Option<crate::store::RunMarker>,
     /// Recent projects, the switcher menu, and the clone sheet.
@@ -4641,8 +4642,11 @@ impl State {
     /// Headless snapshots read a supplied isolated profile without starting Pi or saving.
     pub fn load_snapshot(&mut self) {
         let result = (|| {
-            if let Some(index) = crate::store::load_global(&self.data_dir, None)? {
-                if index["version"] != 3 && index["version"] != 4 {
+            if let Some(index) = crate::store::load_global_readonly(&self.data_dir, None)? {
+                if index["version"] != 3
+                    && index["version"] != 4
+                    && index["version"] != crate::identity::INDEX_VERSION
+                {
                     return Err("Unsupported index version.".into());
                 }
                 self.restore_global(&index)?;
@@ -4919,6 +4923,9 @@ impl State {
             ownership_denied: false,
             runtime_stop_requested: false,
             tasks: Vec::new(),
+            identity: crate::identity::Catalog::local(
+                &crate::store::directory().unwrap_or_default(),
+            ),
             recovery_notice: None,
             run_marker: None,
         };
@@ -4930,6 +4937,7 @@ impl State {
             state.projects.next_id = 1;
         }
         state.threads[0].native.access = state.effective_access_mode(&state.threads[0]);
+        state.identity = crate::identity::Catalog::local(&state.data_dir);
         if demo {
             state.populate_demo();
         }
@@ -13892,7 +13900,11 @@ impl State {
         let path = self.data_dir.join("index.json");
         let mut runtime_inputs = None;
         match crate::store::load_global(&self.data_dir, self.launch_project.as_deref()) {
-            Ok(Some(index)) if index["version"] == 3 || index["version"] == 4 => {
+            Ok(Some(index))
+                if index["version"] == 3
+                    || index["version"] == 4
+                    || index["version"] == crate::identity::INDEX_VERSION =>
+            {
                 if let Err(error) = self.restore_global(&index) {
                     self.storage_error =
                         Some(format!("{error} The index has not been overwritten."));
@@ -14017,6 +14029,10 @@ impl State {
     }
     /// Projections share record validation with session restore, but never restore navigation.
     fn restore_records(&mut self, index: &Value, restore_session: bool) -> Result<(), String> {
+        self.identity = match crate::identity::Catalog::from_index(index)? {
+            Some(catalog) => catalog,
+            None => crate::identity::catalog_from_legacy(index, &self.identity.controller_id)?,
+        };
         self.default_harness = match index.get("defaultHarness") {
             None => "pi".into(),
             Some(value) => value
@@ -15078,14 +15094,16 @@ impl State {
         scope: Option<&std::collections::HashSet<usize>>,
     ) -> Value {
         if let Some(scope) = scope {
-            return json!({"_partial":true,
+            let mut index = json!({"_partial":true,
                 "threads":self.threads.iter().filter(|t|scope.contains(&t.id)).map(Thread::stored_metadata).collect::<Vec<_>>(),
                 "threadViews":self.thread_views_scoped(Some(scope)),
                 "runtimeInputs":self.threads.iter().filter(|t|scope.contains(&t.id)).map(|t|(t.id.to_string(),t.runtime_inputs_value())).collect::<serde_json::Map<_,_>>()
             });
+            self.snapshot_identity().annotate_index(&mut index);
+            return index;
         }
         let mut index = json!({
-            "version":4, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
+            "version":crate::identity::INDEX_VERSION, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
@@ -15128,7 +15146,21 @@ impl State {
                     .collect::<serde_json::Map<_, _>>()
             );
         }
+        self.snapshot_identity().annotate_index(&mut index);
         index
+    }
+    pub(crate) fn snapshot_identity(&self) -> crate::identity::Catalog {
+        self.identity.with_current(
+            0..self.captains.len(),
+            self.projects.entries.iter().map(|project| project.id),
+            self.threads.iter().map(|thread| thread.id),
+            self.tasks.iter().map(|task| task.id.clone()),
+            self.background
+                .routines
+                .entries()
+                .iter()
+                .map(|routine| routine.id),
+        )
     }
     pub fn populate_demo(&mut self) {
         self.demo = true;
@@ -16399,7 +16431,17 @@ mod tests {
             old.threads.push(crew);
         }
         let mut index = old.snapshot();
+        index.as_object_mut().unwrap().remove("identity");
         index["version"] = 3.into();
+        for (field, uid) in [
+            ("captains", "captainUid"),
+            ("projects", "checkoutUid"),
+            ("threads", "threadUid"),
+        ] {
+            for record in index[field].as_array_mut().into_iter().flatten() {
+                record.as_object_mut().unwrap().remove(uid);
+            }
+        }
         for t in index["threads"].as_array_mut().unwrap() {
             t.as_object_mut().unwrap().remove("lifecycle");
             t["pinned"] = true.into();
@@ -20332,7 +20374,7 @@ mod tests {
             crate::store::load(&directory.join("index.json"))
                 .unwrap()
                 .unwrap()["version"],
-            4
+            crate::identity::INDEX_VERSION
         );
         {
             let mut restored = State::new(PathBuf::new(), false);

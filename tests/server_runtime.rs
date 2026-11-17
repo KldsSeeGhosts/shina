@@ -33,6 +33,14 @@ struct Profile {
     children: Vec<Child>,
 }
 
+fn reset_test_thread_identities(index: &mut Value, ids: impl IntoIterator<Item = usize>) {
+    let identities = ids
+        .into_iter()
+        .map(|id| (id.to_string(), json!(uuid::Uuid::new_v4().to_string())))
+        .collect::<serde_json::Map<_, _>>();
+    index["identity"]["threadIds"] = Value::Object(identities);
+}
+
 #[test]
 fn question_dismissal_is_negotiated_idempotent_and_starts_no_provider_turn() {
     let mut profile = Profile::new();
@@ -109,6 +117,73 @@ fn question_dismissal_is_negotiated_idempotent_and_starts_no_provider_turn() {
     );
     assert_eq!(client.snapshot["threads"][0]["status"], "Completed");
     profile.stop();
+}
+
+#[test]
+fn serve_migrates_legacy_identity_and_reopens_with_the_same_logical_ids() {
+    let mut profile = Profile::new();
+    let legacy = json!({
+        "version":4,
+        "captains":[{
+            "name":"Legacy Captain","role":"Fixture","instructions":"Preserve identity",
+            "portrait":0
+        }],
+        "captainScopes":{"0":[]},
+        "captainRemoteScopes":{},
+        "captainHomes":{"0":1},
+        "captainBooks":{},
+        "captainLifecycles":{"0":{"version":1,"phase":"active"}},
+        "captainReportPolicies":{},
+        "captainReports":[],
+        "captainQuestionAnswers":[],
+        "projects":[],
+        "threads":[{
+            "id":1,"title":"Legacy home","captain":0,"captainHome":true,
+            "project":null,"machine":"local","delegated":false,"parent":null,"session":null,
+            "lifecycle":{"createdAt":1,"updatedAt":1,"lastVisitedAt":1}
+        }],
+        "tasks":[],
+        "nextId":2,"nextProjectId":1,
+        "active":1,"tabs":[1]
+    });
+    fs::write(profile.root.join("Shina/index.json"), legacy.to_string()).unwrap();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("identity-migration-hello"),
+    );
+    assert!(
+        hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "identity-v1")
+    );
+    let identity = client.snapshot["index"]["identity"].clone();
+    let captain_uid = identity["captainIds"]["0"].clone();
+    let thread_uid = identity["threadIds"]["1"].clone();
+    assert!(captain_uid.is_string());
+    assert!(thread_uid.is_string());
+    assert_eq!(identity["workspaceId"], hello["result"]["workspaceId"]);
+    assert_eq!(identity["ownerId"], hello["result"]["ownerId"]);
+    assert_eq!(identity["controllerId"], hello["result"]["controllerId"]);
+    assert!(
+        fs::read_dir(profile.root.join("Shina/backups"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().join("state.sqlite").is_file())
+    );
+
+    profile.stop();
+    profile.launch(&["serve"]);
+    let reopened = profile.client(uuid::Uuid::new_v4());
+    let reopened_identity = reopened.snapshot["index"]["identity"].clone();
+    assert_eq!(reopened_identity["workspaceId"], identity["workspaceId"]);
+    assert_eq!(reopened_identity["ownerId"], identity["ownerId"]);
+    assert_eq!(reopened_identity["captainIds"]["0"], captain_uid);
+    assert_eq!(reopened_identity["threadIds"]["1"], thread_uid);
 }
 
 #[test]
@@ -4870,6 +4945,7 @@ fn streaming_storage_scaling() {
         index["threads"] = json!(records);
         index["threadViews"] = json!(views);
         index["nextId"] = json!(count + 1);
+        reset_test_thread_identities(&mut index, 1..=count);
         fs::write(profile.root.join("Shina/index.json"), index.to_string()).unwrap();
         fs::write(profile.root.join("measure-storage"), "").unwrap();
         profile.launch(&["serve"]);
@@ -6258,6 +6334,7 @@ fn sidebar_search_queries_full_transcripts_across_local_and_linked_servers_and_n
         v2["status"] = json!("Completed");
         v2["messages"] = json!(messages);
         index["threadViews"] = json!([v1, v2]);
+        reset_test_thread_identities(&mut index, [1, 2]);
         index
     };
     fs::write(
