@@ -349,7 +349,13 @@ ledger. Do not infer a server implementation from these client contracts.
 The complete ten-record evidence bundle was exported outside the repository.
 Keep proprietary package bytes and the large evidence bundle out of Git.
 
-## Issue #32 candidate: effective capability contracts
+## Issue #32 integration: effective capability contracts
+
+This tree ports the completed candidate `d36694a` onto published main
+`5e2eaa88`. The candidate's server projection prerequisite (`6a379b8`) was not
+replayed: main's `81c0605` already contains that fix. The port keeps main's
+schema 8 identity, schema 9 task operations and peer input intents, protocol 45
+`peer-task-evidence-v1`, and strict paged-snapshot test client unchanged.
 
 One `State` effective capability record per caller now drives what each thread
 is told and shown. `orchestrator_capabilities` returns the record as `contract`
@@ -409,37 +415,37 @@ negotiated peer feature table plus the remote leaf's contract on the target
 machine.
 
 `capacity.scheduler` reports `implemented: false`; admission stays the static
-per-coordinator limits until the separate scheduler work lands. The patch was
-kept additive under protocol minor 39; no bump was needed.
+per-coordinator limits until the separate scheduler work lands. The capability
+contract is additive under the existing protocol 45; this port changes no
+protocol constant, projection schema or migration.
 
-A separate prerequisite fixed the projection invariant. Scoped index metadata
-is now merged into the full index by thread id instead of replacing the global
-list with a filtered subset. A scoped batch that discovers a new thread is
-promoted to a full projection, so the committed snapshot and the runtime patch
-baseline announce the same thread array. The strict runtime test client installs
-paged snapshots before applying `protocol::apply`; it no longer vivifies missing
-patch parents or grows arrays. Regression tests compare the committed snapshot,
-the runtime baseline and a strict subscriber across a full create followed by a
-scoped change, plus a new thread discovered inside a scoped poll.
+The parity test also keeps a shared `NOTES.md` at 34,019 bytes. The crew prompt
+carries its exact revision, size and hash plus a `captain_document_read`
+pointer, while the tool returns the complete document. Pi's resumed session
+records the actual `--append-system-prompt` text and checks that the former
+primary home receives the earlier-home text after reset. A separate fixture
+exits before ACP `initialize` and proves dispatch re-probes before allocation;
+discovery caching cannot turn that failure into authority.
 
 ## Verification
 
-The acceptance tree after `6a379b8` (projection invariant), `25e1085`
-(capability corrections) and `fc34741` (four-adapter workflow coverage) passed
-on the local Apple Silicon Mac:
+The integrated tree passed on the local Apple Silicon Mac with isolated Cargo
+artifacts:
 
-- `cargo build`
 - `cargo fmt --check`
-- `cargo test`: 2,004 unit tests and 109 server-runtime integration tests, zero
-  failures. `npm ci` installed the locked `ws` dev dependency under
-  `packages/mobile-client` so the live mobile SDK test could run.
+- `cargo check --locked --all-targets`
+- `cargo build --locked`
+- `cargo test --locked`: 2,049 unit tests passed with 12 ignored; 119
+  server-runtime integration tests passed with zero failures. `npm ci` installed
+  the locked mobile-client dependencies, so the live TypeScript SDK test ran as
+  part of the integration suite.
+- `npm --prefix packages/mobile-client run typecheck`
 
-The strict-subscriber reproduction failed before the projection fix at
-sequence 48 with `index/threads/5/lifecycle` against a baseline containing
-thread ids 1 through 5. The fixed runtime promotes the scoped new-thread batch
-to a full projection and merges index metadata by id; the same scenario now
-installs through strict `protocol::apply` and matches the committed snapshot,
-the runtime baseline and the subscriber.
+The four harnesses are deterministic local fixtures. They prove endpoint,
+bearer, MCP request and permission-policy integration, not live provider login,
+account entitlement or model availability. Those paid smoke checks remain
+ignored and opt-in. Remote independent crew roots and scheduler admission are
+reported unavailable, not simulated.
 
 Paid provider smoke tests remain opt-in. No issue was closed and no PR was
 published from this worktree.
