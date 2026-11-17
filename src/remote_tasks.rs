@@ -5,6 +5,11 @@ use crate::protocol::Command;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+pub(super) fn input_history_key(message: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(message.as_bytes()).into()
+}
+
 fn peer_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("peer runtime"))
@@ -2849,6 +2854,130 @@ mod tests {
     }
 
     #[test]
+    fn restoring_many_input_intents_holds_the_target_thread_not_the_ledger_position() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let database = crate::database::Database::open(&state.data_dir).unwrap();
+        database.begin().unwrap();
+        for input in 0..4 {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            let mut intent = PeerTaskIntent::input(
+                command_id.clone(),
+                child,
+                Some("attempt-a".into()),
+                None,
+                None,
+                "follow_up",
+                tasks::delivery_text(&command_id, &format!("input {input}")),
+                None,
+            );
+            if input == 0 {
+                intent.queue_state = "applied".into();
+                intent.provider_state = "requested".into();
+                state.threads[1].messages.push(Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "Shina",
+                    text: intent.message.clone().unwrap(),
+                    images: Vec::new(),
+                    context: None,
+                });
+            }
+            database
+                .stage_task_input_intent(serde_json::to_value(intent).unwrap())
+                .unwrap();
+        }
+        database
+            .commit(1, &state.projection(), &json!([]), None, &[])
+            .unwrap();
+        database.begin().unwrap();
+        state.restore_peer_task_intents().unwrap();
+        assert_eq!(state.peer_task_intents.len(), 4);
+        assert!(
+            state
+                .peer_task_intents
+                .iter()
+                .all(|intent| intent.recovery == "awaiting_history")
+        );
+        assert!(
+            !state.threads[0].peer_recovery_held,
+            "the parent has no recovered target inputs"
+        );
+        assert!(state.threads[1].peer_recovery_held);
+        assert_eq!(state.threads[1].pending_injections.len(), 4);
+        database
+            .commit(2, &state.projection(), &json!([]), None, &[])
+            .unwrap();
+        state.peer_task_intents.clear();
+        state.threads[1].peer_recovery_held = false;
+        state.threads[1].pending_injections.clear();
+        database.begin().unwrap();
+        state.restore_peer_task_intents().unwrap();
+        assert!(
+            state.threads[1].peer_recovery_held,
+            "another restart must reconstruct the transient hold"
+        );
+        assert_eq!(state.threads[1].pending_injections.len(), 4);
+        database
+            .commit(3, &state.projection(), &json!([]), None, &[])
+            .unwrap();
+        drop(database);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn optimistic_local_transcript_is_not_provider_acceptance_evidence() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let command = uuid::Uuid::new_v4().to_string();
+        let message = tasks::delivery_text(&command, "not acknowledged");
+        let mut intent = PeerTaskIntent::input(
+            command.clone(),
+            child,
+            Some("attempt-a".into()),
+            None,
+            None,
+            "follow_up",
+            message.clone(),
+            None,
+        );
+        intent.queue_state = "applied".into();
+        intent.provider_state = "requested".into();
+        intent.recovery = "waiting_provider_ack".into();
+        state.stage_peer_task_intent(intent).unwrap();
+        state.threads[1].messages.push(Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: "Shina",
+            text: message.clone(),
+            images: Vec::new(),
+            context: None,
+        });
+        state.threads[1]
+            .peer_dispatches
+            .push((command, "followUp".into(), Some("run-a".into())));
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.peer_task_intents[0].provider_state, "requested");
+        assert_eq!(state.peer_task_intents[0].queue_state, "applied");
+        state.threads[1].apply(json!({"type":"response","id":"history",
+            "command":"get_messages","success":true,
+            "data":{"messages":[{"role":"assistant","content":message}]}}));
+        state.reconcile_peer_task_intents();
+        assert_eq!(
+            state.peer_task_intents[0].provider_state, "requested",
+            "a provider assistant echo is not an input record"
+        );
+        state.threads[1].apply(json!({"type":"response","id":"history",
+            "command":"get_messages","success":true,
+            "data":{"messages":[{"role":"user","content":message}]}}));
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.peer_task_intents[0].provider_state, "accepted");
+        assert_eq!(
+            state.peer_task_intents[0].provider_basis.as_deref(),
+            Some("history_replay")
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn non_authoritative_history_holds_restored_peer_input_as_unknown() {
         let mut state = fixture();
         let child = peer_worker(&mut state);
@@ -4448,9 +4577,8 @@ impl State {
                 .iter()
                 .any(|injection| injection.text == *message)
             && !self.threads[index]
-                .messages
-                .iter()
-                .any(|message| message.text == *intent.message.as_ref().expect("message"))
+                .peer_input_history
+                .contains(&input_history_key(message))
         {
             self.threads[index].pending_injections.push_back(Injection {
                 text: message.clone(),
@@ -4492,24 +4620,14 @@ impl State {
         self.peer_task_intents = intents;
         for index in 0..self.peer_task_intents.len() {
             let mut intent = self.peer_task_intents[index].clone();
-            let Some(thread) = self
+            let Some(thread_index) = self
                 .threads
                 .iter()
-                .find(|thread| thread.id == intent.thread_id)
+                .position(|thread| thread.id == intent.thread_id)
             else {
                 continue;
             };
-            if intent.kind == "input"
-                && intent
-                    .message
-                    .as_deref()
-                    .is_some_and(|message| thread.messages.iter().any(|row| row.text == message))
-            {
-                intent.provider_state = "accepted".into();
-                intent.provider_basis = Some("history_replay".into());
-                intent.queue_state = "settled".into();
-                intent.recovery = "accepted_from_history".into();
-            } else if intent.kind == "input" && intent.provider_state == "prepared" {
+            if intent.kind == "input" && intent.provider_state == "prepared" {
                 // An extension answer is not a prompt and has no stable history
                 // marker. A crash after preparing its adapter write is unknown,
                 // so restart never repeats it.
@@ -4517,24 +4635,37 @@ impl State {
                 intent.provider_basis = Some("interrupted_adapter_write".into());
                 intent.queue_state = "applied".into();
                 intent.recovery = "held_unknown".into();
-            } else if intent.kind == "input" && intent.queue_state == "queued" {
+            } else if intent.kind == "input"
+                && intent.requested_delivery != "answer"
+                && intent.queue_state != "settled"
+                && !matches!(intent.provider_state.as_str(), "accepted" | "rejected")
+            {
+                // A local displayed prompt is optimistic, not provider
+                // history. Reconcile both queued and interrupted writes
+                // against a new provider read before any dispatch.
+                intent.queue_state = "queued".into();
                 intent.recovery = "awaiting_history".into();
+                if intent.provider_state == "requested" {
+                    intent.provider_state = "unknown".into();
+                    intent.provider_basis = Some("interrupted_adapter_write".into());
+                }
             } else if intent.kind == "cancel" && intent.provider_state != "accepted" {
                 // Abort is fenced to the named attempt and safe to repeat once
                 // after restart. It still does nothing to a newer attempt.
                 intent.queue_state = "stop_pending".into();
                 intent.recovery = "recover_stop".into();
             }
-            if self.peer_task_intents[index] == intent {
-                continue;
+            if self.peer_task_intents[index] != intent {
+                intent.updated_at = lifecycle::now();
+                self.stage_peer_task_intent(intent.clone())?;
             }
-            intent.updated_at = lifecycle::now();
-            self.stage_peer_task_intent(intent.clone())?;
+            // The hold and pending queue are transient. Reconstruct them on
+            // every restart, including when the durable row did not change.
+            if intent.kind == "input" && intent.recovery == "awaiting_history" {
+                self.threads[thread_index].peer_recovery_held = true;
+            }
             self.sync_peer_intent_evidence(index);
             self.provision_peer_task_intent(&intent);
-            if intent.kind == "input" && intent.recovery == "awaiting_history" {
-                self.threads[index].peer_recovery_held = true;
-            }
         }
         Ok(())
     }
@@ -4707,10 +4838,11 @@ impl State {
                 continue;
             };
             let thread = &self.threads[thread_index];
-            let marker_present = intent
-                .message
-                .as_deref()
-                .is_some_and(|message| thread.messages.iter().any(|row| row.text == message));
+            let marker_present = intent.message.as_deref().is_some_and(|message| {
+                thread
+                    .peer_input_history
+                    .contains(&input_history_key(message))
+            });
             let origin_input = thread.peer_origin.as_ref().and_then(|origin| {
                 origin
                     .inputs

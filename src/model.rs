@@ -1109,6 +1109,9 @@ pub struct Thread {
     /// A restored peer input whose absence must be proven by authoritative
     /// provider history before it can be dispatched again.
     pub(super) peer_recovery_held: bool,
+    /// Exact input digests read from a successful provider history response.
+    /// Optimistic local transcript rows never enter this transient set.
+    pub(super) peer_input_history: std::collections::HashSet<[u8; 32]>,
     /// Peer input commands actually written to the adapter, with the realized
     /// delivery and run. Absence here never proves the provider did not read it.
     pub(super) peer_dispatches: Vec<(String, String, Option<String>)>,
@@ -1648,6 +1651,7 @@ impl Thread {
             rejected_injections: Vec::new(),
             peer_prompt: None,
             peer_recovery_held: false,
+            peer_input_history: Default::default(),
             peer_dispatches: Vec::new(),
             injection_retry_at: None,
             operation_deadline: None,
@@ -1708,6 +1712,7 @@ impl Thread {
         self.last_activity = Instant::now();
         self.state_loaded = false;
         self.history_loaded = false;
+        self.peer_input_history.clear();
         self.startup_model_applied = false;
         self.startup_thinking_applied = false;
         self.startup_selection_check = None;
@@ -3504,6 +3509,15 @@ impl Thread {
                         }
                     }
                     "get_messages" if record["id"] == "history" => {
+                        self.peer_input_history = record["data"]["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|message| message["role"] == "user")
+                            .map(|message| content_text(&message["content"]))
+                            .filter(|text| tasks::delivery_id(text).is_some())
+                            .map(|text| remote_tasks::input_history_key(&text))
+                            .collect();
                         if self.server_owned
                             && self.harness != "pi"
                             && record["data"]["replaceHistory"] != true
