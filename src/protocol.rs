@@ -3,7 +3,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 48;
+pub const MINOR: u32 = 49;
+/// Editable task plans (issue #34) are additive at protocol 1.49: the
+/// desktop reads and edits the same plan the MCP task_plan tools publish.
+pub const TASK_PLANS_MINOR: u32 = 49;
+pub const TASK_PLANS: &str = "task-plans-v1";
+pub const TASK_PLANS_UPDATE_REQUIRED: &str =
+    "Update required. Update Shina on the client and server to read or change task plans.";
 /// The logical repository catalog and executor checkout provisioning are
 /// additive at protocol 1.48, after execution leases at 1.47.
 /// The feature marker is authoritative, not the minor.
@@ -306,6 +312,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.promote.preview"
         | "captain.lifecycle.preview"
         | "execution.inspect"
+        | "task.plan"
         | "scheduling.status" => "read",
         "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
         "server.updateStatus"
@@ -410,6 +417,9 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.demote"
         | "captain.delete"
         | "execution.reconcile"
+        | "task.plan.prepare"
+        | "task.plan.update"
+        | "task.plan.start"
         | "scheduling.configure" => "operate",
         _ => return None,
     })
@@ -816,6 +826,7 @@ mod tests {
                 | "captain.lifecycle.preview"
                 | "execution.inspect"
                 | "repository.list"
+                | "task.plan"
                 | "scheduling.status" => "read",
                 "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus"

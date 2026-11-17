@@ -354,6 +354,13 @@ impl RuntimeState {
                 .execute_peer_command(device, &command)
                 .map(|result| json!({"status":"accepted","result":result}));
         }
+        if command.method == "task.plan" {
+            // A plan read is a live view, so it neither grows receipts nor commits.
+            return self
+                .state
+                .execute_command(&command)
+                .map(|result| json!({"status":"accepted","result":result}));
+        }
         if let Some(database) = &self.database {
             if let Some(receipt) = database.receipt(device, command.command_id)? {
                 if receipt.hash != command.hash() {

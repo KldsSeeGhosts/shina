@@ -132,6 +132,7 @@ const OWNER_BYPASS: &[&str] = &[
     "list_captains",
     "read_thread",
     "task_status",
+    "task_plan",
     "captain_read",
     "captain_document_read",
     "captain_crew_list",
@@ -1047,6 +1048,7 @@ mod tests {
             "task_cancel" => json!({"client_request_id":"k","thread_id":caller}),
             "task_status" => json!({"thread_id": caller}),
             "delegate_task" => json!({"prompt":"","client_request_id":"k"}),
+            "task_start" => json!({"client_request_id":"capability-probe"}),
             "captain_question_answer" => json!({
                 "reportId":"crew-x","answer":"a","expectedRevision":0,
                 "requestId":uuid::Uuid::new_v4().to_string()}),
@@ -1114,6 +1116,8 @@ mod tests {
     fn documented_argument_error(tool: &str, caller: usize) -> Vec<String> {
         match tool {
             "delegate_task" => vec!["prompt must describe the task.".into()],
+            "task_prepare" => vec!["node is required.".into()],
+            "task_update" | "task_start" => vec!["plan is required.".into()],
             "task_send" | "task_cancel" => vec![format!(
                 "Only the parent that delegated thread {caller} may cancel or send to it."
             )],

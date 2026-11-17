@@ -56,10 +56,9 @@ pub struct PlanNode {
     /// Caller-chosen key, unique inside the plan.
     pub key: String,
     pub title: String,
-    /// The complete brief the worker receives, verbatim.
+    /// The brief the worker receives before the expected outputs.
     pub brief: String,
-    /// Review metadata for the coordinator's own verification; it is plan
-    /// state, not added to the brief.
+    /// What the worker should return for the coordinator's review.
     #[serde(default)]
     pub expected_outputs: Option<String>,
     #[serde(default)]
@@ -163,7 +162,11 @@ fn plan_id_arg(args: &Value, required: bool) -> Result<Option<String>, String> {
 /// retries and restarts so a replayed or repeated launch can never allocate
 /// the node twice.
 fn plan_delegate_key(plan_id: &str, node: &str) -> String {
-    format!("plan-launch:{plan_id}:{node}")
+    let identity = json!([plan_id, node]).to_string();
+    format!(
+        "plan-launch:{}",
+        tasks::keyed_command_id("shina.plan-node", &identity)
+    )
 }
 
 fn launch_command_id(key: &str) -> uuid::Uuid {
@@ -1278,15 +1281,22 @@ impl State {
                     "plan": self.task_plan_value(plan),
                 }))
             }
-            None => Ok(json!({
-                "plans": self
-                    .task_plans
-                    .iter()
-                    .filter(|plan| plan.scope == scope)
-                    .map(|plan| self.task_plan_value(plan))
-                    .collect::<Vec<_>>(),
-            })),
+            None => Ok(self.task_plans_view(caller_index)),
         }
+    }
+
+    /// Every plan in the caller's delegate scope, exactly as `task_plan` without
+    /// a plan id returns it. The desktop panel renders this same value.
+    pub(crate) fn task_plans_view(&self, caller_index: usize) -> Value {
+        let scope = self.delegate_scope_device(caller_index);
+        json!({
+            "plans": self
+                .task_plans
+                .iter()
+                .filter(|plan| plan.scope == scope)
+                .map(|plan| self.task_plan_value(plan))
+                .collect::<Vec<_>>(),
+        })
     }
 
     /// The launch receipt commits in the same batch as the launched nodes, so
