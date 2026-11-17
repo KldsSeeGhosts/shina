@@ -479,6 +479,8 @@ test(
       assert.equal(client.commandState(commandId)?.state, "resolved");
       const stored = await client.receipt(commandId);
       assert.deepEqual(stored, first);
+      await waitFor("the deduplicated fixture turn to finish",
+        () => threadView(client, 1)?.["status"] === "Completed");
     });
 
     await t.test("a dropped ack is uncertain; resume resolves the durable outcome once", async () => {
@@ -502,6 +504,8 @@ test(
         () => promptCount(config.promptLog, "sdk-uncertain-fixture") >= 1);
       await delay(300);
       assert.equal(promptCount(config.promptLog, "sdk-uncertain-fixture"), 1);
+      await waitFor("the resolved uncertain fixture turn to finish",
+        () => threadView(client, 1)?.["status"] === "Completed");
     });
 
     await t.test("suspend and resume keep accepted work running and merge history", async () => {

@@ -40,6 +40,7 @@ impl Start {
             workspace,
             source: SessionSource::New,
             instructions: None,
+            shina: crate::mcp::INSTRUCTIONS,
             link: None,
             owner: Arc::default(),
             context_sent: false,
@@ -263,6 +264,8 @@ pub struct Start {
     pub workspace: PathBuf,
     pub source: SessionSource,
     pub instructions: Option<String>,
+    /// The role-matched Shina awareness text from the caller's effective record.
+    pub shina: &'static str,
     pub link: Option<HostLink>,
     pub owner: Arc<SessionOwner>,
     pub context_sent: bool,
@@ -296,7 +299,7 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
 fn pi_start(mut start: Start) -> Start {
     start.instructions = Some(format!(
         "{}\n\n{}",
-        crate::mcp::INSTRUCTIONS,
+        start.shina,
         start.instructions.as_deref().unwrap_or("")
     ));
     start
@@ -370,6 +373,7 @@ mod tests {
                 workspace: PathBuf::new(),
                 source,
                 instructions: persona.map(str::to_owned),
+                shina: crate::mcp::INSTRUCTIONS,
                 link: None,
                 owner: Arc::default(),
                 context_sent: false,

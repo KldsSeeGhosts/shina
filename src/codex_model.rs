@@ -331,18 +331,14 @@ impl State {
     }
 
     pub(super) fn add_harness_capabilities(&self, capabilities: &mut Value) {
-        let mut harnesses = vec![json!({"id":"pi","name":"Pi","provider":"cpa"})];
-        let codex_models = self.harness_models("codex");
-        harnesses.push(json!({"id":"codex","name":"Codex","provider":"codex",
-            "ready":!codex_models.is_empty(),"protocol":"codex.app-server"}));
-        let claude_models = self.harness_models("claude");
-        harnesses.push(json!({"id":"claude","name":"Claude","provider":"claude",
-            "ready":!claude_models.is_empty(),"available":crate::claude::process().is_ok(),
-            "protocol":"claude.stream-json"}));
-        harnesses.extend(self.harnesses.agents.iter().map(
-            |agent| json!({"id":agent.id,"name":agent.name,"provider":agent.id,"protocol":"acp"}),
-        ));
+        let harnesses = self
+            .harness_ids()
+            .iter()
+            .map(|harness| self.harness_capability(harness))
+            .collect::<Vec<_>>();
         capabilities["harnesses"] = json!(harnesses);
+        let codex_models = self.harness_models("codex");
+        let claude_models = self.harness_models("claude");
         let values = capabilities["models"].as_array_mut().expect("models array");
         for model in codex_models.into_iter().chain(claude_models) {
             if !values
@@ -1338,6 +1334,7 @@ mod tests {
     fn claude_delegation_capabilities_and_harness_inheritance() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.test_connect_pi = Some(Box::new(|_, _| Some(Pi::test_connection().0)));
         state.threads[0].harness = "claude".into();
         state.threads[0].models = vec![
             AgentModel::from_harness_value(
@@ -1416,6 +1413,7 @@ mod tests {
     fn codex_delegation_targets_inheritance_and_capabilities() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.test_connect_pi = Some(Box::new(|_, _| Some(Pi::test_connection().0)));
         state.threads[0].harness = "codex".into();
         state.threads[0].models = vec![
             AgentModel::from_harness_value(
@@ -1527,6 +1525,7 @@ mod tests {
                 workspace: state.data_dir.clone(),
                 source,
                 instructions: Some(instructions.clone()),
+                shina: crate::mcp::INSTRUCTIONS,
                 link: None,
                 owner: Arc::default(),
                 context_sent: true,
