@@ -64,7 +64,16 @@ impl GitDaemon {
             "catalog default branch\n",
         )
         .unwrap();
-        git(&repository, &["add", "release-only.txt"]);
+        fs::write(
+            repository.join("t3.json"),
+            json!({"scripts":[{
+                "name":"repository setup","command":"echo setup >> catalog-setup-runs.txt",
+                "runOnWorktreeCreate":true
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        git(&repository, &["add", "release-only.txt", "t3.json"]);
         git(&repository, &["commit", "--quiet", "-m", "release base"]);
         let base = git(&repository, &["rev-parse", "HEAD"]).trim().to_owned();
         git(&repository, &["checkout", "--quiet", "main"]);
@@ -237,6 +246,8 @@ fn remote_only_repository_clones_on_two_executors_and_replays_after_restart() {
         );
         let prompt_log = checkout.join("fixture-prompts.jsonl");
         assert_eq!(fs::read_to_string(&prompt_log).unwrap().lines().count(), 1);
+        let setup_log = checkout.join("catalog-setup-runs.txt");
+        assert_eq!(fs::read_to_string(&setup_log).unwrap().lines().count(), 1);
         assert_eq!(
             fs::read_dir(target.root.join("Shina/checkouts"))
                 .unwrap()
@@ -274,6 +285,7 @@ fn remote_only_repository_clones_on_two_executors_and_replays_after_restart() {
             1
         );
         assert_eq!(fs::read_to_string(&prompt_log).unwrap().lines().count(), 1);
+        assert_eq!(fs::read_to_string(&setup_log).unwrap().lines().count(), 1);
         assert!(checkout.exists() && bound.exists());
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]).trim(), base);
         physical.push(bound);

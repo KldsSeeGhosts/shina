@@ -119,3 +119,13 @@ ownership dependency, confirm distinct provisioning failure states, and resolve
 the setup-configuration contract without moving platform-specific paths or
 credentials into shared state. Then run the normal exact-head CI and release
 gates. No additional speculative cases are required for closure.
+
+The setup execution contract reuses repository-owned `t3.json` and the existing
+worktree-create runner. A fresh repository clone carries that configuration to
+the selected executor; the selected branch's setup runs before its provider.
+Platform-specific commands, paths and credentials are resolved on that executor.
+The catalog's optional `setup` string is descriptive metadata, not a shared shell
+command. It is not executed or copied as provider instructions.
+
+The existing two-executor clone/restart test now includes a repository setup
+script and checks one setup run per worktree before and after keyed replay.
