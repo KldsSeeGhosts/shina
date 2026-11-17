@@ -69,3 +69,22 @@ Final local validation passes the all-target build, formatting and diff checks,
 16 delta-projection tests, 14 client-history tests, the existing prepend/expand/
 image/width scroll-anchor test and the streaming sticky-bottom test. Full CI
 must run again on the updated PR head. No native frame-time claim is added.
+
+## Dispatch-only projection correction
+
+CI run `44082649873` failed the two-server stale-question test at `5a287d1`.
+Its frozen snapshot showed the answer operation still queued while the peer
+send waited behind the fixture barrier. Dispatch had already updated the
+in-memory operation before the next reducer transaction. Reconciliation staged
+that evidence in SQLite but returned no change, so a quiet batch could commit
+without publishing the global operation projection.
+
+Reconciliation now reports deferred operation changes to the reducer. The
+normal full-projection path publishes them before any peer receipt or unrelated
+event arrives. Transport and provider acceptance remain unobserved until their
+own evidence arrives. No timeout, fence or test assertion was relaxed.
+
+A deterministic regression fails before the correction and passes afterward.
+It checks the change signal, committed dispatch evidence, unchanged transport
+and acceptance fields, and one-time publication. The original live two-server
+stale-question/restart test also passes locally.
