@@ -31,7 +31,9 @@ The same Apple M5 Max host, 18 logical CPUs, macOS 27.2.1 and Rust 1.98.1 ran
 both release binaries with thin LTO and one codegen unit. Allocator counts
 include allocation/reallocation calls. Byte totals count allocation sizes and
 positive reallocation growth, not retained heap or process RSS. Initial load
-is excluded. These runs do not estimate confidence intervals or a noise floor.
+is excluded. Counting is enabled during both timed Rust runs, so latency
+includes counter overhead; uninstrumented latency was not measured. These runs
+do not estimate confidence intervals or a noise floor.
 
 ## Rust results
 
