@@ -1,0 +1,511 @@
+{
+ "issue": 26,
+ "headless": {
+  "before": {
+   "arch": "aarch64",
+   "height": 720,
+   "parts": 1000,
+   "platform": "macos",
+   "profile": "release",
+   "results": [
+    {
+     "alloc_bytes": {
+      "p50": 6404.0,
+      "p95": 7172.0
+     },
+     "allocations": {
+      "p50": 82.0,
+      "p95": 83.0
+     },
+     "counts": {
+      "built_turns": 1,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 1,
+      "views": 1
+     },
+     "fixture": "live",
+     "frame_ms": {
+      "max": 7.386375,
+      "p50": 1.089916,
+      "p95": 1.242625
+     },
+     "mounted_work_elements": 1060,
+     "phase": "scroll_only",
+     "samples": 40,
+     "total_elements": 8816
+    },
+    {
+     "alloc_bytes": {
+      "p50": 13499109.0,
+      "p95": 16625541.0
+     },
+     "allocations": {
+      "p50": 41198.0,
+      "p95": 44012.0
+     },
+     "counts": {
+      "built_turns": 40,
+      "index_builds": 4,
+      "keys": 8,
+      "row_builders": 40,
+      "views": 40
+     },
+     "fixture": "live",
+     "frame_ms": {
+      "max": 7.647917,
+      "p50": 5.434208,
+      "p95": 7.299917000000001
+     },
+     "mounted_work_elements": 1068,
+     "phase": "stream_while_scrolling",
+     "samples": 40,
+     "total_elements": 8906
+    },
+    {
+     "alloc_bytes": {
+      "p50": 16158956.0,
+      "p95": 16184986.0
+     },
+     "allocations": {
+      "p50": 43498.0,
+      "p95": 43498.0
+     },
+     "counts": {
+      "built_turns": 40,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 40,
+      "views": 40
+     },
+     "fixture": "live",
+     "frame_ms": {
+      "max": 7.912832999999999,
+      "p50": 6.503292,
+      "p95": 7.566583
+     },
+     "mounted_work_elements": 1069,
+     "phase": "output_disclosure",
+     "samples": 40,
+     "total_elements": 8919
+    },
+    {
+     "alloc_bytes": {
+      "p50": 4888.0,
+      "p95": 5272.0
+     },
+     "allocations": {
+      "p50": 75.0,
+      "p95": 76.0
+     },
+     "counts": {
+      "built_turns": 0,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 0,
+      "views": 0
+     },
+     "fixture": "completed_expanded",
+     "frame_ms": {
+      "max": 1.0874579999999998,
+      "p50": 1.0265,
+      "p95": 1.0811250000000001
+     },
+     "mounted_work_elements": 1060,
+     "phase": "scroll_only",
+     "samples": 40,
+     "total_elements": 8820
+    },
+    {
+     "alloc_bytes": {
+      "p50": 17184527.0,
+      "p95": 17206257.0
+     },
+     "allocations": {
+      "p50": 48761.0,
+      "p95": 48762.0
+     },
+     "counts": {
+      "built_turns": 40,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 40,
+      "views": 40
+     },
+     "fixture": "completed_expanded",
+     "frame_ms": {
+      "max": 7.973459,
+      "p50": 6.634,
+      "p95": 7.787208000000001
+     },
+     "mounted_work_elements": 1061,
+     "phase": "output_disclosure",
+     "samples": 40,
+     "total_elements": 8833
+    }
+   ],
+   "scope": "headless view/commit/layout CPU and allocator calls per frame; no GPU, presentation or FPS",
+   "source_revision": "ea68d9c6336abc540f1d3510dc8c9332012b97d2",
+   "width": 1280
+  },
+  "after": {
+   "arch": "aarch64",
+   "height": 720,
+   "parts": 1000,
+   "platform": "macos",
+   "profile": "release",
+   "results": [
+    {
+     "alloc_bytes": {
+      "p50": 13818.0,
+      "p95": 14202.0
+     },
+     "allocations": {
+      "p50": 120.0,
+      "p95": 121.0
+     },
+     "counts": {
+      "built_slices": 0,
+      "built_turns": 0,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 0,
+      "views": 0
+     },
+     "fixture": "live",
+     "frame_ms": {
+      "max": 0.175042,
+      "p50": 0.151666,
+      "p95": 0.16729200000000002
+     },
+     "mounted_work_elements": 55,
+     "phase": "scroll_only",
+     "samples": 40,
+     "total_elements": 789
+    },
+    {
+     "alloc_bytes": {
+      "p50": 1615408.0,
+      "p95": 2044664.0
+     },
+     "allocations": {
+      "p50": 19693.0,
+      "p95": 23955.0
+     },
+     "counts": {
+      "built_slices": 0,
+      "built_turns": 0,
+      "index_builds": 4,
+      "keys": 1020,
+      "row_builders": 520,
+      "views": 40
+     },
+     "fixture": "live",
+     "frame_ms": {
+      "max": 0.89225,
+      "p50": 0.697041,
+      "p95": 0.8901669999999999
+     },
+     "mounted_work_elements": 55,
+     "phase": "stream_while_scrolling",
+     "samples": 40,
+     "total_elements": 789
+    },
+    {
+     "alloc_bytes": {
+      "p50": 1916990.0,
+      "p95": 2114542.0
+     },
+     "allocations": {
+      "p50": 20516.0,
+      "p95": 21333.0
+     },
+     "counts": {
+      "built_slices": 97,
+      "built_turns": 0,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 460,
+      "views": 40
+     },
+     "fixture": "live",
+     "frame_ms": {
+      "max": 1.044166,
+      "p50": 0.873833,
+      "p95": 0.945458
+     },
+     "mounted_work_elements": 45,
+     "phase": "output_disclosure",
+     "samples": 40,
+     "total_elements": 698
+    },
+    {
+     "alloc_bytes": {
+      "p50": 5488.0,
+      "p95": 5872.0
+     },
+     "allocations": {
+      "p50": 75.0,
+      "p95": 76.0
+     },
+     "counts": {
+      "built_slices": 0,
+      "built_turns": 0,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 0,
+      "views": 0
+     },
+     "fixture": "completed_expanded",
+     "frame_ms": {
+      "max": 0.140667,
+      "p50": 0.131167,
+      "p95": 0.133542
+     },
+     "mounted_work_elements": 54,
+     "phase": "scroll_only",
+     "samples": 40,
+     "total_elements": 785
+    },
+    {
+     "alloc_bytes": {
+      "p50": 1894094.0,
+      "p95": 1895630.0
+     },
+     "allocations": {
+      "p50": 26653.0,
+      "p95": 26654.0
+     },
+     "counts": {
+      "built_slices": 40,
+      "built_turns": 0,
+      "index_builds": 0,
+      "keys": 0,
+      "row_builders": 520,
+      "views": 40
+     },
+     "fixture": "completed_expanded",
+     "frame_ms": {
+      "max": 1.077375,
+      "p50": 0.919625,
+      "p95": 1.0745
+     },
+     "mounted_work_elements": 55,
+     "phase": "output_disclosure",
+     "samples": 40,
+     "total_elements": 798
+    }
+   ],
+   "scope": "headless view/commit/layout CPU and allocator calls per frame; no GPU, presentation or FPS",
+   "source_revision": "ea68d9c6336abc540f1d3510dc8c9332012b97d2",
+   "width": 1280
+  }
+ },
+ "native": {
+  "scope": "rune/frame-profile RUNE_FRAME_LOG from a live window, release build, scroll frames only (frames with input events). CPU wall time per frame; no presentation timestamps and no per-frame allocation counts in this log.",
+  "host": "Mac Studio, Apple M5 Max, macOS 27.2.0, display 1920x1080 at 60.00 Hz (the only mode reported)",
+  "window": "1280x720 points, --scene long-turn-live / long-turn-expanded, isolated XDG_DATA_HOME",
+  "input": "real macOS scroll events from Computer Use: 30 half-page scrolls up, then 30 alternating, into conversation-1",
+  "binaries": {
+   "before": {
+    "source": "ea68d9c plus the two profiling scenes and fixture only",
+    "sha256": "bdb66009fa030ab1381a5f624043b72e96964c8db7e6eaf18a910aa4e0162ddd"
+   },
+   "after": {
+    "source": "this commit's tree",
+    "sha256": "0cb64c58052a6cee23d3be1678f13f48a9c05ebacf3b496c87948a81941881ca"
+   }
+  },
+  "scroll_frames": {
+   "before-live-scroll": {
+    "frames": 2988,
+    "input_frames": 102,
+    "total_ms": [
+     8.223,
+     9.029,
+     14.363
+    ],
+    "cpu_ms": [
+     8.22,
+     9.026,
+     14.298
+    ],
+    "build_ms": [
+     7.979,
+     8.792,
+     13.742
+    ],
+    "layout_ms": [
+     0.042,
+     0.077,
+     0.096
+    ],
+    "text_ms": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "view_ms": [
+     1.846,
+     2.127,
+     3.773
+    ],
+    "nodes": [
+     8812,
+     8817
+    ],
+    "shaped": [
+     0,
+     0
+    ],
+    "instances": [
+     1028,
+     1076
+    ],
+    "sha256": "e0ae7d3e42997942c37f978e2c8dbd61e4fb593ac0a57b97ceb20abc772c6071"
+   },
+   "after-live-scroll": {
+    "frames": 789,
+    "input_frames": 107,
+    "total_ms": [
+     1.166,
+     1.473,
+     4.1
+    ],
+    "cpu_ms": [
+     1.164,
+     1.471,
+     4.026
+    ],
+    "build_ms": [
+     0.959,
+     1.209,
+     3.46
+    ],
+    "layout_ms": [
+     0.003,
+     0.004,
+     0.037
+    ],
+    "text_ms": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "view_ms": [
+     0.458,
+     0.57,
+     1.698
+    ],
+    "nodes": [
+     582,
+     1476
+    ],
+    "shaped": [
+     0,
+     0
+    ],
+    "instances": [
+     1027,
+     1077
+    ],
+    "sha256": "49cc1dd35f50ce83e2c567cb8b2bc02ef95b69b478201ad126ab758c1a5e5ff7"
+   },
+   "before-expanded-scroll": {
+    "frames": 145,
+    "input_frames": 104,
+    "total_ms": [
+     2.477,
+     3.474,
+     9.99
+    ],
+    "cpu_ms": [
+     2.475,
+     3.473,
+     9.987
+    ],
+    "build_ms": [
+     2.243,
+     3.137,
+     9.498
+    ],
+    "layout_ms": [
+     0.0,
+     0.0,
+     0.117
+    ],
+    "text_ms": [
+     0.0,
+     0.0,
+     0.049
+    ],
+    "view_ms": [
+     0.0,
+     0.0,
+     0.647
+    ],
+    "nodes": [
+     8916,
+     8917
+    ],
+    "shaped": [
+     0,
+     1
+    ],
+    "instances": [
+     1036,
+     1078
+    ],
+    "sha256": "98391b9c4fe9cde02b7958517e3f286823d786c9d29aecbcc5b0c1f789979365"
+   },
+   "after-expanded-scroll": {
+    "frames": 167,
+    "input_frames": 103,
+    "total_ms": [
+     0.571,
+     0.987,
+     2.295
+    ],
+    "cpu_ms": [
+     0.566,
+     0.984,
+     2.295
+    ],
+    "build_ms": [
+     0.329,
+     0.601,
+     1.841
+    ],
+    "layout_ms": [
+     0.0,
+     0.0,
+     0.277
+    ],
+    "text_ms": [
+     0.0,
+     0.0,
+     0.111
+    ],
+    "view_ms": [
+     0.0,
+     0.0,
+     0.919
+    ],
+    "nodes": [
+     663,
+     663
+    ],
+    "shaped": [
+     0,
+     3
+    ],
+    "instances": [
+     1036,
+     1078
+    ],
+    "sha256": "73cddacea9c22095f648fce39a285a2c22d587b1a63383870ea347a0075fd573"
+   }
+  },
+  "metric_format": "[p50, p95, max] ms for timings; [p50, max] for counts"
+ }
+}

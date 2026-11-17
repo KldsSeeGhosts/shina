@@ -4959,17 +4959,11 @@ fn target_queued_input_survives_restart_and_keyed_retry_without_loss_or_duplicat
     let _ = fs::remove_file(home.root.join("Shina/server.json"));
     fs::write(&gate, b"release").unwrap();
     target.launch(&["serve", "--port", &port_arg]);
-    home.launch(&["serve"]);
-    let _target_client = target.client(uuid::Uuid::new_v4());
-    let mut client = home.client(uuid::Uuid::new_v4());
-    let retried = client.command(
-        "task.send",
-        json!({"threadId":parent,"args":send.clone()}),
-        uuid::Uuid::new_v4(),
-    );
-    assert_eq!(retried["result"]["status"], "accepted", "{retried}");
-    assert_eq!(retried["result"]["result"]["replayed"], true, "{retried}");
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    captain_contract::hello(&mut target_client, "recovered-target");
 
+    // Keep the home down until the resumed provider run has finished. The
+    // first wait must carry the input evidence through completion collection.
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let text = fs::read_to_string(&prompts).unwrap_or_default();
@@ -4996,6 +4990,26 @@ fn target_queued_input_survives_restart_and_keyed_retry_without_loss_or_duplicat
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    let attempt = queued["result"]["result"]["attempt_id"].clone();
+    target_client.until(|state| {
+        state["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|thread| {
+                let result = &thread["peerOrigin"]["result"];
+                result["attemptId"] == attempt && result["status"] == "completed"
+            })
+    });
+    home.launch(&["serve"]);
+    let mut client = home.client(uuid::Uuid::new_v4());
+    let retried = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":send.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(retried["result"]["status"], "accepted", "{retried}");
+    assert_eq!(retried["result"]["result"]["replayed"], true, "{retried}");
     client.until_sequence(retried["result"]["seq"].as_u64().unwrap(), |state| {
         state["index"]["tasks"]
             .as_array()

@@ -1040,6 +1040,8 @@ pub struct Thread {
     /// timeline consumer (#25) diffs these instead of rescanning items.
     pub(crate) transcript_structure: u64,
     pub(crate) transcript_content: u64,
+    /// Derived row keys and event indexes. No transcript payloads are retained.
+    pub(crate) timeline_cache: std::cell::RefCell<crate::ui::TimelineCache>,
     pub draft: TextEdit,
     pub queued_edit: Option<QueuedEdit>,
     queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
@@ -1156,7 +1158,7 @@ pub struct Thread {
     pub(super) peer_recovery_held: bool,
     /// Exact input digests read from a successful provider history response.
     /// Optimistic local transcript rows never enter this transient set.
-    pub(super) peer_input_history: std::collections::HashSet<[u8; 32]>,
+    pub(super) peer_input_history: Option<std::collections::HashSet<[u8; 32]>>,
     /// Peer input commands actually written to the adapter, with the realized
     /// delivery and run. Absence here never proves the provider did not read it.
     pub(super) peer_dispatches: Vec<(String, String, Option<String>)>,
@@ -1676,6 +1678,7 @@ impl Thread {
             transcript_disclosures: client_state::Disclosures::default(),
             transcript_structure: 0,
             transcript_content: 0,
+            timeline_cache: Default::default(),
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             typing_guard: crate::composer::TypingGuard::default(),
@@ -1829,7 +1832,7 @@ impl Thread {
         self.last_activity = Instant::now();
         self.state_loaded = false;
         self.history_loaded = false;
-        self.peer_input_history.clear();
+        self.peer_input_history = None;
         self.startup_model_applied = false;
         self.startup_thinking_applied = false;
         self.startup_selection_check = None;
@@ -3752,15 +3755,24 @@ impl Thread {
                         }
                     }
                     "get_messages" if record["id"] == "history" => {
+                        // `history_loaded` also covers the optimistic server
+                        // transcript restored from disk. Only this response
+                        // can provide a provider-side sample for replay.
                         self.peer_input_history = record["data"]["messages"]
                             .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter(|message| message["role"] == "user")
-                            .map(|message| content_text(&message["content"]))
-                            .filter(|text| tasks::delivery_id(text).is_some())
-                            .map(|text| remote_tasks::input_history_key(&text))
-                            .collect();
+                            .filter(|_| {
+                                record["success"] == true
+                                    && record["data"]["historyReplayed"] != false
+                            })
+                            .map(|messages| {
+                                messages
+                                    .iter()
+                                    .filter(|message| message["role"] == "user")
+                                    .map(|message| content_text(&message["content"]))
+                                    .filter(|text| tasks::delivery_id(text).is_some())
+                                    .map(|text| remote_tasks::input_history_key(&text))
+                                    .collect()
+                            });
                         if self.server_owned
                             && self.harness != "pi"
                             && record["data"]["replaceHistory"] != true
@@ -6557,6 +6569,16 @@ impl State {
             return false;
         }
         self.thread_find.pending_reveal = None;
+        // A long open turn is split into rows; reveal the one holding the match.
+        let t = self.current();
+        let query = self.thread_find.query.text.trim().to_owned();
+        let mut seen = 0;
+        let row_key = crate::ui::timeline_text_row(t, msg_idx, |chunk| {
+            let hits = crate::thread_find::find_markdown_occurrences(chunk, &query).len();
+            seen += hits;
+            matched.occurrence < seen
+        })
+        .unwrap_or(row_key);
         tx.scroll_center_in_instant(
             format!("conversation-{tid}"),
             format!("{row_key}/thread-find-active"),
@@ -6580,7 +6602,11 @@ impl State {
         {
             return false;
         }
-        let Some(message) = current.messages.get(sel.message_index) else {
+        let Some(message) = current
+            .messages
+            .iter()
+            .find(|message| message.id == sel.message_id)
+        else {
             return false;
         };
         if message.id != sel.message_id || message.role != "Pi" {
@@ -6643,6 +6669,15 @@ impl State {
             }
             _ => format!("row-{id}-{}", citation.message_id),
         };
+        // A long open turn is split into rows; scroll to the one holding the quote.
+        let row_key = msg_idx
+            .and_then(|message| {
+                crate::ui::timeline_text_row(t, message, |chunk| {
+                    !crate::thread_find::find_markdown_occurrences(chunk, citation.text.trim())
+                        .is_empty()
+                })
+            })
+            .unwrap_or(row_key);
         self.citation_highlight = Some(CitationHighlight {
             machine,
             thread_id: id,

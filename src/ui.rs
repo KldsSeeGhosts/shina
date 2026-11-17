@@ -11,6 +11,36 @@ use rune::{
 use rune_kit::{Markdown, MarkdownStyle};
 use serde_json::json;
 use std::time::Duration;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct TimelineCounts {
+    views: u64,
+    keys: u64,
+    row_builders: u64,
+    built_turns: u64,
+    built_slices: u64,
+    index_builds: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TIMELINE_COUNTS: std::cell::Cell<TimelineCounts> = Default::default();
+}
+
+#[cfg(test)]
+fn timeline_count(f: impl FnOnce(&mut TimelineCounts)) {
+    TIMELINE_COUNTS.with(|cell| {
+        let mut counts = cell.get();
+        f(&mut counts);
+        cell.set(counts);
+    });
+}
+
+#[cfg(test)]
+fn take_timeline_counts() -> TimelineCounts {
+    TIMELINE_COUNTS.with(|cell| cell.replace(TimelineCounts::default()))
+}
 #[path = "attachment_archive_preview.rs"]
 mod attachment_archive_preview;
 #[path = "attachment_notebook_preview.rs"]
@@ -792,6 +822,8 @@ fn timer_label(seconds: u64) -> String {
 const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    #[cfg(test)]
+    timeline_count(|counts| counts.views += 1);
     let unloaded = s
         .current()
         .transcript_projection
@@ -799,7 +831,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .is_some_and(|projection| !projection.history_loaded);
     s.timeline_positions
         .borrow_mut()
-        .open(&s.machines.selected, s.current().id, cx, unloaded);
+        .open(&s.machines.selected, s.current().id, unloaded);
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
@@ -9689,78 +9721,22 @@ enum TranscriptPart {
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
 fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
-    let mut events: Vec<_> = t
-        .tools
-        .iter()
-        .enumerate()
-        .filter(|(_, tool)| {
-            (start..end).contains(&tool.anchor.message)
-                && tool.name.rsplit("__").next() != Some("html_preview")
-        })
-        .map(|(index, tool)| {
-            (
-                tool.anchor,
-                if tool.order == 0 {
-                    tool.block as u64
-                } else {
-                    tool.order
-                },
-                0,
-                index,
-            )
-        })
-        .collect();
-    events.extend(
-        t.thoughts
-            .iter()
-            .enumerate()
-            .filter(|(_, thought)| (start..end).contains(&thought.anchor.message))
-            .map(|(index, thought)| {
-                (
-                    thought.anchor,
-                    if thought.order == 0 {
-                        thought.block as u64
-                    } else {
-                        thought.order
-                    },
-                    1,
-                    index,
-                )
-            }),
-    );
-    events.extend(
-        t.native
-            .compactions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let anchor = crate::work::compaction_anchor(t, item);
-                (start..end).contains(&anchor.message).then_some((
-                    anchor,
-                    item["order"].as_u64().unwrap_or(u64::MAX),
-                    2,
-                    index,
-                ))
-            }),
-    );
-    events.extend(
-        crate::work::retry_events(t)
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                let anchor =
-                    serde_json::from_value::<crate::model::ToolAnchor>(item["anchor"].clone())
-                        .ok()?;
-                (start..end).contains(&anchor.message).then_some((
-                    anchor,
-                    item["order"].as_u64().unwrap_or(u64::MAX),
-                    3,
-                    index,
-                ))
-            }),
-    );
-    events.sort_by_key(|(anchor, block, _, _)| (*anchor, *block));
-    let mut events = events.into_iter().peekable();
+    turn_parts_in(t, &timeline_structure(t).events, start, end)
+}
+
+fn turn_events(events: &[TimelineEvent], start: usize, end: usize) -> &[TimelineEvent] {
+    let lo = events.partition_point(|event| event.0.message < start);
+    let hi = events.partition_point(|event| event.0.message < end);
+    &events[lo..hi]
+}
+
+fn turn_parts_in(
+    t: &Thread,
+    events: &[TimelineEvent],
+    start: usize,
+    end: usize,
+) -> Vec<TranscriptPart> {
+    let mut events = turn_events(events, start, end).iter().copied().peekable();
     let mut parts = vec![];
     for message in start..end {
         let text = &t.messages[message].text;
@@ -9902,13 +9878,11 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         )
         .on_press_tx(move |s: &mut State, tx| {
             tx.keep_on_screen(press_key.clone());
-            if let Some(tool) = s
-                .current_mut()
-                .tools
-                .iter_mut()
-                .find(|tool| tool.id == tool_id)
-            {
+            let thread = s.current_mut();
+            if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == tool_id) {
                 tool.expanded = !tool.expanded;
+                let message = tool.anchor.message;
+                thread.timeline_cache.get_mut().touch_message(message);
             }
         }),
     );
@@ -9926,6 +9900,21 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
         return inline_tool(s, p, indices[0]);
     }
     let t = s.current();
+    let mut group = tool_group_head(s, p, indices);
+    if t.tools[indices[0]].group_expanded {
+        let mut rows = col().pl(14.0).gap(0.0);
+        for index in indices {
+            rows = rows.child(inline_tool(s, p, *index));
+        }
+        group = group.child(rows);
+    }
+    group
+}
+
+/// A tool group's keyed column and summary line, without its rows. Long turns
+/// place each grouped row in its own transcript slice.
+fn tool_group_head(s: &State, p: Palette, indices: &[usize]) -> El {
+    let t = s.current();
     let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
     let first = indices[0];
     let first_id = tools[0].id.clone();
@@ -9934,7 +9923,7 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
     let summary = tool_summary(&tools);
     let toggle_key = format!("toggle-tool-group-{}-{first}", t.id);
     let press_key = toggle_key.clone();
-    let mut group = col()
+    col()
         .key(format!("tool-group-{}-{first}", t.id))
         .gap(2.0)
         .child(
@@ -9949,24 +9938,25 @@ fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
             )
             .on_press_tx(move |s: &mut State, tx| {
                 tx.keep_on_screen(press_key.clone());
-                if let Some(tool) = s
-                    .current_mut()
-                    .tools
-                    .iter_mut()
-                    .find(|tool| tool.id == first_id)
-                {
+                let thread = s.current_mut();
+                if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == first_id) {
                     tool.group_expanded = !tool.group_expanded;
+                    let message = tool.anchor.message;
+                    thread.timeline_cache.get_mut().touch_message(message);
                 }
             }),
-        );
-    if expanded {
-        let mut rows = col().pl(14.0).gap(0.0);
-        for index in indices {
-            rows = rows.child(inline_tool(s, p, *index));
-        }
-        group = group.child(rows);
+        )
+}
+
+fn message_key(thread: &Thread, index: usize) -> String {
+    match thread.messages.get(index) {
+        Some(message) => format!("message-{}-id-{}", thread.id, message.id),
+        None => format!("message-{}-boundary-{index}", thread.id),
     }
-    group
+}
+
+fn assistant_body_key(thread: &Thread, index: usize, from: usize) -> String {
+    format!("{}-body-{from}", message_key(thread, index))
 }
 
 fn transcript_part(
@@ -9984,7 +9974,6 @@ fn transcript_part(
         TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
             let chunk = &t.messages[*message].text[*from..*to];
-            let message_index = *message;
             let message_id = &t.messages[*message].id;
             let offset = *from;
             let thread_id = t.id;
@@ -10029,7 +10018,7 @@ fn transcript_part(
             };
             let memo_find = find_param.map(|(q, occ)| (q.to_owned(), occ));
             let rendered = memo(
-                format!("message-{}-{message}-body-{from}", t.id),
+                assistant_body_key(t, *message, *from),
                 (chunk, s.dark, streaming, wide, memo_find),
                 || {
                     markdown_ui::render_with_find(
@@ -10039,7 +10028,7 @@ fn transcript_part(
                         wide,
                         false,
                         streaming,
-                        &format!("{thread_id}-{message_index}-{offset}"),
+                        &format!("{thread_id}-{message_id}-{offset}"),
                         find_param,
                     )
                 },
@@ -10056,7 +10045,8 @@ fn transcript_part(
 /// What the agent is doing right now, for the live status line at the end of a turn. A
 /// running tool or thought already names itself in its own row, so the line says Working.
 fn live_status(t: &Thread) -> String {
-    if t.tools.iter().any(|tool| !tool.done && !tool.failed)
+    let _ = timeline_structure(t);
+    if !t.timeline_cache.borrow().unfinished_tools.is_empty()
         || t.thoughts.last().is_some_and(|thought| !thought.done)
     {
         return "Working".into();
@@ -10073,19 +10063,106 @@ fn live_status(t: &Thread) -> String {
 const WORK_INDENT: f32 = 14.0;
 
 fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
+    assistant_turn_piece(s, p, wide, start, end, None)
+}
+
+/// One virtual row of an assistant turn. `None` is the whole turn, as short turns
+/// show; a long live or expanded turn is a head, bounded work slices and a tail.
+fn assistant_turn_piece(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    start: usize,
+    end: usize,
+    piece: Option<TurnPiece>,
+) -> El {
     let t = s.current();
-    let parts = turn_parts(t, start, end);
-    // A captain's delegations are its answer, not its working: their task cards stay in view
-    // when the rest of the turn folds into "Worked for".
-    let html_card = |part: &TranscriptPart| {
-        matches!(part, TranscriptPart::Tools(indices) if indices.iter().all(|&i|
-                t.tools[i].resolved_kind() == crate::work::ToolKind::Html
-                && crate::html_render::find_reference(&t.tools[i].structured).is_some()))
-    };
-    let card = |part: &TranscriptPart| crew_ui::is_card_part(s, t, part) || html_card(part);
+    let structure = timeline_structure(t);
+    if let Some(TurnPiece::Work { lo, hi }) = piece {
+        return work_slice(s, p, wide, start, end, lo, hi);
+    }
+    if t.transcript_structure == 0
+        || end == t.messages.len() && t.status.busy()
+        || structure.external_turns.contains(&start)
+    {
+        return build_assistant_turn(s, p, wide, start, end, piece);
+    }
+    let revision = t.timeline_cache.borrow().turn_revision(start);
+    let captain = t
+        .captain
+        .and_then(|id| s.captains.get(id))
+        .map(|c| (&c.name, c.portrait));
+    let find = s.thread_find_active().then(|| {
+        (
+            s.thread_find.query.text.as_str(),
+            s.thread_find
+                .active_match
+                .as_ref()
+                .map(|m| (&m.entry_id, m.occurrence)),
+        )
+    });
+    let cite = s
+        .citation_highlight
+        .as_ref()
+        .map(|h| (&h.machine, h.thread_id, &h.message_id, &h.text));
+    memo(
+        format!(
+            "assistant-turn-{}{}",
+            message_key(t, start),
+            piece_suffix(piece)
+        ),
+        (
+            (structure.version, revision, start, end),
+            (
+                s.dark,
+                wide,
+                rune::memo::layout_with("chat-lane", |rect| rect[2].to_bits()),
+                s.viewport_width.to_bits(),
+                s.demo,
+            ),
+            (
+                captain,
+                t.captain_home,
+                t.archived(),
+                t.native.compaction_expanded,
+            ),
+            (t.harness.as_str(), s.working_directory(), find, cite),
+        ),
+        || build_assistant_turn(s, p, wide, start, end, piece),
+    )
+}
+
+fn piece_suffix(piece: Option<TurnPiece>) -> &'static str {
+    match piece {
+        None | Some(TurnPiece::Head) => "",
+        Some(TurnPiece::Work { .. }) => "-work",
+        Some(TurnPiece::Tail) => "-tail",
+    }
+}
+
+/// An HTML card keeps its own width and is lifted out of a folded turn.
+fn is_html_card(t: &Thread, part: &TranscriptPart) -> bool {
+    matches!(part, TranscriptPart::Tools(indices) if indices.iter().all(|&i|
+            t.tools[i].resolved_kind() == crate::work::ToolKind::Html
+            && crate::html_render::find_reference(&t.tools[i].structured).is_some()))
+}
+
+/// A captain's delegations are its answer, not its working: their task cards stay in view
+/// when the rest of the turn folds into "Worked for". It reads the thread only, so the
+/// timeline structure can split turns without the window state.
+fn is_lifted_card(t: &Thread, part: &TranscriptPart) -> bool {
+    (t.captain_home
+        && !t.delegated
+        && matches!(part, TranscriptPart::Tools(indices)
+            if indices.iter().all(|&index| crew_ui::is_delegation(&t.tools[index]))))
+        || is_html_card(t, part)
+}
+
+/// The last work part and the preamble above the fold.
+fn turn_shape(t: &Thread, parts: &[TranscriptPart]) -> (Option<usize>, Option<usize>) {
     let last_work = parts
         .iter()
-        .rposition(|part| !matches!(part, TranscriptPart::Text { .. }) && !card(part));
+        .rposition(|part| !matches!(part, TranscriptPart::Text { .. }) && !is_lifted_card(t, part));
     // Initial thinking may precede the preamble on the wire. Keep that thinking in
     // the work section, and the first text before subsequent work above its fold.
     let preamble = last_work.and_then(|last| {
@@ -10102,13 +10179,433 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 })
             })
     });
+    (last_work, preamble)
+}
+
+/// The conversation lane's gap between rows. A split turn's slices and tail rise
+/// into it from inside their own row boxes, so the virtual list's measured heights
+/// still match where rows sit, and threads without split turns keep their geometry.
+const LANE_GAP: f32 = 20.0;
+
+/// A turn at or above this many work entries splits into slice rows while it runs or
+/// while its work is open. Shorter turns stay one row with their original layout.
+const SEGMENT_MIN_ITEMS: usize = 48;
+#[cfg(test)]
+thread_local! {
+    static NEVER_SPLIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn segment_min_items() -> usize {
+    #[cfg(test)]
+    if NEVER_SPLIT.with(std::cell::Cell::get) {
+        return usize::MAX;
+    }
+    SEGMENT_MIN_ITEMS
+}
+
+/// Work entries per slice row. Rune mounts the viewport and two viewports either
+/// side, so mounted entries follow the viewport, not the turn's length.
+const SLICE_ITEMS: usize = 4;
+
+/// One entry of a turn's work column, in display order. Expanded tool groups and
+/// thought runs contribute their heading and each row separately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkItem {
+    Part(usize),
+    GroupHead(usize),
+    GroupTool(usize, usize),
+    ThoughtHead(usize),
+    ThoughtBody(usize, usize),
+}
+
+impl WorkItem {
+    fn part(self) -> usize {
+        match self {
+            Self::Part(part)
+            | Self::GroupHead(part)
+            | Self::GroupTool(part, _)
+            | Self::ThoughtHead(part)
+            | Self::ThoughtBody(part, _) => part,
+        }
+    }
+}
+
+fn work_items(
+    t: &Thread,
+    parts: &[TranscriptPart],
+    last_work: Option<usize>,
+    preamble: Option<usize>,
+    lift_cards: bool,
+) -> Vec<WorkItem> {
+    let Some(last) = last_work else {
+        return vec![];
+    };
+    let captain_home = t.captain_home && !t.delegated;
+    let mut items = Vec::with_capacity(last + 1);
+    for (index, part) in parts[..=last].iter().enumerate() {
+        if Some(index) == preamble || lift_cards && is_lifted_card(t, part) {
+            continue;
+        }
+        match part {
+            TranscriptPart::Tools(indices)
+                if indices.len() > 1
+                    && t.tools[indices[0]].group_expanded
+                    && !(captain_home
+                        && indices.iter().any(|&i| crew_ui::is_delegation(&t.tools[i]))) =>
+            {
+                items.push(WorkItem::GroupHead(index));
+                items.extend((0..indices.len()).map(|k| WorkItem::GroupTool(index, k)));
+            }
+            TranscriptPart::Thought(indices) if t.thoughts[indices[0]].expanded => {
+                items.push(WorkItem::ThoughtHead(index));
+                items.extend((0..indices.len()).map(|k| WorkItem::ThoughtBody(index, k)));
+            }
+            _ => items.push(WorkItem::Part(index)),
+        }
+    }
+    items
+}
+
+/// The space above a work entry, as the nested columns of an unsplit turn give it.
+fn work_item_gap(previous: WorkItem, item: WorkItem) -> f32 {
+    match (previous, item) {
+        (WorkItem::GroupTool(..), WorkItem::GroupTool(..)) => 0.0,
+        (_, WorkItem::ThoughtBody(..)) => 4.0,
+        _ => 2.0,
+    }
+}
+
+/// The key part of an entry that does not move when entries are added after it.
+fn work_item_id(t: &Thread, parts: &[TranscriptPart], item: WorkItem) -> String {
+    let part = &parts[item.part()];
+    match (part, item) {
+        (TranscriptPart::Tools(indices), WorkItem::GroupTool(_, k)) => {
+            format!("tool-{}", t.tools[indices[k]].id)
+        }
+        (TranscriptPart::Tools(indices), _) => format!("tools-{}", t.tools[indices[0]].id),
+        (TranscriptPart::Thought(indices), item) => {
+            let k = match item {
+                WorkItem::ThoughtBody(_, k) => k + 1,
+                _ => 0,
+            };
+            let thought = &t.thoughts[indices[0]];
+            let message = t
+                .messages
+                .get(thought.anchor.message)
+                .map_or("end", |message| message.id.as_str());
+            format!(
+                "thought-{message}-{}-{}-{k}",
+                thought.block, thought.anchor.offset
+            )
+        }
+        (TranscriptPart::Text { message, from, .. }, _) => {
+            format!("text-{}-{from}", t.messages[*message].id)
+        }
+        (TranscriptPart::Compaction(index), _) => format!("compaction-{index}"),
+        (TranscriptPart::Retry(index), _) => format!("retry-{index}"),
+    }
+}
+
+/// Whether a turn shows its work column now: always while it runs, and while its
+/// "Worked for" fold is open with its history loaded.
+fn turn_work_open(t: &Thread, structure: &TimelineStructure, start: usize, live: bool) -> bool {
+    if live {
+        return true;
+    }
+    let expanded = structure
+        .work_index
+        .get(&start)
+        .and_then(|index| t.work.get(*index))
+        .is_some_and(|work| work.expanded);
+    let (failed, loading) = structure
+        .deferred_work
+        .get(&start)
+        .copied()
+        .unwrap_or_default();
+    expanded && !failed && !loading
+}
+
+/// Matches before part `index` in the same message, so a slice numbers its find
+/// highlights as the whole message does.
+fn find_occurrence_base(t: &Thread, parts: &[TranscriptPart], index: usize, query: &str) -> usize {
+    let TranscriptPart::Text { message, .. } = parts[index] else {
+        return 0;
+    };
+    parts[..index]
+        .iter()
+        .filter_map(|part| match part {
+            TranscriptPart::Text {
+                message: m,
+                from,
+                to,
+            } if *m == message => Some(
+                crate::thread_find::find_markdown_occurrences(
+                    &t.messages[*m].text[*from..*to],
+                    query,
+                )
+                .len(),
+            ),
+            _ => None,
+        })
+        .sum()
+}
+
+/// One work entry, indented as the unsplit work column indents it.
+fn work_item(s: &State, p: Palette, wide: bool, parts: &[TranscriptPart], item: WorkItem) -> El {
+    let t = s.current();
+    let part = &parts[item.part()];
+    match (part, item) {
+        (TranscriptPart::Tools(indices), WorkItem::GroupHead(_)) => {
+            tool_group_head(s, p, indices).ml(WORK_INDENT)
+        }
+        (TranscriptPart::Tools(indices), WorkItem::GroupTool(_, k)) => col()
+            .ml(WORK_INDENT)
+            .pl(14.0)
+            .child(inline_tool(s, p, indices[k])),
+        (TranscriptPart::Thought(indices), WorkItem::ThoughtHead(_)) => col()
+            .min_w(0.0)
+            .ml(WORK_INDENT)
+            .child(work_ui::thought_head(s, p, indices)),
+        (TranscriptPart::Thought(indices), WorkItem::ThoughtBody(_, k)) => col()
+            .min_w(0.0)
+            .ml(WORK_INDENT)
+            .child(work_ui::thought_body(s, p, indices[k])),
+        (part, _) => {
+            let query = (s.thread_find_active() && !s.thread_find.query.text.trim().is_empty())
+                .then(|| s.thread_find.query.text.trim());
+            let mut base = query.map_or(0, |query| {
+                find_occurrence_base(t, parts, item.part(), query)
+            });
+            let row = transcript_part(s, p, wide, part, &mut base);
+            if matches!(part, TranscriptPart::Text { .. }) {
+                row.py(6.0)
+            } else if is_html_card(t, part) {
+                row
+            } else {
+                row.ml(WORK_INDENT)
+            }
+        }
+    }
+}
+
+/// What a slice's entries show, so a slice rebuilds only when one of them changed.
+fn work_slice_fingerprint(t: &Thread, parts: &[TranscriptPart], items: &[WorkItem]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for item in items {
+        item.hash_fields(&mut hasher);
+        match &parts[item.part()] {
+            TranscriptPart::Tools(indices) => {
+                for &i in indices {
+                    let tool = &t.tools[i];
+                    (
+                        &tool.id,
+                        tool.done,
+                        tool.failed,
+                        tool.expanded,
+                        tool.raw_expanded,
+                        tool.group_expanded,
+                        tool.output.len(),
+                        tool.detail.len(),
+                        tool.changes.len(),
+                        tool.images.len(),
+                        tool.subagents.len(),
+                        tool.exit_code,
+                    )
+                        .hash(&mut hasher);
+                }
+            }
+            TranscriptPart::Thought(indices) => {
+                for &i in indices {
+                    let thought = &t.thoughts[i];
+                    (thought.text.len(), thought.done, thought.expanded).hash(&mut hasher);
+                }
+            }
+            TranscriptPart::Text { message, from, to } => (
+                &t.messages[*message].id,
+                from,
+                to,
+                t.messages[*message].text.len(),
+            )
+                .hash(&mut hasher),
+            TranscriptPart::Compaction(index) | TranscriptPart::Retry(index) => {
+                index.hash(&mut hasher)
+            }
+        }
+    }
+    hasher.finish()
+}
+
+impl WorkItem {
+    fn hash_fields(self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match self {
+            Self::Part(i) => (0u8, i, 0usize),
+            Self::GroupHead(i) => (1, i, 0),
+            Self::GroupTool(i, k) => (2, i, k),
+            Self::ThoughtHead(i) => (3, i, 0),
+            Self::ThoughtBody(i, k) => (4, i, k),
+        }
+        .hash(hasher);
+    }
+}
+
+/// Work entries `lo..hi` of a long turn's work column, as one virtual row. The
+/// rows above and below are the turn's head and tail.
+#[allow(clippy::too_many_arguments)]
+fn work_slice(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    start: usize,
+    end: usize,
+    lo: usize,
+    hi: usize,
+) -> El {
+    let t = s.current();
+    let parts = turn_parts(t, start, end);
+    let (last_work, preamble) = turn_shape(t, &parts);
     let live = end == t.messages.len() && t.status.busy();
-    let work = t.work.iter().find(|work| work.start == start);
+    let items = work_items(t, &parts, last_work, preamble, !live);
+    let lo = lo.min(items.len());
+    let hi = hi.min(items.len());
+    // Above the first slice: the work column's place in the turn. A running turn
+    // with no captain or preamble has an empty head.
+    let top = if lo > 0 {
+        work_item_gap(items[lo - 1], items[lo])
+    } else if !live {
+        4.0
+    } else if t.captain.is_some() || preamble.is_some() {
+        12.0
+    } else {
+        0.0
+    };
+    let key = format!("work-rows-{}-{lo}", message_key(t, start));
+    let build = || {
+        #[cfg(test)]
+        timeline_count(|counts| counts.built_slices += 1);
+        let mut rows = col().key(key.clone()).mt(top - LANE_GAP);
+        for index in lo..hi {
+            let gap = if index == lo {
+                0.0
+            } else {
+                work_item_gap(items[index - 1], items[index])
+            };
+            let item = work_item(s, p, wide, &parts, items[index]);
+            rows = rows.child(if gap > 0.0 {
+                col().pt(gap).child(item)
+            } else {
+                item
+            });
+        }
+        col().child(rows)
+    };
+    if t.transcript_structure == 0 || timeline_structure(t).external_turns.contains(&start) {
+        return build();
+    }
+    let find = s.thread_find_active().then(|| {
+        (
+            s.thread_find.query.text.as_str(),
+            s.thread_find
+                .active_match
+                .as_ref()
+                .map(|m| (&m.entry_id, m.occurrence)),
+        )
+    });
+    let cite = s
+        .citation_highlight
+        .as_ref()
+        .map(|h| (&h.machine, h.thread_id, &h.message_id, &h.text));
+    memo(
+        key.clone(),
+        (
+            (
+                work_slice_fingerprint(t, &parts, &items[lo..hi]),
+                lo,
+                hi,
+                top.to_bits(),
+                live,
+            ),
+            (
+                s.dark,
+                wide,
+                rune::memo::layout_with("chat-lane", |rect| rect[2].to_bits()),
+                s.viewport_width.to_bits(),
+            ),
+            (t.harness.as_str(), s.working_directory(), find, cite),
+        ),
+        build,
+    )
+}
+
+fn live_status_row(t: &Thread, p: Palette) -> El {
+    let seconds = t.started.map(|start| start.elapsed().as_secs());
+    row()
+        .key(format!("live-status-{}", t.id))
+        .min_h(26.0)
+        // The square sits on the prose lane's left edge and the words start one
+        // indent in, where the tool rows above do.
+        .center_y()
+        .gap(WORK_INDENT - 6.0)
+        .child(status_mark(Status::Running, p, 6.0))
+        .child(
+            row()
+                .gap(5.0)
+                .center_y()
+                .min_w(0.0)
+                .shrink()
+                .child(
+                    pixel_text(live_status(t), p.muted)
+                        .key(format!("live-status-text-{}", t.id))
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                )
+                // The phase gives way before the timer, whose tabular figures and
+                // padded seconds keep each tick the same width.
+                .child(match seconds {
+                    Some(seconds) => label(timer_label(seconds), TIMER, p.sea)
+                        .key(format!("live-timer-{}", t.id)),
+                    None => el(),
+                }),
+        )
+}
+
+fn build_assistant_turn(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    start: usize,
+    end: usize,
+    piece: Option<TurnPiece>,
+) -> El {
+    #[cfg(test)]
+    timeline_count(|counts| counts.built_turns += 1);
+    let t = s.current();
+    let parts = turn_parts(t, start, end);
+    let html_card = |part: &TranscriptPart| is_html_card(t, part);
+    let card = |part: &TranscriptPart| is_lifted_card(t, part);
+    let (last_work, preamble) = turn_shape(t, &parts);
+    let live = end == t.messages.len() && t.status.busy();
+    let structure = timeline_structure(t);
+    let work = structure
+        .work_index
+        .get(&start)
+        .and_then(|index| t.work.get(*index));
+    // A split turn's head carries the turn's keys; its tail follows the last slice.
+    let head = piece != Some(TurnPiece::Tail);
+    let tail = piece != Some(TurnPiece::Head);
+    let whole = piece.is_none();
     let mut response = col()
-        .key(format!("assistant-turn-{}-{start}", t.id))
+        .key(format!(
+            "assistant-turn-{}{}",
+            message_key(t, start),
+            piece_suffix(piece)
+        ))
         .gap(12.0);
+    let mut tail_children = 0usize;
     // Captains sign their turns. A lone Pi thread needs no speaker label.
-    if let Some(captain) = t.captain {
+    if let Some(captain) = t.captain.filter(|_| head) {
         response = response.child(
             row()
                 .center_y()
@@ -10147,7 +10644,8 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         let mut base = part_occs[part_index];
         transcript_part(s, p, wide, &parts[part_index], &mut base)
     };
-    if let Some(index) = preamble {
+    if !head {
+    } else if let Some(index) = preamble {
         response = response.child(render_part(index));
     } else if live && last_work.is_none() {
         // Until Pi emits work, streamed text is the preamble.
@@ -10175,56 +10673,32 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         }
         rows
     };
-    if live {
+    if live && !whole {
+        // A split running turn: the slices hold its steps and the tail its status line,
+        // two points below the last step, as the unsplit work column spaces them.
+        if tail {
+            response = response.child(live_status_row(t, p));
+            tail_children += 1;
+        }
+    } else if live {
         // While Pi works, its steps show as they happen, and one status line says what it
         // is doing now. The turn folds into "Worked for" when it ends.
-        let mut rows = work_rows(
-            col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+        let rows = work_rows(
+            col()
+                .key(format!("work-rows-{}", message_key(t, start)))
+                .gap(2.0),
             false,
-        );
-        let seconds = t.started.map(|start| start.elapsed().as_secs());
-        rows = rows.child(
-            row()
-                .key(format!("live-status-{}", t.id))
-                .min_h(26.0)
-                // The square sits on the prose lane's left edge and the words start one
-                // indent in, where the tool rows above do.
-                .center_y()
-                .gap(WORK_INDENT - 6.0)
-                .child(status_mark(Status::Running, p, 6.0))
-                .child(
-                    row()
-                        .gap(5.0)
-                        .center_y()
-                        .min_w(0.0)
-                        .shrink()
-                        .child(
-                            pixel_text(live_status(t), p.muted)
-                                .key(format!("live-status-text-{}", t.id))
-                                .truncate()
-                                .shrink()
-                                .min_w(0.0),
-                        )
-                        // The phase gives way before the timer, whose tabular figures and
-                        // padded seconds keep each tick the same width.
-                        .child(match seconds {
-                            Some(seconds) => label(timer_label(seconds), TIMER, p.sea)
-                                .key(format!("live-timer-{}", t.id)),
-                            None => el(),
-                        }),
-                ),
-        );
+        )
+        .child(live_status_row(t, p));
         response = response.child(rows);
     } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
-        let work_failed = t
+        let (work_failed, loading) = structure
             .deferred_work
-            .iter()
-            .any(|marker| marker["start"] == start && marker["error"].is_string());
-        let work_loading = expanded
-            && t.deferred_work
-                .iter()
-                .any(|marker| marker["start"] == start && !marker["error"].is_string());
+            .get(&start)
+            .copied()
+            .unwrap_or_default();
+        let work_loading = expanded && loading;
         let mut title = match (
             work.is_some_and(|work| work.stopped),
             work.and_then(|work| work.elapsed),
@@ -10241,7 +10715,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
         let press_key = toggle_key.clone();
         let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
         let mut section = col()
-            .key(format!("work-section-{}-{start}", t.id))
+            .key(format!("work-section-{}", message_key(t, start)))
             .gap(4.0)
             .child(
                 activity_line(
@@ -10259,10 +10733,16 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                 .on_press_tx(move |s: &mut State, tx| {
                     tx.keep_on_screen(press_key.clone());
                     let t = s.current_mut();
-                    let current_start = turn_msg_id
-                        .as_deref()
-                        .and_then(|id| t.messages.iter().position(|m| m.id == id))
-                        .unwrap_or(start);
+                    let current_start = match turn_msg_id.as_deref() {
+                        Some(id) => {
+                            let Some(index) = t.messages.iter().position(|m| m.id == id) else {
+                                return;
+                            };
+                            index
+                        }
+                        None => start,
+                    };
+                    t.timeline_cache.get_mut().touch_message(current_start);
                     let retry = t
                         .work
                         .iter()
@@ -10312,7 +10792,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
             if work_loading {
                 let mut skeleton = col()
-                    .key(format!("work-loading-{}-{start}", t.id))
+                    .key(format!("work-loading-{}", message_key(t, start)))
                     .role("status")
                     .label("Loading work history")
                     .pt(12.0)
@@ -10333,29 +10813,36 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     );
                 }
                 section = section.child(skeleton);
-            } else if !work_failed {
+            } else if !work_failed && whole {
                 section = section.child(work_rows(
-                    col().key(format!("work-rows-{}-{start}", t.id)).gap(2.0),
+                    col()
+                        .key(format!("work-rows-{}", message_key(t, start)))
+                        .gap(2.0),
                     true,
                 ));
             }
         }
-        response = response.child(section);
-        if let Some(last) = last_work {
+        if head {
+            response = response.child(section);
+        }
+        if let Some(last) = last_work.filter(|_| tail) {
             for (index, part) in parts[..=last].iter().enumerate() {
                 if card(part) {
                     response = response.child(render_part(index));
+                    tail_children += 1;
                 }
             }
         }
     }
-    if !live || last_work.is_some() {
+    if tail && (!live || last_work.is_some()) {
         let from = last_work.map_or(0, |index| index + 1);
         for index in from..parts.len() {
             response = response.child(render_part(index));
+            tail_children += 1;
         }
     }
-    if !live
+    if tail
+        && !live
         && !s.demo
         && !t.archived()
         && let Some(reply_msg) = t.messages[start..end]
@@ -10383,6 +10870,12 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
                     .help("Reply to this response"),
                 ),
         );
+        tail_children += 1;
+    }
+    if piece == Some(TurnPiece::Tail) && tail_children > 0 {
+        // The status line sits in the work column, 2 pt below the last step; what
+        // follows a folded turn's work takes the response column's 12 pt.
+        return col().child(response.mt(if live { 2.0 } else { 12.0 } - LANE_GAP));
     }
     response
 }
@@ -10440,6 +10933,283 @@ fn history_control(s: &State, p: Palette) -> Option<El> {
     Some(section)
 }
 
+type TimelineEvent = (crate::model::ToolAnchor, u64, u8, usize);
+type BoundaryEvent = (u64, u8, usize);
+
+/// Ported from KSG's useIncrementalTimelineEntries and useIncrementalTimelineRows.
+/// This stores derived identities and ordinals only, never old history payloads.
+#[derive(Default)]
+pub(crate) struct TimelineCache {
+    input: Option<TimelineInput>,
+    structure: std::sync::Arc<TimelineStructure>,
+    content: std::collections::HashMap<usize, u64>,
+    unfinished_tools: std::collections::HashSet<usize>,
+    /// Bumped when a long turn's fold opens or closes, which splits or joins its rows.
+    disclosure: u64,
+}
+
+impl TimelineCache {
+    pub(crate) fn prepare_projection(&mut self, structure: Option<u64>) {
+        if self.input.as_ref().map(|input| input.0) != structure {
+            *self = Self::default();
+        }
+    }
+
+    pub(crate) fn touch_item(&mut self, field: &'static str, index: usize) {
+        if let Some(turn) = self
+            .structure
+            .item_turns
+            .get(field)
+            .and_then(|turns| turns.get(index))
+        {
+            *self.content.entry(*turn).or_default() += 1;
+        }
+    }
+
+    pub(crate) fn touch_message(&mut self, message: usize) {
+        self.touch_item("messages", message);
+    }
+
+    fn touch_disclosure(&mut self) {
+        self.disclosure += 1;
+    }
+
+    pub(crate) fn touch_tool(&mut self, index: usize, tool: &Tool) {
+        self.touch_item("tools", index);
+        if tool.done || tool.failed {
+            self.unfinished_tools.remove(&index);
+        } else {
+            self.unfinished_tools.insert(index);
+        }
+    }
+
+    fn turn_revision(&self, start: usize) -> u64 {
+        self.content.get(&start).copied().unwrap_or(0)
+    }
+}
+
+#[derive(Default)]
+struct TimelineStructure {
+    rows: std::sync::Arc<Vec<TimelineRow>>,
+    events: Vec<TimelineEvent>,
+    boundaries: std::collections::HashMap<usize, Vec<BoundaryEvent>>,
+    item_turns: std::collections::HashMap<&'static str, Vec<usize>>,
+    work_index: std::collections::HashMap<usize, usize>,
+    deferred_work: std::collections::HashMap<usize, (bool, bool)>,
+    external_turns: std::collections::HashSet<usize>,
+    /// Fold flags that decide how long turns split, as they were when this was built.
+    disclosure_probe: Vec<(u8, usize, bool)>,
+    version: u64,
+}
+
+/// The structure after any fold that splits or joins a long turn changed. Handlers
+/// and restored projections set fold flags directly; only a long turn's flags are
+/// checked, so ordinary disclosure keeps the cached rows and indexes.
+fn disclosed_timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
+    let structure = timeline_structure(t);
+    if !structure.disclosure_stale(t) {
+        return structure;
+    }
+    t.timeline_cache.borrow_mut().touch_disclosure();
+    timeline_structure(t)
+}
+
+type TimelineInput = (
+    u64,
+    bool,
+    bool,
+    bool,
+    Vec<(String, usize)>,
+    (usize, usize),
+    u64,
+);
+
+impl TimelineStructure {
+    /// Whether a fold that splits or joins a long turn changed without a handler
+    /// reporting it (a restored projection, find's reveal, a test).
+    fn disclosure_stale(&self, t: &Thread) -> bool {
+        self.disclosure_probe.iter().any(|&(kind, index, open)| {
+            let now = match kind {
+                0 => t.tools.get(index).map(|tool| tool.group_expanded),
+                1 => t.thoughts.get(index).map(|thought| thought.expanded),
+                _ => t.work.get(index).map(|work| work.expanded),
+            };
+            now != Some(open)
+        })
+    }
+}
+
+fn timeline_structure(t: &Thread) -> std::sync::Arc<TimelineStructure> {
+    let input = (
+        t.transcript_structure,
+        t.history_has_more || t.history_error.is_some(),
+        t.worktree_setup.is_some(),
+        t.status.busy(),
+        t.handoffs
+            .iter()
+            .map(|handoff| (handoff.id.clone(), handoff.message_index))
+            .collect(),
+        (
+            t.deferred_work.len(),
+            t.deferred_work
+                .iter()
+                .filter(|marker| marker["error"].is_string())
+                .count(),
+        ),
+        t.timeline_cache.borrow().disclosure,
+    );
+    let mut cache = t.timeline_cache.borrow_mut();
+    // The desktop consumes revisioned projections. Untracked fixtures and
+    // in-process demo threads retain the complete rebuild fallback.
+    if t.transcript_structure != 0 && cache.input.as_ref() == Some(&input) {
+        return cache.structure.clone();
+    }
+    #[cfg(test)]
+    timeline_count(|counts| counts.index_builds += 1);
+    let mut structure = TimelineStructure::default();
+    cache.unfinished_tools.clear();
+    let mut turn = 0;
+    let mut message_turns = Vec::with_capacity(t.messages.len() + 1);
+    for (index, message) in t.messages.iter().enumerate() {
+        if message.role != "Pi" || index == 0 || t.messages[index - 1].role != "Pi" {
+            turn = index;
+        }
+        message_turns.push(turn);
+    }
+    message_turns.push(t.messages.len());
+    let owner = |message: usize| message_turns.get(message).copied().unwrap_or(message);
+    for (field, turns) in [
+        (
+            "tools",
+            t.tools
+                .iter()
+                .map(|tool| owner(tool.anchor.message))
+                .collect(),
+        ),
+        (
+            "thoughts",
+            t.thoughts
+                .iter()
+                .map(|thought| owner(thought.anchor.message))
+                .collect(),
+        ),
+        (
+            "work",
+            t.work.iter().map(|work| owner(work.start)).collect(),
+        ),
+        (
+            "compactions",
+            t.native
+                .compactions
+                .iter()
+                .map(|item| owner(crate::work::compaction_anchor(t, item).message))
+                .collect(),
+        ),
+    ] {
+        structure.item_turns.insert(field, turns);
+    }
+    for (index, tool) in t.tools.iter().enumerate() {
+        if !tool.done && !tool.failed {
+            cache.unfinished_tools.insert(index);
+        }
+        if crew_ui::is_delegation(tool)
+            || !tool.subagents.is_empty()
+            || matches!(
+                tool.resolved_kind(),
+                crate::work::ToolKind::Plan
+                    | crate::work::ToolKind::Html
+                    | crate::work::ToolKind::Subagent
+            )
+        {
+            structure.external_turns.insert(owner(tool.anchor.message));
+        }
+        if tool.name.rsplit("__").next() != Some("html_preview") {
+            structure.events.push((
+                tool.anchor,
+                if tool.order == 0 {
+                    tool.block as u64
+                } else {
+                    tool.order
+                },
+                0,
+                index,
+            ));
+        }
+    }
+    for (index, thought) in t.thoughts.iter().enumerate() {
+        structure.events.push((
+            thought.anchor,
+            if thought.order == 0 {
+                thought.block as u64
+            } else {
+                thought.order
+            },
+            1,
+            index,
+        ));
+    }
+    for (index, item) in t.native.compactions.iter().enumerate() {
+        let anchor = crate::work::compaction_anchor(t, item);
+        let order = item["order"].as_u64().unwrap_or(u64::MAX);
+        structure.events.push((anchor, order, 2, index));
+        structure
+            .boundaries
+            .entry(anchor.message)
+            .or_default()
+            .push((order, 0, index));
+    }
+    for (index, item) in crate::work::retry_events(t).iter().enumerate() {
+        if let Ok(anchor) =
+            serde_json::from_value::<crate::model::ToolAnchor>(item["anchor"].clone())
+        {
+            let order = item["order"].as_u64().unwrap_or(u64::MAX);
+            structure.events.push((anchor, order, 3, index));
+            structure
+                .boundaries
+                .entry(anchor.message)
+                .or_default()
+                .push((order, 1, index));
+        }
+    }
+    for (index, work) in t.work.iter().enumerate() {
+        structure.work_index.entry(work.start).or_insert(index);
+        if work.stopped && (work.start < t.messages.len() || !t.status.busy()) {
+            let order = if work.stopped_order == 0 {
+                u64::MAX
+            } else {
+                work.stopped_order
+            };
+            structure
+                .boundaries
+                .entry(work.start)
+                .or_default()
+                .push((order, 2, 0));
+        }
+    }
+    for marker in &t.deferred_work {
+        if let Some(start) = marker["start"]
+            .as_u64()
+            .and_then(|start| usize::try_from(start).ok())
+        {
+            let flags = structure.deferred_work.entry(start).or_default();
+            flags.0 |= marker["error"].is_string();
+            flags.1 |= !marker["error"].is_string();
+        }
+    }
+    structure.events.sort_by_key(|event| (event.0, event.1));
+    for events in structure.boundaries.values_mut() {
+        events.sort_by_key(|event| event.0);
+    }
+    structure.rows = std::sync::Arc::new(derive_timeline_rows(t, &mut structure));
+    structure.item_turns.insert("messages", message_turns);
+    static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    structure.version = VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache.input = Some(input);
+    cache.content.clear();
+    cache.structure = std::sync::Arc::new(structure);
+    cache.structure.clone()
+}
+
 #[derive(Clone)]
 enum TimelineRow {
     HistoryControl {
@@ -10470,13 +11240,33 @@ enum TimelineRow {
         start: usize,
         key: String,
     },
+    /// A piece of a long running or expanded turn. Its head keeps the turn's row key.
+    TurnPiece {
+        start: usize,
+        end: usize,
+        piece: TurnPiece,
+        key: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnPiece {
+    Head,
+    /// Work entries `lo..hi`, in `work_items` order.
+    Work {
+        lo: usize,
+        hi: usize,
+    },
+    Tail,
 }
 
 impl TimelineRow {
     fn entry_id<'a>(&'a self, thread: &'a Thread) -> Option<&'a str> {
         let index = match self {
             Self::UserOrSystem { message_id, .. } => return Some(message_id),
-            Self::AssistantTurn { start, .. } | Self::LiveTurn { start, .. } => *start,
+            Self::AssistantTurn { start, .. }
+            | Self::LiveTurn { start, .. }
+            | Self::TurnPiece { start, .. } => *start,
             Self::Boundary { message_index, .. } => *message_index,
             Self::Handoff { index, .. } => thread.handoffs.get(*index)?.message_index,
             Self::HistoryControl { .. } | Self::WorktreeSetup { .. } => return None,
@@ -10495,7 +11285,8 @@ impl TimelineRow {
             | Self::UserOrSystem { key, .. }
             | Self::Handoff { key, .. }
             | Self::AssistantTurn { key, .. }
-            | Self::LiveTurn { key, .. } => key,
+            | Self::LiveTurn { key, .. }
+            | Self::TurnPiece { key, .. } => key,
         }
     }
 }
@@ -10514,7 +11305,13 @@ fn push_unique_row_key(seen: &mut std::collections::HashSet<String>, base: Strin
     }
 }
 
-fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
+fn build_timeline_rows(t: &Thread) -> std::sync::Arc<Vec<TimelineRow>> {
+    timeline_structure(t).rows.clone()
+}
+
+fn derive_timeline_rows(t: &Thread, structure: &mut TimelineStructure) -> Vec<TimelineRow> {
+    let boundaries = &structure.boundaries;
+    let mut probe = vec![];
     let mut rows = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if t.history_has_more || t.history_error.is_some() {
@@ -10552,7 +11349,7 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
     while index < t.messages.len() {
         let message = &t.messages[index];
         emit_handoffs(index, &mut rows, &mut seen);
-        if message.role != "Pi" && work_ui::has_boundary_events(t, index) {
+        if message.role != "Pi" && boundaries.contains_key(&index) {
             rows.push(TimelineRow::Boundary {
                 message_index: index,
                 key: push_unique_row_key(&mut seen, format!("boundary-{}-{}", t.id, message.id)),
@@ -10563,11 +11360,16 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
                 .iter()
                 .position(|message| message.role != "Pi")
                 .map_or(t.messages.len(), |offset| index + offset);
-            rows.push(TimelineRow::AssistantTurn {
-                start: index,
-                end,
-                key: push_unique_row_key(&mut seen, format!("turn-{}-{}", t.id, message.id)),
-            });
+            let key = push_unique_row_key(&mut seen, format!("turn-{}-{}", t.id, message.id));
+            if !push_turn_pieces(
+                t, structure, index, end, &key, &mut rows, &mut seen, &mut probe,
+            ) {
+                rows.push(TimelineRow::AssistantTurn {
+                    start: index,
+                    end,
+                    key,
+                });
+            }
             index = end;
             continue;
         }
@@ -10579,7 +11381,7 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
         index += 1;
     }
     emit_handoffs(usize::MAX, &mut rows, &mut seen);
-    if work_ui::has_boundary_events(t, t.messages.len()) {
+    if boundaries.contains_key(&t.messages.len()) {
         rows.push(TimelineRow::Boundary {
             message_index: t.messages.len(),
             key: push_unique_row_key(&mut seen, format!("boundary-end-{}", t.id)),
@@ -10591,7 +11393,135 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
             key: push_unique_row_key(&mut seen, format!("turn-live-{}", t.id)),
         });
     }
+    structure.disclosure_probe = probe;
     rows
+}
+
+/// The row that shows text of message `message` in a split turn: the head for its
+/// preamble, a slice for prose between steps, the tail for the answer. `hit` sees the
+/// message's text chunks in order and returns true for the one holding the target.
+/// `None` when the turn is one row, whose key the caller already has.
+pub(crate) fn timeline_text_row(
+    t: &Thread,
+    message: usize,
+    mut hit: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    let structure = disclosed_timeline_structure(t);
+    let pieces: Vec<_> = structure
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            TimelineRow::TurnPiece {
+                start,
+                end,
+                piece,
+                key,
+            } if (*start..*end).contains(&message) => Some((*start, *end, *piece, key)),
+            _ => None,
+        })
+        .collect();
+    let &(start, end, _, _) = pieces.first()?;
+    let parts = turn_parts_in(t, &structure.events, start, end);
+    let target = parts.iter().position(|part| {
+        matches!(part, TranscriptPart::Text { message: m, from, to }
+            if *m == message && hit(&t.messages[*m].text[*from..*to]))
+    })?;
+    let (last_work, preamble) = turn_shape(t, &parts);
+    let live = end == t.messages.len() && t.status.busy();
+    let want = if Some(target) == preamble {
+        TurnPiece::Head
+    } else if last_work.is_none_or(|last| target > last) {
+        TurnPiece::Tail
+    } else {
+        let item = work_items(t, &parts, last_work, preamble, !live)
+            .iter()
+            .position(|item| item.part() == target)?;
+        return pieces.iter().find_map(|(_, _, piece, key)| match piece {
+            TurnPiece::Work { lo, hi } if (*lo..*hi).contains(&item) => Some((*key).clone()),
+            _ => None,
+        });
+    };
+    pieces
+        .iter()
+        .find(|(_, _, piece, _)| *piece == want)
+        .map(|(_, _, _, key)| (*key).clone())
+}
+
+/// Splits a long running or expanded turn into a head, slices of `SLICE_ITEMS` work
+/// entries and a tail, keyed by the turn and each slice's first entry. Returns false
+/// for a turn that stays one row.
+#[allow(clippy::too_many_arguments)]
+fn push_turn_pieces(
+    t: &Thread,
+    structure: &TimelineStructure,
+    start: usize,
+    end: usize,
+    key: &str,
+    rows: &mut Vec<TimelineRow>,
+    seen: &mut std::collections::HashSet<String>,
+    probe: &mut Vec<(u8, usize, bool)>,
+) -> bool {
+    let events = turn_events(&structure.events, start, end);
+    // Each event yields at most a heading and a row, plus prose between events.
+    if events.len() * 2 + (end - start) < segment_min_items() {
+        return false;
+    }
+    let live = end == t.messages.len() && t.status.busy();
+    if let Some(&index) = structure.work_index.get(&start) {
+        probe.push((2, index, t.work[index].expanded));
+    }
+    let parts = turn_parts_in(t, &structure.events, start, end);
+    for part in &parts {
+        match part {
+            TranscriptPart::Tools(indices) if indices.len() > 1 => {
+                probe.push((0, indices[0], t.tools[indices[0]].group_expanded));
+            }
+            TranscriptPart::Thought(indices) => {
+                probe.push((1, indices[0], t.thoughts[indices[0]].expanded));
+            }
+            _ => {}
+        }
+    }
+    if !turn_work_open(t, structure, start, live) {
+        return false;
+    }
+    let (last_work, preamble) = turn_shape(t, &parts);
+    let items = work_items(t, &parts, last_work, preamble, !live);
+    if items.len() < segment_min_items() {
+        return false;
+    }
+    rows.push(TimelineRow::TurnPiece {
+        start,
+        end,
+        piece: TurnPiece::Head,
+        key: key.to_owned(),
+    });
+    let mut lo = 0;
+    while lo < items.len() {
+        // The last slice takes entries that arrive before the next structure change.
+        let hi = if lo + SLICE_ITEMS >= items.len() {
+            usize::MAX
+        } else {
+            lo + SLICE_ITEMS
+        };
+        rows.push(TimelineRow::TurnPiece {
+            start,
+            end,
+            piece: TurnPiece::Work { lo, hi },
+            key: push_unique_row_key(
+                seen,
+                format!("{key}-work-{}", work_item_id(t, &parts, items[lo])),
+            ),
+        });
+        lo = hi;
+    }
+    rows.push(TimelineRow::TurnPiece {
+        start,
+        end,
+        piece: TurnPiece::Tail,
+        key: push_unique_row_key(seen, format!("{key}-tail")),
+    });
+    true
 }
 
 /// KSG timeline position recovery, applied with the history commit's scroll
@@ -10654,7 +11584,7 @@ fn build_user_or_system_row(
 ) -> El {
     let t = s.current();
     let message = &t.messages[index];
-    let key = format!("message-{}-{index}", t.id);
+    let key = message_key(t, index);
     let body = if message.role == "You" {
         // KSG Code's `TimelineUserMessageRow`: `max-w-[80%] rounded-2xl p-3`.
         let max_width = (lane_width(pane_width, wide) * 0.8).max(160.0);
@@ -10694,7 +11624,7 @@ fn build_user_or_system_row(
                             wide,
                             true,
                             false,
-                            &format!("user-{}-{index}", t.id),
+                            &format!("user-{}-{message_id}", t.id),
                             find_query.map(|q| (q, active_occ)),
                         )
                     },
@@ -11038,10 +11968,10 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let gutter = lane_gutter(pane_width);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
-    let visible_tools = t
-        .tools
-        .iter()
-        .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
+    let visible_tools = t.messages.is_empty()
+        && t.tools
+            .iter()
+            .any(|tool| !(s.is_captain_home(t) && crew_ui::is_delegation(tool)));
     if t.messages.is_empty()
         && !visible_tools
         && !t.status.busy()
@@ -11084,10 +12014,15 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     }
 
     let thread_id = t.id;
-    let rows = std::rc::Rc::new(build_timeline_rows(t));
+    let structure = disclosed_timeline_structure(t);
+    let rows = structure.rows.clone();
     let key_rows = rows.clone();
     let build_rows = rows.clone();
+    let visible_rows = rows.clone();
+    let visible_visit = visit.clone();
+    let visible_server = s.machines.selected.clone();
     let row_visit = visit.clone();
+    let layout_visit = visit.clone();
     let lane = col()
         .key("chat-lane")
         .on_layout_tx(|s: &mut State, rect, tx| {
@@ -11099,13 +12034,19 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         // 24 pt above the first message, counting the cap.
         .pt(24.0 - TRANSCRIPT_CAP)
         .pb(24.0)
-        .gap(20.0)
+        .gap(LANE_GAP)
         .growth(rune::GrowthSpec::default())
         .virtual_rows(
             rows.len(),
             90.0,
-            move |_: &State, index| std::borrow::Cow::Owned(key_rows[index].key().to_owned()),
+            move |_: &State, index| {
+                #[cfg(test)]
+                timeline_count(|counts| counts.keys += 1);
+                std::borrow::Cow::Owned(key_rows[index].key().to_owned())
+            },
             move |s: &State, index| {
+                #[cfg(test)]
+                timeline_count(|counts| counts.row_builders += 1);
                 let row = match &build_rows[index] {
                     TimelineRow::HistoryControl { .. } => history_control(s, p).unwrap_or_else(el),
                     TimelineRow::WorktreeSetup { .. } => {
@@ -11131,14 +12072,30 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     TimelineRow::LiveTurn { start, .. } => {
                         assistant_turn(s, p, wide, *start, *start)
                     }
+                    TimelineRow::TurnPiece {
+                        start, end, piece, ..
+                    } => assistant_turn_piece(s, p, wide, *start, *end, Some(*piece)),
                 };
-                row_visit.row(
-                    build_rows[index].key(),
-                    build_rows[index].entry_id(s.current()),
-                );
-                row
+                let key = build_rows[index].key().to_owned();
+                let entry_id = build_rows[index].entry_id(s.current()).map(str::to_owned);
+                let row_visit = row_visit.clone();
+                row.on_layout_tx(move |_: &mut State, rect, tx| {
+                    row_visit.row(&key, entry_id.as_deref(), rect);
+                    tx.live_only();
+                })
             },
-        );
+        )
+        .virtual_rows_version(structure.version)
+        .on_visible_rows(move |s: &mut State, range| {
+            if s.current().id == thread_id && s.machines.selected == visible_server {
+                visible_visit.visible_rows(
+                    range.filter_map(|index| {
+                        visible_rows.get(index).map(|row| row.key().to_owned())
+                    }),
+                );
+            }
+            false
+        });
 
     let find_open = s.thread_find_active();
     let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
@@ -11149,7 +12106,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom })
         .on_scroll_offset(move |at| *visit.scroll.lock().unwrap() = at)
-        .on_layout_tx(move |s: &mut State, _, tx| {
+        .on_layout_tx(move |s: &mut State, rect, tx| {
+            layout_visit.viewport(rect);
             if s.current().id != thread_id || !restore_timeline_position(s, tx, false) {
                 tx.live_only();
             }
@@ -16078,6 +17036,112 @@ fn dialog(s: &State, p: Palette) -> El {
     card
 }
 
+const LONG_PREAMBLE: &str = "Starting the audit.\n\n";
+const LONG_MIDDLE: &str = "Halfway marker between the steps.\n\n";
+
+/// One assistant turn with `parts` alternating thought and command parts (every
+/// fiftieth a group of two commands), prose between the halves, a large output on every tool and every fifth output open.
+/// `live` leaves it running; otherwise it is complete with its work expanded,
+/// followed by short questions and answers.
+/// The tests and the `long-turn-live` and `long-turn-expanded` profiling scenes share it.
+pub(crate) fn long_turn_fixture(state: &mut State, parts: usize, live: bool) {
+    state.populate_demo();
+    state.compact_sidebar = true;
+    let t = state.current_mut();
+    let tool_template = t.tools[3].clone();
+    let thought_template = t.thoughts[0].clone();
+    t.captain = None;
+    t.messages.clear();
+    t.tools.clear();
+    t.thoughts.clear();
+    t.work.clear();
+    t.native.compactions.clear();
+    t.harness_state["workRetries"] = json!([]);
+    t.started = None;
+    t.transcript_structure = 1;
+    t.messages.push(crate::model::Message {
+        id: "long-user".into(),
+        role: "You",
+        text: "Audit every package.".into(),
+        images: vec![],
+        context: None,
+    });
+    t.messages.push(crate::model::Message {
+        id: "long-answer".into(),
+        role: "Pi",
+        text: format!("{LONG_PREAMBLE}{LONG_MIDDLE}Done. Every package passed."),
+        images: vec![],
+        context: None,
+    });
+    let output = "test result: ok. 1 passed; 0 failed\n".repeat(600);
+    for index in 0..parts {
+        let offset = if index < parts / 2 {
+            LONG_PREAMBLE.len()
+        } else {
+            LONG_PREAMBLE.len() + LONG_MIDDLE.len()
+        };
+        let anchor = crate::model::ToolAnchor { message: 1, offset };
+        if index % 2 == 0 {
+            let mut thought = thought_template.clone();
+            thought.anchor = anchor;
+            thought.block = index;
+            thought.order = 2 * index as u64 + 1;
+            thought.text = format!("Thinking about package {index}.");
+            thought.done = true;
+            thought.expanded = false;
+            t.thoughts.push(thought);
+        } else {
+            let mut tool = tool_template.clone();
+            tool.id = format!("long-tool-{index}");
+            tool.anchor = anchor;
+            tool.block = index;
+            tool.order = 2 * index as u64 + 1;
+            tool.detail = format!("cargo test -p package-{index}");
+            tool.output = output.clone();
+            tool.done = true;
+            tool.failed = false;
+            tool.expanded = index % 10 == 1;
+            // Every fiftieth step runs two commands at once: a tool group.
+            let pair = (index % 50 == 1).then(|| {
+                let mut pair = tool.clone();
+                pair.id = format!("long-tool-{index}-pair");
+                pair.order += 1;
+                pair.expanded = false;
+                pair
+            });
+            t.tools.extend(std::iter::once(tool).chain(pair));
+        }
+    }
+    if live {
+        t.status = Status::Running;
+    } else {
+        t.status = Status::Completed;
+        t.work.push(crate::model::AssistantWork {
+            start: 1,
+            stopped: false,
+            stopped_order: 0,
+            expanded: true,
+            elapsed: Some(600),
+            outcome: Some(Status::Completed),
+        });
+        // Later turns, so the long one is read away from the bottom.
+        for index in 0..12 {
+            for (id, role, text) in [
+                ("after-user", "You", "Thanks. Anything else?"),
+                ("after-answer", "Pi", "No, that covers it."),
+            ] {
+                t.messages.push(crate::model::Message {
+                    id: format!("{id}-{index}"),
+                    role,
+                    text: text.into(),
+                    images: vec![],
+                    context: None,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -17604,7 +18668,10 @@ pub(crate) mod tests {
             rt.state.threads.push(Thread::new(2));
             rt.frame(0.0);
             let key = "context-text-1-context-row-0";
-            let bubble = rt.presented("message-1-0-text").unwrap().0;
+            let bubble = rt
+                .presented(&format!("{}-text", message_key(rt.state.current(), 0)))
+                .unwrap()
+                .0;
             let text = rt
                 .elements()
                 .into_iter()
@@ -17763,7 +18830,10 @@ pub(crate) mod tests {
             });
             rt.frame(0.0);
             rt.frame(0.0);
-            let bubble = rt.presented("message-1-0-text").unwrap().0;
+            let bubble = rt
+                .presented(&format!("{}-text", message_key(rt.state.current(), 0)))
+                .unwrap()
+                .0;
             let chip = rt
                 .elements()
                 .into_iter()
@@ -17798,7 +18868,10 @@ pub(crate) mod tests {
             let bubble = rt
                 .elements()
                 .into_iter()
-                .find(|element| element.key.as_deref() == Some("message-1-0-text"))
+                .find(|element| {
+                    element.key.as_deref()
+                        == Some(&format!("{}-text", message_key(rt.state.current(), 0)))
+                })
                 .unwrap();
             let text: Vec<_> = rt
                 .elements()
@@ -17851,13 +18924,14 @@ pub(crate) mod tests {
             let clipboard = rune::clipboard::memory();
             rt.use_clipboard(&clipboard);
             rt.frame(0.0);
-            let key = "copy-code-1-1-0-0";
-            let (rect, _) = rt.presented(key).unwrap();
+            let thread = rt.state.current();
+            let key = format!("copy-code-{}-{}-0-0", thread.id, thread.messages[1].id);
+            let (rect, _) = rt.presented(&key).unwrap();
             assert!(
                 rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
                 "{width}: {rect:?}"
             );
-            press(&mut rt, key);
+            press(&mut rt, &key);
             assert_eq!(
                 clipboard.text().as_deref().map(|text| text.as_str()),
                 Some("let ready = true;")
@@ -17877,12 +18951,17 @@ pub(crate) mod tests {
             // Reveal the top of the conversation to exercise the user code header.
             rt.wheel(width - 80.0, 200.0, 2000.0);
             rt.frame(1.0);
-            press(&mut rt, "copy-code-user-1-0-0");
+            let thread = rt.state.current();
+            let user_key = format!("copy-code-user-{}-{}-0", thread.id, thread.messages[0].id);
+            let key = format!(
+                "copy-code-{}-{}-0-diff-{diff_start}",
+                thread.id, thread.messages[1].id
+            );
+            press(&mut rt, &user_key);
             assert_eq!(
                 clipboard.text().as_deref().map(|text| text.as_str()),
                 Some("let ready = true;")
             );
-            let key = format!("copy-code-1-1-0-diff-{diff_start}");
             rt.wheel(width - 80.0, 400.0, -2000.0);
             rt.frame(2.0);
             let (rect, _) = rt.presented(&key).unwrap();
@@ -22931,7 +24010,9 @@ pub(crate) mod tests {
                 "{key} overflows the window"
             );
         }
-        let (bubble, _) = rt.presented("message-1-0-text").unwrap();
+        let (bubble, _) = rt
+            .presented(&format!("{}-text", message_key(rt.state.current(), 0)))
+            .unwrap();
         assert!(
             bubble[0] >= 0.0 && bubble[0] + bubble[2] <= 620.0,
             "user message overflows its pane: {bubble:?}"
@@ -23862,6 +24943,862 @@ pub(crate) mod tests {
         assert!(rt.presented("composer").is_some());
     }
     #[test]
+    fn timeline_structure_reuses_streamed_rows_and_reindexes_prepended_history() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        let thread = state.current_mut();
+        thread.transcript_structure = 1;
+        let first = timeline_structure(thread);
+        let old_keys: Vec<_> = first.rows.iter().map(|row| row.key().to_owned()).collect();
+        thread
+            .messages
+            .last_mut()
+            .unwrap()
+            .text
+            .push_str(" Streaming more text.");
+        thread.transcript_content += 1;
+        let streamed = timeline_structure(thread);
+        assert!(std::sync::Arc::ptr_eq(&first, &streamed));
+        assert!(std::sync::Arc::ptr_eq(&first.rows, &streamed.rows));
+        assert_eq!(first.version, streamed.version);
+        let last = thread.messages.len() - 1;
+        assert!(turn_parts(thread, last, last + 1).iter().any(|part| {
+            matches!(part, TranscriptPart::Text { to, .. } if *to == thread.messages[last].text.len())
+        }));
+
+        thread.messages.insert(
+            0,
+            crate::model::Message {
+                id: "earlier-question".into(),
+                role: "You",
+                text: "An earlier question.".into(),
+                images: vec![],
+                context: None,
+            },
+        );
+        for tool in &mut thread.tools {
+            tool.anchor.message += 1;
+        }
+        for thought in &mut thread.thoughts {
+            thought.anchor.message += 1;
+        }
+        for work in &mut thread.work {
+            work.start += 1;
+        }
+        thread.transcript_structure = 2;
+        let prepended = timeline_structure(thread);
+        assert!(!std::sync::Arc::ptr_eq(&first, &prepended));
+        assert_ne!(first.version, prepended.version);
+        for key in old_keys {
+            assert!(prepended.rows.iter().any(|row| row.key() == key));
+        }
+        assert!(matches!(
+            &turn_parts(thread, 3, 4)[0],
+            TranscriptPart::Tools(indices) if *indices == vec![0, 1]
+        ));
+
+        let start = thread.work[0].start;
+        thread.work[0].stopped = true;
+        thread.native.compactions.push(json!({
+            "anchor":{"message":start,"offset":0}, "order":100
+        }));
+        thread.transcript_structure = 3;
+        let boundary = timeline_structure(thread);
+        assert!(boundary.boundaries.contains_key(&start));
+        assert!(boundary.events.iter().any(|event| event.2 == 2));
+        assert_ne!(boundary.version, prepended.version);
+    }
+
+    fn cached_timeline_runtime(width: f32, turns: usize) -> Runtime<State> {
+        let mut rt = runtime(width);
+        rt.state.populate_demo();
+        rt.state.compact_sidebar = true;
+        let t = rt.state.current_mut();
+        let template = t.tools[0].clone();
+        t.captain = None;
+        t.messages.clear();
+        t.tools.clear();
+        t.thoughts.clear();
+        t.work.clear();
+        t.native.compactions.clear();
+        t.harness_state["workRetries"] = json!([]);
+        t.status = Status::Running;
+        t.started = None;
+        t.transcript_structure = 1;
+        for index in 0..turns {
+            t.messages.push(crate::model::Message {
+                id: format!("cache-user-{index}"),
+                role: "You",
+                text: format!("Question {index}."),
+                images: vec![],
+                context: None,
+            });
+            let start = t.messages.len();
+            t.messages.push(crate::model::Message {
+                id: format!("cache-answer-{index}"),
+                role: "Pi",
+                text: format!("Answer {index}. {}", "Readable history. ".repeat(8)),
+                images: vec![],
+                context: None,
+            });
+            let mut tool = template.clone();
+            tool.id = format!("cache-tool-{index}");
+            tool.anchor.message = start;
+            tool.anchor.offset = 0;
+            t.tools.push(tool);
+            t.work.push(crate::model::AssistantWork {
+                start,
+                stopped: false,
+                stopped_order: 0,
+                expanded: false,
+                elapsed: Some(1),
+                outcome: Some(Status::Completed),
+            });
+        }
+        rt.frame(0.0);
+        rt.update(|_, tx| {
+            tx.scroll_center_in_instant(
+                "conversation-1",
+                format!("turn-1-cache-answer-{}", turns / 2),
+            );
+        });
+        for _ in 0..60 {
+            if !rt.frame(1.0 / 60.0) {
+                break;
+            }
+        }
+        // Warm pointer-hover and the first scroll-state transition separately
+        // from steady scroll/stream measurements.
+        let viewport = rt.presented("conversation-1").unwrap().0;
+        rt.wheel(
+            viewport[0] + viewport[2] * 0.5,
+            viewport[1] + viewport[3] * 0.5,
+            1.0,
+        );
+        for _ in 0..60 {
+            if !rt.frame(1.0 / 60.0) {
+                break;
+            }
+        }
+        rt
+    }
+
+    #[test]
+    fn cached_completed_turns_survive_background_streaming_and_disclosure_changes() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = cached_timeline_runtime(width, 100);
+            take_timeline_counts();
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            for index in 0..10 {
+                rt.wheel(
+                    viewport[0] + viewport[2] * 0.5,
+                    viewport[1] + viewport[3] * 0.5,
+                    if index % 2 == 0 { 8.0 } else { -8.0 },
+                );
+                rt.frame(1.0 / 60.0);
+            }
+            let scroll = take_timeline_counts();
+            // Rune may commit one queued viewport/bottom-state transition.
+            // Repeated wheel frames must not each rebuild the application.
+            assert!(
+                scroll.views <= 1,
+                "{width}: scrolling repeatedly rebuilt the view: {scroll:?}"
+            );
+            assert_eq!(scroll.keys, 0);
+            assert_eq!(scroll.index_builds, 0);
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                let last = t.messages.len() - 1;
+                t.messages[last].text.push_str(" A streamed fragment.");
+                t.timeline_cache.get_mut().touch_message(last);
+                t.transcript_content += 1;
+            });
+            rt.frame(1.0 / 60.0);
+            let streamed = take_timeline_counts();
+            assert!(streamed.views > 0);
+            assert_eq!(streamed.index_builds, 0, "{width}: {streamed:?}");
+            assert_eq!(streamed.keys, 0, "{width}: {streamed:?}");
+            assert_eq!(streamed.built_turns, 0, "{width}: {streamed:?}");
+
+            press(&mut rt, "toggle-work-1-101");
+            rt.frame(1.0 / 60.0);
+            assert!(rt.state.current().work[50].expanded);
+            let disclosed = take_timeline_counts();
+            assert!(
+                disclosed.built_turns > 0,
+                "{width}: disclosure was memoized away"
+            );
+            assert_eq!(disclosed.index_builds, 0);
+            assert_eq!(disclosed.keys, 0);
+
+            rt.update(|s, _| s.dark = !s.dark);
+            rt.frame(1.0 / 60.0);
+            assert!(
+                take_timeline_counts().built_turns > 0,
+                "theme must invalidate memos"
+            );
+            rt.set_viewport((width + 60.0, 800.0), 1.0);
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert!(
+                take_timeline_counts().built_turns > 0,
+                "width must invalidate memos"
+            );
+            let body = assistant_body_key(rt.state.current(), 101, 0);
+            rt.update(|_, tx| {
+                tx.blur();
+                tx.select_all_text(body);
+            });
+            rt.frame(1.0 / 60.0);
+            let selected = rt
+                .selected_text()
+                .expect("assistant text selected")
+                .to_owned();
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                for tool in &mut t.tools {
+                    tool.anchor.message += 2;
+                }
+                for work in &mut t.work {
+                    work.start += 2;
+                }
+                t.messages.splice(
+                    0..0,
+                    [
+                        crate::model::Message {
+                            id: "earlier-user".into(),
+                            role: "You",
+                            text: "Earlier question.".into(),
+                            images: vec![],
+                            context: None,
+                        },
+                        crate::model::Message {
+                            id: "earlier-answer".into(),
+                            role: "Pi",
+                            text: "Earlier answer.".into(),
+                            images: vec![],
+                            context: None,
+                        },
+                    ],
+                );
+                t.transcript_structure += 1;
+            });
+            for _ in 0..60 {
+                if !rt.frame(1.0 / 60.0) {
+                    break;
+                }
+            }
+            assert_eq!(rt.selected_text().as_deref(), Some(selected.as_str()));
+            assert_eq!(
+                rt.state
+                    .assistant_selection
+                    .as_ref()
+                    .map(|selection| selection.message_id.as_str()),
+                Some("cache-answer-50"),
+            );
+        }
+    }
+
+    fn long_turn_runtime(width: f32, parts: usize, live: bool) -> Runtime<State> {
+        let mut rt = runtime(width);
+        long_turn_fixture(&mut rt.state, parts, live);
+        settle(&mut rt);
+        rt
+    }
+
+    fn settle(rt: &mut Runtime<State>) {
+        for _ in 0..120 {
+            if !rt.frame(1.0 / 60.0) {
+                break;
+            }
+        }
+    }
+
+    fn mounted_work(rt: &Runtime<State>) -> usize {
+        rt.elements()
+            .iter()
+            .filter(|element| {
+                element.key.as_deref().is_some_and(|key| {
+                    key.starts_with("inline-tool-1-")
+                        || key.starts_with("inline-thought-1-")
+                        || key.starts_with("tool-output-1-")
+                })
+            })
+            .count()
+    }
+
+    /// The key of the work slice halfway through the long turn.
+    fn middle_slice(rt: &Runtime<State>) -> String {
+        let rows = timeline_structure(rt.state.current()).rows.clone();
+        let slices: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    TimelineRow::TurnPiece {
+                        piece: TurnPiece::Work { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        slices[slices.len() / 2].key().to_owned()
+    }
+
+    fn center_on(rt: &mut Runtime<State>, key: &str) {
+        let key = key.to_owned();
+        rt.update(move |_, tx| tx.scroll_center_in_instant("conversation-1", key));
+        settle(rt);
+    }
+
+    /// Where a keyed element sits on screen: the vertical centre `press` aims at.
+    fn top_of(rt: &Runtime<State>, key: &str) -> f32 {
+        rt.find(key)
+            .unwrap_or_else(|| panic!("{key} is not on screen"))
+            .1
+    }
+
+    /// The first tool row whose top sits well inside the viewport.
+    fn visible_tool(rt: &Runtime<State>) -> String {
+        let viewport = rt.presented("conversation-1").unwrap().0;
+        let (lo, hi) = (viewport[1] + 40.0, viewport[1] + viewport[3] - 80.0);
+        rt.elements()
+            .iter()
+            .filter_map(|element| element.key.clone())
+            .filter(|key| key.starts_with("inline-tool-1-"))
+            .find(|key| rt.find(key).is_some_and(|(_, y)| (lo..hi).contains(&y)))
+            .expect("a tool row in the middle of the viewport")
+    }
+
+    #[test]
+    fn long_turns_mount_work_in_proportion_to_the_viewport() {
+        for live in [true, false] {
+            for width in [620.0, 960.0, 1280.0, 1920.0] {
+                let mut rt = long_turn_runtime(width, 1_000, live);
+                let rows = timeline_structure(rt.state.current()).rows.clone();
+                let slices = rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row,
+                            TimelineRow::TurnPiece {
+                                piece: TurnPiece::Work { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                assert!(
+                    slices >= 1_000 / SLICE_ITEMS,
+                    "{live} {width}: {slices} slices"
+                );
+                assert!(rows.iter().any(|row| row.key() == "turn-1-long-answer"));
+                let middle = middle_slice(&rt);
+                center_on(&mut rt, &middle);
+                assert!(rt.presented(&middle).is_some(), "{live} {width}: {middle}");
+                let short = mounted_work(&rt);
+                // Twice the work: the same viewport mounts the same number of rows.
+                let mut longer = long_turn_runtime(width, 2_000, live);
+                let middle = middle_slice(&longer);
+                center_on(&mut longer, &middle);
+                let long = mounted_work(&longer);
+                assert!(short > 0 && short < 400, "{live} {width}: {short} mounted");
+                assert!(
+                    long.abs_diff(short) <= 2 * SLICE_ITEMS,
+                    "{live} {width}: {short} mounted for 1,000 parts, {long} for 2,000"
+                );
+                // Every slice of a completed turn rebuilt only the mounted ones.
+                take_timeline_counts();
+                rt.update(|s, _| s.dark = !s.dark);
+                rt.frame(1.0 / 60.0);
+                let built = take_timeline_counts().built_slices as usize;
+                assert!(
+                    built > 0 && built < slices / 2,
+                    "{live} {width}: built {built}"
+                );
+            }
+        }
+    }
+
+    /// Entry tops relative to the turn's first entry, for the entries on screen.
+    fn entry_offsets(rt: &Runtime<State>) -> std::collections::BTreeMap<String, i32> {
+        let keys: Vec<_> = rt
+            .elements()
+            .iter()
+            .filter_map(|element| element.key.clone())
+            .filter(|key| {
+                [
+                    "inline-tool-1-",
+                    "inline-thought-1-",
+                    "thought-output-1-",
+                    "tool-output-1-",
+                ]
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+                    || key.starts_with("live-status-1")
+                    || key.starts_with("toggle-work-1-")
+            })
+            .collect();
+        let tops: Vec<_> = keys
+            .iter()
+            .filter_map(|key| rt.presented(key).map(|rect| (key.clone(), rect.0[1])))
+            .collect();
+        let base = tops
+            .iter()
+            .find(|(key, _)| key == "inline-thought-1-0")
+            .map(|(_, y)| *y)
+            .expect("the first thought is mounted");
+        tops.into_iter()
+            .map(|(key, y)| (key, (y - base).round() as i32))
+            .collect()
+    }
+
+    #[test]
+    fn split_turns_keep_the_unsplit_layout() {
+        for live in [true, false] {
+            for width in [620.0, 960.0, 1280.0, 1920.0] {
+                let open = |rt: &mut Runtime<State>| {
+                    rt.update(|s, _| {
+                        let t = s.current_mut();
+                        t.thoughts[1].expanded = true;
+                        t.tools[0].group_expanded = true;
+                        // As the disclosure handlers report it to the turn's memo.
+                        t.timeline_cache.get_mut().touch_message(1);
+                    });
+                    settle(rt);
+                    center_on(rt, "turn-1-long-answer");
+                };
+                let mut split = long_turn_runtime(width, 60, live);
+                open(&mut split);
+                assert!(
+                    timeline_structure(split.state.current())
+                        .rows
+                        .iter()
+                        .any(|row| matches!(row, TimelineRow::TurnPiece { .. }))
+                );
+                NEVER_SPLIT.with(|never| never.set(true));
+                let mut whole = long_turn_runtime(width, 60, live);
+                open(&mut whole);
+                NEVER_SPLIT.with(|never| never.set(false));
+                let (split, whole) = (entry_offsets(&split), entry_offsets(&whole));
+                let shared: Vec<_> = split
+                    .keys()
+                    .filter(|key| whole.contains_key(*key))
+                    .collect();
+                assert!(shared.len() > 20, "{live} {width}: {} shared", shared.len());
+                for key in shared {
+                    assert_eq!(split[key], whole[key], "{live} {width}: {key}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn small_turns_keep_one_row() {
+        let mut rt = long_turn_runtime(1280.0, 20, true);
+        let rows = timeline_structure(rt.state.current()).rows.clone();
+        assert!(
+            rows.iter()
+                .all(|row| !matches!(row, TimelineRow::TurnPiece { .. }))
+        );
+        rt.frame(1.0 / 60.0);
+        assert!(rt.presented("work-rows-message-1-id-long-answer").is_some());
+    }
+
+    #[test]
+    fn long_turns_hold_the_reader_through_streaming_disclosure_and_resize() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = long_turn_runtime(width, 1_000, true);
+            let middle = middle_slice(&rt);
+            center_on(&mut rt, &middle);
+            rt.wheel(width * 0.5, 300.0, -4.0);
+            settle(&mut rt);
+            let anchor = visible_tool(&rt);
+            let before = top_of(&rt, &anchor);
+            // Streaming prose and a new step at the end.
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                t.messages[1].text.push_str(" More streamed words.");
+                t.timeline_cache.get_mut().touch_message(1);
+                t.transcript_content += 1;
+                let mut tool = t.tools[0].clone();
+                tool.id = "long-tool-new".into();
+                tool.done = false;
+                tool.order = 5_000;
+                tool.anchor.offset = t.messages[1].text.len();
+                t.tools.push(tool);
+                t.transcript_structure += 1;
+            });
+            settle(&mut rt);
+            assert_eq!(
+                top_of(&rt, &anchor),
+                before,
+                "{width}: streaming moved {anchor}"
+            );
+            // Opening a thought adds a body entry and re-keys later slices.
+            let thought = rt
+                .elements()
+                .iter()
+                .filter_map(|element| element.key.clone())
+                .find(|key| {
+                    key.starts_with("inline-thought-1-")
+                        && rt.find(key).is_some_and(|(_, y)| y > before + 40.0)
+                })
+                .expect("a thought below the anchor");
+            let thought_top = top_of(&rt, &thought);
+            press(&mut rt, &thought);
+            settle(&mut rt);
+            assert_eq!(
+                top_of(&rt, &thought),
+                thought_top,
+                "{width}: {thought} moved"
+            );
+            let index: usize = thought.rsplit('-').next().unwrap().parse().unwrap();
+            assert!(rt.presented(&format!("thought-output-1-{index}")).is_some());
+            // Open a tool's large output, then close it.
+            let tool_top = top_of(&rt, &anchor);
+            press(&mut rt, &anchor);
+            settle(&mut rt);
+            assert_eq!(
+                top_of(&rt, &anchor),
+                tool_top,
+                "{width}: {anchor} moved on open"
+            );
+            press(&mut rt, &anchor);
+            settle(&mut rt);
+            assert_eq!(
+                top_of(&rt, &anchor),
+                tool_top,
+                "{width}: {anchor} moved on close"
+            );
+            // A wider window reflows rows but keeps the reader's row on screen.
+            rt.set_viewport((width + 120.0, 760.0), 1.0);
+            settle(&mut rt);
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            let top = top_of(&rt, &anchor);
+            assert!(
+                top >= viewport[1] && top < viewport[1] + viewport[3],
+                "{width}: resize lost {anchor}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_long_turns_load_deferred_work_and_reveal_search_hits_in_place() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = long_turn_runtime(width, 1_000, false);
+            center_on(&mut rt, "turn-1-long-answer");
+            // Collapse, then reopen with its work still loading: one row with a skeleton.
+            press(&mut rt, "toggle-work-1-1");
+            settle(&mut rt);
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                t.deferred_work.push(json!({"start": 1}));
+                t.work[0].expanded = true;
+                t.transcript_structure += 1;
+            });
+            center_on(&mut rt, "turn-1-long-answer");
+            assert!(
+                timeline_structure(rt.state.current())
+                    .rows
+                    .iter()
+                    .all(|row| !matches!(row, TimelineRow::TurnPiece { .. }))
+            );
+            let toggle = top_of(&rt, "toggle-work-1-1");
+            // The work arrives: the turn splits under the same toggle.
+            rt.update(|s, _| {
+                let t = s.current_mut();
+                t.deferred_work.clear();
+                t.transcript_structure += 1;
+            });
+            settle(&mut rt);
+            assert_eq!(
+                top_of(&rt, "toggle-work-1-1"),
+                toggle,
+                "{width}: load moved"
+            );
+            assert!(mounted_work(&rt) < 400);
+
+            // Find's reveal lands on the slice holding prose between the steps.
+            rt.update(|s, _| {
+                s.open_thread_find();
+                s.thread_find.query.replace_text("Halfway marker");
+                let matched = crate::thread_find::ThreadFindMatch {
+                    entry_id: "long-answer".into(),
+                    occurrence: 0,
+                };
+                s.thread_find.total_matches = 1;
+                s.thread_find.active_match = Some(matched.clone());
+                s.thread_find.pending_reveal = Some(matched);
+            });
+            settle(&mut rt);
+            let key = crate::ui::timeline_text_row(rt.state.current(), 1, |chunk| {
+                chunk.contains("Halfway")
+            })
+            .expect("the prose is in a slice");
+            assert!(key.starts_with("turn-1-long-answer-work-"), "{key}");
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            let hit = rt
+                .find("thread-find-active")
+                .expect("the active match is mounted")
+                .1;
+            assert!(
+                hit >= viewport[1] && hit < viewport[1] + viewport[3],
+                "{width}: the match is off screen"
+            );
+            assert!(rt.state.thread_find.pending_reveal.is_none());
+            // The answer after the work is in the tail.
+            assert_eq!(
+                crate::ui::timeline_text_row(rt.state.current(), 1, |chunk| {
+                    chunk.contains("Every package passed")
+                })
+                .as_deref(),
+                Some("turn-1-long-answer-tail")
+            );
+        }
+    }
+
+    #[test]
+    fn long_turns_keep_complete_logical_content() {
+        let rt = long_turn_runtime(1280.0, 1_000, false);
+        let t = rt.state.current();
+        let structure = timeline_structure(t);
+        let parts = turn_parts(t, 1, 2);
+        let (last_work, preamble) = turn_shape(t, &parts);
+        let items = work_items(t, &parts, last_work, preamble, true);
+        // Every work entry is in exactly one slice, in order.
+        let mut covered = vec![];
+        for row in structure.rows.iter() {
+            if let TimelineRow::TurnPiece {
+                piece: TurnPiece::Work { lo, hi },
+                ..
+            } = row
+            {
+                covered.extend(*lo..(*hi).min(items.len()));
+            }
+        }
+        assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
+        assert_eq!(items.len(), 1_000 + 1);
+        // Search and copy read the thread, not the mounted rows.
+        let text = &t.messages[1].text;
+        assert!(text.contains("Halfway marker") && text.contains("Every package passed"));
+        assert_eq!(t.tools.len() + t.thoughts.len(), 1_000 + 1_000 / 50);
+        assert!(t.tools.iter().all(|tool| tool.output.len() > 20_000));
+    }
+
+    /// Issue #26: headless CPU and allocation counts per frame for one turn of 1,000
+    /// thought and command parts, live and completed with its work expanded. It is the
+    /// same at the parent commit and after the change, so both can run it.
+    #[test]
+    #[ignore = "manual headless long-turn CPU and allocation benchmark"]
+    fn long_turn_view_benchmark() {
+        fn pct(values: &mut [f64], p: usize) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[(values.len() * p / 100).min(values.len() - 1)]
+        }
+        let mut results = Vec::new();
+        for live in [true, false] {
+            let mut rt = long_turn_runtime(1280.0, 1_000, live);
+            let max = rt
+                .state
+                .timeline_positions
+                .borrow()
+                .visit()
+                .scroll
+                .lock()
+                .unwrap()
+                .max[1];
+            rt.update(move |_, tx| tx.scroll_to_y("conversation-1", max * 0.5));
+            settle(&mut rt);
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            let (x, y) = (
+                viewport[0] + viewport[2] * 0.5,
+                viewport[1] + viewport[3] * 0.5,
+            );
+            let phases: &[&str] = if live {
+                &["scroll_only", "stream_while_scrolling", "output_disclosure"]
+            } else {
+                &["scroll_only", "output_disclosure"]
+            };
+            for &phase in phases {
+                let (mut ms, mut allocs, mut bytes) = (vec![], vec![], vec![]);
+                let disclose = (phase == "output_disclosure").then(|| visible_tool(&rt));
+                take_timeline_counts();
+                for sample in 0..40 {
+                    let begin = std::time::Instant::now();
+                    crate::test_alloc::reset();
+                    if phase == "stream_while_scrolling" {
+                        rt.update(move |s, _| {
+                            let t = s.current_mut();
+                            t.messages[1].text.push_str(" streamed");
+                            t.timeline_cache.get_mut().touch_message(1);
+                            t.transcript_content += 1;
+                            if sample % 10 == 9 {
+                                let mut tool = t.tools[0].clone();
+                                tool.id = format!("bench-tool-{sample}");
+                                tool.order = 10_000 + sample as u64;
+                                tool.anchor.offset = t.messages[1].text.len();
+                                t.tools.push(tool);
+                                t.transcript_structure += 1;
+                            }
+                        });
+                    }
+                    if let Some(key) = &disclose {
+                        let (px, py) = rt.find(key).expect("disclosure row on screen");
+                        rt.pointer_down(px, py);
+                        rt.pointer_up(px, py);
+                    } else {
+                        rt.wheel(x, y, if sample % 2 == 0 { 4.0 } else { -4.0 });
+                    }
+                    rt.frame(1.0 / 60.0);
+                    let (count, size) = crate::test_alloc::counts();
+                    ms.push(begin.elapsed().as_secs_f64() * 1_000.0);
+                    allocs.push(count as f64);
+                    bytes.push(size as f64);
+                }
+                results.push(json!({
+                    "fixture": if live { "live" } else { "completed_expanded" },
+                    "phase": phase, "samples": ms.len(),
+                    "frame_ms": {"p50": pct(&mut ms, 50), "p95": pct(&mut ms, 95), "max": pct(&mut ms, 100)},
+                    "allocations": {"p50": pct(&mut allocs, 50), "p95": pct(&mut allocs, 95)},
+                    "alloc_bytes": {"p50": pct(&mut bytes, 50), "p95": pct(&mut bytes, 95)},
+                    "counts": take_timeline_counts(),
+                    "mounted_work_elements": mounted_work(&rt),
+                    "total_elements": rt.elements().len(),
+                }));
+            }
+        }
+        let revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        println!(
+            "LONG_TURN_BENCHMARK {}",
+            json!({
+                "source_revision": String::from_utf8_lossy(&revision.stdout).trim(),
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "platform": std::env::consts::OS, "arch": std::env::consts::ARCH,
+                "scope": "headless view/commit/layout CPU and allocator calls per frame; no GPU, presentation or FPS",
+                "width": 1280, "height": 720, "parts": 1_000, "results": results,
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "manual headless timeline CPU benchmark"]
+    fn timeline_view_benchmark() {
+        let mut results = Vec::new();
+        for turns in [100, 1_000, 5_000] {
+            let mut rt = cached_timeline_runtime(1280.0, turns);
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            for phase in ["scroll_only", "stream_while_scrolling", "history_prepend"] {
+                let mut samples = Vec::new();
+                take_timeline_counts();
+                for sample in 0..20 {
+                    let begin = std::time::Instant::now();
+                    if phase == "stream_while_scrolling" {
+                        rt.update(|s, _| {
+                            let t = s.current_mut();
+                            let last = t.messages.len() - 1;
+                            t.messages[last].text.push_str(" streamed");
+                            t.timeline_cache.get_mut().touch_message(last);
+                            t.transcript_content += 1;
+                        });
+                    } else if phase == "history_prepend" {
+                        rt.update(|s, _| {
+                            let t = s.current_mut();
+                            for tool in &mut t.tools {
+                                tool.anchor.message += 2;
+                            }
+                            for work in &mut t.work {
+                                work.start += 2;
+                            }
+                            let mut tool = t.tools[0].clone();
+                            tool.id = format!("prepend-tool-{sample}");
+                            tool.anchor.message = 1;
+                            t.tools.insert(0, tool);
+                            t.messages.splice(
+                                0..0,
+                                [
+                                    crate::model::Message {
+                                        id: format!("prepend-user-{sample}"),
+                                        role: "You",
+                                        text: "Earlier question.".into(),
+                                        images: vec![],
+                                        context: None,
+                                    },
+                                    crate::model::Message {
+                                        id: format!("prepend-answer-{sample}"),
+                                        role: "Pi",
+                                        text: "Earlier response.".into(),
+                                        images: vec![],
+                                        context: None,
+                                    },
+                                ],
+                            );
+                            t.work.insert(
+                                0,
+                                crate::model::AssistantWork {
+                                    start: 1,
+                                    stopped: false,
+                                    stopped_order: 0,
+                                    expanded: false,
+                                    elapsed: Some(1),
+                                    outcome: Some(Status::Completed),
+                                },
+                            );
+                            t.transcript_structure += 1;
+                        });
+                    }
+                    if phase != "history_prepend" {
+                        rt.wheel(
+                            viewport[0] + viewport[2] * 0.5,
+                            viewport[1] + viewport[3] * 0.5,
+                            if sample % 2 == 0 { 8.0 } else { -8.0 },
+                        );
+                    }
+                    rt.frame(1.0 / 60.0);
+                    samples.push(begin.elapsed().as_secs_f64() * 1_000.0);
+                }
+                samples.sort_by(f64::total_cmp);
+                let mounted = rt
+                    .elements()
+                    .iter()
+                    .filter(|element| {
+                        element.key.as_deref().is_some_and(|key| {
+                            key.starts_with("turn-1-cache-") || key.starts_with("row-1-cache-")
+                        })
+                    })
+                    .count();
+                results.push(json!({
+                    "turns": turns, "messages": turns * 2, "tools": turns,
+                    "phase": phase, "samples": samples.len(),
+                    "p50_ms": samples[samples.len() / 2],
+                    "p95_ms": samples[samples.len() * 95 / 100],
+                    "counts": take_timeline_counts(), "mounted_rows_at_end": mounted,
+                }));
+            }
+        }
+        let revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        println!(
+            "TIMELINE_BENCHMARK {}",
+            json!({
+                "source_revision": String::from_utf8_lossy(&revision.stdout).trim(),
+                "profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+                "platform": std::env::consts::OS, "arch": std::env::consts::ARCH,
+                "scope": "headless native view/commit/layout CPU; no server receive, GPU or FPS measurement",
+                "width": 1280, "height": 720, "results": results,
+            })
+        );
+    }
+
+    #[test]
     fn summaries_group_calls_at_the_same_transcript_position_only() {
         let mut s = State::new(".".into(), false);
         s.populate_demo();
@@ -23951,17 +25888,25 @@ pub(crate) mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         let y = |rt: &Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
-        assert!(y(&rt, "message-1-1-body-0") < y(&rt, "toggle-work-1-1"));
+        assert!(y(&rt, &assistant_body_key(rt.state.current(), 1, 0)) < y(&rt, "toggle-work-1-1"));
         assert!(y(&rt, "toggle-work-1-1") < y(&rt, "toggle-tool-group-1-0"));
         assert!(y(&rt, "toggle-tool-group-1-0") < y(&rt, "inline-thought-1-0"));
-        assert!(y(&rt, "inline-thought-1-0") < y(&rt, "message-1-3-body-0"));
+        assert!(
+            y(&rt, "inline-thought-1-0") < y(&rt, &assistant_body_key(rt.state.current(), 3, 0))
+        );
         press(&mut rt, "inline-thought-1-0");
         assert!(rt.presented("thought-output-1-0").is_some());
         press(&mut rt, "toggle-work-1-1");
         rt.frame(2.0);
         assert!(!rt.state.current().work[0].expanded);
-        assert!(rt.presented("work-rows-1-1").is_none());
-        assert!(rt.presented("message-1-3-body-0").is_some());
+        assert!(
+            rt.presented(&format!("work-rows-{}", message_key(rt.state.current(), 1)))
+                .is_none()
+        );
+        assert!(
+            rt.presented(&assistant_body_key(rt.state.current(), 3, 0))
+                .is_some()
+        );
         press(&mut rt, "toggle-work-1-1");
         rt.frame(4.0);
         assert!(rt.state.current().thoughts[0].expanded);
@@ -23981,8 +25926,17 @@ pub(crate) mod tests {
             .current_mut()
             .apply(json!({"type":"agent_settled"}));
         rt.frame(0.0);
-        assert!(rt.presented("message-1-0-body-0").is_some());
-        assert!(rt.presented("work-section-1-0").is_none());
+        assert!(
+            rt.presented(&assistant_body_key(rt.state.current(), 0, 0))
+                .is_some()
+        );
+        assert!(
+            rt.presented(&format!(
+                "work-section-{}",
+                message_key(rt.state.current(), 0)
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -23995,7 +25949,10 @@ pub(crate) mod tests {
                 "type":"text_delta","contentIndex":0,"delta":"I'll check the file."
             }}));
         rt.frame(0.0);
-        let text_y = rt.presented("message-1-0-body-0").unwrap().0[1];
+        let text_y = rt
+            .presented(&assistant_body_key(rt.state.current(), 0, 0))
+            .unwrap()
+            .0[1];
         assert!(text_y < rt.presented("live-status-1").unwrap().0[1]);
         assert!(
             rt.presented("toggle-work-1-0").is_none(),
@@ -24012,7 +25969,12 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         rt.frame(2.0);
-        assert_eq!(rt.presented("message-1-0-body-0").unwrap().0[1], text_y);
+        assert_eq!(
+            rt.presented(&assistant_body_key(rt.state.current(), 0, 0))
+                .unwrap()
+                .0[1],
+            text_y
+        );
         let tool_y = rt.presented("inline-tool-1-0").unwrap().0[1];
         assert!(tool_y < rt.presented("live-status-1").unwrap().0[1]);
     }
@@ -24033,7 +25995,10 @@ pub(crate) mod tests {
             rt.invalidate();
             rt.frame(1.0);
             rt.frame(2.0);
-            let prose = rt.presented("message-1-0-body-0").unwrap().0;
+            let prose = rt
+                .presented(&assistant_body_key(rt.state.current(), 0, 0))
+                .unwrap()
+                .0;
             let live_tool = rt.presented("inline-tool-1-0").unwrap().0;
             let (status, _) = rt.presented("live-status-1").unwrap();
             assert_eq!(
@@ -29184,7 +31149,7 @@ pub(crate) mod tests {
         rt.frame(1.0);
 
         // Select text inside the assistant message and verify the floating toolbar appears.
-        let body_key = "message-1-0-body-0";
+        let body_key = &assistant_body_key(rt.state.current(), 0, 0);
         rt.update(|_, tx| {
             tx.blur();
             tx.select_all_text(body_key);
@@ -29197,6 +31162,21 @@ pub(crate) mod tests {
             rt.state.assistant_selection
         );
         assert!(rt.presented("assistant-selection-cite").is_some());
+
+        // Prepending history must not make Cite use the old message ordinal.
+        rt.update(|s, _| {
+            s.current_mut().messages.insert(
+                0,
+                crate::model::Message {
+                    id: "earlier-citation-context".into(),
+                    role: "You",
+                    text: "Earlier context.".into(),
+                    images: vec![],
+                    context: None,
+                },
+            );
+        });
+        rt.frame(1.0);
 
         // Press Cite: inserts one chip and one draft record, opens the comment
         // editor (KSG auto-opens it on cite), clears selection and hides toolbar.
@@ -29673,9 +31653,10 @@ pub(crate) mod tests {
             );
 
             // Now select text on the assistant message and verify the selection toolbar fits.
+            let body_key = assistant_body_key(rt.state.current(), 0, 0);
             rt.update(|_, tx| {
                 tx.blur();
-                tx.select_all_text("message-1-0-body-0");
+                tx.select_all_text(body_key);
             });
             rt.frame(1.0);
             rt.frame(1.0);

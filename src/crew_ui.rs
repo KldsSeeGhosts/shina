@@ -410,13 +410,6 @@ fn delegated_task(s: &State, t: &Thread, index: usize) -> Option<TaskView> {
     tasks.into_iter().nth(ordinal)
 }
 
-/// Whether a transcript part is only delegations in a captain's home, shown as task cards.
-pub(super) fn is_card_part(s: &State, t: &Thread, part: &TranscriptPart) -> bool {
-    s.is_captain_home(t)
-        && matches!(part, TranscriptPart::Tools(indices)
-            if indices.iter().all(|&index| is_delegation(&t.tools[index])))
-}
-
 /// A tool batch in the transcript. In a captain's home each delegation becomes a task card;
 /// every other call keeps the shared tool rows.
 pub(super) fn tool_part(s: &State, p: Palette, indices: &[usize]) -> El {
