@@ -985,6 +985,7 @@ mod tests {
             cancelled_commands: vec![],
             reply_after_position: 0,
             document_reads,
+            inputs: Vec::new(),
         });
         state.threads[i].delegated = true;
         state.threads[i].status = Status::Running;
