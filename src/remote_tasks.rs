@@ -132,7 +132,7 @@ pub async fn wait_for_peer_thread(
             "finished":record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
             "documentRequest":document_request,"status":thread["status"],
-            "attemptId":record["peerOrigin"]["attemptId"]});
+            "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"]});
         status["result"] = record["peerOrigin"]["result"].clone();
         status["revision"] = json!(crate::protocol::revision(&status));
         Ok(status)
@@ -603,7 +603,8 @@ mod tests {
         state.threads[0].project = Some(1);
         state.peers.push(crate::peer::Peer {
             server_id:uuid::Uuid::new_v4().to_string(),host:"127.0.0.1:1".into(),label:"Target".into(),linked_at:0,
-            capabilities:json!({"projects":[{"id":9,"path":"/target/project","name":"Project","gitRemote":"example.com/team/repo"}],
+            capabilities:json!({"contracts":[crate::protocol::PLACEMENT],
+                "projects":[{"id":9,"path":"/target/project","name":"Project","gitRemote":"example.com/team/repo"}],
                 "harnesses":[{"id":"pi"}],"models":[{"provider":"cpa","id":"fixture","reasoning_levels":["off"]}]}),
             last_reached_at:Some(0),last_error:None,
         });
@@ -2006,7 +2007,10 @@ mod tests {
     #[test]
     fn explicit_followup_enables_document_reads_for_a_legacy_worker() {
         let mut home = captain_fixture();
-        home.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        home.peers[0].capabilities["contracts"] = json!([
+            crate::protocol::CAPTAIN_PEER_DOCUMENTS,
+            crate::protocol::PLACEMENT
+        ]);
         home.mcp_call(1, "delegate_task", &captain_launch_args())
             .unwrap();
         reply(
@@ -2239,7 +2243,10 @@ mod tests {
     #[test]
     fn crew_context_manifest_carries_revision_hash_and_coverage() {
         let mut state = captain_fixture();
-        state.peers[0].capabilities["contracts"] = json!([crate::protocol::CAPTAIN_PEER_DOCUMENTS]);
+        state.peers[0].capabilities["contracts"] = json!([
+            crate::protocol::CAPTAIN_PEER_DOCUMENTS,
+            crate::protocol::PLACEMENT
+        ]);
         let text = format!("{}TAIL", "x".repeat(10_000));
         state
             .captain_books
@@ -2401,6 +2408,9 @@ pub struct RemoteTask {
     /// authenticated link that carries every other command to the target.
     #[serde(default)]
     pub document_replies: VecDeque<Command>,
+    /// The worker's resolved placement, mirrored from the target's replies.
+    #[serde(default)]
+    pub placement: Option<Value>,
 }
 
 #[derive(Default)]
@@ -2411,6 +2421,19 @@ pub(super) struct PeerRuntime {
     next_probe: u64,
     next_metadata_at: u64,
     followers: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+}
+impl PeerRuntime {
+    /// Queue a peer reply for `poll_remote_tasks`. Test-only seam so sibling
+    /// test modules never touch the channel map directly.
+    #[cfg(test)]
+    pub(crate) fn inject_pending(
+        &mut self,
+        task_id: String,
+        method: String,
+        receive: mpsc::Receiver<Result<Value, String>>,
+    ) {
+        self.pending.insert(task_id, (method, receive));
+    }
 }
 
 pub(crate) type Preparation = mpsc::Receiver<Result<Option<crate::peer::Peer>, String>>;
@@ -3265,6 +3288,7 @@ impl State {
                 needs_you: false,
                 request: None,
                 wait_revision: None,
+                placement: None,
                 parent_stop_serial: 0,
                 child_stop_serial: 0,
                 client_request_id: None,
@@ -3569,12 +3593,69 @@ impl State {
         if brief.len() > 64 * 1024 {
             return Err("The brief and shared crew context exceed the peer's 64 KiB limit. Shorten the brief or crew rules.".into());
         }
+        let mut placement_spec = placement::spec_from_args(args)?;
+        let placement_mode = placement_spec
+            .as_ref()
+            .map(|spec| placement::validate_spec(spec))
+            .transpose()?
+            .flatten();
+        let shared_reader = placement_mode == Some(placement::PlacementMode::Shared);
+        // A peer that does not advertise placement-v1 ignores the launch's
+        // placement argument and would run the worker in its shared checkout.
+        // Refuse isolation rather than let a writer silently share a writable
+        // checkout. Only an explicit shared placement survives on an old peer.
+        let placement_contract =
+            peer.capabilities["contracts"]
+                .as_array()
+                .is_some_and(|contracts| {
+                    contracts
+                        .iter()
+                        .any(|contract| contract == crate::protocol::PLACEMENT)
+                });
+        if !placement_contract && !shared_reader {
+            return Err(format!(
+                "Update required on {}. Worker placement needs {} there; update Shina on that server, or request a shared read-only placement.",
+                peer.label,
+                crate::protocol::PLACEMENT
+            ));
+        }
+        if let Some(spec) = placement_spec.as_mut()
+            && let Some(upstream_id) = spec.upstream_thread_id
+        {
+            // Tool callers know the home's task ids, not the target's private
+            // thread ids. Never forward a home id that could name unrelated
+            // work on the executor.
+            let upstream = self.tasks.iter()
+                .find(|task| task.child_thread_id == upstream_id)
+                .and_then(|task| task.remote.as_ref())
+                .filter(|remote| remote.server_id == peer.server_id
+                    && remote.project["id"] == project["id"])
+                .ok_or("placement.upstreamThreadId must name a delegated task on the same peer project.")?;
+            if upstream
+                .placement
+                .as_ref()
+                .is_none_or(|placement| placement["phase"] != "ready")
+            {
+                return Err("The upstream task's placement is not ready yet.".into());
+            }
+            spec.upstream_thread_id = Some(
+                upstream
+                    .thread_id
+                    .ok_or("The upstream task has no acknowledged peer thread yet.")?,
+            );
+        }
         let launch = Command::new(
             "peer.thread.launch",
             json!({"projectId":project["id"],"harness":harness,"provider":provider,
             "model":model,"reasoning":reasoning,"brief":brief,"title":thread.title,"origin":origin,"request":args,
-            "access":match self.threads[caller].native.access {AccessMode::ReadOnly=>AccessMode::default(),access=>access}.id()}),
+            "placement":if placement_contract {placement_spec.as_ref().map(serde_json::to_value).transpose().ok().flatten()} else {Option::<Value>::None},
+            "access":if shared_reader {AccessMode::ReadOnly.id()} else {match self.threads[caller].native.access {AccessMode::ReadOnly=>AccessMode::default(),access=>access}.id()}}),
         );
+        let old_peer_checkout = if placement_contract {
+            None
+        } else {
+            project["path"].as_str().map(str::to_owned)
+        };
         task.remote = Some(RemoteTask {
             server_id: peer.server_id.clone(),
             project,
@@ -3596,6 +3677,38 @@ impl State {
             client_request_id: request.map(str::to_owned),
             send_command: None,
             document_replies: VecDeque::new(),
+            placement: Some(
+                placement::ThreadPlacement {
+                    requested: placement::PlacementRequest::from_mode(placement_mode),
+                    mode: placement_mode.unwrap_or(placement::PlacementMode::Isolated),
+                    phase: if placement_contract {
+                        placement::PlacementPhase::Pending
+                    } else {
+                        placement::PlacementPhase::Ready
+                    },
+                    executor: peer.server_id.clone(),
+                    repository: None,
+                    base_branch: None,
+                    base_commit: None,
+                    upstream_thread_id: None,
+                    branch: None,
+                    checkout: old_peer_checkout,
+                    start_from_origin: false,
+                    primary_checkout: !placement_contract,
+                    new_worktree: false,
+                    capability: if placement_contract {
+                        None
+                    } else {
+                        Some(format!(
+                            "{} does not advertise {}; the worker shares the project checkout read-only.",
+                            peer.label,
+                            crate::protocol::PLACEMENT
+                        ))
+                    },
+                    error: None,
+                }
+                .value(),
+            ),
         });
         let id = thread.id;
         self.next_id += 1;
@@ -3619,7 +3732,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PEER_TASK_FENCES],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PLACEMENT,crate::protocol::PEER_TASK_FENCES],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
@@ -3723,22 +3836,54 @@ impl State {
             thread.project = Some(project);
             thread.harness = harness.into();
             thread.delegated = true;
+            let placement_seed = format!("peer:{}", origin.task_id);
             thread.peer_origin = Some(origin);
             thread.set_model(selection.provider, selection.model);
             if let Some(reasoning) = selection.reasoning {
                 thread.set_thinking(reasoning);
             }
             thread.arm_task();
-            thread.pending_injections.push_back(Injection {
-                text: brief.into(),
-                shown: false,
-                steer: None,
-            });
+            let executor = std::fs::read_to_string(self.data_dir.join("server-id"))
+                .map(|id| id.trim().to_owned())
+                .unwrap_or_else(|_| "local".into());
+            #[cfg(test)]
+            let git_ctx = self.test_git_context.clone().unwrap_or_default();
+            #[cfg(not(test))]
+            let git_ctx = crate::vcs::GitContext::default();
+            let spec = placement::spec_from_args(args)?;
+            let resolved = self.plan_thread_placement(
+                &thread,
+                spec.as_ref(),
+                &placement_seed,
+                &executor,
+                &git_ctx,
+            )?;
+            if resolved.read_only() {
+                // A shared placement views the project checkout without write
+                // access, whatever access the launch requested.
+                thread.native.access = AccessMode::ReadOnly;
+            }
+            let pending = resolved.phase == placement::PlacementPhase::Pending;
+            if resolved.uses_worktree() {
+                thread.worktree_path = resolved.checkout.clone();
+                thread.branch = resolved.branch.clone();
+                thread.env_mode = Some(ThreadEnvMode::Worktree);
+            }
+            thread.placement = Some(resolved.clone());
+            if !pending {
+                thread.pending_injections.push_back(Injection {
+                    text: brief.into(),
+                    shown: false,
+                    steer: None,
+                });
+            }
             let id = thread.id;
             self.next_id += 1;
             self.threads.push(thread);
-            self.connect_thread(self.threads.len() - 1);
-            return Ok(json!({"threadId":id}));
+            if !pending {
+                self.connect_thread(self.threads.len() - 1);
+            }
+            return Ok(json!({"threadId":id,"placement":resolved.value()}));
         }
         if command.method == "peer.thread.list" {
             return self.readable_threads(None, &args["read"]);
@@ -3949,6 +4094,12 @@ impl State {
                 {
                     thread.memory_suggestions.clear();
                 }
+                let previous_attempt = thread
+                    .peer_origin
+                    .as_ref()
+                    .expect("origin")
+                    .attempt_message
+                    .clone();
                 thread.peer_origin.as_mut().expect("origin").result = None;
                 thread.peer_origin.as_mut().expect("origin").acknowledged = false;
                 thread.peer_origin.as_mut().expect("origin").attempt_message = message.into();
@@ -3963,6 +4114,41 @@ impl State {
                 } else {
                     None
                 };
+                let placement_ready = thread
+                    .placement
+                    .as_ref()
+                    .is_none_or(|placement| placement.phase == placement::PlacementPhase::Ready);
+                let placement_failed = thread
+                    .placement
+                    .as_ref()
+                    .is_some_and(|placement| placement.phase == placement::PlacementPhase::Failed);
+                if !placement_ready {
+                    // Queue the recorded brief ahead of this follow-up until
+                    // the reservation provisions, then deliver both in order.
+                    // finish_placement_ready skips its attempt injection while
+                    // pending_injections is non-empty.
+                    if delivery == Some("attempt") {
+                        // New work supersedes the cancelled attempt. Never
+                        // reconstruct that attempt's brief while adopting its
+                        // still-pending checkout reservation.
+                        thread.pending_injections.clear();
+                    } else if thread.pending_injections.is_empty() && !previous_attempt.is_empty() {
+                        thread.pending_injections.push_back(Injection {
+                            text: previous_attempt,
+                            shown: false,
+                            steer: None,
+                        });
+                    }
+                    thread.pending_injections.push_back(Injection {
+                        text: message.into(),
+                        shown: false,
+                        steer: None,
+                    });
+                    if placement_failed {
+                        self.request_reprovision(index);
+                    }
+                    return Ok(json!({"threadId":self.threads[index].id,"queued":true}));
+                }
                 thread.pending_injections.push_back(Injection {
                     text: message.into(),
                     shown: false,
@@ -4465,6 +4651,10 @@ impl State {
                             remote.thread_id = value["threadId"]
                                 .as_u64()
                                 .and_then(|n| usize::try_from(n).ok());
+                            if let Some(placement) = value.get("placement").filter(|v| !v.is_null())
+                            {
+                                remote.placement = Some(placement.clone());
+                            }
                             remote.state = RemoteState::Accepted;
                             remote.next_retry_at = 0;
                             if !task.state.finished() {
@@ -4496,6 +4686,10 @@ impl State {
                         }
                         "peer.thread.wait" => {
                             remote.wait_revision = value["revision"].as_str().map(str::to_owned);
+                            if let Some(placement) = value.get("placement").filter(|v| !v.is_null())
+                            {
+                                remote.placement = Some(placement.clone());
+                            }
                             remote.needs_you = value["needsYou"] == true;
                             remote.request = value.get("request").filter(|v| !v.is_null()).cloned();
                             remote.state = if value["finished"] == true {

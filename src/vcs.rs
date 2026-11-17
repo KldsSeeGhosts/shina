@@ -284,10 +284,10 @@ struct T3ProjectFileScript {
     run_on_worktree_create: bool,
 }
 
-struct GitOutput {
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct GitOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -349,7 +349,7 @@ pub(crate) fn configure_git_command(cmd: &mut Command, cwd: &Path, ctx: &GitCont
     }
 }
 
-fn run_git_raw(
+pub(crate) fn run_git_raw(
     operation: &str,
     cwd: &Path,
     args: &[&str],
@@ -379,7 +379,7 @@ fn run_git_raw(
     })
 }
 
-fn run_git_checked(
+pub(crate) fn run_git_checked(
     operation: &str,
     cwd: &Path,
     args: &[&str],
@@ -632,7 +632,7 @@ fn refuse_option_like_ref_name(
     Ok(())
 }
 
-fn read_git_common_dir(cwd: &Path, ctx: &GitContext) -> Result<Option<PathBuf>, String> {
+pub(crate) fn read_git_common_dir(cwd: &Path, ctx: &GitContext) -> Result<Option<PathBuf>, String> {
     let out = run_git_raw(
         "GitVcsDriver.resolveRepositoryPaths.commonDir",
         cwd,

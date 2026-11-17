@@ -170,9 +170,10 @@ impl State {
                 target.name
             ));
         }
-        if draft.worktree_path.is_some()
-            || draft.branch.is_some()
-            || self.effective_env_mode(draft) == ThreadEnvMode::Worktree
+        if !self.crew_draft_placement()
+            && (draft.worktree_path.is_some()
+                || draft.branch.is_some()
+                || self.effective_env_mode(draft) == ThreadEnvMode::Worktree)
         {
             return Err(
                 "Crew creation cannot start a new worktree. Switch back to the local checkout or remove the chip."
@@ -228,8 +229,8 @@ impl State {
             return Err("Could not open a draft on this machine.".into());
         }
         let thread = self.current_mut();
-        // The backend never creates a crew thread inside a new worktree; a
-        // worktree or extra-model choice made later blocks send instead.
+        // A backend without placement-v1 never creates a crew thread inside
+        // a new worktree; a worktree choice made later blocks send there.
         thread.env_mode = Some(ThreadEnvMode::Local);
         thread.base_branch = None;
         thread.start_from_origin = None;
@@ -241,7 +242,52 @@ impl State {
             name,
         });
         thread.crew_draft_notice = None;
+        // With placement-v1 a crew worker writes in its own worktree unless
+        // the draft picks the read-only checkout.
+        if self.crew_draft_placement() {
+            self.set_draft_env_mode(ThreadEnvMode::Worktree);
+        }
         Ok(())
+    }
+
+    /// Whether the open crew draft's machine takes an explicit placement
+    /// (`placement-v1`). Without a client this desktop is the server.
+    pub fn crew_draft_placement(&self) -> bool {
+        self.current().crew_draft.as_ref().is_some_and(|target| {
+            self.client.as_ref().is_none_or(|client| {
+                client.supports_capability(&target.server, crate::protocol::PLACEMENT)
+            })
+        })
+    }
+
+    /// The `placement` argument for the draft's `captain.crew.create`, read
+    /// from the composer's workspace controls: a new worktree on the chosen
+    /// base, the selected existing worktree, or the project's checkout read
+    /// only. Without workspace controls the backend's default applies.
+    fn crew_draft_placement_args(&self) -> Option<Value> {
+        if !self.crew_draft_placement() {
+            return None;
+        }
+        match self.composer_vcs_controls() {
+            ComposerVcsControls::Hidden => None,
+            ComposerVcsControls::LockedWorktree { worktree_path, .. } => {
+                Some(json!({"mode":"existing","worktree":worktree_path}))
+            }
+            ComposerVcsControls::Editable {
+                mode: ThreadEnvMode::Local,
+                ..
+            } => Some(json!({"mode":"shared"})),
+            ComposerVcsControls::Editable {
+                base_branch,
+                start_from_origin,
+                ..
+            } => Some(match base_branch {
+                Some(base) => {
+                    json!({"mode":"isolated","baseBranch":base,"startFromOrigin":start_from_origin})
+                }
+                None => json!({"mode":"isolated"}),
+            }),
+        }
     }
 
     /// Send the bound draft through `captain.crew.create`. Called from
@@ -298,7 +344,7 @@ impl State {
         if let Some(reasoning) = &self.current().selected_thinking {
             target_params["options"] = json!({"reasoning":reasoning});
         }
-        let params = json!({
+        let mut params = json!({
             "captain":target.captain,
             "project":self.current().project,
             "access":self.current().native.access.id(),
@@ -310,6 +356,9 @@ impl State {
                 "draft":prompt.draft,
             },
         });
+        if let Some(placement) = self.crew_draft_placement_args() {
+            params["placement"] = placement;
+        }
         let result = match self.remote("captain.crew.create", params.clone()) {
             Some(result) => result,
             None => return self.apply_local_crew_create(&target, &params),
@@ -576,6 +625,63 @@ mod tests {
                 options: vec![],
             });
         assert!(state.crew_draft_unavailable().is_some());
+    }
+
+    #[test]
+    fn a_placement_machine_sends_the_drafts_workspace_choice_as_its_placement() {
+        // A real project, so the draft has workspace controls.
+        let mut state = State::new(".".into(), false);
+        let project = state.current().project.unwrap();
+        let (client, mut commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.captains = crate::captains::Captain::presets();
+        *state.client.as_ref().unwrap().info.lock().expect("info") = json!({"capabilities":[
+            crate::protocol::CAPTAIN_STATE,
+            crate::protocol::CAPTAIN_CREW_CONTROL,
+            crate::protocol::VCS_WORKTREES,
+            crate::protocol::PLACEMENT,
+        ]});
+        state.captain_scopes.insert(0, vec![project]);
+        let path = state
+            .project(Some(project))
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        state.vcs_branches.insert(
+            ("local".into(), path),
+            VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        state.begin_crew_draft("local", 0).unwrap();
+        // A writer defaults to its own worktree on the default branch, and that sends.
+        assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
+        assert_eq!(state.current().base_branch.as_deref(), Some("main"));
+        assert!(state.crew_draft_unavailable().is_none());
+        state.current_mut().draft.replace_text("Fix the parser");
+        assert!(state.send_crew_draft());
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.params["placement"]["mode"], "isolated");
+        assert_eq!(command.params["placement"]["baseBranch"], "main");
+        assert!(state.crew_draft_receipt("local", &command, &receipt(false, 0)));
+        // The checkout choice is the read-only shared placement, never a writable one.
+        state.set_draft_env_mode(ThreadEnvMode::Local);
+        assert!(state.send_crew_draft());
+        let command = commands.try_recv().unwrap();
+        assert_eq!(command.params["placement"], json!({"mode":"shared"}));
     }
 
     #[test]

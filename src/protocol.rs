@@ -198,6 +198,11 @@ pub const THREAD_READ: &str = "thread-read-v2";
 pub const PEER_TASK_FENCES: &str = "peer-task-fences-v1";
 pub const PEER_TASK_FENCES_UPDATE_REQUIRED: &str =
     "Update required on the target machine before it can honor attempt-fenced task control.";
+/// Workers get an explicit shared, isolated or existing checkout before any
+/// provider starts. The resolved placement travels in launch replies, wait
+/// statuses and thread records.
+pub const PLACEMENT_MINOR: u32 = 38;
+pub const PLACEMENT: &str = "placement-v1";
 pub const REMOTE_PROJECT_SCOPE: &str = "remote-project-scope-v1";
 /// The answering server can open its scratch project (`project.ensureScratch`),
 /// which a manual draft retarget uses when no logical project matches there.
