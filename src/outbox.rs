@@ -25,6 +25,21 @@ pub struct Effect {
     dispatch: Dispatch,
 }
 
+impl Effect {
+    /// Durable prompt attribution used before the effect can reach a provider.
+    pub fn prompt_run(&self) -> Option<(&str, &str)> {
+        let Dispatch::Harness { record, .. } = &self.dispatch else {
+            return None;
+        };
+        (record["type"] == "prompt").then(|| {
+            (
+                record["runId"].as_str().unwrap_or_default(),
+                record["id"].as_str().unwrap_or_default(),
+            )
+        })
+    }
+}
+
 thread_local! {
     static CAPTURE: RefCell<Option<Vec<Effect>>> = const { RefCell::new(None) };
 }

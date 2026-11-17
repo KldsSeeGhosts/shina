@@ -574,15 +574,47 @@ async fn pair(
     }
     let mut pairing = shared.pairing.lock().expect("pairing");
     if pairing.is_peer() != (body["peer"] == true) {
-        let _ = pairing.exchange(&shared.database, "", "", crate::lifecycle::now());
+        pairing.invalidate();
         return StatusCode::FORBIDDEN.into_response();
     }
-    let result = pairing.exchange(
-        &shared.database,
-        body["code"].as_str().unwrap_or(""),
-        body["deviceId"].as_str().unwrap_or(""),
-        crate::lifecycle::now(),
-    );
+    let peer = body["peer"] == true;
+    let binding = peer.then(|| {
+        json!({
+            "serverId":body["peerServerId"],
+            "workspaceId":body["peerWorkspaceId"],
+            "ownerId":body["peerOwnerId"],
+            "controllerId":body["peerControllerId"]
+        })
+    });
+    let valid_binding = binding.as_ref().is_none_or(|binding| {
+        ["serverId", "workspaceId", "ownerId", "controllerId"]
+            .iter()
+            .all(|field| {
+                binding[*field]
+                    .as_str()
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            })
+            && binding["controllerId"] == binding["serverId"]
+    });
+    if !valid_binding {
+        pairing.invalidate();
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let result = match binding.as_ref() {
+        Some(binding) => pairing.exchange_peer(
+            &shared.database,
+            body["code"].as_str().unwrap_or(""),
+            body["deviceId"].as_str().unwrap_or(""),
+            crate::lifecycle::now(),
+            binding,
+        ),
+        None => pairing.exchange(
+            &shared.database,
+            body["code"].as_str().unwrap_or(""),
+            body["deviceId"].as_str().unwrap_or(""),
+            crate::lifecycle::now(),
+        ),
+    };
     match result {
         Ok(token) => Json(
             json!({"serverId":shared.discovery.server_id,"token":token,"peer":body["peer"]==true}),
@@ -963,6 +995,9 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         }
                         if minor >= u64::from(protocol::IDENTITY_MINOR) {
                             capabilities.push(protocol::IDENTITY);
+                        }
+                        if minor >= u64::from(protocol::EXECUTION_LEASES_MINOR) {
+                            capabilities.push(protocol::EXECUTION_LEASES);
                         }
                         match identity_for_read(&shared) {
                             Err(error) => Err(error),
@@ -2976,9 +3011,7 @@ mod tests {
     fn peer_pairing_grants_identity_fence_and_launch_receipt_survive_a_lost_response() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let home=Fixture::new("peer-home").await;
-            // The project scope lives on the current home. Launch remains compatible
-            // with the prior peer contract; no new permission is sent to the target.
-            let mut target=Fixture::with_minor("peer-target", 7).await;
+            let mut target=Fixture::with_minor("peer-target", protocol::MINOR).await;
             let user=target.link(&target.shared.directory.join("client")).await;
             let workspace=target.shared.directory.join("workspace");
             std::fs::create_dir_all(&workspace).unwrap();
@@ -2986,23 +3019,85 @@ mod tests {
             let code=target.shared.pairing.lock().unwrap().create_scoped(crate::lifecycle::now(),true).unwrap()["code"].as_str().unwrap().to_owned();
             let peer=crate::peer::link_peer(&home.shared.directory,&home.shared.database,&target.address.to_string(),&code).await.unwrap();
             let link=peer.credential(&home.shared.directory).unwrap();
+            let home_identity=home.shared.database.identity().unwrap();
             assert_eq!(home.shared.database.peers().unwrap().len(),1);
             assert!(!serde_json::to_string(&peer).unwrap().contains(&link.token));
             let scopes=target.shared.database.devices().unwrap();
             let device=scopes.as_array().unwrap().iter().find(|d|d["deviceId"]==link.device_id).unwrap();
             assert_eq!(device["scopes"],json!(["read","peer-delegate"]));
+            assert_eq!(
+                target.shared.database.peer_binding(&link.device_id).unwrap().unwrap(),
+                json!({
+                    "serverId":home_identity["controllerId"],
+                    "workspaceId":home_identity["workspaceId"],
+                    "ownerId":home_identity["ownerId"],
+                    "controllerId":home_identity["controllerId"]
+                })
+            );
             for method in ["server.stop","devices.pair","request.respond","peer.link","workspace.subscribe","thread.history","filesystem.browse","uploads.write"] {
                 assert!(target.shared.database.authorize(&link.device_id,method,&json!({})).is_err(),"{method}");
             }
+            let logical_thread="77777777-7777-4777-8777-777777777777";
+            let run="88888888-8888-4888-8888-888888888888";
+            let assignment=json!({
+                "leaseId":uuid::Uuid::new_v4().to_string(),"generation":1,
+                "workspaceId":home_identity["workspaceId"],"ownerId":home_identity["ownerId"],
+                "runAsOwnerId":home_identity["ownerId"],"controllerId":home_identity["controllerId"],
+                "initiatingDeviceId":user.device_id,"executorId":target.shared.discovery.server_id,
+                "logicalCaptainUid":null,"logicalThreadUid":logical_thread,
+                "runId":run,"attemptId":"attempt-1","deliveryId":"delivery-1",
+                "preparedAt":crate::lifecycle::now(),"queuesBehindCurrent":false
+            });
             let command=Command::new("peer.thread.launch",json!({"projectId":1,"harness":"pi","provider":"cpa","model":"fixture",
-                "brief":"A bounded task","origin":{"deviceId":"forged","serverId":home.shared.discovery.server_id,"serverLabel":"Home",
-                "parentThreadId":1,"taskId":"task-1","captain":"Captain","memories":[]}}));
+                "brief":"A bounded task","execution":assignment,"origin":{"deviceId":"forged","serverId":home.shared.discovery.server_id,"serverLabel":"Home",
+                "parentThreadId":1,"taskId":"task-1","captain":"Captain","memories":[],
+                "attemptId":"attempt-1"}}));
+            let mut forged_origin=command.clone();
+            forged_origin.params["origin"]["serverId"]=json!(uuid::Uuid::new_v4());
+            assert!(
+                crate::client::remote_command(&link,forged_origin)
+                    .await
+                    .unwrap_err()
+                    .contains("authenticated paired")
+            );
+            let mut forged_owner=command.clone();
+            forged_owner.params["execution"]["ownerId"]=json!(uuid::Uuid::new_v4());
+            assert!(
+                crate::client::remote_command(&link,forged_owner)
+                    .await
+                    .unwrap_err()
+                    .contains("authenticated paired")
+            );
+            assert_eq!(
+                target.shared.snapshots.borrow()["state"]["index"]["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|thread| thread["peerOrigin"]["taskId"] == "task-1")
+                    .count(),
+                0,
+                "rejected assignments must not mutate the executor"
+            );
             // Ignore the first reply, then retry the exact command and assert one creation.
             let first=crate::client::remote_command(&link,command.clone()).await.unwrap();
             assert_eq!(first["status"],"accepted","{first}");
             let replay=crate::client::remote_command(&link,command.clone()).await.unwrap();
             assert_eq!(first,replay);
             let id=first["result"]["threadId"].as_u64().unwrap();
+            let lease=first["result"]["execution"]["leaseId"].as_str().unwrap().to_owned();
+            assert_eq!(first["result"]["execution"]["phase"], "executorAccepted");
+            assert_eq!(first["result"]["execution"]["logicalThreadUid"], logical_thread);
+            assert_eq!(
+                first["result"]["execution"]["executorThreadAlias"],
+                json!(id)
+            );
+            let mut duplicate=command.clone();
+            duplicate.command_id=uuid::Uuid::new_v4();
+            let keyed=crate::client::remote_command(&link,duplicate).await.unwrap();
+            assert_eq!(keyed["status"],"accepted", "{keyed}");
+            assert_eq!(keyed["result"]["threadId"], json!(id));
+            assert_eq!(keyed["result"]["replayed"], true);
+            assert_eq!(keyed["result"]["execution"]["leaseId"], json!(lease));
             let snapshot=target.shared.snapshots.borrow().clone();
             assert_eq!(snapshot["state"]["index"]["threads"].as_array().unwrap().iter().filter(|t|t["peerOrigin"]["taskId"]=="task-1").count(),1);
             assert_eq!(snapshot["state"]["index"]["threads"].as_array().unwrap().iter().find(|t|t["id"]==id).unwrap()["peerOrigin"]["deviceId"],link.device_id);
@@ -3016,8 +3111,14 @@ mod tests {
             assert!(crate::client::remote_command(&link,changed).await.unwrap_err().contains("different payload"));
             let mut wrong=link.clone(); wrong.server_id=home.shared.discovery.server_id.clone();
             assert!(crate::client::remote_rpc(&wrong,"peer.capabilities",json!({})).await.unwrap_err().contains("No credential was sent"));
-            let delayed=Command::new("peer.thread.send",json!({"threadId":id,"message":"A delayed follow-up"}));
-            let stop=Command::new("peer.thread.stop",json!({"threadId":id,"sendCommandId":delayed.command_id}));
+            let control=json!({"leaseId":lease,"generation":1,"runId":run,
+                "controllerId":home_identity["controllerId"],
+                "workspaceId":home_identity["workspaceId"],
+                "ownerId":home_identity["ownerId"]});
+            let delayed=Command::new("peer.thread.send",json!({"threadId":id,"message":"A delayed follow-up",
+                "attemptId":"attempt-1","execution":control}));
+            let stop=Command::new("peer.thread.stop",json!({"threadId":id,"sendCommandId":delayed.command_id,
+                "attemptId":"attempt-1","execution":control}));
             let stopped=crate::client::remote_command(&link,stop.clone()).await.unwrap();
             assert_eq!(stopped,crate::client::remote_command(&link,stop).await.unwrap());
             let cancelled=crate::client::remote_command(&link,delayed).await.unwrap();
@@ -3030,6 +3131,145 @@ mod tests {
             target.listen().await;
             target.shared.database.revoke(&link.device_id).unwrap();
             assert!(crate::client::remote_rpc(&link,"peer.thread.wait",json!({"threadId":id})).await.unwrap_err().contains("Authentication denied"));
+        });
+    }
+
+    #[test]
+    fn two_paired_executors_keep_one_controller_captain_identity_with_distinct_aliases() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let home = Fixture::new("execution-two-executors-home").await;
+            let created = home
+                .local_command(
+                    "captain.put",
+                    json!({
+                        "record":crate::captains::Captain::presets()[0].to_value(),
+                        "project":null
+                    }),
+                )
+                .await;
+            assert_eq!(created["status"], "accepted", "{created}");
+            let opened = home
+                .local_command("captain.open", json!({"captain":0}))
+                .await;
+            assert_eq!(opened["status"], "accepted", "{opened}");
+            let home_thread = opened["result"]["threadId"].clone();
+            wait_until(|| {
+                home.shared.snapshots.borrow()["state"]["index"]["identity"]["captainIds"]["0"]
+                    .is_string()
+            })
+            .await;
+            let home_identity = home.shared.database.identity().unwrap();
+            let captain_uid = home_identity["captainIds"]["0"].clone();
+            let mut aliases = Vec::new();
+            let mut leases = Vec::new();
+            for index in 0..2 {
+                let target = Fixture::new(&format!("execution-two-executors-{index}")).await;
+                let user = target.link(&target.shared.directory.join("client")).await;
+                if index == 1 {
+                    let mut occupied = Vec::new();
+                    for _ in 0..4 {
+                        let prior = crate::client::remote_rpc(
+                            &user,
+                            "thread.create",
+                            json!({"occupiedDrafts":occupied}),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(prior["status"], "accepted", "{prior}");
+                        occupied.push(prior["result"]["threadId"].as_u64().unwrap());
+                    }
+                }
+                let workspace = target.shared.directory.join("workspace");
+                let project = crate::client::remote_rpc(
+                    &user,
+                    "project.put",
+                    json!({"path":workspace,"createFolder":true}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(project["status"], "accepted", "{project}");
+                let code = target
+                    .shared
+                    .pairing
+                    .lock()
+                    .unwrap()
+                    .create_scoped(crate::lifecycle::now(), true)
+                    .unwrap()["code"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let peer = crate::peer::link_peer(
+                    &home.shared.directory,
+                    &home.shared.database,
+                    &target.address.to_string(),
+                    &code,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    peer.capabilities["contracts"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|contract| contract == protocol::EXECUTION_LEASES)
+                );
+                let link = peer.credential(&home.shared.directory).unwrap();
+                let logical_thread = uuid::Uuid::new_v4().to_string();
+                let run = uuid::Uuid::new_v4().to_string();
+                let attempt = format!("attempt-{index}");
+                let assignment = json!({
+                    "leaseId":uuid::Uuid::new_v4().to_string(),"generation":1,
+                    "workspaceId":home_identity["workspaceId"],
+                    "ownerId":home_identity["ownerId"],
+                    "runAsOwnerId":home_identity["ownerId"],
+                    "controllerId":home_identity["controllerId"],
+                    "initiatingDeviceId":user.device_id,
+                    "executorId":target.shared.discovery.server_id,
+                    "logicalCaptainUid":captain_uid,
+                    "logicalThreadUid":logical_thread,
+                    "runId":run,"attemptId":attempt,"deliveryId":format!("delivery-{index}"),
+                    "preparedAt":crate::lifecycle::now(),"queuesBehindCurrent":false
+                });
+                let command = Command::new(
+                    "peer.thread.launch",
+                    json!({
+                        "projectId":project["result"]["projectId"],
+                        "harness":"pi","provider":"cpa","model":"fixture",
+                        "brief":format!("Executor {index}"),"execution":assignment,
+                        "origin":{
+                            "deviceId":"forged",
+                            "serverId":home.shared.discovery.server_id,
+                            "serverLabel":"Home","parentThreadId":1,
+                            "taskId":format!("task-{index}"),"captain":"Captain",
+                            "memories":[],"attemptId":attempt
+                        }
+                    }),
+                );
+                let reply = crate::client::remote_command(&link, command).await.unwrap();
+                assert_eq!(reply["status"], "accepted", "{reply}");
+                let lease = &reply["result"]["execution"];
+                assert_eq!(lease["controllerId"], home_identity["controllerId"]);
+                assert_eq!(lease["workspaceId"], home_identity["workspaceId"]);
+                assert_eq!(lease["ownerId"], home_identity["ownerId"]);
+                assert_eq!(lease["logicalCaptainUid"], captain_uid);
+                assert_eq!(lease["logicalThreadUid"], logical_thread);
+                assert_eq!(lease["phase"], "executorAccepted");
+                aliases.push(reply["result"]["threadId"].as_u64().unwrap());
+                leases.push(lease["leaseId"].as_str().unwrap().to_owned());
+            }
+            assert_ne!(aliases[0], aliases[1]);
+            assert_ne!(leases[0], leases[1]);
+            let snapshot = home.shared.snapshots.borrow().clone();
+            assert_eq!(snapshot["state"]["index"]["captainHomes"]["0"], home_thread);
+            assert_eq!(
+                snapshot["state"]["index"]["threads"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|thread| thread["captainHome"] == true && thread["captain"] == 0)
+                    .count(),
+                1
+            );
         });
     }
 
@@ -3073,14 +3313,12 @@ mod tests {
             assert_eq!(put["status"], "accepted", "{put}");
             let project_id = put["result"]["projectId"].as_u64().unwrap();
             let target_id = target.shared.discovery.server_id.clone();
-            let home = Fixture::configured("doc-home", protocol::MINOR, |runtime| {
-                std::fs::write(
-                    runtime.state.data_dir.join("server-id"),
-                    uuid::Uuid::new_v4().to_string(),
-                )
-                .unwrap();
-            })
-            .await;
+            let home = Fixture::new("doc-home").await;
+            std::fs::write(
+                home.shared.directory.join("server-id"),
+                &home.shared.discovery.server_id,
+            )
+            .unwrap();
             // Home setup goes through the same commands a client sends.
             let local = home.shared.directory.join("workspace");
             let project = home
@@ -5134,8 +5372,16 @@ mod tests {
     #[tokio::test]
     async fn two_authenticated_devices_share_one_domain_identity_and_revocation_does_not_change_it()
     {
-        let fixture = Fixture::new("identity-two-devices").await;
-        fixture
+        let fixture = Fixture::configured("identity-two-devices", protocol::MINOR, |runtime| {
+            runtime.state.test_connect_pi = Some(Box::new(|_, _| {
+                let (pi, commands, events) = crate::harness::Session::test_connection();
+                std::mem::forget(commands);
+                std::mem::forget(events);
+                Some(pi)
+            }));
+        })
+        .await;
+        let created = fixture
             .local_command(
                 "captain.put",
                 json!({
@@ -5144,9 +5390,38 @@ mod tests {
                 }),
             )
             .await;
+        assert_eq!(created["status"], "accepted", "{created}");
+        let opened = fixture
+            .local_command("captain.open", json!({"captain":0}))
+            .await;
+        assert_eq!(opened["status"], "accepted", "{opened}");
+        let home_thread = opened["result"]["threadId"].as_u64().unwrap();
+        let home_key = home_thread.to_string();
         wait_until(|| {
             fixture.shared.snapshots.borrow()["state"]["index"]["identity"]["captainIds"]["0"]
                 .is_string()
+        })
+        .await;
+        let configured = fixture
+            .local_command(
+                "thread.configure",
+                json!({"threadId":home_thread,"harness":"pi","provider":"cpa","model":"fixture",
+                    "thinking":"off"}),
+            )
+            .await;
+        assert_eq!(configured["status"], "accepted", "{configured}");
+        let sent = fixture
+            .local_command(
+                "thread.send",
+                json!({"threadId":home_thread,"text":"Execution identity read","attachments":[],
+                    "mode":"prompt"}),
+            )
+            .await;
+        assert_eq!(sent["status"], "accepted", "{sent}");
+        wait_until(|| {
+            fixture.shared.snapshots.borrow()["state"]["index"]["execution"]["leases"]
+                .as_array()
+                .is_some_and(|leases| !leases.is_empty())
         })
         .await;
         fixture
@@ -5175,8 +5450,8 @@ mod tests {
             b["identity"]["logicalIds"]["captains"]["0"]
         );
         assert_eq!(
-            a["identity"]["logicalIds"]["threads"]["1"],
-            b["identity"]["logicalIds"]["threads"]["1"]
+            a["identity"]["logicalIds"]["threads"][home_key.as_str()],
+            b["identity"]["logicalIds"]["threads"][home_key.as_str()]
         );
         assert!(
             a["capabilities"]
@@ -5190,12 +5465,55 @@ mod tests {
         assert_eq!(projected["workspaceId"], a["workspaceId"]);
         assert_eq!(projected["ownerId"], a["ownerId"]);
         assert_eq!(projected["controllerId"], a["controllerId"]);
-        let thread = &snapshot["state"]["index"]["threads"][0];
+        let thread = snapshot["state"]["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|thread| thread["id"] == home_thread)
+            .unwrap();
         let thread_id = thread["id"].to_string();
         assert_eq!(
             thread["threadUid"],
             a["identity"]["logicalIds"]["threads"][thread_id.as_str()]
         );
+        let link_a = crate::peer::Link {
+            server_id: fixture.shared.discovery.server_id.clone(),
+            host: fixture.address.to_string(),
+            device_id: "identity-device-a".into(),
+            token: "identity-token-a".into(),
+            enabled: true,
+        };
+        let link_b = crate::peer::Link {
+            server_id: fixture.shared.discovery.server_id.clone(),
+            host: fixture.address.to_string(),
+            device_id: "identity-device-b".into(),
+            token: "identity-token-b".into(),
+            enabled: true,
+        };
+        let execution_a = crate::client::remote_rpc(
+            &link_a,
+            "execution.inspect",
+            json!({"threadId":home_thread}),
+        )
+        .await
+        .unwrap();
+        let execution_b = crate::client::remote_rpc(
+            &link_b,
+            "execution.inspect",
+            json!({"threadId":home_thread}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(execution_a["result"], execution_b["result"]);
+        let lease = &execution_a["result"]["leases"][0];
+        assert_eq!(lease["logicalThreadUid"], thread["threadUid"]);
+        assert_eq!(
+            lease["logicalCaptainUid"],
+            a["identity"]["logicalIds"]["captains"]["0"]
+        );
+        assert_eq!(lease["controllerId"], a["controllerId"]);
+        assert_eq!(lease["ownerId"], a["ownerId"]);
+        assert_eq!(lease["initiatingDeviceId"], "fixture-maintainer");
 
         let domain = fixture.shared.database.identity().unwrap();
         assert!(
@@ -5255,6 +5573,47 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|capability| capability == protocol::IDENTITY)
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_leases_are_advertised_only_at_the_exact_capability() {
+        let older = Fixture::with_minor(
+            "execution-protocol-43",
+            protocol::EXECUTION_LEASES_MINOR - 1,
+        )
+        .await;
+        older
+            .shared
+            .database
+            .issue_scoped_device("execution-old", "execution-old-token", &["read", "paired"])
+            .unwrap();
+        let hello = hello_with_token(&older, "execution-old-token").await;
+        assert!(
+            !hello["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == protocol::EXECUTION_LEASES)
+        );
+
+        let current = Fixture::new("execution-protocol-44").await;
+        current
+            .shared
+            .database
+            .issue_scoped_device(
+                "execution-current",
+                "execution-current-token",
+                &["read", "paired"],
+            )
+            .unwrap();
+        let hello = hello_with_token(&current, "execution-current-token").await;
+        assert!(
+            hello["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability == protocol::EXECUTION_LEASES)
         );
     }
 }

@@ -1183,6 +1183,7 @@ impl State {
             "memories":(0..self.captains.len()).map(|id| (id.to_string(), json!(self.memories(id)))).collect::<serde_json::Map<_,_>>(),
             "profile":self.user_profile(),
             "routines":routines,
+            "execution":self.execution.projection(),
             "background":self.background_status(),
             "memoryBackend":self.memory_backend_status(),
             "keepAwake":self.background_settings().keep_awake
@@ -4053,6 +4054,114 @@ impl State {
                 }
             }
             "thread.retry" => self.retry(),
+            "execution.inspect" => {
+                if let Some(executor) = args["executorId"].as_str() {
+                    return Ok(json!({
+                        "executorId":executor,
+                        "leases":self.execution.for_executor(executor)
+                            .iter().map(crate::execution::Lease::value).collect::<Vec<_>>()
+                    }));
+                }
+                let uid = if let Some(uid) = args["threadUid"].as_str() {
+                    uid.to_owned()
+                } else {
+                    let thread = number("threadId")?;
+                    self.snapshot_identity()
+                        .thread_uid(thread)
+                        .ok_or("The thread has no logical execution identity.")?
+                        .to_owned()
+                };
+                return Ok(self.execution.inspect_for_thread(&uid));
+            }
+            "execution.reconcile" => {
+                let thread_id = number("threadId")?;
+                let uid = self
+                    .snapshot_identity()
+                    .thread_uid(thread_id)
+                    .ok_or("The thread has no logical execution identity.")?
+                    .to_owned();
+                let lease_id = text("leaseId")?;
+                let generation = number("generation")? as u64;
+                let run = args["runId"]
+                    .as_str()
+                    .ok_or("runId is required for execution reconciliation.")?;
+                let evidence = text("evidence")?;
+                if evidence.trim().is_empty() {
+                    return Err(
+                        "Execution reconciliation requires honest observed evidence.".into(),
+                    );
+                }
+                let lease = self
+                    .execution
+                    .control(&uid, &lease_id, generation, Some(run))?
+                    .clone();
+                if lease.executor_id != self.identity.executor_id {
+                    return Err(format!(
+                        "Lease {} belongs to executor {}. Reconcile it through that authenticated executor.",
+                        lease.lease_id, lease.executor_id
+                    ));
+                }
+                match args["outcome"].as_str() {
+                    Some("terminal") => {
+                        let thread = self
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == thread_id)
+                            .ok_or("Unknown thread.")?;
+                        if thread.provider_terminal_run.as_deref() != Some(&lease.run_id) {
+                            return Err(
+                                "No matching provider terminal event was observed for this execution."
+                                    .into(),
+                            );
+                        }
+                        let status = thread
+                            .provider_terminal_status
+                            .clone()
+                            .unwrap_or_else(|| status_word(thread.status).to_owned());
+                        let lease = self.execution.terminal(
+                            &lease.lease_id,
+                            &status,
+                            lifecycle::now(),
+                            evidence,
+                        )?;
+                        return Ok(json!({"lease":lease}));
+                    }
+                    Some("fence") => {
+                        if lease.phase == crate::execution::Phase::Uncertain
+                            && lease
+                                .uncertain_reason
+                                .as_deref()
+                                .is_some_and(|reason| reason.contains("restarted"))
+                        {
+                            return Err(
+                                "A restart cannot prove an orphaned provider process stopped. Keep this execution uncertain until the executor supplies a verified fence."
+                                    .into(),
+                            );
+                        }
+                        let thread = self
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == thread_id)
+                            .ok_or("Unknown thread.")?;
+                        if !thread.execution_quiescent() {
+                            return Err(
+                                "Executor is not quiescent. A controller-side flag cannot fence a live provider."
+                                    .into(),
+                            );
+                        }
+                        let lease = self.execution.fence(
+                            &lease.lease_id,
+                            lifecycle::now(),
+                            format!(
+                                "executor {} verified no provider process, pending prompt or request; {evidence}",
+                                self.identity.executor_id
+                            ),
+                        )?;
+                        return Ok(json!({"lease":lease}));
+                    }
+                    _ => return Err("outcome must be terminal or fence.".into()),
+                }
+            }
             "thread.worktreeSetup" => match args["action"].as_str() {
                 Some("retry") => self.retry_worktree_setup(),
                 Some("skip") => self.skip_worktree_setup(),

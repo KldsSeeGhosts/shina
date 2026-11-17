@@ -80,6 +80,13 @@ pub struct SessionOwner {
     pub(crate) quarantined: AtomicBool,
 }
 
+impl SessionOwner {
+    /// A free owner lock means no worker still holds the provider session.
+    pub(crate) fn quiescent(&self) -> bool {
+        !self.quarantined.load(Ordering::Acquire) && self.lock.try_lock().is_ok()
+    }
+}
+
 impl Drop for Pi {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);

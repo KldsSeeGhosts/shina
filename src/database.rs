@@ -1059,6 +1059,35 @@ impl Database {
         token: &str,
         scopes: &[&str],
     ) -> Result<(), String> {
+        self.issue_scoped_device_binding(id, token, scopes, None)
+    }
+
+    /// A peer-delegate credential is bound during the user-approved pairing
+    /// exchange to the controller that owns it. The binding is authorization
+    /// metadata, never a bearer credential.
+    pub fn issue_peer_device(&self, id: &str, token: &str, binding: &Value) -> Result<(), String> {
+        for field in ["serverId", "workspaceId", "ownerId", "controllerId"] {
+            uuid::Uuid::parse_str(binding[field].as_str().unwrap_or(""))
+                .map_err(|_| format!("Invalid paired peer {field}."))?;
+        }
+        if binding["controllerId"] != binding["serverId"] {
+            return Err("Paired peer controller does not match its authenticated server.".into());
+        }
+        self.issue_scoped_device_binding(
+            id,
+            token,
+            &["read", "peer-delegate"],
+            Some(binding.clone()),
+        )
+    }
+
+    fn issue_scoped_device_binding(
+        &self,
+        id: &str,
+        token: &str,
+        scopes: &[&str],
+        peer_binding: Option<Value>,
+    ) -> Result<(), String> {
         let mut inner = self.0.lock().expect("database");
         if let Some(failure) = &inner.failure {
             return Err(failure.clone());
@@ -1103,7 +1132,32 @@ impl Database {
             params![id, json!(scopes).to_string()],
         )
         .map_err(error)?;
+        if let Some(binding) = peer_binding {
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("peer-binding:{id}"), binding.to_string()],
+            )
+            .map_err(error)?;
+        }
         tx.commit().map_err(error)
+    }
+
+    pub fn peer_binding(&self, device: &str) -> Result<Option<Value>, String> {
+        let text: Option<String> = self
+            .0
+            .lock()
+            .expect("database")
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [format!("peer-binding:{device}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        text.map(|text| serde_json::from_str(&text).map_err(error))
+            .transpose()
     }
 
     pub fn authorize(&self, id: &str, method: &str, args: &Value) -> Result<(), String> {
@@ -1139,6 +1193,7 @@ impl Database {
                     | "peer.thread.list"
                     | "peer.thread.send"
                     | "peer.thread.stop"
+                    | "peer.execution.fence"
                     | "peer.captain.document.reply"
             )
             && !(method == "devices.revoke" && args["deviceId"] == id)

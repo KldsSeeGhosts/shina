@@ -128,11 +128,35 @@ pub async fn wait_for_peer_thread(
                 }
                 request
             });
+        let execution = record["execution"]["leaseId"]
+            .as_str()
+            .and_then(|lease_id| {
+                state["index"]["execution"]["leases"]
+                    .as_array()
+                    .and_then(|leases| leases.iter().find(|lease| lease["leaseId"] == lease_id))
+            })
+            .or_else(|| {
+                state["index"]["execution"]["leases"]
+                    .as_array()
+                    .and_then(|leases| {
+                        leases.iter().find(|lease| {
+                            lease["logicalThreadUid"] == record["threadUid"]
+                                && lease["runId"] == record["runId"]
+                        })
+                    })
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut status = json!({"threadId":thread["id"],
             "finished":record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
             "documentRequest":document_request,"status":thread["status"],
-            "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"]});
+            "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"],
+            "runId":record["runId"],"execution":execution,
+            "providerAcceptedRun":record["providerAcceptedRun"],
+            "providerRunningRun":record["providerRunningRun"],
+            "providerTerminalRun":record["providerTerminalRun"],
+            "providerTerminalStatus":record["providerTerminalStatus"]});
         status["result"] = record["peerOrigin"]["result"].clone();
         status["revision"] = json!(crate::protocol::revision(&status));
         Ok(status)
@@ -235,6 +259,73 @@ pub(super) fn transcript_page(thread: &Thread, args: &Value) -> Result<Value, St
         "hasMore":next.is_some_and(|n| n.saturating_add(1) < thread.messages.len() as u64),
         "nextPosition":next,"items":messages}),
     )
+}
+
+/// Mirror only what the authenticated executor reported. A launch or send
+/// reply proves executor acceptance at most; provider phases come from a
+/// later wait whose lease identity must still match the controller record.
+fn apply_execution_reply(
+    book: &mut crate::execution::Book,
+    remote: &mut RemoteTask,
+    value: &Value,
+    executor_acknowledgement: bool,
+    allow_rebase: bool,
+) -> Result<(), String> {
+    let execution = value.get("execution").filter(|value| value.is_object());
+    if let Some(execution) = execution {
+        let lease: crate::execution::Lease =
+            serde_json::from_value(execution.clone()).map_err(|_| "Invalid executor lease.")?;
+        if let Some(expected) = &remote.execution
+            && expected.lease_id != lease.lease_id
+            && !allow_rebase
+        {
+            return Err(
+                "Executor returned a lease that does not match the controller assignment.".into(),
+            );
+        }
+        let target = lease.phase;
+        if let Some(stored) = book.get(&lease.lease_id).cloned() {
+            if stored.phase < target {
+                if target == crate::execution::Phase::Terminal {
+                    book.terminal(
+                        &lease.lease_id,
+                        lease.terminal_status.as_deref().unwrap_or("terminal"),
+                        lifecycle::now(),
+                        "authenticated executor reported terminal provider evidence",
+                    )?;
+                } else if target == crate::execution::Phase::Uncertain {
+                    book.uncertain(
+                        &lease.lease_id,
+                        lifecycle::now(),
+                        lease
+                            .uncertain_reason
+                            .clone()
+                            .unwrap_or_else(|| "executor reported uncertainty".into()),
+                    )?;
+                } else {
+                    book.transition(
+                        &lease.lease_id,
+                        target,
+                        lifecycle::now(),
+                        "authenticated executor reported execution phase",
+                    )?;
+                }
+            }
+        }
+        remote.execution = book.get(&lease.lease_id).cloned().or(Some(lease));
+    } else if executor_acknowledgement
+        && let Some(expected) = &remote.execution
+        && expected.phase < crate::execution::Phase::ExecutorAccepted
+    {
+        book.transition(
+            &expected.lease_id,
+            crate::execution::Phase::ExecutorAccepted,
+            lifecycle::now(),
+            "authenticated executor acknowledged the assignment; provider acceptance is not implied",
+        )?;
+        remote.execution = book.get(&expected.lease_id).cloned();
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -603,7 +694,7 @@ mod tests {
         state.threads[0].project = Some(1);
         state.peers.push(crate::peer::Peer {
             server_id:uuid::Uuid::new_v4().to_string(),host:"127.0.0.1:1".into(),label:"Target".into(),linked_at:0,
-            capabilities:json!({"contracts":[crate::protocol::PLACEMENT],
+            capabilities:json!({"contracts":[crate::protocol::PLACEMENT,crate::protocol::EXECUTION_LEASES],
                 "projects":[{"id":9,"path":"/target/project","name":"Project","gitRemote":"example.com/team/repo"}],
                 "harnesses":[{"id":"pi"}],"models":[{"provider":"cpa","id":"fixture","reasoning_levels":["off"]}]}),
             last_reached_at:Some(0),last_error:None,
@@ -959,6 +1050,268 @@ mod tests {
         state.threads[1].peer_origin = Some(origin);
         state.threads[1].status = Status::Running;
         child
+    }
+
+    fn assigned_lease(
+        state: &State,
+        thread: usize,
+        controller: &str,
+        generation: u64,
+        run: &str,
+        attempt: &str,
+        queued: bool,
+    ) -> crate::execution::Lease {
+        crate::execution::Lease {
+            schema: crate::execution::SCHEMA,
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            generation,
+            workspace_id: state.identity.workspace_id.clone(),
+            owner_id: state.identity.owner_id.clone(),
+            run_as_owner_id: state.identity.owner_id.clone(),
+            controller_id: controller.into(),
+            initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+            executor_id: state.identity.executor_id.clone(),
+            logical_captain_uid: None,
+            logical_thread_uid: state
+                .snapshot_identity()
+                .thread_uid(thread)
+                .expect("thread identity")
+                .into(),
+            executor_thread_alias: Some(thread as u64),
+            executor_thread_uid: state
+                .snapshot_identity()
+                .thread_uid(thread)
+                .map(str::to_owned),
+            run_id: run.into(),
+            attempt_id: Some(attempt.into()),
+            delivery_id: Some(format!("{attempt}-result")),
+            request_key: None,
+            queued_behind_current: queued,
+            phase: crate::execution::Phase::Dispatched,
+            prepared_at: 1,
+            saved_at: 1,
+            dispatched_at: Some(1),
+            executor_accepted_at: None,
+            provider_accepted_at: None,
+            running_at: None,
+            terminal_at: None,
+            terminal_status: None,
+            uncertain_at: None,
+            uncertain_reason: None,
+            fenced_at: None,
+            fence_evidence: None,
+            last_observed_at: 1,
+            lease_expires_at: crate::execution::LEASE_MILLIS + 1,
+            evidence: vec!["test assignment".into()],
+        }
+    }
+
+    #[test]
+    fn executor_refuses_a_second_controller_and_stale_controls_leave_new_work_alone() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.peers[0].server_id.clone();
+        let first_run = "88888888-8888-4888-8888-888888888888";
+        let second_run = "99999999-9999-4999-8999-999999999999";
+        let first = assigned_lease(&state, child, &controller, 1, first_run, "attempt-a", false);
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = Some("attempt-a".into());
+        let second = assigned_lease(&state, child, &controller, 2, second_run, "attempt-b", true);
+        let (second, _) = state.execution.accept_assignment(second).unwrap();
+        state.threads[1].next_execution = Some(second.binding());
+
+        let stop_serial = state.threads[1].stop_serial;
+        let stale_stop = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.stop",
+                    json!({"threadId":child,
+                        "execution":{"leaseId":first.lease_id,"generation":1,
+                            "runId":first_run,"controllerId":controller}}),
+                ),
+            )
+            .unwrap_err();
+        assert!(stale_stop.contains("generation changed"), "{stale_stop}");
+        assert_eq!(state.threads[1].stop_serial, stop_serial);
+
+        let stale_follow_up = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"stale","delivery":"follow_up",
+                        "attemptId":"attempt-a","execution":{"leaseId":first.lease_id,
+                            "generation":1,"runId":first_run,"controllerId":controller}}),
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            stale_follow_up.contains("generation changed"),
+            "{stale_follow_up}"
+        );
+        assert_eq!(
+            state.threads[1].next_execution.as_ref().unwrap().lease_id,
+            second.lease_id
+        );
+
+        let conflicting = assigned_lease(
+            &state,
+            child,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            3,
+            "aaaaaaaa-1111-4111-8111-111111111111",
+            "attempt-c",
+            false,
+        );
+        let error = state.execution.accept_assignment(conflicting).unwrap_err();
+        assert!(
+            error.contains("different authoritative controller"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn provider_acceptance_running_and_terminal_are_distinct_durable_evidence() {
+        let mut state = fixture();
+        let thread = state.threads[0].id;
+        let run = uuid::Uuid::new_v4().to_string();
+        state.threads[0].run_id = Some(run.clone());
+        let (lease, _) = state
+            .execution
+            .prepare(crate::execution::Prepare {
+                scope: crate::execution::Scope {
+                    workspace_id: state.identity.workspace_id.clone(),
+                    owner_id: state.identity.owner_id.clone(),
+                    run_as_owner_id: state.identity.owner_id.clone(),
+                    controller_id: state.identity.controller_id.clone(),
+                    initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+                    executor_id: state.identity.executor_id.clone(),
+                },
+                logical_captain_uid: None,
+                logical_thread_uid: state.snapshot_identity().thread_uid(thread).unwrap().into(),
+                executor_thread_alias: Some(thread as u64),
+                executor_thread_uid: state
+                    .snapshot_identity()
+                    .thread_uid(thread)
+                    .map(str::to_owned),
+                run_id: run.clone(),
+                attempt_id: None,
+                delivery_id: None,
+                request_key: None,
+                now: 1,
+                queues_behind_current: false,
+            })
+            .unwrap();
+        state
+            .execution
+            .transition(
+                &lease.lease_id,
+                crate::execution::Phase::Dispatched,
+                2,
+                "prompt committed",
+            )
+            .unwrap();
+        state.threads[0].execution = Some(lease.binding());
+
+        state.threads[0].status = Status::Running;
+        state.threads[0].pending_prompt = Some((
+            "prompt-1".into(),
+            Prompt::new("accepted prompt".into(), vec![]),
+            0,
+        ));
+        state.threads[0].apply(json!({
+            "type":"response","command":"prompt","id":"prompt-1",
+            "success":true,"data":{"disposition":"queued"}
+        }));
+        assert_eq!(
+            state.threads[0].provider_accepted_run.as_deref(),
+            Some(run.as_str())
+        );
+        assert!(state.refresh_execution(3));
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::ProviderAccepted
+        );
+        state.threads[0].apply(json!({"type":"agent_start"}));
+        assert_eq!(
+            state.threads[0].provider_running_run.as_deref(),
+            Some(run.as_str())
+        );
+        assert!(state.refresh_execution(4));
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        state.threads[0].apply(json!({"type":"agent_settled","aborted":false}));
+        assert_eq!(
+            state.threads[0].provider_terminal_run.as_deref(),
+            Some(run.as_str())
+        );
+        assert!(state.refresh_execution(5));
+        let lease = state.execution.get(&lease.lease_id).unwrap();
+        assert_eq!(lease.phase, crate::execution::Phase::Terminal);
+        assert!(lease.terminal_status.is_some());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_quiescent_fence_permits_exactly_one_new_generation() {
+        let mut state = fixture();
+        state.tasks.clear();
+        state.threads.truncate(1);
+        let thread = state.threads[0].id;
+        let run = uuid::Uuid::new_v4().to_string();
+        state.threads[0].run_id = Some(run.clone());
+        state.threads[0].pi = None;
+        state.threads[0].status = Status::Ready;
+        let lease = assigned_lease(
+            &state,
+            thread,
+            &state.identity.controller_id,
+            1,
+            &run,
+            "attempt-1",
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        state.threads[0].execution = Some(lease.binding());
+        let result = state
+            .execute_command(&Command::new(
+                "execution.reconcile",
+                json!({"threadId":thread,"leaseId":lease.lease_id,"generation":1,
+                    "runId":run,"outcome":"fence",
+                    "evidence":"fixture verified provider process absent"}),
+            ))
+            .unwrap();
+        assert_eq!(result["lease"]["phase"], "fenced");
+        let (next, _) = state
+            .execution
+            .prepare(crate::execution::Prepare {
+                scope: crate::execution::Scope {
+                    workspace_id: state.identity.workspace_id.clone(),
+                    owner_id: state.identity.owner_id.clone(),
+                    run_as_owner_id: state.identity.owner_id.clone(),
+                    controller_id: state.identity.controller_id.clone(),
+                    initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+                    executor_id: state.identity.executor_id.clone(),
+                },
+                logical_captain_uid: None,
+                logical_thread_uid: lease.logical_thread_uid.clone(),
+                executor_thread_alias: Some(thread as u64),
+                executor_thread_uid: Some(lease.executor_thread_uid.clone().unwrap()),
+                run_id: uuid::Uuid::new_v4().to_string(),
+                attempt_id: Some("attempt-2".into()),
+                delivery_id: Some("delivery-2".into()),
+                request_key: None,
+                now: 10,
+                queues_behind_current: false,
+            })
+            .unwrap();
+        assert_eq!(next.generation, 2);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]
@@ -2113,7 +2466,8 @@ mod tests {
         let mut home = captain_fixture();
         home.peers[0].capabilities["contracts"] = json!([
             crate::protocol::CAPTAIN_PEER_DOCUMENTS,
-            crate::protocol::PLACEMENT
+            crate::protocol::PLACEMENT,
+            crate::protocol::EXECUTION_LEASES
         ]);
         home.mcp_call(1, "delegate_task", &captain_launch_args())
             .unwrap();
@@ -2349,7 +2703,8 @@ mod tests {
         let mut state = captain_fixture();
         state.peers[0].capabilities["contracts"] = json!([
             crate::protocol::CAPTAIN_PEER_DOCUMENTS,
-            crate::protocol::PLACEMENT
+            crate::protocol::PLACEMENT,
+            crate::protocol::EXECUTION_LEASES
         ]);
         let text = format!("{}TAIL", "x".repeat(10_000));
         state
@@ -2488,6 +2843,10 @@ pub struct RemoteTask {
     pub label: String,
     pub thread_id: Option<usize>,
     pub launch_command: Command,
+    /// Controller-issued lease for this logical run. The target thread id above
+    /// is only the executor-local physical alias.
+    #[serde(default)]
+    pub execution: Option<crate::execution::Lease>,
     pub stop_owed: bool,
     pub stop_command_id: Option<uuid::Uuid>,
     /// The attempt the caller observed when it owed this stop. A target that
@@ -3415,6 +3774,7 @@ impl State {
                 label: label.into(),
                 thread_id: Some(99),
                 launch_command: Command::new("peer.thread.launch", json!({})),
+                execution: None,
                 stop_owed: false,
                 stop_command_id: None,
                 stop_attempt_id: None,
@@ -3501,6 +3861,21 @@ impl State {
             );
         }
         let peer = matches[0];
+        if !peer.capabilities["contracts"]
+            .as_array()
+            .is_some_and(|contracts| {
+                contracts
+                    .iter()
+                    .any(|contract| contract == crate::protocol::EXECUTION_LEASES)
+            })
+        {
+            return Err(format!(
+                "{} Managed execution needs {} on {}; no task or lease was allocated.",
+                crate::protocol::EXECUTION_LEASES_UPDATE_REQUIRED,
+                crate::protocol::EXECUTION_LEASES,
+                peer.label
+            ));
+        }
         if let Some(error) = peer
             .last_error
             .as_deref()
@@ -3799,6 +4174,7 @@ impl State {
             label: peer.label.clone(),
             thread_id: None,
             launch_command: launch,
+            execution: None,
             stop_owed: false,
             stop_command_id: None,
             stop_attempt_id: None,
@@ -3869,7 +4245,7 @@ impl State {
     ) -> Result<Value, String> {
         let args = &command.params;
         if command.method == "peer.capabilities" {
-            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PLACEMENT,crate::protocol::PEER_TASK_FENCES],"models":self.harness_ids().iter().flat_map(|harness|
+            let mut capabilities = json!({"contracts":[crate::protocol::PEER_TASKS,crate::protocol::THREAD_READ,crate::protocol::FILE_ATTACHMENTS,crate::protocol::CAPTAIN_STATE,crate::protocol::CAPTAIN_PEER_DOCUMENTS,crate::protocol::PLACEMENT,crate::protocol::PEER_TASK_FENCES,crate::protocol::EXECUTION_LEASES],"models":self.harness_ids().iter().flat_map(|harness|
                 self.harness_models(harness).into_iter().map(|m|json!({
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
@@ -3924,6 +4300,46 @@ impl State {
                     > memory::ESSENTIAL_BUDGET
             {
                 return Err("Invalid peer origin or memory budget.".into());
+            }
+            let execution = args.get("execution").filter(|value| value.is_object());
+            if let Some(execution) = execution
+                && (execution["controllerId"].as_str() != Some(origin.server_id.as_str())
+                    || execution["attemptId"].as_str() != origin.attempt_id.as_deref())
+            {
+                return Err(
+                    "Execution assignment does not match the authenticated controller origin."
+                        .into(),
+                );
+            }
+            if let Some(execution) = execution {
+                let logical_thread = execution["logicalThreadUid"]
+                    .as_str()
+                    .ok_or("Execution assignment is missing logicalThreadUid.")?;
+                let run_id = execution["runId"]
+                    .as_str()
+                    .ok_or("Execution assignment is missing runId.")?;
+                if let Some(existing) = self.execution.exact_run(logical_thread, run_id) {
+                    if existing.controller_id != origin.server_id
+                        || existing.lease_id != execution["leaseId"].as_str().unwrap_or("")
+                    {
+                        return Err(
+                            "This logical run is already bound to another controller generation."
+                                .into(),
+                        );
+                    }
+                    let thread_id = existing
+                        .executor_thread_alias
+                        .ok_or("The prior launch has no physical executor thread.")?;
+                    return Ok(json!({
+                        "threadId":thread_id,
+                        "replayed":true,
+                        "execution":existing.value(),
+                        "placement":self.threads.iter()
+                            .find(|thread| thread.id as u64 == thread_id)
+                            .and_then(|thread| thread.placement.as_ref())
+                            .map(placement::ThreadPlacement::value)
+                    }));
+                }
             }
             let project = self
                 .projects
@@ -4015,12 +4431,49 @@ impl State {
                 });
             }
             let id = thread.id;
+            let mut execution = execution
+                .map(|assignment| {
+                    crate::execution::lease_from_assignment(
+                        assignment,
+                        &self.identity.executor_id,
+                        Some(id as u64),
+                        None,
+                        lifecycle::now(),
+                    )
+                })
+                .transpose()?;
+            if let Some(lease) = execution.as_mut() {
+                let (accepted, _) = self.execution.accept_assignment(lease.clone())?;
+                *lease = accepted;
+                thread.execution = Some(lease.binding());
+                thread.next_execution = thread.execution.clone();
+            }
             self.next_id += 1;
             self.threads.push(thread);
+            if let Some(lease) = execution.as_ref() {
+                let uid = self.snapshot_identity().thread_uid(id).map(str::to_owned);
+                if let Some(stored) = self.execution.get_mut(&lease.lease_id) {
+                    stored.executor_thread_alias = Some(id as u64);
+                    stored.executor_thread_uid = uid.clone();
+                }
+                if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+                    thread.execution = self
+                        .execution
+                        .get(&lease.lease_id)
+                        .map(crate::execution::Lease::binding);
+                    thread.next_execution = thread.execution.clone();
+                }
+            }
             if !pending {
                 self.connect_thread(self.threads.len() - 1);
             }
-            return Ok(json!({"threadId":id,"placement":resolved.value()}));
+            let execution_value = execution
+                .as_ref()
+                .and_then(|lease| self.execution.get(&lease.lease_id))
+                .map(crate::execution::Lease::value);
+            return Ok(json!({
+                "threadId":id,"placement":resolved.value(),"execution":execution_value
+            }));
         }
         if command.method == "peer.thread.list" {
             return self.readable_threads(None, &args["read"]);
@@ -4046,6 +4499,55 @@ impl State {
             return Err("Permission denied. This peer did not create that thread.".into());
         }
         match command.method.as_str() {
+            "peer.execution.fence" => {
+                let binding = self.threads[index]
+                    .next_execution
+                    .clone()
+                    .or_else(|| self.threads[index].execution.clone())
+                    .ok_or("This peer thread has no lease-managed execution.")?;
+                let lease_id = args["leaseId"].as_str().ok_or("leaseId is required.")?;
+                let generation = args["generation"]
+                    .as_u64()
+                    .ok_or("generation is required.")?;
+                let evidence = args["evidence"]
+                    .as_str()
+                    .filter(|evidence| !evidence.trim().is_empty())
+                    .ok_or("Fencing requires observed evidence.")?;
+                let lease = self.execution.control(
+                    &binding.logical_thread_uid,
+                    lease_id,
+                    generation,
+                    args["runId"].as_str(),
+                )?;
+                if lease.phase == crate::execution::Phase::Uncertain
+                    && lease
+                        .uncertain_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("restarted"))
+                {
+                    return Err(
+                        "A restart cannot prove an orphaned provider process stopped. Keep this execution uncertain until an executor-local process verifier supplies a fence."
+                            .into(),
+                    );
+                }
+                let lease_id = lease.lease_id.clone();
+                let thread = &self.threads[index];
+                if !thread.execution_quiescent() {
+                    return Err(
+                        "Executor is not quiescent. Live provider processes cannot be fenced by a controller flag."
+                            .into(),
+                    );
+                }
+                let lease = self.execution.fence(
+                    &lease_id,
+                    lifecycle::now(),
+                    format!(
+                        "executor {} verified provider process absent for physical thread {}; {evidence}",
+                        self.identity.executor_id, thread.id
+                    ),
+                )?;
+                Ok(json!({"lease":lease,"executorId":self.identity.executor_id}))
+            }
             "peer.captain.document.reply" => {
                 // The origin answers a document read it saw in this thread's
                 // wait status. Only the device that launched the worker may
@@ -4111,6 +4613,39 @@ impl State {
                 Ok(json!({"result":result,"acknowledged":true}))
             }
             "peer.thread.stop" => {
+                if let Some(binding) = self.threads[index]
+                    .next_execution
+                    .clone()
+                    .or_else(|| self.threads[index].execution.clone())
+                {
+                    let control = args.get("execution").filter(|value| value.is_object()).ok_or(
+                        "This lease-managed peer thread requires an exact execution lease and generation to stop.",
+                    )?;
+                    let lease_id = control["leaseId"]
+                        .as_str()
+                        .ok_or("Execution control is missing leaseId.")?;
+                    let generation = control["generation"]
+                        .as_u64()
+                        .ok_or("Execution control is missing generation.")?;
+                    let controlled = self.execution.control(
+                        &binding.logical_thread_uid,
+                        lease_id,
+                        generation,
+                        control["runId"].as_str(),
+                    );
+                    let same_attempt = args["attemptId"]
+                        == self.threads[index]
+                            .peer_origin
+                            .as_ref()
+                            .and_then(|origin| origin.attempt_id.clone())
+                            .map(Value::from)
+                            .unwrap_or(Value::Null);
+                    if let Err(error) = controlled
+                        && !(same_attempt && error.contains("Unknown execution lease"))
+                    {
+                        return Err(error);
+                    }
+                }
                 // A stop fenced to an observed attempt must not land on newer
                 // work. An untracked legacy worker cannot prove a match, even
                 // after its server upgrades to support the contract.
@@ -4135,12 +4670,69 @@ impl State {
                         origin.cancelled_commands.push(id);
                     }
                 }
-                // The target owns the stop even if its provider pipe already disappeared.
-                let _ = self.threads[index].stop_task();
-                Ok(json!({"stopped":true}))
+                let execution_binding = self.threads[index]
+                    .next_execution
+                    .clone()
+                    .or_else(|| self.threads[index].execution.clone());
+                let execution = if let Some(binding) = execution_binding {
+                    // A lease-managed peer stop is an executor-owned hard fence:
+                    // drop the session without an abort effect targeting a dead
+                    // channel, then wait for the session owner to prove exit.
+                    self.threads[index].disconnect();
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while !self.threads[index].execution_quiescent() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if self.threads[index].execution_quiescent() {
+                        Some(self.execution.fence(
+                            &binding.lease_id,
+                            lifecycle::now(),
+                            "executor stopped the provider session and verified no process or pending prompt remains",
+                        )?)
+                    } else {
+                        let _ = self.execution.uncertain(
+                            &binding.lease_id,
+                            lifecycle::now(),
+                            "executor acknowledged the stop but provider quiescence is not yet verified",
+                        );
+                        self.execution.get(&binding.lease_id).cloned()
+                    }
+                } else {
+                    // Legacy peer workers retain their existing stop semantics.
+                    let _ = self.threads[index].stop_task();
+                    None
+                };
+                Ok(json!({"stopped":true,"execution":execution}))
             }
             "peer.thread.send" => {
                 if let Some(request_id) = args.get("requestId") {
+                    if let Some(binding) = self.threads[index]
+                        .execution
+                        .clone()
+                        .or_else(|| self.threads[index].next_execution.clone())
+                    {
+                        let control = args.get("execution").filter(|value| value.is_object()).ok_or(
+                            "This lease-managed peer thread requires an exact execution control for a question answer.",
+                        )?;
+                        let lease_id = control["leaseId"]
+                            .as_str()
+                            .ok_or("Execution control is missing leaseId.")?;
+                        let generation = control["generation"]
+                            .as_u64()
+                            .ok_or("Execution control is missing generation.")?;
+                        let controlled = self.execution.control(
+                            &binding.logical_thread_uid,
+                            lease_id,
+                            generation,
+                            control["runId"].as_str(),
+                        )?;
+                        if controlled.lease_id != binding.lease_id {
+                            return Err(
+                                "Request or execution generation changed before the answer was delivered."
+                                    .into(),
+                            );
+                        }
+                    }
                     let thread = &self.threads[index];
                     let request = thread.request.as_ref().ok_or("Request expired.")?;
                     if request["id"] != *request_id
@@ -4189,6 +4781,88 @@ impl State {
                     .get("documentReads")
                     .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
                     .transpose()?;
+                let execution_control = args.get("execution").filter(|value| value.is_object());
+                let current_binding = self.threads[index]
+                    .next_execution
+                    .clone()
+                    .or_else(|| self.threads[index].execution.clone());
+                let exact_control = delivery == Some("steer") || args.get("requestId").is_some();
+                let next_binding = if exact_control {
+                    if let Some(binding) = &current_binding {
+                        let control = execution_control.ok_or(
+                            "This lease-managed peer thread requires an exact execution lease and generation.",
+                        )?;
+                        let lease_id = control["leaseId"]
+                            .as_str()
+                            .ok_or("Execution control is missing leaseId.")?;
+                        let generation = control["generation"]
+                            .as_u64()
+                            .ok_or("Execution control is missing generation.")?;
+                        let controlled = self.execution.control(
+                            &binding.logical_thread_uid,
+                            lease_id,
+                            generation,
+                            control["runId"].as_str(),
+                        )?;
+                        if controlled.lease_id != binding.lease_id {
+                            return Err(
+                                "This control names an earlier execution lease. The current or newer run was not changed."
+                                    .into(),
+                            );
+                        }
+                    }
+                    current_binding
+                } else if let Some(control) = execution_control {
+                    let lease_id = control["leaseId"]
+                        .as_str()
+                        .ok_or("Execution assignment is missing leaseId.")?;
+                    if let Some(existing) = self.execution.get(lease_id).cloned() {
+                        self.execution.control(
+                            &existing.logical_thread_uid,
+                            lease_id,
+                            control["generation"]
+                                .as_u64()
+                                .ok_or("Execution assignment is missing generation.")?,
+                            control["runId"].as_str(),
+                        )?;
+                        Some(existing.binding())
+                    } else {
+                        let lease = crate::execution::lease_from_assignment(
+                            control,
+                            &self.identity.executor_id,
+                            Some(self.threads[index].id as u64),
+                            self.snapshot_identity()
+                                .thread_uid(self.threads[index].id)
+                                .map(str::to_owned),
+                            lifecycle::now(),
+                        )?;
+                        if let Some(binding) = &current_binding
+                            && let Some(status) = self.threads[index]
+                                .peer_origin
+                                .as_ref()
+                                .and_then(|origin| origin.result.as_ref())
+                                .and_then(|result| result["status"].as_str())
+                        {
+                            let _ = self.execution.terminal(
+                                &binding.lease_id,
+                                status,
+                                lifecycle::now(),
+                                "executor-local stored peer result proves the prior run ended",
+                            );
+                        }
+                        if let Some(binding) = &current_binding
+                            && lease.logical_thread_uid != binding.logical_thread_uid
+                        {
+                            return Err(
+                                "Execution control names a different logical thread.".into()
+                            );
+                        }
+                        let (accepted, _) = self.execution.accept_assignment(lease)?;
+                        Some(accepted.binding())
+                    }
+                } else {
+                    current_binding
+                };
                 let thread = &mut self.threads[index];
                 if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
                     return Err("This attempt cannot accept steering.".into());
@@ -4240,6 +4914,9 @@ impl State {
                 thread.peer_origin.as_mut().expect("origin").result = None;
                 thread.peer_origin.as_mut().expect("origin").acknowledged = false;
                 thread.peer_origin.as_mut().expect("origin").attempt_message = message.into();
+                if !exact_control && let Some(binding) = &next_binding {
+                    thread.next_execution = Some(binding.clone());
+                }
                 thread
                     .peer_origin
                     .as_mut()
@@ -4425,6 +5102,38 @@ impl State {
         message: &str,
         delivery: &str,
     ) -> Result<(), String> {
+        let server_id = self.tasks[task]
+            .remote
+            .as_ref()
+            .expect("remote task")
+            .server_id
+            .clone();
+        let label = self.tasks[task]
+            .remote
+            .as_ref()
+            .expect("remote task")
+            .label
+            .clone();
+        if !self
+            .peers
+            .iter()
+            .find(|peer| peer.server_id == server_id)
+            .is_some_and(|peer| {
+                peer.capabilities["contracts"]
+                    .as_array()
+                    .is_some_and(|contracts| {
+                        contracts
+                            .iter()
+                            .any(|contract| contract == crate::protocol::EXECUTION_LEASES)
+                    })
+            })
+        {
+            return Err(format!(
+                "{} Managed execution needs {} on {label}; the peer send was not queued.",
+                crate::protocol::EXECUTION_LEASES_UPDATE_REQUIRED,
+                crate::protocol::EXECUTION_LEASES
+            ));
+        }
         let document_reads = self.tasks[task]
             .remote
             .as_ref()
@@ -4572,11 +5281,41 @@ impl State {
             let command = if remote.thread_id.is_none() {
                 remote.launch_command.clone()
             } else if remote.stop_owed {
+                let mut params = json!({"threadId":remote.thread_id,"sendCommandId":remote.send_command.as_ref().map(|command|command.command_id),
+                    "attemptId":remote.stop_attempt_id});
+                let execution = remote
+                    .execution
+                    .as_ref()
+                    .filter(|lease| {
+                        lease.phase >= crate::execution::Phase::ExecutorAccepted
+                            && !matches!(lease.phase, crate::execution::Phase::Fenced)
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        let thread = remote.execution.as_ref()?.logical_thread_uid.as_str();
+                        self.execution
+                            .leases
+                            .iter()
+                            .filter(|lease| {
+                                lease.executor_id == remote.server_id
+                                    && lease.logical_thread_uid == thread
+                                    && lease.phase >= crate::execution::Phase::Dispatched
+                                    && !matches!(
+                                        lease.phase,
+                                        crate::execution::Phase::Prepared
+                                            | crate::execution::Phase::Fenced
+                                    )
+                            })
+                            .max_by_key(|lease| lease.generation)
+                            .cloned()
+                    });
+                if let Some(execution) = execution {
+                    params["execution"] = execution.control();
+                }
                 Command {
                     command_id: remote.stop_command_id.expect("owed stop id"),
                     method: "peer.thread.stop".into(),
-                    params: json!({"threadId":remote.thread_id,"sendCommandId":remote.send_command.as_ref().map(|command|command.command_id),
-                        "attemptId":remote.stop_attempt_id}),
+                    params,
                 }
             } else if let Some(reply) = remote.document_replies.front() {
                 reply.clone()
@@ -4785,6 +5524,16 @@ impl State {
                     };
                     match method {
                         "peer.thread.launch" => {
+                            if let Err(error) = apply_execution_reply(
+                                &mut self.execution,
+                                remote,
+                                &value,
+                                true,
+                                false,
+                            ) {
+                                remote.state = RemoteState::UpdateRequired;
+                                remote.last_error = Some(error);
+                            }
                             remote.thread_id = value["threadId"]
                                 .as_u64()
                                 .and_then(|n| usize::try_from(n).ok());
@@ -4799,6 +5548,16 @@ impl State {
                             }
                         }
                         "peer.thread.stop" => {
+                            if let Err(error) = apply_execution_reply(
+                                &mut self.execution,
+                                remote,
+                                &value,
+                                false,
+                                true,
+                            ) {
+                                remote.state = RemoteState::UpdateRequired;
+                                remote.last_error = Some(error);
+                            }
                             remote.stop_owed = false;
                             remote.stop_command_id = None;
                             remote.stop_attempt_id = None;
@@ -4811,6 +5570,16 @@ impl State {
                             remote.next_retry_at = 0;
                         }
                         "peer.thread.send" => {
+                            if let Err(error) = apply_execution_reply(
+                                &mut self.execution,
+                                remote,
+                                &value,
+                                true,
+                                false,
+                            ) {
+                                remote.state = RemoteState::UpdateRequired;
+                                remote.last_error = Some(error);
+                            }
                             remote.send_command = None;
                             remote.request = None;
                             remote.needs_you = false;
@@ -4822,6 +5591,16 @@ impl State {
                             }
                         }
                         "peer.thread.wait" => {
+                            if let Err(error) = apply_execution_reply(
+                                &mut self.execution,
+                                remote,
+                                &value,
+                                false,
+                                false,
+                            ) {
+                                remote.state = RemoteState::UpdateRequired;
+                                remote.last_error = Some(error);
+                            }
                             remote.wait_revision = value["revision"].as_str().map(str::to_owned);
                             if let Some(placement) = value.get("placement").filter(|v| !v.is_null())
                             {
@@ -4932,11 +5711,26 @@ impl State {
                                     continue;
                                 }
                             };
+                            let execution_lease = remote
+                                .execution
+                                .as_ref()
+                                .map(|lease| lease.lease_id.clone());
                             task.finish(
                                 state,
                                 result["reply"].as_str().unwrap_or(""),
                                 result["error"].as_str().unwrap_or(""),
                             );
+                            if let Some(lease_id) = execution_lease {
+                                let _ = self.execution.terminal(
+                                    &lease_id,
+                                    task.state.id(),
+                                    lifecycle::now(),
+                                    "acknowledged peer result is terminal evidence for the controller run",
+                                );
+                                if let Some(remote) = task.remote.as_mut() {
+                                    remote.execution = self.execution.get(&lease_id).cloned();
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -5006,6 +5800,15 @@ impl State {
                             task.finish(TaskState::Failed, "", &error);
                         }
                     } else {
+                        if let Some(lease) = &remote.execution
+                            && lease.phase.in_flight()
+                        {
+                            let _ = self.execution.uncertain(
+                                &lease.lease_id,
+                                lifecycle::now(),
+                                "executor link was lost before terminal or verified fence evidence",
+                            );
+                        }
                         remote.state = RemoteState::TargetOffline;
                         remote.next_retry_at = lifecycle::now() + retry_delay(remote.retry_attempt);
                         remote.retry_attempt = remote.retry_attempt.saturating_add(1);

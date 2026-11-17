@@ -32,6 +32,7 @@ mod context_breakdown;
 mod crisp;
 mod database;
 mod descriptors;
+mod execution;
 mod fleet_update;
 mod handoff;
 mod harness;

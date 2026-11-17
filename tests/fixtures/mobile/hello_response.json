@@ -65,7 +65,8 @@
       "provider-updates-v1",
       "captain-peer-documents-v1",
       "placement-v1",
-      "identity-v1"
+      "identity-v1",
+      "execution-leases-v1"
     ],
     "controllerId": "<uuid>",
     "deviceId": "<uuid>",
@@ -103,7 +104,7 @@
     "ownerId": "<uuid>",
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 42,
+    "protocolMinor": 44,
     "serverId": "<serverId>",
     "serverTime": "<time>",
     "workspaceId": "<uuid>"

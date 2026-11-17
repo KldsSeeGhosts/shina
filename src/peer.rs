@@ -133,9 +133,16 @@ pub async fn link_peer(
     }
     let previous = previous.map(|peer| peer.credential(profile)).transpose()?;
     let device_id = uuid::Uuid::new_v4().to_string();
+    let identity = database.identity()?;
     let response = http()?
         .post(format!("http://{address}/v1/pair"))
-        .json(&json!({"code":code,"deviceId":device_id,"peer":true}))
+        .json(&json!({
+            "code":code,"deviceId":device_id,"peer":true,
+            "peerServerId":identity["controllerId"],
+            "peerWorkspaceId":identity["workspaceId"],
+            "peerOwnerId":identity["ownerId"],
+            "peerControllerId":identity["controllerId"]
+        }))
         .send()
         .await
         .map_err(|_| "Machine pairing endpoint is unavailable.")?;

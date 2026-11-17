@@ -13,6 +13,10 @@ pub struct Pairing {
     peer: bool,
 }
 impl Pairing {
+    pub fn invalidate(&mut self) {
+        self.code_hash.clear();
+        self.expires = 0;
+    }
     pub fn is_peer(&self) -> bool {
         self.peer
     }
@@ -44,6 +48,28 @@ impl Pairing {
         device: &str,
         now: u64,
     ) -> Result<String, String> {
+        self.exchange_binding(database, code, device, now, None)
+    }
+
+    pub fn exchange_peer(
+        &mut self,
+        database: &crate::database::Database,
+        code: &str,
+        device: &str,
+        now: u64,
+        binding: &serde_json::Value,
+    ) -> Result<String, String> {
+        self.exchange_binding(database, code, device, now, Some(binding))
+    }
+
+    fn exchange_binding(
+        &mut self,
+        database: &crate::database::Database,
+        code: &str,
+        device: &str,
+        now: u64,
+        peer_binding: Option<&serde_json::Value>,
+    ) -> Result<String, String> {
         if now.saturating_sub(self.window) >= 60_000 {
             self.window = now;
             self.attempts = 0;
@@ -58,6 +84,7 @@ impl Pairing {
             || code.len() != 12
             || self.code_hash != crate::protocol::revision(&serde_json::json!(code))
             || uuid::Uuid::parse_str(device).is_err()
+            || self.peer && peer_binding.is_none()
         {
             return Err("Pairing refused.".into());
         }
@@ -70,7 +97,11 @@ impl Pairing {
         } else {
             &["paired", "read", "operate", "approve", "update"]
         };
-        database.issue_scoped_device(device, &token, scopes)?;
+        if let Some(binding) = peer_binding {
+            database.issue_peer_device(device, &token, binding)?;
+        } else {
+            database.issue_scoped_device(device, &token, scopes)?;
+        }
         Ok(token)
     }
 }

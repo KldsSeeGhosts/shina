@@ -17,7 +17,9 @@ The catalog stores:
   cannot authenticate.
 
 The executor initially equals the controller. The owner has a separate identity.
-Execution leases, placement changes and run fencing are later work.
+Durable executions and peer fencing are described in
+`docs/execution-leases.md`. They are additive in the same index version and
+do not add a SQLite table or consume migration 9.
 
 Authenticated `hello` exposes domain identities and logical record aliases.
 Public `/v1/identity` remains a pairing-discovery response with the server ID,
