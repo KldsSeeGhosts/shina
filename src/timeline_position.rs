@@ -1,11 +1,12 @@
 //! KSG `timelineScrollAnchoring.ts`: client-local, server-scoped, 100-entry visit cache.
 use rune::{Cx, ScrollPos};
-use std::collections::{HashSet, VecDeque};
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
 pub struct Position {
     pub row: String,
+    pub entry_id: Option<String>,
     pub offset: f32,
     pub scroll: f32,
     pub at_end: bool,
@@ -13,9 +14,8 @@ pub struct Position {
 
 pub struct Visit {
     pub scroll: Mutex<ScrollPos>,
-    rows: Mutex<HashSet<String>>,
+    rows: Mutex<HashMap<String, Option<String>>>,
     pub restore: Mutex<Option<Position>>,
-    pub opened: AtomicBool,
 }
 
 impl Default for Visit {
@@ -24,14 +24,16 @@ impl Default for Visit {
             scroll: Mutex::default(),
             rows: Mutex::default(),
             restore: Mutex::default(),
-            opened: AtomicBool::new(false),
         }
     }
 }
 
 impl Visit {
-    pub fn row(&self, key: &str) {
-        self.rows.lock().unwrap().insert(key.into());
+    pub fn row(&self, key: &str, entry_id: Option<&str>) {
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(key.into(), entry_id.map(str::to_owned));
     }
 
     fn position(&self, thread: usize, cx: &Cx<crate::model::State>) -> Option<Position> {
@@ -41,19 +43,20 @@ impl Visit {
         }
         let viewport = cx.window_layout(&format!("conversation-{thread}"))?;
         let rows = self.rows.lock().unwrap();
-        let (key, rect) = rows
+        let (key, entry_id, rect) = rows
             .iter()
-            .filter_map(|key| {
+            .filter_map(|(key, entry_id)| {
                 let rect = cx.window_layout(key)?;
                 (rect[3] > 0.0
                     && rect[1] + rect[3] > viewport[1]
                     && rect[1] < viewport[1] + viewport[3])
-                    .then_some((key, rect))
+                    .then_some((key, entry_id, rect))
             })
-            .min_by(|a, b| a.1[1].total_cmp(&b.1[1]))?;
+            .min_by(|a, b| a.2[1].total_cmp(&b.2[1]))?;
         let scroll = *self.scroll.lock().unwrap();
         Some(Position {
             row: key.clone(),
+            entry_id: entry_id.clone(),
             offset: viewport[1] - rect[1],
             scroll: scroll.offset[1],
             at_end: scroll.max[1] - scroll.offset[1] <= 40.0,
@@ -68,6 +71,14 @@ pub struct Positions {
 }
 
 impl Positions {
+    pub(crate) fn current(&self, server: &str, thread: usize) -> Option<Arc<Visit>> {
+        self.active
+            .as_ref()
+            .and_then(|((active_server, active_thread), visit)| {
+                (active_server == server && *active_thread == thread).then(|| visit.clone())
+            })
+    }
+
     pub fn visit(&self) -> Arc<Visit> {
         self.active.as_ref().unwrap().1.clone()
     }
@@ -91,9 +102,6 @@ impl Positions {
                 if restore.is_none() {
                     *restore = position;
                 }
-                visit
-                    .opened
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             visit.rows.lock().unwrap().clear();
             return visit.clone();

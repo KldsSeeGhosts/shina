@@ -32,3 +32,40 @@ checks, not hardware frame timings. Exact-head CI and publication still gate
 the final #24 acceptance decision. #25 and #26 remain separate.
 
 No wire contract, protocol minor, persistence schema or migration changed.
+
+## Recent-window recovery correction
+
+Exact-head review at `0015b0d` strengthened the test to render the recovered
+recent window before fetching older pages. The old test loaded all pages
+before that render. The stronger test failed at 620 px: the reader's row moved
+24 px after a cache reset.
+
+The fixed-height viewport's layout callback could run with an older recent-only
+row list after a newer page had already applied. It could also fail to run again
+when older content arrived without resizing the viewport. Retaining the anchor
+alone did not fix either event-ordering problem.
+
+Following the Claude Code Opus 5.5 medium review, restoration now runs with the
+client projection's scroll transaction. It uses the current row list, requests
+older history by the saved message identity when needed, and consumes the anchor
+only when that row arrives or history is exhausted. The first-mount callback
+uses the same helper without requesting history. No callback retains an old row
+list to decide whether the current anchor is missing.
+
+The regression applies projections through a Rune update transaction, matching
+production. At 620, 960, 1280 and 1920 px it exercises both settled recent-only
+frames and newer pages arriving before older layout events drain. Both paths
+preserve the reader row and disclosure state, with no retained transcript
+payloads. These stronger cases pass locally; final exact-head CI and publication
+remain required.
+
+The review also found positional work-disclosure fallback copying an expanded
+flag to a different message when a paged window reused the same local ordinal.
+A separate regression failed before the correction. Positional fallback now
+applies only when the old work boundary has no message identity; normal work
+matches by its stable message id.
+
+Final local validation passes the all-target build, formatting and diff checks,
+16 delta-projection tests, 14 client-history tests, the existing prepend/expand/
+image/width scroll-anchor test and the streaming sticky-bottom test. Full CI
+must run again on the updated PR head. No native frame-time claim is added.

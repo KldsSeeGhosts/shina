@@ -779,6 +779,9 @@ impl ThreadView {
             .work
             .iter()
             .enumerate()
+            // Positional fallback is only for a boundary with no message id.
+            // A paged window can reuse an ordinal for a different message.
+            .filter(|(_, old)| old_msg_ids.get(old.start).is_none())
             .map(|(index, old)| (old.start, index))
             .collect();
         thread.messages = if let Some(view) = view {
@@ -1938,6 +1941,7 @@ impl State {
                 self.storage_error = Some(error);
             }
         }
+        changed |= crate::ui::restore_timeline_position(self, tx, true);
         // A pending draft change resolves once the target's project list
         // arrives, and abandons when the target disconnects mid-change.
         if self.machines.draft_retarget.is_some() {
@@ -9421,10 +9425,52 @@ mod tests {
         }
 
         #[test]
+        fn work_disclosure_does_not_follow_a_reused_window_position() {
+            let window = |prefix: &str| {
+                let mut thread = Thread::new(1);
+                thread.messages = (0..2)
+                    .map(|index| Message {
+                        id: format!("{prefix}-{index}"),
+                        role: "Pi",
+                        text: format!("message {index}"),
+                        images: vec![],
+                        context: None,
+                    })
+                    .collect();
+                thread.work.push(AssistantWork {
+                    start: 1,
+                    stopped: false,
+                    stopped_order: 0,
+                    expanded: false,
+                    elapsed: Some(1),
+                    outcome: Some(Status::Completed),
+                });
+                thread
+            };
+            let mut thread = window("older");
+            thread.work[0].expanded = true;
+            let recent = window("recent");
+            ThreadView::capture(&recent).apply(&mut thread).unwrap();
+            assert!(
+                !thread.work[0].expanded,
+                "a different message at the same local ordinal is not the same work item"
+            );
+        }
+
+        #[test]
         fn reconnect_and_cache_reset_preserve_the_readers_device_state() {
+            fn apply(rt: &mut rune::Runtime<State>, projection: Projection) {
+                rt.update(move |state, tx| {
+                    state.apply_projection(projection).unwrap();
+                    crate::ui::restore_timeline_position(state, tx, true);
+                });
+            }
             // KSG timelineScrollAnchoring.ts remembers the visible row and
             // disclosures independently of provider and transport hydration.
-            for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for (width, settle_recent) in [620.0, 960.0, 1280.0, 1920.0]
+                .into_iter()
+                .flat_map(|width| [false, true].map(move |settle| (width, settle)))
+            {
                 let (mut cache, mut streams, threads, mut fragments) =
                     rig(2, 160, 50, 1 << 22, true);
                 let hello = json!({"capabilities":[
@@ -9445,9 +9491,7 @@ mod tests {
                 }]);
                 let marked = publish(&mut cache, &mut streams, &workspace(1, &threads), &marked);
                 let mut rt = crate::ui::tests::runtime(width);
-                rt.state
-                    .apply_projection(cache.projected().unwrap())
-                    .unwrap();
+                apply(&mut rt, cache.projected().unwrap());
                 rt.state.active = rt.state.threads.iter().position(|t| t.id == 2).unwrap();
                 rt.state.tabs = vec![2, 1];
                 rt.state.selected_threads = vec![1, 2];
@@ -9486,9 +9530,7 @@ mod tests {
                 background["state"]["threads"][0]["messages"][159]["text"] =
                     json!("background stream");
                 let latest = publish(&mut cache, &mut streams, &marked, &background);
-                rt.state
-                    .apply_projection(cache.projected().unwrap())
-                    .unwrap();
+                apply(&mut rt, cache.projected().unwrap());
                 rt.invalidate();
                 rt.frame(0.0);
                 assert_device(&rt.state);
@@ -9517,9 +9559,7 @@ mod tests {
                         .unwrap();
                     // Render the metadata-only/unloaded frame too. Skipping
                     // it would hide lost disclosure and scroll state.
-                    rt.state
-                        .apply_projection(cache.projected().unwrap())
-                        .unwrap();
+                    apply(&mut rt, cache.projected().unwrap());
                     rt.invalidate();
                     rt.frame(0.0);
                     assert_device(&rt.state);
@@ -9530,10 +9570,52 @@ mod tests {
                         );
                     }
                     for id in [1, 2] {
+                        cache.desired_thread = Some(id);
+                        while let Some(request) = cache.next_history() {
+                            answer(&mut cache, &streams, &mut fragments, &request, 1 << 22);
+                            if let Some(projected) = cache.projected() {
+                                apply(&mut rt, projected);
+                            }
+                            // Production renders the recent snapshot before
+                            // any older page can restore the remembered row.
+                            rt.invalidate();
+                            rt.frame(0.0);
+                            if settle_recent {
+                                for _ in 0..60 {
+                                    if !rt.frame(1.0 / 60.0) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !cache.complete(id) {
+                            let pending = rt
+                                .state
+                                .timeline_positions
+                                .borrow()
+                                .visit()
+                                .restore
+                                .lock()
+                                .unwrap()
+                                .clone();
+                            if reset && id == 2 && settle_recent {
+                                assert!(rt.state.current().history_loading);
+                                assert_eq!(
+                                    pending
+                                        .as_ref()
+                                        .and_then(|position| position.entry_id.as_deref()),
+                                    Some("m-2-78")
+                                );
+                            }
+                            cache.request_earlier(
+                                id,
+                                pending.and_then(|position| position.entry_id),
+                            );
+                        }
                         load_all(&mut cache, &streams, &mut fragments, 1 << 22, id);
                     }
                     if let Some(projected) = cache.projected() {
-                        rt.state.apply_projection(projected).unwrap();
+                        apply(&mut rt, projected);
                     }
                     rt.invalidate();
                     for _ in 0..60 {
