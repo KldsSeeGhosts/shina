@@ -3028,6 +3028,143 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_provider_ack_belongs_to_its_input_not_the_running_writer() {
+        queued_provider_reply(false);
+    }
+
+    #[test]
+    fn rejecting_a_queued_provider_input_does_not_settle_the_running_writer() {
+        queued_provider_reply(true);
+    }
+
+    fn queued_provider_reply(rejected: bool) {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.identity.controller_id.clone();
+        let first = assigned_lease(
+            &state,
+            child,
+            &controller,
+            1,
+            "writer-run",
+            "same-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state
+            .execution
+            .transition(
+                &first.lease_id,
+                crate::execution::Phase::Running,
+                2,
+                "writer started",
+            )
+            .unwrap();
+        let next = assigned_lease(
+            &state,
+            child,
+            &controller,
+            2,
+            "queued-provider-run",
+            "same-attempt",
+            true,
+        );
+        let (next, _) = state.execution.accept_assignment(next).unwrap();
+        let input = uuid::Uuid::new_v4();
+        let text = tasks::delivery_text(&input.to_string(), "provider queued follow-up");
+        let thread = &mut state.threads[1];
+        thread.execution = Some(first.binding());
+        thread.run_id = Some(first.run_id.clone());
+        thread.peer_origin.as_mut().unwrap().attempt_id = first.attempt_id.clone();
+        thread
+            .peer_input_executions
+            .insert(input.to_string(), next.binding());
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = false;
+        thread.history_loaded = true;
+        thread.model_provider = "cpa".into();
+        thread.pending_injections.push_back(Injection {
+            text: text.clone(),
+            shown: false,
+            steer: None,
+            peer_input: Some(input),
+        });
+        assert!(thread.flush_injection());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["runId"], next.run_id);
+        assert_eq!(thread.execution, Some(first.binding()));
+        assert_eq!(thread.run_id.as_deref(), Some(first.run_id.as_str()));
+        thread.apply(
+            json!({"type":"response","command":"prompt","id":prompt["id"],"success":!rejected,
+            "error":if rejected { json!("fixture rejected input") } else { Value::Null },
+            "data":{"disposition":"queued"}}),
+        );
+        state.refresh_execution(3);
+        assert_eq!(
+            state.execution.get(&next.lease_id).unwrap().phase,
+            if rejected {
+                crate::execution::Phase::Terminal
+            } else {
+                crate::execution::Phase::ProviderAccepted
+            }
+        );
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        if rejected {
+            assert_eq!(
+                state
+                    .execution
+                    .get(&next.lease_id)
+                    .unwrap()
+                    .terminal_status
+                    .as_deref(),
+                Some("rejected")
+            );
+            assert!(state.threads[1].peer_provider_inputs.is_empty());
+            assert_eq!(state.threads[1].status, Status::Running);
+            assert!(state.threads[1].pending_injections.is_empty());
+            assert_eq!(state.threads[1].task_result, None);
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+            return;
+        }
+        let thread = &mut state.threads[1];
+        thread.apply(json!({"type":"agent_settled","aborted":false}));
+        state.refresh_execution(4);
+        assert_eq!(
+            state.execution.get(&next.lease_id).unwrap().phase,
+            crate::execution::Phase::ProviderAccepted
+        );
+        let snapshot = state.snapshot();
+        let mut restored = State::headless(state.data_dir.clone());
+        restored.restore_global(&snapshot).unwrap();
+        assert!(
+            restored
+                .threads
+                .iter()
+                .find(|thread| thread.id == child)
+                .unwrap()
+                .queued()
+        );
+        let thread = &mut state.threads[1];
+        thread.apply(json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"[delivery unknown-input]"}]}}));
+        assert_eq!(thread.execution, Some(first.binding()));
+        assert!(thread.queued());
+        thread.apply(json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":text}]}}));
+        thread.apply(json!({"type":"agent_start"}));
+        assert_eq!(thread.execution, Some(next.binding()));
+        assert_eq!(thread.run_id.as_deref(), Some(next.run_id.as_str()));
+        state.refresh_execution(5);
+        assert_eq!(
+            state.execution.get(&next.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn the_first_peer_prompt_uses_its_controller_assigned_run() {
         let mut state = fixture();
         let child = peer_worker(&mut state);

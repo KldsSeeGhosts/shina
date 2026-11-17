@@ -5400,6 +5400,13 @@ fn cancellation_before_peer_assignment_survives_restart_without_provider_input()
 fn task_cancel_settles_queued_inputs_and_the_observed_attempts_running_writer() {
     let mut target = Profile::new();
     let mut home = Profile::new();
+    let provider_gate = target.root.join("hold-followup-provider-input");
+    fs::write(&provider_gate, b"ready").unwrap();
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_PEER_INPUT":provider_gate}).to_string(),
+    )
+    .unwrap();
     target.launch(&["serve"]);
     home.launch(&["serve"]);
     let (discovery, mut executor, mut client, parent) = link_peer_servers(
@@ -5416,6 +5423,9 @@ fn task_cancel_settles_queued_inputs_and_the_observed_attempts_running_writer() 
     );
     let child = delegated["result"]["result"]["thread_id"].clone();
     client.until(|state| state["index"]["tasks"][0]["remote"]["execution"]["phase"] == "running");
+    // This contract covers cancellation before provider delivery. The separate
+    // acceptance test covers inputs already written into the provider queue.
+    fs::remove_file(&provider_gate).unwrap();
     let first = client.snapshot["index"]["tasks"][0]["remote"]["execution"].clone();
     let send = json!({"threadId":parent,"args":{
         "thread_id":child,"message":"accepted-queued-input-must-not-deliver",
@@ -5530,6 +5540,7 @@ fn task_cancel_settles_queued_inputs_and_the_observed_attempts_running_writer() 
         assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
     }
     assert_not_delivered();
+    fs::write(&provider_gate, b"ready").unwrap();
     let next = client.command(
         "task.send",
         json!({"threadId":parent,"args":{

@@ -169,8 +169,8 @@ waiting behind it. The oldest unsettled lease remains active. Preparing a
 follow-up does not fence controls for that running turn.
 
 Each peer command retains its own execution binding in the durable thread
-record. Managed follow-ups wait in Shina's queue until the prior turn settles,
-rather than entering an adapter queue under the previous run id. Terminal
+record. This checkpoint held managed follow-ups in Shina's queue until the prior
+turn settled. The provider-queue correction below replaces that restriction. Terminal
 observations retain their exact binding even when a later input starts within
 the same poll batch.
 
@@ -299,3 +299,22 @@ tests and the live two-input attempt cancellation test after the optional-UID
 correction. A fresh run of the unchanged provider-acceptance regression still
 fails. This is a confirmed remaining defect on this candidate, not an inferred
 or ignored failure.
+
+## Provider-queued acceptance and activation
+
+Same-attempt follow-ups can now enter the provider queue with their own assigned
+run id. The durable `peerProviderInputs` map retains that input's binding while
+the older writer stays current. A successful prompt response advances only the
+queued input's acceptance. Its matching user-message delivery marker activates
+the new writer after the older turn settles. An input refusal settles only that
+input, without failing the older writer.
+
+Both focused acceptance/refusal unit tests pass. The previously failing
+`queued_target_response_is_not_provider_acceptance_until_flushed` now passes
+unchanged. The live task-wide cancellation/restart test also passes. That test
+holds delivery explicitly so it continues to exercise cancellation before
+provider dispatch rather than depending on timing.
+
+Formatting and diff checks pass. These results resolve the known provider-queue
+regression, not the remaining main composition, cross-executor continuity,
+exact-head CI or publication gates.

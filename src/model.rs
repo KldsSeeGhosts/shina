@@ -930,6 +930,10 @@ pub struct Thread {
     /// Bind each durable peer input to its own controller-issued run. A single
     /// next_execution slot cannot represent several accepted follow-ups.
     pub(crate) peer_input_executions: std::collections::BTreeMap<String, crate::execution::Binding>,
+    /// Inputs written to the provider while another run still owns the writer.
+    /// A prompt acknowledgement is acceptance, not activation or settlement.
+    pub(crate) peer_provider_inputs: std::collections::BTreeMap<String, crate::execution::Binding>,
+    execution_acceptances: Vec<crate::execution::Binding>,
     /// Provider terminal observations survive changing the active binding
     /// within a poll batch, until refresh_execution commits them to the book.
     execution_settlements: Vec<(crate::execution::Binding, String)>,
@@ -1174,6 +1178,7 @@ impl Thread {
             && self.pending_prompt.is_none()
             && self.queued_prompt.is_none()
             && self.pending_injections.is_empty()
+            && self.peer_provider_inputs.is_empty()
             && self.injection_id.is_none()
             && self.native.queue.is_empty()
             && !self.peer_recovery_held
@@ -1309,6 +1314,7 @@ impl Thread {
             || self.queued_prompt.is_some()
             || self.pending_prompt.is_some()
             || !self.pending_injections.is_empty()
+            || !self.peer_provider_inputs.is_empty()
             || self.native_pending_turns()
     }
     pub fn has_draft_content(&self) -> bool {
@@ -1593,6 +1599,8 @@ impl Thread {
             execution: None,
             next_execution: None,
             peer_input_executions: Default::default(),
+            peer_provider_inputs: Default::default(),
+            execution_acceptances: Vec::new(),
             execution_settlements: Vec::new(),
             provider_accepted_run: None,
             provider_running_run: None,
@@ -2895,10 +2903,14 @@ impl Thread {
             && self.run_id.is_some()
             && self.provider_terminal_run != self.run_id
             && self.execution.as_ref() != Some(binding)
+            && self
+                .peer_origin
+                .as_ref()
+                .and_then(|origin| origin.attempt_id.as_ref())
+                != binding.attempt_id.as_ref()
         {
-            // Keep a future managed turn in Shina's durable queue. Passing it
-            // into an adapter's follow-up queue would attribute it to the
-            // currently running lease and make exact cancellation impossible.
+            // A different attempt cannot enter the current provider queue.
+            // Same-attempt inputs retain their own acceptance attribution.
             return false;
         }
         // A steer injection pins the run it was declared against. If that run
@@ -2913,7 +2925,7 @@ impl Thread {
             || self.run_id.is_none()
             || peer_execution.is_some() && self.provider_terminal_run == self.run_id
         {
-            if let Some(binding) = peer_execution.or_else(|| {
+            if let Some(binding) = peer_execution.clone().or_else(|| {
                 self.next_execution.clone().filter(|binding| {
                     !self
                         .peer_input_executions
@@ -2945,18 +2957,27 @@ impl Thread {
         }
         // prompt starts an idle Pi; followUp also covers a run starting before Pi reads it.
         let behavior = if steer { "steer" } else { "followUp" };
+        let input_run = peer_execution
+            .as_ref()
+            .map(|binding| binding.run_id.clone())
+            .or_else(|| self.run_id.clone());
         if !self.command(
             "prompt",
-            json!({"message":text,"streamingBehavior":behavior}),
+            json!({"message":text,"streamingBehavior":behavior,"runId":input_run}),
         ) {
             return false;
         }
         let prompt_command = format!("{}-{}", self.id, self.serial);
         self.injection_id = Some(prompt_command.clone());
         if let Some(peer) = peer_input {
+            if let Some(binding) = peer_execution
+                && self.execution.as_ref() != Some(&binding)
+            {
+                self.peer_provider_inputs.insert(peer.to_string(), binding);
+            }
             self.peer_prompt = Some((prompt_command, peer));
             self.peer_dispatches
-                .push((peer.to_string(), behavior.into(), self.run_id.clone()));
+                .push((peer.to_string(), behavior.into(), input_run.clone()));
             if let Some(origin) = &mut self.peer_origin
                 && let Some(evidence) = origin
                     .inputs
@@ -2971,7 +2992,7 @@ impl Thread {
                     }
                     .into(),
                 );
-                evidence.run_id = self.run_id.clone();
+                evidence.run_id = input_run;
                 evidence.observed_at = lifecycle::now();
             }
         }
@@ -3408,6 +3429,52 @@ impl Thread {
     }
 
     pub fn apply(&mut self, record: Value) {
+        let queued_prompt = if record["type"] == "response" && record["command"] == "prompt" {
+            self.peer_prompt
+                .as_ref()
+                .filter(|(prompt, _)| record["id"] == *prompt)
+                .and_then(|(_, input)| self.peer_provider_inputs.get(&input.to_string()))
+                .cloned()
+        } else {
+            None
+        };
+        if let Some(binding) = &queued_prompt {
+            if record["success"] == false
+                && !string(&record, "error")
+                    .to_ascii_lowercase()
+                    .contains("compaction")
+            {
+                self.execution_settlements
+                    .push((binding.clone(), "rejected".into()));
+                self.peer_provider_inputs
+                    .retain(|_, queued| queued != binding);
+            } else if record["success"] != false {
+                self.execution_acceptances.push(binding.clone());
+            }
+        }
+        if record["type"] == "message_start" && record["message"]["role"] == "user" {
+            let text = content_text(&record["message"]["content"]);
+            if let Some(input) = tasks::delivery_id(&text)
+                && let Some(binding) = self.peer_provider_inputs.get(input).cloned()
+                && (!self.status.busy() || self.provider_terminal_run == self.run_id)
+            {
+                self.peer_provider_inputs.remove(input);
+                if self.next_execution.as_ref() == Some(&binding) {
+                    self.next_execution = None;
+                }
+                self.run_id = Some(binding.run_id.clone());
+                self.execution = Some(binding.clone());
+                if let Some(origin) = &mut self.peer_origin {
+                    origin.attempt_id = binding.attempt_id;
+                    origin.result = None;
+                    origin.acknowledged = false;
+                    origin.attempt_message = text;
+                    origin.reply_after_position = self.messages.len();
+                }
+                self.arm_task();
+                self.note_provider_running();
+            }
+        }
         self.observe_task_history(&record);
         self.last_activity = Instant::now();
         if self.apply_native(&record) {
@@ -3498,7 +3565,15 @@ impl Thread {
                     return;
                 }
                 if record["success"] == false {
-                    if command == "prompt" {
+                    if queued_prompt.is_some() && injection {
+                        // Refusal of a distinct queued input does not fail or
+                        // settle the provider turn that is already running.
+                        self.pending_injections.pop_front();
+                        self.injection_retry_at = None;
+                        self.diagnostic(string(&record, "error"));
+                        return;
+                    }
+                    if command == "prompt" && queued_prompt.is_none() {
                         self.memory_staged.clear();
                         self.memory_context.clear();
                         self.scope_context_pending = true;
@@ -3993,7 +4068,7 @@ impl Thread {
                             self.mark_handoff_delivered();
                             self.note_provider_prompt_accepted();
                         }
-                        if injection {
+                        if injection && queued_prompt.is_none() {
                             self.note_provider_prompt_accepted();
                         }
                         if record["data"]["disposition"] == "handled"
@@ -5329,6 +5404,22 @@ impl State {
     pub(crate) fn refresh_execution(&mut self, now: u64) -> bool {
         let mut changed = false;
         for thread in &mut self.threads {
+            for binding in std::mem::take(&mut thread.execution_acceptances) {
+                if self.execution.get(&binding.lease_id).is_some_and(|lease| {
+                    lease.binding() == binding
+                        && lease.phase < crate::execution::Phase::ProviderAccepted
+                }) {
+                    changed |= self
+                        .execution
+                        .transition(
+                            &binding.lease_id,
+                            crate::execution::Phase::ProviderAccepted,
+                            now,
+                            "provider acknowledged this exact queued input, not writer activation",
+                        )
+                        .is_ok();
+                }
+            }
             for (binding, status) in std::mem::take(&mut thread.execution_settlements) {
                 if self.execution.get(&binding.lease_id).is_some_and(|lease| {
                     lease.binding() == binding && lease.phase != crate::execution::Phase::Terminal
@@ -15271,6 +15362,15 @@ impl State {
                         .transpose()
                         .ok()?
                         .unwrap_or_default();
+                    thread.peer_provider_inputs = record
+                        .get("peerProviderInputs").filter(|value| !value.is_null())
+                        .map(|value| serde_json::from_value(value.clone())).transpose().ok()?
+                        .unwrap_or_default();
+                    if thread.peer_provider_inputs.iter().any(|(input, binding)| {
+                        thread.peer_input_executions.get(input) != Some(binding)
+                    }) {
+                        return None;
+                    }
                     if thread.peer_input_executions.iter().any(|(input, binding)| {
                         uuid::Uuid::parse_str(input).is_err()
                             || self.execution.get(&binding.lease_id)
@@ -16448,6 +16548,7 @@ impl Thread {
             "runId":self.run_id,"resumableRunId":self.resumable_run_id,"continuationOfRunId":self.continuation_of_run_id,
             "execution":self.execution,"nextExecution":self.next_execution,
             "peerInputExecutions":self.peer_input_executions,
+            "peerProviderInputs":self.peer_provider_inputs,
             "providerAcceptedRun":self.provider_accepted_run,
             "providerRunningRun":self.provider_running_run,
             "providerTerminalRun":self.provider_terminal_run,
