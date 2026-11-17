@@ -586,7 +586,7 @@ fn fake_agent_initialize_mcp_stream_permission_cancel_and_load_round_trip() {
         .find(|r| r["method"] == "session/prompt")
         .unwrap();
     let context = prompt["params"]["prompt"][0]["text"].as_str().unwrap();
-    assert!(context.contains(crate::mcp::INSTRUCTIONS));
+    assert!(context.contains(thread.shina_instructions()));
     assert!(context.contains("Captain fixture instructions"));
     assert_eq!(
         wire.iter()

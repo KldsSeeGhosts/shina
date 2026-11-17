@@ -177,6 +177,7 @@ impl State {
             .and_then(|target| target.harness.as_deref())
             .unwrap_or(&home.harness);
         self.validate_harness(harness)?;
+        self.require_harness_executable(harness)?;
         let provider = if harness == "pi" { "cpa" } else { harness };
         if target
             .as_ref()

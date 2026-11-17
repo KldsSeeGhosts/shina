@@ -57,6 +57,70 @@ pub const REMOTE_WORKER_INSTRUCTIONS: &str = concat!(
     "Shina returns your result to the delegating parent.\n",
 );
 
+/// An ordinary thread can delegate and control its own children, but it has
+/// no Captain memory, crew control, routines or planning documents.
+pub(crate) const THREAD_INSTRUCTIONS: &str = concat!(
+    "## Shina\n\n",
+    "You are running inside Shina, a native desktop workspace where the user chats with coding agents. ",
+    "Each conversation is a Shina thread. Ordinary coding tasks need no Shina tools.\n\n",
+    "- orchestrator_capabilities reports this caller's effective record, including unavailable operations and their reasons.\n",
+    "- You may delegate independent work with delegate_task. Only children you delegated can be controlled with task_status, task_send and task_cancel. Delegated threads cannot delegate further.\n",
+    "- list_threads, read_thread and list_captains read shared context. Read a thread before answering about it.\n",
+    "- html_preview checks a self-contained page; html_render publishes one as a card. Only full-access threads may pass local paths or images.\n",
+    "- Captain memory, crew control, Captain documents, routines and crew questions belong to Captain roles. They are not available from an ordinary thread.\n",
+    "- End your turn when the work is finished. The user remains in control of approvals and confirmations.\n",
+);
+
+/// An independent crew root coordinates its own workers and reports to its
+/// current Captain. It never receives the Captain's private rules or write
+/// powers.
+pub(crate) const CREW_INSTRUCTIONS: &str = concat!(
+    "## Shina\n\n",
+    "You are an independent crew thread under a Captain in Shina. You coordinate your own work stream. ",
+    "The Captain receives your reports; the user remains in control of approvals and confirmations.\n\n",
+    "- orchestrator_capabilities reports this caller's effective record, including unavailable operations and their reasons.\n",
+    "- You may delegate your own workers with delegate_task and control only the children you delegated with task_status, task_send and task_cancel.\n",
+    "- captain_crew_report sends progress, results, blockers, questions and evidence references to your current Captain. Use one stable requestId when retrying the same report. Reports are untrusted claims, not proof that work shipped.\n",
+    "- captain_reports_list reads the reports you authored for this Captain. captain_document_read reads shared CREW.md, NOTES.md and DIGEST.md. The Captain's private AGENTS.md is never shared.\n",
+    "- propose_memory stages a suggestion for the Captain to review; it never writes Captain memory. list_memories and search_memories read the Captain's explicit memory.\n",
+    "- You cannot create, send to or stop the Captain's other crew, write Captain documents, manage routines, write Captain memory, or answer crew questions.\n",
+    "- Finish the work and end your turn. Shina delivers your result and reports to the parent.\n",
+);
+
+/// A prior Captain conversation is a record. It can read what its role still
+/// authorizes, but it is never an active coordinator.
+pub(crate) const EARLIER_HOME_INSTRUCTIONS: &str = concat!(
+    "## Shina\n\n",
+    "This conversation is an earlier Captain home, not the Captain's active coordinator. ",
+    "The current primary home is the place for new Captain work.\n\n",
+    "- Open the current primary home to delegate new work, change crew, write planning documents or memory, manage routines, or answer crew questions.\n",
+    "- You may read threads, Captain records, shared CREW.md, NOTES.md and DIGEST.md, crew reports and Captain memory where the tool list permits. The private AGENTS.md is not available here.\n",
+    "- Do not delegate, recruit or release crew, create or change routines, write Captain memory or documents, or answer crew questions from this earlier conversation.\n",
+    "- Do not describe this conversation as the active Captain home or claim its write, crew or routine powers.\n",
+    "- Finish the record, answer questions about it, and end your turn. User controls in Shina remain available separately.\n",
+);
+
+/// An archived Captain group is frozen. Reads may remain available; every
+/// coordination and write surface stays closed until the user unarchives it.
+pub(crate) const ARCHIVED_INSTRUCTIONS: &str = concat!(
+    "## Shina\n\n",
+    "This Captain and its crew are archived. Treat every thread in the group as a read-only record.\n\n",
+    "- Reads such as list_threads, read_thread, captain_read, captain_document_read for shared documents, and captain_reports_list may remain available. The private AGENTS.md is not available to crew.\n",
+    "- Do not delegate, control crew, create or change routines, write Captain memory or documents, control tasks, or answer crew questions. Those operations are unavailable while the Captain is archived.\n",
+    "- Do not claim primary-home write powers, routines or crew control. The user can unarchive the Captain from Shina's controls.\n",
+    "- Summarize or answer from the record and end your turn.\n",
+);
+
+/// A retired Captain is a read-only record with no coordination powers.
+pub(crate) const RETIRED_INSTRUCTIONS: &str = concat!(
+    "## Shina\n\n",
+    "This Captain was demoted or retired and is a read-only record.\n\n",
+    "- You may read threads, Captain records, shared documents and reports where the tool list permits.\n",
+    "- Do not delegate, control crew, manage routines, write Captain memory or documents, control tasks, or answer crew questions.\n",
+    "- Do not describe this thread as an active primary home or claim its write, crew or routine powers.\n",
+    "- Summarize or answer from the record and end your turn.\n",
+);
+
 /// Tools every caller can invoke regardless of owner lifecycle, mirroring the
 /// skip list in `mcp_call`. All others pass `require_active_thread_owner`.
 const OWNER_BYPASS: &[&str] = &[
@@ -91,17 +155,15 @@ fn gate(available: bool, reason: Option<String>) -> Value {
     json!({"available": available, "reason": reason})
 }
 
+fn peer_reachable(peer: &crate::peer::Peer) -> bool {
+    peer.last_error.is_none() && peer.last_reached_at.is_some()
+}
+
 impl Thread {
-    /// The Shina awareness text this thread's session injects, matching the
-    /// worker or coordinator half of its effective record.
+    /// The role-matched Shina awareness text captured for this session. State
+    /// refreshes it at the next safe session start or eligible prompt.
     pub(crate) fn shina_instructions(&self) -> &'static str {
-        if self.peer_origin.is_some() {
-            REMOTE_WORKER_INSTRUCTIONS
-        } else if self.delegated {
-            WORKER_INSTRUCTIONS
-        } else {
-            crate::mcp::INSTRUCTIONS
-        }
+        self.shina
     }
 }
 
@@ -110,34 +172,67 @@ impl State {
     pub(crate) fn mcp_role(&self, index: usize) -> &'static str {
         let thread = &self.threads[index];
         if thread.peer_origin.is_some() {
-            "remote_worker"
-        } else if thread.delegated {
-            "worker"
-        } else if thread.captain_home {
-            let (_, primary) = self.captain_actor(index);
-            if primary {
-                "captain_home"
-            } else {
-                "earlier_home"
-            }
-        } else if thread.crew_captain.is_some() || thread.captain.is_some() {
-            "crew"
-        } else {
-            "thread"
+            return "remote_worker";
+        }
+        let owner = thread.crew_captain.or(thread.captain);
+        let phase = owner.map_or(CaptainPhase::Active, |id| self.captain_phase(id));
+        if thread.delegated {
+            return match phase {
+                CaptainPhase::Archived => "archived_worker",
+                CaptainPhase::Retired | CaptainPhase::Deleted => "retired_worker",
+                CaptainPhase::Active => "worker",
+            };
+        }
+        if thread.captain_home {
+            return match phase {
+                CaptainPhase::Archived => "archived_home",
+                CaptainPhase::Retired | CaptainPhase::Deleted => "retired_home",
+                CaptainPhase::Active => {
+                    let (_, primary) = self.captain_actor(index);
+                    if primary {
+                        "captain_home"
+                    } else {
+                        "earlier_home"
+                    }
+                }
+            };
+        }
+        if thread.crew_captain.is_some() || thread.captain.is_some() {
+            return match phase {
+                CaptainPhase::Archived => "archived_crew",
+                CaptainPhase::Retired | CaptainPhase::Deleted => "retired_crew",
+                CaptainPhase::Active => "crew",
+            };
+        }
+        "thread"
+    }
+
+    pub(crate) fn instructions_for_role(role: &str) -> &'static str {
+        match role {
+            "captain_home" => crate::mcp::INSTRUCTIONS,
+            "crew" => CREW_INSTRUCTIONS,
+            "earlier_home" => EARLIER_HOME_INSTRUCTIONS,
+            "archived_home" | "archived_crew" | "archived_worker" => ARCHIVED_INSTRUCTIONS,
+            "retired_home" | "retired_crew" | "retired_worker" => RETIRED_INSTRUCTIONS,
+            "worker" => WORKER_INSTRUCTIONS,
+            "remote_worker" => REMOTE_WORKER_INSTRUCTIONS,
+            _ => THREAD_INSTRUCTIONS,
         }
     }
 
     /// The Shina awareness text a caller's harness receives, derived from the
     /// same role the effective record reports.
     pub(crate) fn mcp_instructions(&self, index: usize) -> &'static str {
-        self.threads[index].shina_instructions()
+        Self::instructions_for_role(self.mcp_role(index))
     }
+}
 
+impl State {
     /// Why `tool` is unavailable to this caller before argument validation, in
     /// the same order `mcp_call` (and the request intercepts ahead of it) would
     /// refuse it. `None` means the dispatch can run; per-argument and
     /// per-attempt checks still apply.
-    fn denial(&self, index: usize, tool: &str) -> Option<String> {
+    pub(crate) fn denial(&self, index: usize, tool: &str) -> Option<String> {
         let thread = &self.threads[index];
         // `mcp_call` routes crew control before its owner and remote gates.
         if matches!(
@@ -168,9 +263,16 @@ impl State {
             // `mcp_request_ready` intercepts these before `mcp_call` runs.
             match tool {
                 "captain_document_read" => {
-                    return (!origin.document_reads).then(|| {
-                        "The originating server cannot answer Captain document reads. Only the context in the brief is available.".into()
-                    });
+                    if !origin.document_reads {
+                        return Some("The originating server cannot answer Captain document reads. Only the context in the brief is available.".into());
+                    }
+                    if self.origin_document_read_denial(index).is_some() {
+                        return Some(
+                            "The originating peer is no longer authorized to serve Captain documents."
+                                .into(),
+                        );
+                    }
+                    return None;
                 }
                 // html_render and html_preview are intercepted in
                 // `mcp_request_ready` too; the remote gate never sees them.
@@ -195,6 +297,12 @@ impl State {
             return Some(error);
         }
         let (captain, primary) = self.captain_actor(index);
+        if tool == "captain_reports_list" && captain.is_none() {
+            return Some("Only this captain's threads may read its crew reports.".into());
+        }
+        if matches!(tool, "task_send" | "task_cancel") && thread.delegated {
+            return Some("Delegated threads cannot control other tasks.".into());
+        }
         match tool {
             "delegate_task" => {
                 if thread.delegated {
@@ -256,8 +364,13 @@ impl State {
                     captain.and_then(|id| self.require_active_captain(id).err())
                 }
             }
-            "captain_question_answer" => (!primary)
-                .then(|| "Only this captain's primary home may answer its crew questions.".into()),
+            "captain_question_answer" => {
+                if !primary {
+                    Some("Only this captain's primary home may answer its crew questions.".into())
+                } else {
+                    captain.and_then(|id| self.require_active_captain(id).err())
+                }
+            }
             "captain_crew_report" => {
                 if !(thread.crew_captain.is_some() && !thread.delegated && !thread.captain_home) {
                     Some(
@@ -295,6 +408,28 @@ impl State {
             }
             _ => None,
         }
+    }
+
+    fn remote_document_reads_available(&self, index: usize) -> bool {
+        self.threads[index]
+            .peer_origin
+            .as_ref()
+            .is_some_and(|origin| origin.document_reads)
+            && self.origin_document_read_denial(index).is_none()
+    }
+
+    /// The origin must still grant this worker's thread the peer wait scope
+    /// before it can answer a held Captain document read.
+    fn origin_document_read_denial(&self, index: usize) -> Option<String> {
+        let origin = self.threads[index].peer_origin.as_ref()?;
+        let database = crate::database::for_path(&self.data_dir.join("index.json"))?;
+        database
+            .authorize(
+                &origin.device_id,
+                "peer.thread.wait",
+                &json!({"threadId":self.threads[index].id}),
+            )
+            .err()
     }
 
     /// `captain_crew_tool`'s static gates, in its own order.
@@ -384,22 +519,29 @@ impl State {
     pub(crate) fn coordination(&self, index: usize) -> Value {
         let remote_peers = self.delegation_peers();
         let delegate_denial = self.denial(index, "delegate_task");
-        let remote_capable: Vec<&str> = remote_peers
-            .iter()
-            .filter(|peer| {
-                peer.capabilities["contracts"]
-                    .as_array()
-                    .is_some_and(|c| c.iter().any(|contract| contract == protocol::PEER_TASKS))
-            })
+        let contract_peers = remote_peers.iter().filter(|peer| {
+            peer.capabilities["contracts"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|contract| contract == protocol::PEER_TASKS))
+        });
+        let remote_capable: Vec<&str> = contract_peers
+            .clone()
+            .filter(|peer| peer_reachable(peer))
             .map(|peer| peer.server_id.as_str())
             .collect();
         let (remote_available, remote_reason) = if let Some(reason) = &delegate_denial {
             (false, Some(reason.clone()))
         } else if remote_capable.is_empty() {
-            (
-                false,
-                Some("No linked peer advertises peer tasks. Link a machine in Settings to delegate remotely.".into()),
-            )
+            let reason = if let Some(peer) =
+                contract_peers.clone().find(|peer| !peer_reachable(peer))
+            {
+                peer.last_error.clone().unwrap_or_else(|| {
+                    "A linked peer advertises peer tasks but is not reachable. Check the machine connection or credentials, then retry.".to_string()
+                })
+            } else {
+                "No linked peer advertises peer tasks. Link a machine in Settings to delegate remotely.".to_string()
+            };
+            (false, Some(reason))
         } else {
             (true, None)
         };
@@ -523,10 +665,15 @@ impl State {
                 "AGENTS.md": "The captain's primary home only; never shared with crew or remote workers.",
                 "shared": "CREW.md, NOTES.md and DIGEST.md.",
                 "remote": {
-                    "available": !remote
-                        || self.threads[index].peer_origin.as_ref().is_some_and(|o| o.document_reads),
+                    "available": !remote || self.remote_document_reads_available(index),
                     "reason": self.threads[index].peer_origin.as_ref().and_then(|o| {
-                        (!o.document_reads).then(|| "The originating server cannot answer Captain document reads. Only the context in the brief is available.".to_string())
+                        if !o.document_reads {
+                            Some("The originating server cannot answer Captain document reads. Only the context in the brief is available.".to_string())
+                        } else if self.origin_document_read_denial(index).is_some() {
+                            Some("The originating peer is no longer authorized to serve Captain documents.".to_string())
+                        } else {
+                            None
+                        }
                     }),
                     "bound": "offset, maxBytes and expectedRevision page within the authorized manifest."
                 }
@@ -538,6 +685,25 @@ impl State {
             },
             "captains": gate(!remote, remote.then(remote_reason)),
         })
+    }
+
+    /// Refuse an executable-less or MCP-less harness before work allocation.
+    pub(crate) fn require_harness_executable(&self, harness: &str) -> Result<(), String> {
+        match harness {
+            "pi" => Ok(()),
+            "codex" => crate::codex::process().map(drop),
+            "claude" => crate::claude::process().map(drop),
+            _ => {
+                let agent = self.harnesses.find(harness)?;
+                let capabilities = crate::acp::probe(&agent)?;
+                let mcp = &capabilities["mcpCapabilities"];
+                if mcp["http"] == true || mcp["stdio"] != false {
+                    Ok(())
+                } else {
+                    Err("This ACP agent supports neither HTTP nor stdio MCP. Shina cannot register its tools, so no thread was allocated.".into())
+                }
+            }
+        }
     }
 
     /// Execution options this caller could delegate with: local harnesses with
@@ -559,7 +725,30 @@ impl State {
                     Ok(_) => (true, None),
                     Err(error) => (false, Some(error)),
                 },
-                _ => (true, None),
+                _ => match self.harnesses.find(&harness).and_then(|agent| {
+                    crate::acp::probe(&agent).map(|capabilities| (agent, capabilities))
+                }) {
+                    Ok((_, capabilities)) => {
+                        let mcp = &capabilities["mcpCapabilities"];
+                        let available = mcp["http"] == true || mcp["stdio"] != false;
+                        entry["discovery"] = json!("probed");
+                        entry["mcp"] = json!({
+                            "available": available,
+                            "http": mcp["http"],
+                            "stdio": mcp["stdio"],
+                            "reason": (!available).then(|| "This ACP agent advertises neither HTTP nor stdio MCP. Shina cannot register its tools.".to_string()),
+                        });
+                        if available {
+                            (true, None)
+                        } else {
+                            (false, Some("This ACP agent supports neither HTTP nor stdio MCP. Shina cannot register its tools.".into()))
+                        }
+                    }
+                    Err(error) => {
+                        entry["discovery"] = json!("failed");
+                        (false, Some(error))
+                    }
+                },
             };
             entry["executable"] = json!(ready);
             entry["reason"] = json!(reason);
@@ -582,27 +771,38 @@ impl State {
                     .filter_map(|contract| contract.as_str().map(str::to_owned))
                     .collect();
                 let has = |name: &str| contracts.iter().any(|contract| contract == name);
-                let reachable = peer.last_error.is_none() && peer.last_reached_at.is_some();
+                let reachable = peer_reachable(peer);
+                let unreachable_reason = || {
+                    peer.last_error.clone().unwrap_or_else(|| {
+                        "The peer has not been reached. Check the machine connection or credentials."
+                            .to_string()
+                    })
+                };
+                let requirement = |contract: &str, reason: &str| {
+                    if !reachable {
+                        gate(false, Some(unreachable_reason()))
+                    } else {
+                        gate(
+                            has(contract),
+                            (!has(contract)).then(|| reason.to_string()),
+                        )
+                    }
+                };
                 json!({
                     "serverId": peer.server_id,
                     "label": peer.label,
                     "reachable": reachable,
                     "contracts": contracts,
-                    "delegation": gate(has(protocol::PEER_TASKS), (!has(protocol::PEER_TASKS)).then(|| {
-                        "The peer did not negotiate peer tasks. Update it before delegating.".to_string()
-                    })),
-                    "threadReads": gate(has(protocol::THREAD_READ), (!has(protocol::THREAD_READ)).then(|| {
-                        "The peer did not negotiate thread reads. list_threads and read_thread cannot cross it.".to_string()
-                    })),
-                    "placement": gate(has(protocol::PLACEMENT), (!has(protocol::PLACEMENT)).then(|| {
-                        "The peer did not negotiate placement-v1. Worker placement requests fail on it.".to_string()
-                    })),
-                    "documentReads": gate(has(protocol::CAPTAIN_PEER_DOCUMENTS), (!has(protocol::CAPTAIN_PEER_DOCUMENTS)).then(|| {
-                        "The peer did not negotiate captain-peer-documents-v1. Workers there cannot page captain documents.".to_string()
-                    })),
-                    "taskFences": gate(has(protocol::PEER_TASK_FENCES), (!has(protocol::PEER_TASK_FENCES)).then(|| {
-                        "The peer predates task fences; fenced sends and stops to its workers are refused.".to_string()
-                    })),
+                    "delegation": requirement(protocol::PEER_TASKS,
+                        "The peer did not negotiate peer tasks. Update it before delegating."),
+                    "threadReads": requirement(protocol::THREAD_READ,
+                        "The peer did not negotiate thread reads. list_threads and read_thread cannot cross it."),
+                    "placement": requirement(protocol::PLACEMENT,
+                        "The peer did not negotiate placement-v1. Worker placement requests fail on it."),
+                    "documentReads": requirement(protocol::CAPTAIN_PEER_DOCUMENTS,
+                        "The peer did not negotiate captain-peer-documents-v1. Workers there cannot page captain documents."),
+                    "taskFences": requirement(protocol::PEER_TASK_FENCES,
+                        "The peer predates task fences; fenced sends and stops to its workers are refused."),
                     "harnesses": peer.capabilities["harnesses"].clone(),
                     "models": peer.capabilities["models"].clone(),
                     "projects": peer.capabilities["projects"].clone(),
@@ -625,13 +825,14 @@ impl State {
     /// Placement modes the worker contract supports locally and on peers.
     pub(crate) fn placement(&self, index: usize) -> Value {
         let remote_supported = self.delegation_peers().iter().any(|peer| {
-            peer.capabilities["contracts"]
-                .as_array()
-                .is_some_and(|contracts| {
-                    contracts
-                        .iter()
-                        .any(|contract| contract == protocol::PLACEMENT)
-                })
+            peer_reachable(peer)
+                && peer.capabilities["contracts"]
+                    .as_array()
+                    .is_some_and(|contracts| {
+                        contracts
+                            .iter()
+                            .any(|contract| contract == protocol::PLACEMENT)
+                    })
         });
         let denied = self.denial(index, "delegate_task").is_some();
         json!({
@@ -814,7 +1015,7 @@ mod tests {
                 "reportId":"crew-x","answer":"a","expectedRevision":0,
                 "requestId":uuid::Uuid::new_v4().to_string()}),
             "captain_crew_report" => json!({
-                "outcome":"done","summary":"s",
+                "outcome":"completed","summary":"s",
                 "requestId":uuid::Uuid::new_v4().to_string()}),
             "captain_document_read" => json!({"name":"CREW.md"}),
             "captain_document_write" => {
@@ -825,7 +1026,9 @@ mod tests {
             "propose_memory" | "remember" => json!({"text":"t"}),
             "forget_memory" => json!({"id":"m-1"}),
             "search_memories" | "ask_memory" => json!({"query":"q"}),
-            "create_routine" => json!({"name":"n","prompt":"p","schedule":{}}),
+            "create_routine" => {
+                json!({"name":"n","prompt":"p","schedule":{"kind":"every","minutes":30}})
+            }
             "pause_routine" | "delete_routine" => json!({"id":1}),
             _ => json!({}),
         }
@@ -869,8 +1072,46 @@ mod tests {
         state.mcp_call(caller, tool, args)
     }
 
-    /// Every static refusal the record reports must reproduce verbatim on the
-    /// real dispatch path for the same caller and minimal-valid arguments.
+    /// A listed tool may still refuse the probe for its arguments. These are
+    /// the exact first argument-dependent errors in this fixture, so a listed
+    /// tool cannot silently fail with a role or lifecycle refusal.
+    fn documented_argument_error(tool: &str, caller: usize) -> Vec<String> {
+        match tool {
+            "delegate_task" => vec!["prompt must describe the task.".into()],
+            "task_send" | "task_cancel" => vec![format!(
+                "Only the parent that delegated thread {caller} may cancel or send to it."
+            )],
+            "forget_memory" => vec!["Memory does not exist.".into()],
+            "create_routine" => vec!["Routine storage is not available.".into()],
+            "pause_routine" | "delete_routine" => {
+                vec!["This routine does not belong to the calling captain.".into()]
+            }
+            "captain_question_answer" => vec![
+                "That question does not belong to this Captain.".into(),
+                "Pass a captain id; this thread has no captain.".into(),
+            ],
+            "captain_crew_report" => vec![
+                "This thread has no current run to report against.".into(),
+                "Pass a captain id; this thread has no captain.".into(),
+            ],
+            // These handlers resolve the target captain before their role gate.
+            "captain_read"
+            | "captain_document_read"
+            | "captain_document_write"
+            | "captain_crew_list"
+            | "captain_crew_join"
+            | "captain_crew_release"
+            | "captain_reports_list" => {
+                vec!["Pass a captain id; this thread has no captain.".into()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every refusal the record reports must lead the real dispatch path. A
+    /// listed tool must either succeed with the fixture's valid arguments or
+    /// return one of the exact argument-dependent errors above; it may not
+    /// fail with a role, lifecycle or durable-storage refusal.
     fn assert_agreement(state: &mut State, caller: usize) {
         for tool in tool_names() {
             if tool == "html_render" || tool == "html_preview" {
@@ -879,15 +1120,18 @@ mod tests {
             let args = probe_args(&tool, caller);
             let reason = state.denial(index(state, caller), &tool);
             match (reason, dispatch(state, caller, &tool, &args)) {
-                (Some(reason), Err(error)) => assert_eq!(
-                    error, reason,
-                    "{tool}: record reason disagrees with dispatch"
+                (Some(reason), Err(error)) => assert!(
+                    error == reason || documented_argument_error(&tool, caller).contains(&error),
+                    "{tool}: record says {reason:?}, dispatch said {error:?}"
                 ),
                 (Some(reason), Ok(_)) => {
                     panic!("{tool}: record says {reason} but dispatch succeeded")
                 }
-                // argument, per-attempt and remote validation still apply
-                (None, _) => {}
+                (None, Ok(_)) => {}
+                (None, Err(error)) => assert!(
+                    documented_argument_error(&tool, caller).contains(&error),
+                    "{tool}: listed but failed with an undocumented error: {error}"
+                ),
             }
         }
     }
@@ -902,7 +1146,12 @@ mod tests {
             crate::mcp::INSTRUCTIONS
         );
         let crew_id = crew(&mut state);
-        assert_eq!(state.mcp_role(index(&state, crew_id)), "crew");
+        let crew_index = index(&state, crew_id);
+        assert_eq!(state.mcp_role(crew_index), "crew");
+        assert_eq!(state.mcp_instructions(crew_index), CREW_INSTRUCTIONS);
+        assert!(CREW_INSTRUCTIONS.contains("captain_crew_report"));
+        assert!(CREW_INSTRUCTIONS.contains("propose_memory"));
+        assert!(!CREW_INSTRUCTIONS.contains("Captain homes can use"));
         let parent = index(&state, home);
         let leaf = delegated(&mut state, parent);
         assert_eq!(state.mcp_role(index(&state, leaf)), "worker");
@@ -919,11 +1168,173 @@ mod tests {
         // A second home thread for the same captain is an earlier home: the
         // primary-home map still points at the first.
         let earlier = earlier_home(&mut state);
+        let earlier_index = index(&state, earlier);
         assert_eq!(state.captain_home(0), Some(home));
-        assert_eq!(state.mcp_role(index(&state, earlier)), "earlier_home");
+        assert_eq!(state.mcp_role(earlier_index), "earlier_home");
+        assert_eq!(
+            state.mcp_instructions(earlier_index),
+            EARLIER_HOME_INSTRUCTIONS
+        );
+        assert!(EARLIER_HOME_INSTRUCTIONS.contains("Do not delegate"));
+        assert!(!EARLIER_HOME_INSTRUCTIONS.contains("You may delegate"));
+        assert!(!EARLIER_HOME_INSTRUCTIONS.contains("Captain homes can use"));
         assert_eq!(state.mcp_role(index(&state, home)), "captain_home");
         let plain = push(&mut state);
-        assert_eq!(state.mcp_role(index(&state, plain)), "thread");
+        let plain_index = index(&state, plain);
+        assert_eq!(state.mcp_role(plain_index), "thread");
+        assert_eq!(state.mcp_instructions(plain_index), THREAD_INSTRUCTIONS);
+        assert!(!THREAD_INSTRUCTIONS.contains("Captain homes can use"));
+        assert_agreement(&mut state, plain);
+    }
+
+    #[test]
+    fn plain_threads_do_not_advertise_captain_report_reads() {
+        let mut state = fixture();
+        let plain = push(&mut state);
+        let i = index(&state, plain);
+        let reason = state.denial(i, "captain_reports_list").unwrap();
+        assert_eq!(
+            reason,
+            "Only this captain's threads may read its crew reports."
+        );
+        assert!(
+            !state
+                .listed_tools(i)
+                .iter()
+                .any(|tool| tool["name"] == "captain_reports_list")
+        );
+        assert_eq!(
+            state
+                .mcp_call(plain, "captain_reports_list", &json!({"captain":0}))
+                .unwrap_err(),
+            reason
+        );
+    }
+
+    #[test]
+    fn delegated_leaves_do_not_advertise_task_control() {
+        let mut state = fixture();
+        let home = captain_home(&mut state);
+        let parent = index(&state, home);
+        let leaf = delegated(&mut state, parent);
+        let i = index(&state, leaf);
+        for tool in ["task_send", "task_cancel"] {
+            assert_eq!(
+                state.denial(i, tool).as_deref(),
+                Some("Delegated threads cannot control other tasks.")
+            );
+            assert!(
+                !state
+                    .listed_tools(i)
+                    .iter()
+                    .any(|item| item["name"] == tool),
+                "{tool} listed for a delegated leaf"
+            );
+        }
+        assert_eq!(
+            dispatch(
+                &mut state,
+                leaf,
+                "task_send",
+                &json!({"client_request_id":"k","thread_id":leaf,"message":"x"})
+            )
+            .unwrap_err(),
+            format!("Only the parent that delegated thread {leaf} may cancel or send to it.")
+        );
+    }
+
+    #[test]
+    fn archived_primary_home_does_not_advertise_question_answers() {
+        let mut state = fixture();
+        let home = captain_home(&mut state);
+        let report: crate::model::crew_reports::CrewReport = serde_json::from_value(json!({
+            "id":format!("crew-{}", uuid::Uuid::new_v4()),
+            "captain":0,"threadId":1,"runId":"run-a","title":"Crew",
+            "outcome":"completed","summary":"Waiting","error":"","createdAt":1,
+            "delivered":false,
+            "question":{"text":"Proceed?","recipient":"captain"}
+        }))
+        .unwrap();
+        let report_id = report.id.clone();
+        state.captain_reports.push(report);
+        state.captain_lifecycles.insert(
+            0,
+            CaptainLifecycle {
+                phase: CaptainPhase::Archived,
+                archived_threads: [(home, None)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        let i = index(&state, home);
+        let reason = state.denial(i, "captain_question_answer").unwrap();
+        assert_eq!(reason, "This Captain is archived. Unarchive it first.");
+        assert!(
+            !state
+                .listed_tools(i)
+                .iter()
+                .any(|tool| tool["name"] == "captain_question_answer")
+        );
+        assert_eq!(
+            state
+                .mcp_call(
+                    home,
+                    "captain_question_answer",
+                    &json!({"reportId":report_id,"answer":"yes",
+                        "expectedRevision":0,"requestId":uuid::Uuid::new_v4().to_string()})
+                )
+                .unwrap_err(),
+            reason
+        );
+    }
+
+    #[test]
+    fn legacy_booleans_match_the_effective_coordination_gates() {
+        fn check(state: &mut State, caller: usize) {
+            let record = state.orchestrator_capabilities(index(state, caller));
+            let caller = &record["caller"];
+            let coordination = &record["effective"]["coordination"];
+            assert_eq!(
+                caller["may_delegate"],
+                coordination["delegate_local"]["available"]
+            );
+            assert_eq!(
+                caller["may_control_crew"], coordination["crew"]["create"]["available"],
+                "may_control_crew contradicted crew.create"
+            );
+            assert_eq!(
+                caller["may_write_captain_documents"],
+                coordination["captain_document_write"]["available"]
+            );
+            assert_eq!(
+                caller["may_answer_questions"],
+                coordination["captain_question_answer"]["available"]
+            );
+            assert_eq!(
+                caller["may_manage_routines"],
+                coordination["routines"]["available"]
+            );
+        }
+        let mut state = fixture();
+        let home = captain_home(&mut state);
+        check(&mut state, home);
+        let member = crew(&mut state);
+        check(&mut state, member);
+        let parent = index(&state, home);
+        let leaf = delegated(&mut state, parent);
+        check(&mut state, leaf);
+        let plain = push(&mut state);
+        check(&mut state, plain);
+        let remote = remote_worker(&mut state, false);
+        check(&mut state, remote);
+        state.captain_lifecycles.insert(
+            0,
+            CaptainLifecycle {
+                phase: CaptainPhase::Archived,
+                archived_threads: [(home, None)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        check(&mut state, home);
     }
 
     #[test]
@@ -1081,9 +1492,18 @@ mod tests {
             },
         );
         assert_agreement(&mut archived, home);
-        let error = archived
-            .denial(index(&archived, home), "delegate_task")
+        let archived_index = index(&archived, home);
+        archived.refresh_captain_contexts();
+        assert_eq!(archived.mcp_role(archived_index), "archived_home");
+        assert_eq!(
+            archived.mcp_instructions(archived_index),
+            ARCHIVED_INSTRUCTIONS
+        );
+        let init = archived
+            .mcp_meta_call(home, "initialize", &json!({}))
             .unwrap();
+        assert_eq!(init["instructions"], ARCHIVED_INSTRUCTIONS);
+        let error = archived.denial(archived_index, "delegate_task").unwrap();
         assert!(error.contains("archived"), "{error}");
         // Reads stay: archived homes still answer them.
         assert!(
@@ -1101,10 +1521,80 @@ mod tests {
                 ..Default::default()
             },
         );
+        retired.refresh_captain_contexts();
+        assert_eq!(
+            retired.mcp_instructions(index(&retired, home)),
+            RETIRED_INSTRUCTIONS
+        );
         let error = retired
             .denial(index(&retired, home), "delegate_task")
             .unwrap();
         assert!(error.contains("read-only"), "{error}");
+    }
+
+    #[test]
+    fn a_live_session_receives_role_changes_on_its_next_prompt() {
+        let mut state = fixture();
+        let _home = captain_home(&mut state);
+        let plain = push(&mut state);
+        let i = index(&state, plain);
+        let (pi, commands, _events) = crate::model::Pi::test_connection();
+        state.threads[i].pi = Some(pi);
+        state.threads[i].harness_context_sent = true;
+        state.threads[i].instruction_role = Some("thread");
+        state.threads[i].shina = THREAD_INSTRUCTIONS;
+        state.threads[i].crew_captain = Some(0);
+        state.threads[i].captain = Some(0);
+        state.refresh_captain_contexts();
+        assert_eq!(state.mcp_role(i), "crew");
+        assert!(state.threads[i].instruction_context_pending);
+        assert!(!state.threads[i].harness_context_sent);
+        assert!(
+            state.threads[i].command("prompt", json!({"message":"continue"})),
+            "the next prompt must be accepted"
+        );
+        let text = commands.try_recv().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(text.starts_with("<shina_capability_update>"), "{text}");
+        assert!(text.contains("independent crew thread"), "{text}");
+        assert!(text.contains("captain_crew_report"), "{text}");
+        assert!(text.contains("propose_memory"), "{text}");
+        assert!(!state.threads[i].instruction_context_pending);
+        assert!(
+            state.threads[i].command("prompt", json!({"message":"next"})),
+            "the update is delivered once"
+        );
+        assert_eq!(commands.try_recv().unwrap()["message"], "next");
+    }
+
+    #[test]
+    fn reset_rebuilds_the_old_homes_current_instructions() {
+        let mut state = fixture();
+        let home = captain_home(&mut state);
+        assert_eq!(
+            state.mcp_instructions(index(&state, home)),
+            crate::mcp::INSTRUCTIONS
+        );
+        let old_index = index(&state, home);
+        state.threads[old_index].status = Status::Completed;
+        state.reset_captain_conversation(0).unwrap();
+        let new_home = state.captain_home(0).unwrap();
+        assert_ne!(new_home, home);
+        let old = index(&state, home);
+        assert_eq!(state.mcp_role(old), "earlier_home");
+        assert_eq!(state.mcp_instructions(old), EARLIER_HOME_INSTRUCTIONS);
+        assert_eq!(
+            state.mcp_meta_call(home, "initialize", &json!({})).unwrap()["instructions"],
+            EARLIER_HOME_INSTRUCTIONS
+        );
+        assert_eq!(
+            state
+                .mcp_meta_call(new_home, "initialize", &json!({}))
+                .unwrap()["instructions"],
+            crate::mcp::INSTRUCTIONS
+        );
     }
 
     #[test]
@@ -1187,6 +1677,86 @@ mod tests {
         let reads = state.reads(index(&state, remote));
         assert_eq!(reads["captain_documents"]["remote"]["available"], false);
         assert_eq!(reads["task_status"]["scope"], "Your own thread only.");
+    }
+
+    #[test]
+    fn unreachable_or_dead_peers_close_remote_delegation_and_reads() {
+        let mut state = fixture();
+        let home = captain_home(&mut state);
+        state.peers.push(crate::peer::Peer {
+            server_id: "dead-peer".into(),
+            host: "127.0.0.1:1".into(),
+            label: "Dead".into(),
+            linked_at: 0,
+            capabilities: json!({"contracts":[
+                crate::protocol::PEER_TASKS,
+                crate::protocol::THREAD_READ,
+                crate::protocol::PLACEMENT,
+                crate::protocol::CAPTAIN_PEER_DOCUMENTS
+            ]}),
+            last_reached_at: Some(1),
+            last_error: Some("Authentication denied. Device unknown or revoked.".into()),
+        });
+        let coordination = state.coordination(index(&state, home));
+        assert_eq!(coordination["delegate_remote"]["available"], false);
+        assert!(
+            coordination["delegate_remote"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Authentication denied"),
+            "{coordination}"
+        );
+        let execution = state.execution(index(&state, home));
+        let peer = &execution["peers"][0];
+        for field in ["delegation", "threadReads", "placement", "documentReads"] {
+            assert_eq!(peer[field]["available"], false, "{field}: {peer}");
+            assert!(
+                peer[field]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Authentication denied"),
+                "{field}: {peer}"
+            );
+        }
+        assert_eq!(
+            state.placement(index(&state, home))["remote"]["available"],
+            false
+        );
+    }
+
+    #[test]
+    fn a_revoked_origin_closes_remote_document_reads() {
+        let mut state = fixture();
+        let remote = remote_worker(&mut state, true);
+        let i = index(&state, remote);
+        let database = crate::database::Database::open(&state.data_dir).unwrap();
+        database
+            .issue_scoped_device("origin-device", "origin-token", &["peer-delegate"])
+            .unwrap();
+        assert!(state.denial(i, "captain_document_read").is_none());
+        assert_eq!(
+            state.reads(i)["captain_documents"]["remote"]["available"],
+            true
+        );
+        database.revoke("origin-device").unwrap();
+        assert_eq!(
+            state.denial(i, "captain_document_read").as_deref(),
+            Some("The originating peer is no longer authorized to serve Captain documents.")
+        );
+        assert_eq!(
+            state.reads(i)["captain_documents"]["remote"]["available"],
+            false
+        );
+        assert_eq!(
+            dispatch(
+                &mut state,
+                remote,
+                "captain_document_read",
+                &json!({"name":"CREW.md"})
+            )
+            .unwrap_err(),
+            "The originating peer is no longer authorized to serve Captain documents."
+        );
     }
 
     #[test]
