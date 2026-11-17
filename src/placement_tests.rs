@@ -1304,9 +1304,12 @@ fn two_delegated_writers_on_one_peer_get_distinct_provisioned_worktrees() {
         let (send, receive) = mpsc::channel();
         send.send(Ok(json!({"status": "accepted", "result": accepted})))
             .unwrap();
-        parent
-            .peer_runtime
-            .inject_pending(task.id.clone(), "peer.thread.launch".into(), receive);
+        parent.peer_runtime.inject_pending(
+            task.id.clone(),
+            task.remote.as_ref().unwrap(),
+            "peer.thread.launch".into(),
+            receive,
+        );
     }
     assert!(parent.poll_remote_tasks());
     poll_until_ready(&mut target, 20);
@@ -1504,6 +1507,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
         .unwrap();
     parent.peer_runtime.inject_pending(
         parent.tasks[0].id.clone(),
+        parent.tasks[0].remote.as_ref().unwrap(),
         "peer.thread.launch".into(),
         receive,
     );
@@ -1554,6 +1558,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
     .unwrap();
     parent.peer_runtime.inject_pending(
         parent.tasks[0].id.clone(),
+        parent.tasks[0].remote.as_ref().unwrap(),
         "peer.thread.wait".into(),
         receive,
     );
@@ -1622,6 +1627,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
         .unwrap();
     parent.peer_runtime.inject_pending(
         parent.tasks[1].id.clone(),
+        parent.tasks[1].remote.as_ref().unwrap(),
         "peer.thread.launch".into(),
         receive,
     );
