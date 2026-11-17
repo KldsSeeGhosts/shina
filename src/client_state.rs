@@ -7275,6 +7275,103 @@ mod tests {
     }
 
     #[test]
+    fn context_import_errors_survive_a_later_success_but_not_a_resolved_or_removed_chip() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let bytes = png.into_inner();
+        for failure_first in [true, false] {
+            let mut state = State::new(PathBuf::new(), false);
+            let thread = state.current().id;
+            for id in ["valid_image", "missing_image"] {
+                state.current_mut().draft.insert_pill(
+                    &crate::composer_context::format_composer_context_href("image", id),
+                    id,
+                );
+                state
+                    .pending_context_imports
+                    .push(("local".into(), thread, id.into()));
+            }
+            state.current_mut().attachment_error =
+                Some("Still bringing attached context into this message.".into());
+            for id in if failure_first {
+                ["missing_image", "valid_image"]
+            } else {
+                ["valid_image", "missing_image"]
+            } {
+                state
+                    .pending_context_imports
+                    .retain(|(_, _, pending)| pending != id);
+                state.apply_imported_attachment_bytes(
+                    "local",
+                    thread,
+                    id,
+                    if id == "valid_image" {
+                        "valid.png"
+                    } else {
+                        "missing.png"
+                    },
+                    "image/png",
+                    "image",
+                    if id == "valid_image" {
+                        Ok(bytes.clone())
+                    } else {
+                        Err("Not found".into())
+                    },
+                );
+            }
+            assert_eq!(state.current().draft_images.len(), 1);
+            assert!(
+                state
+                    .current()
+                    .attachment_error
+                    .as_deref()
+                    .is_some_and(|error| {
+                        error.contains("Couldn't bring missing.png into this message")
+                    }),
+                "failure_first={failure_first}, error={:?}",
+                state.current().attachment_error
+            );
+            // Retrying the failed chip successfully resolves its own error.
+            state.apply_imported_attachment_bytes(
+                "local",
+                thread,
+                "missing_image",
+                "missing.png",
+                "image/png",
+                "image",
+                Ok(bytes.clone()),
+            );
+            assert!(state.current().attachment_error.is_none());
+        }
+        // Removing a failed chip also means a later success must not retain
+        // that chip's error or the transient pending-import message.
+        let mut state = State::new(PathBuf::new(), false);
+        let thread = state.current().id;
+        state.current_mut().draft.insert_pill(
+            &crate::composer_context::format_composer_context_href("image", "valid_image"),
+            "valid.png",
+        );
+        state.current_mut().attachment_error =
+            Some("Couldn't bring removed.png into this message.".into());
+        state.apply_imported_attachment_bytes(
+            "local",
+            thread,
+            "valid_image",
+            "valid.png",
+            "image/png",
+            "image",
+            Ok(bytes),
+        );
+        assert!(state.current().attachment_error.is_none());
+    }
+
+    #[test]
     fn linked_machine_thread_pill_allows_thread_read_v2_and_names_missing_link_or_capability() {
         let mut state = State::new(PathBuf::new(), false);
         let (mut client, _rx) = crate::client::Client::test_connected(state.data_dir.clone());
