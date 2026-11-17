@@ -34,3 +34,20 @@ of the full suite.
 This change adds no wire contract, schema migration or automatic provider replay.
 Recovery for adapters without authoritative input history still remains held or
 unknown. It does not claim universal exactly-once provider delivery.
+
+## Preserve a restored input's recovery hold
+
+A fresh peer prompt cannot clear a hold left by an older input whose acceptance
+is unknown. The target rejects the new prompt before staging it or changing
+the attempt. A replay of the original command still returns its saved receipt.
+
+A matching user-input marker can prove acceptance even when the rest of history
+is incomplete. The target then removes that exact restored input from its
+queue. It releases the thread hold only after all held prompt intents are
+resolved. Missing history from a non-authoritative adapter is still unknown,
+and never authorizes automatic replay.
+
+The saved server transcript is separate from a fresh provider history read.
+Even on Pi, Shina waits for a successful history response with a message list
+before treating a missing marker as nonacceptance. A response that says history
+was not replayed supplies no such proof.
