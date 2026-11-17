@@ -99,7 +99,7 @@ All 19 catalog units, 58 remote-task units and the live paired two-executor
 clone/restart contract pass. The four new catalog regressions failed against
 the prior candidate before the corresponding corrections.
 
-The review also identified unresolved work before issue #28 can close:
+The review also identified these limits:
 
 - Repository updates cannot clear fields or replace the clone URL. Remote
   checkout bindings are visible in task placement, not the controller catalog.
@@ -108,5 +108,14 @@ The review also identified unresolved work before issue #28 can close:
 - A pre-existing executor catalog id may differ from the controller's id, and
   restore lacks an explicit duplicate binding-key validation.
 
-These findings are separate from the verified branch fix. No completion or
-publication claim is made for the remaining catalog requirements.
+The issue's acceptance criteria govern closure. Clearing nullable catalog fields,
+replacing a clone URL in place and extra malformed-index validation are not
+acceptance requirements and will not delay this issue. Controller catalog
+binding visibility is also separate from the required per-operation record,
+which already includes repository, base commit, checkout and executor.
+
+The required remaining work is narrower: compose the declared #27 execution
+ownership dependency, confirm distinct provisioning failure states, and resolve
+the setup-configuration contract without moving platform-specific paths or
+credentials into shared state. Then run the normal exact-head CI and release
+gates. No additional speculative cases are required for closure.
