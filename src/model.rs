@@ -8600,6 +8600,7 @@ impl State {
                 {
                     return Ok(replayed);
                 }
+                self.delegate_receipt_ready()?;
                 let index = find(self)?;
                 if self.prepare_task_control(index, caller, tool, args)? {
                     let status = self.mcp_call(
@@ -8607,14 +8608,13 @@ impl State {
                         "task_status",
                         &json!({"thread_id":self.threads[index].id}),
                     )?;
-                    self.record_task_control_receipt(
+                    return self.record_task_control_receipt(
                         caller_index,
                         tool,
                         request_key,
                         args,
                         &status,
-                    )?;
-                    return Ok(status);
+                    );
                 }
                 if !self.owns_child(caller, index) {
                     return Err(format!(
@@ -8655,14 +8655,13 @@ impl State {
                             "task_status",
                             &json!({"thread_id":self.threads[index].id}),
                         )?;
-                        self.record_task_control_receipt(
+                        return self.record_task_control_receipt(
                             caller_index,
                             tool,
                             request_key,
                             args,
                             &status,
-                        )?;
-                        return Ok(status);
+                        );
                     }
                     if !thread.status.busy() {
                         thread.arm_task();
@@ -8683,8 +8682,7 @@ impl State {
                     "task_status",
                     &json!({"thread_id":self.threads[index].id}),
                 )?;
-                self.record_task_control_receipt(caller_index, tool, request_key, args, &status)?;
-                Ok(status)
+                self.record_task_control_receipt(caller_index, tool, request_key, args, &status)
             }
             "captain_read"
             | "captain_document_read"
@@ -16434,12 +16432,14 @@ mod tests {
                 .contains("crew #2 asks")
         );
         assert!(!state.row_pending(&state.threads[0]));
+        let generation = state.threads[index].request_generation.clone();
         assert!(
             state
                 .mcp_call(
                     1,
                     "task_send",
-                    &json!({"thread_id":2,"message":"invalid","client_request_id":"select-invalid"})
+                    &json!({"thread_id":2,"message":"invalid","client_request_id":"select-invalid",
+                        "request_id":"question","runtime_generation":generation})
                 )
                 .is_err()
         );
@@ -16447,7 +16447,8 @@ mod tests {
             .mcp_call(
                 1,
                 "task_send",
-                &json!({"thread_id":2,"message":"b.rs","client_request_id":"select-b"}),
+                &json!({"thread_id":2,"message":"b.rs","client_request_id":"select-b",
+                    "request_id":"question","runtime_generation":generation}),
             )
             .unwrap();
         let response = child_commands.try_recv().unwrap();
@@ -16459,9 +16460,10 @@ mod tests {
             .mcp_call(
                 1,
                 "task_send",
-                &json!({"thread_id":2,"message":"yes","client_request_id":"confirm-yes"}),
+                &json!({"thread_id":2,"message":"yes","client_request_id":"confirm-yes",
+                    "request_id":"approval","runtime_generation":generation}),
             )
-            .unwrap();
+            .unwrap_err();
         assert!(
             state.threads[index].request.is_some(),
             "a coordinator cannot approve for the user"

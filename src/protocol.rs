@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 38;
+pub const MINOR: u32 = 39;
 pub const CAPTAIN_PEER_DOCUMENTS_MINOR: u32 = 37;
 pub const CAPTAIN_PEER_DOCUMENTS: &str = "captain-peer-documents-v1";
-pub const PEER_TASK_FENCES_MINOR: u32 = 38;
+pub const PEER_TASK_FENCES_MINOR: u32 = 39;
 pub const PROVIDER_UPDATES_MINOR: u32 = 36;
 pub const PROVIDER_UPDATES: &str = "provider-updates-v1";
 pub const PROVIDER_UPDATES_UPDATE_REQUIRED: &str =

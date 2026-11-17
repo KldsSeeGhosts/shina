@@ -1102,14 +1102,26 @@ impl State {
         key: &str,
         args: &Value,
         status: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<Value, String> {
         let scope = self.delegate_scope(caller_index);
         let command = Self::task_control_command(tool, key, args);
         let mut result = status.clone();
         result["requestKey"] = json!(key);
         result["caller"] = json!(self.threads[caller_index].id);
+        result["control"] = json!({
+            "saved":true,
+            "target_attempt_id":args.get("attempt_id").unwrap_or(&status["attempt_id"]),
+            "delivery":if tool == "task_cancel" {"cancel"}
+                else if args["request_id"].is_string() {"answer"}
+                else {args["delivery"].as_str().unwrap_or("follow_up")},
+            "worker_acceptance":"not_observed",
+            "completion":"not_observed"
+        });
         if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
-            return database.stage_task_control_receipt(&scope.device(), &command, result);
+            database
+                .stage_task_control_receipt(&scope.device(), &command, result.clone())
+                .map_err(|error| self.fail_delegate_receipt(error))?;
+            return Ok(result);
         }
         let device = scope.device();
         let hash = command.hash();
@@ -1119,7 +1131,7 @@ impl State {
             .find(|receipt| receipt.device_id == device && receipt.command_id == command.command_id)
         {
             return if existing.hash == hash {
-                Ok(())
+                Ok(existing.result.clone())
             } else {
                 Err(CONTROL_KEY_MISMATCH.into())
             };
@@ -1129,10 +1141,10 @@ impl State {
             device_id: device,
             hash,
             status: ReceiptStatus::Accepted,
-            result,
+            result: result.clone(),
             seq: self.server_seq,
         });
-        Ok(())
+        Ok(result)
     }
 
     fn queue_task_attempt(&mut self, index: usize, message: &str) -> Result<(), String> {
@@ -1180,7 +1192,7 @@ impl State {
     }
 
     /// An observed control fence must be a nonempty bounded string when given.
-    /// A null or absent field keeps the pre-fence contract for old callers.
+    /// Each operation decides which fields are mandatory.
     fn control_fence<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, String> {
         args.get(field)
             .filter(|value| !value.is_null())
@@ -1229,6 +1241,7 @@ impl State {
                 remote
                     .request
                     .as_ref()
+                    .filter(|_| !self.tasks[task_index].state.finished())
                     .map(|request| request["requestId"].clone()),
                 remote
                     .request
@@ -1251,12 +1264,18 @@ impl State {
         if let Some(request_id) = request_id
             && current_id.as_ref() != Some(&json!(request_id))
         {
-            return Err("Request or runtime generation changed.".into());
+            return Err(format!(
+                "Request or runtime generation changed. Current request_id: {}; runtime_generation: {current_generation}. Read task_status before answering.",
+                current_id.as_ref().unwrap_or(&Value::Null)
+            ));
         }
         if let Some(generation) = generation
             && current_generation != json!(generation)
         {
-            return Err("Request or runtime generation changed.".into());
+            return Err(format!(
+                "Request or runtime generation changed. Current request_id: {}; runtime_generation: {current_generation}. Read task_status before answering.",
+                current_id.as_ref().unwrap_or(&Value::Null)
+            ));
         }
         Ok(())
     }
@@ -1276,6 +1295,12 @@ impl State {
                 thread.id
             ));
         }
+        let attempt = Self::control_fence(args, "attempt_id")?;
+        let request_id = Self::control_fence(args, "request_id")?;
+        let generation = Self::control_fence(args, "runtime_generation")?;
+        if tool != "task_cancel" && request_id.is_some() != generation.is_some() {
+            return Err("A question answer requires both request_id and runtime_generation from task_status.".into());
+        }
         let Some(task_index) = self
             .tasks
             .iter()
@@ -1284,9 +1309,31 @@ impl State {
             if tool == "task_cancel" {
                 return Err("This child has no durable task or attempt; a keyed cancel cannot be fenced. Stop it from Shina instead.".into());
             }
+            let delivery = Self::control_delivery(args)?;
+            if attempt.is_some() || delivery == Some("steer") {
+                return Err("This child has no durable attempt to fence. Use Shina's thread controls instead.".into());
+            }
+            match thread.request.as_ref() {
+                Some(request) => {
+                    if request_id != request["id"].as_str()
+                        || generation != Some(thread.request_generation.as_str())
+                    {
+                        return Err("Answering a pending request requires its current request_id and runtime_generation from task_status.".into());
+                    }
+                    if !matches!(
+                        request["method"].as_str(),
+                        Some("input" | "editor" | "select")
+                    ) {
+                        return Err("Confirmations require the user's device link.".into());
+                    }
+                }
+                None if request_id.is_some() => {
+                    return Err("The pending request expired before this answer arrived. Read task_status for the task's current state.".into());
+                }
+                None => {}
+            }
             return Ok(false);
         };
-        let attempt = Self::control_fence(args, "attempt_id")?;
         if tool == "task_cancel" {
             for field in ["delivery", "request_id", "runtime_generation", "message"] {
                 if args.get(field).is_some_and(|value| !value.is_null()) {
@@ -1324,8 +1371,6 @@ impl State {
         {
             return Err("This task was interrupted by a restart. The user must resume or dismiss it in Shina after checking partial work.".into());
         }
-        let request_id = Self::control_fence(args, "request_id")?;
-        let generation = Self::control_fence(args, "runtime_generation")?;
         // A live pending request makes every send a declared answer: it must
         // name the request and generation it observed so a delayed answer
         // cannot resolve a newer question or silently become follow-up work.
@@ -2491,6 +2536,113 @@ mod tests {
     }
 
     #[test]
+    fn legacy_children_cannot_answer_questions_without_both_observed_fences() {
+        let mut state = state_with_task();
+        state.tasks.clear();
+        let (commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].request = Some(json!({"id":"new-question","method":"input"}));
+        state.threads[1].request_generation = "new-generation".into();
+        for (key, fields) in [
+            ("missing", json!({})),
+            ("partial", json!({"request_id":"new-question"})),
+            (
+                "old",
+                json!({"request_id":"old-question","runtime_generation":"new-generation"}),
+            ),
+        ] {
+            let mut args = json!({"thread_id":2,"message":"answer","client_request_id":key});
+            args.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(state.mcp_call(1, "task_send", &args).is_err());
+            assert!(state.threads[1].request.is_some());
+            assert!(commands.try_recv().is_err());
+        }
+        let args = json!({"thread_id":2,"message":"answer","client_request_id":"valid",
+            "request_id":"new-question","runtime_generation":"new-generation"});
+        let response = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(response["control"]["saved"], true);
+        assert_eq!(response["control"]["delivery"], "answer");
+        assert_eq!(response["control"]["worker_acceptance"], "not_observed");
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "extension_ui_response"
+        );
+        assert_eq!(
+            state.mcp_call(1, "task_send", &args).unwrap()["control"],
+            response["control"]
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn keyed_task_controls_require_a_batch_before_mutating_and_commit_atomically() {
+        for tool in ["task_send", "task_cancel"] {
+            let directory =
+                std::env::temp_dir().join(format!("shina-control-{}", uuid::Uuid::new_v4()));
+            let mut runtime =
+                crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+            runtime.state.demo = true;
+            runtime.state.runtime_enabled = false;
+            let database = runtime.database.clone().unwrap();
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            runtime
+                .state
+                .mcp_call(1, "delegate_task", &delegate_args("allocate"))
+                .unwrap();
+            runtime.persist_for_test(capture.finish()).unwrap();
+            let child = runtime.state.tasks[0].child_thread_id;
+            let attempt = runtime.state.tasks[0].attempt_id.clone();
+            let mut args = json!({"thread_id":child,"client_request_id":"control"});
+            if tool == "task_cancel" {
+                args["attempt_id"] = json!(attempt);
+            } else {
+                args["message"] = json!("one accepted input");
+            }
+            let before = database.read("index.json").unwrap().unwrap();
+            let state_before = runtime.state.snapshot();
+            assert!(runtime.state.mcp_call(1, tool, &args).is_err());
+            assert_eq!(
+                runtime.state.snapshot(),
+                state_before,
+                "an unfenced batch mutated state"
+            );
+            database.test_connection(|connection| connection.execute_batch(
+                "CREATE TRIGGER fail_control_receipt BEFORE INSERT ON command_receipts
+                 WHEN NEW.device LIKE 'mcp/delegate/%' BEGIN SELECT RAISE(ABORT,'injected control receipt failure'); END;"
+            )).unwrap();
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            let (reply, received) = mpsc::channel();
+            runtime.state.mcp_request(crate::mcp::Request {
+                thread: 1,
+                tool: tool.into(),
+                args,
+                reply,
+            });
+            let persisted = runtime.persist_for_test(capture.finish());
+            assert!(
+                persisted.is_err(),
+                "{tool}: {persisted:?}; reply {:?}",
+                received.try_recv()
+            );
+            assert!(
+                received.try_recv().is_err(),
+                "a reply escaped a failed commit"
+            );
+            database.test_connection(|connection| {
+                assert_eq!(
+                    crate::projection_store::read(connection, "index.json")
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+            });
+        }
+    }
+
+    #[test]
     fn task_cancel_refuses_to_guess_the_observed_attempt() {
         let mut state = state_with_task();
         let error = state
@@ -2556,7 +2708,7 @@ mod tests {
                 1,
                 "task_send",
                 &json!({"thread_id":2,"message":"x","client_request_id":"d-4",
-                    "request_id":"gone"}),
+                    "request_id":"gone","runtime_generation":"gone"}),
             )
             .unwrap_err();
         assert!(error.contains("expired"), "{error}");

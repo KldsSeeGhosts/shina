@@ -1087,6 +1087,32 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_legacy_attempt_is_not_a_match_for_a_fenced_control() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = None;
+        for command in [
+            Command::new(
+                "peer.thread.stop",
+                json!({"threadId":child,"attemptId":"unobserved"}),
+            ),
+            Command::new(
+                "peer.thread.send",
+                json!({"threadId":child,"attemptId":"unobserved",
+                "delivery":"follow_up","message":"must not attach to unknown work"}),
+            ),
+        ] {
+            let error = state
+                .execute_peer_command("fixture-peer", &command)
+                .unwrap_err();
+            assert!(error.contains("no tracked attempt"), "{error}");
+            assert!(state.threads[1].task_result.is_none());
+            assert!(!state.threads[1].native.queue_held);
+        }
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn transcript_pages_continue_unicode_without_losing_text() {
         let mut state = fixture();
         let text = format!("START{}MIDDLE{}END", "界".repeat(5500), "x".repeat(5500));
@@ -2001,6 +2027,17 @@ mod tests {
         );
         let mut target = fixture();
         let worker = document_read_worker(&mut target, false);
+        // This test upgrades document-read support on a tracked attempt.
+        // Completely untracked legacy attempts cannot accept fenced controls.
+        target
+            .threads
+            .iter_mut()
+            .find(|thread| thread.id == worker)
+            .unwrap()
+            .peer_origin
+            .as_mut()
+            .unwrap()
+            .attempt_id = command.params["attemptId"].as_str().map(str::to_owned);
         command.params["threadId"] = json!(worker);
         target
             .execute_peer_command("origin-device", &command)
@@ -3793,21 +3830,21 @@ impl State {
             }
             "peer.thread.stop" => {
                 // A stop fenced to an observed attempt must not land on newer
-                // work. Threads that predate attempt tracking keep the legacy
-                // unconditional semantics; the home negotiates the fence
-                // contract before it relies on it.
-                if let Some(observed) = args["attemptId"].as_str()
-                    && let Some(current) = self.threads[index]
+                // work. An untracked legacy worker cannot prove a match, even
+                // after its server upgrades to support the contract.
+                if let Some(observed) = args["attemptId"].as_str() {
+                    let current = self.threads[index]
                         .peer_origin
                         .as_ref()
                         .expect("origin")
                         .attempt_id
                         .as_deref()
-                    && current != observed
-                {
-                    return Err(format!(
-                        "Attempt changed: {observed} is no longer the current attempt ({current})."
-                    ));
+                        .ok_or("Attempt changed: this legacy worker has no tracked attempt. Use Shina's thread controls to stop it.")?;
+                    if current != observed {
+                        return Err(format!(
+                            "Attempt changed: {observed} is no longer the current attempt ({current})."
+                        ));
+                    }
                 }
                 if let Ok(id) = serde_json::from_value::<uuid::Uuid>(args["sendCommandId"].clone())
                 {
@@ -3871,11 +3908,11 @@ impl State {
                     .map(|value| value.as_bool().ok_or("documentReads must be a boolean."))
                     .transpose()?;
                 let thread = &mut self.threads[index];
+                if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
+                    return Err("This attempt cannot accept steering.".into());
+                }
                 {
                     let origin = thread.peer_origin.as_mut().expect("origin");
-                    if let Some(reads) = document_reads {
-                        origin.document_reads = reads;
-                    }
                     match delivery {
                         // A new attempt is authoritative: the home allocated
                         // this identity before dispatching the send.
@@ -3896,16 +3933,14 @@ impl State {
                                     "Attempt changed: {observed} is no longer the current attempt ({current})."
                                 ));
                             }
-                            if let Some(observed) = attempt
-                                && origin.attempt_id.is_none()
-                            {
-                                origin.attempt_id = Some(observed.into());
+                            if attempt.is_some() && origin.attempt_id.is_none() {
+                                return Err("Attempt changed: this legacy worker has no tracked attempt. Use Shina's thread controls instead.".into());
                             }
                         }
                     }
-                }
-                if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
-                    return Err("This attempt cannot accept steering.".into());
+                    if let Some(reads) = document_reads {
+                        origin.document_reads = reads;
+                    }
                 }
                 if thread
                     .peer_origin

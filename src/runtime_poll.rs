@@ -99,10 +99,10 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
                             .map(str::to_owned)
                             .unwrap_or_else(|| record.to_string());
                         if thread.forwarded_question.as_deref() != Some(token.as_str()) {
-                            thread.forwarded_question = Some(token);
+                            thread.forwarded_question = Some(token.clone());
                             batch.crew_questions.push((parent, format!(
-                            "Shina: crew #{} asks a question.\n{}\nAnswer with mcp__shina__task_send using thread_id {} and message containing your answer. For select, use one listed option exactly. Approval requests still require the user.",
-                            thread.id, record, thread.id
+                            "Shina: crew #{} asks a question.\n{}\nAnswer with mcp__shina__task_send using thread_id {}, a fresh client_request_id, request_id {}, runtime_generation {}, and message containing your answer. Reuse the same key and arguments for retries. For select, use one listed option exactly. Approval requests still require the user.",
+                            thread.id, record, thread.id, json!(token), json!(thread.request_generation)
                             )));
                         }
                     }
