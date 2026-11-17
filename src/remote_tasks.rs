@@ -6737,7 +6737,17 @@ impl State {
                                     }
                                     if status["finished"] == true {
                                         let _dispatch = db.claim_dispatch()?.ok_or("Dispatch is fenced.")?;
-                                        return peer_completion(&link, &thread_id, &status["result"]).await;
+                                        let mut completion = peer_completion(&link, &thread_id, &status["result"]).await?;
+                                        // A fast run can finish before the home observes a
+                                        // nonterminal wait. Keep the original authenticated
+                                        // wait's input evidence alongside the exact result ack.
+                                        if completion["status"] == "accepted"
+                                            && completion["result"]["acknowledged"] == true
+                                            && let Some(inputs) = status.get("inputs").filter(|value| value.is_array())
+                                        {
+                                            completion["result"]["inputs"] = inputs.clone();
+                                        }
+                                        return Ok(completion);
                                     }
                                 }
                                 Ok(receipt)

@@ -424,26 +424,50 @@ fn provider_rate_limit_holds_queued_work_and_persists_backoff() {
 #[test]
 fn a_crash_after_the_reservation_never_starts_the_prompt_twice() {
     let mut profile = Profile::new();
-    let child_pid = profile.launch_with_fault(&["serve"], Some("pending"));
+    let process = profile.launch_with_fault(&["serve"], Some("pending"));
     let device = uuid::Uuid::new_v4();
     let mut client = profile.client(device);
     hello(&mut client, "admission-crash");
     let home = captain_open(&mut client, "Quartermaster");
-    let task = delegate(&mut client, home, "crash-fixture", "crash-1");
-    let task_id = task["task_id"].as_str().unwrap().to_owned();
-    let child = task["thread_id"].as_u64().unwrap();
+    let command_id = uuid::Uuid::new_v4();
+    let args =
+        json!({"threadId":home,"args":{"prompt":"crash-fixture","client_request_id":"crash-1"}});
+    // The process may exit before the socket can deliver the RPC response.
+    client
+        .socket
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":command_id,
+        "method":"task.delegate","params":{"commandId":command_id,"args":args}})
+            .to_string()
+            .into(),
+        ))
+        .unwrap();
 
     // The process dies at the pending effect boundary, after the
     // reservation committed but before the prompt reached the harness.
     let deadline = Instant::now() + Duration::from_secs(15);
-    while profile.children[child_pid].try_wait().unwrap().is_none() {
+    let exit = loop {
+        if let Some(exit) = profile.children[process].try_wait().unwrap() {
+            break exit;
+        }
         assert!(Instant::now() < deadline, "serve did not reach the crash");
         std::thread::sleep(Duration::from_millis(25));
-    }
+    };
+    assert_eq!(exit.code(), Some(86), "expected the pending prompt crash");
     drop(client);
+    fs::remove_file(profile.root.join("Shina/server.json")).unwrap();
     profile.launch(&["serve"]);
     let mut client = profile.client(device);
     hello(&mut client, "admission-crash-restart");
+    let replay = client.command("task.delegate", args, command_id);
+    let receipt = &replay["result"];
+    let task = match receipt["status"].as_str() {
+        Some("accepted") => &receipt["result"],
+        Some("interrupted") => &receipt["result"]["previousResult"],
+        _ => panic!("Expected the committed delegation receipt: {replay}"),
+    };
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+    let child = task["thread_id"].as_u64().unwrap();
 
     // Recovery never counts a crashed prompt as delivered work: the task
     // settles as interrupted with no provider side effect.
