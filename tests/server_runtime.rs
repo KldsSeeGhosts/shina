@@ -1755,6 +1755,7 @@ struct Client {
     notifications: Vec<Value>,
     token: String,
     history_cache: Option<client_history::ProjectionCache>,
+    snapshot_pages: String,
 }
 impl Client {
     fn connect(discovery: &Value, device: uuid::Uuid) -> Self {
@@ -1819,6 +1820,7 @@ impl Client {
             notifications: Vec::new(),
             token,
             history_cache: None,
+            snapshot_pages: String::new(),
         }
     }
     fn rpc(&mut self, method: &str, params: Value, id: Value) -> Value {
@@ -1852,6 +1854,21 @@ impl Client {
                     if let Some(cache) = &mut self.history_cache {
                         cache.receive(&value).unwrap();
                     }
+                    if value["method"] == "subscription.snapshotPage" {
+                        self.snapshot_pages.push_str(
+                            value["params"]["data"]
+                                .as_str()
+                                .expect("snapshot page data"),
+                        );
+                        if value["params"]["nextCursor"].is_null() {
+                            let page: Value =
+                                serde_json::from_str(&std::mem::take(&mut self.snapshot_pages))
+                                    .expect("complete snapshot pages");
+                            self.snapshot = page["state"].clone();
+                            self.seq = page["seq"].as_u64().unwrap();
+                            self.epoch = page["epoch"].clone();
+                        }
+                    }
                     if value["method"] == "subscription.snapshot" {
                         self.snapshot = value["params"]["state"].clone();
                         self.seq = value["params"]["seq"].as_u64().unwrap();
@@ -1864,42 +1881,20 @@ impl Client {
                         );
                     }
                     if value["method"] == "subscription.patch" {
-                        for patch in value["params"]["patch"].as_array().unwrap() {
-                            let path = patch["path"]
+                        if let Err(error) =
+                            protocol::apply(&mut self.snapshot, value["params"]["patch"].clone())
+                        {
+                            let ids: Vec<Value> = self.snapshot["index"]["threads"]
                                 .as_array()
-                                .unwrap()
-                                .iter()
-                                .map(|part| {
-                                    part.as_str().unwrap().replace('~', "~0").replace('/', "~1")
-                                })
-                                .collect::<Vec<_>>();
-                            if path.is_empty() {
-                                self.snapshot = patch["value"].clone();
-                                continue;
-                            }
-                            let parent = if path.len() == 1 {
-                                String::new()
-                            } else {
-                                format!("/{}", path[..path.len() - 1].join("/"))
-                            };
-                            let key = patch["path"]
-                                .as_array()
-                                .unwrap()
-                                .last()
-                                .unwrap()
-                                .as_str()
-                                .unwrap();
-                            let target = self.snapshot.pointer_mut(&parent).unwrap();
-                            if let Some(object) = target.as_object_mut() {
-                                if patch["op"] == "remove" {
-                                    object.remove(key);
-                                } else {
-                                    object.insert(key.into(), patch["value"].clone());
-                                }
-                            } else {
-                                target.as_array_mut().unwrap()[key.parse::<usize>().unwrap()] =
-                                    patch["value"].clone();
-                            }
+                                .into_iter()
+                                .flatten()
+                                .map(|thread| thread["id"].clone())
+                                .collect();
+                            panic!(
+                                "subscription patch at seq {} failed: {error}; index thread ids {ids:?}; batch {}",
+                                self.seq + 1,
+                                value["params"]["patch"]
+                            );
                         }
                         self.seq = value["params"]["seq"].as_u64().unwrap();
                     }

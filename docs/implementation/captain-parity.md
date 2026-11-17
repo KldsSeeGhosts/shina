@@ -278,6 +278,26 @@ Protocol minor 42 and migration 008 remain unpublished. Serialize them with
 the pending scheduler, operation-evidence and repository changes before merge.
 Do not edit a published migration to resolve a later collision.
 
+### Strict subscriber baseline prerequisite for #32 and #24
+
+The #32 parity review reproduced a missing-parent patch after thread creation.
+The live database path returned before the legacy `RuntimeState::command`
+assignment initially suspected by the review. The actual mismatch came from
+scoped index metadata replacing the runtime's full thread list while the
+committed row projection retained that list.
+
+The separate prerequisite merges scoped index records by thread ID and uses a
+full projection when a scoped poll first discovers a new thread. Regression
+tests apply the resulting patches through the production strict parser and
+compare committed index metadata with both the runtime and subscriber. Thread
+headers compare through the production wire compactor because full history
+travels separately.
+
+The live serve-process test client now assembles snapshot pages and calls
+`protocol::apply` directly. It does not create missing parents or grow arrays
+to accept invalid patches. This prerequisite does not include #32 capability
+policy or #24 client item caching, and it makes no performance claim.
+
 ## Capy package investigation
 
 Inspected on November 16, 2026 without installing or launching Capy. The official
