@@ -39,6 +39,12 @@ pub fn probe(agent: &Agent) -> Result<Value, String> {
     result
 }
 
+/// Re-probe before allocation. Discovery may be cached, but dispatch must
+/// answer from the executable and protocol state that exists now.
+pub(crate) fn probe_live(agent: &Agent) -> Result<Value, String> {
+    probe_uncached(agent)
+}
+
 fn probe_uncached(agent: &Agent) -> Result<Value, String> {
     let mut child = agent
         .process()?
@@ -65,7 +71,6 @@ fn probe_uncached(agent: &Agent) -> Result<Value, String> {
     stdin
         .write_all(format!("{request}\n").as_bytes())
         .map_err(|error| format!("ACP probe could not write initialize: {error}"))?;
-    drop(stdin);
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut result = Err("ACP agent exited before answering initialize.".into());

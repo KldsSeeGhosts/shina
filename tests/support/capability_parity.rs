@@ -299,6 +299,31 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
     assert_eq!(retry["thread_id"], leaf);
     assert_eq!(retry["replayed"], true, "{retry}");
     let leaf_directory = directory_of(&mut client, &profile, leaf);
+    let prompt_deadline = Instant::now() + Duration::from_secs(20);
+    let leaf_prompt = loop {
+        if let Ok(prompts) = fs::read_to_string(leaf_directory.join("fixture-prompts.jsonl")) {
+            if let Some(prompt) = prompts
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|prompt| {
+                    prompt
+                        .as_str()
+                        .is_some_and(|text| text.contains("Parity leaf"))
+                })
+            {
+                break prompt.as_str().unwrap().to_owned();
+            }
+        }
+        assert!(
+            Instant::now() < prompt_deadline,
+            "worker prompt with the shared-document manifest never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        !leaf_prompt.contains("SHARED-CONTEXT-TAIL"),
+        "a delegated task must not copy the shared document whole: {leaf_prompt}"
+    );
     let leaf_initialize = mcp_initialize(&leaf_directory);
     assert!(
         leaf_initialize["instructions"]
@@ -461,6 +486,37 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
     assert_eq!(created["result"]["status"], "accepted", "{created}");
     let crew = created["result"]["result"]["threadId"].as_u64().unwrap();
     let crew_directory = directory_of(&mut client, &profile, crew);
+    let crew_prompt_deadline = Instant::now() + Duration::from_secs(20);
+    let crew_prompt = loop {
+        if let Ok(prompts) = fs::read_to_string(crew_directory.join("fixture-prompts.jsonl")) {
+            if let Some(prompt) = prompts
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|prompt| {
+                    prompt
+                        .as_str()
+                        .is_some_and(|text| text.contains("Parity crew"))
+                })
+            {
+                break prompt.as_str().unwrap().to_owned();
+            }
+        }
+        assert!(
+            Instant::now() < crew_prompt_deadline,
+            "crew prompt with the shared-document manifest never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let notes_index = format!("NOTES.md (revision 1, {} bytes", large.len());
+    assert!(
+        crew_prompt.contains(&notes_index)
+            && crew_prompt.contains("not in this context; readable with captain_document_read"),
+        "the injected crew context must point to the full document instead of overfilling the prompt: {crew_prompt}"
+    );
+    assert!(
+        !crew_prompt.contains("SHARED-CONTEXT-TAIL"),
+        "a document beyond the injection limit must not be copied whole: {crew_prompt}"
+    );
     let crew_tools = tool_names(&crew_directory);
     assert!(
         crew_tools.iter().any(|tool| tool == "delegate_task"),
@@ -529,6 +585,43 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
         !tool_names_as(&old_url, &old_token)
             .iter()
             .any(|tool| tool == "delegate_task")
+    );
+    let continued = client.command(
+        "thread.send",
+        json!({"threadId":home,"text":"earlier-home-role-update",
+            "attachments":[],"mode":"prompt"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(continued["result"]["status"], "accepted", "{continued}");
+    let instruction_deadline = Instant::now() + Duration::from_secs(20);
+    let instructions = loop {
+        if let Ok(prompts) = fs::read_to_string(home_directory.join("fixture-system-prompt.jsonl"))
+        {
+            if let Some(prompt) = prompts
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|prompt| {
+                    prompt.as_str().is_some_and(|text| {
+                        text.contains("This conversation is an earlier Captain home")
+                    })
+                })
+            {
+                break prompt.as_str().unwrap().to_owned();
+            }
+        }
+        let view = client.snapshot["threads"]
+            .as_array()
+            .and_then(|threads| threads.iter().find(|thread| thread["id"] == home))
+            .cloned();
+        assert!(
+            Instant::now() < instruction_deadline,
+            "the earlier home session never received role-matched Pi instructions; thread {view:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(
+        !instructions.contains("You may delegate independent work"),
+        "{instructions}"
     );
     // The new home's session rewrites the endpoint record with its own token.
     let new_deadline = Instant::now() + Duration::from_secs(60);
@@ -852,7 +945,10 @@ fn acp_without_mcp_is_refused_before_thread_allocation() {
             {"id":"fixture-acp-nomcp","name":"Fixture ACP without MCP",
             "command":if cfg!(windows) { "python" } else { "python3" },
             "args":["-u",profile.root.join("fake_acp.py"),"--log",
-                profile.root.join("acp-nomcp-log.jsonl"),"--no-mcp"]}
+                profile.root.join("acp-nomcp-log.jsonl"),"--no-mcp"]},
+            {"id":"fixture-acp-exits","name":"Fixture ACP startup failure",
+            "command":if cfg!(windows) { "python" } else { "python3" },
+            "args":["-c","import sys; sys.exit(7)"]}
         ])
         .to_string(),
     )
@@ -887,6 +983,22 @@ fn acp_without_mcp_is_refused_before_thread_allocation() {
         before,
         "an unsupported ACP harness must be refused before a thread is allocated"
     );
+    let error = fixture_refusal(
+        &directory,
+        "delegate_task",
+        json!({"prompt":"startup must not allocate","client_request_id":"exit-before-init",
+            "target":{"harness":"fixture-acp-exits"}}),
+    );
+    assert!(
+        error.contains("exited before answering initialize"),
+        "{error}"
+    );
+    client.rpc("workspace.subscribe", json!({}), json!("after-exit"));
+    assert_eq!(
+        client.snapshot["threads"].as_array().unwrap().len(),
+        before,
+        "an ACP startup failure must be refused before a thread is allocated"
+    );
     let record = capability_record(&directory);
     let harnesses = record["effective"]["execution"]["local"]["harnesses"]
         .as_array()
@@ -905,6 +1017,19 @@ fn acp_without_mcp_is_refused_before_thread_allocation() {
     assert_eq!(supported["executable"], true, "{supported}");
     assert_eq!(supported["discovery"], "probed", "{supported}");
     assert_eq!(supported["mcp"]["available"], true, "{supported}");
+    let failed = harnesses
+        .iter()
+        .find(|harness| harness["id"] == "fixture-acp-exits")
+        .unwrap();
+    assert_eq!(failed["executable"], false, "{failed}");
+    assert_eq!(failed["discovery"], "failed", "{failed}");
+    assert!(
+        failed["reason"]
+            .as_str()
+            .unwrap()
+            .contains("exited before answering initialize"),
+        "{failed}"
+    );
 }
 
 #[test]

@@ -5,6 +5,11 @@ const crypto = require("node:crypto");
 const readline = require("node:readline");
 const http = require("node:http");
 const args = process.argv.slice(2);
+const promptIndex = args.indexOf("--append-system-prompt");
+if (promptIndex >= 0 && args[promptIndex + 1] !== undefined) {
+  fs.appendFileSync(path.join(process.cwd(), "fixture-system-prompt.jsonl"),
+    JSON.stringify(args[promptIndex + 1]) + "\n");
+}
 const sessionIndex = args.indexOf("--session");
 const ephemeral = args.includes("--no-session");
 const session = sessionIndex >= 0 ? args[sessionIndex + 1] : path.join(process.cwd(), `fixture-${crypto.randomUUID()}.json`);

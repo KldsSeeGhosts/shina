@@ -695,7 +695,7 @@ impl State {
             "claude" => crate::claude::process().map(drop),
             _ => {
                 let agent = self.harnesses.find(harness)?;
-                let capabilities = crate::acp::probe(&agent)?;
+                let capabilities = crate::acp::probe_live(&agent)?;
                 let mcp = &capabilities["mcpCapabilities"];
                 if mcp["http"] == true || mcp["stdio"] != false {
                     Ok(())
