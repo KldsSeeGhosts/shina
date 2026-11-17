@@ -2978,6 +2978,34 @@ mod tests {
     }
 
     #[test]
+    fn provider_ack_preserves_the_observed_history_absence_recovery_decision() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let command = uuid::Uuid::new_v4().to_string();
+        let mut intent = PeerTaskIntent::input(
+            command.clone(),
+            child,
+            None,
+            None,
+            None,
+            "follow_up",
+            tasks::delivery_text(&command, "recovered input"),
+            None,
+        );
+        intent.recovery = "history_absent".into();
+        state.stage_peer_task_intent(intent).unwrap();
+        state.threads[1].accepted_deliveries.push(command);
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.peer_task_intents[0].provider_state, "accepted");
+        assert_eq!(
+            state.peer_task_intents[0].provider_basis.as_deref(),
+            Some("provider_ack")
+        );
+        assert_eq!(state.peer_task_intents[0].recovery, "history_absent");
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn non_authoritative_history_holds_restored_peer_input_as_unknown() {
         let mut state = fixture();
         let child = peer_worker(&mut state);
@@ -4888,7 +4916,9 @@ impl State {
                 intent.provider_state = "accepted".into();
                 intent.provider_basis = Some("provider_ack".into());
                 intent.queue_state = "settled".into();
-                intent.recovery = "accepted".into();
+                if intent.recovery != "history_absent" {
+                    intent.recovery = "accepted".into();
+                }
                 if let Some((_, realized, run)) = dispatched.as_ref() {
                     intent.realized_delivery = Some(if realized == "followUp" {
                         "follow_up".into()
