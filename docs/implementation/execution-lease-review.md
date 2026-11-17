@@ -48,6 +48,16 @@ lease identity but uses an allow-rebase path for later replies. Compose the
 published #22 trusted source/request-fence work rather than restoring the old
 unscoped input-evidence path.
 
+Further source review found that the reply helper does not compare the returned
+lease's full `Binding` with the saved controller lease. A stop reply can also
+select another saved lease through `allow_rebase`. Its callers set
+`UpdateRequired` on an error but then continue processing the reply. Launch and
+send overwrite that state with `Accepted`; stop clears its owed command; wait
+installs progress or completion. Add regressions for foreign immutable fields,
+cross-lease stop replies and refusal without any subsequent reply mutation
+before changing those paths. These findings have not been dynamically
+reproduced yet.
+
 Before publication, integrate current identity, task evidence, strict projection
 and scheduler code. The original minor 44 and documentation reserving migration
 9 are obsolete. Published migrations 008/009 must not change; scheduler 46 and
