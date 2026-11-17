@@ -609,6 +609,9 @@ impl ThreadView {
                 if let Some(expected) = read.expected_revision {
                     request["expectedRevision"] = json!(expected);
                 }
+                if let Some(tool) = &read.tool {
+                    request["tool"] = tool.clone();
+                }
                 request
             }),
             pending_approvals: thread
@@ -2014,7 +2017,10 @@ impl State {
                 continue;
             }
             if let crate::client::Event::Receipt(command, value) = &event
-                && command.method == "thread.send"
+                && matches!(
+                    command.method.as_str(),
+                    "thread.send" | "captain.continueOn"
+                )
             {
                 let accepted = value["result"]["status"] == "accepted";
                 let mut bg_started: Option<(String, usize)> = None;
@@ -4174,6 +4180,106 @@ impl State {
             self.projects.captain_target = None;
         }
     }
+
+    pub(crate) fn captain_continue_targets(&self, id: usize) -> Vec<(String, usize, String)> {
+        let Some(home) = self
+            .threads
+            .iter()
+            .find(|thread| thread.id == id && self.is_captain_home(thread))
+        else {
+            return Vec::new();
+        };
+        let Some(captain) = home
+            .captain
+            .filter(|captain| self.captain_home(*captain) == Some(id))
+        else {
+            return Vec::new();
+        };
+        if self.client.as_ref().is_some_and(|client| {
+            !client.supports_capability(
+                &self.machines.selected,
+                crate::protocol::CAPTAIN_CONTINUE_ON,
+            )
+        }) {
+            return Vec::new();
+        }
+        let scope: Vec<crate::model::scope::RemoteProject> = if self.client.is_some() {
+            serde_json::from_value(
+                self.client_views["index"]["captainRemoteScopes"][captain.to_string()].clone(),
+            )
+            .unwrap_or_default()
+        } else {
+            self.remote_captain_scope(captain)
+        };
+        scope
+            .into_iter()
+            .filter_map(|project| {
+                let peer = self.peers.iter().find(|peer| {
+                    peer.server_id == project.server
+                        && peer.last_error.is_none()
+                        && peer.last_reached_at.is_some()
+                        && peer.capabilities["contracts"]
+                            .as_array()
+                            .is_some_and(|contracts| {
+                                contracts
+                                    .iter()
+                                    .any(|flag| flag == crate::protocol::CAPTAIN_CONTINUE_ON)
+                            })
+                })?;
+                let info = peer.capabilities["projects"]
+                    .as_array()?
+                    .iter()
+                    .find(|info| info["id"].as_u64() == Some(project.project_id as u64))?;
+                Some((
+                    project.server,
+                    project.project_id,
+                    format!(
+                        "{} · {}",
+                        peer.label,
+                        info["name"].as_str().unwrap_or("Project")
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) fn can_continue_captain_draft(&self) -> bool {
+        let home = self.current();
+        !home.status.busy()
+            && !home.configuring
+            && !home.queued()
+            && !home.archived()
+            && home.request.is_none()
+            && home.remote_send.is_none()
+            && !home.draft.text.trim().is_empty()
+            && home.draft.pills().next().is_none()
+            && home.draft_images.is_empty()
+            && home.draft_context.is_empty()
+            && home.draft_reply_to.is_none()
+    }
+
+    pub(crate) fn continue_captain_draft(&mut self, server: &str, project: usize) {
+        if !self.can_continue_captain_draft() {
+            return;
+        }
+        let home = self.current();
+        let args = json!({"threadId":home.id,"prompt":home.draft.text,
+            "target":{"machine":server,"projectId":project},"placement":{"mode":"shared"}});
+        let snapshot = crate::composer_rich::Snapshot::capture(&home.draft, &home.draft_images);
+        match self.remote("captain.continueOn", args) {
+            Some(Ok(command)) => {
+                let home = self.current_mut();
+                home.remote_send = Some((command, snapshot));
+                home.draft.replace_text("");
+            }
+            Some(Err(error)) => self.current_mut().error = Some(error),
+            None => {
+                self.current_mut().error = Some(
+                    "Open the Captain through its server to continue on a linked machine.".into(),
+                )
+            }
+        }
+    }
     /// Opens a thread on any linked machine, as one click in the unified sidebar.
     pub fn open_machine_thread(&mut self, server: &str, id: usize) {
         let exists = if server == self.machines.selected {
@@ -4690,6 +4796,9 @@ impl State {
                     );
                 }
                 self.current_mut().recovery_command = Some(command.command_id);
+                if self.stop_remote_captain_turn(self.current().id) {
+                    return Ok(json!({"threadId":self.current().id,"stopping":true}));
+                }
                 self.current_mut().stop();
                 self.owe_remote_stops_for(self.current().id);
                 if self.current().has_draft_content() {
@@ -4751,6 +4860,15 @@ impl State {
                 }
             }
             "thread.retry" => self.retry(),
+            "captain.continueOn" => {
+                let id = number("threadId")?;
+                let caller = self
+                    .threads
+                    .iter()
+                    .position(|thread| thread.id == id)
+                    .ok_or("Unknown Captain home.")?;
+                return self.continue_captain_remote(caller, args);
+            }
             "execution.inspect" => {
                 if let Some(executor) = args["executorId"].as_str() {
                     return Ok(json!({

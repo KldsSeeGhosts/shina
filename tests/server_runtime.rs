@@ -7112,6 +7112,10 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
 }
 
 fn read_full_history(client: &mut Client, budget: usize) -> Value {
+    read_thread_history(client, 1, budget)
+}
+
+fn read_thread_history(client: &mut Client, thread: u64, budget: usize) -> Value {
     let mut history_cursor = Value::Null;
     let mut rows: Vec<history::Row> = Vec::new();
     let mut fields;
@@ -7121,7 +7125,7 @@ fn read_full_history(client: &mut Client, budget: usize) -> Value {
         loop {
             let reply = client.rpc(
                 "thread.history",
-                json!({"threadId":1,"historyCursor":history_cursor,
+                json!({"threadId":thread,"historyCursor":history_cursor,
                 "fragmentCursor":fragment,"byteBudget":budget}),
                 json!("verify-full"),
             );

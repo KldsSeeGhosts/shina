@@ -394,6 +394,10 @@ pub(super) fn valid_id(id: &str) -> bool {
 }
 
 impl Task {
+    pub(super) fn captain_turn(&self) -> bool {
+        self.parent_thread_id == self.child_thread_id
+    }
+
     pub(super) fn new(thread: &Thread, brief: &str, model_target: Option<Value>) -> Self {
         let id = unique_id();
         let parent = thread
@@ -647,6 +651,9 @@ impl Thread {
 
 impl State {
     pub(super) fn task_home(&self, task: &Task) -> Option<usize> {
+        if task.captain_turn() {
+            return None;
+        }
         let thread = self
             .threads
             .iter()
@@ -2598,7 +2605,11 @@ impl State {
                     .is_some_and(|captain| captain >= self.captains.len())
                 || !self.threads.iter().any(|t| {
                     t.id == task.child_thread_id
-                        && t.parent == Some(task.parent_thread_id)
+                        && (if task.captain_turn() {
+                            task.remote.is_some() && t.captain_home && !t.delegated
+                        } else {
+                            t.parent == Some(task.parent_thread_id)
+                        })
                         && t.machine == task.machine
                         && t.project == task.project_id
                 })
@@ -2843,6 +2854,9 @@ impl State {
         }
         for index in 0..self.tasks.len() {
             let task = &self.tasks[index];
+            if task.captain_turn() {
+                continue;
+            }
             let mut messages: Vec<_> = task
                 .prior_deliveries
                 .iter()

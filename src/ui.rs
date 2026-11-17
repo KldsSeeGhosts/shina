@@ -7677,6 +7677,26 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
+    if captain && id == s.current().id {
+        // KSG's BranchToolbarEnvironmentSelector uses a machine row per
+        // environment. Shina keeps the owner selected and sends one turn there.
+        for (machine, project, label) in s.captain_continue_targets(id) {
+            actions = actions.child(
+                menu_item(
+                    &format!("captain-continue-{machine}-{project}"),
+                    &format!("Continue on {label}"),
+                    "monitor",
+                    p,
+                )
+                .disabled(!s.can_continue_captain_draft())
+                .on_press(move |s: &mut State| {
+                    s.thread_menu = false;
+                    s.row_menu = None;
+                    s.continue_captain_draft(&machine, project);
+                }),
+            );
+        }
+    }
     if id == s.current().id && thread.pi.is_some() {
         actions = actions.child(
             menu_item("menu-refresh-commands", "Refresh Pi commands", "refresh", p).on_press(
@@ -23714,6 +23734,49 @@ pub(crate) mod tests {
             assert!(rt.find(key).is_some(), "missing {key}");
         }
         assert!(rt.find(&format!("thread-{home}")).is_some());
+    }
+
+    #[test]
+    fn continue_on_sends_the_active_captain_draft_to_its_scoped_project() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain(0);
+            let thread = rt.state.current().id;
+            let server = uuid::Uuid::new_v4().to_string();
+            let mut projection = rt.state.projection();
+            projection["index"]["captainRemoteScopes"] =
+                json!({"0":[{"server":server,"projectId":9}]});
+            projection["peers"] = json!([{
+                "serverId":server,"host":"127.0.0.1:1","label":"Studio",
+                "linkedAt":0,"lastReachedAt":crate::lifecycle::now(),
+                "capabilities":{"contracts":[crate::protocol::CAPTAIN_CONTINUE_ON],
+                    "projects":[{"id":9,"name":"Workspace"}]}
+            }]);
+            let (client, mut commands) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            client.info.lock().unwrap()["capabilities"] =
+                json!([crate::protocol::CAPTAIN_CONTINUE_ON]);
+            client.test_snapshot(projection);
+            rt.state.client = Some(client);
+            rt.update(|s, tx| {
+                crate::model::poll(s, 0.0, tx);
+            });
+            assert_eq!(rt.state.captain_continue_targets(thread).len(), 1);
+            rt.state.current_mut().draft.replace_text("Continue here");
+            rt.frame(0.0);
+            press(&mut rt, "thread-actions");
+            let key = format!("captain-continue-{server}-9");
+            assert!(rt.presented(&key).is_some(), "{width}");
+            press(&mut rt, &key);
+            let command = std::iter::from_fn(|| commands.try_recv().ok())
+                .find(|command| command.method == "captain.continueOn")
+                .expect("Continue on command");
+            assert_eq!(command.params["threadId"], thread);
+            assert_eq!(command.params["prompt"], "Continue here");
+            assert_eq!(command.params["target"]["machine"], server);
+            assert_eq!(command.params["target"]["projectId"], 9);
+        }
     }
 
     #[test]

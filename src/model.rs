@@ -967,6 +967,8 @@ pub struct Thread {
     pub(crate) remote_send_reply_to: Option<crate::composer_context::ComposerContextRecord>,
     pub fresh_session_arm: Option<u64>,
     pub fresh_session_messages: Vec<String>,
+    /// The next controller prompt starts a new provider session after a linked turn.
+    pub(super) captain_return_context: bool,
     /// Provider handoff records in order. KSG: `thread.contextHandoffs`.
     pub handoffs: Vec<crate::handoff::Handoff>,
     /// Retained provider session ids per harness, so switching back resumes natively.
@@ -1600,6 +1602,7 @@ impl Thread {
             remote_send_reply_to: None,
             fresh_session_arm: None,
             fresh_session_messages: Vec::new(),
+            captain_return_context: false,
             handoffs: Vec::new(),
             handoff_sessions: std::collections::BTreeMap::new(),
             staged_handoff: None,
@@ -2237,6 +2240,7 @@ impl Thread {
     }
 
     pub(super) fn begin_prompt_with_fresh(&mut self, prompt: Prompt, fresh_context: bool) {
+        let fresh_context = fresh_context || self.captain_return_context;
         self.apply_staged_handoff(&prompt);
         // A staged handoff already cleared the session state it replaced; the fresh
         // reset would wipe the destination's retained session.
@@ -3269,6 +3273,18 @@ impl Thread {
             let user_text = record["message"].as_str().unwrap_or_default().to_owned();
             record["message"] = json!(crate::handoff::with_inline_context(package, &user_text));
         }
+        if self.captain_return_context {
+            let recent = crate::handoff::bounded_transcript_context(
+                &self.messages[..index.min(self.messages.len())],
+            );
+            let user_text = record["message"].as_str().unwrap_or_default();
+            record["message"] = json!(crate::handoff::with_inline_context(
+                &format!(
+                    "Recent conversation after a linked Captain turn, for context only:\n{recent}"
+                ),
+                user_text,
+            ));
+        }
         if !self.captain_context.is_empty() {
             let user_text = record["message"].as_str().unwrap_or_default().to_owned();
             record["message"] = json!(format!("{}{user_text}", self.captain_context));
@@ -3792,6 +3808,16 @@ impl Thread {
                             return;
                         }
                         if let Some(messages) = record["data"]["messages"].as_array() {
+                            if self.captain_return_context
+                                && messages.is_empty()
+                                && self.queued_prompt.is_none()
+                                && self.pending_prompt.is_none()
+                            {
+                                // Warming a fresh provider must not replace the controller transcript.
+                                self.history_loaded = true;
+                                self.drive_session();
+                                return;
+                            }
                             let fresh_boundary = self
                                 .messages
                                 .iter()
@@ -4112,6 +4138,7 @@ impl Thread {
                                 .is_some_and(|(id, _, _)| record["id"] == *id)
                         {
                             self.pending_prompt = None;
+                            self.captain_return_context = false;
                             self.mark_handoff_delivered();
                             self.note_provider_prompt_accepted();
                         }
@@ -5279,9 +5306,12 @@ impl State {
         delivery: Option<&str>,
     ) -> Result<crate::execution::Lease, String> {
         let task = self.tasks.get(task_index).ok_or("Unknown remote task.")?;
-        let initiating_device = self
-            .execution_initiator_for_thread(task.parent_thread_id)
-            .unwrap_or_else(|| device.to_owned());
+        let initiating_device = if task.captain_turn() {
+            device.to_owned()
+        } else {
+            self.execution_initiator_for_thread(task.parent_thread_id)
+                .unwrap_or_else(|| device.to_owned())
+        };
         let remote = task.remote.as_ref().ok_or("Task is not remote.")?;
         let already_bound = if delivery.is_some() {
             remote
@@ -5386,6 +5416,14 @@ impl State {
             remote
                 .execution_inputs
                 .insert(lease.lease_id.clone(), command.clone());
+        }
+        if self.tasks[task_index].captain_turn()
+            && let Some(home) = self
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == self.tasks[task_index].child_thread_id)
+        {
+            home.run_id = Some(lease.run_id.clone());
         }
         Ok(lease)
     }
@@ -8068,10 +8106,11 @@ impl State {
         keys[0].clone()
     }
     pub fn lifecycle_busy(&self, id: usize) -> bool {
-        self.threads.iter().any(|t| {
-            (t.id == id || t.parent == Some(id))
-                && (t.status.busy() || t.request.is_some() || t.configuring || t.queued())
-        })
+        self.has_remote_captain_turn(id)
+            || self.threads.iter().any(|t| {
+                (t.id == id || t.parent == Some(id))
+                    && (t.status.busy() || t.request.is_some() || t.configuring || t.queued())
+            })
     }
     fn invalidate_undo(&mut self, id: usize) {
         if let Some(notice) = &mut self.undo {
@@ -10008,6 +10047,9 @@ impl State {
     }
 
     fn mcp_request_ready(&mut self, request: crate::mcp::Request) {
+        if self.relay_captain_tool(&request) {
+            return;
+        }
         if matches!(request.tool.as_str(), "read_thread" | "list_threads")
             && self.remote_transcript_request(&request)
         {
@@ -15448,6 +15490,7 @@ impl State {
                     if let Some(pending) = record.get("scopeContextPending") {
                         thread.scope_context_pending = pending.as_bool()?;
                     }
+                    thread.captain_return_context = record["captainReturnContext"] == true;
                     thread.never_sent = record["neverSent"] == true;
                     // Handoff records are optional thread data: absent means none, and
                     // older files decode with an empty list.
@@ -16808,6 +16851,7 @@ impl Thread {
             "providerTerminalRun":self.provider_terminal_run,
             "providerTerminalStatus":self.provider_terminal_status,
             "memoryContext":self.memory_context, "scopeContextPending":self.scope_context_pending,
+            "captainReturnContext":self.captain_return_context,
             "neverSent":self.never_sent && self.life.latest_user_message_at.is_none(),
             "forkSource":self.native.fork_source, "forkEntry":self.native.fork_entry,
             "previousSession":self.native.previous_session,"accessMode":self.native.access.id(),

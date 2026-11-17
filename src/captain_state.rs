@@ -299,7 +299,7 @@ impl State {
             .join("\n")
     }
 
-    fn captain_turn_context(&self, captain: usize) -> String {
+    pub(super) fn captain_turn_context(&self, captain: usize) -> String {
         let rules = self.captain_document(captain, "AGENTS.md").text;
         let notes = self.captain_document(captain, "NOTES.md").text;
         format!(

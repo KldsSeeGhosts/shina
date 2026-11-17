@@ -253,7 +253,11 @@ impl State {
         let old = self.captain_home(captain);
         if let Some(index) = self.threads.iter().position(|t| Some(t.id) == old) {
             let thread = &self.threads[index];
-            if thread.status.busy() || thread.configuring || thread.queued() {
+            if thread.status.busy()
+                || thread.configuring
+                || thread.queued()
+                || self.has_remote_captain_turn(thread.id)
+            {
                 return Err(
                     "Stop the captain's current turn before resetting its conversation.".into(),
                 );
