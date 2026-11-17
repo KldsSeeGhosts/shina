@@ -1,0 +1,73 @@
+{
+  "format": "shina-projection-benchmark-v1",
+  "host": {"cpu": "Apple M5 Max", "logical_cpus": 18, "os": "macOS 27.2.1", "rustc": "1.98.1", "node": "v26.9.0"},
+  "fixture_sha256": "b04fa3e33dd337e89abbf9fed260bc09ee5eeda8482614453a93612a90005a99",
+  "harness_sha256": "544528efd3b75cfd327ed16ab3c4e558bfe889cdb6093c87018fb982da0184d3",
+  "allocator_sha256": "c265c00f358f6d656ada0fa19646457e4fad7d5ad630a0214fd19aeac5b90e76",
+  "before": {
+    "revision": "5c6e98a13bee2b7d9dcb0986418e1af1215df423",
+    "executable_sha256": "58c6fce2a57fcf34d0f6f24d719e6de9d077e5c2c2fbd6c6f451a88ee256f4b4",
+    "production_changes": false,
+    "test_only_hooks": ["src/client_state.rs", "src/main.rs"]
+  },
+  "after": {"revision": "34431038e28d3eb8b8530cc17f7a7fbbbd7af102", "uncommitted_changes": ["docs/implementation/captain-parity.md"]},
+  "ksg": {
+    "revision": "4807bb1e7e74baae3d0fe9c442c67abadd174a36",
+    "lock_sha256": "28c8614da3e14c72db020f322477b018d7f0b1fce835ef0e2cd983a84bbec2d9",
+    "effect_version": "4.1.3",
+    "allocation_counts": null
+  },
+  "profile": "release, thin LTO, one codegen unit",
+  "warmup_updates": 10,
+  "measured_updates_per_kind": 15,
+  "rust_phases": ["receive/install", "projected", "State::apply_projection"],
+  "ksg_phases": ["applyOrchestrationV2ProjectionEvent"],
+  "confidence_intervals": null,
+  "cases": [
+    {
+      "threads": 2, "messages_per_thread": 200, "tools_per_thread": 60, "total_items": 520,
+      "before": {
+        "messages": {"p50_us": 408.041, "p95_us": 449.625, "allocations_p50": 16242, "allocations_p95": 16242, "allocated_bytes_p50": 2149697, "allocated_bytes_p95": 2149697},
+        "tools": {"p50_us": 383.25, "p95_us": 494.375, "allocations_p50": 16261, "allocations_p95": 16261, "allocated_bytes_p50": 2153764, "allocated_bytes_p95": 2153764}
+      },
+      "after": {
+        "messages": {"p50_us": 51.042, "p95_us": 59.166, "allocations_p50": 1305, "allocations_p95": 1305, "allocated_bytes_p50": 191760, "allocated_bytes_p95": 191760},
+        "tools": {"p50_us": 53.458, "p95_us": 59.0, "allocations_p50": 1361, "allocations_p95": 1361, "allocated_bytes_p50": 193252, "allocated_bytes_p95": 193252}
+      },
+      "ksg": {
+        "messages": {"p50_us": 1.1660000000119908, "p95_us": 4.249999999956344},
+        "tools": {"p50_us": 3.458000000023276, "p95_us": 5.708000000026914}
+      }
+    },
+    {
+      "threads": 4, "messages_per_thread": 1000, "tools_per_thread": 300, "total_items": 5200,
+      "before": {
+        "messages": {"p50_us": 3418.083, "p95_us": 3612.375, "allocations_p50": 139884, "allocations_p95": 139884, "allocated_bytes_p50": 17975686, "allocated_bytes_p95": 17975686},
+        "tools": {"p50_us": 3475.0, "p95_us": 3654.541, "allocations_p50": 139903, "allocations_p95": 139903, "allocated_bytes_p50": 17979757, "allocated_bytes_p95": 17979757}
+      },
+      "after": {
+        "messages": {"p50_us": 150.125, "p95_us": 179.583, "allocations_p50": 3001, "allocations_p95": 3001, "allocated_bytes_p50": 467812, "allocated_bytes_p95": 467812},
+        "tools": {"p50_us": 147.791, "p95_us": 177.375, "allocations_p50": 3057, "allocations_p95": 3057, "allocated_bytes_p50": 437953, "allocated_bytes_p95": 437953}
+      },
+      "ksg": {
+        "messages": {"p50_us": 1.209000000017113, "p95_us": 3.33299999999781},
+        "tools": {"p50_us": 9.66599999992468, "p95_us": 19.000000000005457}
+      }
+    },
+    {
+      "threads": 4, "messages_per_thread": 4000, "tools_per_thread": 1200, "total_items": 20800,
+      "before": {
+        "messages": {"p50_us": 17131.917, "p95_us": 18659.042, "allocations_p50": 555992, "allocations_p95": 555992, "allocated_bytes_p50": 71330015, "allocated_bytes_p95": 71330015},
+        "tools": {"p50_us": 17276.209, "p95_us": 18280.041, "allocations_p50": 556011, "allocations_p95": 556011, "allocated_bytes_p50": 71334087, "allocated_bytes_p95": 71334087}
+      },
+      "after": {
+        "messages": {"p50_us": 336.959, "p95_us": 383.167, "allocations_p50": 6901, "allocations_p95": 6901, "allocated_bytes_p50": 1077016, "allocated_bytes_p95": 1077016},
+        "tools": {"p50_us": 301.333, "p95_us": 334.125, "allocations_p50": 6957, "allocations_p95": 6957, "allocated_bytes_p50": 929550, "allocated_bytes_p95": 929550}
+      },
+      "ksg": {
+        "messages": {"p50_us": 1.9170000000485743, "p95_us": 7.665999999971973},
+        "tools": {"p50_us": 21.999999999934516, "p95_us": 32.00000000003911}
+      }
+    }
+  ]
+}

@@ -11,9 +11,9 @@ pub(super) struct Entry<'a> {
     pub draft: bool,
     pub life: lifecycle::Lifecycle,
     record: Option<&'a Value>,
-    projection: Option<&'a Value>,
-    view: &'a Value,
-    children: Vec<(&'a Value, &'a Value)>,
+    projection: Option<&'a crate::client_history::Projection>,
+    view: &'a crate::client_history::ThreadProjection,
+    children: Vec<(&'a Value, &'a crate::client_history::ThreadProjection)>,
     pub visible: bool,
     pub title_match: bool,
     pub search_hit: Option<crate::thread_search::ThreadSearchHit>,
@@ -44,7 +44,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 life: thread.life.clone(),
                 record: None,
                 projection: None,
-                view: &Value::Null,
+                view: null_view(),
                 children: Vec::new(),
                 visible: captain || searching || visible.contains(&index),
                 title_match,
@@ -57,11 +57,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
         if server == &s.machines.selected || !s.machine_enabled(server) {
             continue;
         }
-        let views: std::collections::HashMap<_, _> = projection["threads"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|view| view["id"].as_u64().map(|id| (id as usize, view)))
+        let views: std::collections::HashMap<_, _> = projection
+            .views
+            .iter()
+            .map(|(id, view)| (*id as usize, &**view))
             .collect();
         let metadata: std::collections::HashMap<_, _> = projection["index"]["threads"]
             .as_array()
@@ -69,8 +68,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             .flatten()
             .filter_map(|record| record["id"].as_u64().map(|id| (id as usize, record)))
             .collect();
-        let mut children: std::collections::HashMap<usize, Vec<(&Value, &Value)>> =
-            Default::default();
+        let mut children: std::collections::HashMap<
+            usize,
+            Vec<(&Value, &crate::client_history::ThreadProjection)>,
+        > = Default::default();
         for record in projection["index"]["threads"]
             .as_array()
             .into_iter()
@@ -79,7 +80,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             if let (Some(parent), Some(id)) = (record["parent"].as_u64(), record["id"].as_u64()) {
                 children.entry(parent as usize).or_default().push((
                     record,
-                    views.get(&(id as usize)).copied().unwrap_or(&Value::Null),
+                    match views.get(&(id as usize)) {
+                        Some(view) => *view,
+                        None => null_view(),
+                    },
                 ));
             }
         }
@@ -122,7 +126,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             {
                 continue;
             }
-            let view = views.get(&id).copied().unwrap_or(&Value::Null);
+            let view = match views.get(&id) {
+                Some(view) => *view,
+                None => null_view(),
+            };
             let saved = &s.machines.ui[server]["drafts"][id.to_string()];
             let draft_text = saved
                 .as_str()
@@ -144,17 +151,15 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 || name.to_lowercase().contains(&query)
                 || draft_text.to_lowercase().contains(&query)
                 || (!server_supports
-                    && view["messages"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|message| {
+                    && view.fields.get("messages").is_some_and(|messages| {
+                        messages.items.iter().any(|message| {
                             message["text"]
                                 .as_str()
                                 .unwrap_or("")
                                 .to_lowercase()
                                 .contains(&query)
-                        }));
+                        })
+                    }));
             let search_hit = if !query.is_empty() && !title_match {
                 s.sidebar_search
                     .visible_matches
@@ -174,7 +179,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 && life.failed_at.is_none()
                 && life.latest_user_message_at.is_none()
                 && life.last_completed_at.is_none()
-                && view["messages"].as_array().is_none_or(Vec::is_empty)
+                && view
+                    .fields
+                    .get("messages")
+                    .is_none_or(|messages| messages.items.is_empty())
                 && status_of_view(view) == Status::Ready;
             // Match local draft-listing rules. Blank remote landing slots are not chats.
             if draft
@@ -266,8 +274,14 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
     entries
 }
 
-fn status_of_view(view: &Value) -> Status {
-    serde_json::from_value(view["status"].clone()).unwrap_or(Status::Ready)
+fn status_of_view(view: &crate::client_history::ThreadProjection) -> Status {
+    serde_json::from_value(view.record["status"].clone()).unwrap_or(Status::Ready)
+}
+
+fn null_view() -> &'static crate::client_history::ThreadProjection {
+    static NULL: std::sync::OnceLock<crate::client_history::ThreadProjection> =
+        std::sync::OnceLock::new();
+    NULL.get_or_init(|| crate::client_history::ThreadProjection::empty(&serde_json::json!({})))
 }
 
 pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
@@ -281,7 +295,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
     let title = record["title"].as_str().unwrap_or("Thread");
     let view = entry.view;
     let mut status = status_of_view(view);
-    let mut requests = usize::from(!view["request"].is_null());
+    let mut requests = usize::from(!view.record["request"].is_null());
     let mut unread = usize::from(entry.life.unread());
     if entry.captain {
         for (child, child_view) in &entry.children {
@@ -295,7 +309,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
             if child_status.urgency() > status.urgency() {
                 status = child_status;
             }
-            requests += usize::from(!child_view["request"].is_null());
+            requests += usize::from(!child_view.record["request"].is_null());
             unread += usize::from(life.unread());
         }
     }
@@ -352,7 +366,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
             .count();
         let approval = std::iter::once(view)
             .chain(entry.children.iter().map(|(_, view)| *view))
-            .any(|view| view["request"]["method"] == "confirm");
+            .any(|view| view.record["request"]["method"] == "confirm");
         match status {
             Status::Running => detail.push(format!(
                 "{} {}",
@@ -388,7 +402,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         let timer = std::iter::once(view)
             .chain(entry.children.iter().map(|(_, view)| *view))
             .filter(|view| status_of_view(view) == Status::Running)
-            .filter_map(|view| view["elapsed"].as_u64())
+            .filter_map(|view| view.record["elapsed"].as_u64())
             .max();
         let mut status_line = rune::row()
             .key(format!("machine-status-{}-{id}", entry.server))
@@ -502,7 +516,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         Section::Settled | Section::Snoozed
     );
     let at = lifecycle::now();
-    let state_label = if view["request"]["method"] == "confirm" {
+    let state_label = if view.record["request"]["method"] == "confirm" {
         "Approval"
     } else if requests > 0 {
         "Input"
@@ -520,7 +534,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         ""
     };
     let age = if state_label == "Working" {
-        view["elapsed"]
+        view.record["elapsed"]
             .as_u64()
             .map(|secs| format!("Working {}", elapsed_label(secs)))
             .or_else(|| Some("Working".into()))

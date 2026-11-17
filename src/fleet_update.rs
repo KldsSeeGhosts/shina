@@ -3715,7 +3715,7 @@ mod tests {
         state.client = Some(client);
         state.machines.views.insert(
             "remote".into(),
-            json!({"updateStatus":{"state":"downloading"}}),
+            json!({"updateStatus":{"state":"downloading"}}).into(),
         );
         state.fleet.running = true;
         state.fleet.open = false;
@@ -3838,7 +3838,7 @@ mod tests {
         row.prior_outcome = Some("previous-update".into());
         state.machines.views.insert("remote".into(),json!({"updateStatus":{
             "runningVersion":"99.0.1","state":"idle","lastOutcome":{"updateId":"new-update","success":true,"tag":"v99.0.1"}
-        }}));
+        }}).into());
         state.poll_fleet();
         assert_eq!(state.fleet.rows[1].state, "updated to 99.0.1");
         assert_eq!(state.fleet.rows[1].update_id.as_deref(), Some("new-update"));
@@ -3960,7 +3960,8 @@ mod tests {
             json!({"updateStatus":{
                 "runningVersion":"0.12.34","canSelfUpdate":true,
                 "release":{"state":"checked","tag":"v0.12.39","assetAvailable":false}
-            }}),
+            }})
+            .into(),
         );
         state.plan_fleet_versions();
         assert!(!state.fleet.rows[0].eligible);
@@ -3983,7 +3984,8 @@ mod tests {
             "local".into(),
             json!({"updateStatus":{
                 "runningVersion":"0.12.34","canSelfUpdate":true,"state":"idle"
-            }}),
+            }})
+            .into(),
         );
         state.plan_fleet_versions_for("0.12.39");
         assert!(state.fleet.rows[0].eligible);
@@ -4058,7 +4060,8 @@ mod tests {
             json!({"providers":[
                 behind("codex","Codex","0.48.0","0.50.0"),
                 behind("claude","Claude","2.0.0","2.1.0")
-            ],"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}),
+            ],"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}})
+            .into(),
         );
         assert_eq!(
             state.update_everything_summary().as_deref(),
@@ -4067,8 +4070,7 @@ mod tests {
         let _calls2 = linked(&mut state, "second", "0.12.28");
         state.machines.views.insert(
             "second".into(),
-            json!({"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}),
-        );
+            json!({"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}).into());
         assert_eq!(
             state.update_everything_summary().as_deref(),
             Some("Update this app, 2 servers and 2 providers")
@@ -4149,7 +4151,7 @@ mod tests {
         state
             .machines
             .views
-            .insert("remote".into(), json!({"providers": settled}));
+            .insert("remote".into(), json!({"providers": settled}).into());
         state.poll_fleet();
         assert_eq!(state.fleet.phase, RunPhase::Servers);
         let server_row = state
@@ -4210,7 +4212,7 @@ mod tests {
         state
             .machines
             .views
-            .insert("remote".into(), json!({"providers": settled}));
+            .insert("remote".into(), json!({"providers": settled}).into());
         state.poll_fleet();
         // The run finished; the notice counts the provider, not the machine's server.
         assert!(!state.fleet.running);
@@ -4264,7 +4266,7 @@ mod tests {
         state
             .machines
             .views
-            .insert("remote".into(), json!({"providers": settled}));
+            .insert("remote".into(), json!({"providers": settled}).into());
         state.poll_fleet();
         let row = state
             .fleet
@@ -4409,7 +4411,8 @@ mod tests {
         state.machines.views.insert(
             "remote".into(),
             json!({"updateStatus":{"runningVersion":"0.1.0","state":"idle",
-                "lastOutcome":{"updateId":"other","success":true}}}),
+                "lastOutcome":{"updateId":"other","success":true}}})
+            .into(),
         );
         state.poll_fleet();
         assert_eq!(state.fleet.rows[0].result, None);
@@ -4600,7 +4603,7 @@ mod tests {
         state
             .machines
             .views
-            .insert("remote".into(), json!({"providers": providers}));
+            .insert("remote".into(), json!({"providers": providers}).into());
         state.poll_fleet();
         // The provider-only machine settled and the run closed.
         assert!(!state.fleet.running);
@@ -4653,7 +4656,7 @@ mod tests {
         });
         state.machines.views.insert(
             "remote".into(),
-            json!({"updateStatus":{"runningVersion":"0.1.0","state":"restarting"}}),
+            json!({"updateStatus":{"runningVersion":"0.1.0","state":"restarting"}}).into(),
         );
         state.poll_fleet();
         assert_eq!(state.fleet.phase, RunPhase::Countdown);
@@ -4726,7 +4729,7 @@ mod tests {
         // Another client's live attempt does not clear the refusal.
         state.machines.views.insert(
             "remote".into(),
-            json!({"updateStatus":{"state":"downloading","updateId":"other-attempt"}}),
+            json!({"updateStatus":{"state":"downloading","updateId":"other-attempt"}}).into(),
         );
         state.poll_fleet();
         assert_eq!(state.fleet.rows[1].update_id, None);
@@ -4738,13 +4741,13 @@ mod tests {
         row.refused = false;
         state.machines.views.insert(
             "remote".into(),
-            json!({"updateStatus":{"state":"downloading","updateId":"prev-attempt"}}),
+            json!({"updateStatus":{"state":"downloading","updateId":"prev-attempt"}}).into(),
         );
         state.poll_fleet();
         assert_eq!(state.fleet.rows[1].update_id, None);
         state.machines.views.insert(
             "remote".into(),
-            json!({"updateStatus":{"state":"downloading","updateId":"new-attempt"}}),
+            json!({"updateStatus":{"state":"downloading","updateId":"new-attempt"}}).into(),
         );
         state.poll_fleet();
         assert_eq!(
@@ -4758,7 +4761,8 @@ mod tests {
         state.machines.views.insert(
             "remote".into(),
             json!({"updateStatus":{"state":"idle",
-                "lastOutcome":{"updateId":"prev-outcome","success":true}}}),
+                "lastOutcome":{"updateId":"prev-outcome","success":true}}})
+            .into(),
         );
         state.poll_fleet();
         assert_eq!(state.fleet.rows[1].update_id, None);
@@ -4775,11 +4779,11 @@ mod tests {
         let _calls = linked(&mut state, "remote", "0.12.28");
         state.machines.views.insert(
             "remote".into(),
-            json!({"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}),
-        );
+            json!({"updateStatus":{"runningVersion":"0.12.28","state":"idle","canSelfUpdate":true}}).into());
         state.machines.views.insert(
             "ghost".into(),
-            json!({"updateStatus":{"runningVersion":"0.0.1","state":"idle","canSelfUpdate":true}}),
+            json!({"updateStatus":{"runningVersion":"0.0.1","state":"idle","canSelfUpdate":true}})
+                .into(),
         );
         assert_eq!(
             state.update_everything_summary().as_deref(),
@@ -4818,7 +4822,7 @@ mod tests {
         state
             .machines
             .views
-            .insert("remote".into(), json!({"providers": providers}));
+            .insert("remote".into(), json!({"providers": providers}).into());
         state.poll_fleet();
         assert_eq!(state.fleet.rows[0].provider_runs[0].update_id, None);
         assert!(!state.fleet.rows[0].provider_runs[0].settled());
@@ -4858,7 +4862,7 @@ mod tests {
         state
             .machines
             .views
-            .insert("remote".into(), json!({"providers": providers}));
+            .insert("remote".into(), json!({"providers": providers}).into());
         state.poll_fleet();
         assert!(!state.fleet.running);
         let notice = state.fleet.result_notice.as_ref().expect("result notice");
@@ -4994,7 +4998,7 @@ mod tests {
         let mut calls = linked(&mut state, "remote", "99.0.0");
         state.machines.views.insert(
             "remote".into(),
-            json!({"providers":[behind("codex","Codex","0.48.0","0.50.0")]}),
+            json!({"providers":[behind("codex","Codex","0.48.0","0.50.0")]}).into(),
         );
         state.update_provider("remote", "codex");
         let sent = calls.try_recv().expect("providers.update sent");
@@ -5040,7 +5044,7 @@ mod tests {
         state.client = Some(crate::client::Client::new(state.data_dir.clone()));
         state.machines.views.insert(
             "local".into(),
-            json!({"providers":[behind("codex","Codex","0.48.0","0.50.0")]}),
+            json!({"providers":[behind("codex","Codex","0.48.0","0.50.0")]}).into(),
         );
         state.update_provider("local", "codex");
         let error = state
