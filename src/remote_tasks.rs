@@ -5634,11 +5634,17 @@ impl State {
             let git_ctx = self.test_git_context.clone().unwrap_or_default();
             #[cfg(not(test))]
             let git_ctx = crate::vcs::GitContext::default();
-            let spec = repositories::default_placement(
+            let mut spec = repositories::default_placement(
                 placement::spec_from_args(args)?,
                 launch_repository.as_ref(),
             );
-            let resolved = if project.is_none() {
+            let selected_base_branch = spec.as_ref().and_then(|spec| spec.base_branch.clone());
+            if launch_repository.is_some()
+                && let Some(project) = project.and_then(|id| self.project(Some(id)))
+            {
+                repositories::pin_placement_base(&mut spec, &project.path, &git_ctx)?;
+            }
+            let mut resolved = if project.is_none() {
                 // No executor-local checkout binds this repository yet. Record
                 // the deterministic target now; poll_checkout_provisioning
                 // clones or adopts it, then runs the deferred plan.
@@ -5700,6 +5706,9 @@ impl State {
                     &git_ctx,
                 )?
             };
+            if resolved.base_branch.is_none() {
+                resolved.base_branch = selected_base_branch;
+            }
             let resolved =
                 if let (Some(repository), Some(project_id)) = (&launch_repository, project) {
                     let local = self.learn_repository(repository)?;

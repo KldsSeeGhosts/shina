@@ -105,6 +105,51 @@ pub(super) fn default_placement(
     Some(spec)
 }
 
+/// Fresh clones need not have a local branch for the catalog's default base.
+/// Resolve a local ref first, then its origin tracking ref, without checkout,
+/// fetch or mutation of an executor's current branch.
+pub(super) fn pin_placement_base(
+    spec: &mut Option<placement::PlacementSpec>,
+    path: &Path,
+    ctx: &crate::vcs::GitContext,
+) -> Result<(), String> {
+    let Some(spec) = spec.as_mut() else {
+        return Ok(());
+    };
+    if spec.base_commit.is_some()
+        || spec.upstream_thread_id.is_some()
+        || spec.start_from_origin == Some(true)
+    {
+        return Ok(());
+    }
+    let Some(branch) = spec.base_branch.as_deref() else {
+        return Ok(());
+    };
+    placement::validate_spec(spec)?;
+    for candidate in [branch.to_owned(), format!("refs/remotes/origin/{branch}")] {
+        let reference = format!("{candidate}^{{commit}}");
+        let output = crate::vcs::run_git_raw(
+            "Catalog.baseCommit",
+            path,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                &reference,
+            ],
+            crate::vcs::SHORT_TIMEOUT,
+            ctx,
+        )?;
+        if output.exit_code == Some(0) {
+            spec.base_commit = Some(output.stdout.trim().to_owned());
+            spec.base_branch = None;
+            return Ok(());
+        }
+    }
+    Err("The repository base branch has no local or origin-tracking commit. Fetch it on this executor or choose another base.".into())
+}
+
 /// One checkout materialization attempt. The target is deterministic per
 /// repository, so retries adopt a completed clone and remove only this
 /// job's own staging directory.
@@ -1236,11 +1281,16 @@ impl State {
                 let executor = std::fs::read_to_string(self.data_dir.join("server-id"))
                     .map(|id| id.trim().to_owned())
                     .unwrap_or_else(|_| "local".into());
-                let spec = binding.spec.clone();
+                let mut spec = binding.spec.clone();
+                let selected_base_branch = spec.as_ref().and_then(|spec| spec.base_branch.clone());
                 #[cfg(test)]
                 let git_ctx = self.test_git_context.clone().unwrap_or_default();
                 #[cfg(not(test))]
                 let git_ctx = crate::vcs::GitContext::default();
+                if let Err(error) = pin_placement_base(&mut spec, &project_path, &git_ctx) {
+                    self.fail_checkout_binding(index, error);
+                    return;
+                }
                 let resolved = self.plan_thread_placement(
                     &self.threads[index],
                     spec.as_ref(),
@@ -1250,6 +1300,9 @@ impl State {
                 );
                 match resolved {
                     Ok(mut resolved) => {
+                        if resolved.base_branch.is_none() {
+                            resolved.base_branch = selected_base_branch;
+                        }
                         resolved.binding = Some(placement::PlacementBinding {
                             repository: binding.repository.clone(),
                             remotes: binding.remotes.clone(),
@@ -1496,6 +1549,54 @@ mod tests {
                 Some(spec)
             );
         }
+    }
+
+    #[test]
+    fn catalog_base_can_use_an_origin_ref_without_switching_the_checkout() {
+        let state = state();
+        let path = state.data_dir.join("executor-checkout");
+        git_checkout(&path, "https://example.com/team/repo.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let branch = git(&["symbolic-ref", "HEAD"]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/remotes/origin/release", &commit]);
+        let mut spec = Some(placement::PlacementSpec {
+            base_branch: Some("release".into()),
+            ..Default::default()
+        });
+        pin_placement_base(&mut spec, &path, &crate::vcs::GitContext::default()).unwrap();
+        let resolved = spec.as_ref().unwrap();
+        assert_eq!(resolved.base_commit.as_deref(), Some(commit.as_str()));
+        assert!(
+            resolved.base_branch.is_none(),
+            "the planner accepts one base selector"
+        );
+        placement::validate_spec(resolved).unwrap();
+        assert_eq!(git(&["symbolic-ref", "HEAD"]), branch);
+        let mut missing = Some(placement::PlacementSpec {
+            base_branch: Some("not-fetched".into()),
+            ..Default::default()
+        });
+        assert!(
+            pin_placement_base(&mut missing, &path, &crate::vcs::GitContext::default())
+                .unwrap_err()
+                .contains("Fetch it on this executor")
+        );
+        assert_eq!(git(&["symbolic-ref", "HEAD"]), branch);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]
