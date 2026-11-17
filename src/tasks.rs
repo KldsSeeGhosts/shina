@@ -5,6 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub(super) const RUNNING_LIMIT: usize = 3;
 pub(super) const UNFINISHED_LIMIT: usize = 8;
+const TASK_OPERATION_LIMIT: usize = 128;
+const OPERATION_NOT_DISPATCHED: &str = "not_dispatched";
+const OPERATION_QUEUED: &str = "queued";
+const OPERATION_DISPATCHED: &str = "dispatched";
+const OPERATION_NOT_OBSERVED: &str = "not_observed";
+const OPERATION_ACCEPTED: &str = "accepted";
+const OPERATION_REJECTED: &str = "rejected";
 const RESUME_MESSAGE: &str = "Shina restarted mid-task. Check the current state of the files and any partial changes or tool actions, then finish the task. Do not assume earlier actions failed or repeat them without checking.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +97,115 @@ pub(super) struct Task {
 pub struct RequestKey {
     pub key: String,
     pub intent_hash: String,
+}
+
+/// One keyed task-control operation, separate from its immutable saved receipt.
+/// The receipt records what the caller asked Shina to save. This ledger records
+/// what Shina later observed about that same command, so a transport save is
+/// never reported as provider acceptance or completed work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskOperation {
+    pub request_key: String,
+    pub caller: usize,
+    pub scope: String,
+    pub command_id: String,
+    pub method: String,
+    pub task_id: Option<String>,
+    pub target_thread_id: usize,
+    pub target_server: Option<String>,
+    pub target_attempt_id: Option<String>,
+    pub request_id: Option<String>,
+    pub runtime_generation: Option<String>,
+    pub requested_delivery: String,
+    pub realized_delivery: Option<String>,
+    pub delivery_id: Option<String>,
+    pub saved: bool,
+    pub saved_at: u64,
+    /// Controller-side dispatch state. `queued` means the command is stored
+    /// here but no transport call has run; `dispatched` means one was made.
+    pub dispatch: String,
+    pub dispatched_at: Option<u64>,
+    /// Controller-to-target transport or target queue acceptance. A peer
+    /// `accepted` receipt proves only that the target stored the command. It
+    /// never proves that a provider read the input.
+    pub transport: String,
+    pub transport_at: Option<u64>,
+    pub transport_basis: Option<String>,
+    /// Actual provider/input acceptance. `unknown` is a real answer: the
+    /// adapter cannot prove it or an older peer has no observation contract.
+    pub acceptance: String,
+    pub accepted_at: Option<u64>,
+    pub acceptance_basis: Option<String>,
+    pub completion: String,
+    pub completed_at: Option<u64>,
+    pub completion_attempt_id: Option<String>,
+    pub completion_run_id: Option<String>,
+    pub rejection_stage: Option<String>,
+    pub rejection: Option<String>,
+    /// The run a local steer named, used only to tell a real steer from the
+    /// follow-up fallback when the run ended before the input was flushed.
+    #[serde(default)]
+    pub target_run_id: Option<String>,
+}
+
+impl TaskOperation {
+    fn saved(
+        scope: &DelegateScope,
+        caller: usize,
+        key: &str,
+        tool: &str,
+        args: &Value,
+        thread: &Thread,
+        task: Option<&Task>,
+        requested_delivery: &str,
+    ) -> Self {
+        Self {
+            request_key: key.into(),
+            caller,
+            scope: scope.device(),
+            command_id: task_control_command_id(key).to_string(),
+            method: tool.into(),
+            task_id: task.map(|task| task.id.clone()),
+            target_thread_id: thread.id,
+            target_server: task
+                .and_then(|task| task.remote.as_ref())
+                .map(|remote| remote.server_id.clone()),
+            target_attempt_id: args["attempt_id"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| task.map(|task| task.attempt_id.clone()))
+                .filter(|id| !id.is_empty()),
+            request_id: args["request_id"].as_str().map(str::to_owned),
+            runtime_generation: args["runtime_generation"].as_str().map(str::to_owned),
+            requested_delivery: requested_delivery.into(),
+            realized_delivery: None,
+            delivery_id: None,
+            saved: true,
+            saved_at: lifecycle::now(),
+            dispatch: if tool == "task_cancel" {
+                OPERATION_QUEUED.into()
+            } else {
+                OPERATION_NOT_DISPATCHED.into()
+            },
+            dispatched_at: None,
+            transport: OPERATION_NOT_OBSERVED.into(),
+            transport_at: None,
+            transport_basis: None,
+            acceptance: OPERATION_NOT_OBSERVED.into(),
+            accepted_at: None,
+            acceptance_basis: None,
+            completion: OPERATION_NOT_OBSERVED.into(),
+            completed_at: None,
+            completion_attempt_id: None,
+            completion_run_id: None,
+            rejection_stage: None,
+            rejection: None,
+            target_run_id: (tool == "task_send"
+                && (args["delivery"].as_str() == Some("steer") || args["request_id"].is_string()))
+            .then(|| thread.run_id.clone())
+            .flatten(),
+        }
+    }
 }
 
 /// The durable caller identity behind a delegation. A Captain's scope survives
@@ -243,7 +359,7 @@ fn unique_id() -> String {
     )
 }
 
-fn delivery_text(id: &str, body: &str) -> String {
+pub(super) fn delivery_text(id: &str, body: &str) -> String {
     format!("{INJECTION_PREFIX}[delivery {id}]\n{body}")
 }
 
@@ -461,17 +577,57 @@ impl Thread {
             return;
         }
         if record["command"] == "prompt"
-            && record["success"] != false
             && self
                 .injection_id
                 .as_ref()
                 .is_some_and(|id| record["id"] == *id)
-            && let Some(id) = self
+        {
+            let delivery = self
                 .pending_injections
                 .front()
-                .and_then(|i| delivery_id(&i.text))
-        {
-            self.accepted_deliveries.push(id.into());
+                .and_then(|injection| delivery_id(&injection.text))
+                .map(str::to_owned);
+            if record["success"] == false {
+                let error = record["error"]
+                    .as_str()
+                    .unwrap_or("The provider rejected the queued input.")
+                    .chars()
+                    .take(2000)
+                    .collect::<String>();
+                if let Some(delivery) = delivery {
+                    self.rejected_injections.push((delivery, error.clone()));
+                }
+                if let Some((prompt, peer)) = self.peer_prompt.take()
+                    && prompt == *self.injection_id.as_ref().expect("checked")
+                    && let Some(origin) = &mut self.peer_origin
+                    && let Some(evidence) = origin
+                        .inputs
+                        .iter_mut()
+                        .find(|evidence| evidence.command_id == peer.to_string())
+                {
+                    evidence.input = "rejected".into();
+                    evidence.input_basis = "provider_rejection".into();
+                    evidence.error = Some(error);
+                    evidence.observed_at = lifecycle::now();
+                }
+            } else {
+                if let Some(delivery) = delivery {
+                    self.accepted_deliveries.push(delivery);
+                }
+                if let Some((prompt, peer)) = self.peer_prompt.take()
+                    && prompt == *self.injection_id.as_ref().expect("checked")
+                    && let Some(origin) = &mut self.peer_origin
+                    && let Some(evidence) = origin
+                        .inputs
+                        .iter_mut()
+                        .find(|evidence| evidence.command_id == peer.to_string())
+                {
+                    evidence.input = "accepted".into();
+                    evidence.input_basis = "provider_ack".into();
+                    evidence.error = None;
+                    evidence.observed_at = lifecycle::now();
+                }
+            }
         }
         if record["command"] == "get_messages" && record["id"] == "history" {
             if self.recovering_task {
@@ -866,6 +1022,568 @@ impl State {
         }
     }
 
+    fn task_operation_index(&self, scope: &str, key: &str) -> Option<usize> {
+        self.task_operations
+            .iter()
+            .position(|operation| operation.scope == scope && operation.request_key == key)
+    }
+
+    pub(super) fn task_operation_for(&self, scope: &str, key: &str) -> Option<&TaskOperation> {
+        self.task_operation_index(scope, key)
+            .map(|index| &self.task_operations[index])
+    }
+
+    /// Durable evidence lives in the database, not in the bounded status
+    /// view. Stage the exact payload in the runtime batch that commits it.
+    fn stage_task_operation_payload(&mut self, operation: &TaskOperation) {
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            let payload = match serde_json::to_value(operation) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let error = format!("Could not encode task operation evidence: {error}");
+                    database.fail(error.clone());
+                    self.storage_error = Some(error);
+                    return;
+                }
+            };
+            if let Err(error) = database.stage_task_operation(payload) {
+                if error.contains("durable runtime transaction") {
+                    // dispatch_peer_work runs before the next reducer batch.
+                    // Reconcile stages it when that batch opens.
+                    self.task_operations_dirty = true;
+                } else {
+                    database.fail(error.clone());
+                    self.storage_error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn stage_task_operation_at(&mut self, index: usize) {
+        let operation = self.task_operations[index].clone();
+        self.stage_task_operation_payload(&operation);
+    }
+
+    /// The durable table is authoritative. This is used when restoring an old
+    /// index that predates it and after a receipt commits a saved operation.
+    fn stage_task_operations(&mut self) {
+        for operation in self.task_operations.clone() {
+            self.stage_task_operation_payload(&operation);
+        }
+    }
+
+    /// Records saved intent in memory before its first mutation. The durable
+    /// receipt and operation row commit together before any outbox effect is
+    /// drained; a file-only profile refuses these controls before this point.
+    pub(super) fn begin_task_operation(
+        &mut self,
+        caller_index: usize,
+        thread_index: usize,
+        task_index: Option<usize>,
+        tool: &str,
+        key: &str,
+        args: &Value,
+        requested_delivery: &str,
+    ) {
+        let operation = TaskOperation::saved(
+            &self.delegate_scope(caller_index),
+            self.threads[caller_index].id,
+            key,
+            tool,
+            args,
+            &self.threads[thread_index],
+            task_index.map(|index| &self.tasks[index]),
+            requested_delivery,
+        );
+        self.task_operations.retain(|existing| {
+            !(existing.scope == operation.scope && existing.request_key == operation.request_key)
+        });
+        self.task_operations.push(operation);
+    }
+
+    pub(super) fn caller_operation_scope(&self, caller_index: usize) -> String {
+        self.delegate_scope(caller_index).device()
+    }
+
+    pub(super) fn attach_caller_operation_delivery(
+        &mut self,
+        caller_index: usize,
+        key: &str,
+        delivery: &str,
+    ) {
+        let scope = self.caller_operation_scope(caller_index);
+        self.attach_operation_delivery(&scope, key, delivery);
+    }
+
+    pub(super) fn mark_caller_operation_dispatched(
+        &mut self,
+        caller_index: usize,
+        key: &str,
+        realized: &str,
+    ) -> bool {
+        let scope = self.caller_operation_scope(caller_index);
+        self.mark_key_operation_dispatched(&scope, key, realized)
+    }
+
+    pub(super) fn mark_caller_operation_input_unknown(
+        &mut self,
+        caller_index: usize,
+        key: &str,
+        basis: &str,
+    ) -> bool {
+        let scope = self.caller_operation_scope(caller_index);
+        self.mark_key_operation_input_unknown(&scope, key, basis)
+    }
+
+    pub(super) fn reject_caller_operation(
+        &mut self,
+        caller_index: usize,
+        key: &str,
+        error: &str,
+    ) -> bool {
+        let scope = self.caller_operation_scope(caller_index);
+        self.reject_key_operation(&scope, key, error)
+    }
+
+    pub(super) fn mark_key_operation_dispatched(
+        &mut self,
+        scope: &str,
+        key: &str,
+        realized: &str,
+    ) -> bool {
+        let Some(index) = self.task_operation_index(scope, key) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        let mut changed = false;
+        if operation.dispatch != OPERATION_DISPATCHED {
+            operation.dispatch = OPERATION_DISPATCHED.into();
+            operation.dispatched_at = Some(lifecycle::now());
+            changed = true;
+        }
+        if operation.transport != OPERATION_ACCEPTED {
+            operation.transport = OPERATION_ACCEPTED.into();
+            operation.transport_at = Some(lifecycle::now());
+            operation.transport_basis = Some("local_adapter".into());
+            changed = true;
+        }
+        if operation.realized_delivery.as_deref() != Some(realized) {
+            operation.realized_delivery = Some(realized.into());
+            changed = true;
+        }
+        if changed {
+            self.stage_task_operation_at(index);
+        }
+        changed
+    }
+
+    pub(super) fn mark_key_operation_input_unknown(
+        &mut self,
+        scope: &str,
+        key: &str,
+        basis: &str,
+    ) -> bool {
+        let Some(index) = self.task_operation_index(scope, key) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        if operation.acceptance != OPERATION_NOT_OBSERVED {
+            return false;
+        }
+        operation.acceptance = "unknown".into();
+        operation.acceptance_basis = Some(basis.into());
+        self.stage_task_operation_at(index);
+        true
+    }
+
+    pub(super) fn reject_key_operation(&mut self, scope: &str, key: &str, error: &str) -> bool {
+        let Some(index) = self.task_operation_index(scope, key) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        operation.acceptance = OPERATION_REJECTED.into();
+        operation.accepted_at = Some(lifecycle::now());
+        operation.rejection_stage = Some("input".into());
+        operation.rejection = Some(error.chars().take(2000).collect());
+        self.stage_task_operation_at(index);
+        true
+    }
+
+    fn remove_task_operation(&mut self, scope: &str, key: &str) {
+        self.task_operations
+            .retain(|operation| !(operation.scope == scope && operation.request_key == key));
+    }
+
+    fn operation_index_for_delivery(&self, delivery: &str) -> Option<usize> {
+        self.task_operations
+            .iter()
+            .position(|operation| operation.delivery_id.as_deref() == Some(delivery))
+    }
+
+    pub(super) fn task_operation_for_delivery(&self, delivery: &str) -> Option<&TaskOperation> {
+        self.task_operations
+            .iter()
+            .find(|operation| operation.delivery_id.as_deref() == Some(delivery))
+    }
+
+    pub(super) fn attach_operation_delivery(&mut self, scope: &str, key: &str, delivery: &str) {
+        if let Some(index) = self.task_operation_index(scope, key) {
+            let operation = &mut self.task_operations[index];
+            operation.delivery_id = Some(delivery.into());
+            if operation.dispatch == OPERATION_NOT_DISPATCHED {
+                operation.dispatch = OPERATION_QUEUED.into();
+            }
+            self.stage_task_operation_at(index);
+        }
+    }
+
+    pub(super) fn attach_operation_target_attempt(
+        &mut self,
+        scope: &str,
+        key: &str,
+        attempt: &str,
+    ) {
+        if let Some(index) = self.task_operation_index(scope, key) {
+            self.task_operations[index].target_attempt_id = Some(attempt.into());
+            self.stage_task_operation_at(index);
+        }
+    }
+
+    pub(super) fn mark_operation_dispatched(&mut self, delivery: &str) -> bool {
+        let Some(index) = self.operation_index_for_delivery(delivery) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        if operation.dispatch == OPERATION_DISPATCHED {
+            return false;
+        }
+        operation.dispatch = OPERATION_DISPATCHED.into();
+        operation.dispatched_at = Some(lifecycle::now());
+        self.stage_task_operation_at(index);
+        true
+    }
+
+    /// The target receipt proves only transport or queue acceptance. Provider
+    /// input acceptance is a separate observation.
+    pub(super) fn mark_operation_transport_accepted(
+        &mut self,
+        delivery: &str,
+        basis: &str,
+    ) -> bool {
+        let Some(index) = self.operation_index_for_delivery(delivery) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        let mut changed = false;
+        if operation.dispatch != OPERATION_DISPATCHED {
+            operation.dispatch = OPERATION_DISPATCHED.into();
+            operation.dispatched_at = Some(lifecycle::now());
+            changed = true;
+        }
+        if operation.transport != OPERATION_ACCEPTED {
+            operation.transport = OPERATION_ACCEPTED.into();
+            operation.transport_at = Some(lifecycle::now());
+            operation.transport_basis = Some(basis.into());
+            changed = true;
+        }
+        if changed {
+            self.stage_task_operation_at(index);
+        }
+        changed
+    }
+
+    pub(super) fn mark_operation_input_accepted(
+        &mut self,
+        delivery: &str,
+        realized: &str,
+        basis: &str,
+    ) -> bool {
+        let Some(index) = self.operation_index_for_delivery(delivery) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        let mut changed = false;
+        if operation.dispatch != OPERATION_DISPATCHED {
+            operation.dispatch = OPERATION_DISPATCHED.into();
+            operation.dispatched_at = Some(lifecycle::now());
+            changed = true;
+        }
+        if operation.transport != OPERATION_ACCEPTED {
+            operation.transport = OPERATION_ACCEPTED.into();
+            operation.transport_at = Some(lifecycle::now());
+            operation.transport_basis = Some(basis.into());
+            changed = true;
+        }
+        if operation.acceptance != OPERATION_ACCEPTED {
+            operation.acceptance = OPERATION_ACCEPTED.into();
+            operation.accepted_at = Some(lifecycle::now());
+            operation.acceptance_basis = Some(basis.into());
+            operation.rejection_stage = None;
+            operation.rejection = None;
+            changed = true;
+        }
+        if operation.realized_delivery.as_deref() != Some(realized) {
+            operation.realized_delivery = Some(realized.into());
+            changed = true;
+        }
+        if changed {
+            self.stage_task_operation_at(index);
+        }
+        changed
+    }
+
+    pub(super) fn mark_operation_realized(
+        &mut self,
+        delivery: &str,
+        realized: &str,
+        run: Option<&str>,
+    ) -> bool {
+        let Some(index) = self.operation_index_for_delivery(delivery) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        let mut changed = false;
+        if operation.realized_delivery.as_deref() != Some(realized) {
+            operation.realized_delivery = Some(realized.into());
+            changed = true;
+        }
+        if let Some(run) = run
+            && operation.target_run_id.as_deref() != Some(run)
+        {
+            operation.target_run_id = Some(run.into());
+            changed = true;
+        }
+        if changed {
+            self.stage_task_operation_at(index);
+        }
+        changed
+    }
+
+    pub(super) fn mark_operation_input_unknown(&mut self, delivery: &str, basis: &str) -> bool {
+        let Some(index) = self.operation_index_for_delivery(delivery) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        if operation.acceptance != OPERATION_NOT_OBSERVED {
+            return false;
+        }
+        operation.acceptance = "unknown".into();
+        operation.acceptance_basis = Some(basis.into());
+        self.stage_task_operation_at(index);
+        true
+    }
+
+    pub(super) fn mark_operation_rejected(
+        &mut self,
+        delivery: &str,
+        stage: &str,
+        error: &str,
+    ) -> bool {
+        let Some(index) = self.operation_index_for_delivery(delivery) else {
+            return false;
+        };
+        let operation = &mut self.task_operations[index];
+        operation.dispatch = OPERATION_DISPATCHED.into();
+        operation.dispatched_at.get_or_insert_with(lifecycle::now);
+        operation.rejection_stage = Some(stage.into());
+        operation.rejection = Some(error.chars().take(2000).collect());
+        if stage == "transport" || stage == "target" {
+            operation.transport = OPERATION_REJECTED.into();
+            operation.transport_at = Some(lifecycle::now());
+            operation.transport_basis = Some("peer_receipt".into());
+        } else {
+            operation.acceptance = OPERATION_REJECTED.into();
+            operation.accepted_at = Some(lifecycle::now());
+            operation.acceptance_basis = Some("provider_receipt".into());
+        }
+        self.stage_task_operation_at(index);
+        true
+    }
+
+    /// Completion is an observed terminal outcome for this exact attempt and
+    /// run. A send needs provider input acceptance first. A cancellation only
+    /// needs the stop transport; its provider settlement is the observation.
+    pub(super) fn mark_operation_completion(
+        &mut self,
+        task_id: &str,
+        attempt: &str,
+        run: Option<&str>,
+        state: TaskState,
+    ) -> bool {
+        let mut changed = false;
+        let mut staged = Vec::new();
+        for (index, operation) in self.task_operations.iter_mut().enumerate() {
+            if operation.task_id.as_deref() != Some(task_id)
+                || operation.target_attempt_id.as_deref() != Some(attempt)
+                || operation.completion != OPERATION_NOT_OBSERVED
+                || operation.acceptance == OPERATION_REJECTED
+                || operation.transport == OPERATION_REJECTED
+                || operation.dispatch != OPERATION_DISPATCHED
+            {
+                continue;
+            }
+            if let (Some(expected), Some(actual)) = (operation.target_run_id.as_deref(), run)
+                && expected != actual
+            {
+                continue;
+            }
+            if operation.target_run_id.is_some() && run.is_none() {
+                continue;
+            }
+            if operation.method != "task_cancel" && operation.acceptance != OPERATION_ACCEPTED {
+                continue;
+            }
+            operation.completion = state.id().into();
+            operation.completed_at = Some(lifecycle::now());
+            operation.completion_attempt_id = Some(attempt.into());
+            operation.completion_run_id = run.map(str::to_owned);
+            staged.push(index);
+            changed = true;
+        }
+        for index in staged {
+            self.stage_task_operation_at(index);
+        }
+        changed
+    }
+
+    /// Turns observed local delivery evidence into the same durable ledger
+    /// remote commands use. Dispatch, provider input acceptance and completion
+    /// are separate observations, all bound to the delivery or attempt.
+    pub(super) fn reconcile_task_operations(&mut self) -> bool {
+        let mut changed = false;
+        if std::mem::take(&mut self.task_operations_dirty) {
+            self.stage_task_operations();
+        }
+        let dispatches: Vec<_> = self
+            .threads
+            .iter_mut()
+            .flat_map(|thread| thread.injection_dispatches.drain(..))
+            .collect();
+        for (delivery, realized) in dispatches {
+            let Some(index) = self.operation_index_for_delivery(&delivery) else {
+                continue;
+            };
+            let realized = if realized == "steer" {
+                "steer"
+            } else {
+                "follow_up"
+            };
+            let operation = &mut self.task_operations[index];
+            if operation.dispatch != OPERATION_DISPATCHED {
+                operation.dispatch = OPERATION_DISPATCHED.into();
+                operation.dispatched_at = Some(lifecycle::now());
+                changed = true;
+            }
+            if operation.transport != OPERATION_ACCEPTED {
+                operation.transport = OPERATION_ACCEPTED.into();
+                operation.transport_at = Some(lifecycle::now());
+                operation.transport_basis = Some("local_adapter".into());
+                changed = true;
+            }
+            if operation.realized_delivery.as_deref() != Some(realized) {
+                operation.realized_delivery = Some(realized.into());
+                changed = true;
+            }
+            self.stage_task_operation_at(index);
+        }
+        let rejected: Vec<_> = self
+            .threads
+            .iter_mut()
+            .flat_map(|thread| thread.rejected_injections.drain(..))
+            .collect();
+        for (delivery, error) in rejected {
+            changed |= self.mark_operation_rejected(&delivery, "input", &error);
+        }
+        let operations: Vec<(usize, TaskOperation)> = self
+            .task_operations
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, operation)| {
+                operation.completion == OPERATION_NOT_OBSERVED
+                    && operation.acceptance != OPERATION_REJECTED
+            })
+            .collect();
+        for (index, operation) in operations {
+            let Some(delivery) = operation.delivery_id.as_deref() else {
+                continue;
+            };
+            let Some(thread) = self
+                .threads
+                .iter()
+                .find(|thread| thread.id == operation.target_thread_id)
+            else {
+                continue;
+            };
+            if !thread
+                .accepted_deliveries
+                .iter()
+                .any(|accepted| accepted == delivery)
+            {
+                continue;
+            }
+            let realized = operation.realized_delivery.clone().unwrap_or_else(|| {
+                match operation.requested_delivery.as_str() {
+                    "steer" => {
+                        if operation.target_run_id.is_some()
+                            && thread.run_id == operation.target_run_id
+                        {
+                            "steer".to_owned()
+                        } else {
+                            "follow_up".to_owned()
+                        }
+                    }
+                    "answer" => "answer".to_owned(),
+                    _ => "follow_up".to_owned(),
+                }
+            });
+            let operation = &mut self.task_operations[index];
+            if operation.acceptance != OPERATION_ACCEPTED {
+                operation.acceptance = OPERATION_ACCEPTED.into();
+                operation.accepted_at = Some(lifecycle::now());
+                operation.acceptance_basis = Some("provider_ack".into());
+                operation.rejection_stage = None;
+                operation.rejection = None;
+                operation.realized_delivery = Some(realized.into());
+                changed = true;
+                self.stage_task_operation_at(index);
+            }
+        }
+        let terminal: Vec<_> = self
+            .tasks
+            .iter()
+            .filter(|task| task.remote.is_none() && task.state.finished())
+            .map(|task| {
+                let thread = self
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == task.child_thread_id);
+                let run = thread.and_then(|thread| thread.run_id.clone());
+                let settled = thread.is_none_or(|thread| {
+                    !thread.status.busy()
+                        && thread.phase != "Stopping"
+                        && thread.injection_id.is_none()
+                        && thread.stop_control.phase()
+                            != Some(crate::model::run_control::StopPhase::Pending)
+                });
+                (
+                    task.id.clone(),
+                    task.attempt_id.clone(),
+                    run,
+                    task.state,
+                    settled,
+                )
+            })
+            .collect();
+        for (task_id, attempt, run, state, settled) in terminal {
+            if state == TaskState::Cancelled && !settled {
+                continue;
+            }
+            changed |= self.mark_operation_completion(&task_id, &attempt, run.as_deref(), state);
+        }
+        changed
+    }
+
     fn delegate_receipt_lookup(
         &self,
         scope: DelegateScope,
@@ -898,7 +1616,19 @@ impl State {
     /// the same contract through their committed receipt record.
     pub(super) fn delegate_receipt_ready(&self) -> Result<(), String> {
         if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
-            database.require_batch()?;
+            return database.require_batch();
+        }
+        if self.durable_task_controls {
+            return Ok(());
+        }
+        // A live file-only profile cannot commit saved intent before a
+        // provider or peer effect. Direct reducer tests run without a live
+        // runtime; real file-only profiles refuse before any mutation.
+        if self.runtime_enabled && !self.demo {
+            return Err(
+                "Keyed task controls require the durable server profile. This file-only profile cannot commit saved intent before a provider or peer effect; update to the server profile or use the user's thread controls."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -1011,6 +1741,7 @@ impl State {
             result,
             seq: self.server_seq,
         });
+        self.persist_receipt_snapshot()?;
         Ok(())
     }
 
@@ -1021,6 +1752,18 @@ impl State {
         }
         self.storage_error = Some(error.clone());
         error
+    }
+
+    /// A legacy file profile has one committed snapshot for the task change and
+    /// its receipt. Wait for that write before the caller can dispatch work.
+    fn persist_receipt_snapshot(&mut self) -> Result<(), String> {
+        if self.store.is_some() {
+            return self
+                .checkpoint_and_flush()
+                .map_err(|error| self.fail_delegate_receipt(error));
+        }
+        self.checkpoint();
+        Ok(())
     }
 
     /// Control intent hashes everything the caller declared except the key:
@@ -1078,17 +1821,35 @@ impl State {
         if receipt.hash != intent {
             return Err(CONTROL_KEY_MISMATCH.into());
         }
+        self.reconcile_task_operations();
         let mut result = receipt.result;
+        let saved_operation = result.get("operation").cloned();
         result["replayed"] = json!(true);
-        let exists = args["thread_id"]
-            .as_u64()
-            .map(|id| id as usize)
-            .is_some_and(|id| self.threads.iter().any(|thread| thread.id == id));
+        let thread_id = args["thread_id"].as_u64().map(|id| id as usize);
+        let exists = thread_id.is_some_and(|id| self.threads.iter().any(|thread| thread.id == id));
         result["exists"] = json!(exists);
-        result["current"] = if let Some(id) = args["thread_id"].as_u64().filter(|_| exists) {
+        result["current"] = if let Some(id) = thread_id.filter(|_| exists) {
             self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?
         } else {
             Value::Null
+        };
+        let operation = self.task_operation_for(&scope.device(), key).cloned();
+        let task_id = operation
+            .as_ref()
+            .and_then(|operation| operation.task_id.as_deref())
+            .or_else(|| {
+                saved_operation
+                    .as_ref()
+                    .and_then(|operation| operation["task_id"].as_str())
+            });
+        let task_exists = task_id.map(|id| self.tasks.iter().any(|task| task.id == id));
+        result["target_missing"] = json!(!exists);
+        result["task_missing"] = json!(task_exists == Some(false));
+        result["operation_history_unavailable"] = json!(operation.is_none());
+        result["operation"] = if let Some(operation) = operation {
+            json!(operation)
+        } else {
+            saved_operation.unwrap_or(Value::Null)
         };
         Ok(Some(result))
     }
@@ -1117,6 +1878,15 @@ impl State {
             "worker_acceptance":"not_observed",
             "completion":"not_observed"
         });
+        self.reconcile_task_operations();
+        if let Some(index) = self.task_operation_index(&scope.device(), key) {
+            self.stage_task_operation_at(index);
+        }
+        if let Some(operation) = self.task_operation_for(&scope.device(), key).cloned() {
+            result["operation"] = json!(operation);
+        } else {
+            result["operation"] = Value::Null;
+        }
         if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
             database
                 .stage_task_control_receipt(&scope.device(), &command, result.clone())
@@ -1144,6 +1914,7 @@ impl State {
             result: result.clone(),
             seq: self.server_seq,
         });
+        self.persist_receipt_snapshot()?;
         Ok(result)
     }
 
@@ -1296,6 +2067,11 @@ impl State {
         args: &Value,
     ) -> Result<bool, String> {
         self.require_active_thread_owner(self.threads[index].id)?;
+        let caller_index = self
+            .threads
+            .iter()
+            .position(|thread| thread.id == caller)
+            .ok_or("The calling thread no longer exists.")?;
         let thread = &self.threads[index];
         if !self.owns_child(caller, index) {
             return Err(format!(
@@ -1306,6 +2082,15 @@ impl State {
         let attempt = Self::control_fence(args, "attempt_id")?;
         let request_id = Self::control_fence(args, "request_id")?;
         let generation = Self::control_fence(args, "runtime_generation")?;
+        let operation_key = args["client_request_id"].as_str();
+        let operation_scope = self.delegate_scope(caller_index).device();
+        let requested_delivery = if tool == "task_cancel" {
+            "cancel"
+        } else if request_id.is_some() {
+            "answer"
+        } else {
+            args["delivery"].as_str().unwrap_or("follow_up")
+        };
         if tool != "task_cancel" && request_id.is_some() != generation.is_some() {
             return Err("A question answer requires both request_id and runtime_generation from task_status.".into());
         }
@@ -1340,6 +2125,17 @@ impl State {
                 }
                 None => {}
             }
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    None,
+                    tool,
+                    key,
+                    args,
+                    requested_delivery,
+                );
+            }
             return Ok(false);
         };
         if tool == "task_cancel" {
@@ -1359,19 +2155,40 @@ impl State {
                     observed,
                 ));
             }
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    Some(task_index),
+                    tool,
+                    key,
+                    args,
+                    "cancel",
+                );
+            }
             self.tasks[task_index].owe_remote_stop(Some(observed.to_owned()));
+            if let Some(key) = operation_key
+                && let Some(command) = self.tasks[task_index]
+                    .remote
+                    .as_ref()
+                    .and_then(|remote| remote.stop_command_id)
+            {
+                self.attach_operation_delivery(&operation_scope, key, &command.to_string());
+            }
             if self.tasks[task_index].state.finished() {
                 return Ok(true);
             }
             if self.tasks[task_index].remote.is_none() {
                 self.threads[index].stop_task()?;
+                if let Some(key) = operation_key {
+                    self.mark_key_operation_dispatched(&operation_scope, key, "cancel");
+                }
             }
             self.threads[index].task_result = Some("cancelled");
             self.threads[index].completion_notified = true;
             self.tasks[task_index].recovering = false;
             self.threads[index].recovering_task = false;
             self.tasks[task_index].finish(TaskState::Cancelled, "", "Cancelled by the parent.");
-            self.checkpoint();
             return Ok(true);
         }
         if self.tasks[task_index].recovering
@@ -1423,6 +2240,17 @@ impl State {
             ) {
                 return Err("Confirmations require the user's device link.".into());
             }
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    Some(task_index),
+                    tool,
+                    key,
+                    args,
+                    requested_delivery,
+                );
+            }
             return Ok(false);
         }
         let message = args["message"]
@@ -1441,6 +2269,17 @@ impl State {
                         .into(),
                 );
             }
+            if self.tasks[task_index].state == TaskState::Cancelled
+                && self.tasks[task_index]
+                    .remote
+                    .as_ref()
+                    .is_some_and(|remote| remote.state != RemoteState::Done)
+            {
+                return Err(
+                    "Wait for the target to report the cancelled attempt's provider settlement before starting newer work."
+                        .into(),
+                );
+            }
             if delivery == Some("steer")
                 && (self.tasks[task_index].state.finished()
                     || self.tasks[task_index]
@@ -1450,46 +2289,124 @@ impl State {
             {
                 return Err("This attempt cannot accept steering.".into());
             }
-            if !self.tasks[task_index].state.finished() {
-                return self
-                    .queue_remote_send(task_index, message, delivery.unwrap_or("follow_up"))
-                    .map(|_| true);
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    Some(task_index),
+                    tool,
+                    key,
+                    args,
+                    requested_delivery,
+                );
             }
-            let message_with_context = self.remote_task_message(task_index, message)?;
-            self.queue_task_attempt(task_index, message)?;
+            if !self.tasks[task_index].state.finished() {
+                let result =
+                    self.queue_remote_send(task_index, message, delivery.unwrap_or("follow_up"));
+                if let Some(key) = operation_key {
+                    if result.is_ok()
+                        && let Some(command) = self.tasks[task_index]
+                            .remote
+                            .as_ref()
+                            .and_then(|remote| remote.send_command.as_ref())
+                    {
+                        self.attach_operation_delivery(
+                            &operation_scope,
+                            key,
+                            &command.command_id.to_string(),
+                        );
+                    } else if result.is_err() {
+                        self.remove_task_operation(&operation_scope, key);
+                    }
+                }
+                return result.map(|_| true);
+            }
+            let message_with_context = match self.remote_task_message(task_index, message) {
+                Ok(message) => message,
+                Err(error) => {
+                    if let Some(key) = operation_key {
+                        self.remove_task_operation(&operation_scope, key);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.queue_task_attempt(task_index, message) {
+                if let Some(key) = operation_key {
+                    self.remove_task_operation(&operation_scope, key);
+                }
+                return Err(error);
+            }
             let attempt_id = self.tasks[task_index].attempt_id.clone();
+            if let Some(key) = operation_key {
+                self.attach_operation_target_attempt(&operation_scope, key, &attempt_id);
+            }
             let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
             remote.send_command = Some(crate::protocol::Command::new(
                 "peer.thread.send",
                 json!({"threadId":remote.thread_id,"message":message_with_context,
                     "delivery":"attempt","attemptId":attempt_id}),
             ));
+            let command_id = remote
+                .send_command
+                .as_ref()
+                .expect("send command")
+                .command_id
+                .to_string();
             remote.state = RemoteState::Launching;
             remote.next_retry_at = 0;
-            self.start_queued_tasks();
+            if let Some(key) = operation_key {
+                self.attach_operation_delivery(&operation_scope, key, &command_id);
+            }
             return Ok(true);
         }
         if delivery == Some("steer") {
-            let thread = &mut self.threads[index];
-            if self.tasks[task_index].state.finished()
-                || !thread.status.busy()
-                || !thread.can_steer()
-            {
+            let can_steer = !self.tasks[task_index].state.finished()
+                && self.threads[index].status.busy()
+                && self.threads[index].can_steer();
+            if !can_steer {
                 return Err("This attempt cannot accept steering.".into());
             }
+            let delivery_id = format!("{}-operation-{}", self.tasks[task_index].id, unique_id());
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    Some(task_index),
+                    tool,
+                    key,
+                    args,
+                    "steer",
+                );
+                self.attach_operation_delivery(&operation_scope, key, &delivery_id);
+            }
             let text = delivery_text(
-                &format!("{}-brief-{}", self.tasks[task_index].id, unique_id()),
+                &delivery_id,
                 &format!("Shina: message from parent #{caller}\n\n{message}"),
             );
             self.tasks[task_index].attempt_message = text.clone();
+            let thread = &mut self.threads[index];
             thread.pending_injections.push_back(Injection {
                 text,
                 shown: false,
                 steer: thread.run_id.clone(),
+                peer_input: None,
             });
         } else if self.tasks[task_index].state.occupies_slot() {
+            let delivery_id = format!("{}-operation-{}", self.tasks[task_index].id, unique_id());
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    Some(task_index),
+                    tool,
+                    key,
+                    args,
+                    "follow_up",
+                );
+                self.attach_operation_delivery(&operation_scope, key, &delivery_id);
+            }
             let text = delivery_text(
-                &format!("{}-brief-{}", self.tasks[task_index].id, unique_id()),
+                &delivery_id,
                 &format!("Shina: message from parent #{caller}\n\n{message}"),
             );
             self.tasks[task_index].attempt_message = text.clone();
@@ -1497,6 +2414,7 @@ impl State {
                 text,
                 shown: false,
                 steer: None,
+                peer_input: None,
             });
         } else {
             let message = if self.tasks[task_index].state == TaskState::Queued {
@@ -1507,10 +2425,29 @@ impl State {
             } else {
                 message.to_owned()
             };
-            self.queue_task_attempt(task_index, &message)?;
-            self.start_queued_tasks();
+            if let Some(key) = operation_key {
+                self.begin_task_operation(
+                    caller_index,
+                    index,
+                    Some(task_index),
+                    tool,
+                    key,
+                    args,
+                    "follow_up",
+                );
+            }
+            if let Err(error) = self.queue_task_attempt(task_index, &message) {
+                if let Some(key) = operation_key {
+                    self.remove_task_operation(&operation_scope, key);
+                }
+                return Err(error);
+            }
+            if let Some(key) = operation_key {
+                let attempt = self.tasks[task_index].attempt_id.clone();
+                self.attach_operation_target_attempt(&operation_scope, key, &attempt);
+                self.attach_operation_delivery(&operation_scope, key, &attempt);
+            }
         }
-        self.checkpoint();
         Ok(true)
     }
 
@@ -1582,6 +2519,7 @@ impl State {
                 text: self.tasks[index].attempt_message.clone(),
                 shown: false,
                 steer: None,
+                peer_input: None,
             });
             self.connect_thread(child);
             changed = true;
@@ -1725,6 +2663,46 @@ impl State {
             tasks.push(task);
         }
         self.tasks = tasks;
+        let legacy: Vec<TaskOperation> = match index.get("taskOperations") {
+            None => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|error| format!("Invalid saved task operations: {error}."))?,
+        };
+        let durable = crate::database::for_path(&self.data_dir.join("index.json"))
+            .map(|database| database.task_operations())
+            .transpose()?
+            .unwrap_or_default();
+        let imported = durable.is_empty();
+        let operations: Vec<TaskOperation> = if imported {
+            legacy
+        } else {
+            durable
+                .into_iter()
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| format!("Invalid durable task operations: {error}."))
+                })
+                .collect::<Result<_, _>>()?
+        };
+        let mut keys = std::collections::HashSet::new();
+        let operations: Vec<_> = operations
+            .into_iter()
+            .filter(|operation| {
+                !operation.request_key.is_empty()
+                    && operation.request_key.len() <= 256
+                    && !operation.command_id.is_empty()
+                    && !operation.scope.is_empty()
+                    && matches!(operation.method.as_str(), "task_send" | "task_cancel")
+                    && keys.insert((operation.scope.clone(), operation.request_key.clone()))
+            })
+            .collect();
+        self.task_operations = operations;
+        if imported {
+            // A candidate or older build may have kept evidence only in the
+            // index. Import it once; from here the durable table is canonical.
+            self.stage_task_operations();
+        }
+        self.restore_peer_task_intents()?;
         Ok(())
     }
 
@@ -1922,6 +2900,7 @@ impl State {
                             text,
                             shown: false,
                             steer: None,
+                            peer_input: None,
                         });
                     changed = true;
                     enqueued = true;
@@ -1937,6 +2916,8 @@ impl State {
             }
         }
         changed |= self.start_queued_tasks();
+        changed |= self.reconcile_task_operations();
+        changed |= self.reconcile_peer_task_intents();
         changed | self.poll_legacy_tasks(now)
     }
 
@@ -2325,6 +3306,236 @@ mod tests {
     }
 
     #[test]
+    fn operation_ledger_tracks_save_dispatch_acceptance_completion_and_restart() {
+        let mut state = state_with_task();
+        let (_commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].status = Status::Running;
+        let args = json!({"thread_id":2,"message":"Ledger work","client_request_id":"ledger-1"});
+        let first = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(first["operation"]["saved"], true);
+        assert_eq!(first["operation"]["dispatch"], "queued");
+        assert_eq!(first["operation"]["acceptance"], "not_observed");
+        assert_eq!(first["operation"]["completion"], "not_observed");
+
+        // A provider prompt command is dispatch evidence, not acceptance.
+        assert!(state.threads[1].flush_injection());
+        state.reconcile_task_operations();
+        let injection_id = state.threads[1].injection_id.clone().unwrap();
+        assert_eq!(state.task_operations[0].dispatch, "dispatched");
+        assert_eq!(
+            state.task_operations[0].realized_delivery.as_deref(),
+            Some("follow_up")
+        );
+        assert_eq!(state.task_operations[0].acceptance, "not_observed");
+
+        // The prompt response proves worker acceptance; completion stays unobserved.
+        state.threads[1]
+            .observe_task_history(&json!({"type":"response","command":"prompt","id":injection_id}));
+        state.reconcile_task_operations();
+        assert_eq!(state.task_operations[0].acceptance, "accepted");
+        assert_eq!(state.task_operations[0].completion, "not_observed");
+
+        state.tasks[0].finish(TaskState::Completed, "done", "");
+        state.reconcile_task_operations();
+        assert_eq!(state.task_operations[0].completion, "completed");
+
+        // Replay keeps the immutable saved control and adds the fresh ledger.
+        let replay = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["control"], first["control"]);
+        assert_eq!(replay["operation"]["acceptance"], "accepted");
+        assert_eq!(replay["operation"]["completion"], "completed");
+        assert_eq!(
+            state.threads[1].pending_injections.len(),
+            1,
+            "replay never queues the input again"
+        );
+
+        let snapshot = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.restore_global(&snapshot).unwrap();
+        assert_eq!(restored.task_operations, state.task_operations);
+        let replay = restored.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["operation"]["completion"], "completed");
+    }
+
+    #[test]
+    fn local_cancel_operation_records_dispatch_and_completion_without_claiming_acceptance() {
+        let mut state = state_with_task();
+        let (_commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].status = Status::Running;
+        let attempt = state.tasks[0].attempt_id.clone();
+        let args = json!({"thread_id":2,"client_request_id":"local-cancel",
+            "attempt_id":attempt});
+        let response = state.mcp_call(1, "task_cancel", &args).unwrap();
+        assert_eq!(response["operation"]["requested_delivery"], "cancel");
+        assert_eq!(response["operation"]["dispatch"], "dispatched");
+        assert_eq!(response["operation"]["transport"], "accepted");
+        assert_eq!(response["operation"]["acceptance"], "not_observed");
+        // Task cancelled is the local decision. The provider is still stopping.
+        assert_eq!(response["operation"]["completion"], "not_observed");
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+        assert_eq!(state.threads[1].phase, "Stopping");
+        let replay = state.mcp_call(1, "task_cancel", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["control"], response["control"]);
+        assert_eq!(replay["operation"]["completion"], "not_observed");
+        // Settlement is observed separately from the local task-state decision.
+        state.threads[1].status = Status::Completed;
+        state.threads[1].phase.clear();
+        state.threads[1].injection_id = None;
+        state.reconcile_task_operations();
+        let settled = state
+            .task_operation_for(&state.task_operations[0].scope.clone(), "local-cancel")
+            .unwrap()
+            .clone();
+        assert_eq!(settled.completion, "cancelled");
+        assert_eq!(
+            settled.completion_attempt_id.as_deref(),
+            Some(attempt.as_str())
+        );
+    }
+
+    #[test]
+    fn late_steer_operation_records_realized_follow_up() {
+        let mut state = state_with_task();
+        let (commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].status = Status::Running;
+        state.threads[1].run_id = Some("run-a".into());
+        let attempt = state.tasks[0].attempt_id.clone();
+        let response = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"Steer late","client_request_id":"steer-late",
+                    "delivery":"steer","attempt_id":attempt}),
+            )
+            .unwrap();
+        assert_eq!(response["operation"]["requested_delivery"], "steer");
+        assert_eq!(response["operation"]["realized_delivery"], Value::Null);
+
+        // The observed run ended before the injection flushed. It becomes
+        // follow-up input, and the ledger says that rather than claiming steer.
+        state.threads[1].run_id = Some("run-b".into());
+        assert!(state.threads[1].flush_injection());
+        state.reconcile_task_operations();
+        assert_eq!(state.task_operations[0].requested_delivery, "steer");
+        assert_eq!(
+            state.task_operations[0].realized_delivery.as_deref(),
+            Some("follow_up")
+        );
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        assert_eq!(prompt["streamingBehavior"], "followUp");
+    }
+
+    #[test]
+    fn file_profile_keyed_control_commits_task_and_receipt_together() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-control-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut state = state_with_task();
+        state.data_dir = directory.clone();
+        state.load_global_for_test();
+        state.tasks[0].state = TaskState::Running;
+        state.tasks[0].recovering = false;
+        state.threads[1].recovering_task = false;
+        let args = json!({"thread_id":2,"message":"Atomic input","client_request_id":"atomic-1"});
+        let response = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(response["operation"]["saved"], true);
+        let index = crate::store::load(&directory.join("index.json"))
+            .unwrap()
+            .unwrap();
+        let receipt = index["commandReceipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt["result"]["requestKey"] == "atomic-1")
+            .expect("keyed receipt");
+        assert_eq!(
+            receipt["result"]["operation"]["requested_delivery"],
+            "follow_up"
+        );
+        assert!(
+            index["tasks"][0]["attempt_message"]
+                .as_str()
+                .unwrap()
+                .contains("Atomic input")
+        );
+        assert!(
+            index["taskOperations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|operation| operation["request_key"] == "atomic-1")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_file_snapshot_commits_neither_delegation_nor_receipt() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-delegate-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut state = State::new(PathBuf::new(), false);
+        state.data_dir = directory.clone();
+        state.load_global_for_test();
+        state.checkpoint_and_flush().unwrap();
+        let path = directory.join("index.json");
+        let before = std::fs::read(&path).unwrap();
+        let blocked = directory.join("blocked-index.json");
+        std::fs::create_dir(&blocked).unwrap();
+        state.store = Some(crate::store::Store::new(blocked, state.wake.clone()));
+        assert!(
+            state
+                .mcp_call(1, "delegate_task", &delegate_args("atomic-delegate"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let index = crate::store::load(&path).unwrap().unwrap();
+        assert!(index["tasks"].as_array().unwrap().is_empty());
+        assert!(
+            index["commandReceipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|receipt| receipt["result"]["requestKey"] != "atomic-delegate")
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_file_snapshot_commits_neither_task_intent_nor_receipt() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-control-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut state = state_with_task();
+        state.data_dir = directory.clone();
+        state.load_global_for_test();
+        state.checkpoint_and_flush().unwrap();
+        let path = directory.join("index.json");
+        let before = std::fs::read(&path).unwrap();
+        let blocked = directory.join("blocked-index.json");
+        std::fs::create_dir(&blocked).unwrap();
+        state.store = Some(crate::store::Store::new(blocked, state.wake.clone()));
+        let args =
+            json!({"thread_id":2,"message":"Never committed","client_request_id":"atomic-2"});
+        assert!(state.mcp_call(1, "task_send", &args).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let index = crate::store::load(&path).unwrap().unwrap();
+        assert!(
+            index["commandReceipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|receipt| receipt["result"]["requestKey"] != "atomic-2")
+        );
+        assert!(!index.to_string().contains("Never committed"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn keyed_sends_replay_without_delivering_twice() {
         let mut state = state_with_task();
         let args = json!({"thread_id":2,"message":"More context","client_request_id":"send-1"});
@@ -2416,6 +3627,13 @@ mod tests {
         let replay = state.mcp_call(home, "task_send", &send).unwrap();
         assert_eq!(replay["replayed"], true, "{replay}");
         assert_eq!(replay["attempt_id"], attempt);
+        assert_eq!(replay["operation"]["caller"], 1);
+        assert!(
+            replay["operation"]["scope"]
+                .as_str()
+                .unwrap()
+                .contains("captain/0")
+        );
         assert_eq!(
             state.threads[1].pending_injections.len(),
             1,
@@ -3030,6 +4248,7 @@ mod tests {
             text: state.tasks[0].completion_message(),
             shown: false,
             steer: None,
+            peer_input: None,
         });
         state.threads[0].injection_id = Some("ack-1".into());
         state.threads[0]
@@ -3360,15 +4579,15 @@ mod tests {
         let first;
         let stored_receipt;
         let server_id;
+        let stored_identity;
         {
             let mut runtime =
                 crate::runtime::RuntimeState::open(directory.clone(), Arc::new(|| {})).unwrap();
             runtime.state.demo = true;
             let database = runtime.database.clone().unwrap();
-            server_id = database.identity().unwrap()["controllerId"]
-                .as_str()
-                .unwrap()
-                .to_owned();
+            let identity = database.identity().unwrap();
+            server_id = identity["controllerId"].as_str().unwrap().to_owned();
+            stored_identity = identity;
             database.begin().unwrap();
             let capture = crate::outbox::Capture::begin();
             first = runtime
@@ -3386,7 +4605,7 @@ mod tests {
         }
         std::fs::write(directory.join("server-id"), &server_id).unwrap();
         let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
-        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TABLE IF EXISTS catalog_captain_scopes; DROP TABLE IF EXISTS catalog_checkouts; DROP TABLE IF EXISTS catalog_repository_remotes; DROP TABLE IF EXISTS catalog_repositories; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=OFF; DROP TABLE identity_audit_subjects; DROP TABLE identity_aliases; DROP TABLE identity_entities; DROP TABLE identity_workspace; DROP TABLE task_input_intents; DROP TABLE task_operations; DROP TABLE IF EXISTS catalog_captain_scopes; DROP TABLE IF EXISTS catalog_checkouts; DROP TABLE IF EXISTS catalog_repository_remotes; DROP TABLE IF EXISTS catalog_repositories; DROP TRIGGER IF EXISTS identity_audit_subject_is_not_device; DROP TRIGGER IF EXISTS identity_device_is_not_audit_subject; PRAGMA user_version=7;").unwrap();
         let mut legacy = crate::projection_store::read(&connection, "index.json")
             .unwrap()
             .unwrap();
@@ -3421,5 +4640,123 @@ mod tests {
         );
         assert_eq!(runtime.state.tasks.len(), 1);
         assert_eq!(runtime.state.threads.len(), 2);
+        let identity = runtime.database.as_ref().unwrap().identity().unwrap();
+        for field in ["workspaceId", "ownerId", "controllerId"] {
+            assert_eq!(identity[field], stored_identity[field], "{field}");
+        }
+    }
+
+    #[test]
+    fn live_file_only_reducer_refuses_keyed_controls_before_effects() {
+        let mut state = state_with_task();
+        state.runtime_enabled = true;
+        state.demo = false;
+        state.durable_task_controls = false;
+        let threads = state.threads.len();
+        let tasks = state.tasks.len();
+        let refused = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"file-only work","client_request_id":"file-only-delegate"}),
+            )
+            .unwrap_err();
+        assert!(refused.contains("durable server profile"), "{refused}");
+        assert_eq!(state.threads.len(), threads);
+        assert_eq!(state.tasks.len(), tasks);
+
+        let send = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"blocked",
+                    "client_request_id":"file-only-send"}),
+            )
+            .unwrap_err();
+        assert!(send.contains("durable server profile"), "{send}");
+        assert!(state.threads[1].pending_injections.is_empty());
+
+        let attempt = state.tasks[0].attempt_id.clone();
+        let cancel = state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"file-only-cancel",
+                    "attempt_id":attempt}),
+            )
+            .unwrap_err();
+        assert!(cancel.contains("durable server profile"), "{cancel}");
+        assert_eq!(state.tasks[0].state, TaskState::Running);
+
+        let mut legacy = Thread::new(3);
+        legacy.parent = Some(1);
+        legacy.delegated = true;
+        legacy.request = Some(json!({"id":"legacy-question","method":"input"}));
+        legacy.request_generation = "legacy-generation".into();
+        let (commands, _events) = fake_pi(&mut legacy);
+        state.threads.push(legacy);
+        state.next_id = 4;
+        let answer = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":3,"message":"legacy answer",
+                    "client_request_id":"file-only-legacy",
+                    "request_id":"legacy-question","runtime_generation":"legacy-generation"}),
+            )
+            .unwrap_err();
+        assert!(answer.contains("durable server profile"), "{answer}");
+        assert!(state.threads[2].request.is_some());
+        assert!(commands.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn operation_ledger_keeps_old_keys_beyond_the_bounded_status_view() {
+        let mut state = state_with_task();
+        for index in 0..200 {
+            state.begin_task_operation(
+                0,
+                1,
+                Some(0),
+                "task_send",
+                &format!("retain-{index}"),
+                &json!({"message":"retained"}),
+                "follow_up",
+            );
+        }
+        assert_eq!(state.task_operations.len(), 200);
+        assert!(
+            state
+                .task_operation_for(&state.task_operations[0].scope.clone(), "retain-0")
+                .is_some()
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot["taskOperations"].as_array().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn replay_flags_missing_history_without_blaming_an_existing_target() {
+        let mut state = state_with_task();
+        let key = "missing-ledger";
+        let args = json!({"thread_id":2,"message":"retained",
+            "client_request_id":key});
+        let command = State::task_control_command("task_send", key, &args);
+        let scope = state.caller_operation_scope(0);
+        state.command_receipts.push(Receipt {
+            command_id: command.command_id,
+            device_id: scope,
+            hash: command.hash(),
+            status: ReceiptStatus::Accepted,
+            result: json!({"thread_id":2,"operation":{
+                "request_key":key,"task_id":state.tasks[0].id}}),
+            seq: 0,
+        });
+        let replay = state
+            .task_control_receipt_replay(0, "task_send", key, &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay["target_missing"], false);
+        assert_eq!(replay["operation_history_unavailable"], true);
+        assert_eq!(replay["task_missing"], false);
     }
 }

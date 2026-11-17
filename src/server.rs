@@ -867,6 +867,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         if history_items { capabilities.push(protocol::HISTORY_ITEMS); }
                         if minor >= 7 { capabilities.extend([protocol::PEER_TASKS, protocol::THREAD_READ]); }
                         if minor >= u64::from(protocol::PEER_TASK_FENCES_MINOR) { capabilities.push(protocol::PEER_TASK_FENCES); }
+                        if minor >= u64::from(protocol::PEER_TASK_EVIDENCE_MINOR) { capabilities.push(protocol::PEER_TASK_EVIDENCE); }
                         if minor >= 8 { capabilities.push(protocol::REMOTE_PROJECT_SCOPE); }
                         if minor >= 8 { capabilities.push(protocol::COMPOSER_TRANSACTIONS); }
                         if minor >= 9 { capabilities.push(protocol::RUN_CONTROL); }

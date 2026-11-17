@@ -910,18 +910,18 @@ impl State {
         }
         let thread = &self.threads[index];
         if thread.peer_origin.is_some() {
-            if thread.pending_injections.is_empty()
-                && let Some(origin) = &thread.peer_origin
-                && !origin.attempt_message.is_empty()
-            {
-                let text = origin.attempt_message.clone();
-                self.threads[index].pending_injections.push_back(Injection {
-                    text,
-                    shown: false,
-                    steer: None,
-                });
+            let intents: Vec<_> = self
+                .peer_task_intents
+                .iter()
+                .filter(|intent| intent.thread_id == thread.id && intent.kind == "input")
+                .cloned()
+                .collect();
+            for intent in intents {
+                self.provision_peer_task_intent(&intent);
             }
-            self.connect_thread(index);
+            if !self.threads[index].pending_injections.is_empty() {
+                self.connect_thread(index);
+            }
             return;
         }
         if thread.delegated {

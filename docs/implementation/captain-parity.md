@@ -298,6 +298,83 @@ The live serve-process test client now assembles snapshot pages and calls
 to accept invalid patches. This prerequisite does not include #32 capability
 policy or #24 client item caching, and it makes no performance claim.
 
+### Item-level projection candidate for #24
+
+The candidate adds immutable, source-ID-keyed item fields alongside compact
+thread records. Unchanged fields and item payloads share `Arc` allocations.
+The client deserializes only changed items while retaining local disclosure
+state, drafts and selection. Separate structure and content tokens support the
+later timeline cache. Source identity, item order, anchors, deferred markers and
+snapshot recovery invalidate structure; ordinary text edits invalidate content.
+
+Root review reproduced two failures when the client's single-slot mailbox
+overwrote an intermediate projection. The latest emission's thread and item
+change sets omitted earlier unapplied changes. Application now compares each
+incoming projection and item against its last successful apply. Both the
+cross-thread and same-thread coalescing regressions fail before the correction
+and pass afterward.
+
+Review also reproduced missing structure invalidation on an anchor edit and
+missing content invalidation on metadata changes. Emission tokens now cover
+those cases and cannot repeat after snapshot or cache replacement. A content
+edit still preserves structure. Item replacement also releases its old byte
+budget instead of retaining the larger estimate after content shrinks.
+
+The benchmark keeps separate clients for delta, materialized full apply and a
+legacy cache reference. The legacy reference uses the pinned `269a2d0` cache
+algorithms with the current full-apply implementation, not an old executable.
+Every reference starts with all thread histories loaded. KSG measurements are
+logical workload comparisons only; do not claim a cross-runtime speed ratio.
+Native UI-frame performance and finer virtualization remain #25 and #26 work.
+This candidate is not yet publication or issue-closure evidence.
+
+Independent review confirmed the coalescing repair but reproduced scalar-only
+retry anchors that remained server-relative and deferred/history metadata that
+missed invalidation flags. Retry remapping now runs on scalar refresh as well
+as message-window changes. Compact record comparisons cover history errors and
+retry transitions; deferred-list changes invalidate structure. The three new
+regressions fail before these corrections and pass afterward.
+
+The same review found cache eviction retaining emitted item references and
+leaving an evicted subscription unable to reload. Eviction now drops the source,
+installed and emitted cache entries, emits an unloaded thread, and invalidates
+its subscription. A new request takes a fresh snapshot without a replay cursor.
+An outstanding earlier/work page drains before reusing its RPC id and cannot
+recreate an evicted partial base. The client apply test proves that an unloaded
+emission also releases the UI's last-applied item references.
+
+The 64 MiB history estimate now includes raw source rows, installed values and
+retained emitted field versions. Identical installed/emitted field allocations
+count once; replaced fields count conservatively until their next emission.
+This is serialized cache retention, not a process RSS cap or an accounting of
+arbitrary external snapshots. The pressure regression crosses the real 64 MiB
+limit across three threads, checks released item references, applies a metadata
+update, reloads the evicted subscription and compares it with a fresh snapshot.
+All 13 client-history and 13 delta-projection tests pass.
+
+The candidate still needs CI and publication before a #25/#26 merge.
+The actual historical-executable and pinned same-transcript comparison is now
+recorded in [projection-benchmark.md](projection-benchmark.md), with full
+numbers and source/fixture hashes in the adjacent JSON. It uses compiled main
+`5c6e98a`, not the legacy cache proxy, and a clean KSG checkout at `4807bb1`.
+The client-path measurement also found an unnecessary full re-anchor pass for
+text-only message changes. That pass now runs only when message positions
+change or fresh assembly needs its final anchor remap. Fourteen client-history
+tests and thirteen non-benchmark delta tests cover the correction.
+
+Combined-main verification at `8475cc6` includes the identity prerequisite and
+strict server baseline. Build, formatting and the full serial test run passed:
+2,033 unit tests, 112 integration tests and two examples, with 12 opt-in tests
+ignored. The shared benchmark tooling under development is separate from that
+tested production code.
+
+The returned #23 scheduler candidate still needs current-main integration.
+Its `remote_occupancy_unproven` helper checks `stop_owed` and offline state, but
+merged #22 clears the owed transport stop on receipt and keeps the remote state
+`Running` until provider settlement. Integration must preserve the reservation
+through that intermediate state. A stored stop receipt alone cannot release
+capacity. The original candidate remains unchanged.
+
 ## Capy package investigation
 
 Inspected on November 16, 2026 without installing or launching Capy. The official

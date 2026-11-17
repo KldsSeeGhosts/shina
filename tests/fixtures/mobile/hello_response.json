@@ -23,6 +23,7 @@
       "peer-tasks-v2",
       "thread-read-v2",
       "peer-task-fences-v1",
+      "peer-task-evidence-v1",
       "remote-project-scope-v1",
       "composer-transactions",
       "run-control",

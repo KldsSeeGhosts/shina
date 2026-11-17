@@ -207,6 +207,11 @@ pub const THREAD_READ: &str = "thread-read-v2";
 pub const PEER_TASK_FENCES: &str = "peer-task-fences-v1";
 pub const PEER_TASK_FENCES_UPDATE_REQUIRED: &str =
     "Update required on the target machine before it can honor attempt-fenced task control.";
+/// The target reports per-command transport, realized delivery and provider
+/// input evidence inside peer.thread.wait. Homes must not promote a bare
+/// peer.thread.send receipt to provider acceptance without this contract.
+pub const PEER_TASK_EVIDENCE_MINOR: u32 = 45;
+pub const PEER_TASK_EVIDENCE: &str = "peer-task-evidence-v1";
 /// Workers get an explicit shared, isolated or existing checkout before any
 /// provider starts. The resolved placement travels in launch replies, wait
 /// statuses and thread records.

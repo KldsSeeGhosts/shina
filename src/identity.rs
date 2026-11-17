@@ -2337,6 +2337,43 @@ mod tests {
     }
 
     #[test]
+    fn schema_eight_upgrades_task_tables_without_replacing_identity() {
+        let directory =
+            schema_seven_profile("identity-schema-eight-upgrade", &fixture(), &routines());
+        let first = Database::open(&directory).unwrap();
+        let identity = first.identity().unwrap();
+        drop(first);
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_input_intents;
+                 DROP TABLE task_operations;
+                 PRAGMA user_version=8;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let upgraded = Database::open(&directory).unwrap();
+        assert_eq!(upgraded.identity().unwrap(), identity);
+        drop(upgraded);
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        for table in ["task_operations", "task_input_intents"] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "schema 8 -> 9 did not create {table}");
+        }
+    }
+
+    #[test]
     fn newer_sqlite_schema_is_rejected_before_tables_are_touched() {
         let directory = profile_dir("identity-newer-schema");
         let connection = Connection::open(directory.join("state.sqlite")).unwrap();

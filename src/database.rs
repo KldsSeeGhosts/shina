@@ -35,6 +35,8 @@ struct Inner {
     staged: BTreeMap<String, Value>,
     staged_push: Vec<crate::mobile_push::Staged>,
     staged_tool_receipts: Vec<Receipt>,
+    staged_task_operations: Vec<Value>,
+    staged_task_input_intents: Vec<Value>,
     revocations: Vec<String>,
     failure: Option<String>,
     dispatch_fenced: bool,
@@ -206,7 +208,13 @@ impl Database {
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
-        // Migration 009 is reserved by the pending task-evidence candidate.
+        if version < 9 {
+            crate::maintenance::backup_state(directory)?;
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/009.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
         if version < 10 {
             crate::maintenance::backup_state(directory)?;
             let tx = connection.transaction().map_err(error)?;
@@ -261,6 +269,8 @@ impl Database {
             staged: BTreeMap::new(),
             staged_push: Vec::new(),
             staged_tool_receipts: Vec::new(),
+            staged_task_operations: Vec::new(),
+            staged_task_input_intents: Vec::new(),
             revocations: Vec::new(),
             failure: None,
             dispatch_fenced: false,
@@ -492,6 +502,8 @@ impl Database {
         }
         let staged = std::mem::take(&mut inner.staged);
         let tool_receipts = std::mem::take(&mut inner.staged_tool_receipts);
+        let task_operations = std::mem::take(&mut inner.staged_task_operations);
+        let task_input_intents = std::mem::take(&mut inner.staged_task_input_intents);
         let history_events = std::mem::take(&mut inner.history_events);
         let metrics_path = if cfg!(debug_assertions) {
             std::env::var_os("SHINA_TEST_STORAGE_METRICS").map(PathBuf::from)
@@ -548,6 +560,70 @@ impl Database {
             for mut tool_receipt in tool_receipts {
                 tool_receipt.seq = seq;
                 put_receipt(&tx, &tool_receipt)?;
+            }
+            // Task-operation evidence is durable and append-only by key. The
+            // projected index keeps only a bounded view; this table is the
+            // authoritative replay record and is never trimmed by the reducer.
+            for operation in task_operations {
+                let scope = operation["scope"]
+                    .as_str()
+                    .ok_or("Invalid task operation scope.")?;
+                let request_key = operation["request_key"]
+                    .as_str()
+                    .ok_or("Invalid task operation key.")?;
+                let command_id = operation["command_id"]
+                    .as_str()
+                    .ok_or("Invalid task operation command.")?;
+                tx.execute(
+                    "INSERT INTO task_operations(scope,request_key,command_id,task_id,target_thread_id,updated_at,payload)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)
+                     ON CONFLICT(scope,request_key) DO UPDATE SET
+                        command_id=excluded.command_id,task_id=excluded.task_id,
+                        target_thread_id=excluded.target_thread_id,
+                        updated_at=excluded.updated_at,payload=excluded.payload",
+                    params![
+                        scope,
+                        request_key,
+                        command_id,
+                        operation["task_id"].as_str(),
+                        operation["target_thread_id"].as_u64().unwrap_or(0) as i64,
+                        crate::lifecycle::now() as i64,
+                        operation.to_string()
+                    ],
+                )
+                .map_err(error)?;
+            }
+            // Target input/control intent is written before any provider
+            // command. A later effect may still be uncertain, but the exact
+            // command and queue intent can no longer disappear with memory.
+            for intent in task_input_intents {
+                let thread_id = intent["thread_id"]
+                    .as_u64()
+                    .and_then(|id| i64::try_from(id).ok())
+                    .ok_or("Invalid task input thread.")?;
+                let command_id = intent["command_id"]
+                    .as_str()
+                    .ok_or("Invalid task input command.")?;
+                let kind = intent["kind"].as_str().ok_or("Invalid task input kind.")?;
+                tx.execute(
+                    "INSERT INTO task_input_intents(thread_id,command_id,kind,attempt_id,request_id,runtime_generation,updated_at,payload)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                     ON CONFLICT(thread_id,command_id) DO UPDATE SET
+                        kind=excluded.kind,attempt_id=excluded.attempt_id,
+                        request_id=excluded.request_id,runtime_generation=excluded.runtime_generation,
+                        updated_at=excluded.updated_at,payload=excluded.payload",
+                    params![
+                        thread_id,
+                        command_id,
+                        kind,
+                        intent["attempt_id"].as_str(),
+                        intent["request_id"].as_str(),
+                        intent["runtime_generation"].as_str(),
+                        crate::lifecycle::now() as i64,
+                        intent.to_string()
+                    ],
+                )
+                .map_err(error)?;
             }
             if let Some(receipt) = receipt {
                 put_receipt(&tx, receipt)?;
@@ -870,6 +946,84 @@ impl Database {
                 seq: 0,
             });
         Ok(())
+    }
+
+    /// Durable task-operation evidence. The reducer stages the complete
+    /// payload in the same batch as its receipt and queued input, so a failed
+    /// commit cannot leave a claimed acceptance without its saved intent.
+    pub fn stage_task_operation(&self, operation: Value) -> Result<(), String> {
+        self.require_batch()?;
+        if !operation["scope"].is_string()
+            || !operation["request_key"].is_string()
+            || !operation["command_id"].is_string()
+        {
+            return Err("Invalid task operation evidence.".into());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_task_operations
+            .push(operation);
+        Ok(())
+    }
+
+    pub fn task_operations(&self) -> Result<Vec<Value>, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(error) = &inner.failure {
+            return Err(error.clone());
+        }
+        let mut statement = inner
+            .connection
+            .prepare("SELECT payload FROM task_operations ORDER BY updated_at, scope, request_key")
+            .map_err(error)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(error)?
+            .map(|row| {
+                let text = row.map_err(error)?;
+                serde_json::from_str(&text).map_err(error)
+            })
+            .collect()
+    }
+
+    /// Durable target-side peer input and stop intent. This table is separate
+    /// from the controller operation ledger because the target owns the queue
+    /// and provider observations, not the caller's saved receipt.
+    pub fn stage_task_input_intent(&self, intent: Value) -> Result<(), String> {
+        self.require_batch()?;
+        if !intent["thread_id"].is_u64()
+            || intent["command_id"].as_str().is_none_or(str::is_empty)
+            || !matches!(intent["kind"].as_str(), Some("input" | "cancel"))
+        {
+            return Err("Invalid task input intent.".into());
+        }
+        self.0
+            .lock()
+            .expect("database")
+            .staged_task_input_intents
+            .push(intent);
+        Ok(())
+    }
+
+    pub fn task_input_intents(&self) -> Result<Vec<Value>, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(error) = &inner.failure {
+            return Err(error.clone());
+        }
+        let mut statement = inner
+            .connection
+            .prepare(
+                "SELECT payload FROM task_input_intents ORDER BY updated_at, thread_id, command_id",
+            )
+            .map_err(error)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(error)?
+            .map(|row| {
+                let text = row.map_err(error)?;
+                serde_json::from_str(&text).map_err(error)
+            })
+            .collect()
     }
 
     pub fn stage_history(&self, events: Vec<Value>) {
@@ -2274,6 +2428,35 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&saved).unwrap(),
             json!({"verified":"committed"})
+        );
+    }
+
+    #[test]
+    fn task_operation_evidence_is_not_trimmed_by_the_projection_limit() {
+        let directory = directory("task-operations");
+        let database = Database::open(&directory).unwrap();
+        database.begin().unwrap();
+        for index in 0..200 {
+            database
+                .stage_task_operation(json!({
+                    "scope":"mcp/delegate/thread/1",
+                    "request_key":format!("retain-{index}"),
+                    "command_id":uuid::Uuid::new_v4().to_string(),
+                    "task_id":"task-1",
+                    "target_thread_id":2,
+                    "method":"task_send"
+                }))
+                .unwrap();
+        }
+        database
+            .commit(1, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        let operations = database.task_operations().unwrap();
+        assert_eq!(operations.len(), 200);
+        assert!(
+            operations
+                .iter()
+                .any(|operation| { operation["request_key"] == "retain-0" })
         );
     }
 }
