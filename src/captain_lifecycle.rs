@@ -815,6 +815,7 @@ mod tests {
                 text: exact.clone(),
                 shown: false,
                 steer: None,
+                peer_input: None,
             });
         assert!(state.captain_archive_blockers(0).is_empty());
         state.threads[index].pending_injections[0]
@@ -910,6 +911,7 @@ mod tests {
                     text,
                     shown: false,
                     steer: None,
+                    peer_input: None,
                 });
         }
         assert_eq!(state.threads[index].pending_injections.len(), 2);

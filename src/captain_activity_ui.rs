@@ -1224,7 +1224,10 @@ mod tests {
         );
         rt.state.client = Some(client);
         let projection = rt.state.projection();
-        rt.state.machines.views.insert("studio".into(), projection);
+        rt.state
+            .machines
+            .views
+            .insert("studio".into(), projection.into());
         rt.state.machines.selected = "studio".into();
         // The link reports disconnected only off the demo path.
         rt.state.demo = false;
@@ -1307,7 +1310,10 @@ mod tests {
         client.linked.insert("studio".into(), remote);
         rt.state.client = Some(client);
         let projection = rt.state.projection();
-        rt.state.machines.views.insert("studio".into(), projection);
+        rt.state
+            .machines
+            .views
+            .insert("studio".into(), projection.into());
         rt.state.machines.selected = "studio".into();
         rt.invalidate();
         rt.frame(0.0);

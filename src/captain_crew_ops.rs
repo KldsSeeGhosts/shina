@@ -1323,6 +1323,7 @@ mod tests {
                 cancelled_commands: vec![],
                 reply_after_position: 0,
                 document_reads: false,
+                inputs: Vec::new(),
             });
         });
         let create = |runtime: &mut RuntimeState, caller: usize| {

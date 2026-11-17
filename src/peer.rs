@@ -247,7 +247,7 @@ pub struct Machines {
     /// window, not to whichever server currently supplies the conversation.
     pub scope_server: Option<String>,
     pub scope_remote: Vec<(String, usize)>,
-    pub views: std::collections::BTreeMap<String, Value>,
+    pub views: std::collections::BTreeMap<String, crate::client_history::Projection>,
     pub threads: std::collections::HashMap<String, Vec<crate::model::Thread>>,
     pub ui: Value,
     pub receipts: std::collections::HashMap<String, Vec<crate::client::Event>>,

@@ -1,11 +1,12 @@
 # Execution leases and controller ownership
 
-Schema 8 index version 5 stores execution leases in the additive
-`execution` object. The change needs no SQLite table and does not use migration
-9, which is reserved for the repository catalog. The wire contract is the
-exact capability `execution-leases-v1` at protocol minor 44. A peer that does
-not advertise that capability receives no managed task or lease. Minor 44 alone
-does not grant any other reserved feature.
+Index version 5 stores execution leases in the additive `execution` object.
+Published schema 9 retains the task-operation and input-intent tables unchanged.
+This change adds no SQLite table or migration. The wire contract is the exact
+capability `execution-leases-v1` at tentative protocol minor 48, after the
+separately reserved scheduler 46 and catalog 47. A peer that does not advertise
+that capability receives no managed task or lease. Minor 48 alone does not
+grant any other reserved feature.
 
 ## Identity split
 

@@ -42,6 +42,8 @@ project aliases remain present.
 Missing references, alias conflicts, malformed IDs and unknown future index or
 schema versions block opening. Reopening also checks the controller against
 `server-id`; replacing that file cannot silently reassign the saved controller.
+The index version check runs before SQLite schema changes or first import.
+Rejecting a future file format does not create an empty database beside it.
 File-only profiles validate saved records, history and queued inputs before
 writing the same catalog into `index.json`. Their pre-migration directory is
 copied to `backups/` and the new index is installed with the existing atomic

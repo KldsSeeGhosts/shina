@@ -157,6 +157,7 @@ impl Fixture {
         std::fs::create_dir_all(&state.data_dir).unwrap();
         state.load_global_for_test();
         state.runtime_enabled = true;
+        state.durable_task_controls = true;
         state.test_git_context = Some(crate::vcs::GitContext {
             git_config_global: Some(self.empty_cfg.clone()),
             git_config_system: Some(self.empty_cfg.clone()),
@@ -552,6 +553,7 @@ fn restart_preserves_and_reuses_the_recorded_reservation() {
     restored.data_dir = state.data_dir.clone();
     restored.restore_global(&snapshot).unwrap();
     restored.runtime_enabled = true;
+    restored.durable_task_controls = true;
     restored.test_git_context = state.test_git_context.clone();
     poll_until_ready(&mut restored, 15);
     let placement = child_placement(&restored, 1);
@@ -771,6 +773,7 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
             &Command::new("peer.thread.stop", json!({"threadId":child_id})),
         )
         .unwrap();
+    target.reconcile_peer_task_intents();
     assert_eq!(target.threads[1].task_result, Some("cancelled"));
     let deadline = Instant::now() + Duration::from_secs(20);
     while !target.placement_rxs.is_empty() {
@@ -804,7 +807,16 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
         child_placement(&target, 1).phase,
         placement::PlacementPhase::Ready
     );
-    assert_eq!(target.threads[1].pending_injections.len(), 1);
+    assert_eq!(
+        target.threads[1].pending_injections.len(),
+        1,
+        "{:?}",
+        target.threads[1]
+            .pending_injections
+            .iter()
+            .map(|injection| injection.text.as_str())
+            .collect::<Vec<_>>()
+    );
     assert!(
         target.threads[1].pending_injections[0]
             .text
@@ -953,6 +965,7 @@ fn peer_origin() -> remote_tasks::PeerOrigin {
         cancelled_commands: Vec::new(),
         reply_after_position: 0,
         document_reads: false,
+        inputs: Vec::new(),
     }
 }
 
@@ -1295,9 +1308,12 @@ fn two_delegated_writers_on_one_peer_get_distinct_provisioned_worktrees() {
         let (send, receive) = mpsc::channel();
         send.send(Ok(json!({"status": "accepted", "result": accepted})))
             .unwrap();
-        parent
-            .peer_runtime
-            .inject_pending(task.id.clone(), "peer.thread.launch".into(), receive);
+        parent.peer_runtime.inject_pending(
+            task.id.clone(),
+            task.remote.as_ref().unwrap(),
+            "peer.thread.launch".into(),
+            receive,
+        );
     }
     assert!(parent.poll_remote_tasks());
     poll_until_ready(&mut target, 20);
@@ -1520,6 +1536,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
         .unwrap();
     parent.peer_runtime.inject_pending(
         parent.tasks[0].id.clone(),
+        parent.tasks[0].remote.as_ref().unwrap(),
         "peer.thread.launch".into(),
         receive,
     );
@@ -1570,6 +1587,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
     .unwrap();
     parent.peer_runtime.inject_pending(
         parent.tasks[0].id.clone(),
+        parent.tasks[0].remote.as_ref().unwrap(),
         "peer.thread.wait".into(),
         receive,
     );
@@ -1638,6 +1656,7 @@ fn a_peer_dependent_checkout_uses_the_target_upstream_branch_pinned_at_reservati
         .unwrap();
     parent.peer_runtime.inject_pending(
         parent.tasks[1].id.clone(),
+        parent.tasks[1].remote.as_ref().unwrap(),
         "peer.thread.launch".into(),
         receive,
     );

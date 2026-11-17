@@ -667,7 +667,10 @@ fn fleet_demo(state: &mut State) {
             });
             client.linked.insert(server.into(), remote);
         }
-        state.machines.views.insert(server.into(), projection);
+        state
+            .machines
+            .views
+            .insert(server.into(), projection.into());
     }
     state.client = Some(client);
 }
@@ -1637,6 +1640,16 @@ fn long_draft_demo(state: &mut State) {
     );
     state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
 }
+
+/// Unit-test builds count allocations so projection benchmarks can report them.
+/// Run benchmarks with `--test-threads=1` so no sibling test pollutes the count.
+#[cfg(test)]
+#[path = "../tools/projection-benchmark-alloc.rs"]
+pub(crate) mod test_alloc;
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: test_alloc::Counting = test_alloc::Counting;
 
 #[cfg(test)]
 mod tests {

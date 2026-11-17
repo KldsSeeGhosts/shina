@@ -215,6 +215,51 @@ pub use remote_tasks::{
 #[path = "runtime_poll.rs"]
 mod runtime_poll;
 
+/// Debug-only deterministic barrier for the queued-input integration test.
+/// It blocks the provider slot in an isolated profile until the test creates
+/// the release file. Production builds and ordinary profiles never see it.
+#[cfg(debug_assertions)]
+fn test_hold_injection_flush() -> bool {
+    let Some(release) = std::env::var_os("SHINA_TEST_HOLD_INJECTION_FLUSH") else {
+        return false;
+    };
+    let release = std::path::PathBuf::from(release);
+    let held = release.starts_with(std::env::temp_dir())
+        && release
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("shina-server-integration-")
+            })
+        && !release.exists();
+    held
+}
+
+/// Debug-only barrier for a peer input that has already crossed the failed
+/// observation boundary. Ordinary task injections are not held by it.
+#[cfg(debug_assertions)]
+fn test_hold_peer_input_flush() -> bool {
+    let Some(release) = std::env::var_os("SHINA_TEST_HOLD_PEER_INPUT") else {
+        return false;
+    };
+    let release = std::path::PathBuf::from(release);
+    release.starts_with(std::env::temp_dir())
+        && release
+            .parent()
+            .and_then(|path| path.file_name())
+            .is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("shina-server-integration-")
+            })
+        && !release.exists()
+}
+
+#[cfg(not(debug_assertions))]
+fn test_hold_peer_input_flush() -> bool {
+    false
+}
+
 struct Injection {
     text: String,
     shown: bool,
@@ -223,6 +268,8 @@ struct Injection {
     /// the steering input goes to the follow-up queue instead of interrupting
     /// work the caller never saw.
     steer: Option<String>,
+    /// The peer command whose provider acceptance this injection can prove.
+    peer_input: Option<uuid::Uuid>,
 }
 
 struct TaskWaiter {
@@ -965,6 +1012,18 @@ pub struct Thread {
     pub tools: Vec<Tool>,
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
+    /// Item lists keyed by the last applied projection's stable source ids.
+    /// The next apply reuses unchanged items positionally or by id; it never
+    /// rebuilds items that did not change.
+    pub(crate) transcript_fields:
+        std::collections::HashMap<&'static str, std::sync::Arc<crate::client_history::FieldItems>>,
+    /// Last successfully applied source, not the network's previous emission.
+    pub(crate) transcript_projection:
+        Option<std::sync::Arc<crate::client_history::ThreadProjection>>,
+    /// Structure and content revisions of the last applied emission; the
+    /// timeline consumer (#25) diffs these instead of rescanning items.
+    pub(crate) transcript_structure: u64,
+    pub(crate) transcript_content: u64,
     pub draft: TextEdit,
     pub queued_edit: Option<QueuedEdit>,
     queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
@@ -1063,6 +1122,23 @@ pub struct Thread {
     pending_prompt: Option<(String, Prompt, usize)>,
     pending_injections: VecDeque<Injection>,
     injection_id: Option<String>,
+    /// Delivery markers whose prompt command reached the provider, with the
+    /// behavior actually used. Consumed into the durable operation ledger.
+    pub(super) injection_dispatches: Vec<(String, String)>,
+    /// Provider rejections for exact internal delivery ids. This is separate
+    /// from `accepted_deliveries`; a rejected prompt is never retried blindly.
+    pub(super) rejected_injections: Vec<(String, String)>,
+    /// The provider prompt command currently proving a peer input's acceptance.
+    pub(super) peer_prompt: Option<(String, uuid::Uuid)>,
+    /// A restored peer input whose absence must be proven by authoritative
+    /// provider history before it can be dispatched again.
+    pub(super) peer_recovery_held: bool,
+    /// Exact input digests read from a successful provider history response.
+    /// Optimistic local transcript rows never enter this transient set.
+    pub(super) peer_input_history: std::collections::HashSet<[u8; 32]>,
+    /// Peer input commands actually written to the adapter, with the realized
+    /// delivery and run. Absence here never proves the provider did not read it.
+    pub(super) peer_dispatches: Vec<(String, String, Option<String>)>,
     injection_retry_at: Option<Instant>,
     operation_deadline: Option<(&'static str, Instant)>,
     task_result: Option<&'static str>,
@@ -1546,6 +1622,10 @@ impl Thread {
             tools: vec![],
             thoughts: vec![],
             work: vec![],
+            transcript_fields: std::collections::HashMap::new(),
+            transcript_projection: None,
+            transcript_structure: 0,
+            transcript_content: 0,
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             typing_guard: crate::composer::TypingGuard::default(),
@@ -1628,6 +1708,12 @@ impl Thread {
             pending_prompt: None,
             pending_injections: VecDeque::new(),
             injection_id: None,
+            injection_dispatches: Vec::new(),
+            rejected_injections: Vec::new(),
+            peer_prompt: None,
+            peer_recovery_held: false,
+            peer_input_history: Default::default(),
+            peer_dispatches: Vec::new(),
             injection_retry_at: None,
             operation_deadline: None,
             task_result: None,
@@ -1687,6 +1773,7 @@ impl Thread {
         self.last_activity = Instant::now();
         self.state_loaded = false;
         self.history_loaded = false;
+        self.peer_input_history.clear();
         self.startup_model_applied = false;
         self.startup_thinking_applied = false;
         self.startup_selection_check = None;
@@ -2716,24 +2803,28 @@ impl Thread {
         }
     }
 
-    fn enqueue_injection(&mut self, text: String) {
+    fn enqueue_injection(&mut self, text: String) -> String {
         self.serial += 1;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
+        let delivery = format!("{}-{}-{stamp}", self.id, self.serial);
         self.pending_injections.push_back(Injection {
-            text: format!(
-                "{INJECTION_PREFIX}[delivery {}-{}-{stamp}]\n{text}",
-                self.id, self.serial
-            ),
+            text: format!("{INJECTION_PREFIX}[delivery {delivery}]\n{text}"),
             shown: false,
             steer: None,
+            peer_input: None,
         });
+        delivery
     }
 
     fn flush_injection(&mut self) -> bool {
         if self.offline_blocked || self.provider_update_held || self.status == Status::Paused {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        if test_hold_injection_flush() {
             return false;
         }
         if self
@@ -2760,12 +2851,20 @@ impl Thread {
         {
             return false;
         }
+        if self.pending_injections[0].peer_input.is_some()
+            && (!self.history_loaded || self.peer_recovery_held || test_hold_peer_input_flush())
+        {
+            // Recovery needs a completed stable-history read before an input
+            // that may have crossed the crash boundary can be retried.
+            return false;
+        }
         if self.harness == "pi" && self.model_provider != "cpa" {
             self.error =
                 Some("Choose a CPA model before Shina can deliver queued messages.".into());
             return false;
         }
         let text = self.pending_injections[0].text.clone();
+        let peer_input = self.pending_injections[0].peer_input;
         // A steer injection pins the run it was declared against. If that run
         // already ended, the message becomes ordinary follow-up input so it
         // queues behind the newer work rather than vanishing.
@@ -2786,7 +2885,34 @@ impl Thread {
         ) {
             return false;
         }
-        self.injection_id = Some(format!("{}-{}", self.id, self.serial));
+        let prompt_command = format!("{}-{}", self.id, self.serial);
+        self.injection_id = Some(prompt_command.clone());
+        if let Some(peer) = peer_input {
+            self.peer_prompt = Some((prompt_command, peer));
+            self.peer_dispatches
+                .push((peer.to_string(), behavior.into(), self.run_id.clone()));
+            if let Some(origin) = &mut self.peer_origin
+                && let Some(evidence) = origin
+                    .inputs
+                    .iter_mut()
+                    .find(|evidence| evidence.command_id == peer.to_string())
+            {
+                evidence.realized_delivery = Some(
+                    if behavior == "steer" {
+                        "steer"
+                    } else {
+                        "follow_up"
+                    }
+                    .into(),
+                );
+                evidence.run_id = self.run_id.clone();
+                evidence.observed_at = lifecycle::now();
+            }
+        }
+        if let Some(delivery) = tasks::delivery_id(&text) {
+            self.injection_dispatches
+                .push((delivery.to_owned(), behavior.to_owned()));
+        }
         let at = lifecycle::now();
         if self.life.settled() {
             self.life.unsettle(at, false);
@@ -3450,6 +3576,15 @@ impl Thread {
                         }
                     }
                     "get_messages" if record["id"] == "history" => {
+                        self.peer_input_history = record["data"]["messages"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|message| message["role"] == "user")
+                            .map(|message| content_text(&message["content"]))
+                            .filter(|text| tasks::delivery_id(text).is_some())
+                            .map(|text| remote_tasks::input_history_key(&text))
+                            .collect();
                         if self.server_owned
                             && self.harness != "pi"
                             && record["data"]["replaceHistory"] != true
@@ -4438,6 +4573,8 @@ pub struct State {
     server_seq: u64,
     persist_transcripts: bool,
     client_views: Value,
+    /// Which emitted thread records the last projections actually applied.
+    pub(crate) apply_stats: client_state::ApplyStats,
     next_client_draft: usize,
     tab_epoch: u64,
     tab_intents: std::collections::HashMap<(String, uuid::Uuid), (u64, TabIntent)>,
@@ -4692,6 +4829,11 @@ pub struct State {
     tasks: Vec<Task>,
     pub(crate) identity: crate::identity::Catalog,
     pub(crate) execution: crate::execution::Book,
+    /// Keyed control evidence, separate from the immutable saved receipts.
+    pub(crate) task_operations: Vec<tasks::TaskOperation>,
+    /// Target-side accepted input and stop intent. The database is canonical;
+    /// this in-memory copy drives queue restoration and provider evidence.
+    pub(crate) peer_task_intents: Vec<remote_tasks::PeerTaskIntent>,
     pub recovery_notice: Option<String>,
     run_marker: Option<crate::store::RunMarker>,
     /// Recent projects, the switcher menu, and the clone sheet.
@@ -4702,6 +4844,14 @@ pub struct State {
     pub harnesses: crate::harness::Registry,
     pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
+    /// True only when this reducer runs under the durable server batch (or a
+    /// test explicitly simulates that profile). A live file-only reducer
+    /// leaves it false and refuses keyed controls before any effect.
+    pub(crate) durable_task_controls: bool,
+    /// Set when peer dispatch runs before the runtime opens its next database
+    /// batch. The next reconcile stages these exact operations in that batch.
+    pub(super) task_operations_dirty: bool,
+    pub(super) peer_task_intents_dirty: bool,
     ownership_denied: bool,
     pub runtime_stop_requested: bool,
     // Drop the owner only after every store has flushed and stopped its writer.
@@ -5024,6 +5174,7 @@ impl State {
             "runId":lease.run_id,
             "attemptId":lease.attempt_id,
             "deliveryId":lease.delivery_id,
+            "requestKey":lease.request_key,
             "preparedAt":lease.prepared_at,
             "queuesBehindCurrent":lease.queued_behind_current
         });
@@ -5436,6 +5587,7 @@ impl State {
             persist_transcripts: false,
             dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
+            apply_stats: Default::default(),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
             tab_intents: Default::default(),
@@ -5647,6 +5799,9 @@ impl State {
                 read_managed_policy()
             },
             runtime_enabled: false,
+            durable_task_controls: false,
+            task_operations_dirty: false,
+            peer_task_intents_dirty: false,
             ownership_denied: false,
             runtime_stop_requested: false,
             tasks: Vec::new(),
@@ -5654,6 +5809,8 @@ impl State {
                 &crate::store::directory().unwrap_or_default(),
             ),
             execution: crate::execution::Book::default(),
+            task_operations: Vec::new(),
+            peer_task_intents: Vec::new(),
             recovery_notice: None,
             run_marker: None,
         };
@@ -9297,8 +9454,6 @@ impl State {
                 self.threads.push(thread);
                 self.tasks.push(task);
                 self.sync_memory_links();
-                self.start_queued_tasks();
-                self.checkpoint();
                 let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
                 if let Some(key) = request_key
                     && let Err(error) =
@@ -9306,10 +9461,14 @@ impl State {
                 {
                     return Err(self.fail_delegate_receipt(error));
                 }
+                self.checkpoint();
+                self.start_queued_tasks();
                 Ok(status)
             }
             "task_status" => {
-                let thread = &self.threads[find(self)?];
+                let thread_index = find(self)?;
+                self.reconcile_task_operations();
+                let thread = &self.threads[thread_index];
                 let task = self
                     .tasks
                     .iter()
@@ -9327,6 +9486,20 @@ impl State {
                         status_word(thread.status)
                     }
                 });
+                let mut operations: Vec<_> = task
+                    .map(|task| {
+                        self.task_operations
+                            .iter()
+                            .filter(|operation| {
+                                operation.task_id.as_deref() == Some(task.id.as_str())
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if operations.len() > 16 {
+                    operations.drain(..operations.len() - 16);
+                }
                 Ok(json!({
                     "remote":task.and_then(|task|task.remote.as_ref()),
                     "remote_state":task.and_then(|task|task.remote.as_ref()).map(|remote|remote.state.word()),
@@ -9373,6 +9546,8 @@ impl State {
                     "finished": task.map(|task| task.state.finished()).unwrap_or(thread.task_result.is_some() || (thread.completion_notified && matches!(thread.status, Status::Completed | Status::Failed))),
                     "phase": thread.phase,
                     "error": task.map(|task| task.error_excerpt.as_str()).filter(|s| !s.is_empty()).or(thread.error.as_deref()),
+                    "remote_error": task.and_then(|task|task.remote.as_ref()).and_then(|remote|remote.last_error.as_deref()),
+                    "operations": operations,
                     "latest_reply": task.map(|task| task.result_excerpt.as_str()).filter(|s| !s.is_empty()).map(str::to_owned).or(reply),
                 }))
             }
@@ -9395,13 +9570,15 @@ impl State {
                         "task_status",
                         &json!({"thread_id":self.threads[index].id}),
                     )?;
-                    return self.record_task_control_receipt(
+                    let result = self.record_task_control_receipt(
                         caller_index,
                         tool,
                         request_key,
                         args,
                         &status,
-                    );
+                    )?;
+                    self.start_queued_tasks();
+                    return Ok(result);
                 }
                 if !self.owns_child(caller, index) {
                     return Err(format!(
@@ -9409,18 +9586,18 @@ impl State {
                         self.threads[index].id
                     ));
                 }
-                let thread = &mut self.threads[index];
                 if tool == "task_cancel" {
-                    thread.stop_task()?;
+                    self.threads[index].stop_task()?;
                 } else {
                     let message = args["message"]
                         .as_str()
                         .map(str::trim)
                         .filter(|m| !m.is_empty())
                         .ok_or("message must contain a correction or follow-up brief.")?;
-                    if let Some(request) = thread.request.as_ref().filter(|r| {
+                    let request = self.threads[index].request.clone().filter(|r| {
                         matches!(r["method"].as_str(), Some("input" | "editor" | "select"))
-                    }) {
+                    });
+                    if let Some(request) = request {
                         if request["method"] == "select"
                             && !request["options"].as_array().is_some_and(|choices| {
                                 choices
@@ -9430,13 +9607,23 @@ impl State {
                         {
                             return Err("Choose one of the crew question's listed options.".into());
                         }
-                        thread.respond(json!({"value":message}));
-                        if thread.request.is_some() {
-                            return Err(thread
+                        self.threads[index].respond(json!({"value":message}));
+                        if self.threads[index].request.is_some() {
+                            let error = self.threads[index]
                                 .error
                                 .clone()
-                                .unwrap_or_else(|| "Could not answer the crew question.".into()));
+                                .unwrap_or_else(|| "Could not answer the crew question.".into());
+                            self.reject_caller_operation(caller_index, request_key, &error);
+                            return Err(error);
                         }
+                        self.mark_caller_operation_dispatched(caller_index, request_key, "answer");
+                        // The local adapter can prove it accepted the write, not
+                        // that the provider consumed the answer.
+                        self.mark_caller_operation_input_unknown(
+                            caller_index,
+                            request_key,
+                            "adapter_write",
+                        );
                         let status = self.mcp_call(
                             caller,
                             "task_status",
@@ -9450,17 +9637,20 @@ impl State {
                             &status,
                         );
                     }
-                    if !thread.status.busy() {
-                        thread.arm_task();
-                        if thread.status == Status::Failed && thread.pi.is_some() {
-                            thread.status = Status::Ready;
-                            thread.error = None;
+                    if !self.threads[index].status.busy() {
+                        self.threads[index].arm_task();
+                        if self.threads[index].status == Status::Failed
+                            && self.threads[index].pi.is_some()
+                        {
+                            self.threads[index].status = Status::Ready;
+                            self.threads[index].error = None;
                         }
                     }
-                    thread.enqueue_injection(format!(
+                    let delivery = self.threads[index].enqueue_injection(format!(
                         "Shina: message from parent #{caller}\n\n{message}"
                     ));
-                    if thread.pi.is_none() {
+                    self.attach_caller_operation_delivery(caller_index, request_key, &delivery);
+                    if self.threads[index].pi.is_none() {
                         self.connect_thread(index);
                     }
                 }
@@ -9627,6 +9817,7 @@ impl State {
         for thread in &mut self.threads {
             changed |= thread.flush_injection();
         }
+        changed |= self.reconcile_task_operations();
         changed |= self.poll_context_imports();
         changed
     }
@@ -15895,6 +16086,19 @@ impl State {
         });
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
+        // Bounded projection only. The durable table keeps every operation;
+        // task_status keeps the latest 16 for the model payload.
+        let projected_operations: Vec<_> = self
+            .task_operations
+            .iter()
+            .rev()
+            .take(64)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        index["taskOperations"] = json!(projected_operations);
         index["serverEpoch"] = json!(self.server_epoch);
         index["serverSeq"] = json!(self.server_seq);
         index["recoveredInputs"] = json!(self.recovered_inputs);
@@ -18173,10 +18377,10 @@ mod tests {
         state.client = Some(crate::client::Client::new(state.data_dir.clone()));
         state.machines.selected = "remote".into();
         state.current_mut().status = Status::Running;
-        state
-            .machines
-            .views
-            .insert("local".into(), json!({"updateStatus":{"blocker":null}}));
+        state.machines.views.insert(
+            "local".into(),
+            json!({"updateStatus":{"blocker":null}}).into(),
+        );
         assert_eq!(state.update_restart_blocker(), None);
         state.machines.views.get_mut("local").unwrap()["updateStatus"]["blocker"] =
             json!("2 local threads are running");
@@ -19651,6 +19855,7 @@ mod tests {
             text: "Shina: input for the ended run".into(),
             shown: false,
             steer: Some("run-a".into()),
+            peer_input: None,
         });
         assert!(thread.flush_injection());
         let prompt = commands.try_recv().unwrap();
@@ -19665,6 +19870,7 @@ mod tests {
             text: "Shina: steer the live run".into(),
             shown: false,
             steer: Some("run-b".into()),
+            peer_input: None,
         });
         assert!(thread.flush_injection());
         let prompt = commands

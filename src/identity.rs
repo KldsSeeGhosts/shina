@@ -857,9 +857,32 @@ fn require_id(
     Ok(())
 }
 
+pub(crate) fn validate_index_version(index: &Value) -> Result<(), String> {
+    if index["version"] != 3 && index["version"] != 4 && index["version"] != INDEX_VERSION {
+        return Err("Unsupported index version.".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn read_index(connection: &Connection) -> Result<Option<(Value, String)>, String> {
-    if let Some(value) = crate::projection_store::read(connection, "index.json")? {
+    // Startup also uses this before migrations, including an empty database
+    // or an older schema that has documents but no row projection table.
+    let has_table = |name: &str| {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [name],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|e| e.to_string())
+    };
+    if has_table("projection_records")?
+        && let Some(value) = crate::projection_store::read(connection, "index.json")?
+    {
         return Ok(Some((value.clone(), value.to_string())));
+    }
+    if !has_table("documents")? {
+        return Ok(None);
     }
     let text: Option<String> = connection
         .query_row(
@@ -1930,7 +1953,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 8,
+            version, 9,
             "the schema gate is durable even when identity data rolls back"
         );
         let rows: i64 = connection
@@ -2119,6 +2142,58 @@ mod tests {
     }
 
     #[test]
+    fn future_index_is_rejected_before_schema_upgrade_or_first_import() {
+        let mut future = fixture();
+        future["version"] = json!(INDEX_VERSION + 1);
+        future["futureField"] = json!({"preserve":"before any schema write"});
+        let directory = schema_seven_profile("identity-future-schema-seven", &future, &routines());
+        assert!(Database::open(&directory).is_err());
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='identity_workspace'",
+                    [],
+                    |row| row.get::<_, u32>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(read_index(&connection).unwrap().unwrap().0, future);
+
+        let directory = profile_dir("identity-future-first-import");
+        let bytes = future.to_string().into_bytes();
+        std::fs::write(directory.join("index.json"), &bytes).unwrap();
+        assert!(Database::open(&directory).is_err());
+        assert!(!directory.join("state.sqlite").exists());
+        assert_eq!(std::fs::read(directory.join("index.json")).unwrap(), bytes);
+        // A prior failed startup may already have left an empty SQLite file.
+        drop(Connection::open(directory.join("state.sqlite")).unwrap());
+        assert!(Database::open(&directory).is_err());
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(directory.join("index.json")).unwrap(), bytes);
+    }
+
+    #[test]
     fn legacy_workspace_projection_upgrades_but_future_projection_is_not_rewritten() {
         let legacy = fixture();
         let directory = schema_seven_profile("identity-workspace-projection", &legacy, &routines());
@@ -2262,11 +2337,48 @@ mod tests {
     }
 
     #[test]
+    fn schema_eight_upgrades_task_tables_without_replacing_identity() {
+        let directory =
+            schema_seven_profile("identity-schema-eight-upgrade", &fixture(), &routines());
+        let first = Database::open(&directory).unwrap();
+        let identity = first.identity().unwrap();
+        drop(first);
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE task_input_intents;
+                 DROP TABLE task_operations;
+                 PRAGMA user_version=8;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let upgraded = Database::open(&directory).unwrap();
+        assert_eq!(upgraded.identity().unwrap(), identity);
+        drop(upgraded);
+        let connection = Connection::open(directory.join("state.sqlite")).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+        for table in ["task_operations", "task_input_intents"] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "schema 8 -> 9 did not create {table}");
+        }
+    }
+
+    #[test]
     fn newer_sqlite_schema_is_rejected_before_tables_are_touched() {
         let directory = profile_dir("identity-newer-schema");
         let connection = Connection::open(directory.join("state.sqlite")).unwrap();
         connection
-            .execute_batch("CREATE TABLE untouched(value TEXT); PRAGMA user_version=9;")
+            .execute_batch("CREATE TABLE untouched(value TEXT); PRAGMA user_version=10;")
             .unwrap();
         drop(connection);
         let error = match Database::open(&directory) {

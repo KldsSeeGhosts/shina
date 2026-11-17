@@ -354,6 +354,7 @@ mod tests {
             text,
             shown: false,
             steer: None,
+            peer_input: None,
         });
         assert!(state.scrub_crew_report_injections());
         assert_eq!(report_injections(&state, home, &id), 0);

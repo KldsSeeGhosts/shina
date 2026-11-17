@@ -281,6 +281,7 @@ impl State {
                     text,
                     shown: false,
                     steer: None,
+                    peer_input: None,
                 });
             changed = true;
             if self.threads[position].pi.is_none()
@@ -1031,6 +1032,7 @@ mod tests {
             text: stale,
             shown: false,
             steer: None,
+            peer_input: None,
         });
         assert!(state.scrub_crew_report_injections());
         assert!(report_injections(&state, old, &report_id).is_empty());

@@ -218,6 +218,12 @@ fn crash_boundary(payload: &Value, phase: &str) {
                     })
         })
     {
+        if phase == "sent" {
+            // `try_send` only proved the record entered the harness channel.
+            // Let the fixture read it so this phase models a lost response
+            // after the harness consumed the prompt, not a dropped write.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         std::process::exit(86);
     }
 }
