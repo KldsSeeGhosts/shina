@@ -1,7 +1,108 @@
 //! Ported from KSG client-runtime state/threads.ts and threadHistoryMerge.ts.
 use crate::{history::Row, protocol};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+/// One projected workspace. `state` holds the complete workspace state but its
+/// `threads` records keep only compact fields plus `historyMeta`/`historyRetry`;
+/// the emitted records with transcripts live in `views` and keep their `Arc`
+/// allocation between projections when the thread did not change.
+///
+/// Seam for future timeline work (#25/#26): a consumer that needs item-level
+/// granularity takes `changed` (thread ids) and then compares `views[id]` rows
+/// by their stable identities — `messages`/`tools`/etc. items carry their
+/// `id`, and record-level `historyRevision`/`historySequence` move only when a
+/// mutation stamps them, so unchanged rows keep equal `id` + position without
+/// rehashing output strings. Structure edits (membership/order/anchors) and
+/// content edits both arrive through `changed`; `Arc::ptr_eq` on `views[id]`
+/// is the cheap "record is identical" check.
+pub(crate) struct Projection {
+    pub(crate) state: Value,
+    pub(crate) views: HashMap<u64, Arc<Value>>,
+    /// Ids whose emitted record changed since the previous projection. `None`
+    /// means every record was rebuilt: snapshot, reset, or first emission.
+    pub(crate) changed: Option<Arc<HashSet<u64>>>,
+}
+
+impl Projection {
+    /// The wire-shaped projection with every `views` record merged into `state`.
+    /// Only remote persistence and asset fetching need this; applying a
+    /// projection reads `views` directly.
+    pub(crate) fn full(&self) -> Value {
+        let mut state = self.state.clone();
+        if let Some(threads) = state["threads"].as_array_mut() {
+            for record in threads {
+                if let Some(view) = record["id"].as_u64().and_then(|id| self.views.get(&id)) {
+                    *record = (**view).clone();
+                }
+            }
+        }
+        state
+    }
+}
+
+impl Clone for Projection {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            views: self.views.clone(),
+            changed: self.changed.clone(),
+        }
+    }
+}
+
+/// A plain `Value` projection, as tests and remote asset responses produce, is a
+/// full projection: every thread record counts as changed.
+impl From<Value> for Projection {
+    fn from(state: Value) -> Self {
+        let views = state["threads"]
+            .as_array()
+            .map(|threads| {
+                threads
+                    .iter()
+                    .filter_map(|thread| {
+                        thread["id"]
+                            .as_u64()
+                            .map(|id| (id, Arc::new(thread.clone())))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            state,
+            views,
+            changed: None,
+        }
+    }
+}
+
+/// `projection["index"]` keeps working for workspace fields; thread records are
+/// read through `views` because `state["threads"]` stays compact.
+impl std::ops::Index<&str> for Projection {
+    type Output = Value;
+    fn index(&self, key: &str) -> &Value {
+        &self.state[key]
+    }
+}
+
+impl std::ops::IndexMut<&str> for Projection {
+    fn index_mut(&mut self, key: &str) -> &mut Value {
+        &mut self.state[key]
+    }
+}
+
+/// Counts proving an unchanged thread record is shared, not re-materialized.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ProjectionCounters {
+    pub(crate) projections: u64,
+    /// Emissions that rebuilt every thread record versus ones that shared them.
+    pub(crate) full: u64,
+    pub(crate) delta: u64,
+    /// Thread records rebuilt into a new allocation versus reused unchanged.
+    pub(crate) threads_rebuilt: u64,
+    pub(crate) threads_shared: u64,
+}
 
 #[derive(Default)]
 pub(crate) struct ProjectionCache {
@@ -22,6 +123,13 @@ pub(crate) struct ProjectionCache {
     retries: HashMap<u64, Retry>,
     update_required: bool,
     deferred_work: bool,
+    /// The last emitted record per thread, shared between projections.
+    emitted: HashMap<u64, Arc<Value>>,
+    /// Threads whose emitted record changed since the last `projected()`.
+    touched: HashSet<u64>,
+    /// The next projection must rebuild every record.
+    rebuild: bool,
+    pub(crate) counters: ProjectionCounters,
 }
 
 #[derive(Default)]
@@ -80,6 +188,10 @@ impl ProjectionCache {
             // An older build must re-send inline history, not inherit unresolved work anchors.
             self.views.clear();
         }
+        if self.deferred_work != deferred {
+            // `workLoading` in emitted records depends on the negotiated mode.
+            self.rebuild = true;
+        }
         self.deferred_work = deferred;
         if !hello["capabilities"]
             .as_array()
@@ -117,6 +229,7 @@ impl ProjectionCache {
                 retry.attempts
             ));
         }
+        self.touched.insert(thread);
         self.dirty = true;
     }
 
@@ -138,6 +251,7 @@ impl ProjectionCache {
         view.error = None;
         view.load_requested = true;
         view.through_entry_id = through_entry_id;
+        self.touched.insert(thread);
         self.dirty = true;
     }
 
@@ -287,6 +401,7 @@ impl ProjectionCache {
             self.histories.remove(&oldest);
             self.views.remove(&oldest);
         }
+        self.touched.insert(thread);
         self.dirty = true;
         Ok(())
     }
@@ -531,6 +646,7 @@ impl ProjectionCache {
                 self.seq = params["seq"].as_u64();
                 self.epoch = params["epoch"].clone();
                 self.maintenance = params["maintenance"].clone();
+                self.rebuild = true;
                 self.dirty = true;
             }
             Some("subscription.ready") if params.get("maintenance").is_some() => {
@@ -546,8 +662,42 @@ impl ProjectionCache {
                 {
                     return Err("Projection replay gap. Reconnecting for a snapshot.".into());
                 }
-                protocol::apply(&mut self.state, params["patch"].clone())?;
+                // Path indexes name positions in the array after each op runs;
+                // resolving them post-apply marks the record actually touched.
+                let patch = params["patch"].clone();
+                protocol::apply(&mut self.state, patch.clone())?;
                 self.seq = Some(seq);
+                let mut all_threads = false;
+                let mut positions = Vec::new();
+                for op in patch.as_array().into_iter().flatten() {
+                    match op["path"].as_array().map(Vec::as_slice) {
+                        None | Some([]) => all_threads = true,
+                        Some([first]) if first == "threads" => all_threads = true,
+                        Some([first, position, ..]) if first == "threads" => {
+                            if let Some(index) =
+                                position.as_str().and_then(|i| i.parse::<usize>().ok())
+                            {
+                                positions.push(index);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if all_threads {
+                    self.touched.extend(
+                        self.state["threads"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|thread| thread["id"].as_u64()),
+                    );
+                } else {
+                    self.touched.extend(
+                        positions
+                            .into_iter()
+                            .filter_map(|index| self.state["threads"][index]["id"].as_u64()),
+                    );
+                }
                 self.dirty = true;
             }
             Some("thread.streamPage") => {
@@ -617,6 +767,7 @@ impl ProjectionCache {
                             view.through_entry_id = None;
                             view.error = Some(message.into());
                         }
+                        self.touched.insert(walk.thread);
                         self.dirty = true;
                     } else {
                         self.failed(
@@ -806,50 +957,110 @@ impl ProjectionCache {
         Some(json!({"jsonrpc":"2.0","id":"history","method":method,"params":params}))
     }
 
-    pub(crate) fn projected(&mut self) -> Option<Value> {
+    /// The workspace projection, split so an unchanged thread's emitted record
+    /// is shared by `Arc` identity instead of cloned. `changed` names the ids
+    /// whose record differs from the previous emission; `None` rebuilds all.
+    pub(crate) fn projected(&mut self) -> Option<Projection> {
         if !self.dirty || self.seq.is_none() {
             return None;
         }
         self.dirty = false;
+        let live: HashSet<u64> = self.state["threads"]
+            .as_array()
+            .map(|threads| {
+                threads
+                    .iter()
+                    .filter_map(|thread| thread["id"].as_u64())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.histories.retain(|id, _| live.contains(id));
+        self.views.retain(|id, _| live.contains(id));
+        self.retries.retain(|id, _| live.contains(id));
+        self.emitted.retain(|id, _| live.contains(id));
+        self.history_order
+            .retain(|id| self.histories.contains_key(id));
+        self.touched.retain(|id| live.contains(id));
+        self.counters.projections += 1;
+        let rebuild = self.rebuild || (self.emitted.is_empty() && !live.is_empty());
+        self.rebuild = false;
+        if rebuild {
+            self.counters.full += 1;
+            self.touched.clear();
+        } else {
+            self.counters.delta += 1;
+        }
+        let changed = (!rebuild).then(|| Arc::new(std::mem::take(&mut self.touched)));
+        let mut views = HashMap::with_capacity(live.len());
+        let mut compact = Vec::with_capacity(live.len());
         if let Some(threads) = self.state["threads"].as_array() {
-            self.histories
-                .retain(|id, _| threads.iter().any(|t| t["id"] == *id));
-            self.views
-                .retain(|id, _| threads.iter().any(|t| t["id"] == *id));
-            self.retries
-                .retain(|id, _| threads.iter().any(|t| t["id"] == *id));
-            self.history_order
-                .retain(|id| self.histories.contains_key(id));
+            for record in threads {
+                let Some(id) = record["id"].as_u64() else {
+                    compact.push(record.clone());
+                    continue;
+                };
+                let share = changed
+                    .as_ref()
+                    .is_some_and(|changed| !changed.contains(&id));
+                let emitted = match self.emitted.get(&id) {
+                    Some(emitted) if share => {
+                        self.counters.threads_shared += 1;
+                        emitted.clone()
+                    }
+                    _ => {
+                        self.counters.threads_rebuilt += 1;
+                        let mut thread = record.clone();
+                        if let Some((_, history, _)) = self.histories.get(&id) {
+                            for field in protocol::HISTORY_FIELDS {
+                                thread[field] = history[field].clone();
+                            }
+                        }
+                        if let Some(view) = self.views.get(&id) {
+                            thread["historyMeta"] = json!({
+                                "hasMoreHistory": view.has_more,
+                                "loading": view.loading,
+                                "error": view.error,
+                                "expanded": view.expanded,
+                                "deferredWork":self.histories.get(&id).map(|(_, history, _)| &history["deferredWork"]),
+                                "workLoading": if self.deferred_work { "deferred" } else { "inline-legacy" },
+                            });
+                        }
+                        if let Some(retry) = self.retries.get(&id) {
+                            thread["historyRetry"] = json!({"count":retry.attempts,"limit":1,"fullRestarts":retry.restarts,
+                                "stopped":retry.blocked,"error":retry.error});
+                        }
+                        let emitted = Arc::new(thread);
+                        self.emitted.insert(id, emitted.clone());
+                        emitted
+                    }
+                };
+                // `state["threads"]` stays compact; the transcript lives in `views`.
+                let mut entry = record.clone();
+                for field in protocol::HISTORY_FIELDS {
+                    entry[field] = if field == "stats" {
+                        json!({})
+                    } else {
+                        json!([])
+                    };
+                }
+                if let Some(meta) = emitted.get("historyMeta") {
+                    entry["historyMeta"] = meta.clone();
+                }
+                if let Some(retry) = emitted.get("historyRetry") {
+                    entry["historyRetry"] = retry.clone();
+                }
+                views.insert(id, emitted);
+                compact.push(entry);
+            }
         }
         let mut state = self.state.clone();
         state["historyUpdateRequired"] = json!(self.update_required);
-        if let Some(threads) = state["threads"].as_array_mut() {
-            for thread in threads {
-                let Some(id) = thread["id"].as_u64() else {
-                    continue;
-                };
-                if let Some((_, history, _)) = self.histories.get(&id) {
-                    for field in protocol::HISTORY_FIELDS {
-                        thread[field] = history[field].clone();
-                    }
-                }
-                if let Some(view) = self.views.get(&id) {
-                    thread["historyMeta"] = json!({
-                        "hasMoreHistory": view.has_more,
-                        "loading": view.loading,
-                        "error": view.error,
-                        "expanded": view.expanded,
-                        "deferredWork":self.histories.get(&id).map(|(_, history, _)| &history["deferredWork"]),
-                        "workLoading": if self.deferred_work { "deferred" } else { "inline-legacy" },
-                    });
-                }
-                if let Some(retry) = self.retries.get(&id) {
-                    thread["historyRetry"] = json!({"count":retry.attempts,"limit":1,"fullRestarts":retry.restarts,
-                        "stopped":retry.blocked,"error":retry.error});
-                }
-            }
-        }
-        Some(state)
+        state["threads"] = json!(compact);
+        Some(Projection {
+            state,
+            views,
+            changed,
+        })
     }
 }
 
@@ -1150,10 +1361,7 @@ mod tests {
         );
         assert_eq!(projected["threads"][0]["historyMeta"]["loading"], false);
         assert_eq!(
-            projected["threads"][0]["messages"]
-                .as_array()
-                .unwrap()
-                .len(),
+            projected.views[&1]["messages"].as_array().unwrap().len(),
             20
         );
 
@@ -1176,10 +1384,7 @@ mod tests {
         );
         assert_eq!(final_view["threads"][0]["historyMeta"]["loading"], false);
         assert_eq!(
-            final_view["threads"][0]["messages"]
-                .as_array()
-                .unwrap()
-                .len(),
+            final_view.views[&1]["messages"].as_array().unwrap().len(),
             30
         );
     }

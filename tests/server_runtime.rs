@@ -5154,7 +5154,7 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
     client.history_cache = Some(cache);
     client.rpc("workspace.subscribe", json!({}), json!("history-subscribe"));
     let deadline = Instant::now() + Duration::from_secs(25);
-    let mut displayed = Value::Null;
+    let mut displayed: Option<client_history::Projection> = None;
     let mut first_live_len = None;
     let mut live_advanced = false;
     let mut reconnected = false;
@@ -5170,7 +5170,7 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
         );
         let cache = client.history_cache.as_mut().unwrap();
         if let Some(view) = cache.projected() {
-            displayed = view;
+            displayed = Some(view);
         }
         let installed = cache.histories.get(&1);
         if let Some((revision, view, size)) = installed {
@@ -5188,7 +5188,7 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
                 .unwrap();
             if cache.state["threads"][0]["status"] == "Running" {
                 assert_eq!(
-                    displayed["threads"][0]["messages"]
+                    displayed.as_ref().unwrap().views[&1]["messages"]
                         .as_array()
                         .unwrap()
                         .last()
@@ -5213,9 +5213,12 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
                     .map(|tick| format!("stream-{tick:03} 😀\n"))
                     .collect();
                 assert_eq!(assistant, expected);
-                assert_eq!(displayed["threads"][0]["messages"], view["messages"]);
                 assert_eq!(
-                    displayed["threads"][0]["historyRetry"]["fullRestarts"]
+                    displayed.as_ref().unwrap().views[&1]["messages"],
+                    view["messages"]
+                );
+                assert_eq!(
+                    displayed.as_ref().unwrap()["threads"][0]["historyRetry"]["fullRestarts"]
                         .as_u64()
                         .unwrap_or(0),
                     0
@@ -5741,7 +5744,7 @@ fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect(
         );
         let view = cache.projected().unwrap();
         assert_eq!(view["threads"][0]["historyMeta"]["hasMoreHistory"], true);
-        let loaded_msgs = view["threads"][0]["messages"].as_array().unwrap();
+        let loaded_msgs = view.views[&1]["messages"].as_array().unwrap();
         assert!(
             loaded_msgs.len() <= 20,
             "recent budget only, got {}",

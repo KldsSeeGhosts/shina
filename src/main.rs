@@ -665,7 +665,10 @@ fn fleet_demo(state: &mut State) {
             });
             client.linked.insert(server.into(), remote);
         }
-        state.machines.views.insert(server.into(), projection);
+        state
+            .machines
+            .views
+            .insert(server.into(), projection.into());
     }
     state.client = Some(client);
 }
@@ -1635,6 +1638,47 @@ fn long_draft_demo(state: &mut State) {
     );
     state.restore_composer_focus(ui::composer_ui::FocusReason::Explicit);
 }
+
+/// Unit-test builds count allocations so projection benchmarks can report them.
+/// Run benchmarks with `--test-threads=1` so no sibling test pollutes the count.
+#[cfg(test)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) struct Counting;
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
+            COUNT.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(new.saturating_sub(layout.size()), Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new) }
+        }
+    }
+
+    pub(crate) fn reset() {
+        COUNT.store(0, Ordering::Relaxed);
+        BYTES.store(0, Ordering::Relaxed);
+    }
+    /// (allocation calls, bytes requested) since `reset`.
+    pub(crate) fn counts() -> (usize, usize) {
+        (COUNT.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: test_alloc::Counting = test_alloc::Counting;
 
 #[cfg(test)]
 mod tests {

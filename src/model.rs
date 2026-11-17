@@ -4369,6 +4369,8 @@ pub struct State {
     server_seq: u64,
     persist_transcripts: bool,
     client_views: Value,
+    /// Which emitted thread records the last projections actually applied.
+    pub(crate) apply_stats: client_state::ApplyStats,
     next_client_draft: usize,
     tab_epoch: u64,
     tab_intents: std::collections::HashMap<(String, uuid::Uuid), (u64, TabIntent)>,
@@ -4705,6 +4707,7 @@ impl State {
             persist_transcripts: false,
             dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
+            apply_stats: Default::default(),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
             tab_intents: Default::default(),
@@ -17359,10 +17362,10 @@ mod tests {
         state.client = Some(crate::client::Client::new(state.data_dir.clone()));
         state.machines.selected = "remote".into();
         state.current_mut().status = Status::Running;
-        state
-            .machines
-            .views
-            .insert("local".into(), json!({"updateStatus":{"blocker":null}}));
+        state.machines.views.insert(
+            "local".into(),
+            json!({"updateStatus":{"blocker":null}}).into(),
+        );
         assert_eq!(state.update_restart_blocker(), None);
         state.machines.views.get_mut("local").unwrap()["updateStatus"]["blocker"] =
             json!("2 local threads are running");

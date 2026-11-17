@@ -11,7 +11,7 @@ pub(super) struct Entry<'a> {
     pub draft: bool,
     pub life: lifecycle::Lifecycle,
     record: Option<&'a Value>,
-    projection: Option<&'a Value>,
+    projection: Option<&'a crate::client_history::Projection>,
     view: &'a Value,
     children: Vec<(&'a Value, &'a Value)>,
     pub visible: bool,
@@ -57,11 +57,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
         if server == &s.machines.selected || !s.machine_enabled(server) {
             continue;
         }
-        let views: std::collections::HashMap<_, _> = projection["threads"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|view| view["id"].as_u64().map(|id| (id as usize, view)))
+        let views: std::collections::HashMap<_, _> = projection
+            .views
+            .iter()
+            .map(|(id, view)| (*id as usize, &**view))
             .collect();
         let metadata: std::collections::HashMap<_, _> = projection["index"]["threads"]
             .as_array()

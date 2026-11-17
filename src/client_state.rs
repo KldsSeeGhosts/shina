@@ -1,5 +1,6 @@
 //! State facade and plain projections. Execution still uses the original State/Thread methods.
 use super::*;
+use crate::client_history::Projection;
 use crate::protocol::{Command, Receipt};
 
 /// Where a draft machine change can land without blocking on more data.
@@ -10,6 +11,15 @@ enum RouteTarget {
     Scratch,
     /// The target's project list is not loaded yet.
     Unresolved,
+}
+
+/// Counts proving which emitted records an application touched. Delta
+/// projections skip records whose ids are absent from `changed`.
+#[derive(Default)]
+pub(crate) struct ApplyStats {
+    pub(crate) thread_views_applied: u64,
+    pub(crate) thread_views_skipped: u64,
+    pub(crate) records_deserialized: u64,
 }
 
 // A fixed monotonic/wall-clock pair makes a start timestamp stable across captures.
@@ -502,6 +512,13 @@ impl ThreadView {
                 })
             })
             .collect::<Result<_, String>>()?;
+        // .rev() keeps the first match for a duplicate key, as `find` did.
+        let old_tools: std::collections::HashMap<&str, &Tool> = thread
+            .tools
+            .iter()
+            .rev()
+            .map(|tool| (tool.id.as_str(), tool))
+            .collect();
         let mut tools = self.tools;
         for tool in &mut tools {
             if !tool.done {
@@ -515,13 +532,24 @@ impl ThreadView {
                             .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)))
                     });
             }
-            if let Some(old) = thread.tools.iter().find(|old| old.id == tool.id) {
+            if let Some(old) = old_tools.get(tool.id.as_str()) {
                 tool.expanded = old.expanded;
                 tool.raw_expanded = old.raw_expanded;
                 tool.group_expanded = old.group_expanded;
             }
         }
         thread.tools = tools;
+        let old_thoughts: std::collections::HashMap<(usize, usize, usize), &Thought> = thread
+            .thoughts
+            .iter()
+            .rev()
+            .map(|thought| {
+                (
+                    (thought.anchor.message, thought.anchor.offset, thought.block),
+                    thought,
+                )
+            })
+            .collect();
         let mut thoughts = self.thoughts;
         for (index, thought) in thoughts.iter_mut().enumerate() {
             if !thought.done {
@@ -537,24 +565,35 @@ impl ThreadView {
                             .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)))
                     });
             }
-            thought.expanded = thread
-                .thoughts
-                .iter()
-                .find(|old| old.block == thought.block && old.anchor == thought.anchor)
+            thought.expanded = old_thoughts
+                .get(&(thought.anchor.message, thought.anchor.offset, thought.block))
                 .is_some_and(|old| old.expanded);
         }
         thread.thoughts = thoughts;
+        // Work items match by the stable message id at their start position,
+        // falling back to the position itself when that message is gone.
+        let old_work_by_message: std::collections::HashMap<&str, &AssistantWork> = thread
+            .work
+            .iter()
+            .rev()
+            .filter_map(|old| {
+                old_messages
+                    .get(old.start)
+                    .map(|message| (message.id.as_str(), old))
+            })
+            .collect();
+        let old_work_by_start: std::collections::HashMap<usize, &AssistantWork> = thread
+            .work
+            .iter()
+            .rev()
+            .map(|old| (old.start, old))
+            .collect();
         let mut work = self.work;
         for item in &mut work {
             let message_id = thread.messages.get(item.start).map(|m| m.id.as_str());
             let matched = message_id
-                .and_then(|id| {
-                    thread
-                        .work
-                        .iter()
-                        .find(|old| old_messages.get(old.start).map(|m| m.id.as_str()) == Some(id))
-                })
-                .or_else(|| thread.work.iter().find(|old| old.start == item.start));
+                .and_then(|id| old_work_by_message.get(id).copied())
+                .or_else(|| old_work_by_start.get(&item.start).copied());
             item.expanded = matched.is_some_and(|old| old.expanded);
         }
         thread.work = work;
@@ -639,21 +678,17 @@ impl ThreadView {
                     .filter(|_| thread.status.busy())
                     .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs)))
             });
+        let mut queue_drafts: std::collections::HashMap<usize, _> =
+            self.queue_drafts.into_iter().rev().collect();
+        let mut queue_contexts: std::collections::HashMap<usize, _> =
+            self.queue_contexts.into_iter().rev().collect();
         thread.native.queue = self
             .queue
             .into_iter()
             .map(|(id, text, images)| {
                 let mut prompt = Prompt::new(text, images);
-                prompt.draft = self
-                    .queue_drafts
-                    .iter()
-                    .find(|(key, _)| *key == id)
-                    .map(|(_, draft)| draft.clone());
-                prompt.context = self
-                    .queue_contexts
-                    .iter()
-                    .find(|(key, _)| *key == id)
-                    .map(|(_, ctx)| ctx.clone());
+                prompt.draft = queue_drafts.remove(&id);
+                prompt.context = queue_contexts.remove(&id);
                 pi_session::QueuedMessage { id, prompt }
             })
             .collect();
@@ -1297,7 +1332,7 @@ impl State {
             }
             self.machines
                 .views
-                .insert(server.clone(), projection.clone());
+                .insert(server.clone(), projection.clone().into());
             if server == self.machines.selected
                 && let Err(error) = self.apply_projection(projection)
             {
@@ -1865,7 +1900,8 @@ impl State {
         changed
     }
 
-    fn apply_projection(&mut self, projection: Value) -> Result<(), String> {
+    fn apply_projection(&mut self, projection: impl Into<Projection>) -> Result<(), String> {
+        let projection = projection.into();
         let preserve_cached_editors = self.client_views["cachedEditors"] == true;
         let active = self.current().id;
         let tabs = self.tabs.clone();
@@ -1903,9 +1939,18 @@ impl State {
         }
         self.peers = serde_json::from_value(projection["peers"].clone()).unwrap_or_default();
         let metadata = std::mem::take(&mut self.threads);
+        let mut old_positions: std::collections::HashMap<usize, usize> = old
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| (thread.id, index))
+            .collect();
         for mut thread in metadata {
-            if let Some(index) = old.iter().position(|old| old.id == thread.id) {
+            if let Some(index) = old_positions.remove(&thread.id).filter(|i| *i < old.len()) {
                 let mut local = old.swap_remove(index);
+                // swap_remove moved the tail into `index`; keep the map honest.
+                if index < old.len() {
+                    old_positions.insert(old[index].id, index);
+                }
                 local.title = thread.title;
                 local.renamed = thread.renamed;
                 local.life = thread.life;
@@ -2033,22 +2078,39 @@ impl State {
                 self.threads.push(thread);
             }
         }
-        let views: Vec<ThreadView> =
-            serde_json::from_value(projection["threads"].clone()).map_err(|e| e.to_string())?;
-        for (view, raw) in views
-            .into_iter()
-            .zip(projection["threads"].as_array().into_iter().flatten())
-        {
-            if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == view.id) {
-                view.apply(thread)?;
-                if let Some(meta) = raw.get("historyMeta").filter(|m| m.is_object()) {
-                    thread.history_has_more = meta["hasMoreHistory"] == true;
-                    thread.history_loading = meta["loading"] == true;
-                    thread.history_error = meta["error"].as_str().map(str::to_owned);
-                    thread.deferred_work =
-                        meta["deferredWork"].as_array().cloned().unwrap_or_default();
-                    thread.deferred_work_supported = meta["workLoading"] == "deferred";
-                }
+        let positions: std::collections::HashMap<u64, usize> = self
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| (thread.id as u64, index))
+            .collect();
+        // A delta projection names the records it changed; the rest still carry
+        // identical transcripts and metadata, so their live threads keep state.
+        let changed = projection.changed.as_deref();
+        for record in projection["threads"].as_array().into_iter().flatten() {
+            let Some(id) = record["id"].as_u64() else {
+                return Err("Invalid thread record id.".into());
+            };
+            let Some(&index) = positions.get(&id) else {
+                continue;
+            };
+            if changed.is_some_and(|ids| !ids.contains(&id)) {
+                self.apply_stats.thread_views_skipped += 1;
+                continue;
+            }
+            let raw = projection.views.get(&id).map_or(record, |view| &**view);
+            let view: ThreadView =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            self.apply_stats.records_deserialized += 1;
+            self.apply_stats.thread_views_applied += 1;
+            let thread = &mut self.threads[index];
+            view.apply(thread)?;
+            if let Some(meta) = raw.get("historyMeta").filter(|m| m.is_object()) {
+                thread.history_has_more = meta["hasMoreHistory"] == true;
+                thread.history_loading = meta["loading"] == true;
+                thread.history_error = meta["error"].as_str().map(str::to_owned);
+                thread.deferred_work = meta["deferredWork"].as_array().cloned().unwrap_or_default();
+                thread.deferred_work_supported = meta["workLoading"] == "deferred";
             }
         }
         self.active = self
@@ -2084,7 +2146,7 @@ impl State {
             .get_mut("localUi")
             .map(Value::take)
             .unwrap_or(Value::Null);
-        self.client_views = projection;
+        self.client_views = projection.state;
         self.apply_projected_catalog();
         self.apply_native_catalogs();
         if first && !local.is_null() {
@@ -2535,7 +2597,10 @@ impl State {
         );
         self.client_views =
             json!({"localUi":self.machines.ui[server],"cachedEditors":cached_editors});
-        if let Some(projection) = projection {
+        if let Some(mut projection) = projection {
+            // The stored view's delta set belongs to another machine's emission;
+            // this thread set last saw whichever machine was selected before.
+            projection.changed = None;
             if let Err(error) = self.apply_projection(projection) {
                 self.storage_error = Some(error);
             }
@@ -5213,11 +5278,11 @@ mod tests {
         state
             .machines
             .views
-            .insert("local".into(), projection.clone());
+            .insert("local".into(), projection.clone().into());
         state
             .machines
             .views
-            .insert("studio".into(), projection.clone());
+            .insert("studio".into(), projection.clone().into());
         state.apply_projection(projection.clone()).unwrap();
         // This fixture starts with an existing device session on each host.
         state.checkpoint_client();
@@ -5344,8 +5409,11 @@ mod tests {
         state
             .machines
             .views
-            .insert("local".into(), local_view.clone());
-        state.machines.views.insert("server-b".into(), remote_view);
+            .insert("local".into(), local_view.clone().into());
+        state
+            .machines
+            .views
+            .insert("server-b".into(), remote_view.into());
         state.apply_projection(local_view).unwrap();
         (state, local, commands)
     }
@@ -6362,7 +6430,7 @@ mod tests {
                 state
                     .machines
                     .views
-                    .insert("local".into(), projection.clone());
+                    .insert("local".into(), projection.clone().into());
                 state.current_mut().draft.replace_text(if ordinary_empty {
                     ""
                 } else {
@@ -6378,7 +6446,10 @@ mod tests {
                         .iter_mut()
                         .find(|view| view["id"] == json!(id))
                         .unwrap()["queue"] = json!([]);
-                    state.machines.views.insert("local".into(), projection);
+                    state
+                        .machines
+                        .views
+                        .insert("local".into(), projection.into());
                 }
                 state.select_machine("local");
                 if leaves_queue {
@@ -6643,11 +6714,11 @@ mod tests {
         state
             .machines
             .views
-            .insert("local".into(), projection.clone());
+            .insert("local".into(), projection.clone().into());
         state
             .machines
             .views
-            .insert("server-b".into(), projection.clone());
+            .insert("server-b".into(), projection.clone().into());
         state.apply_projection(projection).unwrap();
         state.checkpoint_client();
         state.machines.ui["server-b"] = state.machines.ui["local"].clone();
@@ -6686,11 +6757,11 @@ mod tests {
         state
             .machines
             .views
-            .insert("local".into(), projection.clone());
+            .insert("local".into(), projection.clone().into());
         state
             .machines
             .views
-            .insert("remote".into(), projection.clone());
+            .insert("remote".into(), projection.clone().into());
         state.apply_projection(projection).unwrap();
         state.dark = false;
         state.zoom = 1.1;
@@ -7920,7 +7991,7 @@ mod tests {
         state
             .machines
             .views
-            .insert(server_id.clone(), remote_proj.projection());
+            .insert(server_id.clone(), remote_proj.projection().into());
         state.open_machine_thread(&server_id, 1);
         assert_eq!(state.machines.selected, server_id);
         assert!(!state.current().messages.is_empty());
@@ -8142,6 +8213,522 @@ mod tests {
                 assert!(draft.error.as_ref().unwrap().contains("held"));
             } else {
                 assert_eq!(draft.draft.text, "Preserve my crew input");
+            }
+        }
+    }
+
+    // Issue #24: delta projections share unchanged thread records and the apply
+    // path skips them instead of rebuilding every loaded transcript. These tests
+    // drive the real server->cache->apply path: Streams::publish generates the
+    // wire stream events, ProjectionCache::receive installs them, and
+    // State::apply_projection consumes the projection the worker would emit.
+    mod delta_projection {
+        use super::*;
+        use crate::client_history::{Projection, ProjectionCache};
+        use crate::history::{Fragments, Streams};
+        use crate::protocol;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        fn tool_rich_thread(id: u64, messages: usize, tools: usize) -> Value {
+            let mut items = Vec::with_capacity(messages);
+            let mut calls = Vec::with_capacity(tools);
+            for i in 0..messages {
+                let role = if i % 2 == 0 { "You" } else { "Pi" };
+                items.push(json!({"id":format!("m-{id}-{i}"),"role":role,"images":[],
+                        "text":format!("message {i} {}", "x".repeat(200))}));
+                if role == "Pi" && calls.len() < tools {
+                    calls.push(
+                        json!({"id":format!("t-{id}-{i}"),"name":"read","detail":"f",
+                            "done":true,"failed":false,"output":"out","images":[],
+                            "structured":null,"parent_call":null,"exit_code":0,
+                            "subagents":[],"anchor":{"message":i,"offset":0},
+                            "block":0,"order":i}),
+                    );
+                }
+            }
+            // A captured live thread supplies every non-history ThreadView
+            // field; the test only populates the transcript arrays.
+            let mut record =
+                serde_json::to_value(ThreadView::capture(&Thread::new(id as usize))).unwrap();
+            record["messages"] = json!(items);
+            record["tools"] = json!(calls);
+            record
+        }
+
+        fn workspace(seq: u64, threads: &[Value]) -> Value {
+            let index_threads: Vec<Value> = threads
+                .iter()
+                .map(|thread| {
+                    json!({"id":thread["id"],"machine":"local","title":format!("Thread {}", thread["id"])})
+                })
+                .collect();
+            json!({"epoch":"workspace","seq":seq,
+                "state":{"index":{"active":threads[0]["id"],"captains":[],"projects":[],
+                    "threads":index_threads},
+                    "threads":threads}})
+        }
+
+        /// The wire snapshot shape the worker serves.
+        fn connect(cache: &mut ProjectionCache, snapshot: &Value) {
+            cache
+                .reconnect(&json!({"capabilities":[protocol::HISTORY_ITEMS]}))
+                .unwrap();
+            cache
+                .receive(&protocol::notification(
+                    "subscription.snapshot",
+                    json!({"epoch":"workspace","seq":snapshot["seq"],
+                        "state":protocol::compact(&snapshot["state"])}),
+                ))
+                .unwrap();
+        }
+
+        /// Serve one pending history request exactly as the server would:
+        /// resubscribe replays the stream, and pages go through `Fragments`.
+        fn answer(
+            cache: &mut ProjectionCache,
+            streams: &Streams,
+            fragments: &mut Fragments,
+            request: &Value,
+            budget: usize,
+        ) {
+            let params = &request["params"];
+            let thread = params["threadId"].as_u64().unwrap();
+            let result = if request["method"] == "thread.subscribe" {
+                if params["afterSequence"].is_u64()
+                    && params["streamEpoch"] == "stream"
+                    && let Some(events) =
+                        streams.replay(thread, params["afterSequence"].as_u64().unwrap())
+                {
+                    for mut event in events {
+                        event["streamEpoch"] = json!("stream");
+                        cache
+                            .receive(&protocol::notification("thread.stream", event))
+                            .unwrap();
+                    }
+                    json!({"kind":"synchronized","threadId":thread,
+                        "snapshotSequence":streams.high_water(thread),
+                        "streamEpoch":"stream"})
+                } else {
+                    let mut page = fragments
+                        .read(thread, params, Instant::now(), || {
+                            streams.page(thread, None, budget)
+                        })
+                        .unwrap();
+                    page["kind"] = json!("snapshot");
+                    page["streamEpoch"] = json!("stream");
+                    page
+                }
+            } else {
+                fragments
+                    .read(thread, params, Instant::now(), || {
+                        streams.page(thread, params["historyCursor"].as_str(), budget)
+                    })
+                    .unwrap()
+            };
+            cache
+                .receive(&json!({"id":"history","result":result}))
+                .unwrap();
+        }
+
+        /// Drain every request the cache currently wants answered.
+        fn drain(
+            cache: &mut ProjectionCache,
+            streams: &Streams,
+            fragments: &mut Fragments,
+            budget: usize,
+        ) {
+            while let Some(request) = cache.next_history() {
+                answer(cache, streams, fragments, &request, budget);
+            }
+        }
+
+        fn changed_ids(projection: &Projection) -> std::collections::HashSet<u64> {
+            projection.changed.as_deref().cloned().unwrap_or_default()
+        }
+
+        /// Subscribe and, when `full`, walk every earlier page until the cache
+        /// reports the thread complete — the same requests the UI issues when a
+        /// user scrolls to the oldest message.
+        fn load_all(
+            cache: &mut ProjectionCache,
+            streams: &Streams,
+            fragments: &mut Fragments,
+            budget: usize,
+            id: u64,
+        ) {
+            cache.desired_thread = Some(id);
+            loop {
+                let mut progress = false;
+                while let Some(request) = cache.next_history() {
+                    answer(cache, streams, fragments, &request, budget);
+                    progress = true;
+                }
+                if cache.complete(id) {
+                    return;
+                }
+                cache.request_earlier(id, None);
+                if !progress {
+                    return;
+                }
+            }
+        }
+
+        /// One tool-rich workspace of `n` threads, all subscribed through the
+        /// real request/response path. `budget` is the server page size; with
+        /// `full` every older page is read too, otherwise only the recent
+        /// window is loaded and `request_earlier` still has work.
+        fn rig(
+            n: usize,
+            messages: usize,
+            tools: usize,
+            budget: usize,
+            full: bool,
+        ) -> (ProjectionCache, Streams, Vec<Value>, Fragments) {
+            let threads: Vec<Value> = (1..=n as u64)
+                .map(|id| {
+                    let mut thread = tool_rich_thread(id, messages, tools);
+                    crate::history::stamp(&Value::Null, &mut thread, 1);
+                    thread
+                })
+                .collect();
+            let snapshot = workspace(1, &threads);
+            let streams = Streams::new(&snapshot);
+            let mut cache = ProjectionCache::default();
+            connect(&mut cache, &snapshot);
+            let mut fragments = Fragments::default();
+            for id in 1..=n as u64 {
+                if full {
+                    load_all(&mut cache, &streams, &mut fragments, budget, id);
+                } else {
+                    cache.desired_thread = Some(id);
+                    drain(&mut cache, &streams, &mut fragments, budget);
+                }
+            }
+            (cache, streams, threads, fragments)
+        }
+
+        /// Publish a new workspace snapshot and feed the cache the same stream
+        /// events and patch the server would emit for it. The server restamps
+        /// every record's history identities and revision per snapshot.
+        /// Returns the stamped snapshot.
+        fn publish(
+            cache: &mut ProjectionCache,
+            streams: &mut Streams,
+            before: &Value,
+            after: &Value,
+        ) -> Value {
+            let seq = after["seq"].as_u64().unwrap();
+            let mut after = after.clone();
+            let before_threads = before["state"]["threads"].clone();
+            for thread in after["state"]["threads"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                let id = thread["id"].as_u64().unwrap();
+                let old = before_threads
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t["id"].as_u64() == Some(id))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                crate::history::stamp(&old, thread, seq);
+            }
+            cache
+                .receive(&protocol::notification(
+                    "subscription.patch",
+                    json!({"epoch":"workspace","seq":seq,
+                    "patch":protocol::diff(
+                        &protocol::compact(&before["state"]),
+                        &protocol::compact(&after["state"]),
+                    )}),
+                ))
+                .unwrap();
+            streams.publish(&after);
+            for thread in after["state"]["threads"].as_array().into_iter().flatten() {
+                let id = thread["id"].as_u64().unwrap();
+                for mut event in streams.replay(id, seq - 1).unwrap_or_default() {
+                    event["streamEpoch"] = json!("stream");
+                    cache
+                        .receive(&protocol::notification("thread.stream", event))
+                        .unwrap();
+                }
+            }
+            after
+        }
+
+        #[test]
+        fn a_tiny_delta_rebuilds_only_the_streamed_thread() {
+            let (mut cache, mut streams, threads, _f) = rig(3, 40, 20, 1 << 22, true);
+            let mut state = State::new(PathBuf::new(), false);
+            let first = cache.projected().unwrap();
+            assert!(first.changed.is_none(), "first emission is a full rebuild");
+            state.apply_projection(first.clone()).unwrap();
+
+            // One message edit on thread 2 only.
+            let mut after_threads = threads.clone();
+            after_threads[1]["messages"][1]["text"] = json!("edited once");
+            publish(
+                &mut cache,
+                &mut streams,
+                &workspace(1, &threads),
+                &workspace(2, &after_threads),
+            );
+            let delta = cache.projected().unwrap();
+            assert_eq!(changed_ids(&delta), [2].into_iter().collect());
+            assert!(
+                Arc::ptr_eq(&first.views[&1], &delta.views[&1]),
+                "untouched thread keeps its emitted record"
+            );
+            assert!(!Arc::ptr_eq(&first.views[&2], &delta.views[&2]));
+            assert!(Arc::ptr_eq(&first.views[&3], &delta.views[&3]));
+
+            let before = (
+                state.apply_stats.thread_views_applied,
+                state.apply_stats.thread_views_skipped,
+            );
+            state.apply_projection(delta).unwrap();
+            assert_eq!(state.apply_stats.thread_views_applied - before.0, 1);
+            assert_eq!(state.apply_stats.thread_views_skipped - before.1, 2);
+            assert_eq!(cache.counters.threads_shared, 2);
+            assert_eq!(
+                state.threads.iter().find(|t| t.id == 2).unwrap().messages[1].text,
+                "edited once"
+            );
+        }
+
+        #[test]
+        fn metadata_patches_mark_only_the_addressed_records() {
+            let (mut cache, _streams, _threads, _f) = rig(2, 10, 4, 1 << 22, false);
+            let first = cache.projected().unwrap();
+            // A workspace-level patch shares every emitted record.
+            cache
+                .receive(&protocol::notification(
+                    "subscription.patch",
+                    json!({"epoch":"workspace","seq":2,
+                        "patch":[{"op":"set","path":["index","active"],"value":2}]}),
+                ))
+                .unwrap();
+            let delta = cache.projected().unwrap();
+            assert!(delta.changed.as_deref().unwrap().is_empty());
+            assert!(Arc::ptr_eq(&first.views[&1], &delta.views[&1]));
+            // A threads/<index> patch marks only the record at that position.
+            cache
+                .receive(&protocol::notification(
+                    "subscription.patch",
+                    json!({"epoch":"workspace","seq":3,
+                        "patch":[{"op":"set","path":["threads","0","status"],"value":"Running"}]}),
+                ))
+                .unwrap();
+            let delta = cache.projected().unwrap();
+            assert_eq!(changed_ids(&delta), [1].into_iter().collect());
+            assert!(Arc::ptr_eq(&first.views[&2], &delta.views[&2]));
+        }
+
+        #[test]
+        fn an_older_read_and_a_background_stream_touch_only_their_threads() {
+            // The small page budget leaves older history unread so thread 1's
+            // walk has work to do.
+            let (mut cache, mut streams, threads, mut fragments) = rig(3, 60, 20, 4 << 10, false);
+            let first = cache.projected().unwrap();
+            let mut state = State::new(PathBuf::new(), false);
+            state.apply_projection(first.clone()).unwrap();
+            // Reselect thread 1 (resubscribe settles), then start its
+            // older-history walk and leave it in flight while thread 2 streams.
+            cache.desired_thread = Some(1);
+            drain(&mut cache, &streams, &mut fragments, 4 << 10);
+            cache.request_earlier(1, None);
+            assert!(cache.next_history().is_some(), "walk is in flight");
+            // Update the newest message, which sits inside the loaded window.
+            let mut after_threads = threads.clone();
+            let last_message = after_threads[1]["messages"].as_array().unwrap().len() - 1;
+            after_threads[1]["messages"][last_message]["text"] = json!("new output");
+            publish(
+                &mut cache,
+                &mut streams,
+                &workspace(1, &threads),
+                &workspace(2, &after_threads),
+            );
+            let delta = cache.projected().unwrap();
+            assert_eq!(changed_ids(&delta), [1, 2].into_iter().collect());
+            assert!(Arc::ptr_eq(&first.views[&3], &delta.views[&3]));
+            let skipped = state.apply_stats.thread_views_skipped;
+            state.apply_projection(delta).unwrap();
+            assert_eq!(state.apply_stats.thread_views_skipped - skipped, 1);
+            assert_eq!(
+                state
+                    .threads
+                    .iter()
+                    .find(|t| t.id == 2)
+                    .unwrap()
+                    .messages
+                    .last()
+                    .unwrap()
+                    .text,
+                "new output"
+            );
+        }
+
+        #[test]
+        fn deltas_and_full_snapshots_converge_to_the_same_emission() {
+            let (mut cache, mut streams, threads, _f) = rig(2, 30, 10, 1 << 22, true);
+            cache.projected().unwrap();
+            let mut after_threads = threads.clone();
+            after_threads[0]["messages"][0]["text"] = json!("post-delta");
+            after_threads[1]["tools"][1]["detail"] = json!("moved");
+            let final_snapshot = publish(
+                &mut cache,
+                &mut streams,
+                &workspace(1, &threads),
+                &workspace(2, &after_threads),
+            );
+            let delta_full = cache.projected().unwrap().full();
+
+            // A fresh client that only ever saw the final snapshot converges.
+            let mut fresh = ProjectionCache::default();
+            connect(&mut fresh, &final_snapshot);
+            let fresh_streams = Streams::new(&final_snapshot);
+            let mut fragments = Fragments::default();
+            for id in [1, 2] {
+                load_all(&mut fresh, &fresh_streams, &mut fragments, 1 << 22, id);
+            }
+            let fresh_full = fresh.projected().unwrap().full();
+            assert_eq!(
+                delta_full, fresh_full,
+                "incremental and snapshot emissions must be identical"
+            );
+        }
+
+        #[test]
+        fn applied_views_keep_disclosure_state_and_shared_records_survive() {
+            let (mut cache, mut streams, threads, _f) = rig(2, 40, 20, 1 << 22, true);
+            let first = cache.projected().unwrap();
+            let mut state = State::new(PathBuf::new(), false);
+            state.apply_projection(first.clone()).unwrap();
+            {
+                let thread = state.threads.iter_mut().find(|t| t.id == 2).unwrap();
+                thread.tools[0].expanded = true;
+                thread.tools[1].raw_expanded = true;
+                thread.draft.replace_text("keep me");
+            }
+            let mut after_threads = threads.clone();
+            after_threads[1]["tools"][0]["output"] = json!("updated");
+            publish(
+                &mut cache,
+                &mut streams,
+                &workspace(1, &threads),
+                &workspace(2, &after_threads),
+            );
+            let delta = cache.projected().unwrap();
+            assert_eq!(changed_ids(&delta), [2].into_iter().collect());
+            state.apply_projection(delta).unwrap();
+            let thread = state.threads.iter().find(|t| t.id == 2).unwrap();
+            assert!(thread.tools[0].expanded);
+            assert!(thread.tools[1].raw_expanded);
+            assert_eq!(thread.draft.text, "keep me");
+            assert_eq!(thread.tools[0].output, "updated");
+        }
+
+        /// Report allocation counts and p50/p95 application times across sizes,
+        /// comparing the delta path against the pre-#24 path (full projection
+        /// clone + every ThreadView applied, i.e. `changed == None`).
+        /// Run alone for clean numbers:
+        /// `cargo test delta_application_benchmark -- --exact --test-threads=1 --nocapture`
+        #[test]
+        fn delta_application_benchmark_report() {
+            println!("issue-24 projection benchmark, {} updates/size", 30);
+            println!(
+                "{:>3} {:>6} {:>6} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12}",
+                "thr",
+                "msgs",
+                "tools",
+                "delta_p50",
+                "delta_p95",
+                "delta_bytes",
+                "full_p50",
+                "full_p95",
+                "full_bytes"
+            );
+            for (n, messages, tools) in
+                [(2usize, 200usize, 60usize), (4, 1000, 300), (4, 4000, 1200)]
+            {
+                // Every thread's history is fully loaded, so the streamed
+                // update lands on the largest record the cache holds. The
+                // older-read-while-streaming mix is exercised by
+                // `an_older_read_and_a_background_stream_touch_only_their_threads`.
+                let budget = 64 << 10;
+                let (mut cache, mut streams, threads, mut fragments) =
+                    rig(n, messages, tools, budget, true);
+                cache.desired_thread = Some(1);
+                let mut snapshot = workspace(1, &threads);
+                let mut state = State::new(PathBuf::new(), false);
+                let first = cache.projected().unwrap();
+                crate::test_alloc::reset();
+                let full_start = Instant::now();
+                state.apply_projection(first).unwrap();
+                let full_apply = full_start.elapsed().as_micros();
+                let (full_allocs, full_bytes) = crate::test_alloc::counts();
+                println!(
+                    "initial full apply: {}us, {} allocs, {} bytes",
+                    full_apply, full_allocs, full_bytes
+                );
+
+                let updates = 30;
+                let mut delta_times = Vec::with_capacity(updates);
+                let mut delta_bytes = Vec::with_capacity(updates);
+                let mut full_times = Vec::with_capacity(updates);
+                let mut full_bytes = Vec::with_capacity(updates);
+                for iter in 0..updates {
+                    let mut after_threads = threads.clone();
+                    // A background thread streams into its newest item while
+                    // thread 1's older pages are being read.
+                    let last = after_threads.len() - 1;
+                    let last_message =
+                        after_threads[last]["messages"].as_array().unwrap().len() - 1;
+                    after_threads[last]["messages"][last_message]["text"] =
+                        json!(format!("delta {iter}"));
+                    let after = workspace((iter + 2) as u64, &after_threads);
+                    cache.desired_thread = Some(1);
+                    cache.request_earlier(1, None);
+                    snapshot = publish(&mut cache, &mut streams, &snapshot, &after);
+                    drain(&mut cache, &streams, &mut fragments, budget);
+
+                    // Delta path: emit and apply only touched thread records.
+                    crate::test_alloc::reset();
+                    let start = Instant::now();
+                    let projection = cache.projected().unwrap();
+                    state.apply_projection(projection.clone()).unwrap();
+                    delta_times.push(start.elapsed().as_micros());
+                    delta_bytes.push(crate::test_alloc::counts().1);
+
+                    // Legacy path: materialize the wire-shaped full projection
+                    // (the old `state.clone()` + embedded transcripts) and apply
+                    // every thread record, as pre-#24 code did.
+                    crate::test_alloc::reset();
+                    let start = Instant::now();
+                    let full_wire = projection.full();
+                    state.apply_projection(full_wire).unwrap();
+                    full_times.push(start.elapsed().as_micros());
+                    full_bytes.push(crate::test_alloc::counts().1);
+                }
+                delta_times.sort_unstable();
+                delta_bytes.sort_unstable();
+                full_times.sort_unstable();
+                full_bytes.sort_unstable();
+                println!(
+                    "{:>3} {:>6} {:>6} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12}",
+                    n,
+                    messages,
+                    tools,
+                    delta_times[delta_times.len() / 2],
+                    delta_times[delta_times.len() * 95 / 100],
+                    delta_bytes[delta_bytes.len() / 2],
+                    full_times[full_times.len() / 2],
+                    full_times[full_times.len() * 95 / 100],
+                    full_bytes[full_bytes.len() / 2],
+                );
             }
         }
     }

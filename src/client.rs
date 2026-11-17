@@ -1,6 +1,6 @@
 //! KSG DesktopBackendManager lifecycle: attach first, supervise only our own child.
 use crate::{
-    client_history::ProjectionCache,
+    client_history::{Projection, ProjectionCache},
     protocol::{self, Command},
     server_auth::Discovery,
 };
@@ -170,7 +170,7 @@ pub struct Client {
     input: Option<tokio::sync::mpsc::Receiver<Command>>,
     events: mpsc::Receiver<Event>,
     output: mpsc::SyncSender<Event>,
-    snapshot: Arc<Mutex<Option<Value>>>,
+    snapshot: Arc<Mutex<Option<Projection>>>,
     stop: Arc<AtomicBool>,
     worker: Arc<Worker>,
     worker_finished: Arc<AtomicBool>,
@@ -280,7 +280,7 @@ impl Client {
     }
     #[cfg(test)]
     pub(crate) fn test_snapshot(&self, projection: Value) {
-        *self.snapshot.lock().expect("client snapshot") = Some(projection);
+        *self.snapshot.lock().expect("client snapshot") = Some(Projection::from(projection));
     }
     #[cfg(test)]
     pub(crate) fn test_receipt(&self, command: Command, value: Value) {
@@ -419,7 +419,7 @@ impl Client {
             self.linked.get(server).map(|client| &client.commands)
         }
     }
-    pub fn snapshots(&self) -> Vec<(String, Value)> {
+    pub fn snapshots(&self) -> Vec<(String, Projection)> {
         let mut views = Vec::new();
         if let Some(value) = self.snapshot() {
             views.push(("local".into(), value));
@@ -442,7 +442,7 @@ impl Client {
                     .find_map(|(id, client)| client.event().map(|event| (id.clone(), event)))
             })
     }
-    pub fn snapshot(&self) -> Option<Value> {
+    pub fn snapshot(&self) -> Option<Projection> {
         self.snapshot.lock().expect("client snapshot").take()
     }
     pub fn version(&self) -> Option<String> {
@@ -816,7 +816,7 @@ async fn supervise(
     info: Arc<Mutex<Value>>,
     mut input: tokio::sync::mpsc::Receiver<Command>,
     output: mpsc::SyncSender<Event>,
-    snapshot: Arc<Mutex<Option<Value>>>,
+    snapshot: Arc<Mutex<Option<Projection>>>,
     stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
     worker_finished: Arc<AtomicBool>,
@@ -897,11 +897,12 @@ async fn supervise(
                 cache.seq = saved["seq"].as_u64();
                 cache.epoch = saved["epoch"].clone();
                 cache.dirty = true;
-                if let Some(mut projected) = cache.projected() {
+                if let Some(projected) = cache.projected() {
+                    let mut projected = projected.full();
                     if let Some(remote) = &remote {
                         let _ = cache_images(remote, &directory, &mut projected, false).await;
                     }
-                    *snapshot.lock().expect("client snapshot") = Some(projected);
+                    *snapshot.lock().expect("client snapshot") = Some(Projection::from(projected));
                     wake();
                 }
             }
@@ -1243,10 +1244,13 @@ async fn supervise(
                                 report(notice);
                             }
                             if let Some(projected) = cache.projected() {
+                                let full = (view_writer.is_some()
+                                    || image_job.as_ref().is_some_and(|job| !job.is_finished()))
+                                .then(|| projected.full());
                                 if let Some(writer) = &view_writer {
-                                    writer.submit(json!({"schemaVersion":1,"state":projected,"seq":cache.seq,"epoch":cache.epoch}));
+                                    writer.submit(json!({"schemaVersion":1,"state":full.clone().unwrap_or_default(),"seq":cache.seq,"epoch":cache.epoch}));
                                 }
-                                let asset_view=image_job.as_ref().filter(|job|!job.is_finished()).map(|_|Arc::new(projected.clone()));
+                                let asset_view=image_job.as_ref().filter(|job|!job.is_finished()).map(|_|Arc::new(full.unwrap_or_default()));
                                 let generation={
                                     let mut snapshot=snapshot.lock().expect("client snapshot");
                                     let generation=image_generation.fetch_add(1,Ordering::AcqRel)+1;
@@ -1388,7 +1392,7 @@ async fn supervise(
 async fn fetch_assets(
     remote: crate::peer::Link,
     profile: PathBuf,
-    snapshot: Arc<Mutex<Option<Value>>>,
+    snapshot: Arc<Mutex<Option<Projection>>>,
     generation: Arc<AtomicUsize>,
     mut updates: tokio::sync::watch::Receiver<AssetView>,
     wake: rune::Waker,
@@ -1421,7 +1425,7 @@ async fn fetch_assets(
         {
             let mut snapshot = snapshot.lock().expect("client snapshot");
             if generation.load(Ordering::Acquire) == version {
-                *snapshot = Some(current);
+                *snapshot = Some(Projection::from(current));
                 wake();
             }
         }
@@ -2823,18 +2827,18 @@ mod tests {
             let profile=crate::store::directory().unwrap().join("stable-blob-test");
             let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into(),enabled:true};
             let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
-            let snapshot=Arc::new(Mutex::new(Some(view(1))));
+            let snapshot=Arc::new(Mutex::new(Some(Projection::from(view(1)))));
             let generation=Arc::new(AtomicUsize::new(1));
             let (changed,updates)=tokio::sync::watch::channel(None);
             let worker=tokio::spawn(fetch_assets(remote,profile,snapshot.clone(),generation.clone(),updates,Arc::new(||{}),Arc::new(|_|{})));
             changed.send_replace(Some((1,Arc::new(view(1)))));
             tokio::time::timeout(Duration::from_secs(2),started.notified()).await.unwrap();
-            let mut consumed=Value::Null;
+            let mut consumed=Projection::from(Value::Null);
             for seq in 2..=30 {
                 {
                     let mut snapshot=snapshot.lock().unwrap();
                     generation.store(seq,Ordering::Release);
-                    *snapshot=Some(view(seq));
+                    *snapshot=Some(Projection::from(view(seq)));
                 }
                 changed.send_replace(Some((seq,Arc::new(view(seq)))));
                 // Match Client::snapshot, which drains the UI's pending value.
@@ -2898,13 +2902,13 @@ mod tests {
                 "sourceThreadId":1,"sourceItemId":"message-1","field":"messages","ordinal":0,"position":0,"item":{"text":"retained"}
             }],"fields":{"id":1},"nextCursor":null}).to_string(),"nextFragment":null}})).unwrap();
         assert_eq!(
-            cache.projected().unwrap()["threads"][0]["messages"][0]["text"],
+            cache.projected().unwrap().views[&1]["messages"][0]["text"],
             "retained"
         );
         cache.receive(&protocol::notification("subscription.patch",
             json!({"epoch":"epoch","seq":11,"patch":[{"op":"set","path":["threads","0","status"],"value":"completed"}]}))).unwrap();
         assert_eq!(
-            cache.projected().unwrap()["threads"][0]["messages"][0]["text"],
+            cache.projected().unwrap().views[&1]["messages"][0]["text"],
             "retained"
         );
         assert!(
