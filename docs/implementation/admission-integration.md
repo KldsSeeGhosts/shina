@@ -30,6 +30,22 @@ disconnection, revocation and incompatible replies. Only a terminal result
 permits another queued task to start. Repeated reconciliation does not release
 the slot twice.
 
-The focused integration checks pass with 21 scheduler tests and 58 remote-task
-tests. Full combined-tree validation and the live admission contracts still
-gate publication. #23 remains open.
+## Placement and restart integration
+
+The first full combined run passed 2,078 unit tests but failed the existing
+Captain placement-retry regression. A ready checkout left its crew reservation
+queued, so the normal provider connection stayed blocked. Placement completion
+now pumps admission after clearing the placement fence. A separate capacity
+regression proves that a ready checkout still waits when the account is full.
+
+A live fake-provider rate-limit test also exposed queued delegated work becoming
+interrupted on restart. Recovery now preserves only an exact queued attempt with
+a durable reservation that was never granted and no recorded start. Previously
+granted or uncertain attempts still use history recovery. The live test checks
+provider refusal, one accepted input, a blocked second task, and preservation of
+the same backoff deadline and queued task across restart.
+
+The focused checks pass with 23 scheduler tests, seven authenticated live
+admission contracts and the existing placement-retry regression. The earlier
+58 remote-task tests also passed after integration. Full final-tree validation
+still gates publication. #23 remains open.

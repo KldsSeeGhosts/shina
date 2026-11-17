@@ -302,6 +302,89 @@ fn a_failed_admission_commit_interrupts_before_any_provider_effect() {
 }
 
 #[test]
+fn provider_rate_limit_holds_queued_work_and_persists_backoff() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let device = uuid::Uuid::new_v4();
+    let mut client = profile.client(device);
+    hello(&mut client, "admission-provider-backoff");
+    let home = captain_open(&mut client, "Quartermaster");
+    let first = delegate(
+        &mut client,
+        home,
+        "admission-rate-limit-fixture",
+        "provider-refusal",
+    );
+    let first_id = first["task_id"].as_str().unwrap().to_owned();
+    let first_child = first["thread_id"].as_u64().unwrap();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == first_id && task["state"] == "failed")
+    });
+    let failed = task_record(&client, &first_id);
+    assert!(
+        failed["error_excerpt"].as_str().unwrap().contains("429"),
+        "{failed}"
+    );
+    let status = scheduling_status(&mut client);
+    let deadline = |status: &Value| {
+        status["providerBackoff"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["provider"] == "cpa"))
+            .and_then(|row| row["until"].as_u64())
+            .unwrap_or_else(|| panic!("provider backoff missing: {status}"))
+    };
+    let backoff = deadline(&status);
+    assert!(backoff > 0, "{status}");
+    assert_eq!(status["usage"]["account"]["held"], 0, "{status}");
+    assert_eq!(prompts(&profile, first_child).len(), 1);
+
+    let second = delegate(
+        &mut client,
+        home,
+        "after-rate-limit-fixture",
+        "after-refusal",
+    );
+    let second_id = second["task_id"].as_str().unwrap().to_owned();
+    let second_child = second["thread_id"].as_u64().unwrap();
+    let status = scheduling_status(&mut client);
+    assert_eq!(
+        status["queue"][0]["subject"]["taskId"], second_id,
+        "{status}"
+    );
+    assert_eq!(
+        status["queue"][0]["blockedBy"], "provider_backoff",
+        "{status}"
+    );
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(prompts(&profile, second_child).is_empty());
+    assert_eq!(prompts(&profile, first_child).len(), 1);
+
+    // Restart must preserve the same deadline rather than granting early or
+    // retrying the refused input. Existing unit coverage advances past expiry.
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(device);
+    hello(&mut client, "admission-provider-backoff-restart");
+    let status = scheduling_status(&mut client);
+    assert_eq!(deadline(&status), backoff, "{status}");
+    assert_eq!(
+        status["queue"][0]["subject"]["taskId"], second_id,
+        "{status}"
+    );
+    assert_eq!(
+        status["queue"][0]["blockedBy"], "provider_backoff",
+        "{status}"
+    );
+    assert!(prompts(&profile, second_child).is_empty());
+    assert_eq!(prompts(&profile, first_child).len(), 1);
+    profile.stop();
+}
+
+#[test]
 fn a_crash_after_the_reservation_never_starts_the_prompt_twice() {
     let mut profile = Profile::new();
     let child_pid = profile.launch_with_fault(&["serve"], Some("pending"));

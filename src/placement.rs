@@ -889,6 +889,9 @@ impl State {
             return;
         }
         self.release_after_worktree_setup(index);
+        // Placement completion opens the fence, but only admission may grant
+        // the waiting crew reservation and start its provider.
+        self.admission_pump();
     }
 
     /// Provisioning or setup failed before a provider ever started. The task

@@ -2631,6 +2631,62 @@ mod tests {
     }
 
     #[test]
+    fn a_ready_crew_placement_still_waits_for_account_capacity() {
+        let mut state = demo();
+        state.scheduler.limits.account_running = Some(1);
+        captain(&mut state, 0, "Cap");
+        let first = worker(&mut state, "occupying capacity");
+        let second = crew_member(&mut state, 0, "waiting for placement");
+        state.admission_pump();
+        state.finish_placement_ready(second);
+        let queued = reservation_for(&state, state.threads[second].id);
+        assert_eq!(queued.state, ReservationState::Queued);
+        assert_eq!(queued.blocked_by.as_deref(), Some("account"));
+        assert!(state.threads[second].admission_blocked);
+
+        state.threads[first].pending_injections.clear();
+        state.finish_placement_ready(second);
+        assert_eq!(
+            reservation_for(&state, state.threads[second].id).state,
+            ReservationState::Held
+        );
+        assert!(!state.threads[second].admission_blocked);
+    }
+
+    #[test]
+    fn restart_keeps_only_proven_never_granted_tasks_in_the_queue() {
+        for previously_granted in [false, true] {
+            let mut state = demo();
+            state.scheduler.limits.account_running = Some(1);
+            worker(&mut state, "occupying capacity");
+            state.admission_pump();
+            state
+                .mcp_call(1, "delegate_task", &json!({"prompt":"queued brief"}))
+                .unwrap();
+            assert_eq!(state.tasks[0].state, TaskState::Queued);
+            let task_id = state.tasks[0].id.clone();
+            let reservation = state.scheduler.reservations.iter_mut().find(|row| {
+                matches!(&row.subject, Subject::Task { task_id: id, .. } if *id == task_id)
+            }).unwrap();
+            assert_eq!(reservation.state, ReservationState::Queued);
+            assert!(reservation.granted_at.is_none());
+            if previously_granted {
+                reservation.granted_at = Some(lifecycle::now());
+            }
+            state.prepare_task_recovery();
+            assert_eq!(
+                state.tasks[0].state,
+                if previously_granted {
+                    TaskState::Interrupted
+                } else {
+                    TaskState::Queued
+                }
+            );
+            assert!(!state.tasks[0].recovering);
+        }
+    }
+
+    #[test]
     fn a_cancelled_remote_attempt_stays_uncertain_until_the_stop_lands() {
         let mut state = demo();
         state.scheduler.limits.account_running = Some(1);

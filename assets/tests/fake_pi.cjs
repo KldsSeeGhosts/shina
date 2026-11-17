@@ -51,6 +51,13 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     // dies before it observes the prompt response.
     if (request.message.includes("peer-crash-after-accept-fixture")) return;
     response(request, {}); emit({ type: "agent_start" });
+    if (request.message.includes("admission-rate-limit-fixture")) {
+      const message = { role: "assistant", content: [], stopReason: "error",
+        errorMessage: "429 rate limit exceeded by the local admission fixture", timestamp: Date.now() };
+      messages.push(message); save(); emit({ type: "message_end", message });
+      running = false; emit({ type: "agent_end", messages }); emit({ type: "agent_settled" });
+      return;
+    }
     // Keep a remote provider turn active while the integration test issues its MCP reads.
     if (request.message.includes("peer-documents-hold-fixture")) return;
     if (request.message.includes("peer-steer-race-fixture")) {

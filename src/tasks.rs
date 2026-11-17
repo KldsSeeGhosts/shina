@@ -2635,6 +2635,25 @@ impl State {
     }
 
     pub(super) fn prepare_task_recovery(&mut self) {
+        // The committed scheduler proves these exact attempts never acquired
+        // capacity, so no provider dispatch could have occurred. Other queued
+        // tasks still need history recovery, including previously held work.
+        let never_granted: std::collections::HashSet<_> = self
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.state == admission::ReservationState::Queued
+                    && reservation.granted_at.is_none()
+            })
+            .filter_map(|reservation| match &reservation.subject {
+                admission::Subject::Task {
+                    task_id,
+                    attempt_id,
+                } => Some((task_id.clone(), attempt_id.clone())),
+                _ => None,
+            })
+            .collect();
         for task in &mut self.tasks {
             if let Some(remote) = &mut task.remote {
                 remote.next_retry_at = 0;
@@ -2647,6 +2666,12 @@ impl State {
             }
             task.hold_delivery = true;
             if task.remote.is_some() {
+                continue;
+            }
+            if task.state == TaskState::Queued
+                && task.started_at.is_none()
+                && never_granted.contains(&(task.id.clone(), task.attempt_id.clone()))
+            {
                 continue;
             }
             if self.threads.iter().any(|thread| {
