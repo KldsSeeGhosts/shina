@@ -1036,7 +1036,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err("Send hello before other requests.".into())
                 } else if matches!(method, "providers.refresh" | "providers.update") && !provider_updates {
                     Err(protocol::PROVIDER_UPDATES_UPDATE_REQUIRED.into())
-                } else if method == "captain.reportPolicy" && !captain_events {
+                } else if matches!(method, "captain.reportPolicy" | "captain.recoveryMode" | "captain.inbox.list") && !captain_events {
                     Err(protocol::CAPTAIN_EVENTS_UPDATE_REQUIRED.into())
                 } else if matches!(method, "captain.reports.list" | "captain.report.answer") && !captain_reports {
                     Err(protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED.into())

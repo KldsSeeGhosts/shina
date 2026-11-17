@@ -1030,6 +1030,8 @@ impl State {
             "documents":documents,
             "digest":{"text":digest.text,"revision":digest.revision,"updatedAt":digest.updated_at},
             "reportPolicy":self.captain_report_policy(captain).id(),
+            "recoveryMode":self.captain_recovery_mode(captain).id(),
+            "waits":self.captain_wait_views(captain),
             "activityDigest":activity,
         }))
     }
@@ -2209,11 +2211,11 @@ mod tests {
         let new_home = state.captain_home(1).unwrap();
         state.tasks[task_index].delivered = false;
         state.tasks[task_index].hold_delivery = true;
-        state.release_task_results(old_home);
+        state.release_task_results(old_home, captain_inbox::ReleaseActor::User);
         assert!(state.tasks[task_index].hold_delivery);
         state.poll_tasks(Instant::now());
         assert!(thread(&state, new_home).pending_injections.is_empty());
-        state.release_task_results(new_home);
+        state.release_task_results(new_home, captain_inbox::ReleaseActor::User);
         state.poll_tasks(Instant::now());
         assert_eq!(
             thread(&state, new_home).pending_injections.len(),

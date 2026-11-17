@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(report_injections(&state, home, &id), 0);
         // Releasing holds cannot resurrect it either.
         let home_id = state.captain_home(0).unwrap();
-        state.release_task_results(home_id);
+        state.release_task_results(home_id, captain_inbox::ReleaseActor::User);
         state.poll_tasks(Instant::now());
         assert_eq!(report_injections(&state, home, &id), 0);
         // The record survives release and reopen still undelivered.
@@ -404,7 +404,7 @@ mod tests {
         assert!(!state.poll_crew_reports());
         // The explicit user turn releases the hold; delivery then settles it.
         let home_id = state.captain_home(0).unwrap();
-        state.release_task_results(home_id);
+        state.release_task_results(home_id, captain_inbox::ReleaseActor::User);
         assert!(!state.captain_reports[0].hold_delivery);
         state.poll_tasks(Instant::now());
         assert_eq!(report_injections(&state, home, &id), 1);

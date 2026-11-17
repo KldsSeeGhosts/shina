@@ -4738,7 +4738,7 @@ mod tests {
         restored.prepare_task_recovery();
         restored.poll_tasks(Instant::now());
         assert!(restored.threads[0].pending_injections.is_empty());
-        restored.release_task_results(1);
+        restored.release_task_results(1, captain_inbox::ReleaseActor::User);
         restored.poll_tasks(Instant::now());
         assert_eq!(restored.threads[0].pending_injections.len(), 1);
         restored.poll_tasks(Instant::now());

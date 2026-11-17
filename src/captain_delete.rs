@@ -216,6 +216,8 @@ impl State {
         self.captain_scopes.remove(&captain);
         self.captain_remote_scopes.remove(&captain);
         self.captain_report_policies.remove(&captain);
+        self.captain_recovery_modes.remove(&captain);
+        self.close_captain_inbox(captain);
         self.captains[captain] = Captain {
             name: format!("Deleted Captain {captain}"),
             role: String::new(),

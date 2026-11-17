@@ -181,6 +181,22 @@ The Brief initially shows up to three Needs you rows, two What's new rows and th
 
 The digest bounds its sections to 16, 32 and 16 rows respectively, with overflow counts. Titles and summaries have character limits. Its version fingerprints the derived rows and counts without a clock, so unchanged source records produce the same version after restart.
 
+## Captain event inbox and restart recovery
+
+Every Captain has a durable, typed inbox in `captainInbox`, committed in the same index snapshot and runtime transaction as reports and tasks. It is a ledger over the existing senders, not a second sender: crew reports and routine timers keep their own message text and delivery machinery, and `watch`/`external` entries reuse the same `[delivery id]` injection and accepted-history path. Each event records an identity, its subject Captain, a kind (`crew_outcome`, `timer`, `watch`, `external`, `user_message`), a source, the wake policy frozen at capture, a delivery state, and a `correlationId` the producer chooses. States are `pending`, `held`, `accepted`, `superseded`, `expired` and `cancelled`; accepted, superseded, expired and cancelled are terminal and never wake the Captain again.
+
+Every `crew_outcome` event mirrors a durable crew report with the same id, source and captured policy. `timer` events name a routine slot's `routine-{id}-{slot}` delivery id. `user_message` events record the explicit turn or resume that released a Captain's held work, listing the released event ids. `watch` and `external` events are the producer-facing kinds. A new event can supersede an earlier non-failure event with the same Captain, kind, source and correlation before dispatch. Failure events are never superseded and never supersede others. The inbox retains commit order.
+
+After restart, a committed event that never dispatched can resume through its original delivery id. A watch or external event with a recorded adapter dispatch but no provider acceptance stays held. Neither an explicit turn nor unattended mode sends it again on that evidence alone. Acceptance requires the delivery id in a Captain home's accepted history. An optimistic transcript never counts. A timer slot interrupted by restart is not replayed. The routine ledger clears `active_delivery`, and the inbox marks the event `expired` or `cancelled` if the routine is gone. Deleting or demoting a Captain cancels its open events and waits. Deleting a source thread removes its events, and undo restores them with the thread's other records.
+
+Each Captain has a recovery mode for future restarts. `attended` is the default. Held results wait for an explicit turn or resume. `unattended` is an explicit opt-in through `captain.recoveryMode`, with `captain`, `mode`, and `expectedMode`. It releases recovery holds only after worker state is reconciled. Uncertain execution leases or dispatches, pending approvals or questions, offline executors or paused workers, revoked credentials or unavailable providers, and missing homes each have a visible wait reason. Context-policy reports and events remain held under either mode unless an explicit turn releases them. Unattended never answers a user question or treats the loss of an executor link as proof that it stopped.
+
+Waits live in `captainWaits` with an awaited condition, reason, correlation id, state (`waiting`, `satisfied`, `expired`, `cancelled`) and an optional `expiresAt`. One open wait exists per key; when its condition clears it is marked satisfied, when its clock runs out it expires, and it can be cancelled explicitly. Waits describe state, not retries: nothing re-sends on their account.
+
+`captain.read` reports `recoveryMode` and the Captain's recent `waits`. `captain.inbox.list` pages a Captain's events and waits under the same capability gate as the other event RPCs, with cursor paging under the protocol byte budget.
+
+Remaining integration points, by design not in this backend pass: external webhook and watch producers call `capture_inbox_event` with a stable `correlationId` when they land; the worker side of restart replay belongs to execution leases (#27) and provider evidence receipts (#22), which are separately gated; and no UI renders the inbox or the recovery-mode control yet.
+
 ## Explicit memory
 
 Each captain has at most 256 memories. Each memory has an id, text of at most 500 characters, an essential flag, and a user-controlled flag. Shina deduplicates text after collapsing whitespace and lowercasing it.
