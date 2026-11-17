@@ -876,9 +876,10 @@ impl State {
             for intent in intents {
                 self.provision_peer_task_intent(&intent);
             }
-            if !self.threads[index].pending_injections.is_empty() {
-                self.connect_thread(index);
-            }
+            // The peer worker's reservation gates this connect; the pump
+            // grants it now that the placement fence is open.
+            self.ensure_thread_admission(index, true, false);
+            self.admission_pump();
             return;
         }
         if thread.delegated {
@@ -888,6 +889,9 @@ impl State {
             return;
         }
         self.release_after_worktree_setup(index);
+        // Placement completion opens the fence, but only admission may grant
+        // the waiting crew reservation and start its provider.
+        self.admission_pump();
     }
 
     /// Provisioning or setup failed before a provider ever started. The task

@@ -7908,5 +7908,8 @@ mod mobile_sdk_runtime;
 #[path = "support/captain_contract.rs"]
 mod captain_contract;
 
+#[path = "support/admission_contract.rs"]
+mod admission_contract;
+
 #[path = "support/update_recovery.rs"]
 mod update_recovery;

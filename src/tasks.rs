@@ -3,8 +3,6 @@ use super::*;
 use crate::protocol::{Receipt, ReceiptStatus};
 use serde::{Deserialize, Serialize};
 
-pub(super) const RUNNING_LIMIT: usize = 3;
-pub(super) const UNFINISHED_LIMIT: usize = 8;
 const TASK_OPERATION_LIMIT: usize = 128;
 const OPERATION_NOT_DISPATCHED: &str = "not_dispatched";
 const OPERATION_QUEUED: &str = "queued";
@@ -85,7 +83,7 @@ pub(super) struct Task {
     #[serde(default)]
     prior_deliveries: Vec<ResultDelivery>,
     #[serde(skip)]
-    recovering: bool,
+    pub(super) recovering: bool,
     #[serde(skip)]
     pub(super) hold_delivery: bool,
 }
@@ -976,32 +974,38 @@ impl State {
         self.release_crew_reports(parent_thread_id);
     }
 
+    /// Pre-creation admission checks: the coordinator's unfinished cap and
+    /// the account's pending-reservation bound. Capacity beyond that queues
+    /// durably instead of refusing.
     pub(super) fn check_task_capacity(&self, parent: usize) -> Result<(), String> {
-        if self
-            .tasks
-            .iter()
-            .filter(|task| {
-                self.task_home(task) == Some(self.effective_home(parent)) && !task.state.finished()
-            })
-            .count()
-            >= UNFINISHED_LIMIT
+        if let Some(limit) = self.scheduler.limits.coordinator_unfinished
+            && self
+                .tasks
+                .iter()
+                .filter(|task| {
+                    self.task_home(task) == Some(self.effective_home(parent))
+                        && !task.state.finished()
+                })
+                .count()
+                >= limit
         {
-            return Err("This captain already has 8 unfinished tasks. Finish or dismiss a task before delegating more work.".into());
+            return Err(format!(
+                "This captain already has {limit} unfinished tasks. Finish or dismiss a task before delegating more work."
+            ));
         }
-        Ok(())
+        self.scheduler.check_pending()
     }
 
     pub(super) fn task_queue_position(&self, task: &Task) -> Option<usize> {
-        (task.state == TaskState::Queued).then(|| {
-            self.tasks
-                .iter()
-                .filter(|other| {
-                    self.task_home(other) == self.task_home(task)
-                        && other.state == TaskState::Queued
-                })
-                .position(|other| other.id == task.id)
-                .unwrap_or(0)
-                + 1
+        if task.state != TaskState::Queued {
+            return None;
+        }
+        self.scheduler.reservations.iter().find_map(|reservation| {
+            matches!(&reservation.subject,
+                super::admission::Subject::Task { task_id, attempt_id }
+                if task_id == &task.id && attempt_id == &task.attempt_id)
+            .then(|| self.scheduler.queue_position(&reservation.id))
+            .flatten()
         })
     }
 
@@ -1921,6 +1925,20 @@ impl State {
     }
 
     fn queue_task_attempt(&mut self, index: usize, message: &str) -> Result<(), String> {
+        let task = &self.tasks[index];
+        if task.state.finished()
+            && task.remote.is_some()
+            && (Self::remote_occupancy_unproven(task, &task.attempt_id)
+                || self.scheduler.reservations.iter().any(|reservation| {
+                    reservation.state == admission::ReservationState::Held
+                        && reservation.uncertain
+                        && matches!(&reservation.subject,
+                            admission::Subject::Task { task_id, attempt_id }
+                            if *task_id == task.id && *attempt_id != task.attempt_id)
+                }))
+        {
+            return Err("The previous remote attempt has unproven occupancy. Verify target settlement before starting another attempt.".into());
+        }
         let parent = self.tasks[index].parent_thread_id;
         if self.tasks[index].state.finished() {
             self.check_task_capacity(parent)?;
@@ -1969,6 +1987,8 @@ impl State {
         {
             self.request_reprovision(child);
         }
+        // The new attempt identity needs its own admission reservation.
+        self.admit_task_index(index);
         Ok(())
     }
 
@@ -2343,17 +2363,33 @@ impl State {
                 self.attach_operation_target_attempt(&operation_scope, key, &attempt_id);
             }
             let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
-            remote.send_command = Some(crate::protocol::Command::new(
-                "peer.thread.send",
-                json!({"threadId":remote.thread_id,"message":message_with_context,
-                    "delivery":"attempt","attemptId":attempt_id}),
-            ));
-            let command_id = remote
-                .send_command
-                .as_ref()
-                .expect("send command")
-                .command_id
-                .to_string();
+            let command_id = if remote.thread_id.is_none()
+                && remote.rejected_launch == Some(remote.launch_command.command_id)
+            {
+                // This launch provably created no target. A deliberate new
+                // attempt needs a new command; replaying the old command would
+                // return its immutable rejected receipt forever.
+                let mut params = remote.launch_command.params.clone();
+                params["brief"] = json!(message_with_context);
+                params["origin"]["attemptId"] = json!(attempt_id);
+                remote.launch_command = crate::protocol::Command::new("peer.thread.launch", params);
+                remote.rejected_launch = None;
+                remote.send_command = None;
+                remote.last_error = None;
+                remote.launch_command.command_id.to_string()
+            } else {
+                remote.send_command = Some(crate::protocol::Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":remote.thread_id,"message":message_with_context,
+                        "delivery":"attempt","attemptId":attempt_id}),
+                ));
+                remote
+                    .send_command
+                    .as_ref()
+                    .expect("send command")
+                    .command_id
+                    .to_string()
+            };
             remote.state = RemoteState::Launching;
             remote.next_retry_at = 0;
             if let Some(key) = operation_key {
@@ -2453,89 +2489,10 @@ impl State {
         Ok(true)
     }
 
+    /// Delegated attempts, crew members and peer workers all start through
+    /// the one durable admission scheduler.
     pub(super) fn start_queued_tasks(&mut self) -> bool {
-        if self.network_blocked() {
-            return false;
-        }
-        let mut changed = false;
-        for index in 0..self.tasks.len() {
-            let task = &self.tasks[index];
-            if task.state != TaskState::Queued || task.recovering {
-                continue;
-            }
-            if self
-                .require_active_thread_owner(task.child_thread_id)
-                .is_err()
-            {
-                continue;
-            }
-            if self
-                .tasks
-                .iter()
-                .filter(|other| {
-                    self.task_home(other) == self.task_home(task) && self.task_occupies_slot(other)
-                })
-                .count()
-                >= RUNNING_LIMIT
-            {
-                continue;
-            }
-            let Some(child) = self
-                .threads
-                .iter()
-                .position(|thread| thread.id == task.child_thread_id && !thread.archived())
-            else {
-                continue;
-            };
-            if self.threads[child].status.busy()
-                || self.threads[child].phase == "Stopping"
-                || self.threads[child]
-                    .placement
-                    .as_ref()
-                    .is_some_and(|placement| placement.phase != placement::PlacementPhase::Ready)
-                || (self.threads[child].machine == "local"
-                    && self
-                        .provider_update_drivers
-                        .contains(&self.threads[child].harness))
-            {
-                continue;
-            }
-            self.tasks[index].state = TaskState::Starting;
-            self.tasks[index].started_at = Some(lifecycle::now());
-            if self.tasks[index].remote.is_some() {
-                changed = true;
-                continue;
-            }
-            // Persist intent before any prompt can reach Pi. Failure leaves work stopped.
-            if self.runtime_enabled
-                && let Err(error) = self.checkpoint_and_flush()
-            {
-                self.tasks[index].state = TaskState::Interrupted;
-                self.tasks[index].error_excerpt = excerpt(&error, 2000);
-                self.storage_error = Some(error);
-                continue;
-            }
-            let thread = &mut self.threads[child];
-            thread.arm_task();
-            thread.pending_injections.push_back(Injection {
-                text: self.tasks[index].attempt_message.clone(),
-                shown: false,
-                steer: None,
-                peer_input: None,
-            });
-            self.connect_thread(child);
-            changed = true;
-        }
-        changed
-    }
-
-    fn task_occupies_slot(&self, task: &Task) -> bool {
-        !task.recovering
-            && (task.state.occupies_slot()
-                || self
-                    .threads
-                    .iter()
-                    .any(|thread| thread.id == task.child_thread_id && thread.status.busy()))
+        self.admission_pump()
     }
 
     pub(super) fn restore_tasks(
@@ -2709,6 +2666,25 @@ impl State {
     }
 
     pub(super) fn prepare_task_recovery(&mut self) {
+        // The committed scheduler proves these exact attempts never acquired
+        // capacity, so no provider dispatch could have occurred. Other queued
+        // tasks still need history recovery, including previously held work.
+        let never_granted: std::collections::HashSet<_> = self
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.state == admission::ReservationState::Queued
+                    && reservation.granted_at.is_none()
+            })
+            .filter_map(|reservation| match &reservation.subject {
+                admission::Subject::Task {
+                    task_id,
+                    attempt_id,
+                } => Some((task_id.clone(), attempt_id.clone())),
+                _ => None,
+            })
+            .collect();
         for task in &mut self.tasks {
             if let Some(remote) = &mut task.remote {
                 remote.next_retry_at = 0;
@@ -2721,6 +2697,12 @@ impl State {
             }
             task.hold_delivery = true;
             if task.remote.is_some() {
+                continue;
+            }
+            if task.state == TaskState::Queued
+                && task.started_at.is_none()
+                && never_granted.contains(&(task.id.clone(), task.attempt_id.clone()))
+            {
                 continue;
             }
             if self.threads.iter().any(|thread| {
@@ -2991,6 +2973,14 @@ impl State {
             task.error_excerpt = error.into();
         }
         self.tasks.push(task);
+        if matches!(
+            state,
+            TaskState::Queued | TaskState::Starting | TaskState::Running
+        ) {
+            // Demo projections use the same queue positions as production,
+            // without pumping admission or starting a provider.
+            self.admit_task_index(self.tasks.len() - 1);
+        }
     }
 }
 
@@ -3242,7 +3232,27 @@ mod tests {
         restored.demo = true;
         restored.restore_global(&snapshot).unwrap();
         restored.prepare_task_recovery();
-        assert_eq!(restored.tasks[0].state, TaskState::Interrupted);
+        // This follow-up never acquired capacity. It remains queued without
+        // replaying either its brief or the previous result during recovery.
+        assert_eq!(restored.tasks[0].state, TaskState::Queued);
+        assert!(!restored.tasks[0].recovering);
+        assert!(restored.scheduler.reservations.iter().any(|reservation| {
+            reservation.state == admission::ReservationState::Queued
+                && reservation.granted_at.is_none()
+                && matches!(&reservation.subject,
+                    admission::Subject::Task { task_id, attempt_id }
+                    if *task_id == restored.tasks[0].id
+                        && *attempt_id == restored.tasks[0].attempt_id)
+        }));
+        assert!(
+            restored
+                .threads
+                .iter()
+                .find(|thread| thread.id == restored.tasks[0].child_thread_id)
+                .unwrap()
+                .pending_injections
+                .is_empty()
+        );
         assert!(restored.tasks[0].prior_deliveries[0].hold);
         let (commands, _events) = fake_pi(&mut restored.threads[0]);
         restored.resume_task_results(1).unwrap();
@@ -4354,12 +4364,12 @@ mod tests {
             .mcp_call(1, "delegate_task", &delegate_args("cap-1"))
             .unwrap();
         state.tasks[0].finish(TaskState::Completed, "done", "");
-        for _ in 0..UNFINISHED_LIMIT {
+        for _ in 0..admission::COORDINATOR_UNFINISHED {
             state
                 .mcp_call(1, "delegate_task", &json!({"prompt":"Another task"}))
                 .unwrap();
         }
-        assert_eq!(state.tasks.len(), UNFINISHED_LIMIT + 1);
+        assert_eq!(state.tasks.len(), admission::COORDINATOR_UNFINISHED + 1);
         assert!(
             state
                 .mcp_call(1, "delegate_task", &json!({"prompt":"Ninth task"}))
