@@ -372,27 +372,55 @@ ACP's `<shina_context>`. Native Claude endpoint binding and allowlist, Pi
 read-only admission, Codex and ACP agent policy differences, AGENTS.md privacy,
 delivery receipts and attempt/question fences are unchanged.
 
+The caller role includes lifecycle. Active earlier homes get the earlier-home
+instructions, archived homes and crew get archived instructions, retired homes
+and crew get retired instructions, crew get their own coordinator text with
+authorized reports and `propose_memory`, and ordinary threads get ordinary
+thread text. A role change marks a live session for a
+`<shina_capability_update>` on its next prompt and clears the harness awareness
+flag so a reconnect re-injects the same current text. `initialize` answers from
+the current state, including an old endpoint after reset or archive.
+
+Reachability and harness discovery are part of the same record. An ACP harness is
+probed with a metadata-only `initialize` before allocation; an agent that
+advertises neither HTTP nor stdio MCP is reported as `executable: false` with
+its discovery and MCP state, and `delegate_task` or crew creation refuses before
+creating a thread. A linked peer must also be reachable and free of a recorded
+reachability or authentication error before remote delegation, placement or
+document reads are reported available. A revoked origin device closes remote
+Captain document reads at discovery and dispatch.
+
 Coverage sits in `src/capabilities.rs` unit tests and
 `tests/support/capability_parity.rs`. The runtime tests drive real
 `initialize`, `tools/list` and `tools/call` over each thread's token endpoint
 recorded by the fake Pi, native Claude, native Codex (`fake_codex.js` app-server
-fixture) and ACP fixtures. They cover the primary read-only Captain home,
-crew, delegated leaves on all four harnesses, the earlier home after
-`captain.reset`, the archived Captain, a revoked bearer token, keyed
-`delegate_task` retry replay for lost responses, a `NOTES.md` near the document
-limit, stale `tools/list` revalidation at dispatch, unsupported remote
-independent roots, and an ACP agent that refuses startup for lack of MCP
-transport. The remote test pairs two live serves and checks the negotiated
-peer feature table plus the remote leaf's contract on the target machine.
+fixture) and ACP fixtures. The four fake agents now issue an actual
+`orchestrator_capabilities` and `list_threads` workflow from the MCP
+registration they were launched with; Claude's read-only crew additionally
+exercises `can_use_tool`, the `shina-policy` hook callback, and denied lookalike
+names. Tests compare the exact endpoint and bearer token, cover the primary
+read-only Captain home, crew, delegated leaves on all four harnesses, the
+earlier home after `captain.reset`, the archived Captain, a revoked bearer
+token, keyed `delegate_task` retry replay for lost responses, a `NOTES.md` near
+the document limit, stale `tools/list` revalidation at dispatch, unsupported
+remote independent roots, ACP MCP preflight refusal, unreachable peers and a
+revoked origin device. The remote test pairs two live serves and checks the
+negotiated peer feature table plus the remote leaf's contract on the target
+machine.
 
 `capacity.scheduler` reports `implemented: false`; admission stays the static
 per-coordinator limits until the separate scheduler work lands. The patch was
 kept additive under protocol minor 39; no bump was needed.
 
-While integrating, the server-runtime test client exposed a real projection
-race: the global `last_projection` diff can emit a deep `set` before the
-element add that creates its parents. The test client now vivifies missing
-patch parents; the underlying ordering question is a residual for review.
+A separate prerequisite fixed the projection invariant. Scoped index metadata
+is now merged into the full index by thread id instead of replacing the global
+list with a filtered subset. A scoped batch that discovers a new thread is
+promoted to a full projection, so the committed snapshot and the runtime patch
+baseline announce the same thread array. The strict runtime test client installs
+paged snapshots before applying `protocol::apply`; it no longer vivifies missing
+patch parents or grows arrays. Regression tests compare the committed snapshot,
+the runtime baseline and a strict subscriber across a full create followed by a
+scoped change, plus a new thread discovered inside a scoped poll.
 
 ## Verification baseline
 
