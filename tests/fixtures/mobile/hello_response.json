@@ -23,6 +23,7 @@
       "peer-tasks-v2",
       "thread-read-v2",
       "peer-task-fences-v1",
+      "peer-task-evidence-v1",
       "remote-project-scope-v1",
       "composer-transactions",
       "run-control",
@@ -103,7 +104,7 @@
     "ownerId": "<uuid>",
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 42,
+    "protocolMinor": 45,
     "serverId": "<serverId>",
     "serverTime": "<time>",
     "workspaceId": "<uuid>"
