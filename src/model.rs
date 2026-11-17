@@ -1002,6 +1002,18 @@ pub struct Thread {
     pub tools: Vec<Tool>,
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
+    /// Item lists keyed by the last applied projection's stable source ids.
+    /// The next apply reuses unchanged items positionally or by id; it never
+    /// rebuilds items that did not change.
+    pub(crate) transcript_fields:
+        std::collections::HashMap<&'static str, std::sync::Arc<crate::client_history::FieldItems>>,
+    /// Last successfully applied source, not the network's previous emission.
+    pub(crate) transcript_projection:
+        Option<std::sync::Arc<crate::client_history::ThreadProjection>>,
+    /// Structure and content revisions of the last applied emission; the
+    /// timeline consumer (#25) diffs these instead of rescanning items.
+    pub(crate) transcript_structure: u64,
+    pub(crate) transcript_content: u64,
     pub draft: TextEdit,
     pub queued_edit: Option<QueuedEdit>,
     queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
@@ -1572,6 +1584,10 @@ impl Thread {
             tools: vec![],
             thoughts: vec![],
             work: vec![],
+            transcript_fields: std::collections::HashMap::new(),
+            transcript_projection: None,
+            transcript_structure: 0,
+            transcript_content: 0,
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             typing_guard: crate::composer::TypingGuard::default(),
@@ -4501,6 +4517,8 @@ pub struct State {
     server_seq: u64,
     persist_transcripts: bool,
     client_views: Value,
+    /// Which emitted thread records the last projections actually applied.
+    pub(crate) apply_stats: client_state::ApplyStats,
     next_client_draft: usize,
     tab_epoch: u64,
     tab_intents: std::collections::HashMap<(String, uuid::Uuid), (u64, TabIntent)>,
@@ -4854,6 +4872,7 @@ impl State {
             persist_transcripts: false,
             dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
+            apply_stats: Default::default(),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
             tab_intents: Default::default(),
@@ -17621,10 +17640,10 @@ mod tests {
         state.client = Some(crate::client::Client::new(state.data_dir.clone()));
         state.machines.selected = "remote".into();
         state.current_mut().status = Status::Running;
-        state
-            .machines
-            .views
-            .insert("local".into(), json!({"updateStatus":{"blocker":null}}));
+        state.machines.views.insert(
+            "local".into(),
+            json!({"updateStatus":{"blocker":null}}).into(),
+        );
         assert_eq!(state.update_restart_blocker(), None);
         state.machines.views.get_mut("local").unwrap()["updateStatus"]["blocker"] =
             json!("2 local threads are running");
