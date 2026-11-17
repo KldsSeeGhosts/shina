@@ -1158,9 +1158,29 @@ impl Database {
             let text:String=inner.connection.query_row("SELECT payload FROM projection_records WHERE document='index.json' AND scope=?1 AND key='$'",[scope],|r|r.get(0)).map_err(error)?;
             serde_json::from_str(&text).map_err(error)
         };
-        Ok(
-            json!({"index":{"threads":[read(&format!("threads/{thread}"))?]},"threads":[read(&format!("threadViews/{thread}"))?]}),
-        )
+        let record = read(&format!("threads/{thread}"))?;
+        let mut index = json!({"threads":[record.clone()]});
+        let execution: Option<String> = inner.connection.query_row(
+            "SELECT payload FROM projection_records WHERE document='index.json' AND scope='$' AND key='execution'",
+            [], |row| row.get(0),
+        ).optional().map_err(error)?;
+        if let Some(execution) = execution {
+            let execution: Value = serde_json::from_str(&execution).map_err(error)?;
+            let leases = execution["leases"]
+                .as_array()
+                .ok_or("Invalid execution lease projection.")?
+                .iter()
+                .filter(|lease| {
+                    lease["leaseId"].as_str().is_some_and(|id| {
+                        record["execution"]["leaseId"].as_str() == Some(id)
+                            || record["nextExecution"]["leaseId"].as_str() == Some(id)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            index["execution"] = json!({"schema":execution["schema"],"leases":leases});
+        }
+        Ok(json!({"index":index,"threads":[read(&format!("threadViews/{thread}"))?]}))
     }
 
     pub fn replay(&self, after: u64, through: u64) -> Result<Option<Vec<Value>>, String> {
@@ -1811,6 +1831,35 @@ fn put_receipt(connection: &Connection, receipt: &Receipt) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scoped_peer_state_includes_only_its_bound_execution_leases() {
+        let directory = directory("scoped-execution");
+        let database = Database::open(&directory).unwrap();
+        let index = json!({
+            "threads":[{"id":7,"execution":{"leaseId":"current"},
+                "nextExecution":{"leaseId":"queued"}}],
+            "threadViews":[{"id":7,"messages":[]}],
+            "execution":{"schema":1,"leases":[
+                {"leaseId":"current","ownerId":"owner-a"},
+                {"leaseId":"queued","ownerId":"owner-a"},
+                {"leaseId":"unrelated","ownerId":"private-owner"}
+            ]}
+        });
+        database.test_connection(|connection| {
+            crate::projection_store::write(connection, "index.json", &index).unwrap();
+        });
+        let scoped = database.scoped_state(7).unwrap();
+        assert_eq!(
+            scoped["index"]["execution"]["leases"],
+            json!([
+                index["execution"]["leases"][0],
+                index["execution"]["leases"][1]
+            ])
+        );
+        assert!(!scoped.to_string().contains("private-owner"));
+        assert_eq!(scoped["index"]["threads"][0], index["threads"][0]);
+    }
+
     #[test]
     fn persisted_thread_replay_has_a_hard_byte_budget() {
         let directory = crate::store::directory().unwrap();

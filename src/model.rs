@@ -1166,6 +1166,13 @@ impl Thread {
             && self.connection_owner.quiescent()
             && !self.status.busy()
             && self.pending_prompt.is_none()
+            && self.queued_prompt.is_none()
+            && self.pending_injections.is_empty()
+            && self.injection_id.is_none()
+            && self.native.queue.is_empty()
+            && !self.peer_recovery_held
+            && !self.initializing
+            && !self.configuring
             && self.request.is_none()
     }
 
@@ -2874,7 +2881,12 @@ impl Thread {
             .filter(|run| self.status.busy() && Some(*run) == self.run_id.as_ref())
             .is_some();
         if !self.status.busy() || self.run_id.is_none() {
-            self.run_id = Some(uuid::Uuid::new_v4().to_string());
+            if let Some(binding) = self.next_execution.take() {
+                self.run_id = Some(binding.run_id.clone());
+                self.execution = Some(binding);
+            } else {
+                self.run_id = Some(uuid::Uuid::new_v4().to_string());
+            }
             self.prompt_suggestion = None;
         }
         // prompt starts an idle Pi; followUp also covers a run starting before Pi reads it.
@@ -4859,6 +4871,18 @@ pub struct State {
 }
 
 impl State {
+    pub(crate) fn execution_thread_quiescent(&self, thread_id: usize) -> bool {
+        self.threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .is_some_and(Thread::execution_quiescent)
+            && !self.peer_task_intents.iter().any(|intent| {
+                intent.thread_id == thread_id
+                    && intent.queue_state != "settled"
+                    && intent.provider_state != "rejected"
+            })
+    }
+
     pub(crate) fn execution_baseline(&self) -> ExecutionBaseline {
         ExecutionBaseline {
             runs: self
@@ -17206,6 +17230,59 @@ mod tests {
         thread.disconnect();
         thread.session = Some("newly-learned-session.jsonl".into());
         assert!(Arc::ptr_eq(&owner, &thread.connection_owner));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_quiescence_waits_for_the_owned_child_to_be_reaped_after_disconnect() {
+        let mut thread = Thread::new(1);
+        let (started, ready) = mpsc::channel();
+        let (release, cleanup) = mpsc::channel();
+        let (finished, reaped) = mpsc::channel();
+        thread.pi = Some(Pi::worker(
+            Arc::new(|| {}),
+            thread.connection_owner.clone(),
+            None,
+            move |_, _, _, _, _| {
+                let mut command = std::process::Command::new("/bin/sh");
+                command
+                    .args(["-c", "read -r fixture_line"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                let mut child = crate::process::Process::spawn(&mut command)
+                    .map_err(|error| error.to_string())?;
+                let pid = child.id();
+                started.send(pid).map_err(|error| error.to_string())?;
+                let released = cleanup.recv_timeout(Duration::from_secs(5));
+                child.terminate();
+                child
+                    .reap(Duration::from_secs(1))
+                    .map_err(|error| error.to_string())?;
+                finished.send(()).map_err(|error| error.to_string())?;
+                released.map_err(|error| error.to_string())
+            },
+        ));
+        let pid = ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(crate::process::is_alive(pid));
+        thread.disconnect();
+        assert!(thread.pi.is_none());
+        assert!(
+            !thread.execution_quiescent(),
+            "dropping the handle is not a child exit"
+        );
+        assert!(crate::process::is_alive(pid));
+        release.send(()).unwrap();
+        reaped.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !thread.execution_quiescent() {
+            assert!(
+                Instant::now() < deadline,
+                "the session owner was not released"
+            );
+            std::thread::yield_now();
+        }
+        assert!(!crate::process::is_alive(pid));
     }
 
     #[test]

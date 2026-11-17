@@ -165,7 +165,7 @@ pub async fn wait_for_peer_thread(
             "request":request,"needsYou":request.is_some(),
             "documentRequest":document_request,"status":thread["status"],
             "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"],
-            "runId":thread.get("runId"),"execution":execution,
+            "runId":record["runId"],"execution":execution,
             "inputs":record["peerOrigin"]["inputs"].clone(),
             "providerAcceptedRun":record["providerAcceptedRun"],
             "providerRunningRun":record["providerRunningRun"],
@@ -311,6 +311,33 @@ fn apply_execution_reply(
         let alias = value["threadId"]
             .as_u64()
             .or_else(|| remote.thread_id.map(|id| id as u64));
+        let saved_value = stored.value();
+        let returned_value = lease.value();
+        for field in [
+            "leaseId",
+            "generation",
+            "workspaceId",
+            "ownerId",
+            "runAsOwnerId",
+            "controllerId",
+            "initiatingDeviceId",
+            "executorId",
+            "logicalCaptainUid",
+            "logicalThreadUid",
+            "runId",
+            "attemptId",
+            "deliveryId",
+            "schema",
+            "preparedAt",
+            "requestKey",
+            "queuedBehindCurrent",
+        ] {
+            if saved_value[field] != returned_value[field] {
+                return Err(format!(
+                    "Executor returned a lease that does not match the controller assignment in {field}."
+                ));
+            }
+        }
         if stored.binding() != lease.binding()
             || stored.schema != lease.schema
             || stored.prepared_at != lease.prepared_at
@@ -2136,6 +2163,220 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_execution_lease_cannot_stop_a_matching_attempt() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        let lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &attempt,
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        state.threads[1].execution = Some(lease.binding());
+        let before = serde_json::to_value(&state.threads[1].peer_origin).unwrap();
+        let controls = state.peer_task_intents.len();
+        let response = state.execute_peer_command(
+            "fixture-peer",
+            &Command::new(
+                "peer.thread.stop",
+                json!({
+                    "threadId":child, "attemptId":attempt,
+                    "execution":{
+                        "leaseId":uuid::Uuid::new_v4().to_string(),
+                        "generation":lease.generation, "runId":lease.run_id
+                    }
+                }),
+            ),
+        );
+        assert!(
+            response.is_err(),
+            "an unknown lease staged a stop: {response:?}"
+        );
+        assert_eq!(state.peer_task_intents.len(), controls);
+        assert_eq!(
+            serde_json::to_value(&state.threads[1].peer_origin).unwrap(),
+            before
+        );
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::ExecutorAccepted
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_peer_prompt_uses_its_controller_assigned_run() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        let lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &attempt,
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        let thread = &mut state.threads[1];
+        thread.execution = Some(lease.binding());
+        thread.next_execution = Some(lease.binding());
+        let (pi, commands, _) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.status = Status::Running;
+        thread.model_provider = "cpa".into();
+        thread.history_loaded = true;
+        thread.pending_injections.push_back(Injection {
+            text: "first controller prompt".into(),
+            shown: false,
+            steer: None,
+            peer_input: Some(uuid::Uuid::new_v4()),
+        });
+        assert!(thread.flush_injection());
+        assert_eq!(thread.run_id.as_deref(), Some(lease.run_id.as_str()));
+        assert_eq!(commands.try_recv().unwrap()["runId"], lease.run_id);
+        assert!(thread.next_execution.is_none());
+        assert_eq!(thread.execution.as_ref().unwrap(), &lease.binding());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn remote_send_uses_the_committed_peer_contract_before_the_next_metadata_poll() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let database = crate::database::Database::open(&state.data_dir).unwrap();
+        database.put_peer(&state.peers[0]).unwrap();
+        state.peers.clear();
+        state
+            .queue_remote_send(0, "use committed discovery", "follow_up")
+            .unwrap();
+        assert!(
+            state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .send_command
+                .is_some()
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn execution_fence_refuses_every_pending_input_or_control() {
+        for pending in [
+            "injection",
+            "queued_prompt",
+            "native_queue",
+            "inflight",
+            "recovery",
+            "durable_input",
+            "durable_stop",
+        ] {
+            let mut state = fixture();
+            let child = peer_worker(&mut state);
+            let attempt = state.threads[1]
+                .peer_origin
+                .as_ref()
+                .unwrap()
+                .attempt_id
+                .clone()
+                .unwrap();
+            let lease = assigned_lease(
+                &state,
+                child,
+                &state.identity.controller_id,
+                1,
+                &uuid::Uuid::new_v4().to_string(),
+                &attempt,
+                false,
+            );
+            let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+            state
+                .execution
+                .uncertain(&lease.lease_id, 2, "link lost")
+                .unwrap();
+            state.threads[1].execution = Some(lease.binding());
+            state.threads[1].status = Status::Ready;
+            let prompt = Prompt::new("pending provider input".into(), vec![]);
+            match pending {
+                "injection" => state.threads[1].pending_injections.push_back(Injection {
+                    text: "pending".into(),
+                    shown: false,
+                    steer: None,
+                    peer_input: None,
+                }),
+                "queued_prompt" => state.threads[1].queued_prompt = Some((prompt, 0)),
+                "native_queue" => state.threads[1]
+                    .native
+                    .queue
+                    .push_back(pi_session::QueuedMessage { id: 1, prompt }),
+                "inflight" => state.threads[1].injection_id = Some("prompt-in-flight".into()),
+                "recovery" => state.threads[1].peer_recovery_held = true,
+                "durable_input" => state.peer_task_intents.push(PeerTaskIntent::input(
+                    uuid::Uuid::new_v4().to_string(),
+                    child,
+                    Some(attempt),
+                    None,
+                    None,
+                    "follow_up",
+                    "pending".into(),
+                    Some(lease.run_id.clone()),
+                )),
+                "durable_stop" => state.peer_task_intents.push(PeerTaskIntent::cancel(
+                    uuid::Uuid::new_v4().to_string(),
+                    child,
+                    Some(attempt),
+                    Some(lease.run_id.clone()),
+                )),
+                _ => unreachable!(),
+            }
+            let response = state.execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.execution.fence",
+                    json!({
+                        "threadId":child, "leaseId":lease.lease_id,
+                        "generation":lease.generation, "runId":lease.run_id,
+                        "evidence":"test has no live process"
+                    }),
+                ),
+            );
+            assert!(
+                response.is_err(),
+                "{pending} was incorrectly fenced: {response:?}"
+            );
+            assert_eq!(
+                state.execution.get(&lease.lease_id).unwrap().phase,
+                crate::execution::Phase::Uncertain,
+                "{pending}"
+            );
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
     }
 
     #[test]
@@ -6360,7 +6601,7 @@ impl State {
                 }
                 let lease_id = lease.lease_id.clone();
                 let thread = &self.threads[index];
-                if !thread.execution_quiescent() {
+                if !self.execution_thread_quiescent(thread.id) {
                     return Err(
                         "Executor is not quiescent. Live provider processes cannot be fenced by a controller flag."
                             .into(),
@@ -6455,24 +6696,12 @@ impl State {
                     let generation = control["generation"]
                         .as_u64()
                         .ok_or("Execution control is missing generation.")?;
-                    let controlled = self.execution.control(
+                    self.execution.control(
                         &binding.logical_thread_uid,
                         lease_id,
                         generation,
                         control["runId"].as_str(),
-                    );
-                    let same_attempt = args["attemptId"]
-                        == self.threads[index]
-                            .peer_origin
-                            .as_ref()
-                            .and_then(|origin| origin.attempt_id.clone())
-                            .map(Value::from)
-                            .unwrap_or(Value::Null);
-                    if let Err(error) = controlled
-                        && !(same_attempt && error.contains("Unknown execution lease"))
-                    {
-                        return Err(error);
-                    }
+                    )?;
                 }
                 // A stop fenced to an observed attempt must not land on newer
                 // work. An untracked legacy worker cannot prove a match, even
@@ -7030,8 +7259,11 @@ impl State {
             .expect("remote task")
             .label
             .clone();
-        if !self
-            .peers
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .map(|database| database.peers())
+            .transpose()?
+            .unwrap_or_else(|| self.peers.clone());
+        if !peers
             .iter()
             .find(|peer| peer.server_id == server_id)
             .is_some_and(|peer| {

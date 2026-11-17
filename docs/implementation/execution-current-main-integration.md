@@ -54,7 +54,49 @@ terminal/fence reconciliation.
 
 Two authenticated paired-server tests pass, as do the exact lease-capability
 gate and live mobile hello golden. The all-target build, formatting and diff
-checks pass. A full combined suite has not run.
+checks passed at the first focused checkpoint. The subsequent full-run result
+and corrections are recorded below.
+
+## Combined-suite findings and corrections
+
+The first full serial run at `5843526` passed all 2,080 unit tests with 13
+ignored, but only 109 of 122 integration tests passed. The 13 failures block
+publication. They were not attributed to environmental flakiness.
+
+The failed live snapshots and follow-up regressions exposed these composition
+defects:
+
+- Database-backed peer waits loaded thread rows without the root execution
+  book, so strict progress validation received no lease. The scoped read now
+  includes only the current and next leases named by that thread. A regression
+  checks both inclusion and exclusion of unrelated owner records.
+- The first peer injection generated a new run UUID instead of consuming its
+  controller-issued binding. That prompted an executor-local replacement lease.
+  The first injection now consumes the assigned run. A failing-then-passing
+  regression checks the actual adapter command's run id.
+- Follow-up admission read the runtime's stale in-memory peer list before its
+  next metadata poll. It now uses the committed peer table, like launch
+  admission. A regression with an empty in-memory list and a committed peer
+  failed before the correction and passes now.
+- The stop route allowed an unknown lease when its attempt matched. The
+  regression proved that it staged a durable stop. Unknown leases now fail
+  before input or origin mutation.
+- Quiescence ignored pending injections, native queued prompts, in-flight
+  injection commands and held recovery. Both local and peer fences now check
+  those states plus unsettled durable input/stop intents. The regression proved
+  an invalid fence before the fix and covers seven pending-state variants
+  afterward.
+
+A real owned child-process regression also proves that disconnecting the
+session handle does not release quiescence while its worker still owns the
+child. It requires explicit cleanup and reaping before the owner becomes free.
+Only the fixture-owned process is terminated.
+
+The four safety/scoped-state tests, initial-run test and committed-discovery
+test pass. The authenticated two-server stale-question/restart test, which
+failed in the combined run, passes after these corrections. A fresh full
+integration run is in progress. The original full run is terminal and was not
+restarted.
 
 Issue #27 remains open. Queued generations still need distinct current-run and
 queued-run control semantics. Executor quiescence still needs pending-input and

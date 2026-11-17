@@ -4694,12 +4694,7 @@ impl State {
                                     .into(),
                             );
                         }
-                        let thread = self
-                            .threads
-                            .iter()
-                            .find(|thread| thread.id == thread_id)
-                            .ok_or("Unknown thread.")?;
-                        if !thread.execution_quiescent() {
+                        if !self.execution_thread_quiescent(thread_id) {
                             return Err(
                                 "Executor is not quiescent. A controller-side flag cannot fence a live provider."
                                     .into(),
