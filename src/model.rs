@@ -5535,32 +5535,18 @@ impl State {
                         thread.provider_running_run.clone(),
                         thread.provider_terminal_run.clone(),
                         thread.provider_terminal_status.clone(),
-                        thread
-                            .peer_origin
-                            .as_ref()
-                            .and_then(|origin| origin.result.as_ref())
-                            .and_then(|result| result["status"].as_str())
-                            .map(str::to_owned),
-                        thread.run_id.clone(),
                     )
                 })
             })
             .collect();
-        for (thread_id, binding, accepted, running, terminal, terminal_status, peer_result, run) in
-            observations
-        {
+        for (thread_id, binding, accepted, running, terminal, terminal_status) in observations {
             let Some(lease) = self.execution.get(&binding.lease_id).cloned() else {
                 continue;
             };
-            let logical_run_matches = run.as_deref() == Some(lease.run_id.as_str());
-            let target = if terminal.as_deref() == Some(lease.run_id.as_str())
-                || peer_result.is_some() && logical_run_matches
-            {
+            let target = if terminal.as_deref() == Some(lease.run_id.as_str()) {
                 Some((
                     crate::execution::Phase::Terminal,
-                    terminal_status
-                        .or(peer_result)
-                        .unwrap_or_else(|| "terminal".into()),
+                    terminal_status.unwrap_or_else(|| "terminal".into()),
                 ))
             } else if running.as_deref() == Some(lease.run_id.as_str()) {
                 Some((crate::execution::Phase::Running, String::new()))

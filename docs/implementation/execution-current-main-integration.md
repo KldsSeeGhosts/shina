@@ -390,3 +390,10 @@ command ID. The executor can settle that lease only if its exact durable input
 still proves no dispatch; otherwise normal run settlement is required. The
 controller keeps the reservation held until it receives that proof. The test
 checks both the durable rejection and that the provider saw no cancelled prompt.
+
+A recovered peer result is not itself proof that a writer ended. A managed
+peer only reports completion after an exact terminal observation or verified
+fence. During restart recovery, a fresh Pi replay with the matching brief and
+final reply can supply that observation. Missing, inconclusive, or explicitly
+non-replayed history leaves the lease uncertain. A result acknowledgement
+cannot upgrade it.

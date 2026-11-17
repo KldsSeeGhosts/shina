@@ -158,7 +158,11 @@ pub async fn wait_for_peer_thread(
                 return Err("This execution does not belong to the requested peer thread.".into());
             }
         }
-        let execution = requested_execution.unwrap_or(&record["execution"])["leaseId"]
+        let bound_execution = record
+            .get("execution")
+            .filter(|binding| binding.is_object())
+            .unwrap_or(&record["nextExecution"]);
+        let execution = requested_execution.unwrap_or(bound_execution)["leaseId"]
             .as_str()
             .and_then(|lease_id| {
                 state["index"]["execution"]["leases"]
@@ -186,6 +190,8 @@ pub async fn wait_for_peer_thread(
         }
         let current =
             requested_execution.is_none() || execution["leaseId"] == record["execution"]["leaseId"];
+        let execution_settled = (!bound_execution.is_object() && requested_execution.is_none())
+            || matches!(execution["phase"].as_str(), Some("terminal" | "fenced"));
         let request = current.then_some(request).flatten();
         let document_request = current.then_some(document_request).flatten();
         // The worker's live admission reservation rides the wait answer so
@@ -201,7 +207,7 @@ pub async fn wait_for_peer_thread(
             .cloned()
             .unwrap_or(Value::Null);
         let mut status = json!({"threadId":thread["id"],
-            "finished":current && record["peerOrigin"]["result"].is_object(),
+            "finished":current && execution_settled && record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
             "documentRequest":document_request,"status":thread["status"],
             "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"],
@@ -212,7 +218,7 @@ pub async fn wait_for_peer_thread(
             "providerRunningRun":record["providerRunningRun"],
             "providerTerminalRun":record["providerTerminalRun"],
             "providerTerminalStatus":record["providerTerminalStatus"]});
-        status["result"] = if current {
+        status["result"] = if current && execution_settled {
             record["peerOrigin"]["result"].clone()
         } else {
             Value::Null
@@ -425,6 +431,11 @@ fn apply_execution_reply(
         }
         let target = lease.phase;
         use crate::execution::Phase;
+        if (value["finished"] == true || value["acknowledged"] == true)
+            && !matches!(target, Phase::Terminal | Phase::Fenced)
+        {
+            return Err("Executor reported completion without settling the exact lease.".into());
+        }
         if target == Phase::Terminal
             && !lease
                 .terminal_status
@@ -2489,6 +2500,9 @@ mod tests {
             json!({}),
             json!({"execution":"invalid"}),
             json!({"execution":{}}),
+            json!({"threadId":9,"acknowledged":true,
+                "result":{"status":"failed","runId":lease.run_id},
+                "execution":lease.value()}),
         ] {
             let before = state.execution.projection();
             assert!(
@@ -2535,6 +2549,55 @@ mod tests {
             .is_err()
         );
         std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn replay_without_authoritative_history_does_not_settle_a_peer_lease() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let origin = state.threads[1].peer_origin.as_ref().unwrap();
+        let attempt = origin.attempt_id.clone().unwrap();
+        let brief = origin.attempt_message.clone();
+        let lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &attempt,
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        state
+            .execution
+            .uncertain(&lease.lease_id, 2, "executor restarted")
+            .unwrap();
+        let thread = &mut state.threads[1];
+        thread.execution = Some(lease.binding());
+        thread.run_id = Some(lease.run_id.clone());
+        thread.recovering_task = true;
+        // Even a plausible final reply is not evidence if the adapter did not
+        // replay provider history.
+        thread.task_history = Some(json!({"success":true,"data":{
+            "historyReplayed":false,"messages":[
+                {"role":"user","content":[{"type":"text","text":brief}]},
+                {"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"A result"}]}
+            ]
+        }}));
+        state.capture_peer_results();
+        state.refresh_execution(3);
+        assert!(
+            state.threads[1]
+                .peer_origin
+                .as_ref()
+                .unwrap()
+                .result
+                .is_none()
+        );
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Uncertain
+        );
     }
 
     #[test]
@@ -2835,8 +2898,7 @@ mod tests {
             "type":"response","command":"prompt","id":prompt["id"],
             "success":true,"data":{"disposition":"queued"}
         }));
-        state.threads[1].status = Status::Completed;
-        state.threads[1].task_result = Some("done");
+        state.threads[1].apply(json!({"type":"agent_settled","aborted":false}));
         assert!(state.capture_peer_results());
         let result = state.threads[1]
             .peer_origin
@@ -8854,17 +8916,16 @@ impl State {
                             lifecycle::now(),
                         )?;
                         if let Some(binding) = &current_binding
-                            && let Some(status) = self.threads[index]
-                                .peer_origin
-                                .as_ref()
-                                .and_then(|origin| origin.result.as_ref())
-                                .and_then(|result| result["status"].as_str())
+                            && self.threads[index].provider_terminal_run.as_deref()
+                                == Some(binding.run_id.as_str())
+                            && let Some(status) =
+                                self.threads[index].provider_terminal_status.as_deref()
                         {
                             let _ = self.execution.terminal(
                                 &binding.lease_id,
                                 status,
                                 lifecycle::now(),
-                                "executor-local stored peer result proves the prior run ended",
+                                "matching provider terminal event proves the prior run ended",
                             );
                         }
                         if let Some(binding) = &current_binding
@@ -9070,6 +9131,10 @@ impl State {
             .map(|intent| intent.thread_id)
             .collect();
         for thread in &mut self.threads {
+            let binding = thread.execution.as_ref().or(thread.next_execution.as_ref());
+            let lease = binding.and_then(|binding| self.execution.get(&binding.lease_id));
+            let needs_settlement =
+                binding.is_some() && lease.is_none_or(|lease| lease.phase.blocks_replacement());
             if thread.peer_origin.is_some() && thread.recovering_task {
                 if pending_inputs.contains(&thread.id) {
                     // A saved task record describes the previous attempt. The
@@ -9089,6 +9154,31 @@ impl State {
                         .attempt_message
                         .clone();
                     recovered.reconcile(&history);
+                    let proved_completion = thread.harness == "pi"
+                        && history["success"] == true
+                        && history["data"]["historyReplayed"] != false
+                        && recovered.state == TaskState::Completed
+                        && binding.is_some_and(|binding| {
+                            thread.run_id.as_deref() == Some(&binding.run_id)
+                                && thread
+                                    .peer_origin
+                                    .as_ref()
+                                    .is_some_and(|origin| origin.attempt_id == binding.attempt_id)
+                        });
+                    if needs_settlement && !proved_completion {
+                        thread.recovering_task = false;
+                        thread.task_result = None;
+                        thread.disconnect();
+                        thread.status = Status::Failed;
+                        thread.error = Some(
+                            "Recovery held: provider history did not prove this run ended.".into(),
+                        );
+                        changed = true;
+                        continue;
+                    }
+                    if needs_settlement {
+                        thread.note_provider_terminal("completed");
+                    }
                     let origin = thread.peer_origin.as_mut().expect("origin");
                     origin.result = Some(
                         json!({"status":if recovered.state==TaskState::Completed {"completed"}else{"failed"},
@@ -9101,7 +9191,10 @@ impl State {
                     changed = true;
                 } else if thread.status == Status::Failed {
                     thread.recovering_task = false;
-                    thread.task_result = Some("failed");
+                    if !needs_settlement {
+                        thread.task_result = Some("failed");
+                    }
+                    changed = true;
                 }
             }
             let Some(origin) = &mut thread.peer_origin else {
@@ -9121,7 +9214,12 @@ impl State {
             }
             // A follow-up can still display the previous Completed status while
             // its prompt is queued. Only settlement proves this attempt ended.
-            if let Some(status) = thread.task_result {
+            if let Some(status) = thread.task_result
+                && (!needs_settlement
+                    || lease.is_some_and(|lease| {
+                        thread.provider_terminal_run.as_deref() == Some(&lease.run_id)
+                    }))
+            {
                 origin.result = Some(
                     json!({"status":if status=="done" {"completed"} else {status},
                     "resultId":uuid::Uuid::new_v4(),"replyItemId":thread.messages.iter().enumerate().rfind(|(i,m)|*i>=origin.reply_after_position && m.role=="Pi").map(|(i,_)|i.to_string()),
@@ -10132,26 +10230,11 @@ impl State {
                                     continue;
                                 }
                             };
-                            let execution_lease = remote
-                                .execution
-                                .as_ref()
-                                .map(|lease| lease.lease_id.clone());
                             task.finish(
                                 state,
                                 result["reply"].as_str().unwrap_or(""),
                                 result["error"].as_str().unwrap_or(""),
                             );
-                            if let Some(lease_id) = execution_lease {
-                                let _ = self.execution.terminal(
-                                    &lease_id,
-                                    task.state.id(),
-                                    lifecycle::now(),
-                                    "acknowledged peer result is terminal evidence for the controller run",
-                                );
-                                if let Some(remote) = task.remote.as_mut() {
-                                    remote.execution = self.execution.get(&lease_id).cloned();
-                                }
-                            }
                             if let Some(inputs) = value.get("inputs").and_then(Value::as_array) {
                                 peer_inputs.extend(
                                     inputs.iter().map(|input| {
