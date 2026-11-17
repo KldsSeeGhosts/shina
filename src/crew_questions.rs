@@ -515,6 +515,7 @@ impl State {
                     text,
                     shown: false,
                     steer: None,
+                    peer_input: None,
                 });
             changed = true;
             if self.threads[position].pi.is_none()
