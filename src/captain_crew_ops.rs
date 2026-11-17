@@ -356,12 +356,18 @@ impl State {
     ) -> Result<Value, String> {
         let index = self.independent_crew_index(captain, id)?;
         let thread = &self.threads[index];
+        // A failed placement starts nothing, so its held input is recoverable
+        // by new Captain work. Other interrupted input still needs review.
+        let placement_failed = thread
+            .placement
+            .as_ref()
+            .is_some_and(|placement| placement.phase == placement::PlacementPhase::Failed);
         if thread.status == Status::Paused
             || thread.phase == "Stopping"
-            || thread.native.queue_held
+            || (thread.native.queue_held && !placement_failed)
             || thread.has_recoverable_native_inputs()
             || self.recovered_inputs.contains_key(&id)
-            || thread.status == Status::Failed && thread.has_draft_content()
+            || (thread.status == Status::Failed && thread.has_draft_content() && !placement_failed)
         {
             return Err(
                 "Review or resume the crew thread's interrupted input before adding work.".into(),
@@ -375,6 +381,9 @@ impl State {
         self.crew_database()?;
         attachments::stage_prompt_files(&mut prompt)?;
         let thread = &mut self.threads[index];
+        if placement_failed {
+            thread.native.queue_held = false;
+        }
         thread.serial = serial;
         thread
             .native

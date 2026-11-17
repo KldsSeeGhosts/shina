@@ -12901,6 +12901,32 @@ impl State {
         if self.current().resume_pending() || self.current().responding_request.is_some() {
             return false;
         }
+        if let Some(placement) = self.current().placement.as_ref()
+            && placement.phase != placement::PlacementPhase::Ready
+        {
+            let setup_failed = self
+                .current()
+                .worktree_setup
+                .as_ref()
+                .is_some_and(|setup| setup.phase == WorktreeSetupPhase::Failed);
+            let message = match placement.phase {
+                placement::PlacementPhase::Pending => {
+                    "This worker's checkout is still preparing. Nothing started; wait for the placement to finish."
+                }
+                placement::PlacementPhase::Failed if setup_failed => {
+                    "Nothing started. Open the worker to retry or skip its setup script."
+                }
+                placement::PlacementPhase::Failed => {
+                    "Nothing started. New work from its parent or Captain retries the same checkout."
+                }
+                placement::PlacementPhase::Ready => unreachable!(),
+            }
+            .to_owned();
+            let thread = self.current_mut();
+            thread.submission_error = Some(message.clone());
+            thread.error = Some(message);
+            return false;
+        }
         if self.current().crew_draft.is_some() {
             if background || approval_redirect {
                 self.current_mut().crew_draft_notice =
