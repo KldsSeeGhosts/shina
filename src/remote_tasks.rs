@@ -133,6 +133,18 @@ pub async fn wait_for_peer_thread(
                 }
                 request
             });
+        // The worker's live admission reservation rides the wait answer so
+        // the origin sees queued/held/uncertain occupancy, not just turns.
+        let admission = record["admission"]
+            .as_str()
+            .and_then(|id| {
+                state["index"]["scheduler"]["reservations"]
+                    .as_array()?
+                    .iter()
+                    .find(|reservation| reservation["id"] == id)
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut status = json!({"threadId":thread["id"],
             "finished":record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
@@ -140,7 +152,8 @@ pub async fn wait_for_peer_thread(
             "attemptId":record["peerOrigin"]["attemptId"],
             "runId":thread.get("runId"),
             "inputs":record["peerOrigin"]["inputs"].clone(),
-            "placement":record["placement"]});
+            "placement":record["placement"],
+            "admission":admission});
         status["result"] = record["peerOrigin"]["result"].clone();
         status["revision"] = json!(crate::protocol::revision(&status));
         Ok(status)
@@ -4729,6 +4742,9 @@ impl State {
         self.next_id += 1;
         self.threads.push(thread);
         self.tasks.push(task);
+        // The remote attempt reserves admission under this account and the
+        // peer's executor scope before its launch command can dispatch.
+        self.admit_task_index(self.tasks.len() - 1);
         let status = self.mcp_call(parent, "task_status", &json!({"thread_id":id}))?;
         if let Some(request) = request
             && let Err(error) = self.record_delegate_receipt(caller, request, args, &status)
@@ -5307,6 +5323,7 @@ impl State {
                 crate::protocol::PLACEMENT,
                 crate::protocol::PEER_TASK_FENCES,
                 crate::protocol::PEER_TASK_EVIDENCE,
+                crate::protocol::SCHEDULING,
             ];
             #[cfg(debug_assertions)]
             if std::env::var_os("SHINA_TEST_OMIT_PEER_EVIDENCE").is_some()
@@ -5410,6 +5427,7 @@ impl State {
                 .ok_or("A bounded brief is required.")?;
             let marked_brief = tasks::delivery_text(&command.command_id.to_string(), brief);
             origin.attempt_message = marked_brief.clone();
+            self.scheduler.check_pending()?;
             let mut thread = Thread::new(self.next_id);
             thread.native.access = match args.get("access") {
                 None | Some(Value::Null) => AccessMode::Supervised,
@@ -5486,7 +5504,13 @@ impl State {
             ))?;
             self.next_id += 1;
             self.threads.push(thread);
-            return Ok(json!({"threadId":id,"placement":resolved.value()}));
+            // A peer-launched worker reserves admission on this executor
+            // before its provider may start. Placement still pending keeps
+            // it queued until the reservation provisions.
+            self.ensure_thread_admission(self.threads.len() - 1, true, false);
+            self.admission_pump();
+            return Ok(json!({"threadId":id,"placement":resolved.value(),
+                "admission":self.admission_value_for(id)}));
         }
         if command.method == "peer.thread.list" {
             return self.readable_threads(None, &args["read"]);
@@ -5822,12 +5846,13 @@ impl State {
                     if placement_failed {
                         self.request_reprovision(index);
                     }
+                    self.ensure_thread_admission(index, true, delivery == Some("attempt"));
                     self.sync_peer_intent_evidence(
                         self.peer_task_intent_index(thread_id, &command.command_id.to_string())
                             .expect("staged peer intent"),
                     );
                     let mut result = json!({"threadId":thread_id,
-                        "queued":true});
+                        "queued":true,"admission":self.admission_value_for(thread_id)});
                     if self.peer_evidence_enabled() {
                         result["input"] = json!("queued");
                     }
@@ -5843,7 +5868,12 @@ impl State {
                     self.peer_task_intent_index(thread_id, &command.command_id.to_string())
                         .expect("staged peer intent"),
                 );
-                let mut result = json!({"threadId":thread_id});
+                // A new attempt supersedes worker occupancy; a follow-up
+                // inside it reuses the live reservation.
+                self.ensure_thread_admission(index, true, delivery == Some("attempt"));
+                self.admission_pump();
+                let mut result = json!({"threadId":thread_id,
+                    "admission":self.admission_value_for(thread_id)});
                 if self.peer_evidence_enabled() {
                     result["input"] = json!("queued");
                 }

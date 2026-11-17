@@ -114,6 +114,8 @@ pub(crate) mod crew_question_state;
 #[path = "crew_questions.rs"]
 pub(crate) mod crew_questions;
 pub use crew_question_state::CrewQuestionDraft;
+#[path = "admission.rs"]
+mod admission;
 #[path = "crew_reports.rs"]
 pub(crate) mod crew_reports;
 #[path = "question_answers.rs"]
@@ -1139,6 +1141,10 @@ pub struct Thread {
     crew_report_last_run: Option<String>,
     recovering_task: bool,
     task_history: Option<Value>,
+    /// The live admission reservation id this crew member or peer worker
+    /// holds, and the monotonic run counter its reservations key to.
+    pub admission: Option<String>,
+    pub admission_run: u64,
     memory: Option<memory::MemoryLink>,
     learned_turn: Option<honcho::Turn>,
     memory_pending: VecDeque<mpsc::Receiver<Value>>,
@@ -1681,6 +1687,8 @@ impl Thread {
             crew_report_last_run: None,
             recovering_task: false,
             task_history: None,
+            admission: None,
+            admission_run: 0,
             memory: None,
             learned_turn: None,
             memory_pending: VecDeque::new(),
@@ -4492,6 +4500,9 @@ fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
 pub struct State {
     /// None means a command/global change. A poll records only changed threads.
     pub(crate) persistence_scope: Option<std::collections::HashSet<usize>>,
+    /// The durable admission scheduler shared by delegated tasks, crew
+    /// members and peer-launched workers. Persisted with the index.
+    pub(crate) scheduler: admission::Scheduler,
     pub(crate) provider_update_drivers: std::collections::BTreeSet<String>,
     pub client: Option<crate::client::Client>,
     pub machines: crate::peer::Machines,
@@ -4850,6 +4861,7 @@ impl State {
             peer_runtime: Default::default(),
             headless: false,
             persistence_scope: None,
+            scheduler: admission::Scheduler::default(),
             provider_update_drivers: Default::default(),
             owner: None,
             command_receipts: Vec::new(),
@@ -8205,8 +8217,8 @@ impl State {
                 "host_supported": caller.machine == "local",
             },
             "constraints": {
-                "running_children_per_coordinator": tasks::RUNNING_LIMIT,
-                "unfinished_tasks_per_coordinator": tasks::UNFINISHED_LIMIT,
+                "running_children_per_coordinator": self.scheduler.limits.coordinator_running,
+                "unfinished_tasks_per_coordinator": self.scheduler.limits.coordinator_unfinished,
                 "direct_providers": false,
                 "remote_hosts": true,
                 "model_ids": "exact ids only",
@@ -8259,6 +8271,11 @@ impl State {
                 "MCP admission is the agent's own permission policy on this harness; Shina cannot report whether a call prompts or is refused."
             }
         };
+        // Authoritative admission state for this caller's coordinator: the
+        // same limits the scheduler enforces at execution time, usage and
+        // the caller-visible queue. Not a cached discovery record.
+        capabilities["scheduling"] =
+            self.scheduling_scoped_value(Some(self.effective_home(caller.id)));
         capabilities["caller"] = json!({
             "role": if caller.delegated {
                 "worker"
@@ -8316,6 +8333,12 @@ impl State {
                 .iter()
                 .any(|task| task.child_thread_id == self.threads[index].id && task.remote.is_some())
         {
+            return;
+        }
+        // A queued admission reservation gates every provider start, however
+        // the call reached here. Held reservations and unmanaged interactive
+        // threads never match.
+        if index < self.threads.len() && self.admission_blocks_connect(self.threads[index].id) {
             return;
         }
         if self.demo
@@ -8725,6 +8748,8 @@ impl State {
                 self.threads.push(thread);
                 self.tasks.push(task);
                 self.sync_memory_links();
+                // The attempt reserves admission before the pump can start it.
+                self.admit_task_index(self.tasks.len() - 1);
                 let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
                 if let Some(key) = request_key
                     && let Err(error) =
@@ -8805,6 +8830,7 @@ impl State {
                             "kind": request["method"],
                         }))),
                     "queue_position": task.and_then(|task| self.task_queue_position(task)),
+                    "admission": task.map(|task| self.admission_value_for_task(task)).unwrap_or(Value::Null),
                     "selection": selection_value(thread),
                     "placement": task.and_then(|task|task.remote.as_ref()).and_then(|remote|remote.placement.clone())
                         .or_else(|| thread.placement.as_ref().map(placement::ThreadPlacement::value)),
@@ -14537,6 +14563,8 @@ impl State {
                         .transpose()
                         .ok()?;
                     thread.stop_serial = record["stopSerial"].as_u64().unwrap_or(0);
+                    thread.admission = record["admission"].as_str().map(str::to_owned);
+                    thread.admission_run = record["admissionRun"].as_u64().unwrap_or(0);
                     thread.parent = if record["parent"].is_null() {
                         None
                     } else {
@@ -14718,6 +14746,11 @@ impl State {
             self.capture_opened_draft();
         }
         self.restore_tasks(index, &project_remap)?;
+        if let Some(saved) = index.get("scheduler") {
+            self.scheduler = serde_json::from_value(saved.clone())
+                .map_err(|error| format!("Invalid saved scheduler: {error}."))?;
+            self.scheduler.validate()?;
+        }
         self.validate_captain_archives()?;
         self.sync_memory_links();
         self.refresh_captain_contexts();
@@ -15316,6 +15349,7 @@ impl State {
                 self.headless || self.persist_transcripts || !thread.blank_draft() || thread.crew_captain.is_some() || thread.id == self.current().id || self.tabs.contains(&thread.id)
             }).map(Thread::stored_metadata).collect::<Vec<_>>()
         });
+        index["scheduler"] = json!(self.scheduler);
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
         // Bounded projection only. The durable table keeps every operation;
@@ -15568,6 +15602,7 @@ impl Thread {
         });
         record.as_object_mut().unwrap().extend(json!({
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
+            "admission":self.admission,"admissionRun":self.admission_run,
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
             "options":self.model_options,

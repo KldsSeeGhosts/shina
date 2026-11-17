@@ -5247,6 +5247,8 @@ impl State {
             "task.dismiss" => self.dismiss_task(&text("taskId")?)?,
             "task.resumeResults" => self.resume_task_results(self.current().id)?,
             "server.stop" => self.runtime_stop_requested = true,
+            "scheduling.status" => return Ok(self.scheduling_status_value()),
+            "scheduling.configure" => return self.scheduling_configure(args),
             "task.delegate" | "task.send" | "task.cancel" => {
                 let tool = match command.method.as_str() {
                     "task.delegate" => "delegate_task",

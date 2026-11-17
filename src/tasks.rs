@@ -3,8 +3,6 @@ use super::*;
 use crate::protocol::{Receipt, ReceiptStatus};
 use serde::{Deserialize, Serialize};
 
-pub(super) const RUNNING_LIMIT: usize = 3;
-pub(super) const UNFINISHED_LIMIT: usize = 8;
 const TASK_OPERATION_LIMIT: usize = 128;
 const OPERATION_NOT_DISPATCHED: &str = "not_dispatched";
 const OPERATION_QUEUED: &str = "queued";
@@ -85,7 +83,7 @@ pub(super) struct Task {
     #[serde(default)]
     prior_deliveries: Vec<ResultDelivery>,
     #[serde(skip)]
-    recovering: bool,
+    pub(super) recovering: bool,
     #[serde(skip)]
     pub(super) hold_delivery: bool,
 }
@@ -976,19 +974,26 @@ impl State {
         self.release_crew_reports(parent_thread_id);
     }
 
+    /// Pre-creation admission checks: the coordinator's unfinished cap and
+    /// the account's pending-reservation bound. Capacity beyond that queues
+    /// durably instead of refusing.
     pub(super) fn check_task_capacity(&self, parent: usize) -> Result<(), String> {
-        if self
-            .tasks
-            .iter()
-            .filter(|task| {
-                self.task_home(task) == Some(self.effective_home(parent)) && !task.state.finished()
-            })
-            .count()
-            >= UNFINISHED_LIMIT
+        if let Some(limit) = self.scheduler.limits.coordinator_unfinished
+            && self
+                .tasks
+                .iter()
+                .filter(|task| {
+                    self.task_home(task) == Some(self.effective_home(parent))
+                        && !task.state.finished()
+                })
+                .count()
+                >= limit
         {
-            return Err("This captain already has 8 unfinished tasks. Finish or dismiss a task before delegating more work.".into());
+            return Err(format!(
+                "This captain already has {limit} unfinished tasks. Finish or dismiss a task before delegating more work."
+            ));
         }
-        Ok(())
+        self.scheduler.check_pending()
     }
 
     pub(super) fn task_queue_position(&self, task: &Task) -> Option<usize> {
@@ -1967,6 +1972,8 @@ impl State {
         {
             self.request_reprovision(child);
         }
+        // The new attempt identity needs its own admission reservation.
+        self.admit_task_index(index);
         Ok(())
     }
 
@@ -2451,89 +2458,10 @@ impl State {
         Ok(true)
     }
 
+    /// Delegated attempts, crew members and peer workers all start through
+    /// the one durable admission scheduler.
     pub(super) fn start_queued_tasks(&mut self) -> bool {
-        if self.network_blocked() {
-            return false;
-        }
-        let mut changed = false;
-        for index in 0..self.tasks.len() {
-            let task = &self.tasks[index];
-            if task.state != TaskState::Queued || task.recovering {
-                continue;
-            }
-            if self
-                .require_active_thread_owner(task.child_thread_id)
-                .is_err()
-            {
-                continue;
-            }
-            if self
-                .tasks
-                .iter()
-                .filter(|other| {
-                    self.task_home(other) == self.task_home(task) && self.task_occupies_slot(other)
-                })
-                .count()
-                >= RUNNING_LIMIT
-            {
-                continue;
-            }
-            let Some(child) = self
-                .threads
-                .iter()
-                .position(|thread| thread.id == task.child_thread_id && !thread.archived())
-            else {
-                continue;
-            };
-            if self.threads[child].status.busy()
-                || self.threads[child].phase == "Stopping"
-                || self.threads[child]
-                    .placement
-                    .as_ref()
-                    .is_some_and(|placement| placement.phase != placement::PlacementPhase::Ready)
-                || (self.threads[child].machine == "local"
-                    && self
-                        .provider_update_drivers
-                        .contains(&self.threads[child].harness))
-            {
-                continue;
-            }
-            self.tasks[index].state = TaskState::Starting;
-            self.tasks[index].started_at = Some(lifecycle::now());
-            if self.tasks[index].remote.is_some() {
-                changed = true;
-                continue;
-            }
-            // Persist intent before any prompt can reach Pi. Failure leaves work stopped.
-            if self.runtime_enabled
-                && let Err(error) = self.checkpoint_and_flush()
-            {
-                self.tasks[index].state = TaskState::Interrupted;
-                self.tasks[index].error_excerpt = excerpt(&error, 2000);
-                self.storage_error = Some(error);
-                continue;
-            }
-            let thread = &mut self.threads[child];
-            thread.arm_task();
-            thread.pending_injections.push_back(Injection {
-                text: self.tasks[index].attempt_message.clone(),
-                shown: false,
-                steer: None,
-                peer_input: None,
-            });
-            self.connect_thread(child);
-            changed = true;
-        }
-        changed
-    }
-
-    fn task_occupies_slot(&self, task: &Task) -> bool {
-        !task.recovering
-            && (task.state.occupies_slot()
-                || self
-                    .threads
-                    .iter()
-                    .any(|thread| thread.id == task.child_thread_id && thread.status.busy()))
+        self.admission_pump()
     }
 
     pub(super) fn restore_tasks(
@@ -4352,12 +4280,12 @@ mod tests {
             .mcp_call(1, "delegate_task", &delegate_args("cap-1"))
             .unwrap();
         state.tasks[0].finish(TaskState::Completed, "done", "");
-        for _ in 0..UNFINISHED_LIMIT {
+        for _ in 0..admission::COORDINATOR_UNFINISHED {
             state
                 .mcp_call(1, "delegate_task", &json!({"prompt":"Another task"}))
                 .unwrap();
         }
-        assert_eq!(state.tasks.len(), UNFINISHED_LIMIT + 1);
+        assert_eq!(state.tasks.len(), admission::COORDINATOR_UNFINISHED + 1);
         assert!(
             state
                 .mcp_call(1, "delegate_task", &json!({"prompt":"Ninth task"}))

@@ -876,9 +876,10 @@ impl State {
             for intent in intents {
                 self.provision_peer_task_intent(&intent);
             }
-            if !self.threads[index].pending_injections.is_empty() {
-                self.connect_thread(index);
-            }
+            // The peer worker's reservation gates this connect; the pump
+            // grants it now that the placement fence is open.
+            self.ensure_thread_admission(index, true, false);
+            self.admission_pump();
             return;
         }
         if thread.delegated {

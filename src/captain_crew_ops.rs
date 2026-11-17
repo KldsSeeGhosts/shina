@@ -300,6 +300,7 @@ impl State {
             .filter(|id| *id < usize::MAX)
             .ok_or("Thread IDs are exhausted.")?;
         self.crew_database()?;
+        self.scheduler.check_pending()?;
         #[cfg(test)]
         let git_ctx = self.test_git_context.clone().unwrap_or_default();
         #[cfg(not(test))]
@@ -314,7 +315,6 @@ impl State {
         if placement.read_only() {
             thread.native.access = AccessMode::ReadOnly;
         }
-        let pending = placement.phase == placement::PlacementPhase::Pending;
         if placement.uses_worktree() {
             thread.worktree_path = placement.checkout.clone();
             thread.branch = placement.branch.clone();
@@ -330,9 +330,12 @@ impl State {
         let index = self.threads.len() - 1;
         self.sync_memory_links();
         self.refresh_captain_contexts();
-        if !pending {
-            self.connect_thread(index);
-        }
+        // An independent crew root shares the one admission scheduler: it
+        // reserves before its provider may start and queues when capacity
+        // is full, exactly like a delegated attempt.
+        self.ensure_thread_admission(index, false, false);
+        self.admission_pump();
+        let admission = self.admission_value_for(id);
         // A synchronous startup refusal restores the prompt to a draft. Save
         // that exact input in this creation transaction, not on a later tick.
         if self.threads[index].has_draft_content() {
@@ -343,7 +346,7 @@ impl State {
         self.persistence_scope = None;
         Ok(
             json!({"saved":true,"captain":captain,"threadId":id,"runId":self.threads[index].run_id,
-            "runtimeGeneration":self.threads[index].request_generation,
+            "runtimeGeneration":self.threads[index].request_generation,"admission":admission,
             "placement":self.threads[index].placement.as_ref().map(placement::ThreadPlacement::value)}),
         )
     }
@@ -399,16 +402,16 @@ impl State {
         {
             self.request_reprovision(index);
         }
-        if self.threads[index].pi.is_none()
-            && self.threads[index]
-                .placement
-                .as_ref()
-                .is_none_or(|placement| placement.phase == placement::PlacementPhase::Ready)
-        {
-            self.connect_thread(index);
-        }
+        // Re-admission reserves a fresh run before this provider starts
+        // again; a live reservation already covers a connected member, and a
+        // pending placement keeps the reservation queued until it resolves.
+        self.ensure_thread_admission(index, false, false);
+        self.admission_pump();
         self.persistence_scope = None;
-        Ok(json!({"saved":true,"captain":captain,"threadId":id,"inputId":serial}))
+        Ok(
+            json!({"saved":true,"captain":captain,"threadId":id,"inputId":serial,
+            "admission":self.admission_value_for(id)}),
+        )
     }
 
     pub fn captain_crew_stop(
