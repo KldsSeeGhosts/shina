@@ -441,16 +441,24 @@ pub fn response_context_record(
     }
 }
 
-fn parse_assistant_body_path(path: &str, thread_id: usize) -> Option<(usize, usize)> {
+fn parse_assistant_body_path(
+    path: &str,
+    thread_id: usize,
+    messages: &[Message],
+) -> Option<(usize, usize)> {
     let prefix = format!("message-{thread_id}-");
     for segment in path.split('/') {
         let Some(rest) = segment.strip_prefix(&prefix) else {
             continue;
         };
-        let Some((msg_str, from_str)) = rest.split_once("-body-") else {
+        let Some((msg_str, from_str)) = rest.rsplit_once("-body-") else {
             continue;
         };
-        let Ok(msg_idx) = msg_str.parse::<usize>() else {
+        let msg_idx = match msg_str.strip_prefix("id-") {
+            Some(id) => messages.iter().position(|message| message.id == id),
+            None => msg_str.parse::<usize>().ok(),
+        };
+        let Some(msg_idx) = msg_idx else {
             continue;
         };
         let Ok(from) = from_str.parse::<usize>() else {
@@ -476,7 +484,7 @@ pub fn validate_single_assistant_selection(
     let mut target_idx: Option<usize> = None;
     let mut target_from: Option<usize> = None;
     for path in selected_paths {
-        let (msg_idx, from) = parse_assistant_body_path(path, thread_id)?;
+        let (msg_idx, from) = parse_assistant_body_path(path, thread_id, messages)?;
         let msg = messages.get(msg_idx)?;
         if msg.role != "Pi" {
             return None;

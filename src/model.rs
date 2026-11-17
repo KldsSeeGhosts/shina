@@ -1018,6 +1018,8 @@ pub struct Thread {
     /// timeline consumer (#25) diffs these instead of rescanning items.
     pub(crate) transcript_structure: u64,
     pub(crate) transcript_content: u64,
+    /// Derived row keys and event indexes. No transcript payloads are retained.
+    pub(crate) timeline_cache: std::cell::RefCell<crate::ui::TimelineCache>,
     pub draft: TextEdit,
     pub queued_edit: Option<QueuedEdit>,
     queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
@@ -1602,6 +1604,7 @@ impl Thread {
             transcript_disclosures: client_state::Disclosures::default(),
             transcript_structure: 0,
             transcript_content: 0,
+            timeline_cache: Default::default(),
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             typing_guard: crate::composer::TypingGuard::default(),
@@ -5654,7 +5657,11 @@ impl State {
         {
             return false;
         }
-        let Some(message) = current.messages.get(sel.message_index) else {
+        let Some(message) = current
+            .messages
+            .iter()
+            .find(|message| message.id == sel.message_id)
+        else {
             return false;
         };
         if message.id != sel.message_id || message.role != "Pi" {

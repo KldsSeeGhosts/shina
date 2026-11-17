@@ -6,55 +6,11 @@ use serde_json::Value;
 #[path = "work_ui_tests.rs"]
 mod tests;
 
-pub(super) fn has_boundary_events(t: &Thread, message: usize) -> bool {
-    t.native
-        .compactions
-        .iter()
-        .any(|item| crate::work::compaction_anchor(t, item).message == message)
-        || crate::work::retry_events(t)
-            .iter()
-            .any(|event| event["anchor"]["message"].as_u64() == Some(message as u64))
-        || t.work.iter().any(|work| {
-            work.start == message
-                && work.stopped
-                && (message < t.messages.len() || !t.status.busy())
-        })
-}
-
 pub(super) fn boundary_events(s: &State, p: Palette, wide: bool, message: usize) -> Option<El> {
-    let mut events = vec![];
-    for (index, item) in s.current().native.compactions.iter().enumerate() {
-        if crate::work::compaction_anchor(s.current(), item).message == message {
-            events.push((item["order"].as_u64().unwrap_or(u64::MAX), 0, index));
-        }
-    }
-    for (index, event) in crate::work::retry_events(s.current()).iter().enumerate() {
-        if event["anchor"]["message"].as_u64() == Some(message as u64) {
-            events.push((event["order"].as_u64().unwrap_or(u64::MAX), 1, index));
-        }
-    }
-    for work in &s.current().work {
-        if work.start == message
-            && work.stopped
-            && (message < s.current().messages.len() || !s.current().status.busy())
-        {
-            events.push((
-                if work.stopped_order == 0 {
-                    u64::MAX
-                } else {
-                    work.stopped_order
-                },
-                2,
-                0,
-            ));
-        }
-    }
-    if events.is_empty() {
-        return None;
-    }
-    events.sort_by_key(|e| e.0);
+    let structure = timeline_structure(s.current());
+    let events = structure.boundaries.get(&message)?;
     let mut rows = col().min_w(0.0).gap(6.0);
-    for (_, kind, index) in events {
+    for &(_, kind, index) in events {
         rows = rows.child(match kind {
             0 => pi_ui::compaction_activity(s, p, index),
             1 => retry_row(s, p, index),
@@ -233,12 +189,17 @@ pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
             let msg_idx = anchor_msg_id
                 .as_deref()
                 .and_then(|id| t.messages.iter().position(|m| m.id == id));
+            if anchor_msg_id.is_some() && msg_idx.is_none() {
+                return;
+            }
             if let Some(thought) = t.thoughts.iter_mut().find(|th| {
                 th.block == block
                     && th.anchor.offset == offset
                     && msg_idx.is_none_or(|idx| th.anchor.message == idx)
             }) {
                 thought.expanded = !thought.expanded;
+                let message = thought.anchor.message;
+                t.timeline_cache.get_mut().touch_message(message);
             }
         }),
     );
@@ -581,6 +542,7 @@ pub(super) fn html_card(s: &State, p: Palette, index: usize) -> El {
 
 fn raw(s: &State, p: Palette, index: usize) -> El {
     let tool = &s.current().tools[index];
+    let tool_id = tool.id.clone();
     let id = format!("{}-{index}", s.current().id);
     let mut body = col().min_w(0.0).child(
         row()
@@ -601,8 +563,12 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
                 p.faint,
             ))
             .on_press(move |s: &mut State| {
-                let tool = &mut s.current_mut().tools[index];
-                tool.raw_expanded = !tool.raw_expanded;
+                let thread = s.current_mut();
+                if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                    tool.raw_expanded = !tool.raw_expanded;
+                    let message = tool.anchor.message;
+                    thread.timeline_cache.get_mut().touch_message(message);
+                }
             }),
     );
     if tool.raw_expanded {
