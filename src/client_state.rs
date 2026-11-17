@@ -35,6 +35,98 @@ pub(crate) struct ApplyStats {
     pub(crate) items_dropped: u64,
 }
 
+/// Client-local presentation state, never a second transcript cache. Entries
+/// contain stable keys and flags only and are consumed as their items reload.
+#[derive(Default)]
+pub(crate) struct Disclosures {
+    tools: HashMap<String, (bool, bool, bool)>,
+    thoughts: std::collections::HashSet<String>,
+    work: std::collections::HashSet<String>,
+}
+
+fn disclosure_anchor(messages: &[Message], ordinal: usize) -> String {
+    messages
+        .get(ordinal)
+        .map(|message| format!("message:{}", message.id))
+        .unwrap_or_else(|| format!("boundary:{ordinal}"))
+}
+
+impl Disclosures {
+    fn capture(
+        &mut self,
+        messages: &[Message],
+        tools: &[Tool],
+        thoughts: &[Thought],
+        work: &[AssistantWork],
+    ) {
+        for tool in tools {
+            let flags = (tool.expanded, tool.raw_expanded, tool.group_expanded);
+            if flags != (false, false, false) {
+                self.tools.insert(tool.id.clone(), flags);
+            } else {
+                self.tools.remove(&tool.id);
+            }
+        }
+        for thought in thoughts {
+            let key = format!(
+                "{}:{}:{}",
+                disclosure_anchor(messages, thought.anchor.message),
+                thought.anchor.offset,
+                thought.block
+            );
+            if thought.expanded {
+                self.thoughts.insert(key);
+            } else {
+                self.thoughts.remove(&key);
+            }
+        }
+        for item in work {
+            let key = disclosure_anchor(messages, item.start);
+            if item.expanded {
+                self.work.insert(key);
+            } else {
+                self.work.remove(&key);
+            }
+        }
+    }
+
+    fn restore(
+        &mut self,
+        messages: &[Message],
+        tools: &mut [Tool],
+        thoughts: &mut [Thought],
+        work: &mut [AssistantWork],
+    ) {
+        if self.tools.is_empty() && self.thoughts.is_empty() && self.work.is_empty() {
+            return;
+        }
+        for tool in tools {
+            if let Some((expanded, raw, group)) = self.tools.remove(&tool.id) {
+                tool.expanded = expanded;
+                tool.raw_expanded = raw;
+                tool.group_expanded = group;
+            }
+        }
+        for thought in thoughts {
+            let key = format!(
+                "{}:{}:{}",
+                disclosure_anchor(messages, thought.anchor.message),
+                thought.anchor.offset,
+                thought.block
+            );
+            if self.thoughts.remove(&key) {
+                thought.expanded = true;
+            }
+        }
+        for item in work {
+            let key = disclosure_anchor(messages, item.start);
+            if self.work.remove(&key) {
+                item.expanded = true;
+            }
+        }
+    }
+}
+
 // A fixed monotonic/wall-clock pair makes a start timestamp stable across captures.
 fn stable_timestamp(at: Instant) -> u64 {
     static CLOCK: std::sync::OnceLock<(Instant, u64)> = std::sync::OnceLock::new();
@@ -630,6 +722,14 @@ impl ThreadView {
         view: Option<&crate::client_history::ThreadProjection>,
         stats: &mut ApplyStats,
     ) -> Result<(), String> {
+        if view.is_some_and(|view| !view.history_loaded) {
+            thread.transcript_disclosures.capture(
+                &thread.messages,
+                &thread.tools,
+                &thread.thoughts,
+                &thread.work,
+            );
+        }
         thread.worktree_path = self.worktree_path;
         thread.branch = self.branch;
         thread.base_branch = self.base_branch;
@@ -882,6 +982,12 @@ impl ThreadView {
             }
             work
         };
+        thread.transcript_disclosures.restore(
+            &thread.messages,
+            &mut thread.tools,
+            &mut thread.thoughts,
+            &mut thread.work,
+        );
         thread.harness_state = self.harness_state;
         if let Some(capabilities) = self.turn_capabilities {
             thread.harness_state["turnCapabilities"] = json!(capabilities);
@@ -9312,6 +9418,156 @@ mod tests {
             assert!(thread.tools[1].raw_expanded);
             assert_eq!(thread.draft.text, "keep me");
             assert_eq!(thread.tools[0].output, "updated");
+        }
+
+        #[test]
+        fn reconnect_and_cache_reset_preserve_the_readers_device_state() {
+            // KSG timelineScrollAnchoring.ts remembers the visible row and
+            // disclosures independently of provider and transport hydration.
+            for width in [620.0, 960.0, 1280.0, 1920.0] {
+                let (mut cache, mut streams, threads, mut fragments) =
+                    rig(2, 160, 50, 1 << 22, true);
+                let hello = json!({"capabilities":[
+                    protocol::HISTORY_ITEMS, protocol::DEFERRED_WORK
+                ]});
+                cache.reconnect(&hello).unwrap();
+                let mut marked = workspace(2, &threads);
+                marked["state"]["threads"][1]["work"] = json!([{
+                    "id":"remembered-work","start":1,
+                    "deferredWork":{"start":1,"cursor":"deferred-cursor","count":10}
+                }, serde_json::to_value(AssistantWork {
+                    start:81, stopped:false, stopped_order:0, expanded:false,
+                    elapsed:Some(3), outcome:Some(Status::Completed),
+                }).unwrap()]);
+                marked["state"]["threads"][1]["thoughts"] = json!([{
+                    "anchor":{"message":81,"offset":0},"block":1,"order":82,
+                    "text":"remembered thought","done":true
+                }]);
+                let marked = publish(&mut cache, &mut streams, &workspace(1, &threads), &marked);
+                let mut rt = crate::ui::tests::runtime(width);
+                rt.state
+                    .apply_projection(cache.projected().unwrap())
+                    .unwrap();
+                rt.state.active = rt.state.threads.iter().position(|t| t.id == 2).unwrap();
+                rt.state.tabs = vec![2, 1];
+                rt.state.selected_threads = vec![1, 2];
+                rt.state.selection_anchor = Some(2);
+                rt.state
+                    .current_mut()
+                    .draft
+                    .replace_text("unsent reader draft");
+                rt.state.current_mut().tools[20].expanded = true;
+                rt.state.current_mut().tools[21].raw_expanded = true;
+                rt.state.current_mut().tools[22].group_expanded = true;
+                rt.state.current_mut().thoughts[0].expanded = true;
+                rt.state.current_mut().work[0].expanded = true;
+                assert_eq!(rt.state.current().deferred_work.len(), 1);
+                rt.frame(0.0);
+                let row = "row-2-m-2-80";
+                rt.update(|_, tx| tx.scroll_center_in_instant("conversation-2", row));
+                for _ in 0..60 {
+                    if !rt.frame(1.0 / 60.0) {
+                        break;
+                    }
+                }
+                let before_y = rt.presented(row).expect("reader row is mounted").0[1];
+                let assert_device = |state: &State| {
+                    assert_eq!(state.current().id, 2);
+                    assert_eq!(state.tabs, [2, 1]);
+                    assert_eq!(state.selected_threads, [1, 2]);
+                    assert_eq!(state.selection_anchor, Some(2));
+                    assert_eq!(state.current().draft.text, "unsent reader draft");
+                };
+
+                // A background thread streams while this device reads older
+                // content. The active view and its anchor must not move.
+                let mut background = marked.clone();
+                background["seq"] = json!(3);
+                background["state"]["threads"][0]["messages"][159]["text"] =
+                    json!("background stream");
+                let latest = publish(&mut cache, &mut streams, &marked, &background);
+                rt.state
+                    .apply_projection(cache.projected().unwrap())
+                    .unwrap();
+                rt.invalidate();
+                rt.frame(0.0);
+                assert_device(&rt.state);
+                assert!((rt.presented(row).unwrap().0[1] - before_y).abs() < 1.0);
+
+                for reset in [false, true] {
+                    let payload = Arc::downgrade(
+                        &rt.state
+                            .current()
+                            .transcript_projection
+                            .as_ref()
+                            .unwrap()
+                            .fields["messages"]
+                            .items[0],
+                    );
+                    if reset {
+                        cache = ProjectionCache::default();
+                    }
+                    cache.reconnect(&hello).unwrap();
+                    cache
+                        .receive(&protocol::notification(
+                            "subscription.snapshot",
+                            json!({"epoch":"workspace","seq":latest["seq"],
+                            "state":protocol::compact(&latest["state"])}),
+                        ))
+                        .unwrap();
+                    // Render the metadata-only/unloaded frame too. Skipping
+                    // it would hide lost disclosure and scroll state.
+                    rt.state
+                        .apply_projection(cache.projected().unwrap())
+                        .unwrap();
+                    rt.invalidate();
+                    rt.frame(0.0);
+                    assert_device(&rt.state);
+                    if reset {
+                        assert!(
+                            payload.upgrade().is_none(),
+                            "unloaded presentation state must not retain transcript payloads"
+                        );
+                    }
+                    for id in [1, 2] {
+                        load_all(&mut cache, &streams, &mut fragments, 1 << 22, id);
+                    }
+                    if let Some(projected) = cache.projected() {
+                        rt.state.apply_projection(projected).unwrap();
+                    }
+                    rt.invalidate();
+                    for _ in 0..60 {
+                        if !rt.frame(1.0 / 60.0) {
+                            break;
+                        }
+                    }
+                    assert_device(&rt.state);
+                    assert!(
+                        rt.state.current().tools[20].expanded,
+                        "{width}, reset={reset}"
+                    );
+                    assert!(
+                        rt.state.current().tools[21].raw_expanded,
+                        "{width}, reset={reset}"
+                    );
+                    assert!(rt.state.current().tools[22].group_expanded);
+                    assert!(rt.state.current().thoughts[0].expanded);
+                    assert!(rt.state.current().work[0].expanded);
+                    let saved = &rt.state.current().transcript_disclosures;
+                    assert!(
+                        saved.tools.is_empty()
+                            && saved.thoughts.is_empty()
+                            && saved.work.is_empty(),
+                        "rehydration consumes the saved disclosure keys"
+                    );
+                    assert_eq!(rt.state.current().deferred_work.len(), 1);
+                    let after_y = rt.presented(row).expect("reader row restored").0[1];
+                    assert!(
+                        (after_y - before_y).abs() < 1.0,
+                        "{width}, reset={reset}: reader row moved from {before_y} to {after_y}"
+                    );
+                }
+            }
         }
 
         #[test]

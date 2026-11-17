@@ -77,13 +77,24 @@ impl Positions {
         server: &str,
         thread: usize,
         cx: &Cx<crate::model::State>,
+        unloaded: bool,
     ) -> Arc<Visit> {
         let key = (server.to_owned(), thread);
         if let Some((current, visit)) = &self.active
             && current == &key
         {
-            // Prime Rune's tracked layout reads while this list is mounted.
-            let _ = visit.position(thread, cx);
+            // Capture before an unloaded frame unmounts the reader's row.
+            // Retain keys/coordinates only, never the transcript payload.
+            let position = visit.position(thread, cx);
+            if unloaded {
+                let mut restore = visit.restore.lock().unwrap();
+                if restore.is_none() {
+                    *restore = position;
+                }
+                visit
+                    .opened
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             visit.rows.lock().unwrap().clear();
             return visit.clone();
         }

@@ -792,9 +792,14 @@ fn timer_label(seconds: u64) -> String {
 const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    let unloaded = s
+        .current()
+        .transcript_projection
+        .as_ref()
+        .is_some_and(|projection| !projection.history_loaded);
     s.timeline_positions
         .borrow_mut()
-        .open(&s.machines.selected, s.current().id, cx);
+        .open(&s.machines.selected, s.current().id, cx, unloaded);
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
@@ -10965,6 +10970,10 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
 /// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
+    let unloaded = t
+        .transcript_projection
+        .as_ref()
+        .is_some_and(|projection| !projection.history_loaded);
     let visit = s.timeline_positions.borrow().visit();
     let gutter = lane_gutter(pane_width);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
@@ -11080,6 +11089,10 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .scroll(ScrollSpec { stick_bottom })
         .on_scroll_offset(move |at| *visit.scroll.lock().unwrap() = at)
         .on_layout_tx(move |_: &mut State, _, tx| {
+            if unloaded {
+                tx.live_only();
+                return;
+            }
             if layout_visit
                 .opened
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -16027,7 +16040,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::context::ContextUsage;
     use rune::{Env, Runtime};
-    pub(super) fn runtime(width: f32) -> Runtime<State> {
+    pub(crate) fn runtime(width: f32) -> Runtime<State> {
         let mut rt = Runtime::with_text(
             State::new(".".into(), false),
             view,
