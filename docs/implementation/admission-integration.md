@@ -49,3 +49,11 @@ The focused checks pass with 23 scheduler tests, seven authenticated live
 admission contracts and the existing placement-retry regression. The earlier
 58 remote-task tests also passed after integration. Full final-tree validation
 still gates publication. #23 remains open.
+
+The next full unit run passed 2,080 tests and found one older assertion that
+expected every queued follow-up to become interrupted. That regression now
+requires the saved never-granted reservation, a queued follow-up with no
+provider input, and preservation and single delivery of the preceding result.
+The separate previously-granted recovery regression still requires an
+interrupted outcome. All 105 task and remote-task tests pass after this
+test-contract update.

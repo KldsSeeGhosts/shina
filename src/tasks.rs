@@ -3193,7 +3193,27 @@ mod tests {
         restored.demo = true;
         restored.restore_global(&snapshot).unwrap();
         restored.prepare_task_recovery();
-        assert_eq!(restored.tasks[0].state, TaskState::Interrupted);
+        // This follow-up never acquired capacity. It remains queued without
+        // replaying either its brief or the previous result during recovery.
+        assert_eq!(restored.tasks[0].state, TaskState::Queued);
+        assert!(!restored.tasks[0].recovering);
+        assert!(restored.scheduler.reservations.iter().any(|reservation| {
+            reservation.state == admission::ReservationState::Queued
+                && reservation.granted_at.is_none()
+                && matches!(&reservation.subject,
+                    admission::Subject::Task { task_id, attempt_id }
+                    if *task_id == restored.tasks[0].id
+                        && *attempt_id == restored.tasks[0].attempt_id)
+        }));
+        assert!(
+            restored
+                .threads
+                .iter()
+                .find(|thread| thread.id == restored.tasks[0].child_thread_id)
+                .unwrap()
+                .pending_injections
+                .is_empty()
+        );
         assert!(restored.tasks[0].prior_deliveries[0].hold);
         let (commands, _events) = fake_pi(&mut restored.threads[0]);
         restored.resume_task_results(1).unwrap();
