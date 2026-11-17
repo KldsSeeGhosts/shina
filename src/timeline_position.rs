@@ -1,6 +1,6 @@
 //! KSG `timelineScrollAnchoring.ts`: client-local, server-scoped, 100-entry visit cache.
-use rune::{Cx, ScrollPos};
-use std::collections::{HashMap, VecDeque};
+use rune::ScrollPos;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug)]
@@ -14,7 +14,9 @@ pub struct Position {
 
 pub struct Visit {
     pub scroll: Mutex<ScrollPos>,
-    rows: Mutex<HashMap<String, Option<String>>>,
+    viewport: Mutex<Option<[f32; 4]>>,
+    rows: Mutex<HashMap<String, (Option<String>, [f32; 4])>>,
+    visible: Mutex<HashSet<String>>,
     pub restore: Mutex<Option<Position>>,
 }
 
@@ -22,31 +24,42 @@ impl Default for Visit {
     fn default() -> Self {
         Self {
             scroll: Mutex::default(),
+            viewport: Mutex::default(),
             rows: Mutex::default(),
+            visible: Mutex::default(),
             restore: Mutex::default(),
         }
     }
 }
 
 impl Visit {
-    pub fn row(&self, key: &str, entry_id: Option<&str>) {
+    pub fn visible_rows(&self, rows: impl IntoIterator<Item = String>) {
+        *self.visible.lock().unwrap() = rows.into_iter().collect();
+    }
+
+    pub fn viewport(&self, rect: [f32; 4]) {
+        *self.viewport.lock().unwrap() = Some(rect);
+    }
+
+    pub fn row(&self, key: &str, entry_id: Option<&str>, rect: [f32; 4]) {
         self.rows
             .lock()
             .unwrap()
-            .insert(key.into(), entry_id.map(str::to_owned));
+            .insert(key.into(), (entry_id.map(str::to_owned), rect));
     }
 
-    fn position(&self, thread: usize, cx: &Cx<crate::model::State>) -> Option<Position> {
+    fn position(&self) -> Option<Position> {
         // Do not replace a saved position with an intermediate restoration frame.
         if let Some(position) = self.restore.lock().unwrap().as_ref() {
             return Some(position.clone());
         }
-        let viewport = cx.window_layout(&format!("conversation-{thread}"))?;
+        let viewport = (*self.viewport.lock().unwrap())?;
         let rows = self.rows.lock().unwrap();
-        let (key, entry_id, rect) = rows
+        let visible = self.visible.lock().unwrap();
+        let (key, entry_id, rect) = visible
             .iter()
-            .filter_map(|(key, entry_id)| {
-                let rect = cx.window_layout(key)?;
+            .filter_map(|key| {
+                let (entry_id, rect) = rows.get(key)?;
                 (rect[3] > 0.0
                     && rect[1] + rect[3] > viewport[1]
                     && rect[1] < viewport[1] + viewport[3])
@@ -83,31 +96,24 @@ impl Positions {
         self.active.as_ref().unwrap().1.clone()
     }
 
-    pub fn open(
-        &mut self,
-        server: &str,
-        thread: usize,
-        cx: &Cx<crate::model::State>,
-        unloaded: bool,
-    ) -> Arc<Visit> {
+    pub fn open(&mut self, server: &str, thread: usize, unloaded: bool) -> Arc<Visit> {
         let key = (server.to_owned(), thread);
         if let Some((current, visit)) = &self.active
             && current == &key
         {
             // Capture before an unloaded frame unmounts the reader's row.
             // Retain keys/coordinates only, never the transcript payload.
-            let position = visit.position(thread, cx);
             if unloaded {
+                let position = visit.position();
                 let mut restore = visit.restore.lock().unwrap();
                 if restore.is_none() {
                     *restore = position;
                 }
             }
-            visit.rows.lock().unwrap().clear();
             return visit.clone();
         }
         if let Some((previous, visit)) = self.active.take()
-            && let Some(position) = visit.position(previous.1, cx)
+            && let Some(position) = visit.position()
         {
             self.saved.retain(|(key, _)| key != &previous);
             self.saved.push_back((previous, position));

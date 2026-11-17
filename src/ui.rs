@@ -830,7 +830,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .is_some_and(|projection| !projection.history_loaded);
     s.timeline_positions
         .borrow_mut()
-        .open(&s.machines.selected, s.current().id, cx, unloaded);
+        .open(&s.machines.selected, s.current().id, unloaded);
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
@@ -10069,7 +10069,7 @@ fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -
             (
                 s.dark,
                 wide,
-                rune::memo::layout_size("chat-lane").map(|size| size[0].to_bits()),
+                rune::memo::layout_with("chat-lane", |rect| rect[2].to_bits()),
                 s.viewport_width.to_bits(),
                 s.demo,
             ),
@@ -11319,7 +11319,11 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let rows = structure.rows.clone();
     let key_rows = rows.clone();
     let build_rows = rows.clone();
+    let visible_rows = rows.clone();
+    let visible_visit = visit.clone();
+    let visible_server = s.machines.selected.clone();
     let row_visit = visit.clone();
+    let layout_visit = visit.clone();
     let lane = col()
         .key("chat-lane")
         .on_layout_tx(|s: &mut State, rect, tx| {
@@ -11370,14 +11374,26 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                         assistant_turn(s, p, wide, *start, *start)
                     }
                 };
-                row_visit.row(
-                    build_rows[index].key(),
-                    build_rows[index].entry_id(s.current()),
-                );
-                row
+                let key = build_rows[index].key().to_owned();
+                let entry_id = build_rows[index].entry_id(s.current()).map(str::to_owned);
+                let row_visit = row_visit.clone();
+                row.on_layout_tx(move |_: &mut State, rect, tx| {
+                    row_visit.row(&key, entry_id.as_deref(), rect);
+                    tx.live_only();
+                })
             },
         )
-        .virtual_rows_version(structure.version);
+        .virtual_rows_version(structure.version)
+        .on_visible_rows(move |s: &mut State, range| {
+            if s.current().id == thread_id && s.machines.selected == visible_server {
+                visible_visit.visible_rows(
+                    range.filter_map(|index| {
+                        visible_rows.get(index).map(|row| row.key().to_owned())
+                    }),
+                );
+            }
+            false
+        });
 
     let find_open = s.thread_find_active();
     let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
@@ -11388,7 +11404,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom })
         .on_scroll_offset(move |at| *visit.scroll.lock().unwrap() = at)
-        .on_layout_tx(move |s: &mut State, _, tx| {
+        .on_layout_tx(move |s: &mut State, rect, tx| {
+            layout_visit.viewport(rect);
             if s.current().id != thread_id || !restore_timeline_position(s, tx, false) {
                 tx.live_only();
             }
@@ -24225,6 +24242,19 @@ pub(crate) mod tests {
                 break;
             }
         }
+        // Warm pointer-hover and the first scroll-state transition separately
+        // from steady scroll/stream measurements.
+        let viewport = rt.presented("conversation-1").unwrap().0;
+        rt.wheel(
+            viewport[0] + viewport[2] * 0.5,
+            viewport[1] + viewport[3] * 0.5,
+            1.0,
+        );
+        for _ in 0..60 {
+            if !rt.frame(1.0 / 60.0) {
+                break;
+            }
+        }
         rt
     }
 
@@ -24233,6 +24263,24 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = cached_timeline_runtime(width, 100);
             take_timeline_counts();
+            let viewport = rt.presented("conversation-1").unwrap().0;
+            for index in 0..10 {
+                rt.wheel(
+                    viewport[0] + viewport[2] * 0.5,
+                    viewport[1] + viewport[3] * 0.5,
+                    if index % 2 == 0 { 8.0 } else { -8.0 },
+                );
+                rt.frame(1.0 / 60.0);
+            }
+            let scroll = take_timeline_counts();
+            // Rune may commit one queued viewport/bottom-state transition.
+            // Repeated wheel frames must not each rebuild the application.
+            assert!(
+                scroll.views <= 1,
+                "{width}: scrolling repeatedly rebuilt the view: {scroll:?}"
+            );
+            assert_eq!(scroll.keys, 0);
+            assert_eq!(scroll.index_builds, 0);
             rt.update(|s, _| {
                 let t = s.current_mut();
                 let last = t.messages.len() - 1;

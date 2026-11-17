@@ -43,6 +43,18 @@ regression and independent tool/group-output test also pass.
 scroll, stream-while-scroll and prepend phases and view/key/row/turn/index
 counters. It does not measure server receive, GPU timing or FPS.
 
+The first benchmark exposed an existing scroll-only view invalidation:
+`Positions::open` read every row's window geometry on each ordinary build,
+then discarded the result. Those observations made scrolling rebuild the
+view. Position capture now runs only when switching threads or preserving
+an anchor before history unloads. Normal scroll frames do not observe row
+window positions through `Cx`. Row and viewport layout callbacks keep only
+their latest rectangles, and the visible-row callback keeps their current
+identities. Those callbacks update bookkeeping without rebuilding the view.
+This also avoids querying geometry that Rune has not yet recorded on the
+first unloaded frame. The combined reconnect/cache-reset regression passes
+with this callback-based anchor capture.
+
 Remaining acceptance work includes running and recording that benchmark,
 checking stable selection identities during prepends and the normal CI/release
 gates. This branch does not yet complete #25.

@@ -9668,7 +9668,17 @@ mod tests {
                         "rehydration consumes the saved disclosure keys"
                     );
                     assert_eq!(rt.state.current().deferred_work.len(), 1);
-                    let after_y = rt.presented(row).expect("reader row restored").0[1];
+                    let after_y = rt.presented(row).unwrap_or_else(|| {
+                        let visit = rt.state.timeline_positions.borrow().visit();
+                        panic!(
+                            "reader row {row} missing: width={width}, reset={reset}, settle_recent={settle_recent}, restore={:?}, scroll={:?}, visible={:?}",
+                            visit.restore.lock().unwrap(),
+                            visit.scroll.lock().unwrap().offset,
+                            rt.elements().iter().filter_map(|element| element.key.as_deref())
+                                .filter(|key| key.starts_with("row-2-") || key.starts_with("turn-2-"))
+                                .collect::<Vec<_>>(),
+                        )
+                    }).0[1];
                     assert!(
                         (after_y - before_y).abs() < 1.0,
                         "{width}, reset={reset}: reader row moved from {before_y} to {after_y}"
