@@ -5262,6 +5262,17 @@ impl State {
             remote.launch_command.params["execution"] = assignment;
         } else if let Some(command) = &mut remote.send_command {
             command.params["execution"] = assignment;
+            remote.execution_inputs.retain(|id, _| {
+                self.execution.get(id).is_none_or(|lease| {
+                    !matches!(
+                        lease.phase,
+                        crate::execution::Phase::Terminal | crate::execution::Phase::Fenced
+                    )
+                })
+            });
+            remote
+                .execution_inputs
+                .insert(lease.lease_id.clone(), command.clone());
         }
         Ok(lease)
     }

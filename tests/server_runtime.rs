@@ -5394,10 +5394,10 @@ fn cancellation_before_peer_assignment_survives_restart_without_provider_input()
     target.stop();
 }
 
-/// Transport acceptance can precede provider dispatch. Cancelling that exact
-/// queued assignment must leave the earlier provider turn running.
+/// Task cancellation includes queued assignments and the running writer in
+/// the observed attempt. It remains unsettled until every exact control settles.
 #[test]
-fn cancelling_an_accepted_queued_lease_preserves_the_running_peer_turn() {
+fn task_cancel_settles_queued_inputs_and_the_observed_attempts_running_writer() {
     let mut target = Profile::new();
     let mut home = Profile::new();
     target.launch(&["serve"]);
@@ -5443,6 +5443,18 @@ fn cancelling_an_accepted_queued_lease_preserves_the_running_peer_turn() {
         }),
         "{durable:?}"
     );
+    let second_send = json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"second-accepted-queued-input-must-not-deliver",
+        "client_request_id":"accepted-queue-second-send","delivery":"follow_up",
+    }});
+    let accepted = client.command("task.send", second_send.clone(), uuid::Uuid::new_v4());
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    client.until(|state| {
+        let remote = &state["index"]["tasks"][0]["remote"];
+        remote["sendCommand"].is_null()
+            && remote["acceptedSend"]["commandId"] != input_id
+            && remote["execution"]["generation"].as_u64() > queued["generation"].as_u64()
+    });
     let target_thread = remote["threadId"].clone();
     executor.rpc(
         "workspace.subscribe",
@@ -5467,8 +5479,17 @@ fn cancelling_an_accepted_queued_lease_preserves_the_running_peer_turn() {
         let remote = &state["index"]["tasks"][0]["remote"];
         remote["state"] == "done"
             && remote["stopOwed"] == false
-            && remote["execution"]["terminalStatus"] == "cancelled_before_dispatch"
+            && remote["execution"]["leaseId"] == first["leaseId"]
+            && remote["execution"]["terminalStatus"] == "cancelled"
     });
+    assert!(
+        client.snapshot["index"]["execution"]["leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|lease| lease["logicalThreadUid"] == first["logicalThreadUid"])
+            .all(|lease| lease["phase"] == "terminal")
+    );
     executor.rpc(
         "workspace.subscribe",
         json!({}),
@@ -5483,7 +5504,7 @@ fn cancelling_an_accepted_queued_lease_preserves_the_running_peer_turn() {
     assert_eq!(after["execution"], before["execution"]);
     assert_eq!(after["runId"], before["runId"]);
     assert_eq!(after["stopSerial"], before["stopSerial"]);
-    assert_eq!(after["providerTerminalRun"], before["providerTerminalRun"]);
+    assert_eq!(after["providerTerminalRun"], first["runId"]);
     let prompts = target.root.join("workspace/fixture-prompts.jsonl");
     let assert_not_delivered = || {
         assert!(
@@ -5500,10 +5521,33 @@ fn cancelling_an_accepted_queued_lease_preserves_the_running_peer_turn() {
     target.launch(&["serve", "--port", &discovery["port"].to_string()]);
     home.launch(&["serve"]);
     client = home.client(uuid::Uuid::new_v4());
-    for (method, args) in [("task.send", send), ("task.cancel", cancel)] {
+    for (method, args) in [
+        ("task.send", send),
+        ("task.send", second_send),
+        ("task.cancel", cancel),
+    ] {
         let replay = client.command(method, args, uuid::Uuid::new_v4());
         assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
     }
+    assert_not_delivered();
+    let next = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{
+            "thread_id":child,"message":"after-attempt-cancel-fixture",
+            "client_request_id":"after-attempt-cancel",
+        }}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(next["result"]["status"], "accepted", "{next}");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    assert_eq!(
+        fs::read_to_string(&prompts)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("after-attempt-cancel-fixture"))
+            .count(),
+        1
+    );
     assert_not_delivered();
     home.stop();
     target.stop();

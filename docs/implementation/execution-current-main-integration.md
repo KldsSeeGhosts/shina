@@ -251,3 +251,51 @@ writer rather than only cancelling its newest queued input. Provider-queued
 acceptance and exact writer activation need separate attribution. Neither
 problem is resolved by this result-preservation correction. No PR or publication
 is authorized by these results, and issue #27 remains open.
+
+## Attempt-wide cancellation of undispatched follow-ups
+
+The controller previously treated cancellation of its newest queued lease as
+completion of `task.cancel`. An older writer in the same observed attempt kept
+running with no remaining controller wait or stop. The queued-input-only peer
+control was correct, but composing it as a complete task cancellation was not.
+
+The controller now retains exact assigned input commands by lease id. After
+terminal proof for one cancelled input, it commits the next stop for an older
+unsettled generation of that same attempt. Each stop has its own durable command
+id. It never reuses the latest input command for another generation's control.
+The chain does not report remote completion until its older writer also settles.
+Transport acceptance of that writer's stop still does not prove settlement.
+
+Selection checks the logical thread, ownership, controller, executor, Captain
+and physical worker identities. It cannot expand to a newer generation or a
+different attempt. Missing historical input commands or a different physical
+worker require explicit reconciliation and leave occupancy unproven. No timeout
+or restart substitutes for terminal proof.
+
+One live rerun exposed an earlier queued assignment whose transport receipt had
+not yet supplied its executor UID. An unlearned optional UID is not a conflicting
+UID. Preparing that exact saved control leaves its lease phase unchanged; the
+executor still validates the assignment, physical worker and input before any
+mutation, and its matching reply supplies the missing metadata. Conflicting
+known physical identities remain refused.
+
+The single-lease peer control still supports cancelling an explicitly named
+undispatched input without stopping the writer. Its existing unit test remains.
+The task-level live regression now exercises the task-level contract instead:
+two queued inputs are cancelled, the running writer settles, both sides restart,
+all keyed controls replay, and one deliberate next attempt completes without
+duplicate prompts or an orphaned lease.
+
+Focused validation passes 80 remote-task tests, 32 runtime tests and the live
+attempt-wide cancellation, offline-cancel fencing and late-steer attribution
+tests. These results do not resolve provider-queued input acceptance or writer
+activation attribution. Mid-chain process-crash recovery and historical writer
+progress still need stronger evidence. The unchanged provider-acceptance
+integration failure remains a blocker, so no publication or issue closure is
+claimed.
+
+The final focused rerun also passes the all-target build, all 80 remote-task
+tests and the live two-input attempt cancellation test after the optional-UID
+correction. A fresh run of the unchanged provider-acceptance regression still
+fails. This is a confirmed remaining defect on this candidate, not an inferred
+or ignored failure.
