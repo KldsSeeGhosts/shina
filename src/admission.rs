@@ -784,9 +784,9 @@ impl State {
         self.scheduler.revision += 1;
     }
 
-    /// Whether an attempt's remote process may still occupy the target: an
-    /// owed stop naming it (or landing unconditionally) is unacknowledged,
-    /// or the target is unreachable so nothing is proven either way.
+    /// A stop receipt, disconnection, revocation or protocol error cannot
+    /// prove provider settlement. Keep occupancy until a terminal result
+    /// reaches the home, and also while this attempt still owes its stop.
     fn remote_occupancy_unproven(task: &Task, attempt: &str) -> bool {
         task.remote.as_ref().is_some_and(|remote| {
             remote.stop_owed
@@ -794,7 +794,10 @@ impl State {
                     .stop_attempt_id
                     .as_deref()
                     .is_none_or(|named| named == attempt)
-                || remote.state == RemoteState::TargetOffline
+                || !matches!(
+                    remote.state,
+                    RemoteState::Done | RemoteState::ResultPendingDelivery
+                )
         })
     }
 
@@ -1503,6 +1506,7 @@ impl State {
                     text,
                     shown: false,
                     steer: None,
+                    peer_input: None,
                 });
                 self.connect_thread(child);
                 true
@@ -2103,6 +2107,7 @@ mod tests {
             text: text.into(),
             shown: false,
             steer: None,
+            peer_input: None,
         });
         state.threads.push(thread);
         let index = state.threads.len() - 1;
@@ -2308,6 +2313,7 @@ mod tests {
             send_command: None,
             document_replies: VecDeque::new(),
             placement: None,
+            evidence_supported: false,
         });
         state.admission_pump();
         let reservation = &state.scheduler.reservations[0];
@@ -2526,6 +2532,7 @@ mod tests {
             text: text.into(),
             shown: false,
             steer: None,
+            peer_input: None,
         });
         state.threads.push(thread);
         let index = state.threads.len() - 1;
@@ -2626,6 +2633,7 @@ mod tests {
     #[test]
     fn a_cancelled_remote_attempt_stays_uncertain_until_the_stop_lands() {
         let mut state = demo();
+        state.scheduler.limits.account_running = Some(1);
         state
             .mcp_call(1, "delegate_task", &json!({"prompt":"Remote work"}))
             .unwrap();
@@ -2639,9 +2647,50 @@ mod tests {
         let reservation = &state.scheduler.reservations[0];
         assert_eq!(reservation.state, ReservationState::Held);
         assert!(reservation.uncertain);
-        // The acknowledged stop proves the occupancy is gone.
-        state.tasks[0].remote.as_mut().unwrap().stop_owed = false;
-        state.tasks[0].remote.as_mut().unwrap().state = RemoteState::Done;
+        state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({"prompt":"Waiting for capacity"}),
+            )
+            .unwrap();
+        assert_eq!(state.tasks[1].state, TaskState::Queued);
+
+        // The actual peer receipt clears stop_owed but proves transport only.
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(Ok(json!({"status":"accepted","result":{"stopped":true}})))
+            .unwrap();
+        state.peer_runtime.inject_pending(
+            state.tasks[0].id.clone(),
+            state.tasks[0].remote.as_ref().unwrap(),
+            "peer.thread.stop".into(),
+            receive,
+        );
+        assert!(state.poll_remote_tasks_for_test());
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert!(!remote.stop_owed);
+        assert_eq!(remote.state, RemoteState::Running);
+        state.admission_pump();
+        assert_eq!(
+            state.scheduler.reservations[0].state,
+            ReservationState::Held
+        );
+        assert!(state.scheduler.reservations[0].uncertain);
+        assert_eq!(state.tasks[1].state, TaskState::Queued);
+
+        // Only a later provider-terminal observation permits another grant.
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(Ok(json!({"status":"accepted","result":{
+            "revision":"provider-settled","finished":true,"attemptId":attempt,
+            "result":{"status":"cancelled","attemptId":attempt}}})))
+            .unwrap();
+        state.peer_runtime.inject_pending(
+            state.tasks[0].id.clone(),
+            state.tasks[0].remote.as_ref().unwrap(),
+            "peer.thread.wait".into(),
+            receive,
+        );
+        assert!(state.poll_remote_tasks_for_test());
         state.admission_pump();
         assert_eq!(
             state.scheduler.reservations[0].state,
@@ -2651,6 +2700,10 @@ mod tests {
             state.scheduler.reservations[0].release_reason.as_deref(),
             Some("cancelled")
         );
+        assert_eq!(state.tasks[1].state, TaskState::Starting);
+        let revision = state.scheduler.revision;
+        state.admission_pump();
+        assert_eq!(state.scheduler.revision, revision, "release is idempotent");
     }
 
     #[test]
@@ -2688,6 +2741,35 @@ mod tests {
             })
             .unwrap();
         assert_eq!(current.state, ReservationState::Held);
+    }
+
+    #[test]
+    fn remote_transport_failures_do_not_prove_cancelled_provider_settlement() {
+        for remote_state in [
+            RemoteState::Launching,
+            RemoteState::Accepted,
+            RemoteState::Running,
+            RemoteState::TargetOffline,
+            RemoteState::Revoked,
+            RemoteState::Failed,
+            RemoteState::UpdateRequired,
+        ] {
+            let mut state = demo();
+            state
+                .mcp_call(1, "delegate_task", &json!({"prompt":"Remote work"}))
+                .unwrap();
+            let mut remote = remote_fixture("peer-1", false, None);
+            remote.state = remote_state;
+            state.tasks[0].remote = Some(remote);
+            state.tasks[0].finish(TaskState::Cancelled, "", "cancelled");
+            state.admission_pump();
+            assert_eq!(
+                state.scheduler.reservations[0].state,
+                ReservationState::Held,
+                "{remote_state:?} is not provider-terminal evidence"
+            );
+            assert!(state.scheduler.reservations[0].uncertain);
+        }
     }
 
     #[test]
@@ -2751,6 +2833,7 @@ mod tests {
             text: "second run".into(),
             shown: false,
             steer: None,
+            peer_input: None,
         });
         state.admission_pump();
         let queued = reservation_for(&state, state.threads[idle].id);
@@ -2791,6 +2874,7 @@ mod tests {
             send_command: None,
             document_replies: VecDeque::new(),
             placement: None,
+            evidence_supported: false,
         }
     }
     #[test]
@@ -2798,7 +2882,7 @@ mod tests {
         let mut state = demo();
         state.scheduler.limits.account_running = Some(1);
         captain(&mut state, 0, "Cap");
-        let first = worker(&mut state, "first");
+        let _first = worker(&mut state, "first");
         let second = crew_member(&mut state, 0, "second");
         state.threads[second].captain = Some(0);
         state.threads[second].queued_prompt = Some((
