@@ -179,11 +179,12 @@ move into overflow, matching KSG's `BranchToolbar`. Headless tests exercise
 pointer and keyboard selection, errors and bounds at all four supported widths.
 The worker's full suite passes 1,964 unit tests and 102 server-runtime tests,
 with 12 optional tests ignored. Root review inspected the actual 620 and 1280
-pixel picker renders. The initial PR #47 head passed CI; the updated UI head
-must pass again before merge.
+pixel picker renders. Both the initial and final PR #47 heads passed CI.
 
 PR #47 merged at `63c820ba7d6e847a34eeb221a7a7a6c07f593d2e` after the final
-UI head passed CI. Its main release runs separately.
+UI head passed CI. Release `v0.12.57` published that exact source commit.
+The core gate, three platform builds and publish jobs passed, and the actual
+tag target, manifest and downloaded asset hashes were verified.
 
 Issue #22's mandatory cancellation and question-answer fences are in PR #48.
 Root review adds receipt-transaction preflight, atomic send/cancel failure
@@ -198,8 +199,34 @@ reservations. A new attempt after cancellation cannot requeue the cancelled
 brief while its checkout is still pending; the placement regression now tests
 that transition through setup and provider startup. The combined branch passes
 1,978 unit tests and 105 server-runtime tests, with 12 optional tests ignored.
-Build, formatting and diff checks pass. PR #48 still requires fresh exact-head
-CI after this merge. Do not merge it while #47's main release is still running.
+Build, formatting and diff checks pass. PR #48's integrated head passed CI and
+merged as `269a2d022539907f839eebd7989ff21d2134766a`. Release `v0.12.59`
+publishes that exact source commit. Its core gate, all platform builds and
+publish jobs passed; the non-draft release, tag target, checksum manifest and
+all three downloaded asset hashes were verified. The still-open #20 and #22
+acceptance criteria are being checked separately before closing those issues.
+
+The next implementation batch is #23, #32 and #24 on separate Devin SWE-2
+worktrees. Claude Code Opus 5.5 medium prepared the #23 UI source mapping and
+will implement against the committed backend contract. DeepSeek V4.1 Flash at
+maximum reasoning through Codex is reviewing #20/#22 acceptance and preparing
+the #27/#28 migration source map. No worker changes provider authentication or
+production CPA configuration.
+
+### Repository identity prerequisite for #28
+
+Root regression tests reproduced four normalization defects: repeated `.git`
+suffix removal conflated distinct names, an `@` in an SCP-style path was parsed
+as credentials, SCP-style IPv6 hosts were split at their first colon, and URL
+queries/fragments were ignored. The correction preserves ordinary SSH/HTTPS
+identity keys, strips one suffix, parses the authority separately, preserves
+IPv6 and non-default ports, and rejects unsupported URL components rather than
+discarding them. The existing live peer delegation/restart test now uses
+equivalent SSH and HTTPS origins with an `@` and `.git` in the repository name.
+All five new identity tests pass. The complete branch passes 1,983 unit tests
+and 105 server-runtime tests, with 12 optional tests ignored.
+This is a prerequisite fix, not completion of #28's logical repository catalog,
+checkout provisioning or identity migration.
 
 Any frontend implementation or design decisions are assigned to Claude Opus
 5.5 medium. KSG Code remains the layout and interaction reference, with Shina's

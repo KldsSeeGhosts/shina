@@ -1431,6 +1431,80 @@ mod tests {
     }
 
     #[test]
+    fn repository_identity_removes_only_one_git_transport_suffix() {
+        assert_eq!(
+            canonical_remote("https://example.com/team/repo.git.git"),
+            Some("example.com/team/repo.git".into())
+        );
+        assert_eq!(
+            canonical_remote("git@example.com:team/repo.git.git"),
+            Some("example.com/team/repo.git".into())
+        );
+        assert_ne!(
+            canonical_remote("https://example.com/team/repo.git.git"),
+            canonical_remote("https://example.com/team/repo.git")
+        );
+    }
+
+    #[test]
+    fn repository_identity_does_not_parse_path_at_signs_as_credentials() {
+        assert_eq!(
+            canonical_remote("git@example.com:team/repo@review.git"),
+            Some("example.com/team/repo@review".into())
+        );
+        assert_eq!(
+            canonical_remote("example.com:team/repo@review.git"),
+            canonical_remote("ssh://example.com/team/repo@review.git")
+        );
+    }
+
+    #[test]
+    fn repository_identity_preserves_ipv6_hosts_and_nondefault_ports() {
+        assert_eq!(
+            canonical_remote("git@[2001:db8::1]:team/repo.git"),
+            canonical_remote("ssh://git@[2001:db8::1]:22/team/repo.git")
+        );
+        assert_eq!(
+            canonical_remote("git@[2001:db8::1]:team/repo.git"),
+            Some("[2001:db8::1]/team/repo".into())
+        );
+        assert_ne!(
+            canonical_remote("ssh://git@example.com:2222/team/repo.git"),
+            canonical_remote("ssh://git@example.com:22/team/repo.git")
+        );
+    }
+
+    #[test]
+    fn repository_identity_rejects_url_components_it_cannot_preserve() {
+        for remote in [
+            "https://example.com/team/repo.git?tenant=another",
+            "https://example.com/team/repo.git#another",
+            "https://exam\nple.com/team/repo.git",
+            "file:///tmp/team/repo.git",
+            "/tmp/team/repo.git",
+            "C:\\repos\\team\\repo",
+        ] {
+            assert_eq!(canonical_remote(remote), None, "{remote:?}");
+        }
+    }
+
+    #[test]
+    fn repository_identity_keeps_hosts_namespaces_and_credentials_separate() {
+        let original = canonical_remote("git@example.com:team/repo.git").unwrap();
+        for other in [
+            "git@another.example.com:team/repo.git",
+            "git@example.com:fork/repo.git",
+            "git@example.com:team/another.git",
+        ] {
+            assert_ne!(canonical_remote(other).as_ref(), Some(&original));
+        }
+        assert_eq!(
+            canonical_remote("https://user:fixture-secret@example.com/team/repo.git"),
+            Some(original)
+        );
+    }
+
+    #[test]
     fn open_remote_states_restore_without_relaunching_or_becoming_interrupted() {
         for (phase, state) in [
             (RemoteState::Launching, TaskState::Queued),
@@ -2581,9 +2655,15 @@ pub(super) fn target_machine(args: &Value) -> Result<Option<&str>, String> {
 }
 fn canonical_remote(remote: &str) -> Option<String> {
     let remote = remote.trim();
+    if remote.chars().any(char::is_control) {
+        return None;
+    }
     let (host, path) = if remote.contains("://") {
         let url = reqwest::Url::parse(remote).ok()?;
-        if !matches!(url.scheme(), "http" | "https" | "ssh" | "git") {
+        if !matches!(url.scheme(), "http" | "https" | "ssh" | "git")
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
             return None;
         }
         let mut host = url.host_str()?.to_ascii_lowercase();
@@ -2594,17 +2674,43 @@ fn canonical_remote(remote: &str) -> Option<String> {
         }
         (host, url.path().trim_start_matches('/').to_owned())
     } else {
-        let remote = remote.rsplit_once('@').map_or(remote, |(_, rest)| rest);
-        let (host, path) = remote.split_once(':')?;
+        // Only the authority can contain a username. An @ after the path
+        // separator belongs to the repository name, not the credentials.
+        let host_start = remote
+            .find('@')
+            .filter(|at| !remote[..*at].contains([':', '/', '\\']))
+            .map_or(0, |at| at + 1);
+        let (authority, path) = if remote[host_start..].starts_with('[') {
+            let close = host_start + remote[host_start..].find(']')?;
+            (&remote[..=close], remote[close + 1..].strip_prefix(':')?)
+        } else {
+            remote.split_once(':')?
+        };
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, rest)| rest);
         if host.len() < 2 || host.contains(['/', '\\']) {
             return None;
         }
+        let address = reqwest::Url::parse(&format!("ssh://{host}/")).ok()?;
+        if !address.username().is_empty()
+            || address.password().is_some()
+            || address.port().is_some()
+            || address.query().is_some()
+            || address.fragment().is_some()
+            || address.path() != "/"
+        {
+            return None;
+        }
         (
-            host.to_ascii_lowercase(),
+            address.host_str()?.to_ascii_lowercase(),
             path.trim_start_matches('/').to_owned(),
         )
     };
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let path = path.trim_end_matches('/');
+    // Strip the optional transport suffix once. repo.git.git and repo.git
+    // must not collapse into the same repository identity.
+    let path = path.strip_suffix(".git").unwrap_or(path);
     (!path.is_empty()).then(|| format!("{host}/{path}"))
 }
 

@@ -2251,7 +2251,13 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
     let workspace = target.root.join("workspace");
     fs::create_dir_all(&workspace).unwrap();
     let home_workspace = home.root.join("workspace");
-    for path in [&workspace, &home_workspace] {
+    // The same repository is addressed through HTTPS and SCP-style SSH.
+    // Both @ inside the path and a repository name ending in .git survive
+    // normalization; stripping credentials or suffixes must not change it.
+    for (path, remote) in [
+        (&workspace, "https://example.com/team/peer@fixture.git.git"),
+        (&home_workspace, "git@EXAMPLE.com:team/peer@fixture.git.git"),
+    ] {
         assert!(
             Command::new("git")
                 .args(["init", "--quiet"])
@@ -2264,12 +2270,7 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
             Command::new("git")
                 .arg("-C")
                 .arg(path)
-                .args([
-                    "remote",
-                    "add",
-                    "origin",
-                    "https://example.com/peer-fixture.git"
-                ])
+                .args(["remote", "add", "origin", remote])
                 .status()
                 .unwrap()
                 .success()
