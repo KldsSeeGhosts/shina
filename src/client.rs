@@ -2902,13 +2902,13 @@ mod tests {
                 "sourceThreadId":1,"sourceItemId":"message-1","field":"messages","ordinal":0,"position":0,"item":{"text":"retained"}
             }],"fields":{"id":1},"nextCursor":null}).to_string(),"nextFragment":null}})).unwrap();
         assert_eq!(
-            cache.projected().unwrap().views[&1]["messages"][0]["text"],
+            cache.projected().unwrap().views[&1].fields["messages"].items[0]["text"],
             "retained"
         );
         cache.receive(&protocol::notification("subscription.patch",
             json!({"epoch":"epoch","seq":11,"patch":[{"op":"set","path":["threads","0","status"],"value":"completed"}]}))).unwrap();
         assert_eq!(
-            cache.projected().unwrap().views[&1]["messages"][0]["text"],
+            cache.projected().unwrap().views[&1].fields["messages"].items[0]["text"],
             "retained"
         );
         assert!(
@@ -2948,7 +2948,7 @@ mod tests {
             .receive(&json!({"id":"history","result":{"data":"{}","nextCursor":null}}))
             .unwrap();
         assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 1);
-        assert!(cache.histories.is_empty());
+        assert_eq!(cache.installed_count(), 0);
     }
 
     #[test]

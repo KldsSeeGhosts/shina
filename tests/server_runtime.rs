@@ -5172,8 +5172,8 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
         if let Some(view) = cache.projected() {
             displayed = Some(view);
         }
-        let installed = cache.histories.get(&1);
-        if let Some((revision, view, size)) = installed {
+        let installed = cache.installed_info(1);
+        if let Some((revision, view, size)) = installed.as_ref() {
             if !first_walk_complete && cache.complete(1) {
                 assert!(*size > bytes);
                 assert_eq!(
@@ -5185,12 +5185,12 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             }
             let assistant = view["messages"].as_array().unwrap().last().unwrap()["text"]
                 .as_str()
-                .unwrap();
+                .unwrap()
+                .to_string();
             if cache.state["threads"][0]["status"] == "Running" {
                 assert_eq!(
-                    displayed.as_ref().unwrap().views[&1]["messages"]
-                        .as_array()
-                        .unwrap()
+                    displayed.as_ref().unwrap().views[&1].fields["messages"]
+                        .items
                         .last()
                         .unwrap()["text"],
                     assistant
@@ -5214,8 +5214,16 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
                     .collect();
                 assert_eq!(assistant, expected);
                 assert_eq!(
-                    displayed.as_ref().unwrap().views[&1]["messages"],
+                    displayed.as_ref().unwrap().views[&1].fields["messages"]
+                        .items
+                        .iter()
+                        .map(|item| &**item)
+                        .collect::<Vec<_>>(),
                     view["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>()
                 );
                 assert_eq!(
                     displayed.as_ref().unwrap()["threads"][0]["historyRetry"]["fullRestarts"]
@@ -5272,7 +5280,7 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
             );
             // Match the audit's page-request delay, not a delay on reading live events.
             std::thread::sleep(Duration::from_millis(120));
-        } else if cache.histories.contains_key(&1) && !cache.complete(1) {
+        } else if cache.assembled(1).is_some() && !cache.complete(1) {
             cache.request_earlier(1, None);
         } else {
             client.read();
@@ -5289,8 +5297,12 @@ fn streaming_history_case(bytes: usize, disconnect: bool) {
     // Compare all transcript/activity fields against a full walk of the final revision.
     let final_history = read_full_history(&mut client, 65536);
     assert_eq!(
-        client.history_cache.as_ref().unwrap().histories[&1]
-            .1
+        client
+            .history_cache
+            .as_ref()
+            .unwrap()
+            .assembled(1)
+            .unwrap()
             .to_string()
             .as_bytes(),
         final_history.to_string().as_bytes()
@@ -5730,7 +5742,7 @@ fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect(
                 req["params"].clone(),
                 json!("history"),
             );
-        } else if cache.histories.contains_key(&1) {
+        } else if cache.assembled(1).is_some() {
             break;
         } else {
             client.read();
@@ -5744,7 +5756,7 @@ fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect(
         );
         let view = cache.projected().unwrap();
         assert_eq!(view["threads"][0]["historyMeta"]["hasMoreHistory"], true);
-        let loaded_msgs = view.views[&1]["messages"].as_array().unwrap();
+        let loaded_msgs = &view.views[&1].fields["messages"].items;
         assert!(
             loaded_msgs.len() <= 20,
             "recent budget only, got {}",
@@ -5815,15 +5827,21 @@ fn older_history_paging_loads_thousands_of_items_on_demand_and_across_reconnect(
     );
     let cache = client.history_cache.as_ref().unwrap();
     assert_eq!(
-        cache.histories[&1].1["messages"].as_array().unwrap().len(),
+        cache.assembled(1).unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
         1800
     );
     assert_eq!(
-        cache.histories[&1].1["tools"].as_array().unwrap().len(),
+        cache.assembled(1).unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
         900
     );
     assert_eq!(
-        cache.histories[&1].1["messages"][0]["text"],
+        cache.assembled(1).unwrap()["messages"][0]["text"],
         "Turn prompt 0"
     );
     assert!(cache.complete(1));
@@ -5977,7 +5995,7 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
                 req["params"].clone(),
                 json!("history"),
             );
-        } else if cache.histories.contains_key(&1) {
+        } else if cache.assembled(1).is_some() {
             break;
         }
     }
@@ -5985,7 +6003,7 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
     {
         let cache = linked_client.history_cache.as_mut().unwrap();
         assert!(
-            !cache.histories[&1].1["messages"]
+            !cache.assembled(1).unwrap()["messages"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -6006,14 +6024,24 @@ fn server_backed_find_searches_thousands_of_items_pages_to_match_works_on_linked
         }
     }
     assert!(
-        linked_client.history_cache.as_ref().unwrap().histories[&1].1["messages"]
+        linked_client
+            .history_cache
+            .as_ref()
+            .unwrap()
+            .assembled(1)
+            .unwrap()["messages"]
             .as_array()
             .unwrap()
             .iter()
             .any(|m| m["id"] == "u-3")
     );
     assert!(
-        linked_client.history_cache.as_ref().unwrap().histories[&1].1["tools"]
+        linked_client
+            .history_cache
+            .as_ref()
+            .unwrap()
+            .assembled(1)
+            .unwrap()["tools"]
             .as_array()
             .unwrap()
             .iter()
@@ -6117,7 +6145,7 @@ fn completed_turn_defers_500_work_records_until_the_fold_loads_them() {
         initial_page_bytes = reply["result"]["totalBytes"].as_u64().unwrap_or(0) as usize;
     }
     let cache = client.history_cache.as_mut().unwrap();
-    let history = &cache.histories[&1].1;
+    let history = cache.assembled(1).unwrap();
     let bytes = history.to_string().len();
     assert_eq!(history["tools"].as_array().unwrap().len(), 1, "{history}");
     assert_eq!(history["deferredWork"][0]["itemCount"], 500);
@@ -6138,9 +6166,12 @@ fn completed_turn_defers_500_work_records_until_the_fold_loads_them() {
     cache
         .receive(&json!({"id":"history","error":{"code":-32603,"message":"Fixture work failure"}}))
         .unwrap();
-    assert_eq!(cache.histories[&1].1["deferredWork"][0]["loading"], false);
     assert_eq!(
-        cache.histories[&1].1["deferredWork"][0]["error"],
+        cache.assembled(1).unwrap()["deferredWork"][0]["loading"],
+        false
+    );
+    assert_eq!(
+        cache.assembled(1).unwrap()["deferredWork"][0]["error"],
         "Fixture work failure"
     );
     cache.request_work(1, anchor);
@@ -6178,11 +6209,14 @@ fn completed_turn_defers_500_work_records_until_the_fold_loads_them() {
     }
     let cache = client.history_cache.as_ref().unwrap();
     assert_eq!(
-        cache.histories[&1].1["tools"].as_array().unwrap().len(),
+        cache.assembled(1).unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
         500
     );
     assert!(
-        cache.histories[&1].1["deferredWork"]
+        cache.assembled(1).unwrap()["deferredWork"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -6220,7 +6254,7 @@ fn completed_turn_defers_500_work_records_until_the_fold_loads_them() {
         projected["threads"][0]["historyMeta"]["workLoading"],
         "inline-legacy"
     );
-    assert!(cache.histories[&1].1["deferredWork"].is_null());
+    assert!(cache.assembled(1).unwrap()["deferredWork"].is_null());
     profile.stop();
 }
 

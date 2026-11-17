@@ -1,7 +1,10 @@
 //! State facade and plain projections. Execution still uses the original State/Thread methods.
 use super::*;
 use crate::client_history::Projection;
+use crate::model::pi_session::SlashCommand;
 use crate::protocol::{Command, Receipt};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Where a draft machine change can land without blocking on more data.
 enum RouteTarget {
@@ -20,6 +23,13 @@ pub(crate) struct ApplyStats {
     pub(crate) thread_views_applied: u64,
     pub(crate) thread_views_skipped: u64,
     pub(crate) records_deserialized: u64,
+    /// Field item vectors skipped by `Arc` identity versus rebuilt.
+    pub(crate) fields_skipped: u64,
+    pub(crate) fields_walked: u64,
+    /// Item payloads converted into thread structs versus carried over by id.
+    pub(crate) items_deserialized: u64,
+    pub(crate) items_reused: u64,
+    pub(crate) items_dropped: u64,
 }
 
 // A fixed monotonic/wall-clock pair makes a start timestamp stable across captures.
@@ -299,6 +309,156 @@ struct ThreadView {
     handoffs: Vec<crate::handoff::Handoff>,
 }
 
+fn message_from_view(message: MessageView) -> Result<Message, String> {
+    Ok(Message {
+        id: message.id,
+        role: match message.role.as_str() {
+            "You" => "You",
+            "Pi" => "Pi",
+            "Shina" => "Shina",
+            _ => return Err("Invalid message role.".into()),
+        },
+        text: message.text,
+        images: message.images,
+        context: message.context,
+    })
+}
+
+/// The content-changed item ids for `name` in this emission; `None` means the
+/// field is untouched or the emission could not narrow the set.
+fn changed_items<'a>(
+    view: &'a crate::client_history::ThreadProjection,
+    name: &str,
+) -> Option<&'a HashSet<Arc<str>>> {
+    view.items_changed
+        .as_deref()
+        .and_then(|changes| changes.get(name))
+}
+
+/// Whether a field carried by a `ThreadProjection` is provably untouched
+/// relative to what the thread last applied.
+fn field_unchanged(
+    stored: Option<&Arc<crate::client_history::FieldItems>>,
+    incoming: Option<&Arc<crate::client_history::FieldItems>>,
+    changed: Option<&HashSet<Arc<str>>>,
+) -> bool {
+    let Some(incoming) = incoming else {
+        return stored.is_none_or(|field| field.items.is_empty());
+    };
+    if stored.is_some_and(|old| Arc::ptr_eq(old, incoming)) {
+        return true;
+    }
+    match (
+        stored.and_then(|field| field.ids.as_deref()),
+        incoming.ids.as_deref(),
+    ) {
+        (Some(old_ids), Some(new_ids)) => {
+            old_ids == new_ids
+                && changed.is_some_and(|changed| new_ids.iter().all(|sid| !changed.contains(sid)))
+        }
+        _ => false,
+    }
+}
+
+/// Apply one transcript field to `old`: unchanged items keep their existing
+/// `T` (disclosure state, timers, allocation) by stable id or position, and
+/// only changed or new payloads deserialize. `lookup` finds the previous item
+/// index to merge preserved state from when no sid matched (key merge), or
+/// when identities are absent.
+fn apply_items<T>(
+    transcript: &mut HashMap<&'static str, Arc<crate::client_history::FieldItems>>,
+    name: &'static str,
+    view: &crate::client_history::ThreadProjection,
+    stats: &mut ApplyStats,
+    old: Vec<T>,
+    deser: impl Fn(usize, &Value) -> Result<T, String>,
+    lookup: impl Fn(&T) -> Option<usize>,
+    merge: impl Fn(&mut T, &T),
+) -> Result<Vec<T>, String> {
+    let incoming = view.fields.get(name);
+    let stored = transcript.get(name);
+    if let (Some(stored), Some(incoming)) = (stored, incoming)
+        && Arc::ptr_eq(stored, incoming)
+    {
+        stats.fields_skipped += 1;
+        stats.items_reused += incoming.items.len() as u64;
+        return Ok(old);
+    }
+    let inc_ids: Option<&[Arc<str>]> = incoming.and_then(|field| field.ids.as_deref());
+    let inc_items: &[Arc<Value>] = incoming.map(|field| field.items.as_slice()).unwrap_or(&[]);
+    let old_ids: Option<&[Arc<str>]> = stored.and_then(|field| field.ids.as_deref());
+    let changed = changed_items(view, name);
+    // Same ids in the same order: reuse untouched items positionally.
+    if let (Some(old_ids), Some(inc_ids)) = (old_ids, inc_ids)
+        && old_ids == inc_ids
+    {
+        let mut out = Vec::with_capacity(inc_items.len());
+        for (index, (old_item, (sid, raw))) in old
+            .into_iter()
+            .zip(inc_ids.iter().zip(inc_items.iter()))
+            .enumerate()
+        {
+            if changed.is_none_or(|changed| changed.contains(sid)) {
+                let mut item = deser(index, raw)?;
+                merge(&mut item, &old_item);
+                out.push(item);
+                stats.items_deserialized += 1;
+            } else {
+                out.push(old_item);
+                stats.items_reused += 1;
+            }
+        }
+        if let Some(incoming) = incoming {
+            transcript.insert(name, incoming.clone());
+        }
+        stats.fields_walked += 1;
+        return Ok(out);
+    }
+    // Membership or order changed, or identities are unknown: index the old
+    // items by sid first, then let `lookup` merge by intrinsic key.
+    let mut old_opt: Vec<Option<T>> = old.into_iter().map(Some).collect();
+    let mut by_sid: HashMap<&str, usize> = HashMap::new();
+    if let Some(old_ids) = old_ids {
+        for (index, sid) in old_ids.iter().enumerate() {
+            by_sid.entry(sid.as_ref()).or_insert(index);
+        }
+    }
+    let mut out = Vec::with_capacity(inc_items.len());
+    for (index, raw) in inc_items.iter().enumerate() {
+        let sid = inc_ids.map(|ids| &ids[index]);
+        let hit = sid.and_then(|sid| by_sid.get(sid.as_ref()).copied());
+        let is_changed =
+            changed.map_or(true, |changed| sid.is_none_or(|sid| changed.contains(sid)));
+        if let (Some(index), false) = (hit, is_changed)
+            && old_opt[index].is_some()
+        {
+            out.push(old_opt[index].take().unwrap());
+            stats.items_reused += 1;
+            continue;
+        }
+        let mut item = deser(index, raw)?;
+        let merge_source = hit
+            .and_then(|index| old_opt[index].as_ref())
+            .or_else(|| lookup(&item).and_then(|index| old_opt[index].as_ref()));
+        if let Some(old) = merge_source {
+            merge(&mut item, old);
+        }
+        out.push(item);
+        stats.items_deserialized += 1;
+    }
+    stats.items_dropped += old_opt.iter().flatten().count() as u64;
+    match incoming {
+        Some(incoming) => {
+            transcript.insert(name, incoming.clone());
+        }
+        None => {
+            transcript.remove(name);
+        }
+    }
+    stats.fields_walked += 1;
+    Ok(out)
+}
+
 impl ThreadView {
     fn capture(thread: &Thread) -> Self {
         // JSON roundtrips these bounded, plain records, never process or presentation objects.
@@ -457,6 +617,27 @@ impl ThreadView {
     }
 
     fn apply(self, thread: &mut Thread) -> Result<(), String> {
+        thread.transcript_fields.clear();
+        self.apply_inner(thread, None, &mut ApplyStats::default())
+    }
+
+    /// Apply a projected thread: unchanged items keep their structs, state and
+    /// allocations by stable source id; only emitted-changed items deserialize.
+    fn apply_projected(
+        self,
+        thread: &mut Thread,
+        view: &crate::client_history::ThreadProjection,
+        stats: &mut ApplyStats,
+    ) -> Result<(), String> {
+        self.apply_inner(thread, Some(view), stats)
+    }
+
+    fn apply_inner(
+        mut self,
+        thread: &mut Thread,
+        view: Option<&crate::client_history::ThreadProjection>,
+        stats: &mut ApplyStats,
+    ) -> Result<(), String> {
         thread.worktree_path = self.worktree_path;
         thread.branch = self.branch;
         thread.base_branch = self.base_branch;
@@ -493,37 +674,47 @@ impl ThreadView {
         thread.continuation_of_run_id = self.continuation_of_run_id;
         thread.prompt_suggestion = self.prompt_suggestion;
         thread.run_control_supported = self.run_control_supported;
-        let old_messages = std::mem::take(&mut thread.messages);
-        thread.messages = self
-            .messages
-            .into_iter()
-            .map(|message| {
-                Ok(Message {
-                    id: message.id,
-                    role: match message.role.as_str() {
-                        "You" => "You",
-                        "Pi" => "Pi",
-                        "Shina" => "Shina",
-                        _ => return Err("Invalid message role.".into()),
-                    },
-                    text: message.text,
-                    images: message.images,
-                    context: message.context,
-                })
-            })
-            .collect::<Result<_, String>>()?;
-        // .rev() keeps the first match for a duplicate key, as `find` did.
-        let old_tools: std::collections::HashMap<&str, &Tool> = thread
-            .tools
+        // Work expansion keys on the old message ids, captured before the
+        // message field applies.
+        let old_msg_ids: Vec<String> = thread.messages.iter().map(|m| m.id.clone()).collect();
+        let old_work_by_message: HashMap<String, usize> = thread
+            .work
             .iter()
-            .rev()
-            .map(|tool| (tool.id.as_str(), tool))
+            .enumerate()
+            .filter_map(|(index, old)| old_msg_ids.get(old.start).map(|id| (id.clone(), index)))
             .collect();
-        let mut tools = self.tools;
-        for tool in &mut tools {
+        let old_work_by_start: HashMap<usize, usize> = thread
+            .work
+            .iter()
+            .enumerate()
+            .map(|(index, old)| (old.start, index))
+            .collect();
+        thread.messages = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "messages",
+                view,
+                stats,
+                std::mem::take(&mut thread.messages),
+                |_, raw| {
+                    let view: MessageView =
+                        serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+                    message_from_view(view)
+                },
+                |_| None,
+                |_, _| {},
+            )?
+        } else {
+            self.messages
+                .into_iter()
+                .map(message_from_view)
+                .collect::<Result<_, String>>()?
+        };
+        let tool_started_at = std::mem::take(&mut self.tool_started_at);
+        let deser_tool = |_: usize, raw: &Value| -> Result<Tool, String> {
+            let mut tool: Tool = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             if !tool.done {
-                tool.started = self
-                    .tool_started_at
+                tool.started = tool_started_at
                     .get(&tool.id)
                     .copied()
                     .and_then(timestamp_instant)
@@ -532,32 +723,67 @@ impl ThreadView {
                             .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)))
                     });
             }
-            if let Some(old) = old_tools.get(tool.id.as_str()) {
-                tool.expanded = old.expanded;
-                tool.raw_expanded = old.raw_expanded;
-                tool.group_expanded = old.group_expanded;
+            Ok(tool)
+        };
+        let merge_tool = |tool: &mut Tool, old: &Tool| {
+            tool.expanded = old.expanded;
+            tool.raw_expanded = old.raw_expanded;
+            tool.group_expanded = old.group_expanded;
+        };
+        thread.tools = if let Some(view) = view {
+            let by_id: HashMap<String, usize> = thread
+                .tools
+                .iter()
+                .enumerate()
+                .map(|(index, tool)| (tool.id.clone(), index))
+                .collect();
+            apply_items(
+                &mut thread.transcript_fields,
+                "tools",
+                view,
+                stats,
+                std::mem::take(&mut thread.tools),
+                deser_tool,
+                |tool| by_id.get(&tool.id).copied(),
+                merge_tool,
+            )?
+        } else {
+            // or_insert keeps the first match for a duplicate key, as `find` did.
+            let old_tools: std::collections::HashMap<&str, &Tool> = thread
+                .tools
+                .iter()
+                .rev()
+                .map(|tool| (tool.id.as_str(), tool))
+                .collect();
+            let mut tools = self.tools;
+            for tool in &mut tools {
+                if !tool.done {
+                    tool.started = tool_started_at
+                        .get(&tool.id)
+                        .copied()
+                        .and_then(timestamp_instant)
+                        .or_else(|| {
+                            tool.duration_ms.and_then(|ms| {
+                                Instant::now().checked_sub(Duration::from_millis(ms))
+                            })
+                        });
+                }
+                if let Some(old) = old_tools.get(tool.id.as_str()) {
+                    merge_tool(tool, old);
+                }
             }
-        }
-        thread.tools = tools;
-        let old_thoughts: std::collections::HashMap<(usize, usize, usize), &Thought> = thread
-            .thoughts
-            .iter()
-            .rev()
-            .map(|thought| {
-                (
-                    (thought.anchor.message, thought.anchor.offset, thought.block),
-                    thought,
-                )
-            })
-            .collect();
-        let mut thoughts = self.thoughts;
-        for (index, thought) in thoughts.iter_mut().enumerate() {
+            tools
+        };
+        let thought_clocks = std::mem::take(&mut self.thought_clocks);
+        let thought_started_at = std::mem::take(&mut self.thought_started_at);
+        let deser_thought = |index: usize, raw: &Value| -> Result<Thought, String> {
+            let mut thought: Thought =
+                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
             if !thought.done {
-                thought.started = self
-                    .thought_clocks
-                    .get(&thought_clock_key(thought))
+                thought.started = thought_clocks
+                    .get(&thought_clock_key(&thought))
                     .copied()
-                    .or_else(|| self.thought_started_at.get(index).copied().flatten())
+                    .or_else(|| thought_started_at.get(index).copied().flatten())
                     .and_then(timestamp_instant)
                     .or_else(|| {
                         thought
@@ -565,38 +791,105 @@ impl ThreadView {
                             .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)))
                     });
             }
-            thought.expanded = old_thoughts
-                .get(&(thought.anchor.message, thought.anchor.offset, thought.block))
-                .is_some_and(|old| old.expanded);
-        }
-        thread.thoughts = thoughts;
+            Ok(thought)
+        };
+        let merge_thought = |thought: &mut Thought, old: &Thought| {
+            thought.expanded = old.expanded;
+        };
+        thread.thoughts = if let Some(view) = view {
+            let by_key: HashMap<(usize, usize, usize), usize> = thread
+                .thoughts
+                .iter()
+                .enumerate()
+                .map(|(index, thought)| {
+                    (
+                        (thought.anchor.message, thought.anchor.offset, thought.block),
+                        index,
+                    )
+                })
+                .collect();
+            apply_items(
+                &mut thread.transcript_fields,
+                "thoughts",
+                view,
+                stats,
+                std::mem::take(&mut thread.thoughts),
+                deser_thought,
+                |thought| {
+                    by_key
+                        .get(&(thought.anchor.message, thought.anchor.offset, thought.block))
+                        .copied()
+                },
+                merge_thought,
+            )?
+        } else {
+            // or_insert keeps the first match for a duplicate key, as `find` did.
+            let old_thoughts: std::collections::HashMap<(usize, usize, usize), &Thought> = thread
+                .thoughts
+                .iter()
+                .rev()
+                .map(|thought| {
+                    (
+                        (thought.anchor.message, thought.anchor.offset, thought.block),
+                        thought,
+                    )
+                })
+                .collect();
+            let mut thoughts = self.thoughts;
+            for (index, thought) in thoughts.iter_mut().enumerate() {
+                if !thought.done {
+                    thought.started = thought_clocks
+                        .get(&thought_clock_key(thought))
+                        .copied()
+                        .or_else(|| thought_started_at.get(index).copied().flatten())
+                        .and_then(timestamp_instant)
+                        .or_else(|| {
+                            thought.duration_ms.and_then(|ms| {
+                                Instant::now().checked_sub(Duration::from_millis(ms))
+                            })
+                        });
+                }
+                thought.expanded = old_thoughts
+                    .get(&(thought.anchor.message, thought.anchor.offset, thought.block))
+                    .is_some_and(|old| old.expanded);
+            }
+            thoughts
+        };
         // Work items match by the stable message id at their start position,
         // falling back to the position itself when that message is gone.
-        let old_work_by_message: std::collections::HashMap<&str, &AssistantWork> = thread
-            .work
-            .iter()
-            .rev()
-            .filter_map(|old| {
-                old_messages
-                    .get(old.start)
-                    .map(|message| (message.id.as_str(), old))
-            })
-            .collect();
-        let old_work_by_start: std::collections::HashMap<usize, &AssistantWork> = thread
-            .work
-            .iter()
-            .rev()
-            .map(|old| (old.start, old))
-            .collect();
-        let mut work = self.work;
-        for item in &mut work {
-            let message_id = thread.messages.get(item.start).map(|m| m.id.as_str());
-            let matched = message_id
-                .and_then(|id| old_work_by_message.get(id).copied())
-                .or_else(|| old_work_by_start.get(&item.start).copied());
-            item.expanded = matched.is_some_and(|old| old.expanded);
-        }
-        thread.work = work;
+        thread.work = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "work",
+                view,
+                stats,
+                std::mem::take(&mut thread.work),
+                |_, raw| {
+                    serde_json::from_value::<AssistantWork>(raw.clone()).map_err(|e| e.to_string())
+                },
+                |item| {
+                    thread
+                        .messages
+                        .get(item.start)
+                        .and_then(|message| old_work_by_message.get(&message.id).copied())
+                        .or_else(|| old_work_by_start.get(&item.start).copied())
+                },
+                |item, old| item.expanded = old.expanded,
+            )?
+        } else {
+            let old_work = std::mem::take(&mut thread.work);
+            let mut work = self.work;
+            for item in &mut work {
+                let matched = thread
+                    .messages
+                    .get(item.start)
+                    .and_then(|message| old_work_by_message.get(&message.id))
+                    .or_else(|| old_work_by_start.get(&item.start))
+                    .copied();
+                item.expanded = matched.is_some_and(|index| old_work[index].expanded);
+            }
+            work
+        };
         thread.harness_state = self.harness_state;
         if let Some(capabilities) = self.turn_capabilities {
             thread.harness_state["turnCapabilities"] = json!(capabilities);
@@ -606,7 +899,22 @@ impl ThreadView {
         thread.model_id = self.model_id;
         thread.thinking = self.thinking;
         thread.model_options = self.model_options;
-        thread.models = self.models;
+        thread.models = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "models",
+                view,
+                stats,
+                std::mem::take(&mut thread.models),
+                |_, raw| {
+                    serde_json::from_value::<AgentModel>(raw.clone()).map_err(|e| e.to_string())
+                },
+                |_| None,
+                |_, _| {},
+            )?
+        } else {
+            self.models
+        };
         thread.thinking_levels = self.thinking_levels;
         thread.supports_images = self.supports_images;
         thread.context_window = self.context_window;
@@ -620,7 +928,24 @@ impl ThreadView {
         }
         thread.phase = self.phase;
         thread.error = self.error;
-        thread.diagnostics = self.diagnostics;
+        thread.diagnostics = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "diagnostics",
+                view,
+                stats,
+                std::mem::take(&mut thread.diagnostics),
+                |_, raw| {
+                    raw.as_str()
+                        .map(str::to_owned)
+                        .ok_or("Invalid diagnostic entry.".into())
+                },
+                |_| None,
+                |_, _| {},
+            )?
+        } else {
+            self.diagnostics
+        };
         let changed_request = thread
             .request
             .as_ref()
@@ -678,37 +1003,192 @@ impl ThreadView {
                     .filter(|_| thread.status.busy())
                     .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs)))
             });
-        let mut queue_drafts: std::collections::HashMap<usize, _> =
-            self.queue_drafts.into_iter().rev().collect();
         let mut queue_contexts: std::collections::HashMap<usize, _> =
-            self.queue_contexts.into_iter().rev().collect();
-        thread.native.queue = self
-            .queue
-            .into_iter()
-            .map(|(id, text, images)| {
-                let mut prompt = Prompt::new(text, images);
-                prompt.draft = queue_drafts.remove(&id);
-                prompt.context = queue_contexts.remove(&id);
-                pi_session::QueuedMessage { id, prompt }
-            })
-            .collect();
+            self.queue_contexts.iter().cloned().collect();
+        let contexts_differ = {
+            let current: std::collections::HashMap<
+                usize,
+                &crate::composer_context::MessageContext,
+            > = thread
+                .native
+                .queue
+                .iter()
+                .filter_map(|q| q.prompt.context.as_ref().map(|ctx| (q.id, ctx)))
+                .collect();
+            current.len() != queue_contexts.len()
+                || current
+                    .iter()
+                    .any(|(id, ctx)| queue_contexts.get(id) != Some(ctx))
+        };
+        if let Some(view) = view {
+            let queue_touched = !field_unchanged(
+                thread.transcript_fields.get("queue"),
+                view.fields.get("queue"),
+                changed_items(view, "queue"),
+            ) || !field_unchanged(
+                thread.transcript_fields.get("queue_drafts"),
+                view.fields.get("queue_drafts"),
+                changed_items(view, "queue_drafts"),
+            ) || contexts_differ;
+            if queue_touched {
+                let mut queue_drafts: std::collections::HashMap<usize, _> = view
+                    .fields
+                    .get("queue_drafts")
+                    .map(|field| {
+                        field
+                            .items
+                            .iter()
+                            .map(|raw| {
+                                serde_json::from_value::<(usize, crate::composer_rich::Snapshot)>(
+                                    (**raw).clone(),
+                                )
+                                .map_err(|e| e.to_string())
+                            })
+                            .rev()
+                            .collect::<Result<_, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let queue_items = view
+                    .fields
+                    .get("queue")
+                    .map(|field| field.items.as_slice())
+                    .unwrap_or(&[]);
+                let mut queue = Vec::with_capacity(queue_items.len());
+                for raw in queue_items {
+                    let (id, text, images): (usize, String, Vec<Attachment>) =
+                        serde_json::from_value((**raw).clone()).map_err(|e| e.to_string())?;
+                    let mut prompt = Prompt::new(text, images);
+                    prompt.draft = queue_drafts.remove(&id);
+                    prompt.context = queue_contexts.remove(&id);
+                    queue.push(pi_session::QueuedMessage { id, prompt });
+                }
+                stats.items_deserialized += (queue_items.len() + queue_drafts.len()) as u64;
+                stats.fields_walked += 2;
+                thread.native.queue = queue.into();
+                for name in ["queue", "queue_drafts"] {
+                    match view.fields.get(name) {
+                        Some(field) => {
+                            thread.transcript_fields.insert(name, field.clone());
+                        }
+                        None => {
+                            thread.transcript_fields.remove(name);
+                        }
+                    }
+                }
+            } else {
+                stats.fields_skipped += 2;
+                stats.items_reused += (thread.native.queue.len()) as u64;
+            }
+        } else {
+            let mut queue_drafts: std::collections::HashMap<usize, _> =
+                self.queue_drafts.into_iter().rev().collect();
+            thread.native.queue = self
+                .queue
+                .into_iter()
+                .map(|(id, text, images)| {
+                    let mut prompt = Prompt::new(text, images);
+                    prompt.draft = queue_drafts.remove(&id);
+                    prompt.context = queue_contexts.remove(&id);
+                    pi_session::QueuedMessage { id, prompt }
+                })
+                .collect();
+        }
         thread.queue_edit_supported = self.queue_edit_supported;
         thread.composer_context_supported = self.composer_context_supported;
         thread.native.queue_held = self.queue_held;
         thread.reconcile_queued_edit();
         thread.tick_stop(Instant::now());
-        thread.native.steering = self.steering;
-        thread.native.follow_ups = self.follow_ups;
-        thread.native.commands = self
-            .commands
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        thread.native.compactions = self.compactions;
+        thread.native.steering = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "steering",
+                view,
+                stats,
+                std::mem::take(&mut thread.native.steering),
+                |_, raw| {
+                    raw.as_str()
+                        .map(str::to_owned)
+                        .ok_or("Invalid steering entry.".into())
+                },
+                |_| None,
+                |_, _| {},
+            )?
+        } else {
+            self.steering
+        };
+        thread.native.follow_ups = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "follow_ups",
+                view,
+                stats,
+                std::mem::take(&mut thread.native.follow_ups),
+                |_, raw| {
+                    raw.as_str()
+                        .map(str::to_owned)
+                        .ok_or("Invalid follow-up entry.".into())
+                },
+                |_| None,
+                |_, _| {},
+            )?
+        } else {
+            self.follow_ups
+        };
+        thread.native.commands = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "commands",
+                view,
+                stats,
+                std::mem::take(&mut thread.native.commands),
+                |_, raw| {
+                    serde_json::from_value::<SlashCommand>(raw.clone()).map_err(|e| e.to_string())
+                },
+                |_| None::<usize>,
+                |_, _| {},
+            )?
+        } else {
+            self.commands
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        thread.native.compactions = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "compactions",
+                view,
+                stats,
+                std::mem::take(&mut thread.native.compactions),
+                |_, raw| Ok(raw.clone()),
+                |_| None::<usize>,
+                |_, _| {},
+            )?
+        } else {
+            self.compactions
+        };
         thread.native.skills = self.skills;
         thread.native.stats = self.stats;
-        thread.native.fork_points = self.fork_points;
+        thread.native.fork_points = if let Some(view) = view {
+            apply_items(
+                &mut thread.transcript_fields,
+                "fork_points",
+                view,
+                stats,
+                std::mem::take(&mut thread.native.fork_points),
+                |_, raw| Ok(raw.clone()),
+                |_| None::<usize>,
+                |_, _| {},
+            )?
+        } else {
+            self.fork_points
+        };
+        if let Some(view) = view {
+            thread.transcript_structure = view.structure;
+            thread.transcript_content = view.content;
+        }
         thread.native.projected_operating = self.operating;
         thread.native.projected_queued = self.queued;
         thread.projected_harness_choice = self.harness_choice;
@@ -2098,14 +2578,28 @@ impl State {
                 self.apply_stats.thread_views_skipped += 1;
                 continue;
             }
-            let raw = projection.views.get(&id).map_or(record, |view| &**view);
-            let view: ThreadView =
-                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
-            self.apply_stats.records_deserialized += 1;
-            self.apply_stats.thread_views_applied += 1;
             let thread = &mut self.threads[index];
-            view.apply(thread)?;
-            if let Some(meta) = raw.get("historyMeta").filter(|m| m.is_object()) {
+            let meta_raw: &Value = match projection.views.get(&id) {
+                Some(view) => {
+                    // The compact meta record deserializes cheaply; transcript
+                    // items apply through shared field lists, not the record.
+                    let parsed: ThreadView = serde_json::from_value((*view.record).clone())
+                        .map_err(|e| e.to_string())?;
+                    self.apply_stats.records_deserialized += 1;
+                    self.apply_stats.thread_views_applied += 1;
+                    parsed.apply_projected(thread, view, &mut self.apply_stats)?;
+                    &view.record
+                }
+                None => {
+                    let view: ThreadView =
+                        serde_json::from_value(record.clone()).map_err(|e| e.to_string())?;
+                    self.apply_stats.records_deserialized += 1;
+                    self.apply_stats.thread_views_applied += 1;
+                    view.apply(thread)?;
+                    record
+                }
+            };
+            if let Some(meta) = meta_raw.get("historyMeta").filter(|m| m.is_object()) {
                 thread.history_has_more = meta["hasMoreHistory"] == true;
                 thread.history_loading = meta["loading"] == true;
                 thread.history_error = meta["error"].as_str().map(str::to_owned);
@@ -8525,6 +9019,14 @@ mod tests {
             let delta = cache.projected().unwrap();
             assert_eq!(changed_ids(&delta), [1].into_iter().collect());
             assert!(Arc::ptr_eq(&first.views[&2], &delta.views[&2]));
+            // The patch touched record metadata, not items or membership.
+            let projection = &delta.views[&1];
+            assert!(projection.record_changed);
+            assert!(!projection.structural);
+            assert_eq!(
+                projection.items_changed.as_deref(),
+                Some(&std::collections::HashMap::new())
+            );
         }
 
         #[test]
@@ -8631,16 +9133,94 @@ mod tests {
             assert_eq!(thread.tools[0].output, "updated");
         }
 
-        /// Report allocation counts and p50/p95 application times across sizes,
-        /// comparing the delta path against the pre-#24 path (full projection
-        /// clone + every ThreadView applied, i.e. `changed == None`).
+        #[test]
+        fn revisions_separate_structure_from_content_and_name_changed_items() {
+            let (mut cache, mut streams, threads, _f) = rig(2, 40, 20, 1 << 22, true);
+            let mut state = State::new(PathBuf::new(), false);
+            let first = cache.projected().unwrap();
+            let first_tp = &first.views[&2];
+            assert!(first_tp.items_changed.is_none(), "first emission is whole");
+            assert!(first_tp.structural);
+            let (structure0, content0) = (first_tp.structure, first_tp.content);
+            state.apply_projection(first).unwrap();
+
+            // A pure content edit: content bumps, structure holds, and the
+            // changed item ids name exactly the edited message.
+            let mut after = threads.clone();
+            after[1]["messages"][3]["text"] = json!("edited");
+            publish(
+                &mut cache,
+                &mut streams,
+                &workspace(1, &threads),
+                &workspace(2, &after),
+            );
+            let delta = cache.projected().unwrap();
+            let tp = &delta.views[&2];
+            assert!(!tp.structural, "content edits keep structure");
+            assert_eq!(tp.structure, structure0);
+            assert!(tp.content > content0);
+            let changed = tp.items_changed.as_deref().unwrap();
+            assert_eq!(changed.keys().copied().collect::<Vec<_>>(), ["messages"]);
+            assert_eq!(changed["messages"].len(), 1);
+            assert!(
+                changed["messages"]
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .starts_with("messages:")
+            );
+            // Reordering two messages moves membership: structure bumps and
+            // both moved items are named.
+            let (structure1, content1) = (tp.structure, tp.content);
+            state.apply_projection(delta).unwrap();
+            let thread = state.threads.iter().find(|t| t.id == 2).unwrap();
+            assert_eq!(thread.transcript_structure, structure0);
+            assert_eq!(thread.transcript_content, content1);
+
+            let mut reordered = threads.clone();
+            reordered[1]["messages"][3]["text"] = json!("edited");
+            reordered[1]["messages"].as_array_mut().unwrap().swap(3, 4);
+            publish(
+                &mut cache,
+                &mut streams,
+                &workspace(2, &after),
+                &workspace(3, &reordered),
+            );
+            let delta = cache.projected().unwrap();
+            let tp = &delta.views[&2];
+            assert!(tp.structural, "reorder changes structure");
+            assert!(tp.structure > structure1);
+            assert!(tp.content > content1);
+            let changed = tp.items_changed.as_deref().unwrap();
+            assert_eq!(changed["messages"].len(), 2);
+            let reordered_structure = tp.structure;
+            state.apply_projection(delta).unwrap();
+            let thread = state.threads.iter().find(|t| t.id == 2).unwrap();
+            assert_eq!(thread.transcript_structure, reordered_structure);
+            // The live record sees the reordered items in their new order.
+            let before: Vec<_> = after[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["text"].clone())
+                .collect();
+            let mut want = before.clone();
+            want.swap(3, 4);
+            let got: Vec<_> = thread.messages.iter().map(|m| json!(m.text)).collect();
+            assert_eq!(got[..5], want[..5]);
+        }
+
+        /// Report allocation counts and p50/p95 application times across sizes:
+        /// the delta path, the materialized-wire fallback, and the ported
+        /// pinned-269a2d0 install/projected/apply pipeline (`legacy_install` +
+        /// `legacy_projected` in client_history.rs, verbatim from that commit).
         /// Run alone for clean numbers:
         /// `cargo test delta_application_benchmark -- --exact --test-threads=1 --nocapture`
         #[test]
         fn delta_application_benchmark_report() {
             println!("issue-24 projection benchmark, {} updates/size", 30);
             println!(
-                "{:>3} {:>6} {:>6} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12}",
+                "{:>3} {:>6} {:>6} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12}",
                 "thr",
                 "msgs",
                 "tools",
@@ -8649,7 +9229,10 @@ mod tests {
                 "delta_bytes",
                 "full_p50",
                 "full_p95",
-                "full_bytes"
+                "full_bytes",
+                "269a2d0_p50",
+                "269a2d0_p95",
+                "269a2d0_bytes"
             );
             for (n, messages, tools) in
                 [(2usize, 200usize, 60usize), (4, 1000, 300), (4, 4000, 1200)]
@@ -8680,6 +9263,11 @@ mod tests {
                 let mut delta_bytes = Vec::with_capacity(updates);
                 let mut full_times = Vec::with_capacity(updates);
                 let mut full_bytes = Vec::with_capacity(updates);
+                let mut base_times = Vec::with_capacity(updates);
+                let mut base_bytes = Vec::with_capacity(updates);
+                // The pinned baseline keeps the old `histories` map the ported
+                // `legacy_install` wrote into on every event.
+                let mut legacy_histories = std::collections::HashMap::new();
                 for iter in 0..updates {
                     let mut after_threads = threads.clone();
                     // A background thread streams into its newest item while
@@ -8703,22 +9291,39 @@ mod tests {
                     delta_times.push(start.elapsed().as_micros());
                     delta_bytes.push(crate::test_alloc::counts().1);
 
-                    // Legacy path: materialize the wire-shaped full projection
-                    // (the old `state.clone()` + embedded transcripts) and apply
-                    // every thread record, as pre-#24 code did.
+                    // Materialized-wire path: `projection.full()` plus apply of
+                    // every thread record — the delta emission's own fallback.
                     crate::test_alloc::reset();
                     let start = Instant::now();
                     let full_wire = projection.full();
                     state.apply_projection(full_wire).unwrap();
                     full_times.push(start.elapsed().as_micros());
                     full_bytes.push(crate::test_alloc::counts().1);
+
+                    // Pinned 269a2d0 baseline: the ported `install()` rebuilds
+                    // the streamed thread's record and thread 1's paged record
+                    // from every row, `projected()` clones the workspace and
+                    // each history field, then every record is applied.
+                    crate::test_alloc::reset();
+                    let start = Instant::now();
+                    for id in [1, n as u64] {
+                        if let Some(installed) = cache.legacy_install(id) {
+                            legacy_histories.insert(id, installed);
+                        }
+                    }
+                    let wire = cache.legacy_projected(&legacy_histories);
+                    state.apply_projection(wire).unwrap();
+                    base_times.push(start.elapsed().as_micros());
+                    base_bytes.push(crate::test_alloc::counts().1);
                 }
                 delta_times.sort_unstable();
                 delta_bytes.sort_unstable();
                 full_times.sort_unstable();
                 full_bytes.sort_unstable();
+                base_times.sort_unstable();
+                base_bytes.sort_unstable();
                 println!(
-                    "{:>3} {:>6} {:>6} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12}",
+                    "{:>3} {:>6} {:>6} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12} | {:>10} {:>10} {:>12}",
                     n,
                     messages,
                     tools,
@@ -8728,6 +9333,9 @@ mod tests {
                     full_times[full_times.len() / 2],
                     full_times[full_times.len() * 95 / 100],
                     full_bytes[full_bytes.len() / 2],
+                    base_times[base_times.len() / 2],
+                    base_times[base_times.len() * 95 / 100],
+                    base_bytes[base_bytes.len() / 2],
                 );
             }
         }

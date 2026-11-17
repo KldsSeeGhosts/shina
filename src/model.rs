@@ -953,6 +953,15 @@ pub struct Thread {
     pub tools: Vec<Tool>,
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
+    /// Item lists keyed by the last applied projection's stable source ids.
+    /// The next apply reuses unchanged items positionally or by id; it never
+    /// rebuilds items that did not change.
+    pub(crate) transcript_fields:
+        std::collections::HashMap<&'static str, std::sync::Arc<crate::client_history::FieldItems>>,
+    /// Structure and content revisions of the last applied emission; the
+    /// timeline consumer (#25) diffs these instead of rescanning items.
+    pub(crate) transcript_structure: u64,
+    pub(crate) transcript_content: u64,
     pub draft: TextEdit,
     pub queued_edit: Option<QueuedEdit>,
     queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
@@ -1501,6 +1510,9 @@ impl Thread {
             tools: vec![],
             thoughts: vec![],
             work: vec![],
+            transcript_fields: std::collections::HashMap::new(),
+            transcript_structure: 0,
+            transcript_content: 0,
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             typing_guard: crate::composer::TypingGuard::default(),
