@@ -67,6 +67,11 @@ pub(super) struct Task {
     pub created_at: u64,
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
+    /// The current attempt's stable generation. It changes only when a new task
+    /// attempt is queued, never when input joins a running attempt. Cancellation
+    /// fences against this id so a delayed stop cannot land on a later attempt.
+    #[serde(default)]
+    pub attempt_id: String,
     /// Exact last submitted brief, including a stable marker, rather than a text heuristic.
     pub attempt_message: String,
     /// A follow-up must not overwrite an earlier result awaiting acceptance.
@@ -107,6 +112,8 @@ impl DelegateScope {
 
 const DELEGATE_KEY_MISMATCH: &str =
     "client_request_id was already used with a different brief or target.";
+const CONTROL_KEY_MISMATCH: &str =
+    "client_request_id was already used with different send or cancel arguments.";
 
 /// A valid retry key is a nonempty string in the shared local/remote contract.
 pub(super) fn delegate_request_key(args: &Value) -> Result<Option<&str>, String> {
@@ -144,8 +151,18 @@ pub(super) fn delegate_intent_hash(args: &Value) -> String {
 /// A stable command id keeps one retry key in the durable receipts table,
 /// distinct from the per-call JSON-RPC request id.
 fn delegate_request_command_id(key: &str) -> uuid::Uuid {
+    keyed_command_id("shina.delegate.request-key", key)
+}
+
+/// task_send and task_cancel share the caller-scoped receipt table under their
+/// own derivation, so a send key can never collide with a delegation key.
+fn task_control_command_id(key: &str) -> uuid::Uuid {
+    keyed_command_id("shina.task-control.request-key", key)
+}
+
+fn keyed_command_id(namespace: &str, key: &str) -> uuid::Uuid {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("shina.delegate.request-key:{key}"));
+    let digest = Sha256::digest(format!("{namespace}:{key}"));
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
@@ -254,7 +271,7 @@ pub(super) fn delivery_id(text: &str) -> Option<&str> {
         .strip_suffix(']')
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 256
         && id
@@ -272,6 +289,7 @@ impl Task {
         Self {
             remote: None,
             request_key: None,
+            attempt_id: format!("{id}-brief"),
             attempt_message: delivery_text(
                 &format!("{id}-brief"),
                 &format!("Shina: task from parent #{parent}\n\n{brief}"),
@@ -732,7 +750,7 @@ impl State {
         }
         let child = self.tasks[index].child_thread_id;
         self.require_active_thread_owner(child)?;
-        self.tasks[index].owe_remote_stop();
+        self.tasks[index].owe_remote_stop(None);
         if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == child) {
             if self.tasks[index].remote.is_none() {
                 thread.stop_task()?;
@@ -1005,6 +1023,130 @@ impl State {
         error
     }
 
+    /// Control intent hashes everything the caller declared except the key:
+    /// message, delivery mode, observed attempt and request fences. A changed
+    /// argument under a used key fails rather than running a second operation.
+    fn task_control_intent(args: &Value) -> Value {
+        let mut intent = args.clone();
+        if let Some(object) = intent.as_object_mut() {
+            object.remove("client_request_id");
+        }
+        intent
+    }
+
+    fn task_control_command(tool: &str, key: &str, args: &Value) -> crate::protocol::Command {
+        crate::protocol::Command {
+            command_id: task_control_command_id(key),
+            method: tool.into(),
+            params: Self::task_control_intent(args),
+        }
+    }
+
+    fn task_control_receipt_lookup(
+        &self,
+        scope: DelegateScope,
+        key: &str,
+    ) -> Result<Option<Receipt>, String> {
+        let id = task_control_command_id(key);
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            return database.delegate_tool_receipt(&scope.device(), id);
+        }
+        Ok(self.command_receipt(&scope.device(), id).cloned())
+    }
+
+    /// An identical keyed send or cancel replays its committed receipt: the
+    /// outcome the original operation recorded, plus replayed:true. The
+    /// recorded acceptance, delivery and attempt never move, so a retry can
+    /// never mistake newer state for its own operation. `exists` reports
+    /// whether the task's thread is still present and `current` carries a
+    /// fresh task_status when it is, so the caller can make a fresh decision.
+    /// The replay never queues another input, starts another attempt or stops
+    /// another attempt.
+    pub(super) fn task_control_receipt_replay(
+        &mut self,
+        caller_index: usize,
+        tool: &str,
+        key: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        let scope = self.delegate_scope(caller_index);
+        let caller = self.threads[caller_index].id;
+        let intent = Self::task_control_command(tool, key, args).hash();
+        let Some(receipt) = self.task_control_receipt_lookup(scope, key)? else {
+            return Ok(None);
+        };
+        if receipt.hash != intent {
+            return Err(CONTROL_KEY_MISMATCH.into());
+        }
+        let mut result = receipt.result;
+        result["replayed"] = json!(true);
+        let exists = args["thread_id"]
+            .as_u64()
+            .map(|id| id as usize)
+            .is_some_and(|id| self.threads.iter().any(|thread| thread.id == id));
+        result["exists"] = json!(exists);
+        result["current"] = if let Some(id) = args["thread_id"].as_u64().filter(|_| exists) {
+            self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?
+        } else {
+            Value::Null
+        };
+        Ok(Some(result))
+    }
+
+    /// The control receipt commits in the same batch as the saved input or the
+    /// owed stop, so a crash cannot lose which attempt the caller targeted.
+    pub(super) fn record_task_control_receipt(
+        &mut self,
+        caller_index: usize,
+        tool: &str,
+        key: &str,
+        args: &Value,
+        status: &Value,
+    ) -> Result<Value, String> {
+        let scope = self.delegate_scope(caller_index);
+        let command = Self::task_control_command(tool, key, args);
+        let mut result = status.clone();
+        result["requestKey"] = json!(key);
+        result["caller"] = json!(self.threads[caller_index].id);
+        result["control"] = json!({
+            "saved":true,
+            "target_attempt_id":args.get("attempt_id").unwrap_or(&status["attempt_id"]),
+            "delivery":if tool == "task_cancel" {"cancel"}
+                else if args["request_id"].is_string() {"answer"}
+                else {args["delivery"].as_str().unwrap_or("follow_up")},
+            "worker_acceptance":"not_observed",
+            "completion":"not_observed"
+        });
+        if let Some(database) = crate::database::for_path(&self.data_dir.join("index.json")) {
+            database
+                .stage_task_control_receipt(&scope.device(), &command, result.clone())
+                .map_err(|error| self.fail_delegate_receipt(error))?;
+            return Ok(result);
+        }
+        let device = scope.device();
+        let hash = command.hash();
+        if let Some(existing) = self
+            .command_receipts
+            .iter()
+            .find(|receipt| receipt.device_id == device && receipt.command_id == command.command_id)
+        {
+            return if existing.hash == hash {
+                Ok(existing.result.clone())
+            } else {
+                Err(CONTROL_KEY_MISMATCH.into())
+            };
+        }
+        self.command_receipts.push(Receipt {
+            command_id: command.command_id,
+            device_id: device,
+            hash,
+            status: ReceiptStatus::Accepted,
+            result: result.clone(),
+            seq: self.server_seq,
+        });
+        Ok(result)
+    }
+
     fn queue_task_attempt(&mut self, index: usize, message: &str) -> Result<(), String> {
         let parent = self.tasks[index].parent_thread_id;
         if self.tasks[index].state.finished() {
@@ -1033,9 +1175,11 @@ impl State {
         task.state = TaskState::Queued;
         task.delivered = false;
         task.delivery_id = format!("{}-result-{}", task.id, unique_id());
+        let attempt = format!("{}-brief-{}", task.id, unique_id());
+        task.attempt_id = attempt.clone();
         let child_thread_id = task.child_thread_id;
         task.attempt_message = delivery_text(
-            &format!("{}-brief-{}", task.id, unique_id()),
+            &attempt,
             &format!("Shina: message from parent #{parent}\n\n{message}"),
         );
         task.result_excerpt.clear();
@@ -1055,6 +1199,95 @@ impl State {
         Ok(())
     }
 
+    /// An observed control fence must be a nonempty bounded string when given.
+    /// Each operation decides which fields are mandatory.
+    fn control_fence<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, String> {
+        args.get(field)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|text| !text.is_empty() && text.len() <= 256)
+                    .ok_or_else(|| format!("{field} must be a nonempty string."))
+            })
+            .transpose()
+    }
+
+    fn control_delivery<'a>(args: &'a Value) -> Result<Option<&'a str>, String> {
+        let Some(delivery) = Self::control_fence(args, "delivery")? else {
+            return Ok(None);
+        };
+        match delivery {
+            "follow_up" | "steer" => Ok(Some(delivery)),
+            _ => Err(format!(
+                "Unknown delivery mode {delivery}. Use follow_up or steer."
+            )),
+        }
+    }
+
+    /// The task attempt a stale-observation error names for the retry.
+    fn attempt_changed_error(task: &Task, observed: &str) -> String {
+        format!(
+            "The observed attempt {observed} is no longer current; this task now runs {}. Read task_status and retry with its attempt_id.",
+            task.attempt_id
+        )
+    }
+
+    /// A declared answer must land on the request it names. When the pending
+    /// request expired or a newer one replaced it, the send fails closed rather
+    /// than answering the wrong question or becoming silent follow-up work.
+    fn check_request_fence(
+        &self,
+        task_index: usize,
+        index: usize,
+        request_id: Option<&str>,
+        generation: Option<&str>,
+    ) -> Result<(), String> {
+        let (current_id, current_generation) = if let Some(remote) = &self.tasks[task_index].remote
+        {
+            (
+                remote
+                    .request
+                    .as_ref()
+                    .filter(|_| !self.tasks[task_index].state.finished())
+                    .map(|request| request["requestId"].clone()),
+                remote
+                    .request
+                    .as_ref()
+                    .map(|request| request["generation"].clone())
+                    .unwrap_or(Value::Null),
+            )
+        } else {
+            (
+                self.threads[index]
+                    .request
+                    .as_ref()
+                    .map(|request| request["id"].clone()),
+                json!(self.threads[index].request_generation),
+            )
+        };
+        if current_id.is_none() {
+            return Err("The pending request expired before this answer arrived. Read task_status for the task's current state.".into());
+        }
+        if let Some(request_id) = request_id
+            && current_id.as_ref() != Some(&json!(request_id))
+        {
+            return Err(format!(
+                "Request or runtime generation changed. Current request_id: {}; runtime_generation: {current_generation}. Read task_status before answering.",
+                current_id.as_ref().unwrap_or(&Value::Null)
+            ));
+        }
+        if let Some(generation) = generation
+            && current_generation != json!(generation)
+        {
+            return Err(format!(
+                "Request or runtime generation changed. Current request_id: {}; runtime_generation: {current_generation}. Read task_status before answering.",
+                current_id.as_ref().unwrap_or(&Value::Null)
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn prepare_task_control(
         &mut self,
         index: usize,
@@ -1070,15 +1303,63 @@ impl State {
                 thread.id
             ));
         }
+        let attempt = Self::control_fence(args, "attempt_id")?;
+        let request_id = Self::control_fence(args, "request_id")?;
+        let generation = Self::control_fence(args, "runtime_generation")?;
+        if tool != "task_cancel" && request_id.is_some() != generation.is_some() {
+            return Err("A question answer requires both request_id and runtime_generation from task_status.".into());
+        }
         let Some(task_index) = self
             .tasks
             .iter()
             .position(|task| task.child_thread_id == thread.id)
         else {
+            if tool == "task_cancel" {
+                return Err("This child has no durable task or attempt; a keyed cancel cannot be fenced. Stop it from Shina instead.".into());
+            }
+            let delivery = Self::control_delivery(args)?;
+            if attempt.is_some() || delivery == Some("steer") {
+                return Err("This child has no durable attempt to fence. Use Shina's thread controls instead.".into());
+            }
+            match thread.request.as_ref() {
+                Some(request) => {
+                    if request_id != request["id"].as_str()
+                        || generation != Some(thread.request_generation.as_str())
+                    {
+                        return Err("Answering a pending request requires its current request_id and runtime_generation from task_status.".into());
+                    }
+                    if !matches!(
+                        request["method"].as_str(),
+                        Some("input" | "editor" | "select")
+                    ) {
+                        return Err("Confirmations require the user's device link.".into());
+                    }
+                }
+                None if request_id.is_some() => {
+                    return Err("The pending request expired before this answer arrived. Read task_status for the task's current state.".into());
+                }
+                None => {}
+            }
             return Ok(false);
         };
         if tool == "task_cancel" {
-            self.tasks[task_index].owe_remote_stop();
+            for field in ["delivery", "request_id", "runtime_generation", "message"] {
+                if args.get(field).is_some_and(|value| !value.is_null()) {
+                    return Err(format!("task_cancel does not accept {field}."));
+                }
+            }
+            // An observed attempt is mandatory: a delayed cancel must never
+            // stop work the caller did not name.
+            let observed = attempt.ok_or(
+                "task_cancel requires the attempt_id observed from task_status; read task_status and retry with its attempt_id.",
+            )?;
+            if observed != self.tasks[task_index].attempt_id {
+                return Err(Self::attempt_changed_error(
+                    &self.tasks[task_index],
+                    observed,
+                ));
+            }
+            self.tasks[task_index].owe_remote_stop(Some(observed.to_owned()));
             if self.tasks[task_index].state.finished() {
                 return Ok(true);
             }
@@ -1098,8 +1379,50 @@ impl State {
         {
             return Err("This task was interrupted by a restart. The user must resume or dismiss it in Shina after checking partial work.".into());
         }
+        // A live pending request makes every send a declared answer: it must
+        // name the request and generation it observed so a delayed answer
+        // cannot resolve a newer question or silently become follow-up work.
+        // A remote request is a snapshot of the target's live attempt; once
+        // the attempt ends a send starts fresh work and no longer answers it.
+        let request_pending = if let Some(remote) = &self.tasks[task_index].remote {
+            !self.tasks[task_index].state.finished() && remote.request.is_some()
+        } else {
+            self.threads[index].request.is_some()
+        };
+        if request_pending && (request_id.is_none() || generation.is_none()) {
+            return Err("task_status shows a pending request. Answering it requires request_id and runtime_generation from task_status.".into());
+        }
+        if request_id.is_some() || generation.is_some() {
+            self.check_request_fence(task_index, index, request_id, generation)?;
+        }
+        let delivery = Self::control_delivery(args)?;
+        if delivery == Some("steer") && attempt.is_none() {
+            return Err("Steering requires the attempt_id observed from task_status.".into());
+        }
+        if let Some(observed) = attempt
+            && observed != self.tasks[task_index].attempt_id
+        {
+            return Err(Self::attempt_changed_error(
+                &self.tasks[task_index],
+                observed,
+            ));
+        }
         // Preserve the existing input/editor/select response path. Confirmations remain user-only.
-        if self.threads[index].request.is_some() && self.tasks[task_index].remote.is_none() {
+        if let Some(request) = &self.threads[index].request
+            && self.tasks[task_index].remote.is_none()
+        {
+            // A declared steer must not silently become a question answer.
+            if delivery == Some("steer") {
+                return Err("This attempt cannot accept steering.".into());
+            }
+            // A fenced send naming a request the provider will not let Shina
+            // answer fails rather than silently becoming follow-up input.
+            if !matches!(
+                request["method"].as_str(),
+                Some("input" | "editor" | "select")
+            ) {
+                return Err("Confirmations require the user's device link.".into());
+            }
             return Ok(false);
         }
         let message = args["message"]
@@ -1118,30 +1441,63 @@ impl State {
                         .into(),
                 );
             }
+            if delivery == Some("steer")
+                && (self.tasks[task_index].state.finished()
+                    || self.tasks[task_index]
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.request.is_some()))
+            {
+                return Err("This attempt cannot accept steering.".into());
+            }
             if !self.tasks[task_index].state.finished() {
-                return self.queue_remote_send(task_index, message).map(|_| true);
+                return self
+                    .queue_remote_send(task_index, message, delivery.unwrap_or("follow_up"))
+                    .map(|_| true);
             }
             let message_with_context = self.remote_task_message(task_index, message)?;
             self.queue_task_attempt(task_index, message)?;
+            let attempt_id = self.tasks[task_index].attempt_id.clone();
             let remote = self.tasks[task_index].remote.as_mut().expect("remote task");
             remote.send_command = Some(crate::protocol::Command::new(
                 "peer.thread.send",
-                json!({"threadId":remote.thread_id,"message":message_with_context}),
+                json!({"threadId":remote.thread_id,"message":message_with_context,
+                    "delivery":"attempt","attemptId":attempt_id}),
             ));
             remote.state = RemoteState::Launching;
             remote.next_retry_at = 0;
             self.start_queued_tasks();
             return Ok(true);
         }
-        if self.tasks[task_index].state.occupies_slot() {
+        if delivery == Some("steer") {
+            let thread = &mut self.threads[index];
+            if self.tasks[task_index].state.finished()
+                || !thread.status.busy()
+                || !thread.can_steer()
+            {
+                return Err("This attempt cannot accept steering.".into());
+            }
             let text = delivery_text(
                 &format!("{}-brief-{}", self.tasks[task_index].id, unique_id()),
                 &format!("Shina: message from parent #{caller}\n\n{message}"),
             );
             self.tasks[task_index].attempt_message = text.clone();
-            self.threads[index]
-                .pending_injections
-                .push_back(Injection { text, shown: false });
+            thread.pending_injections.push_back(Injection {
+                text,
+                shown: false,
+                steer: thread.run_id.clone(),
+            });
+        } else if self.tasks[task_index].state.occupies_slot() {
+            let text = delivery_text(
+                &format!("{}-brief-{}", self.tasks[task_index].id, unique_id()),
+                &format!("Shina: message from parent #{caller}\n\n{message}"),
+            );
+            self.tasks[task_index].attempt_message = text.clone();
+            self.threads[index].pending_injections.push_back(Injection {
+                text,
+                shown: false,
+                steer: None,
+            });
         } else {
             let message = if self.tasks[task_index].state == TaskState::Queued {
                 format!(
@@ -1225,6 +1581,7 @@ impl State {
             thread.pending_injections.push_back(Injection {
                 text: self.tasks[index].attempt_message.clone(),
                 shown: false,
+                steer: None,
             });
             self.connect_thread(child);
             changed = true;
@@ -1270,6 +1627,13 @@ impl State {
         let mut children = std::collections::HashSet::new();
         let mut deliveries = std::collections::HashSet::new();
         for task in &mut tasks {
+            if task.attempt_id.is_empty() {
+                // Indexes that predate attempt fencing reuse the saved attempt
+                // marker. A busy-time correction's marker is equally unique.
+                task.attempt_id = delivery_id(&task.attempt_message)
+                    .unwrap_or(task.id.as_str())
+                    .to_owned();
+            }
             if let Some(remote) = &task.remote
                 && (uuid::Uuid::parse_str(&remote.server_id).is_err()
                     || remote.launch_command.method != "peer.thread.launch"
@@ -1281,9 +1645,19 @@ impl State {
                         .client_request_id
                         .as_ref()
                         .is_some_and(|id| id.is_empty() || id.len() > 256)
+                    || remote
+                        .stop_attempt_id
+                        .as_deref()
+                        .is_some_and(|attempt| !valid_id(attempt))
                     || remote.send_command.as_ref().is_some_and(|command| {
                         command.method != "peer.thread.send"
                             || command.params["threadId"] != json!(remote.thread_id)
+                            || command.params["delivery"].as_str().is_some_and(|delivery| {
+                                !matches!(delivery, "follow_up" | "steer" | "attempt")
+                            })
+                            || command.params["attemptId"]
+                                .as_str()
+                                .is_some_and(|attempt| !valid_id(attempt))
                     }))
             {
                 return Err("The saved index contains an invalid remote task.".into());
@@ -1301,6 +1675,7 @@ impl State {
                 || !children.insert(task.child_thread_id)
                 || !deliveries.insert(task.delivery_id.clone())
                 || !valid_id(&task.delivery_id)
+                || !valid_id(&task.attempt_id)
                 || delivery_id(&task.attempt_message).is_none_or(|id| !valid_id(id))
                 || task.result_excerpt.chars().count() > 6000
                 || task.error_excerpt.chars().count() > 2000
@@ -1442,6 +1817,13 @@ impl State {
             if !thread.completion_notified
                 && let Some(result) = thread.task_result
             {
+                if task.state == TaskState::Queued {
+                    // The settled turn's result belongs to the previous
+                    // attempt; a queued retry must not inherit it.
+                    thread.task_result = None;
+                    thread.completion_notified = true;
+                    continue;
+                }
                 // A correction may still be local, queued by the provider, or
                 // running in its next turn. The previous turn cannot finish it.
                 if thread.pi.is_some()
@@ -1536,7 +1918,11 @@ impl State {
                 {
                     self.threads[parent]
                         .pending_injections
-                        .push_back(Injection { text, shown: false });
+                        .push_back(Injection {
+                            text,
+                            shown: false,
+                            steer: None,
+                        });
                     changed = true;
                     enqueued = true;
                 }
@@ -1626,7 +2012,11 @@ impl State {
 }
 
 impl Task {
-    pub(super) fn owe_remote_stop(&mut self) {
+    /// A caller-observed attempt fences the owed stop; a home-authoritative
+    /// stop passes None and lands unconditionally. The first observed fence is
+    /// kept because the outstanding stop command must never change its params
+    /// under the same command id.
+    pub(super) fn owe_remote_stop(&mut self, attempt: Option<String>) {
         if let Some(remote) = &mut self.remote {
             if self.state == TaskState::Queued
                 && self.started_at.is_none()
@@ -1639,6 +2029,9 @@ impl Task {
             remote
                 .stop_command_id
                 .get_or_insert_with(uuid::Uuid::new_v4);
+            if remote.stop_attempt_id.is_none() {
+                remote.stop_attempt_id = attempt;
+            }
             remote.next_retry_at = 0;
         }
     }
@@ -1913,14 +2306,434 @@ mod tests {
                 .unwrap_err()
                 .contains("8 unfinished")
         );
+        let attempt = state
+            .mcp_call(1, "task_status", &json!({"thread_id":2}))
+            .unwrap()["attempt_id"]
+            .clone();
         state
-            .mcp_call(1, "task_cancel", &json!({"thread_id":2}))
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-2","attempt_id":attempt}),
+            )
             .unwrap();
         state.poll_tasks(Instant::now());
         assert_eq!(state.tasks[3].state, TaskState::Starting);
         assert_eq!(state.tasks_for(1)[4].queue_position, Some(1));
         state.tasks[7].state = TaskState::Interrupted;
         assert!(!state.tasks[7].state.finished());
+    }
+
+    #[test]
+    fn keyed_sends_replay_without_delivering_twice() {
+        let mut state = state_with_task();
+        let args = json!({"thread_id":2,"message":"More context","client_request_id":"send-1"});
+        let first = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert_eq!(first["replayed"], Value::Null);
+        let replay = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["attempt_id"], first["attempt_id"]);
+        assert_eq!(
+            state.threads[1].pending_injections.len(),
+            1,
+            "a replay never queues the same input again"
+        );
+        let changed = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"Different","client_request_id":"send-1"}),
+            )
+            .unwrap_err();
+        assert!(
+            changed.contains("different send or cancel arguments"),
+            "{changed}"
+        );
+        assert!(state.threads[1].pending_injections.len() == 1);
+        let missing = state
+            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"x"}))
+            .unwrap_err();
+        assert!(missing.contains("client_request_id"), "{missing}");
+    }
+
+    #[test]
+    fn keyed_controls_replay_after_a_restart() {
+        let directory =
+            std::env::temp_dir().join(format!("shina-control-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut state = state_with_task();
+        state.data_dir = directory.clone();
+        state.load_global_for_test();
+        // Loading a live profile fences mid-run work for user review; the
+        // fixture resumes it so the keyed send can commit its receipt.
+        state.tasks[0].state = TaskState::Running;
+        state.tasks[0].recovering = false;
+        state.threads[1].recovering_task = false;
+        let args = json!({"thread_id":2,"message":"Persist me","client_request_id":"send-boot"});
+        state.mcp_call(1, "task_send", &args).unwrap();
+        state.checkpoint_and_flush().unwrap();
+        let index = crate::store::load(&state.data_dir.join("index.json"))
+            .unwrap()
+            .unwrap();
+        let mut restored = State::new(state.data_dir.clone(), false);
+        restored.restore_global(&index).unwrap();
+        let replay = restored.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(replay["replayed"], true);
+        assert!(
+            restored.threads[1]
+                .pending_injections
+                .iter()
+                .filter(|injection| injection.text.contains("Persist me"))
+                .count()
+                <= 1,
+            "a replayed send never queues the input again"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn keyed_control_receipts_survive_a_captain_home_reset() {
+        let mut state = state_with_task();
+        // The caller is a Captain home, so its control receipts are scoped to
+        // the Captain rather than the thread that happens to host it.
+        state.captains = Captain::presets();
+        state.threads[0].captain = Some(0);
+        state.threads[0].captain_home = true;
+        state.captain_homes.insert(0, 1);
+        let send = json!({"thread_id":2,"message":"Scoped work","client_request_id":"home-send"});
+        let first = state.mcp_call(1, "task_send", &send).unwrap();
+        let attempt = first["attempt_id"].clone();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+
+        // The reset retires home 1 and opens a fresh home for the same Captain.
+        state.reset_captain_conversation(0).unwrap();
+        let home = state.captain_home(0).unwrap();
+        assert_ne!(home, 1);
+
+        // The same keyed send replays the committed receipt instead of
+        // queueing the input a second time.
+        let replay = state.mcp_call(home, "task_send", &send).unwrap();
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(replay["attempt_id"], attempt);
+        assert_eq!(
+            state.threads[1].pending_injections.len(),
+            1,
+            "a replayed send never queues the input again"
+        );
+
+        // A keyed cancel issued from the new home stops the named attempt,
+        // and its own retry replays the receipt without another stop.
+        let cancel = json!({"thread_id":2,"client_request_id":"home-cancel","attempt_id":attempt});
+        state.mcp_call(home, "task_cancel", &cancel).unwrap();
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+        let replay = state.mcp_call(home, "task_cancel", &cancel).unwrap();
+        assert_eq!(replay["replayed"], true, "{replay}");
+        assert_eq!(replay["status"], "cancelled");
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn a_stale_attempt_fence_never_cancels_newer_work() {
+        let mut state = state_with_task();
+        let status = state
+            .mcp_call(1, "task_status", &json!({"thread_id":2}))
+            .unwrap();
+        let attempt_a = status["attempt_id"].as_str().unwrap().to_owned();
+        state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-1","attempt_id":attempt_a}),
+            )
+            .unwrap();
+        let replay = state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-1","attempt_id":attempt_a}),
+            )
+            .unwrap();
+        assert_eq!(replay["replayed"], true);
+        // New work under a new key starts attempt B.
+        state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"Again","client_request_id":"send-2"}),
+            )
+            .unwrap();
+        let status = state
+            .mcp_call(1, "task_status", &json!({"thread_id":2}))
+            .unwrap();
+        let attempt_b = status["attempt_id"].as_str().unwrap().to_owned();
+        assert_ne!(attempt_a, attempt_b);
+        // The delayed cancel for attempt A must not land on attempt B.
+        let error = state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-2","attempt_id":attempt_a}),
+            )
+            .unwrap_err();
+        assert!(error.contains("attempt"), "{error}");
+        assert!(!state.tasks[0].state.finished());
+        state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-3","attempt_id":attempt_b}),
+            )
+            .unwrap();
+        assert_eq!(state.tasks[0].state, TaskState::Cancelled);
+    }
+
+    #[test]
+    fn sends_to_a_pending_request_must_name_it_and_its_generation() {
+        let mut state = state_with_task();
+        let (commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].request = Some(json!({"id":"request-1","method":"input"}));
+        state.threads[1].request_generation = "generation-1".into();
+        // An unfenced send cannot resolve a request the caller never observed.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"answer","client_request_id":"a-1"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("pending request"), "{error}");
+        // Naming a request or generation the state does not show fails closed,
+        // so a delayed answer cannot resolve a newer question.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"answer","client_request_id":"a-2",
+                    "request_id":"request-0","runtime_generation":"generation-1"}),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("Request or runtime generation changed"),
+            "{error}"
+        );
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"answer","client_request_id":"a-3",
+                    "request_id":"request-1","runtime_generation":"generation-0"}),
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("Request or runtime generation changed"),
+            "{error}"
+        );
+        assert!(state.threads[1].request.is_some());
+        // The observed identity answers the request once.
+        state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"the answer","client_request_id":"a-4",
+                    "request_id":"request-1","runtime_generation":"generation-1"}),
+            )
+            .unwrap();
+        assert!(state.threads[1].request.is_none());
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "extension_ui_response"
+        );
+        // A delayed retry of the same answer now fences against the expired
+        // request instead of becoming silent follow-up input.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"the answer","client_request_id":"a-5",
+                    "request_id":"request-1","runtime_generation":"generation-1"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("expired"), "{error}");
+    }
+
+    #[test]
+    fn legacy_children_cannot_answer_questions_without_both_observed_fences() {
+        let mut state = state_with_task();
+        state.tasks.clear();
+        let (commands, _events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].request = Some(json!({"id":"new-question","method":"input"}));
+        state.threads[1].request_generation = "new-generation".into();
+        for (key, fields) in [
+            ("missing", json!({})),
+            ("partial", json!({"request_id":"new-question"})),
+            (
+                "old",
+                json!({"request_id":"old-question","runtime_generation":"new-generation"}),
+            ),
+        ] {
+            let mut args = json!({"thread_id":2,"message":"answer","client_request_id":key});
+            args.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(state.mcp_call(1, "task_send", &args).is_err());
+            assert!(state.threads[1].request.is_some());
+            assert!(commands.try_recv().is_err());
+        }
+        let args = json!({"thread_id":2,"message":"answer","client_request_id":"valid",
+            "request_id":"new-question","runtime_generation":"new-generation"});
+        let response = state.mcp_call(1, "task_send", &args).unwrap();
+        assert_eq!(response["control"]["saved"], true);
+        assert_eq!(response["control"]["delivery"], "answer");
+        assert_eq!(response["control"]["worker_acceptance"], "not_observed");
+        assert_eq!(
+            commands.try_recv().unwrap()["type"],
+            "extension_ui_response"
+        );
+        assert_eq!(
+            state.mcp_call(1, "task_send", &args).unwrap()["control"],
+            response["control"]
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn keyed_task_controls_require_a_batch_before_mutating_and_commit_atomically() {
+        for tool in ["task_send", "task_cancel"] {
+            let directory =
+                std::env::temp_dir().join(format!("shina-control-{}", uuid::Uuid::new_v4()));
+            let mut runtime =
+                crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+            runtime.state.demo = true;
+            runtime.state.runtime_enabled = false;
+            let database = runtime.database.clone().unwrap();
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            runtime
+                .state
+                .mcp_call(1, "delegate_task", &delegate_args("allocate"))
+                .unwrap();
+            runtime.persist_for_test(capture.finish()).unwrap();
+            let child = runtime.state.tasks[0].child_thread_id;
+            let attempt = runtime.state.tasks[0].attempt_id.clone();
+            let mut args = json!({"thread_id":child,"client_request_id":"control"});
+            if tool == "task_cancel" {
+                args["attempt_id"] = json!(attempt);
+            } else {
+                args["message"] = json!("one accepted input");
+            }
+            let before = database.read("index.json").unwrap().unwrap();
+            let state_before = runtime.state.snapshot();
+            assert!(runtime.state.mcp_call(1, tool, &args).is_err());
+            assert_eq!(
+                runtime.state.snapshot(),
+                state_before,
+                "an unfenced batch mutated state"
+            );
+            database.test_connection(|connection| connection.execute_batch(
+                "CREATE TRIGGER fail_control_receipt BEFORE INSERT ON command_receipts
+                 WHEN NEW.device LIKE 'mcp/delegate/%' BEGIN SELECT RAISE(ABORT,'injected control receipt failure'); END;"
+            )).unwrap();
+            database.begin().unwrap();
+            let capture = crate::outbox::Capture::begin();
+            let (reply, received) = mpsc::channel();
+            runtime.state.mcp_request(crate::mcp::Request {
+                thread: 1,
+                tool: tool.into(),
+                args,
+                reply,
+            });
+            let persisted = runtime.persist_for_test(capture.finish());
+            assert!(
+                persisted.is_err(),
+                "{tool}: {persisted:?}; reply {:?}",
+                received.try_recv()
+            );
+            assert!(
+                received.try_recv().is_err(),
+                "a reply escaped a failed commit"
+            );
+            database.test_connection(|connection| {
+                assert_eq!(
+                    crate::projection_store::read(connection, "index.json")
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn task_cancel_refuses_to_guess_the_observed_attempt() {
+        let mut state = state_with_task();
+        let error = state
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-no-fence"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("attempt_id"), "{error}");
+        assert!(!state.tasks[0].state.finished());
+        assert!(state.threads[1].task_result.is_none());
+        for field in ["message", "delivery", "request_id", "runtime_generation"] {
+            let error = state
+                .mcp_call(
+                    1,
+                    "task_cancel",
+                    &json!({"thread_id":2,"client_request_id":format!("cancel-{field}"),
+                        "attempt_id":"a",field:"x"}),
+                )
+                .unwrap_err();
+            assert!(error.contains("does not accept"), "{error}");
+        }
+    }
+
+    #[test]
+    fn delivery_modes_and_request_fences_are_explicit() {
+        let mut state = state_with_task();
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"x","client_request_id":"d-1","delivery":"teleport"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("Unknown delivery mode"), "{error}");
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"x","client_request_id":"d-2","delivery":"steer"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("attempt_id"), "{error}");
+        // Steering a harness that cannot steer reports instead of queueing.
+        state.threads[1].harness = "none".into();
+        let status = state
+            .mcp_call(1, "task_status", &json!({"thread_id":2}))
+            .unwrap();
+        let attempt = status["attempt_id"].as_str().unwrap().to_owned();
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"x","client_request_id":"d-3",
+                    "delivery":"steer","attempt_id":attempt}),
+            )
+            .unwrap_err();
+        assert!(error.contains("cannot accept steering"), "{error}");
+        // A request fence against no pending request fails closed.
+        let error = state
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"x","client_request_id":"d-4",
+                    "request_id":"gone","runtime_generation":"gone"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("expired"), "{error}");
     }
 
     #[test]
@@ -2217,6 +3030,7 @@ mod tests {
         state.threads[0].pending_injections.push_back(Injection {
             text: state.tasks[0].completion_message(),
             shown: false,
+            steer: None,
         });
         state.threads[0].injection_id = Some("ack-1".into());
         state.threads[0]

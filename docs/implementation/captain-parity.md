@@ -182,7 +182,24 @@ with 12 optional tests ignored. Root review inspected the actual 620 and 1280
 pixel picker renders. The initial PR #47 head passed CI; the updated UI head
 must pass again before merge.
 
-Issue #22's mandatory cancellation and question-answer fences remain separate.
+PR #47 merged at `63c820ba7d6e847a34eeb221a7a7a6c07f593d2e` after the final
+UI head passed CI. Its main release runs separately.
+
+Issue #22's mandatory cancellation and question-answer fences are in PR #48.
+Root review adds receipt-transaction preflight, atomic send/cancel failure
+tests, mandatory question fences for legacy children, and refusal of fenced
+controls when a legacy peer worker has no recorded attempt. The saved receipt
+explicitly distinguishes saved intent from provider acceptance and completed
+work. Protocol minor 39 adds task fences while retaining placement at minor 38
+and peer document reads at minor 37.
+
+Integration with #20 retains pending-placement follow-up ordering and retry
+reservations. A new attempt after cancellation cannot requeue the cancelled
+brief while its checkout is still pending; the placement regression now tests
+that transition through setup and provider startup. The combined branch passes
+1,978 unit tests and 105 server-runtime tests, with 12 optional tests ignored.
+Build, formatting and diff checks pass. PR #48 still requires fresh exact-head
+CI after this merge. Do not merge it while #47's main release is still running.
 
 Any frontend implementation or design decisions are assigned to Claude Opus
 5.5 medium. KSG Code remains the layout and interaction reference, with Shina's

@@ -218,6 +218,11 @@ mod runtime_poll;
 struct Injection {
     text: String,
     shown: bool,
+    /// Set for steering input: the run the caller observed. The flush uses Pi's
+    /// steer behavior only while this is still the live run; a newer run means
+    /// the steering input goes to the follow-up queue instead of interrupting
+    /// work the caller never saw.
+    steer: Option<String>,
 }
 
 struct TaskWaiter {
@@ -2673,6 +2678,7 @@ impl Thread {
                 self.id, self.serial
             ),
             shown: false,
+            steer: None,
         });
     }
 
@@ -2710,14 +2716,23 @@ impl Thread {
             return false;
         }
         let text = self.pending_injections[0].text.clone();
+        // A steer injection pins the run it was declared against. If that run
+        // already ended, the message becomes ordinary follow-up input so it
+        // queues behind the newer work rather than vanishing.
+        let steer = self.pending_injections[0]
+            .steer
+            .as_ref()
+            .filter(|run| self.status.busy() && Some(*run) == self.run_id.as_ref())
+            .is_some();
         if !self.status.busy() || self.run_id.is_none() {
             self.run_id = Some(uuid::Uuid::new_v4().to_string());
             self.prompt_suggestion = None;
         }
         // prompt starts an idle Pi; followUp also covers a run starting before Pi reads it.
+        let behavior = if steer { "steer" } else { "followUp" };
         if !self.command(
             "prompt",
-            json!({"message":text,"streamingBehavior":"followUp"}),
+            json!({"message":text,"streamingBehavior":behavior}),
         ) {
             return false;
         }
@@ -8588,6 +8603,27 @@ impl State {
                     "captain": captain_name(self, thread.captain),
                     "status": task.map(|task| task.state.id()).unwrap_or(status),
                     "task_id": task.map(|task| &task.id),
+                    // Stable task identity, the attempt a keyed control call
+                    // fences against, and the live run/runtime generation a
+                    // steering send or question answer names.
+                    "attempt_id": task.map(|task| task.attempt_id.as_str()),
+                    "run_id": thread.run_id.as_deref(),
+                    "runtime_generation": thread.request_generation,
+                    // One request shape for local and remote children; the
+                    // answer fence reads requestId and generation from here.
+                    "request": task
+                        .and_then(|task| task.remote.as_ref())
+                        .and_then(|remote| remote.request.as_ref())
+                        .map(|request| json!({
+                            "requestId": request["requestId"],
+                            "generation": request["generation"],
+                            "kind": request["kind"],
+                        }))
+                        .or_else(|| thread.request.as_ref().map(|request| json!({
+                            "requestId": request["id"],
+                            "generation": thread.request_generation,
+                            "kind": request["method"],
+                        }))),
                     "queue_position": task.and_then(|task| self.task_queue_position(task)),
                     "selection": selection_value(thread),
                     "placement": task.and_then(|task|task.remote.as_ref()).and_then(|remote|remote.placement.clone())
@@ -8599,12 +8635,30 @@ impl State {
                 }))
             }
             "task_cancel" | "task_send" => {
+                let request_key = args["client_request_id"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty() && key.len() <= 256)
+                    .ok_or("task_send and task_cancel require client_request_id: a nonempty caller-chosen string of at most 256 characters. Reuse it verbatim to retry; never reuse it for different arguments.")?;
+                if let Some(replayed) =
+                    self.task_control_receipt_replay(caller_index, tool, request_key, args)?
+                {
+                    return Ok(replayed);
+                }
+                self.delegate_receipt_ready()?;
                 let index = find(self)?;
                 if self.prepare_task_control(index, caller, tool, args)? {
-                    return self.mcp_call(
+                    let status = self.mcp_call(
                         caller,
                         "task_status",
                         &json!({"thread_id":self.threads[index].id}),
+                    )?;
+                    return self.record_task_control_receipt(
+                        caller_index,
+                        tool,
+                        request_key,
+                        args,
+                        &status,
                     );
                 }
                 if !self.owns_child(caller, index) {
@@ -8641,10 +8695,17 @@ impl State {
                                 .clone()
                                 .unwrap_or_else(|| "Could not answer the crew question.".into()));
                         }
-                        return self.mcp_call(
+                        let status = self.mcp_call(
                             caller,
                             "task_status",
                             &json!({"thread_id":self.threads[index].id}),
+                        )?;
+                        return self.record_task_control_receipt(
+                            caller_index,
+                            tool,
+                            request_key,
+                            args,
+                            &status,
                         );
                     }
                     if !thread.status.busy() {
@@ -8661,11 +8722,12 @@ impl State {
                         self.connect_thread(index);
                     }
                 }
-                self.mcp_call(
+                let status = self.mcp_call(
                     caller,
                     "task_status",
                     &json!({"thread_id":self.threads[index].id}),
-                )
+                )?;
+                self.record_task_control_receipt(caller_index, tool, request_key, args, &status)
             }
             "captain_read"
             | "captain_document_read"
@@ -16453,13 +16515,24 @@ mod tests {
                 .contains("crew #2 asks")
         );
         assert!(!state.row_pending(&state.threads[0]));
+        let generation = state.threads[index].request_generation.clone();
         assert!(
             state
-                .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"invalid"}))
+                .mcp_call(
+                    1,
+                    "task_send",
+                    &json!({"thread_id":2,"message":"invalid","client_request_id":"select-invalid",
+                        "request_id":"question","runtime_generation":generation})
+                )
                 .is_err()
         );
         state
-            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"b.rs"}))
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"b.rs","client_request_id":"select-b",
+                    "request_id":"question","runtime_generation":generation}),
+            )
             .unwrap();
         let response = child_commands.try_recv().unwrap();
         assert_eq!(response["type"], "extension_ui_response");
@@ -16467,8 +16540,13 @@ mod tests {
         assert!(state.threads[index].request.is_none());
         state.threads[index].apply(json!({"type":"extension_ui_request","id":"approval","method":"confirm","title":"Run tool?"}));
         state
-            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"yes"}))
-            .unwrap();
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"yes","client_request_id":"confirm-yes",
+                    "request_id":"approval","runtime_generation":generation}),
+            )
+            .unwrap_err();
         assert!(
             state.threads[index].request.is_some(),
             "a coordinator cannot approve for the user"
@@ -18552,20 +18630,28 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, events) = child(&mut state);
+        let mut task = Task::new(&state.threads[index], "A bounded task", None);
+        task.state = TaskState::Running;
+        let attempt = task.attempt_id.clone();
+        state.tasks.push(task);
         let mut stranger = Thread::new(3);
         stranger.status = Status::Ready;
         state.threads.push(stranger);
         for caller in [2, 3] {
             for tool in ["task_cancel", "task_send"] {
                 let error = state
-                    .mcp_call(caller, tool, &json!({"thread_id":2,"message":"Correction"}))
+                    .mcp_call(caller, tool, &json!({"thread_id":2,"message":"Correction","client_request_id":"stranger"}))
                     .unwrap_err();
                 assert!(error.contains("Only the parent"));
             }
         }
         assert!(
             state
-                .mcp_call(1, "task_cancel", &json!({"thread_id":3}))
+                .mcp_call(
+                    1,
+                    "task_cancel",
+                    &json!({"thread_id":3,"client_request_id":"cancel-stranger","attempt_id":attempt})
+                )
                 .is_err()
         );
         assert!(commands.try_recv().is_err());
@@ -18573,7 +18659,7 @@ mod tests {
             .mcp_call(
                 1,
                 "task_send",
-                &json!({"thread_id":2,"message":"Correction"}),
+                &json!({"thread_id":2,"message":"Correction","client_request_id":"send-correction"}),
             )
             .unwrap();
         state.poll_tasks(Instant::now());
@@ -18590,7 +18676,11 @@ mod tests {
             reply,
         });
         state
-            .mcp_call(1, "task_cancel", &json!({"thread_id":2}))
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-1","attempt_id":attempt}),
+            )
             .unwrap();
         assert_eq!(commands.try_recv().unwrap()["type"], "clear_queue");
         assert_eq!(commands.try_recv().unwrap()["type"], "abort");
@@ -18611,7 +18701,11 @@ mod tests {
                 .contains("cannot delegate")
         );
         state
-            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"Retry"}))
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"Retry","client_request_id":"send-retry"}),
+            )
             .unwrap();
         state.poll_tasks(Instant::now());
         assert_eq!(state.threads[index].status, Status::Running);
@@ -18682,6 +18776,38 @@ mod tests {
     }
 
     #[test]
+    fn a_steer_pinned_to_a_dead_run_sends_follow_up_instead_of_steering() {
+        let mut thread = Thread::new(1);
+        let (commands, _events) = fake_pi(&mut thread, Status::Running);
+        thread.run_id = Some("run-b".into());
+        thread.pending_injections.push_back(Injection {
+            text: "Shina: input for the ended run".into(),
+            shown: false,
+            steer: Some("run-a".into()),
+        });
+        assert!(thread.flush_injection());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        // The pinned run ended; the input queues behind the live run instead
+        // of interrupting work the caller never observed.
+        assert_eq!(prompt["streamingBehavior"], "followUp");
+        assert_eq!(thread.run_id.as_deref(), Some("run-b"));
+        acknowledge(&mut thread, &prompt);
+        // A pin that still matches the live run steers it on the wire.
+        thread.pending_injections.push_back(Injection {
+            text: "Shina: steer the live run".into(),
+            shown: false,
+            steer: Some("run-b".into()),
+        });
+        assert!(thread.flush_injection());
+        let prompt = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .expect("the live-run steer prompt");
+        assert_eq!(prompt["streamingBehavior"], "steer");
+    }
+
+    #[test]
     fn a_wait_deadline_wakes_an_otherwise_idle_ui() {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
@@ -18711,10 +18837,18 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, _events) = child(&mut state);
+        let mut task = Task::new(&state.threads[index], "A bounded task", None);
+        task.state = TaskState::Running;
+        let attempt = task.attempt_id.clone();
+        state.tasks.push(task);
         state.threads[index].initializing = true;
         state.threads[index].enqueue_injection("Shina: task brief".into());
         let result = state
-            .mcp_call(1, "task_cancel", &json!({"thread_id":2}))
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-early","attempt_id":attempt}),
+            )
             .unwrap();
         assert_eq!(result["status"], "cancelled");
         assert_eq!(result["finished"], true);
@@ -18728,13 +18862,25 @@ mod tests {
         let mut state = State::new(".".into(), false);
         let (_commands, _events) = fake_pi(&mut state.threads[0], Status::Running);
         let (index, commands, _events) = child(&mut state);
+        let mut task = Task::new(&state.threads[index], "A bounded task", None);
+        task.state = TaskState::Running;
+        let attempt = task.attempt_id.clone();
+        state.tasks.push(task);
         state
-            .mcp_call(1, "task_cancel", &json!({"thread_id":2}))
+            .mcp_call(
+                1,
+                "task_cancel",
+                &json!({"thread_id":2,"client_request_id":"cancel-stop","attempt_id":attempt}),
+            )
             .unwrap();
         assert_eq!(commands.try_recv().unwrap()["type"], "clear_queue");
         assert_eq!(commands.try_recv().unwrap()["type"], "abort");
         state
-            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"New work"}))
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"New work","client_request_id":"send-new"}),
+            )
             .unwrap();
         state.poll_tasks(Instant::now());
         assert!(
@@ -18767,7 +18913,11 @@ mod tests {
         state.threads[index].apply(json!({"type":"agent_settled","aborted":false}));
         state.poll_tasks(Instant::now());
         let result = state
-            .mcp_call(1, "task_send", &json!({"thread_id":2,"message":"Retry"}))
+            .mcp_call(
+                1,
+                "task_send",
+                &json!({"thread_id":2,"message":"Retry","client_request_id":"send-failed"}),
+            )
             .unwrap();
         assert_eq!(result["status"], "queued");
         assert_eq!(result["finished"], false);

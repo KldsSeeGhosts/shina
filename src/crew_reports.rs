@@ -277,7 +277,11 @@ impl State {
             }
             self.threads[position]
                 .pending_injections
-                .push_back(Injection { text, shown: false });
+                .push_back(Injection {
+                    text,
+                    shown: false,
+                    steer: None,
+                });
             changed = true;
             if self.threads[position].pi.is_none()
                 && self.threads[position].status != Status::Failed
@@ -1026,6 +1030,7 @@ mod tests {
         state.threads[old].pending_injections.push_back(Injection {
             text: stale,
             shown: false,
+            steer: None,
         });
         assert!(state.scrub_crew_report_injections());
         assert!(report_injections(&state, old, &report_id).is_empty());

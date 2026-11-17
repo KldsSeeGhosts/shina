@@ -1310,6 +1310,7 @@ mod tests {
                 result: None,
                 acknowledged: false,
                 attempt_message: String::new(),
+                attempt_id: None,
                 cancelled_commands: vec![],
                 reply_after_position: 0,
                 document_reads: false,

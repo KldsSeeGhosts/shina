@@ -872,9 +872,11 @@ impl State {
                 && !origin.attempt_message.is_empty()
             {
                 let text = origin.attempt_message.clone();
-                self.threads[index]
-                    .pending_injections
-                    .push_back(Injection { text, shown: false });
+                self.threads[index].pending_injections.push_back(Injection {
+                    text,
+                    shown: false,
+                    steer: None,
+                });
             }
             self.connect_thread(index);
             return;

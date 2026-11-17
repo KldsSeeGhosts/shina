@@ -2480,6 +2480,24 @@ async fn remote_request_outcome(
                 protocol::CAPTAIN_PEER_DOCUMENTS
             )));
         }
+        // Fenced task control fields only exist on the wire when the target
+        // negotiated them. A peer without the contract gets a loud refusal,
+        // never silently unfenced semantics.
+        if peer
+            && matches!(
+                command.method.as_str(),
+                "peer.thread.stop" | "peer.thread.send"
+            )
+            && (!command.params["attemptId"].is_null()
+                || command.params["delivery"]
+                    .as_str()
+                    .is_some_and(|delivery| delivery != "follow_up"))
+            && !hello["capabilities"]
+                .as_array()
+                .is_some_and(|caps| caps.iter().any(|cap| cap == protocol::PEER_TASK_FENCES))
+        {
+            return Err(protocol::PEER_TASK_FENCES_UPDATE_REQUIRED.into());
+        }
         if command.method == "filesystem.browse" && !supports_browse(&hello) {
             return Err(
                 "This server needs an update to browse folders. Type a path instead.".into(),

@@ -507,7 +507,7 @@ fn retry_after_provisioning_failure_reuses_the_same_reservation() {
         .mcp_call(
             1,
             "task_send",
-            &json!({"thread_id": child_id, "message": "continue"}),
+            &json!({"thread_id": child_id, "message": "continue", "client_request_id":"retry-placement"}),
         )
         .unwrap();
     poll_until_ready(&mut state, 15);
@@ -783,6 +783,35 @@ fn a_late_peer_placement_result_cannot_revive_a_cancelled_worker() {
     assert!(target.threads[1].pending_injections.is_empty());
     assert!(target.threads[1].pi.is_none());
     assert!(connects.lock().unwrap().is_empty());
+    target
+        .execute_peer_command(
+            "parent-device",
+            &Command::new(
+                "peer.thread.send",
+                json!({
+                    "threadId":child_id, "message":"Only the new attempt",
+                    "delivery":"attempt", "attemptId":"new-attempt"
+                }),
+            ),
+        )
+        .unwrap();
+    poll_until_ready(&mut target, 20);
+    assert_eq!(
+        child_placement(&target, 1).phase,
+        placement::PlacementPhase::Ready
+    );
+    assert_eq!(target.threads[1].pending_injections.len(), 1);
+    assert!(
+        target.threads[1].pending_injections[0]
+            .text
+            .contains("Only the new attempt")
+    );
+    assert!(
+        !target.threads[1].pending_injections[0]
+            .text
+            .contains("Do not revive this work")
+    );
+    assert_eq!(connects.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -911,6 +940,7 @@ fn peer_origin() -> remote_tasks::PeerOrigin {
         server_label: "Home".into(),
         parent_thread_id: 1,
         task_id: "parent-task-1".into(),
+        attempt_id: None,
         captain: "Captain".into(),
         memories: Vec::new(),
         result: None,

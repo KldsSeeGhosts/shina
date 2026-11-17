@@ -2509,7 +2509,7 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
     );
     let followup = client.command(
         "task.send",
-        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-long-fixture-again"}}),
+        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-long-fixture-again","client_request_id":"followup-again"}}),
         uuid::Uuid::new_v4(),
     );
     assert_eq!(followup["result"]["status"], "accepted", "{followup}");
@@ -2535,7 +2535,7 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
     );
     let confirmation = client.command(
         "task.send",
-        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-confirm-fixture"}}),
+        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-confirm-fixture","client_request_id":"confirm-turn"}}),
         uuid::Uuid::new_v4(),
     );
     assert_eq!(
@@ -2586,14 +2586,15 @@ fn peer_cli_delegation_recovers_home_and_delivers_one_acknowledged_remote_result
     {
         let followup = client.command(
             "task.send",
-            json!({"threadId":parent,"args":{"thread_id":child,"message":"A second remote turn"}}),
+            json!({"threadId":parent,"args":{"thread_id":child,"message":"A second remote turn","client_request_id":"second-turn"}}),
             uuid::Uuid::new_v4(),
         );
         assert_eq!(followup["result"]["status"], "accepted", "{followup}");
+        let attempt = followup["result"]["result"]["attempt_id"].clone();
         let pause = PausedProcess::new(target.children.last().unwrap());
         let cancelled = client.command(
             "task.cancel",
-            json!({"threadId":parent,"args":{"thread_id":child}}),
+            json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"stop-second-turn","attempt_id":attempt}}),
             uuid::Uuid::new_v4(),
         );
         assert_eq!(cancelled["result"]["status"], "accepted", "{cancelled}");
@@ -3322,6 +3323,470 @@ fn two_serve_processes_converge_and_mcp_delivers_without_a_client() {
                 .is_some_and(|text| text.contains("finished\nTask id:")))
     );
     profile.stop();
+}
+
+#[test]
+fn keyed_task_controls_replay_on_the_wire_and_survive_restart() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    client.until(|state| {
+        state["threads"][0]["models"]
+            .as_array()
+            .is_some_and(|models| !models.is_empty())
+    });
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"delegate-fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .is_some_and(|tasks| !tasks.is_empty())
+    });
+    let child = client.snapshot["index"]["tasks"][0]["child_thread_id"]
+        .as_u64()
+        .unwrap();
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    let task_id = client.snapshot["index"]["tasks"][0]["id"].clone();
+    let first_attempt = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
+    assert!(first_attempt.is_string(), "attempt identity is durable");
+
+    // The compatibility policy is loud: unkeyed control is refused.
+    let unkeyed = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"no key"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        unkeyed.to_string().contains("client_request_id"),
+        "{unkeyed}"
+    );
+
+    // A keyed send to the completed child starts a fresh attempt on the same task.
+    let send = json!({"thread_id":child,"message":"wire-check","client_request_id":"send-wire-1"});
+    let first = client.command(
+        "task.send",
+        json!({"threadId":1,"args":send.clone()}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(first["result"]["status"], "accepted", "{first}");
+    assert_eq!(first["result"]["result"]["task_id"], task_id);
+    assert_ne!(first["result"]["result"]["attempt_id"], first_attempt);
+    let attempt_b = first["result"]["result"]["attempt_id"].clone();
+
+    // An identical retry replays the committed receipt without another delivery.
+    let replay = client.command(
+        "task.send",
+        json!({"threadId":1,"args":send}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    assert_eq!(replay["result"]["result"]["attempt_id"], attempt_b);
+
+    // A used key with different arguments fails rather than running twice.
+    let conflict = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"changed","client_request_id":"send-wire-1"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        conflict
+            .to_string()
+            .contains("different send or cancel arguments"),
+        "{conflict}"
+    );
+
+    // The single accepted input reaches the child harness exactly once.
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    let child_prompts = profile
+        .root
+        .join(format!("Shina/chats/{child}/fixture-prompts.jsonl"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let count = fs::read_to_string(&child_prompts)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("wire-check"))
+            .count();
+        if count == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child prompt log at {child_prompts:?}: {count} deliveries"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The receipt is durable across a server restart: replay, never resend.
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let replay = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"wire-check","client_request_id":"send-wire-1"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    let delivered = fs::read_to_string(&child_prompts).unwrap();
+    assert_eq!(
+        delivered
+            .lines()
+            .filter(|line| line.contains("wire-check"))
+            .count(),
+        1
+    );
+
+    // A second keyed send starts attempt C; the fixture raises a confirmation
+    // and holds the run open, so the next cancel lands on live work.
+    let send = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"remote-confirm-fixture","client_request_id":"send-wire-2"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(send["result"]["status"], "accepted", "{send}");
+    let attempt_c = send["result"]["result"]["attempt_id"].clone();
+    assert_ne!(attempt_c, attempt_b);
+    client.until(|state| state["index"]["tasks"][0]["state"] == "running");
+
+    // A delayed cancel fenced to the older attempt is refused; attempt C's
+    // live work is untouched.
+    let stale = client.command(
+        "task.cancel",
+        json!({"threadId":1,"args":{"thread_id":child,"client_request_id":"cancel-stale","attempt_id":attempt_b}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(stale.to_string().contains("attempt"), "{stale}");
+    assert_eq!(client.snapshot["index"]["tasks"][0]["state"], "running");
+
+    let cancel = client.command(
+        "task.cancel",
+        json!({"threadId":1,"args":{"thread_id":child,"client_request_id":"cancel-wire-1","attempt_id":attempt_c}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(cancel["result"]["status"], "accepted", "{cancel}");
+    let replay = client.command(
+        "task.cancel",
+        json!({"threadId":1,"args":{"thread_id":child,"client_request_id":"cancel-wire-1","attempt_id":attempt_c}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "cancelled");
+    profile.stop();
+}
+
+/// A declared steer reaches the child harness as streamingBehavior:"steer"
+/// over the live MCP wire, while an ordinary send goes as followUp. Steering
+/// without an observed attempt, or against a finished attempt, is refused.
+#[test]
+fn steered_task_send_reaches_the_child_harness_as_steer_on_the_wire() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let workspace = profile.root.join("Shina/chats/1");
+    assert_eq!(
+        client.command(
+            "thread.send",
+            json!({"threadId":1,"text":"Initialize the coordinator fixture","attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    client.until(|state| state["threads"][0]["status"] == "Completed");
+
+    // The hold marker keeps the child's turn active with no pending request,
+    // so a declared steer has a live run to pin.
+    let delegated = call_fixture_tool(
+        &workspace,
+        "delegate_task",
+        json!({"prompt":"peer-documents-hold-fixture","title":"Steerable child",
+            "client_request_id":"steer-delegate"}),
+    );
+    assert_ne!(delegated["result"]["isError"], true, "{delegated}");
+    let child =
+        serde_json::from_str::<Value>(delegated["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()["thread_id"]
+            .as_u64()
+            .unwrap();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .is_some_and(|tasks| !tasks.is_empty() && tasks[0]["state"] == "running")
+    });
+    let attempt = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
+    let child_directory = profile
+        .root
+        .join(format!("Shina/chats/{child}/fixture-behavior.jsonl"));
+
+    // Steering without the observed attempt is refused before any dispatch.
+    let unfenced = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"steer-this-turn","client_request_id":"steer-0","delivery":"steer"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(unfenced.to_string().contains("attempt_id"), "{unfenced}");
+
+    // The fenced steer interrupts the live run on the wire.
+    let steered = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"steer-this-turn","client_request_id":"steer-1","delivery":"steer","attempt_id":attempt}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(steered["result"]["status"], "accepted", "{steered}");
+
+    // An ordinary keyed send stays follow-up input while the run is live.
+    let follow_up = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"queue-behind","client_request_id":"send-1"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(follow_up["result"]["status"], "accepted", "{follow_up}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let records = loop {
+        if let Ok(text) = fs::read_to_string(&child_directory) {
+            let records: Vec<Value> = text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if records.iter().any(|record| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("steer-this-turn"))
+            }) && records.iter().any(|record| {
+                record["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("queue-behind"))
+            }) {
+                break records;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child wire log at {child_directory:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let steered_prompt = records
+        .iter()
+        .find(|record| {
+            record["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("steer-this-turn"))
+        })
+        .unwrap();
+    assert_eq!(steered_prompt["streamingBehavior"], "steer");
+    let queued_prompt = records
+        .iter()
+        .find(|record| {
+            record["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("queue-behind"))
+        })
+        .unwrap();
+    assert_eq!(queued_prompt["streamingBehavior"], "followUp");
+
+    // Once the attempt finishes, steering is refused outright instead of
+    // silently queueing as input the caller never marked as follow-up.
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    let finished = client.command(
+        "task.send",
+        json!({"threadId":1,"args":{"thread_id":child,"message":"steer-after-end","client_request_id":"steer-2","delivery":"steer","attempt_id":attempt}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        finished.to_string().contains("cannot accept steering"),
+        "{finished}"
+    );
+    profile.stop();
+}
+
+/// Remote control carries the observed attempt through peer transport. A
+/// delayed cancel naming an attempt the target already left is refused before
+/// dispatch; a matching fence stops the remote worker.
+#[test]
+fn remote_task_cancel_fences_the_observed_attempt_over_peer_transport() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    home.launch(&["serve"]);
+    target.launch(&["serve"]);
+    let target_discovery = target.discovery();
+    let mut target_client = target.client(uuid::Uuid::new_v4());
+    let workspace = target.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let home_workspace = home.root.join("workspace");
+    for path in [&workspace, &home_workspace] {
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.com/peer-fixture.git"
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(
+        target_client.command(
+            "project.put",
+            json!({"path":workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let code = target.cli(&["pair", "--peer"]);
+    assert!(
+        code.status.success(),
+        "{}",
+        String::from_utf8_lossy(&code.stderr)
+    );
+    let code = String::from_utf8(code.stdout)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Pairing code: ")
+        .unwrap()
+        .to_owned();
+    let host = format!("127.0.0.1:{}", target_discovery["port"]);
+    let linked = home.cli(&["peer", "link", &host, &code]);
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let mut client = home.client(uuid::Uuid::new_v4());
+    assert_eq!(
+        client.command(
+            "project.put",
+            json!({"path":home_workspace}),
+            uuid::Uuid::new_v4()
+        )["result"]["status"],
+        "accepted"
+    );
+    let parent = client.command(
+        "thread.create",
+        json!({"project":1}),
+        uuid::Uuid::new_v4()
+    )["result"]["result"]["threadId"]
+        .clone();
+    // The fixture child raises a confirmation and holds it open, keeping
+    // attempt A alive while control commands travel.
+    let args = json!({"prompt":"remote-confirm-fixture","client_request_id":"launch-1",
+        "target":{"machine":target_discovery["serverId"],"model":"fixture"}});
+    let mut delegated = Value::Null;
+    for _ in 0..100 {
+        delegated = client.command(
+            "task.delegate",
+            json!({"threadId":parent,"args":args}),
+            uuid::Uuid::new_v4(),
+        );
+        let waiting = delegated["result"]["result"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("does not advertise this model"));
+        if !waiting {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(delegated["result"]["status"], "accepted", "{delegated}");
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["remote"]["threadId"].is_number())
+    });
+    client.until(|state| state["index"]["tasks"][0]["remote"]["request"].is_object());
+    let attempt_a = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
+    assert!(attempt_a.is_string());
+
+    // A cancel fenced to the observed attempt travels over peer transport and
+    // stops the remote worker.
+    let cancel = client.command(
+        "task.cancel",
+        json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"cancel-1","attempt_id":attempt_a}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(cancel["result"]["status"], "accepted", "{cancel}");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "cancelled");
+    target_client.until(|state| {
+        state["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["peerOrigin"]["taskId"].is_string())
+    });
+    let retry = client.command(
+        "task.cancel",
+        json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"cancel-1","attempt_id":attempt_a}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(retry["result"]["result"]["replayed"], true, "{retry}");
+
+    // The owed stop must be acknowledged before further work is owed.
+    client.until(|state| state["index"]["tasks"][0]["remote"]["stopOwed"] == false);
+
+    // A new keyed send starts attempt B on the same remote thread; the target
+    // records the attempt identity the home committed.
+    let send = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{"thread_id":child,"message":"remote-confirm-fixture","client_request_id":"send-2"}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(send["result"]["status"], "accepted", "{send}");
+    let attempt_b = send["result"]["result"]["attempt_id"].clone();
+    assert_ne!(attempt_a, attempt_b);
+    target_client.until(|state| {
+        state["index"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["peerOrigin"]["attemptId"] == attempt_b)
+    });
+
+    // The delayed cancel a caller fenced to attempt A is refused before
+    // dispatch: attempt B keeps running on the target.
+    let stale = client.command(
+        "task.cancel",
+        json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"cancel-2","attempt_id":attempt_a}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(stale.to_string().contains("attempt"), "{stale}");
+    assert_ne!(client.snapshot["index"]["tasks"][0]["state"], "cancelled");
+    assert_ne!(
+        client.snapshot["index"]["tasks"][0]["remote"]["stopOwed"], true,
+        "a refused fence owes no remote stop"
+    );
+
+    let cancel_b = client.command(
+        "task.cancel",
+        json!({"threadId":parent,"args":{"thread_id":child,"client_request_id":"cancel-3","attempt_id":attempt_b}}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(cancel_b["result"]["status"], "accepted", "{cancel_b}");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "cancelled");
+    home.stop();
+    target.stop();
 }
 
 #[test]

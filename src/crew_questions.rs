@@ -511,7 +511,11 @@ impl State {
             }
             self.threads[position]
                 .pending_injections
-                .push_back(Injection { text, shown: false });
+                .push_back(Injection {
+                    text,
+                    shown: false,
+                    steer: None,
+                });
             changed = true;
             if self.threads[position].pi.is_none()
                 && self.threads[position].status != Status::Failed

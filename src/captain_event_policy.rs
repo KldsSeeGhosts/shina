@@ -350,9 +350,11 @@ mod tests {
         assert!(state.crew_idle(worker_index).is_ok());
         // A stale queued copy is scrubbed, never flushed.
         let text = state.captain_reports[0].message();
-        state.threads[home]
-            .pending_injections
-            .push_back(Injection { text, shown: false });
+        state.threads[home].pending_injections.push_back(Injection {
+            text,
+            shown: false,
+            steer: None,
+        });
         assert!(state.scrub_crew_report_injections());
         assert_eq!(report_injections(&state, home, &id), 0);
         // Releasing holds cannot resurrect it either.

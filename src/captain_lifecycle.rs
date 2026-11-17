@@ -814,6 +814,7 @@ mod tests {
             .push_back(Injection {
                 text: exact.clone(),
                 shown: false,
+                steer: None,
             });
         assert!(state.captain_archive_blockers(0).is_empty());
         state.threads[index].pending_injections[0]
@@ -905,7 +906,11 @@ mod tests {
         for text in state.tasks[0].result_notifications() {
             state.threads[index]
                 .pending_injections
-                .push_back(Injection { text, shown: false });
+                .push_back(Injection {
+                    text,
+                    shown: false,
+                    steer: None,
+                });
         }
         assert_eq!(state.threads[index].pending_injections.len(), 2);
         assert!(state.captain_archive_blockers(0).is_empty());
