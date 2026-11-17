@@ -57,3 +57,7 @@ provider input, and preservation and single delivery of the preceding result.
 The separate previously-granted recovery regression still requires an
 interrupted outcome. All 105 task and remote-task tests pass after this
 test-contract update.
+
+After integrating main `6eff805`, the final production tree builds with all
+targets and all 129 server-runtime integration tests pass. Formatting and diff
+checks pass. The exact-head aggregate unit run remains a required PR CI gate.
