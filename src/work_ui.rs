@@ -158,6 +158,19 @@ fn output(tool: &Tool, p: Palette, id: &str) -> El {
 /// consecutive run of thoughts, with the original text keys inside it.
 pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
     let t = s.current();
+    let mut content = col().min_w(0.0).gap(4.0).child(thought_head(s, p, indices));
+    if t.thoughts[indices[0]].expanded {
+        for index in indices {
+            content = content.child(thought_body(s, p, *index));
+        }
+    }
+    content
+}
+
+/// The disclosure line of a thought run. Long turns place it and each body in
+/// their own transcript slice; `thoughts` keeps them together for short turns.
+pub(super) fn thought_head(s: &State, p: Palette, indices: &[usize]) -> El {
+    let t = s.current();
     let first = indices[0];
     let expanded = t.thoughts[first].expanded;
     let block = t.thoughts[first].block;
@@ -173,68 +186,63 @@ pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
     } else {
         format!("Thought ×{}", indices.len())
     };
-    let mut content = col().min_w(0.0).gap(4.0).child(
-        activity_line(
-            key,
-            format!("{} thinking text", if expanded { "Hide" } else { "Show" }),
-            (title, ""),
-            false,
-            expanded,
-            "brain",
-            p,
-        )
-        .on_press_tx(move |s: &mut State, tx| {
-            tx.keep_on_screen(press_key.clone());
-            let t = s.current_mut();
-            let msg_idx = anchor_msg_id
-                .as_deref()
-                .and_then(|id| t.messages.iter().position(|m| m.id == id));
-            if anchor_msg_id.is_some() && msg_idx.is_none() {
-                return;
-            }
-            if let Some(thought) = t.thoughts.iter_mut().find(|th| {
-                th.block == block
-                    && th.anchor.offset == offset
-                    && msg_idx.is_none_or(|idx| th.anchor.message == idx)
-            }) {
-                thought.expanded = !thought.expanded;
-                let message = thought.anchor.message;
-                t.timeline_cache.get_mut().touch_message(message);
-            }
-        }),
-    );
-    if expanded {
-        for index in indices {
-            let thought = &t.thoughts[*index];
-            content = content.child(
-                col()
-                    .key(format!("thought-output-{}-{index}", t.id))
-                    .role("group")
-                    .label("Thinking text")
-                    .min_w(0.0)
-                    .pl(28.0)
-                    .mb(4.0)
-                    .max_h(200.0)
-                    .scroll(ScrollSpec {
-                        stick_bottom: !thought.done,
-                    })
-                    .child(
-                        label(
-                            if thought.text.is_empty() {
-                                "The provider did not provide visible thinking text."
-                            } else {
-                                &thought.text
-                            },
-                            TextStyle::new(13.0, 400.0).lh(20.0),
-                            p.faint,
-                        )
-                        .wrap_anywhere()
-                        .selectable(true),
-                    ),
-            );
+    activity_line(
+        key,
+        format!("{} thinking text", if expanded { "Hide" } else { "Show" }),
+        (title, ""),
+        false,
+        expanded,
+        "brain",
+        p,
+    )
+    .on_press_tx(move |s: &mut State, tx| {
+        tx.keep_on_screen(press_key.clone());
+        let t = s.current_mut();
+        let msg_idx = anchor_msg_id
+            .as_deref()
+            .and_then(|id| t.messages.iter().position(|m| m.id == id));
+        if anchor_msg_id.is_some() && msg_idx.is_none() {
+            return;
         }
-    }
-    content
+        if let Some(thought) = t.thoughts.iter_mut().find(|th| {
+            th.block == block
+                && th.anchor.offset == offset
+                && msg_idx.is_none_or(|idx| th.anchor.message == idx)
+        }) {
+            thought.expanded = !thought.expanded;
+            let message = thought.anchor.message;
+            t.timeline_cache.get_mut().touch_message(message);
+        }
+    })
+}
+
+pub(super) fn thought_body(s: &State, p: Palette, index: usize) -> El {
+    let t = s.current();
+    let thought = &t.thoughts[index];
+    col()
+        .key(format!("thought-output-{}-{index}", t.id))
+        .role("group")
+        .label("Thinking text")
+        .min_w(0.0)
+        .pl(28.0)
+        .mb(4.0)
+        .max_h(200.0)
+        .scroll(ScrollSpec {
+            stick_bottom: !thought.done,
+        })
+        .child(
+            label(
+                if thought.text.is_empty() {
+                    "The provider did not provide visible thinking text."
+                } else {
+                    &thought.text
+                },
+                TextStyle::new(13.0, 400.0).lh(20.0),
+                p.faint,
+            )
+            .wrap_anywhere()
+            .selectable(true),
+        )
 }
 
 /// The existing output frame owns padding and caps, not a second inspector or drawer.

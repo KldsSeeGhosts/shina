@@ -1245,6 +1245,9 @@ fn main() {
         on_key: Some(key),
         scenes: &[
             ("example", |state| state.populate_demo()),
+            // Issue #26 profiling: one turn of 1,000 thought and command parts.
+            ("long-turn-live", |state| ui::long_turn_fixture(state, 1_000, true)),
+            ("long-turn-expanded", |state| ui::long_turn_fixture(state, 1_000, false)),
             ("fleet", fleet_demo),
             ("fleet-sidebar", |state| { fleet_demo(state); state.compact_sidebar = true; }),
             ("markdown", markdown_demo),
