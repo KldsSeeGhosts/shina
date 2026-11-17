@@ -792,9 +792,14 @@ fn timer_label(seconds: u64) -> String {
 const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    let unloaded = s
+        .current()
+        .transcript_projection
+        .as_ref()
+        .is_some_and(|projection| !projection.history_loaded);
     s.timeline_positions
         .borrow_mut()
-        .open(&s.machines.selected, s.current().id, cx);
+        .open(&s.machines.selected, s.current().id, cx, unloaded);
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
@@ -10468,6 +10473,20 @@ enum TimelineRow {
 }
 
 impl TimelineRow {
+    fn entry_id<'a>(&'a self, thread: &'a Thread) -> Option<&'a str> {
+        let index = match self {
+            Self::UserOrSystem { message_id, .. } => return Some(message_id),
+            Self::AssistantTurn { start, .. } | Self::LiveTurn { start, .. } => *start,
+            Self::Boundary { message_index, .. } => *message_index,
+            Self::Handoff { index, .. } => thread.handoffs.get(*index)?.message_index,
+            Self::HistoryControl { .. } | Self::WorktreeSetup { .. } => return None,
+        };
+        thread
+            .messages
+            .get(index)
+            .map(|message| message.id.as_str())
+    }
+
     fn key(&self) -> &str {
         match self {
             Self::HistoryControl { key }
@@ -10573,6 +10592,56 @@ fn build_timeline_rows(t: &Thread) -> Vec<TimelineRow> {
         });
     }
     rows
+}
+
+/// KSG timeline position recovery, applied with the history commit's scroll
+/// transaction instead of waiting for the fixed viewport to resize.
+pub(crate) fn restore_timeline_position(
+    s: &mut State,
+    tx: &mut rune::Tx,
+    load_earlier: bool,
+) -> bool {
+    let thread = s.current();
+    if thread
+        .transcript_projection
+        .as_ref()
+        .is_some_and(|projection| !projection.history_loaded)
+    {
+        return false;
+    }
+    let thread_id = thread.id;
+    let Some(visit) = s
+        .timeline_positions
+        .borrow()
+        .current(&s.machines.selected, thread_id)
+    else {
+        return false;
+    };
+    let position = visit.restore.lock().unwrap().clone();
+    let Some(position) = position else {
+        return false;
+    };
+    let row_loaded = !position.at_end
+        && build_timeline_rows(thread)
+            .iter()
+            .any(|row| row.key() == position.row);
+    if !position.at_end && !row_loaded && thread.history_has_more {
+        if load_earlier && !thread.history_loading && thread.history_error.is_none() {
+            s.load_earlier_history(thread_id, position.entry_id);
+            return true;
+        }
+        return false;
+    }
+    visit.restore.lock().unwrap().take();
+    if position.at_end {
+        tx.scroll_to_bottom_instant(format!("conversation-{thread_id}"));
+    } else if row_loaded {
+        tx.scroll_into_view_in(format!("conversation-{thread_id}"), &position.row);
+        tx.scroll_key_to(&position.row, -position.offset);
+    } else {
+        tx.scroll_to_y(format!("conversation-{thread_id}"), position.scroll);
+    }
+    true
 }
 
 fn build_user_or_system_row(
@@ -11063,15 +11132,16 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                         assistant_turn(s, p, wide, *start, *start)
                     }
                 };
-                row_visit.row(build_rows[index].key());
+                row_visit.row(
+                    build_rows[index].key(),
+                    build_rows[index].entry_id(s.current()),
+                );
                 row
             },
         );
 
     let find_open = s.thread_find_active();
     let stick_bottom = !find_open && (!t.messages.is_empty() || !t.tools.is_empty());
-    let layout_visit = visit.clone();
-    let restore_rows = rows.clone();
     let scroller = col()
         .key(format!("conversation-{thread_id}"))
         .animated_changes()
@@ -11079,23 +11149,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         .min_h(0.0)
         .scroll(ScrollSpec { stick_bottom })
         .on_scroll_offset(move |at| *visit.scroll.lock().unwrap() = at)
-        .on_layout_tx(move |_: &mut State, _, tx| {
-            if layout_visit
-                .opened
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-            {
+        .on_layout_tx(move |s: &mut State, _, tx| {
+            if s.current().id != thread_id || !restore_timeline_position(s, tx, false) {
                 tx.live_only();
-                return;
-            }
-            if let Some(position) = layout_visit.restore.lock().unwrap().take() {
-                if position.at_end {
-                    tx.scroll_to_bottom_instant(format!("conversation-{thread_id}"));
-                } else if restore_rows.iter().any(|row| row.key() == position.row) {
-                    tx.scroll_into_view_in(format!("conversation-{thread_id}"), &position.row);
-                    tx.scroll_key_to(&position.row, -position.offset);
-                } else {
-                    tx.scroll_to_y(format!("conversation-{thread_id}"), position.scroll);
-                }
             }
         })
         .on_far_from_bottom(40.0, move |s: &mut State, far| {
@@ -16027,7 +16083,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::context::ContextUsage;
     use rune::{Env, Runtime};
-    pub(super) fn runtime(width: f32) -> Runtime<State> {
+    pub(crate) fn runtime(width: f32) -> Runtime<State> {
         let mut rt = Runtime::with_text(
             State::new(".".into(), false),
             view,
