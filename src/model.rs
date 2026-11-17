@@ -13144,6 +13144,12 @@ impl State {
             self.current_mut().error = Some(error);
             return false;
         }
+        if self.remote_task(self.current().id).is_some() {
+            self.current_mut().submission_error = Some(
+                "This is a remote task result. Open its thread on the target machine, or send a follow-up from its parent.".into(),
+            );
+            return false;
+        }
         // KSG's useComposerSend refuses while readPendingEnvironmentChange is
         // set: the draft is still being addressed to its new machine.
         if self.machines.draft_retarget.is_some() {

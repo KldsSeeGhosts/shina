@@ -52,6 +52,43 @@ fn task_record(client: &Client, task_id: &str) -> Value {
         .unwrap_or_else(|| panic!("task {task_id} missing: {}", client.snapshot))
 }
 
+fn assert_proxy_send_refused(client: &mut Client, child: &Value, task_id: &str) {
+    let task = task_record(client, task_id);
+    let before = scheduling_status(client)["usage"]["account"].clone();
+    let previous = client.snapshot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == *child)
+        .unwrap()
+        .clone();
+    let sent = client.command(
+        "thread.send",
+        json!({"threadId":child,"text":"proxy input must not run locally"}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(sent["result"]["status"], "rejected", "{sent}");
+    assert!(
+        sent["result"]["result"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("remote task"),
+        "{sent}"
+    );
+    let after = scheduling_status(client)["usage"]["account"].clone();
+    assert_eq!(after["held"], before["held"]);
+    assert_eq!(after["queued"], before["queued"]);
+    assert_eq!(task_record(client, task_id)["state"], task["state"]);
+    let proxy = client.snapshot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == *child)
+        .unwrap();
+    assert_eq!(proxy["status"], previous["status"], "{proxy}");
+    assert_eq!(proxy["queued"], previous["queued"], "{proxy}");
+}
+
 #[test]
 fn crew_roots_share_the_account_limit_and_the_queue_survives_restart() {
     let mut profile = Profile::new();
@@ -593,6 +630,7 @@ fn rejected_remote_launch_releases_capacity_and_retries_once_after_restart() {
     let status = scheduling_status(&mut here);
     assert_eq!(status["usage"]["account"]["held"], 0, "{status}");
     assert_eq!(status["usage"]["account"]["queued"], 0, "{status}");
+    assert_proxy_send_refused(&mut here, &child, &task_id);
     there.rpc("workspace.subscribe", json!({}), json!("refused-target"));
     assert!(
         there.snapshot["index"]["threads"]
@@ -644,6 +682,7 @@ fn rejected_remote_launch_releases_capacity_and_retries_once_after_restart() {
     assert_eq!(operation["remote"]["launchCommand"]["commandId"], fresh);
     let status = scheduling_status(&mut here);
     assert_eq!(status["usage"]["account"]["held"], 0, "{status}");
+    assert_proxy_send_refused(&mut here, &child, &task_id);
     let replay = here.command("task.send", retry, uuid::Uuid::new_v4());
     assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
     assert_eq!(

@@ -136,3 +136,28 @@ two-line correction and deterministic regression are included here so this
 branch does not depend on unrelated activity to publish dispatch state.
 Transport and provider acceptance still require their own observations.
 Updated-head CI and review still gate merging.
+
+## Remote status-proxy send guard
+
+The second independent review at `5587802` found that direct composer input on
+a remote task's local status proxy could create a local crew reservation.
+That proxy cannot connect a provider, so the new reservation never settled.
+A new regression reproduced the failure before the correction.
+
+The composer now applies the same remote-task refusal that the command API
+already enforced. It leaves the draft, thread status, task and scheduler
+unchanged for queued, running and completed remote tasks. Work still goes
+through the parent task controls or the actual executor thread. The paired
+server refusal/retry test also checks command-API refusal after failed launch
+and after successful remote completion, without another reservation or a
+locally queued prompt. It still verifies successful deliberate retry through
+`task.send`, so the guard does not disable the supported remote control path.
+
+A full target pending queue remains an explicit rejection requiring deliberate
+retry. It is not proof that any older uncertain worker stopped, and it does
+not trigger automatic replacement or repeated launch attempts.
+
+The corrected tree passes the all-target build, formatting and diff checks,
+all 29 scheduler unit tests and all eight authenticated live admission
+contracts. Exact-head CI remains required; the previous full aggregate result
+above belongs to `1033a9e`, not this later correction.

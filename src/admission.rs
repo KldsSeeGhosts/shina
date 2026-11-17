@@ -2223,6 +2223,57 @@ mod tests {
     }
 
     #[test]
+    fn direct_input_to_a_remote_task_proxy_never_reserves_or_stages_work() {
+        for state_value in [TaskState::Queued, TaskState::Running, TaskState::Completed] {
+            let mut state = demo();
+            let child = finished_child(&mut state);
+            let mut remote = remote_fixture("peer-1", false, None);
+            remote.state = if state_value == TaskState::Completed {
+                RemoteState::Done
+            } else {
+                RemoteState::Running
+            };
+            state.tasks[0].remote = Some(remote);
+            state.tasks[0].state = state_value;
+            state.threads[child].status = if state_value == TaskState::Running {
+                Status::Running
+            } else {
+                Status::Completed
+            };
+            state.threads[child].draft.replace_text("keep remote input");
+            state.active = child;
+            state.demo = false;
+            let tasks = serde_json::to_value(&state.tasks).unwrap();
+            let scheduler = serde_json::to_value(&state.scheduler).unwrap();
+            let status = state.current().status;
+            let messages = state.current().messages.len();
+            assert!(!state.dispatch_send_with_options(Some(false), Some(false)));
+            assert_eq!(state.current().draft.text, "keep remote input");
+            assert_eq!(state.current().status, status);
+            assert_eq!(state.current().messages.len(), messages);
+            assert!(state.current().queued_prompt.is_none());
+            assert!(state.current().pending_injections.is_empty());
+            assert_eq!(serde_json::to_value(&state.tasks).unwrap(), tasks);
+            assert_eq!(serde_json::to_value(&state.scheduler).unwrap(), scheduler);
+            assert!(
+                state
+                    .current()
+                    .submission_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("remote task")
+            );
+            let error = state.execute_command(&crate::protocol::Command::new(
+                "thread.send",
+                json!({"threadId":state.current().id,"text":"must not replace the existing draft"}),
+            )).unwrap_err();
+            assert!(error.contains("remote task"), "{error}");
+            assert_eq!(state.current().draft.text, "keep remote input");
+            assert_eq!(serde_json::to_value(&state.scheduler).unwrap(), scheduler);
+        }
+    }
+
+    #[test]
     fn direct_input_to_a_finished_child_waits_for_admission_on_an_idle_connection() {
         let mut state = demo();
         let child = finished_child(&mut state);
