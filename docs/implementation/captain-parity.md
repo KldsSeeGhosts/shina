@@ -349,6 +349,51 @@ ledger. Do not infer a server implementation from these client contracts.
 The complete ten-record evidence bundle was exported outside the repository.
 Keep proprietary package bytes and the large evidence bundle out of Git.
 
+## Issue #32 candidate: effective capability contracts
+
+One `State` effective capability record per caller now drives what each thread
+is told and shown. `orchestrator_capabilities` returns the record as `contract`
+`shina-effective-capabilities/v1` with `caller` identity, `effective` sections
+(coordination rights with precise unavailable reasons, interaction fences,
+authorized reads, executable harnesses and models, placement modes, live
+capacity, negotiated peer features) and a per-tool `tools` table mirroring the
+advertised list. `initialize` and `tools/list` ride the same UI-thread request
+queue as `tools/call`, so each bearer token answers from its own thread's
+record: coordinators get the full catalog, delegated leaves get worker
+instructions and no coordination tools, remote workers get the remote-worker
+text and read scope, earlier homes and archived captains lose coordination.
+Advertisement stays discovery only; every `tools/call` still revalidates the
+gate at dispatch, so a stale `tools/list` can never widen authority.
+
+Role-derived instructions bind through each harness's real injection path:
+`Start::shina` prepends to Pi's instruction block, appends to Claude's
+`--append-system-prompt`, merges into Codex `developerInstructions`, and fills
+ACP's `<shina_context>`. Native Claude endpoint binding and allowlist, Pi
+read-only admission, Codex and ACP agent policy differences, AGENTS.md privacy,
+delivery receipts and attempt/question fences are unchanged.
+
+Coverage sits in `src/capabilities.rs` unit tests and
+`tests/support/capability_parity.rs`. The runtime tests drive real
+`initialize`, `tools/list` and `tools/call` over each thread's token endpoint
+recorded by the fake Pi, native Claude, native Codex (`fake_codex.js` app-server
+fixture) and ACP fixtures. They cover the primary read-only Captain home,
+crew, delegated leaves on all four harnesses, the earlier home after
+`captain.reset`, the archived Captain, a revoked bearer token, keyed
+`delegate_task` retry replay for lost responses, a `NOTES.md` near the document
+limit, stale `tools/list` revalidation at dispatch, unsupported remote
+independent roots, and an ACP agent that refuses startup for lack of MCP
+transport. The remote test pairs two live serves and checks the negotiated
+peer feature table plus the remote leaf's contract on the target machine.
+
+`capacity.scheduler` reports `implemented: false`; admission stays the static
+per-coordinator limits until the separate scheduler work lands. The patch was
+kept additive under protocol minor 39; no bump was needed.
+
+While integrating, the server-runtime test client exposed a real projection
+race: the global `last_projection` diff can emit a deep `set` before the
+element add that creates its parents. The test client now vivifies missing
+patch parents; the underlying ordering question is a residual for review.
+
 ## Verification baseline
 
 At commit `c710261`, before integration of this batch, `cargo build`,
