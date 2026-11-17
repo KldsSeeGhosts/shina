@@ -29,6 +29,8 @@ pub(crate) struct FieldItems {
     /// Server ordinals parallel to `items` when `ids` is set.
     pub(crate) ords: Vec<usize>,
     pub(crate) items: Vec<Arc<Value>>,
+    /// Serialized payload estimate. Used without walking unchanged payloads.
+    bytes: usize,
 }
 
 /// Content-changed item ids per field since a thread's previous emission.
@@ -66,6 +68,7 @@ pub(crate) struct ThreadProjection {
     pub(crate) items_changed: Option<Arc<FieldChanges>>,
     #[allow(dead_code)]
     pub(crate) record_changed: bool,
+    record_bytes: usize,
 }
 
 /// One projected workspace. `state` holds the complete workspace state but its
@@ -159,10 +162,14 @@ impl ThreadProjection {
                         ids: None,
                         ords: Vec::new(),
                         items: items.into_iter().map(Arc::new).collect(),
+                        // Untracked full projections are not retained by the
+                        // history cache and do not need its byte accounting.
+                        bytes: 0,
                     }),
                 );
             }
         }
+        let record_bytes = record.to_string().len();
         Self {
             record: Arc::new(record),
             fields,
@@ -171,6 +178,7 @@ impl ThreadProjection {
             structural: true,
             items_changed: None,
             record_changed: true,
+            record_bytes,
         }
     }
 }
@@ -287,6 +295,8 @@ struct View {
     epoch: String,
     revision: String,
     rows: HashMap<String, (u64, Row)>,
+    /// Source rows remain separate from their locally remapped item payloads.
+    row_bytes: usize,
     removed: HashMap<String, u64>,
     /// sids created, updated or removed since the last `install`.
     reconcile: HashSet<String>,
@@ -305,6 +315,28 @@ struct View {
     ready: bool,
     work_requests: VecDeque<String>,
     work_errors: HashMap<String, String>,
+}
+
+impl View {
+    fn insert_row(&mut self, sequence: u64, row: Row) {
+        self.row_bytes += serde_json::to_string(&row).expect("history row").len();
+        if let Some((_, previous)) = self
+            .rows
+            .insert(row.source_item_id.clone(), (sequence, row))
+        {
+            self.row_bytes = self
+                .row_bytes
+                .saturating_sub(serde_json::to_string(&previous).expect("history row").len());
+        }
+    }
+
+    fn remove_row(&mut self, sid: &str) {
+        if let Some((_, previous)) = self.rows.remove(sid) {
+            self.row_bytes = self
+                .row_bytes
+                .saturating_sub(serde_json::to_string(&previous).expect("history row").len());
+        }
+    }
 }
 
 #[derive(Default)]
@@ -528,6 +560,7 @@ impl ProjectionCache {
                 .iter()
                 .any(|key| items.items[pos].get(*key) != item.get(*key));
                 installed.item_bytes = installed.item_bytes.saturating_sub(slot.bytes) + bytes;
+                items.bytes = items.bytes.saturating_sub(slot.bytes) + bytes;
                 items.items[pos] = Arc::new(item);
                 installed.slot.get_mut(&sid).unwrap().bytes = bytes;
                 pending.items.entry(field).or_default().insert(sid);
@@ -540,6 +573,7 @@ impl ProjectionCache {
                 ids: Some(Vec::new()),
                 ords: Vec::new(),
                 items: Vec::new(),
+                bytes: 0,
             })
         });
         let items = Arc::make_mut(entry);
@@ -548,6 +582,7 @@ impl ProjectionCache {
         items.ords.insert(at, ordinal);
         items.ids.as_mut().unwrap().insert(at, sid.clone());
         items.items.insert(at, Arc::new(item));
+        items.bytes += bytes;
         installed.slot.insert(
             sid.clone(),
             Slot {
@@ -583,6 +618,7 @@ impl ProjectionCache {
             items.items.remove(pos);
         }
         installed.item_bytes = installed.item_bytes.saturating_sub(slot.bytes);
+        items.bytes = items.bytes.saturating_sub(slot.bytes);
         pending.structural = true;
         true
     }
@@ -685,6 +721,7 @@ impl ProjectionCache {
                             if let Some(slot) = installed.slot.remove(&sid) {
                                 installed.item_bytes =
                                     installed.item_bytes.saturating_sub(slot.bytes);
+                                items.bytes = items.bytes.saturating_sub(slot.bytes);
                             }
                             installed.held.insert(sid);
                             view.pending.structural = true;
@@ -710,6 +747,7 @@ impl ProjectionCache {
                             if let Some(slot) = installed.slot.get_mut(&sid) {
                                 installed.item_bytes =
                                     installed.item_bytes.saturating_sub(slot.bytes) + bytes;
+                                items.bytes = items.bytes.saturating_sub(slot.bytes) + bytes;
                                 slot.bytes = bytes;
                             }
                             items.items[index] = Arc::new(item);
@@ -945,27 +983,85 @@ impl ProjectionCache {
             .saturating_add(installed.slot.len().saturating_mul(2))
             .saturating_add(installed.fields.len().saturating_mul(8))
             .saturating_add(64);
-        if installed.bytes > protocol::MAX_SNAPSHOT_BYTES {
+        if installed
+            .bytes
+            .saturating_add(view.row_bytes)
+            .saturating_add(installed.scalars_bytes)
+            > protocol::MAX_SNAPSHOT_BYTES
+        {
+            self.evict(thread);
             return Err("Thread history exceeded the client memory budget.".into());
         }
         view.installed = Some(installed);
         self.history_order.retain(|id| *id != thread);
         self.history_order.push_back(thread);
-        while self
-            .views
-            .values()
-            .filter_map(|view| view.installed.as_ref().map(|i| i.bytes))
-            .sum::<usize>()
-            > protocol::MAX_SNAPSHOT_BYTES
-        {
+        while self.retained_history_bytes() > protocol::MAX_SNAPSHOT_BYTES {
             let Some(oldest) = self.history_order.pop_front() else {
                 break;
             };
-            self.views.remove(&oldest);
+            self.evict(oldest);
         }
         self.touched.insert(thread);
         self.dirty = true;
         Ok(())
+    }
+
+    fn evict(&mut self, thread: u64) {
+        self.views.remove(&thread);
+        self.emitted.remove(&thread);
+        self.history_order.retain(|id| *id != thread);
+        self.touched.insert(thread);
+        self.dirty = true;
+        if self.subscribed == Some(thread) {
+            self.subscribed = None;
+        }
+        // A waiting RPC uses the shared history response id. Drain its
+        // response before sending another; an unsent walk can be dropped.
+        if self
+            .inflight
+            .as_ref()
+            .is_some_and(|walk| walk.thread == thread && !walk.waiting)
+        {
+            self.inflight = None;
+        }
+    }
+
+    /// Conservative serialized-history retention, not a process RSS limit.
+    /// Count source rows, installed payloads and old emitted field versions.
+    /// Shared installed/emitted field allocations count once. A replaced field
+    /// counts in full until its old emission drops, without scanning its items.
+    /// External mailbox/UI owners release old Arcs when they apply an eviction
+    /// emission; the cache cannot account for arbitrary external snapshots.
+    fn retained_history_bytes(&self) -> usize {
+        let installed = self
+            .views
+            .values()
+            .map(|view| {
+                view.row_bytes.saturating_add(
+                    view.installed
+                        .as_ref()
+                        .map_or(0, |i| i.bytes.saturating_add(i.scalars_bytes)),
+                )
+            })
+            .sum::<usize>();
+        self.emitted.iter().fold(installed, |bytes, (id, emitted)| {
+            emitted.fields.iter().fold(
+                bytes.saturating_add(emitted.record_bytes),
+                |bytes, (field, items)| {
+                    if self
+                        .views
+                        .get(id)
+                        .and_then(|view| view.installed.as_ref())
+                        .and_then(|installed| installed.fields.get(field))
+                        .is_some_and(|installed| Arc::ptr_eq(installed, items))
+                    {
+                        bytes
+                    } else {
+                        bytes.saturating_add(items.bytes)
+                    }
+                },
+            )
+        })
     }
 
     /// How many threads hold an installed history view.
@@ -1079,8 +1175,7 @@ impl ProjectionCache {
                         }
                         view.removed.remove(&row.source_item_id);
                         view.reconcile.insert(row.source_item_id.clone());
-                        view.rows
-                            .insert(row.source_item_id.clone(), (sequence, row));
+                        view.insert_row(sequence, row);
                     }
                     Some("item.removed") => {
                         let id = event["sourceItemId"]
@@ -1089,7 +1184,7 @@ impl ProjectionCache {
                         if view.rows.get(id).is_some_and(|(seq, _)| *seq > sequence) {
                             continue;
                         }
-                        view.rows.remove(id);
+                        view.remove_row(id);
                         view.reconcile.insert(id.into());
                         view.removed.insert(id.into(), sequence);
                     }
@@ -1166,8 +1261,7 @@ impl ProjectionCache {
                 continue;
             }
             view.reconcile.insert(row.source_item_id.clone());
-            view.rows
-                .insert(row.source_item_id.clone(), (sequence, row));
+            view.insert_row(sequence, row);
         }
         if sequence >= view.fields_sequence {
             view.fields = page["fields"]
@@ -1185,13 +1279,14 @@ impl ProjectionCache {
         }
         if let Some(anchor) = work_anchor {
             let next = page["nextCursor"].as_str();
-            if let Some((_, row)) = view.rows.get_mut(anchor) {
+            if let Some((sequence, mut row)) = view.rows.get(anchor).cloned() {
                 if let Some(next) = next {
                     row.item["deferredWork"]["cursor"] = json!(next);
                 } else {
                     row.item.as_object_mut().unwrap().remove("deferredWork");
                 }
                 view.reconcile.insert(anchor.into());
+                view.insert_row(sequence, row);
             }
             if next.is_none() {
                 view.work_requests.retain(|request| request != anchor);
@@ -1358,6 +1453,11 @@ impl ProjectionCache {
                 {
                     return Ok(());
                 }
+                if !walk.subscribe && !walk.snapshot && !self.views.contains_key(&walk.thread) {
+                    // An earlier/work page that was in flight at eviction no
+                    // longer has a base. Drain it and request a fresh snapshot.
+                    return Ok(());
+                }
                 if !value["error"].is_null() {
                     let code = value["error"]["code"].as_i64();
                     let message = value["error"]["message"]
@@ -1497,7 +1597,11 @@ impl ProjectionCache {
             if self.retries.get(&thread).is_some_and(|r| r.blocked) {
                 return None;
             }
-            let subscribe = self.subscribed != Some(thread);
+            let subscribe = self.subscribed != Some(thread)
+                || !self
+                    .views
+                    .get(&thread)
+                    .is_some_and(|view| view.ready && view.installed.is_some());
             if let Some(view) = self.views.get_mut(&thread) {
                 view.work_requests.retain(|anchor| {
                     view.rows
@@ -1667,7 +1771,7 @@ impl ProjectionCache {
                         // Invalidation is relative to emitted state, while UI
                         // application compares Arcs to its own last apply.
                         // A full snapshot invalidates even unchanged item IDs.
-                        structural |= rebuild;
+                        structural |= rebuild || !self.emitted.contains_key(&id);
                         if let Some(previous) = self.emitted.get(&id) {
                             structural |= previous.record["harness_state"]["workRetries"]
                                 != thread["harness_state"]["workRetries"];
@@ -1701,6 +1805,7 @@ impl ProjectionCache {
                                 }
                             }
                         }
+                        let record_bytes = thread.to_string().len();
                         let emitted = Arc::new(ThreadProjection {
                             record: Arc::new(thread),
                             fields,
@@ -1709,6 +1814,7 @@ impl ProjectionCache {
                             structural,
                             items_changed,
                             record_changed,
+                            record_bytes,
                         });
                         self.emitted.insert(id, emitted.clone());
                         emitted
@@ -1954,6 +2060,144 @@ mod tests {
             .receive(&json!({"id":"history","result":result}))
             .unwrap();
         request
+    }
+
+    fn large_page(thread: u64, bytes: usize) -> Value {
+        json!({
+            "threadId":thread, "snapshotSequence":1, "historyRevision":"1",
+            "nextCursor":null, "hasMoreHistory":false, "fields":{"id":thread,"stats":{}},
+            "items":[{"sourceThreadId":thread, "sourceItemId":format!("messages:{thread}"),
+                "field":"messages", "ordinal":0, "position":0,
+                "item":{"id":format!("m-{thread}"),"role":"Pi","text":"x".repeat(bytes)}}]
+        })
+    }
+
+    #[test]
+    fn global_eviction_releases_emissions_and_reloads_a_subscribed_thread() {
+        let mut cache = cache(&json!({"epoch":"workspace","seq":1,
+            "state":{"index":{"active":1},"threads":[{"id":1},{"id":2},{"id":3}]}}));
+        let size = 12 * 1024 * 1024;
+        cache
+            .merge_page(1, large_page(1, size), true, "stream", None)
+            .unwrap();
+        cache.subscribed = Some(1);
+        let first = cache.projected().unwrap();
+        let retained = Arc::downgrade(&first.views[&1].fields["messages"].items[0]);
+        drop(first);
+        for thread in [2, 3] {
+            cache
+                .merge_page(thread, large_page(thread, size), true, "stream", None)
+                .unwrap();
+            drop(cache.projected().unwrap());
+        }
+        assert!(
+            !cache.views.contains_key(&1),
+            "source and installed copies count toward the budget"
+        );
+        assert!(
+            retained.upgrade().is_none(),
+            "the cache must drop its emitted item too"
+        );
+
+        cache
+            .receive(&protocol::notification(
+                "subscription.patch",
+                json!({"epoch":"workspace","seq":2,
+                "patch":[{"op":"set","path":["threads","0","title"],"value":"still live"}]}),
+            ))
+            .unwrap();
+        let evicted = cache.projected().unwrap();
+        assert!(evicted.views[&1].fields.is_empty());
+        assert!(evicted.views[&1].structural);
+        assert_eq!(evicted.views[&1].record["title"], "still live");
+        drop(evicted);
+        let request = cache
+            .next_history()
+            .expect("the evicted subscription must reload");
+        assert_eq!(request["method"], "thread.subscribe");
+        assert!(
+            request["params"]["afterSequence"].is_null(),
+            "never replay from an evicted base"
+        );
+        assert!(request["params"]["streamEpoch"].is_null());
+
+        let page = large_page(1, size);
+        cache
+            .receive(&json!({"id":"history","result":{"kind":"snapshot",
+            "streamEpoch":"stream","data":page.to_string(),"nextFragment":null}}))
+            .unwrap();
+        let recovered = cache.projected().unwrap();
+        let mut fresh = self::cache(&json!({"epoch":"workspace","seq":2,
+            "state":{"index":{"active":1},"threads":[{"id":1,"title":"still live"},{"id":2},{"id":3}]}}));
+        fresh.merge_page(1, page, true, "stream", None).unwrap();
+        let full = fresh.projected().unwrap();
+        assert_eq!(recovered.full()["threads"][0], full.full()["threads"][0]);
+        assert!(
+            cache.next_history().is_none(),
+            "the recovered subscription is current"
+        );
+        assert!(cache.retained_history_bytes() <= protocol::MAX_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn replaced_emitted_fields_count_until_the_next_emission() {
+        let mut cache = cache(&snapshot(1, json!({"id":1})));
+        cache
+            .merge_page(1, large_page(1, 8192), true, "stream", None)
+            .unwrap();
+        let first = cache.projected().unwrap();
+        let old_item = Arc::downgrade(&first.views[&1].fields["messages"].items[0]);
+        let mut row = large_page(1, 32)["items"][0].clone();
+        row["item"]["text"] = json!("small");
+        cache
+            .stream(
+                &json!({"kind":"event","threadId":1,"streamEpoch":"stream","sequence":2,
+            "events":[{"type":"item.updated","row":row}]}),
+            )
+            .unwrap();
+        let before_emission = cache.retained_history_bytes();
+        let latest = cache.projected().unwrap();
+        assert!(before_emission > cache.retained_history_bytes() + 8000);
+        assert!(
+            old_item.upgrade().is_some(),
+            "external clients own their last-applied version"
+        );
+        drop(first);
+        assert!(old_item.upgrade().is_none());
+        assert_eq!(
+            latest.views[&1].fields["messages"].items[0]["text"],
+            "small"
+        );
+    }
+
+    #[test]
+    fn eviction_drains_an_outstanding_page_before_starting_a_fresh_subscription() {
+        let mut cache = cache(&snapshot(1, json!({"id":1})));
+        let mut page = large_page(1, 32);
+        page["nextCursor"] = json!("earlier");
+        page["hasMoreHistory"] = json!(true);
+        cache.merge_page(1, page, true, "stream", None).unwrap();
+        cache.subscribed = Some(1);
+        cache.projected().unwrap();
+        cache.request_earlier(1, None);
+        assert_eq!(cache.next_history().unwrap()["method"], "thread.history");
+        cache.evict(1);
+        assert!(
+            cache.next_history().is_none(),
+            "do not reuse an outstanding RPC id"
+        );
+        cache
+            .receive(&json!({"id":"history","result":{
+                "data":large_page(1, 64).to_string(),"nextFragment":null
+            }}))
+            .unwrap();
+        assert!(
+            !cache.views.contains_key(&1),
+            "a stale page must not recreate a partial base"
+        );
+        let request = cache.next_history().unwrap();
+        assert_eq!(request["method"], "thread.subscribe");
+        assert!(request["params"]["afterSequence"].is_null());
     }
 
     #[test]

@@ -309,11 +309,26 @@ retry transitions; deferred-list changes invalidate structure. The three new
 regressions fail before these corrections and pass afterward.
 
 The same review found cache eviction retaining emitted item references and
-leaving an evicted subscription unable to reload. That correction and its
-budget/reload regression remain pending. The candidate must not be handed to
-#25/#26 as a complete contract until eviction is fixed. The benchmark also
-still lacks an actual historical-executable comparison and a pinned KSG run
-using the same transcript; current reference numbers do not close those gaps.
+leaving an evicted subscription unable to reload. Eviction now drops the source,
+installed and emitted cache entries, emits an unloaded thread, and invalidates
+its subscription. A new request takes a fresh snapshot without a replay cursor.
+An outstanding earlier/work page drains before reusing its RPC id and cannot
+recreate an evicted partial base. The client apply test proves that an unloaded
+emission also releases the UI's last-applied item references.
+
+The 64 MiB history estimate now includes raw source rows, installed values and
+retained emitted field versions. Identical installed/emitted field allocations
+count once; replaced fields count conservatively until their next emission.
+This is serialized cache retention, not a process RSS cap or an accounting of
+arbitrary external snapshots. The pressure regression crosses the real 64 MiB
+limit across three threads, checks released item references, applies a metadata
+update, reloads the evicted subscription and compares it with a fresh snapshot.
+All 13 client-history and 13 delta-projection tests pass.
+
+The candidate still needs combined-main verification and publication before a
+#25/#26 handoff. The benchmark also lacks an actual historical-executable
+comparison and a pinned KSG run using the same transcript; current reference
+numbers do not close those gaps.
 
 ## Capy package investigation
 

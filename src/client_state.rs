@@ -8963,6 +8963,33 @@ mod tests {
         }
 
         #[test]
+        fn unloaded_history_emission_releases_the_last_applied_item_payloads() {
+            let (mut cache, _, threads, _) = rig(1, 10, 4, 1 << 22, true);
+            let first = cache.projected().unwrap();
+            let item = Arc::downgrade(&first.views[&1].fields["messages"].items[0]);
+            let mut state = State::new(PathBuf::new(), false);
+            state.apply_projection(first).unwrap();
+            drop(cache);
+            assert!(
+                item.upgrade().is_some(),
+                "the UI still owns its last applied projection"
+            );
+
+            // An evicted cache emits the compact thread without an installed
+            // history. A replacement cache supplies exactly that same shape.
+            let mut unloaded = ProjectionCache::default();
+            connect(&mut unloaded, &workspace(2, &threads));
+            let emission = unloaded.projected().unwrap();
+            assert!(emission.views[&1].fields.is_empty());
+            state.apply_projection(emission).unwrap();
+            assert!(state.threads[0].messages.is_empty());
+            assert!(
+                item.upgrade().is_none(),
+                "applying the eviction must release the UI's old Arcs"
+            );
+        }
+
+        #[test]
         fn anchor_changes_bump_structure_without_changing_item_membership() {
             let (mut cache, mut streams, threads, _f) = rig(1, 10, 4, 1 << 22, true);
             let first = cache.projected().unwrap();
