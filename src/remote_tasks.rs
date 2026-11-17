@@ -1475,6 +1475,36 @@ mod tests {
     }
 
     #[test]
+    fn repository_identity_accepts_git_ssh_transport_without_losing_ports() {
+        let expected = canonical_remote("git@example.com:team/repo.git").unwrap();
+        for remote in [
+            "git+ssh://git@example.com/team/repo.git",
+            "git+ssh://git@EXAMPLE.com:22/team/repo.git",
+            "ssh://git@example.com:22/team/repo.git",
+        ] {
+            assert_eq!(canonical_remote(remote), Some(expected.clone()), "{remote}");
+        }
+        assert_eq!(
+            canonical_remote("git+ssh://git@example.com:2222/team/repo.git"),
+            canonical_remote("ssh://git@example.com:2222/team/repo.git")
+        );
+        assert_ne!(
+            canonical_remote("git+ssh://git@example.com:2222/team/repo.git"),
+            Some(expected)
+        );
+        assert_eq!(
+            canonical_remote("git+ssh://git@[2001:db8::1]:22/team/repo.git"),
+            canonical_remote("git@[2001:db8::1]:team/repo.git")
+        );
+        for remote in [
+            "git+ssh://git@example.com/team/repo.git?tenant=another",
+            "git+ssh://git@example.com/team/repo.git#another",
+        ] {
+            assert_eq!(canonical_remote(remote), None, "{remote}");
+        }
+    }
+
+    #[test]
     fn repository_identity_rejects_url_components_it_cannot_preserve() {
         for remote in [
             "https://example.com/team/repo.git?tenant=another",
@@ -2660,7 +2690,7 @@ fn canonical_remote(remote: &str) -> Option<String> {
     }
     let (host, path) = if remote.contains("://") {
         let url = reqwest::Url::parse(remote).ok()?;
-        if !matches!(url.scheme(), "http" | "https" | "ssh" | "git")
+        if !matches!(url.scheme(), "http" | "https" | "ssh" | "git+ssh" | "git")
             || url.query().is_some()
             || url.fragment().is_some()
         {
@@ -2668,7 +2698,8 @@ fn canonical_remote(remote: &str) -> Option<String> {
         }
         let mut host = url.host_str()?.to_ascii_lowercase();
         if let Some(port) = url.port().filter(|port| {
-            !(url.scheme() == "ssh" && *port == 22) && !(url.scheme() == "git" && *port == 9418)
+            !(matches!(url.scheme(), "ssh" | "git+ssh") && *port == 22)
+                && !(url.scheme() == "git" && *port == 9418)
         }) {
             host = format!("{host}:{port}");
         }
