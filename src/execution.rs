@@ -384,10 +384,12 @@ impl Book {
                 uncertain.lease_id,
             ));
         }
-        if let Some(previous) = self.latest(&request.logical_thread_uid)
-            && previous.phase.blocks_replacement()
-            && (!request.queues_behind_current || previous.executor_id != request.scope.executor_id)
-        {
+        if let Some(previous) = self.leases.iter().find(|previous| {
+            previous.logical_thread_uid == request.logical_thread_uid
+                && previous.phase.blocks_replacement()
+                && (!request.queues_behind_current
+                    || previous.executor_id != request.scope.executor_id)
+        }) {
             return Err(format!(
                 "Execution {} (generation {}) is {}. Observe a terminal result or verified executor fence before starting generation {}.",
                 previous.lease_id,
@@ -490,12 +492,14 @@ impl Book {
                     existing.lease_id
                 ));
             }
-            if existing.phase.blocks_replacement()
-                && (!lease.queued_behind_current
-                    || existing.executor_id != lease.executor_id
-                    || existing.executor_thread_alias != lease.executor_thread_alias
-                    || existing.executor_thread_uid != lease.executor_thread_uid)
-            {
+            if let Some(existing) = self.leases.iter().find(|existing| {
+                existing.logical_thread_uid == lease.logical_thread_uid
+                    && existing.phase.blocks_replacement()
+                    && (!lease.queued_behind_current
+                        || existing.executor_id != lease.executor_id
+                        || existing.executor_thread_alias != lease.executor_thread_alias
+                        || existing.executor_thread_uid != lease.executor_thread_uid)
+            }) {
                 return Err(format!(
                     "Execution {} (generation {}) is {}. The executor requires observed terminal or verified fence evidence before accepting a replacement.",
                     existing.lease_id,
@@ -515,6 +519,65 @@ impl Book {
             .insert(assignment_key(&lease), lease.lease_id.clone());
         self.leases.push(lease.clone());
         Ok((lease, false))
+    }
+
+    /// Record an assignment that the executor never accepted for dispatch.
+    /// This is a cancellation tombstone, not permission to replace a writer.
+    pub(crate) fn cancel_unaccepted_assignment(
+        &mut self,
+        mut lease: Lease,
+        now: u64,
+    ) -> Result<Lease, String> {
+        validate_lease(&lease)?;
+        if let Some(existing) = self.get(&lease.lease_id) {
+            if existing.binding() == lease.binding()
+                && existing.request_key == lease.request_key
+                && existing.queued_behind_current == lease.queued_behind_current
+                && existing.executor_thread_alias == lease.executor_thread_alias
+                && existing.executor_thread_uid == lease.executor_thread_uid
+                && existing.terminal_status.as_deref() == Some("cancelled_before_dispatch")
+            {
+                return Ok(existing.clone());
+            }
+            return Err(
+                "This assignment was already accepted or has a conflicting cancellation.".into(),
+            );
+        }
+        let previous = self
+            .latest(&lease.logical_thread_uid)
+            .ok_or("Pending cancellation requires an existing logical execution thread.")?;
+        if !previous.same_ownership(&lease.scope(), &lease.logical_captain_uid)
+            || previous.executor_id != lease.executor_id
+            || previous.executor_thread_alias != lease.executor_thread_alias
+            || previous.executor_thread_uid != lease.executor_thread_uid
+            || lease.generation <= previous.generation
+            || self
+                .exact_run(&lease.logical_thread_uid, &lease.run_id)
+                .is_some()
+        {
+            return Err(
+                "Pending cancellation does not match this controller and executor thread.".into(),
+            );
+        }
+        lease.phase = Phase::Terminal;
+        lease.terminal_status = Some("cancelled_before_dispatch".into());
+        lease.terminal_at = Some(now);
+        lease.dispatched_at = None;
+        lease.executor_accepted_at = None;
+        lease.provider_accepted_at = None;
+        lease.running_at = None;
+        lease.last_observed_at = now;
+        lease.lease_expires_at = 0;
+        lease.evidence.push(
+            "executor never accepted the assignment or input; cancellation tombstone committed"
+                .into(),
+        );
+        self.next_generations
+            .insert(lease.logical_thread_uid.clone(), lease.generation);
+        self.assignments
+            .insert(assignment_key(&lease), lease.lease_id.clone());
+        self.leases.push(lease.clone());
+        Ok(lease)
     }
 
     pub fn exact_run(&self, thread: &str, run: &str) -> Option<&Lease> {
@@ -741,7 +804,15 @@ impl Book {
             ));
         }
         let latest = self
-            .latest(thread)
+            .leases
+            .iter()
+            .filter(|lease| {
+                lease.logical_thread_uid == thread
+                    && !(lease.phase == Phase::Terminal
+                        && lease.terminal_status.as_deref() == Some("cancelled_before_dispatch"))
+            })
+            .max_by_key(|lease| lease.generation)
+            .or_else(|| self.latest(thread))
             .ok_or("Unknown logical execution thread.")?;
         if latest.lease_id != lease.lease_id && latest.generation > lease.generation {
             return Err(format!(
@@ -1124,5 +1195,57 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("uncertain"), "{error}");
         assert_eq!(book.leases.len(), 1, "no replacement was allocated");
+    }
+
+    #[test]
+    fn a_cancelled_future_assignment_does_not_hide_an_unsettled_writer() {
+        let mut executor = Book::default();
+        let (first, _) = executor.prepare(prepare("first-run", 10)).unwrap();
+        executor
+            .transition(&first.lease_id, Phase::Running, 11, "provider running")
+            .unwrap();
+        let mut controller = executor.clone();
+        let mut next = prepare("cancelled-before-dispatch", 12);
+        next.queues_behind_current = true;
+        let (next, _) = controller.prepare(next).unwrap();
+        let cancelled = executor.cancel_unaccepted_assignment(next, 13).unwrap();
+        assert_eq!(
+            cancelled.terminal_status.as_deref(),
+            Some("cancelled_before_dispatch")
+        );
+        assert_eq!(
+            executor
+                .control(
+                    &first.logical_thread_uid,
+                    &first.lease_id,
+                    first.generation,
+                    Some(&first.run_id)
+                )
+                .unwrap()
+                .lease_id,
+            first.lease_id
+        );
+        assert_eq!(
+            executor
+                .active_for_thread(&first.logical_thread_uid)
+                .unwrap()
+                .lease_id,
+            first.lease_id
+        );
+        assert!(
+            executor.prepare(prepare("replacement", 14)).is_err(),
+            "a terminal future reservation must not hide the earlier writer"
+        );
+        let mut replacement = prepare("foreign-executor", 14);
+        replacement.scope.executor_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+        replacement.queues_behind_current = true;
+        assert!(executor.prepare(replacement).is_err());
+        let mut replacement = cancelled.clone();
+        replacement.lease_id = uuid::Uuid::new_v4().to_string();
+        replacement.run_id = "replacement-run".into();
+        replacement.generation += 1;
+        replacement.queued_behind_current = false;
+        assert!(executor.accept_assignment(replacement).is_err());
+        assert_eq!(executor.get(&first.lease_id).unwrap().phase, Phase::Running);
     }
 }

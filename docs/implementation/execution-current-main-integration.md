@@ -116,21 +116,51 @@ recreate a removed peer and never regresses its last-reached timestamp.
 Unit tests cover those restrictions and continued uncertainty until exact
 terminal evidence arrives.
 
-With these corrections the live restart test proceeds further, then fails when
-cancellation overtakes a follow-up before the executor installs its assignment.
-The resulting stop names an unknown lease and is correctly refused. A previous
+With those corrections the live restart test proceeded further, then failed when
+cancellation overtook a follow-up before the executor installed its assignment.
+The resulting stop named an unknown lease and was correctly refused. A previous
 same-attempt fallback hid this case by weakening lease validation. Do not restore
-that fallback. Implement an explicit pending-assignment cancellation contract
-that records proved non-delivery without stopping an older provider generation
-or delivering cancelled input just to establish a lease.
+that fallback.
 
 After the acknowledgement/reachability corrections, all 72 remote-task units,
 ten lease-book units and the narrow database reachability regression pass.
-Formatting and diff checks pass. The live restart/cancel failure above remains
-open and blocks a green combined-suite claim.
+Formatting and diff checks passed at that checkpoint.
+
+## Pending-assignment cancellation correction
+
+The failing-then-passing regression now covers an explicit pending assignment
+and its exact input command id. The executor validates the full assignment
+against the controller, current physical thread and stop control. It records a
+terminal never-dispatched cancellation and cancelled-input marker together,
+without changing the older run or issuing its stop. A delayed input is refused
+before and after restore. Changed owner, executor, thread, attempt or lease
+fields and invalid command ids are rejected without mutations.
+
+The controller sends its exact pending assignment instead of substituting an
+older accepted lease. It requires the matching input command id and terminal
+non-delivery evidence before consuming the saved send/stop. Ordinary transport
+acknowledgements still leave execution uncertain.
+
+Cancellation records cannot hide earlier unsettled writers from placement
+replacement checks or fence their controls. Stops for an already cancelled
+future generation cannot stop the current provider turn. Assignments that
+already reached the executor use the normal stop path; this correction does
+not manufacture non-delivery evidence for them.
+
+The formerly failing live restart test now passes. A new authenticated two-server
+test crashes the controller while a send is held, restores the saved stop,
+restarts both sides and replays both keyed calls. It verifies terminal
+cancellation, the unchanged earlier executor binding and zero provider inputs
+containing the cancelled prompt.
+
+The all-target build and 74 remote-task, 11 lease-book and 32 runtime unit tests
+pass at this checkpoint. The new cancelled-generation regression also checks
+that its terminal record cannot hide an earlier writer from controller prepare
+or executor assignment checks. Exact source still needs a full combined run.
 
 Issue #27 remains open. Queued generations still need distinct current-run and
-queued-run control semantics and the pending-assignment cancellation contract.
+already-accepted queued-run control semantics. Pending-assignment cancellation
+is now covered, but a full combined suite on this correction is still required.
 Pending-input and owned-child quiescence now have regression coverage; restart
 and cross-executor process proof still need review. Moving the same logical run between executors remains
 unproven. Scheduler/catalog composition, exact-head CI, serialized publication

@@ -66,6 +66,22 @@ match. A different controller or conflicting generation is refused. Stops,
 steers and follow-ups name the exact lease, generation and run they observed;
 an older control cannot affect a newer generation.
 
+If cancellation overtakes a follow-up before the executor accepts its
+assignment, the stop carries that exact pending assignment and input command
+id. The executor verifies them against the authenticated controller and physical
+thread, then records `terminalStatus: "cancelled_before_dispatch"`. It stores a
+durable cancelled-input marker so a delayed send cannot dispatch after restart.
+It does not abort the older provider turn or deliver the cancelled prompt.
+The controller consumes the pending send and stop only after the matching
+terminal cancellation evidence arrives. A transport stop receipt alone cannot
+produce that result.
+
+A cancellation record for a never-dispatched generation does not replace the
+current writer. Replacement checks still inspect earlier unsettled leases, and
+current controls ignore a later never-dispatched cancellation record. If an
+assignment already reached the executor, this cancellation path cannot claim
+non-delivery. The normal provider-settlement checks still apply.
+
 ## Controller offline and uncertainty
 
 Lease expiry, a missing peer acknowledgement, an executor link loss or a
