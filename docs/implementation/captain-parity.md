@@ -391,10 +391,13 @@ Reachability and harness discovery are part of the same record. An ACP harness i
 probed with a metadata-only `initialize` before allocation; an agent that
 advertises neither HTTP nor stdio MCP is reported as `executable: false` with
 its discovery and MCP state, and `delegate_task` or crew creation refuses before
-creating a thread. A linked peer must also be reachable and free of a recorded
-reachability or authentication error before remote delegation, placement or
-document reads are reported available. A revoked origin device closes remote
-Captain document reads at discovery and dispatch.
+creating a thread. Linked peers publish those executable, discovery and MCP
+fields with each harness, so the origin refuses an advertised non-executable
+target before creating its metadata-only task. The target re-probes before its
+own allocation as well. A linked peer must also be reachable and free of a
+recorded reachability or authentication error before remote delegation,
+placement or document reads are reported available. A revoked origin device
+closes remote Captain document reads at discovery and dispatch.
 
 Coverage sits in `src/capabilities.rs` unit tests and
 `tests/support/capability_parity.rs`. The runtime tests drive real

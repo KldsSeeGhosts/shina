@@ -48,7 +48,11 @@ fn fixture_rpc_as(url: &str, token: &str, method: &str, params: Value) -> Value 
     let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
     write!(stream, "POST {} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", url.path(), body.len(), body).unwrap();
     let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
+    if let Err(error) = stream.read_to_string(&mut response)
+        && (error.kind() != std::io::ErrorKind::ConnectionReset || response.is_empty())
+    {
+        panic!("{method} response read failed: {error}; received {response:?}");
+    }
     serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
