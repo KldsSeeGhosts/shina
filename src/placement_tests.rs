@@ -111,6 +111,10 @@ impl Fixture {
             assert!(Instant::now() < deadline, "repository identity unresolved");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let mut contracts = contracts.to_vec();
+        if !contracts.contains(&crate::protocol::EXECUTION_LEASES) {
+            contracts.push(crate::protocol::EXECUTION_LEASES);
+        }
         state.peers.push(crate::peer::Peer {
             server_id: uuid::Uuid::new_v4().to_string(),
             host: "127.0.0.1:1".into(),
@@ -1396,8 +1400,19 @@ fn a_peer_launch_reservation_commits_before_any_provisioning_starts() {
     });
     let mut runtime = crate::runtime::RuntimeState::from_state(state);
     let database = crate::database::Database::open(&runtime.state.data_dir).unwrap();
+    let mut origin = peer_origin();
+    origin.attempt_id = Some("attempt-1".into());
     database
-        .issue_scoped_device("parent", "parent-token", &["read", "peer-delegate"])
+        .issue_peer_device(
+            "parent",
+            "parent-token",
+            &json!({
+                "serverId":origin.server_id,
+                "workspaceId":runtime.state.identity.workspace_id,
+                "ownerId":runtime.state.identity.owner_id,
+                "controllerId":origin.server_id
+            }),
+        )
         .unwrap();
     runtime.database = Some(database.clone());
     let launch = Command::new(
@@ -1405,7 +1420,21 @@ fn a_peer_launch_reservation_commits_before_any_provisioning_starts() {
         json!({
             "projectId": 1, "harness": "pi", "provider": "cpa",
             "model": "fixture", "brief": "Do the delegated work",
-            "title": "Worker", "origin": serde_json::to_value(peer_origin()).unwrap(),
+            "title": "Worker", "origin": serde_json::to_value(&origin).unwrap(),
+            "execution": {
+                "leaseId":uuid::Uuid::new_v4().to_string(),"generation":1,
+                "workspaceId":runtime.state.identity.workspace_id,
+                "ownerId":runtime.state.identity.owner_id,
+                "runAsOwnerId":runtime.state.identity.owner_id,
+                "controllerId":origin.server_id,
+                "initiatingDeviceId":"44444444-4444-4444-8444-444444444444",
+                "executorId":runtime.state.identity.executor_id,
+                "logicalCaptainUid":null,
+                "logicalThreadUid":uuid::Uuid::new_v4().to_string(),
+                "runId":uuid::Uuid::new_v4().to_string(),
+                "attemptId":"attempt-1","deliveryId":"delivery-1",
+                "preparedAt":crate::lifecycle::now(),"queuesBehindCurrent":false
+            }
         }),
     );
     let receipt = runtime.command("parent", launch).unwrap();

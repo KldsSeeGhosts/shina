@@ -67,6 +67,7 @@
       "captain-peer-documents-v1",
       "placement-v1",
       "identity-v1",
+      "execution-leases-v1",
       "admission-scheduler-v1"
     ],
     "controllerId": "<uuid>",
@@ -105,7 +106,7 @@
     "ownerId": "<uuid>",
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 46,
+    "protocolMinor": 47,
     "serverId": "<serverId>",
     "serverTime": "<time>",
     "workspaceId": "<uuid>"

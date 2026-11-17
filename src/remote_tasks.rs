@@ -25,9 +25,10 @@ async fn peer_completion(
     thread: &Value,
     metadata: &Value,
 ) -> Result<Value, String> {
-    if !metadata["resultId"].is_string()
+    let result = &metadata["result"];
+    if !result["resultId"].is_string()
         || !matches!(
-            metadata["status"].as_str(),
+            result["status"].as_str(),
             Some("completed" | "failed" | "cancelled")
         )
     {
@@ -37,7 +38,7 @@ async fn peer_completion(
         ));
     }
     let mut text = String::new();
-    if let Some(item) = metadata["replyItemId"].as_str() {
+    if let Some(item) = result["replyItemId"].as_str() {
         let mut offset = 0u64;
         loop {
             let receipt = crate::client::remote_rpc(link, "peer.thread.read",
@@ -73,11 +74,18 @@ async fn peer_completion(
     let mut ack = crate::client::remote_rpc(
         link,
         "peer.task.ack",
-        json!({"threadId":thread,"resultId":metadata["resultId"]}),
+        json!({"threadId":thread,"resultId":result["resultId"]}),
     )
     .await?;
     if ack["status"] == "accepted" && ack["result"]["acknowledged"] == true {
         ack["result"]["result"]["reply"] = json!(text);
+        // Preserve the exact wait observation, not an executor-selected new
+        // assignment. The accepted result id binds this acknowledgement.
+        for field in ["execution", "inputs"] {
+            if let Some(value) = metadata.get(field) {
+                ack["result"][field] = value.clone();
+            }
+        }
     }
     Ok(ack)
 }
@@ -136,6 +144,56 @@ pub async fn wait_for_peer_thread(
                 }
                 request
             });
+        let requested_execution = args.get("execution").filter(|value| !value.is_null());
+        if let Some(control) = requested_execution {
+            let id = control["leaseId"]
+                .as_str()
+                .ok_or("Execution wait requires leaseId.")?;
+            if record["execution"]["leaseId"] != id
+                && record["nextExecution"]["leaseId"] != id
+                && !record["peerInputExecutions"]
+                    .as_object()
+                    .is_some_and(|inputs| inputs.values().any(|binding| binding["leaseId"] == id))
+            {
+                return Err("This execution does not belong to the requested peer thread.".into());
+            }
+        }
+        let bound_execution = record
+            .get("execution")
+            .filter(|binding| binding.is_object())
+            .unwrap_or(&record["nextExecution"]);
+        let execution = requested_execution.unwrap_or(bound_execution)["leaseId"]
+            .as_str()
+            .and_then(|lease_id| {
+                state["index"]["execution"]["leases"]
+                    .as_array()
+                    .and_then(|leases| leases.iter().find(|lease| lease["leaseId"] == lease_id))
+            })
+            .or_else(|| {
+                state["index"]["execution"]["leases"]
+                    .as_array()
+                    .and_then(|leases| {
+                        leases.iter().find(|lease| {
+                            lease["logicalThreadUid"] == record["threadUid"]
+                                && lease["runId"] == record["runId"]
+                        })
+                    })
+            })
+            .cloned()
+            .unwrap_or(Value::Null);
+        if let Some(control) = requested_execution
+            && (execution.is_null()
+                || execution["generation"] != control["generation"]
+                || execution["runId"] != control["runId"])
+        {
+            return Err("Execution wait does not match the exact saved generation and run.".into());
+        }
+        let current =
+            requested_execution.is_none() || execution["leaseId"] == record["execution"]["leaseId"];
+        let execution_settled = (!bound_execution.is_object() && requested_execution.is_none())
+            || matches!(execution["phase"].as_str(), Some("terminal" | "fenced"));
+        let request = current.then_some(request).flatten();
+        let document_request = current.then_some(document_request).flatten();
         // The worker's live admission reservation rides the wait answer so
         // the origin sees queued/held/uncertain occupancy, not just turns.
         let admission = record["admission"]
@@ -149,15 +207,22 @@ pub async fn wait_for_peer_thread(
             .cloned()
             .unwrap_or(Value::Null);
         let mut status = json!({"threadId":thread["id"],
-            "finished":record["peerOrigin"]["result"].is_object(),
+            "finished":current && execution_settled && record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
             "documentRequest":document_request,"status":thread["status"],
-            "attemptId":record["peerOrigin"]["attemptId"],
-            "runId":thread.get("runId"),
+            "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"],
+            "runId":record["runId"],"execution":execution,
             "inputs":record["peerOrigin"]["inputs"].clone(),
-            "placement":record["placement"],
-            "admission":admission});
-        status["result"] = record["peerOrigin"]["result"].clone();
+            "admission":admission,
+            "providerAcceptedRun":record["providerAcceptedRun"],
+            "providerRunningRun":record["providerRunningRun"],
+            "providerTerminalRun":record["providerTerminalRun"],
+            "providerTerminalStatus":record["providerTerminalStatus"]});
+        status["result"] = if current && execution_settled {
+            record["peerOrigin"]["result"].clone()
+        } else {
+            Value::Null
+        };
         status["revision"] = json!(crate::protocol::revision(&status));
         Ok(status)
     };
@@ -261,6 +326,195 @@ pub(super) fn transcript_page(thread: &Thread, args: &Value) -> Result<Value, St
     )
 }
 
+/// Mirror only what the authenticated executor reported. A launch or send
+/// reply proves executor acceptance at most; provider phases come from a
+/// later wait whose lease identity must still match the controller record.
+fn apply_execution_reply(
+    book: &mut crate::execution::Book,
+    remote: &mut RemoteTask,
+    value: &Value,
+    executor_acknowledgement: bool,
+    transport_receipt: bool,
+) -> Result<(), String> {
+    if value["cancelledBeforeDispatch"] == true {
+        let pending = remote
+            .controlled_input()
+            .ok_or("Pending cancellation reply has no saved input command.")?;
+        if !transport_receipt
+            || !remote.stop_owed
+            || value["cancelledInputCommandId"].as_str()
+                != Some(pending.command_id.to_string().as_str())
+            || value["execution"]["terminalStatus"] != "cancelled_before_dispatch"
+            || value["execution"]["phase"] != "terminal"
+        {
+            return Err(
+                "Pending cancellation reply does not match the saved input and stop.".into(),
+            );
+        }
+    }
+    let execution = value.get("execution").filter(|value| !value.is_null());
+    let Some(expected) = remote.execution.as_ref() else {
+        return if execution.is_some() {
+            Err("Executor returned an execution lease without a controller assignment.".into())
+        } else {
+            Ok(())
+        };
+    };
+    let stored = book
+        .get(&expected.lease_id)
+        .cloned()
+        .ok_or("The controller execution assignment is missing.")?;
+    if expected.binding() != stored.binding()
+        || expected.schema != stored.schema
+        || expected.request_key != stored.request_key
+        || expected.queued_behind_current != stored.queued_behind_current
+        || stored.executor_id != remote.server_id
+    {
+        return Err("The saved execution assignment does not match this target.".into());
+    }
+    if let Some(execution) = execution {
+        let lease: crate::execution::Lease =
+            serde_json::from_value(execution.clone()).map_err(|_| "Invalid executor lease.")?;
+        let alias = value["threadId"]
+            .as_u64()
+            .or_else(|| remote.thread_id.map(|id| id as u64));
+        let saved_value = stored.value();
+        let returned_value = lease.value();
+        for field in [
+            "leaseId",
+            "generation",
+            "workspaceId",
+            "ownerId",
+            "runAsOwnerId",
+            "controllerId",
+            "initiatingDeviceId",
+            "executorId",
+            "logicalCaptainUid",
+            "logicalThreadUid",
+            "runId",
+            "attemptId",
+            "deliveryId",
+            "schema",
+            "preparedAt",
+            "requestKey",
+            "queuedBehindCurrent",
+        ] {
+            if saved_value[field] != returned_value[field] {
+                return Err(format!(
+                    "Executor returned a lease that does not match the controller assignment in {field}."
+                ));
+            }
+        }
+        if stored.binding() != lease.binding()
+            || stored.schema != lease.schema
+            || stored.prepared_at != lease.prepared_at
+            || stored.request_key != lease.request_key
+            || stored.queued_behind_current != lease.queued_behind_current
+            || alias.is_none()
+            || lease.executor_thread_alias != alias
+            || remote.thread_id.is_some_and(|id| alias != Some(id as u64))
+            || stored
+                .executor_thread_alias
+                .is_some_and(|alias| lease.executor_thread_alias != Some(alias))
+            || stored
+                .executor_thread_uid
+                .as_ref()
+                .is_some_and(|uid| lease.executor_thread_uid.as_ref() != Some(uid))
+            || !lease
+                .executor_thread_uid
+                .as_deref()
+                .is_some_and(|uid| uuid::Uuid::parse_str(uid).is_ok())
+        {
+            return Err(
+                "Executor returned a lease that does not match the controller assignment.".into(),
+            );
+        }
+        let target = lease.phase;
+        use crate::execution::Phase;
+        if (value["finished"] == true || value["acknowledged"] == true)
+            && !matches!(target, Phase::Terminal | Phase::Fenced)
+        {
+            return Err("Executor reported completion without settling the exact lease.".into());
+        }
+        if target == Phase::Terminal
+            && !lease
+                .terminal_status
+                .as_deref()
+                .is_some_and(|status| !status.trim().is_empty())
+        {
+            return Err("Executor terminal evidence is missing its outcome.".into());
+        }
+        if target == Phase::Fenced
+            && !lease
+                .fence_evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.trim().is_empty())
+        {
+            return Err("Executor fence evidence is missing its quiescence proof.".into());
+        }
+        if stored.phase != target && !matches!(stored.phase, Phase::Terminal | Phase::Fenced) {
+            match target {
+                Phase::Terminal => {
+                    book.terminal(
+                        &lease.lease_id,
+                        lease.terminal_status.as_deref().expect("validated outcome"),
+                        lifecycle::now(),
+                        "authenticated executor reported terminal provider evidence",
+                    )?;
+                }
+                Phase::Fenced => {
+                    book.fence(
+                        &lease.lease_id,
+                        lifecycle::now(),
+                        lease
+                            .fence_evidence
+                            .as_deref()
+                            .expect("validated fence evidence"),
+                    )?;
+                }
+                Phase::Uncertain => {
+                    book.uncertain(
+                        &lease.lease_id,
+                        lifecycle::now(),
+                        lease
+                            .uncertain_reason
+                            .clone()
+                            .unwrap_or_else(|| "executor reported uncertainty".into()),
+                    )?;
+                }
+                _ if stored.phase < target => {
+                    book.transition(
+                        &lease.lease_id,
+                        target,
+                        lifecycle::now(),
+                        "authenticated executor reported execution phase",
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        let saved = book
+            .get_mut(&lease.lease_id)
+            .expect("validated controller lease");
+        saved.executor_thread_alias = lease.executor_thread_alias;
+        saved.executor_thread_uid = lease.executor_thread_uid;
+        remote.execution = Some(saved.clone());
+    } else if executor_acknowledgement || transport_receipt {
+        if executor_acknowledgement && stored.phase < crate::execution::Phase::ExecutorAccepted {
+            book.transition(
+                &expected.lease_id,
+                crate::execution::Phase::ExecutorAccepted,
+                lifecycle::now(),
+                "authenticated executor acknowledged the assignment; provider acceptance is not implied",
+            )?;
+        }
+        remote.execution = book.get(&expected.lease_id).cloned();
+    } else {
+        return Err("Executor progress is missing its exact execution lease.".into());
+    }
+    Ok(())
+}
+
 /// One peer command's observed input fate. The target records this only from
 /// the adapter or provider event bound to the exact command id. A missing
 /// entry is never evidence of acceptance.
@@ -323,6 +577,8 @@ pub(crate) struct PeerTaskIntent {
     pub message: Option<String>,
     #[serde(default)]
     pub target_run_id: Option<String>,
+    #[serde(default)]
+    pub execution: Option<crate::execution::Binding>,
     /// queued | stop_pending | applied | settled
     pub queue_state: String,
     /// not_observed | requested | accepted | rejected | unknown
@@ -370,6 +626,7 @@ impl PeerTaskIntent {
             requested_delivery: requested_delivery.into(),
             message: Some(message),
             target_run_id,
+            execution: None,
             queue_state: "queued".into(),
             provider_state: "not_observed".into(),
             provider_basis: None,
@@ -399,6 +656,7 @@ impl PeerTaskIntent {
             requested_delivery: "cancel".into(),
             message: None,
             target_run_id,
+            execution: None,
             queue_state: "stop_pending".into(),
             provider_state: "not_observed".into(),
             provider_basis: None,
@@ -783,7 +1041,7 @@ mod tests {
         state.threads[0].project = Some(1);
         state.peers.push(crate::peer::Peer {
             server_id:uuid::Uuid::new_v4().to_string(),host:"127.0.0.1:1".into(),label:"Target".into(),linked_at:0,
-            capabilities:json!({"contracts":[crate::protocol::PLACEMENT,crate::protocol::PEER_TASK_EVIDENCE],
+            capabilities:json!({"contracts":[crate::protocol::PLACEMENT,crate::protocol::EXECUTION_LEASES,crate::protocol::PEER_TASK_EVIDENCE],
                 "projects":[{"id":9,"path":"/target/project","name":"Project","gitRemote":"example.com/team/repo"}],
                 "harnesses":[{"id":"pi"}],"models":[{"provider":"cpa","id":"fixture","reasoning_levels":["off"]}]}),
             last_reached_at:Some(0),last_error:None,
@@ -1952,6 +2210,1778 @@ mod tests {
         state.threads[1].peer_origin = Some(origin);
         state.threads[1].status = Status::Running;
         child
+    }
+
+    fn assigned_lease(
+        state: &State,
+        thread: usize,
+        controller: &str,
+        generation: u64,
+        run: &str,
+        attempt: &str,
+        queued: bool,
+    ) -> crate::execution::Lease {
+        crate::execution::Lease {
+            schema: crate::execution::SCHEMA,
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            generation,
+            workspace_id: state.identity.workspace_id.clone(),
+            owner_id: state.identity.owner_id.clone(),
+            run_as_owner_id: state.identity.owner_id.clone(),
+            controller_id: controller.into(),
+            initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+            executor_id: state.identity.executor_id.clone(),
+            logical_captain_uid: None,
+            logical_thread_uid: state
+                .snapshot_identity()
+                .thread_uid(thread)
+                .expect("thread identity")
+                .into(),
+            executor_thread_alias: Some(thread as u64),
+            executor_thread_uid: state
+                .snapshot_identity()
+                .thread_uid(thread)
+                .map(str::to_owned),
+            run_id: run.into(),
+            attempt_id: Some(attempt.into()),
+            delivery_id: Some(format!("{attempt}-result")),
+            request_key: None,
+            queued_behind_current: queued,
+            phase: crate::execution::Phase::Dispatched,
+            prepared_at: 1,
+            saved_at: 1,
+            dispatched_at: Some(1),
+            executor_accepted_at: None,
+            provider_accepted_at: None,
+            running_at: None,
+            terminal_at: None,
+            terminal_status: None,
+            uncertain_at: None,
+            uncertain_reason: None,
+            fenced_at: None,
+            fence_evidence: None,
+            last_observed_at: 1,
+            lease_expires_at: crate::execution::LEASE_MILLIS + 1,
+            evidence: vec!["test assignment".into()],
+        }
+    }
+
+    fn execution_reply_fixture() -> (State, crate::execution::Lease) {
+        let mut state = fixture();
+        let child = state.tasks[0].child_thread_id;
+        let mut lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &state.tasks[0].attempt_id,
+            false,
+        );
+        lease.executor_id = state.tasks[0].remote.as_ref().unwrap().server_id.clone();
+        lease.executor_thread_alias = Some(9);
+        lease.executor_thread_uid = Some(uuid::Uuid::new_v4().to_string());
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        remote.thread_id = Some(9);
+        remote.execution = Some(lease.clone());
+        (state, lease)
+    }
+
+    #[test]
+    fn execution_reply_requires_the_complete_saved_assignment() {
+        for field in [
+            "workspaceId",
+            "ownerId",
+            "runAsOwnerId",
+            "controllerId",
+            "initiatingDeviceId",
+            "executorId",
+            "logicalCaptainUid",
+            "logicalThreadUid",
+            "runId",
+            "attemptId",
+            "deliveryId",
+            "executorThreadUid",
+            "requestKey",
+            "generation",
+            "schema",
+            "queuedBehindCurrent",
+            "executorThreadAlias",
+            "preparedAt",
+        ] {
+            let (mut state, lease) = execution_reply_fixture();
+            let mut value = lease.value();
+            value["phase"] = json!("running");
+            value[field] = match field {
+                "generation" => json!(lease.generation + 1),
+                "schema" => json!(lease.schema + 1),
+                "queuedBehindCurrent" => json!(!lease.queued_behind_current),
+                "executorThreadAlias" => json!(19),
+                "preparedAt" => json!(lease.prepared_at + 1),
+                _ => json!(uuid::Uuid::new_v4().to_string()),
+            };
+            let before = state.execution.projection();
+            let remote = state.tasks[0].remote.as_mut().unwrap();
+            let remote_before = serde_json::to_value(&*remote).unwrap();
+            let result = apply_execution_reply(
+                &mut state.execution,
+                remote,
+                &json!({"execution":value}),
+                false,
+                false,
+            );
+            assert!(result.is_err(), "the executor changed {field}");
+            assert_eq!(state.execution.projection(), before, "{field}");
+            assert_eq!(
+                serde_json::to_value(&*remote).unwrap(),
+                remote_before,
+                "{field}"
+            );
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn execution_reply_cannot_rebase_a_stop_to_another_saved_lease() {
+        let (mut state, first) = execution_reply_fixture();
+        let mut other = first.clone();
+        other.lease_id = uuid::Uuid::new_v4().to_string();
+        other.logical_thread_uid = uuid::Uuid::new_v4().to_string();
+        other.run_id = uuid::Uuid::new_v4().to_string();
+        let (mut other, _) = state.execution.accept_assignment(other).unwrap();
+        other.phase = crate::execution::Phase::Terminal;
+        other.terminal_status = Some("cancelled".into());
+        let before = state.execution.projection();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        let remote_before = serde_json::to_value(&*remote).unwrap();
+        assert!(
+            apply_execution_reply(
+                &mut state.execution,
+                remote,
+                &json!({"execution":other.value()}),
+                false,
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(state.execution.projection(), before);
+        assert_eq!(serde_json::to_value(&*remote).unwrap(), remote_before);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn execution_reply_rejection_does_not_apply_launch_or_wait_progress() {
+        for method in [
+            "peer.thread.launch",
+            "peer.thread.wait",
+            "peer.thread.send",
+            "peer.thread.stop",
+            "peer.task.ack",
+        ] {
+            let (mut state, lease) = execution_reply_fixture();
+            let attempt = state.tasks[0].attempt_id.clone();
+            let command = Command::new("peer.thread.send", json!({"threadId":9}));
+            {
+                let remote = state.tasks[0].remote.as_mut().unwrap();
+                remote.send_command = Some(command.clone());
+                remote.stop_owed = true;
+                remote.stop_command_id = Some(uuid::Uuid::new_v4());
+                remote.stop_attempt_id = Some(attempt.clone());
+            }
+            if method == "peer.task.ack" {
+                state.tasks[0].state = TaskState::Cancelled;
+            }
+            let task_state = state.tasks[0].state;
+            let placement = state.tasks[0].remote.as_ref().unwrap().placement.clone();
+            let before = state.execution.projection();
+            let mut incompatible = lease.clone();
+            incompatible.lease_id = uuid::Uuid::new_v4().to_string();
+            incompatible.phase = crate::execution::Phase::Running;
+            reply(
+                &mut state,
+                method,
+                accepted(json!({
+                    "threadId":19, "execution":incompatible.value(),
+                    "revision":"foreign", "finished":false, "needsYou":true,
+                    "placement":{"phase":"foreign"}, "acknowledged":true,
+                    "result":{"status":"cancelled","attemptId":attempt,"runId":lease.run_id}
+                })),
+            );
+            let remote = state.tasks[0].remote.as_ref().unwrap();
+            assert_eq!(remote.state, RemoteState::UpdateRequired, "{method}");
+            assert_eq!(remote.thread_id, Some(9), "{method}");
+            assert_eq!(remote.placement, placement, "{method}");
+            assert!(!remote.needs_you, "{method}");
+            assert!(remote.wait_revision.is_none(), "{method}");
+            assert_eq!(
+                remote
+                    .send_command
+                    .as_ref()
+                    .map(|command| command.command_id),
+                Some(command.command_id),
+                "{method}"
+            );
+            assert!(remote.stop_owed, "{method}");
+            assert!(remote.stop_command_id.is_some(), "{method}");
+            assert_eq!(state.tasks[0].state, task_state, "{method}");
+            assert_eq!(state.execution.projection(), before, "{method}");
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn execution_reply_learns_one_physical_alias_and_accepts_exact_terminal_evidence() {
+        let (mut state, lease) = execution_reply_fixture();
+        {
+            let saved = state.execution.get_mut(&lease.lease_id).unwrap();
+            saved.executor_thread_alias = None;
+            saved.executor_thread_uid = None;
+        }
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        remote.thread_id = None;
+        remote.execution = state.execution.get(&lease.lease_id).cloned();
+        apply_execution_reply(
+            &mut state.execution,
+            remote,
+            &json!({"threadId":9,"execution":lease.value()}),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .execution
+                .get(&lease.lease_id)
+                .unwrap()
+                .executor_thread_alias,
+            Some(9)
+        );
+        assert_eq!(
+            state
+                .execution
+                .get(&lease.lease_id)
+                .unwrap()
+                .executor_thread_uid,
+            lease.executor_thread_uid
+        );
+        remote.thread_id = Some(9);
+        state
+            .execution
+            .uncertain(&lease.lease_id, 5, "lost link")
+            .unwrap();
+        let mut terminal = lease.clone();
+        terminal.phase = crate::execution::Phase::Terminal;
+        terminal.terminal_status = Some("completed".into());
+        apply_execution_reply(
+            &mut state.execution,
+            remote,
+            &json!({"execution":terminal.value()}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Terminal
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn execution_reply_requires_assignment_and_proof_before_releasing_uncertainty() {
+        let (mut state, lease) = execution_reply_fixture();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        state
+            .execution
+            .uncertain(&lease.lease_id, 5, "lost link")
+            .unwrap();
+        for value in [
+            json!({}),
+            json!({"execution":"invalid"}),
+            json!({"execution":{}}),
+            json!({"threadId":9,"acknowledged":true,
+                "result":{"status":"failed","runId":lease.run_id},
+                "execution":lease.value()}),
+        ] {
+            let before = state.execution.projection();
+            assert!(
+                apply_execution_reply(&mut state.execution, remote, &value, false, false,).is_err()
+            );
+            assert_eq!(state.execution.projection(), before);
+        }
+        let mut fenced = lease.clone();
+        fenced.phase = crate::execution::Phase::Fenced;
+        let before = state.execution.projection();
+        assert!(
+            apply_execution_reply(
+                &mut state.execution,
+                remote,
+                &json!({"execution":fenced.value()}),
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(state.execution.projection(), before);
+        fenced.fence_evidence = Some("executor verified process exit and empty input queue".into());
+        apply_execution_reply(
+            &mut state.execution,
+            remote,
+            &json!({"execution":fenced.value()}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Fenced
+        );
+        remote.execution = None;
+        assert!(
+            apply_execution_reply(
+                &mut state.execution,
+                remote,
+                &json!({"execution":fenced.value()}),
+                false,
+                false,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn replay_without_authoritative_history_does_not_settle_a_peer_lease() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let origin = state.threads[1].peer_origin.as_ref().unwrap();
+        let attempt = origin.attempt_id.clone().unwrap();
+        let brief = origin.attempt_message.clone();
+        let lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &attempt,
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        state
+            .execution
+            .uncertain(&lease.lease_id, 2, "executor restarted")
+            .unwrap();
+        let thread = &mut state.threads[1];
+        thread.execution = Some(lease.binding());
+        thread.run_id = Some(lease.run_id.clone());
+        thread.recovering_task = true;
+        // Even a plausible final reply is not evidence if the adapter did not
+        // replay provider history.
+        thread.task_history = Some(json!({"success":true,"data":{
+            "historyReplayed":false,"messages":[
+                {"role":"user","content":[{"type":"text","text":brief}]},
+                {"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"A result"}]}
+            ]
+        }}));
+        state.capture_peer_results();
+        state.refresh_execution(3);
+        assert!(
+            state.threads[1]
+                .peer_origin
+                .as_ref()
+                .unwrap()
+                .result
+                .is_none()
+        );
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Uncertain
+        );
+    }
+
+    #[test]
+    fn a_transport_ack_preserves_uncertainty_without_blocking_later_exact_evidence() {
+        let (mut state, lease) = execution_reply_fixture();
+        let uncertain = state
+            .execution
+            .uncertain(&lease.lease_id, 5, "target offline")
+            .unwrap();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        remote.execution.as_mut().unwrap().phase = crate::execution::Phase::Prepared;
+        let before = state.execution.projection();
+        assert!(
+            apply_execution_reply(
+                &mut state.execution,
+                remote,
+                &json!({"threadId":9,"input":"queued"}),
+                true,
+                false,
+            )
+            .is_ok(),
+            "transport acceptance must not try to clear existing uncertainty"
+        );
+        assert_eq!(state.execution.projection(), before);
+        assert_eq!(remote.execution.as_ref().unwrap().phase, uncertain.phase);
+        let mut terminal = lease.clone();
+        terminal.phase = crate::execution::Phase::Terminal;
+        terminal.terminal_status = Some("completed".into());
+        apply_execution_reply(
+            &mut state.execution,
+            remote,
+            &json!({"execution":terminal.value()}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Terminal
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn a_valid_authenticated_reply_clears_stale_offline_metadata_not_lease_uncertainty() {
+        let (mut state, mut lease) = execution_reply_fixture();
+        state.peers[0].last_error = Some("Target offline.".into());
+        lease.phase = crate::execution::Phase::Running;
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"threadId":9,"execution":lease.value(),
+                "revision":"live","finished":false})),
+        );
+        assert!(
+            state.peers[0].last_error.is_none(),
+            "authenticated success is current reachability evidence"
+        );
+        state.refresh_execution(6);
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        state
+            .execution
+            .uncertain(&lease.lease_id, 7, "earlier unverified execution")
+            .unwrap();
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({"threadId":9,"execution":lease.value(),
+                "revision":"still-live","finished":false})),
+        );
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Uncertain,
+            "reachability alone cannot release uncertainty"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn executor_refuses_a_second_controller_and_stale_controls_leave_new_work_alone() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.peers[0].server_id.clone();
+        let first_run = "88888888-8888-4888-8888-888888888888";
+        let second_run = "99999999-9999-4999-8999-999999999999";
+        let first = assigned_lease(&state, child, &controller, 1, first_run, "attempt-a", false);
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = Some("attempt-a".into());
+        let second = assigned_lease(&state, child, &controller, 2, second_run, "attempt-b", true);
+        let (second, _) = state.execution.accept_assignment(second).unwrap();
+        state
+            .execution
+            .terminal(&first.lease_id, "completed", 3, "provider settled")
+            .unwrap();
+        state.threads[1].execution = Some(second.binding());
+        state.threads[1].next_execution = Some(second.binding());
+
+        let stop_serial = state.threads[1].stop_serial;
+        let stale_stop = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.stop",
+                    json!({"threadId":child,
+                        "execution":{"leaseId":first.lease_id,"generation":1,
+                            "runId":first_run,"controllerId":controller}}),
+                ),
+            )
+            .unwrap_err();
+        assert!(stale_stop.contains("generation changed"), "{stale_stop}");
+        assert_eq!(state.threads[1].stop_serial, stop_serial);
+
+        let stale_follow_up = state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.thread.send",
+                    json!({"threadId":child,"message":"stale","delivery":"follow_up",
+                        "attemptId":"attempt-a","execution":{"leaseId":first.lease_id,
+                            "generation":1,"runId":first_run,"controllerId":controller}}),
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            stale_follow_up.contains("generation changed"),
+            "{stale_follow_up}"
+        );
+        assert_eq!(
+            state.threads[1].next_execution.as_ref().unwrap().lease_id,
+            second.lease_id
+        );
+
+        let conflicting = assigned_lease(
+            &state,
+            child,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            3,
+            "aaaaaaaa-1111-4111-8111-111111111111",
+            "attempt-c",
+            false,
+        );
+        let error = state.execution.accept_assignment(conflicting).unwrap_err();
+        assert!(
+            error.contains("different authoritative controller"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_exact_writer_stop_preserves_later_inputs_and_cannot_replay_on_them() {
+        writer_stop_preserves_later_input(false);
+    }
+
+    #[test]
+    fn a_delayed_writer_stop_preserves_its_completed_result_and_later_input() {
+        writer_stop_preserves_later_input(true);
+    }
+
+    fn writer_stop_preserves_later_input(completed_before_stop: bool) {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.identity.controller_id.clone();
+        let first = assigned_lease(
+            &state,
+            child,
+            &controller,
+            1,
+            "current-run",
+            "shared-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].run_id = Some(first.run_id.clone());
+        state.threads[1].status = Status::Running;
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = first.attempt_id.clone();
+        let next = assigned_lease(
+            &state,
+            child,
+            &controller,
+            2,
+            "queued-run",
+            "shared-attempt",
+            true,
+        );
+        let mut assignment = next.value();
+        assignment["queuesBehindCurrent"] = json!(true);
+        let send = Command::new(
+            "peer.thread.send",
+            json!({
+                "threadId":child,"message":"preserve this future input",
+                "delivery":"follow_up","attemptId":"shared-attempt","execution":assignment,
+            }),
+        );
+        state.execute_peer_command("fixture-peer", &send).unwrap();
+        // An input accepted before per-input execution bindings existed must
+        // not remain queued in the durable ledger after stop removes it.
+        let legacy_input = uuid::Uuid::new_v4();
+        state
+            .stage_peer_task_intent(PeerTaskIntent::input(
+                legacy_input.to_string(),
+                child,
+                first.attempt_id.clone(),
+                None,
+                None,
+                "follow_up",
+                "legacy queued input".into(),
+                Some(first.run_id.clone()),
+            ))
+            .unwrap();
+        state.threads[1].pending_injections.push_front(Injection {
+            text: "legacy queued input".into(),
+            shown: false,
+            steer: None,
+            peer_input: Some(legacy_input),
+        });
+        let completed_result = json!({
+            "status":"completed","resultId":"original-completed-result",
+            "replyItemId":null,"attemptId":"shared-attempt","runId":first.run_id,
+            "error":null,"memorySuggestions":[]
+        });
+        if completed_before_stop {
+            state.threads[1].status = Status::Completed;
+            state.threads[1].task_result = Some("done");
+            state.threads[1].peer_origin.as_mut().unwrap().result = Some(completed_result.clone());
+        }
+        let stop = Command::new(
+            "peer.thread.stop",
+            json!({
+                "threadId":child,"attemptId":"shared-attempt","execution":first.control(),
+            }),
+        );
+        state.execute_peer_command("fixture-peer", &stop).unwrap();
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert_eq!(
+            state.threads[1].pending_injections[0].peer_input,
+            Some(send.command_id)
+        );
+        assert_eq!(state.peer_task_intents[0].provider_state, "not_observed");
+        assert_eq!(state.peer_task_intents[0].queue_state, "queued");
+        let legacy = state
+            .peer_task_intent_index(child, &legacy_input.to_string())
+            .unwrap();
+        assert_eq!(state.peer_task_intents[legacy].provider_state, "rejected");
+        assert_eq!(state.peer_task_intents[legacy].queue_state, "settled");
+        if completed_before_stop {
+            assert_eq!(state.threads[1].task_result, Some("done"));
+            assert_eq!(
+                state.threads[1].peer_origin.as_ref().unwrap().result,
+                Some(completed_result)
+            );
+        }
+        let (pi, commands, _events) = Pi::test_connection();
+        let thread = &mut state.threads[1];
+        thread.pi = Some(pi);
+        thread.status = Status::Completed;
+        thread.phase.clear();
+        thread.initializing = false;
+        thread.history_loaded = true;
+        thread.model_provider = "cpa".into();
+        let reply_after_position = thread.messages.len();
+        assert!(thread.flush_injection());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["runId"], next.run_id);
+        assert_eq!(thread.execution, Some(next.binding()));
+        assert!(thread.peer_origin.as_ref().unwrap().result.is_none());
+        assert!(!thread.peer_origin.as_ref().unwrap().acknowledged);
+        assert_eq!(
+            thread.peer_origin.as_ref().unwrap().reply_after_position,
+            reply_after_position
+        );
+        assert_eq!(thread.task_result, None);
+        let input_count = state.threads[1].pending_injections.len();
+        let cancel_index = state
+            .peer_task_intent_index(child, &stop.command_id.to_string())
+            .unwrap();
+        state.peer_task_intents[cancel_index].provider_state = "not_observed".into();
+        state.reconcile_peer_task_intents();
+        assert_eq!(
+            state.peer_task_intents[cancel_index].provider_state,
+            "rejected"
+        );
+        assert_eq!(
+            state.peer_task_intents[cancel_index]
+                .provider_basis
+                .as_deref(),
+            Some("execution_fence")
+        );
+        assert_eq!(state.threads[1].pending_injections.len(), input_count);
+        assert_eq!(state.threads[1].task_result, None);
+        state.threads[1].apply(json!({
+            "type":"response","command":"prompt","id":prompt["id"],
+            "success":true,"data":{"disposition":"queued"}
+        }));
+        state.threads[1].apply(json!({"type":"agent_settled","aborted":false}));
+        assert!(state.capture_peer_results());
+        let result = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["runId"], next.run_id);
+        assert_ne!(result["resultId"], "original-completed-result");
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_accepted_queued_input_can_be_cancelled_without_stopping_the_writer() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.identity.controller_id.clone();
+        let first = assigned_lease(
+            &state,
+            child,
+            &controller,
+            1,
+            "current-run",
+            "current-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state
+            .execution
+            .transition(
+                &first.lease_id,
+                crate::execution::Phase::Running,
+                2,
+                "running",
+            )
+            .unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].run_id = Some(first.run_id.clone());
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = first.attempt_id.clone();
+        let next = assigned_lease(
+            &state,
+            child,
+            &controller,
+            2,
+            "queued-run",
+            "queued-attempt",
+            true,
+        );
+        let mut assignment = next.value();
+        assignment["queuesBehindCurrent"] = json!(true);
+        let send = Command::new(
+            "peer.thread.send",
+            json!({
+                "threadId":child,"message":"cancel only this queued input",
+                "delivery":"attempt","attemptId":"queued-attempt","execution":assignment,
+            }),
+        );
+        state.execute_peer_command("fixture-peer", &send).unwrap();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert_eq!(
+            state.threads[1].peer_origin.as_ref().unwrap().attempt_id,
+            first.attempt_id
+        );
+        assert!(
+            state
+                .execution
+                .control(
+                    &first.logical_thread_uid,
+                    &first.lease_id,
+                    first.generation,
+                    Some(&first.run_id),
+                )
+                .is_ok()
+        );
+        let before_stop = state.threads[1].stop_serial;
+        let stop = Command::new(
+            "peer.thread.stop",
+            json!({
+                "threadId":child,"attemptId":"queued-attempt","execution":next.control(),
+                "sendCommandId":send.command_id,"pendingExecution":assignment,
+            }),
+        );
+        let response = state.execute_peer_command("fixture-peer", &stop).unwrap();
+        assert_eq!(response["cancelledBeforeDispatch"], true);
+        assert_eq!(response["execution"]["leaseId"], next.lease_id);
+        assert_eq!(
+            response["cancelledInputCommandId"],
+            send.command_id.to_string()
+        );
+        assert!(state.threads[1].pending_injections.is_empty());
+        assert_eq!(state.threads[1].execution, Some(first.binding()));
+        assert_eq!(state.threads[1].stop_serial, before_stop);
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        assert_eq!(state.peer_task_intents[0].provider_state, "rejected");
+        assert_eq!(state.peer_task_intents[0].queue_state, "settled");
+        assert_eq!(
+            state.execute_peer_command("fixture-peer", &stop).unwrap(),
+            response,
+            "an exact retry must not stop the older writer"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_execution_lease_cannot_stop_a_matching_attempt() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        let lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &attempt,
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        state.threads[1].execution = Some(lease.binding());
+        let before = serde_json::to_value(&state.threads[1].peer_origin).unwrap();
+        let controls = state.peer_task_intents.len();
+        let response = state.execute_peer_command(
+            "fixture-peer",
+            &Command::new(
+                "peer.thread.stop",
+                json!({
+                    "threadId":child, "attemptId":attempt,
+                    "execution":{
+                        "leaseId":uuid::Uuid::new_v4().to_string(),
+                        "generation":lease.generation, "runId":lease.run_id
+                    }
+                }),
+            ),
+        );
+        assert!(
+            response.is_err(),
+            "an unknown lease staged a stop: {response:?}"
+        );
+        assert_eq!(state.peer_task_intents.len(), controls);
+        assert_eq!(
+            serde_json::to_value(&state.threads[1].peer_origin).unwrap(),
+            before
+        );
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::ExecutorAccepted
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_an_unaccepted_assignment_preserves_the_current_writer_and_blocks_delayed_input() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let first = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            "old-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].run_id = Some(first.run_id.clone());
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = Some("old-attempt".into());
+        let next = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            2,
+            &uuid::Uuid::new_v4().to_string(),
+            "pending-attempt",
+            true,
+        );
+        let mut assignment = next.value();
+        assignment["queuesBehindCurrent"] = json!(true);
+        let send = Command::new(
+            "peer.thread.send",
+            json!({
+                "threadId":child,"message":"must not reach provider","delivery":"attempt",
+                "attemptId":"pending-attempt","execution":assignment,
+            }),
+        );
+        let stop = Command::new(
+            "peer.thread.stop",
+            json!({
+                "threadId":child,"attemptId":"pending-attempt",
+                "sendCommandId":send.command_id,"execution":next.control(),
+                "pendingExecution":assignment,
+            }),
+        );
+        let old_serial = state.threads[1].stop_serial;
+        let book_before = state.execution.projection();
+        let origin_before = serde_json::to_value(&state.threads[1].peer_origin).unwrap();
+        for field in [
+            "ownerId",
+            "logicalThreadUid",
+            "executorId",
+            "attemptId",
+            "leaseId",
+        ] {
+            let mut invalid = stop.clone();
+            invalid.params["pendingExecution"][field] = json!(uuid::Uuid::new_v4().to_string());
+            assert!(
+                state
+                    .execute_peer_command("fixture-peer", &invalid)
+                    .is_err(),
+                "{field}"
+            );
+            assert_eq!(state.execution.projection(), book_before, "{field}");
+            assert_eq!(
+                serde_json::to_value(&state.threads[1].peer_origin).unwrap(),
+                origin_before,
+                "{field}"
+            );
+            assert!(state.peer_task_intents.is_empty(), "{field}");
+        }
+        let mut invalid = stop.clone();
+        invalid.params["sendCommandId"] = json!("not-a-command-id");
+        assert!(
+            state
+                .execute_peer_command("fixture-peer", &invalid)
+                .is_err()
+        );
+        assert_eq!(state.execution.projection(), book_before);
+        let response = state.execute_peer_command("fixture-peer", &stop).unwrap();
+        assert_eq!(response["cancelledBeforeDispatch"], true);
+        assert_eq!(
+            response["cancelledInputCommandId"],
+            send.command_id.to_string()
+        );
+        assert_eq!(response["execution"]["leaseId"], next.lease_id);
+        assert_eq!(
+            response["execution"]["terminalStatus"],
+            "cancelled_before_dispatch"
+        );
+        assert_eq!(
+            state.threads[1].execution.as_ref().unwrap(),
+            &first.binding()
+        );
+        assert_eq!(
+            state.threads[1].run_id.as_deref(),
+            Some(first.run_id.as_str())
+        );
+        assert_eq!(state.threads[1].stop_serial, old_serial);
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::ExecutorAccepted
+        );
+        assert!(
+            state
+                .execution
+                .control(
+                    &first.logical_thread_uid,
+                    &first.lease_id,
+                    first.generation,
+                    Some(&first.run_id)
+                )
+                .is_ok(),
+            "a never-dispatched cancellation cannot fence the current writer"
+        );
+        let cancelled_stop = Command::new(
+            "peer.thread.stop",
+            json!({
+                "threadId":child,"attemptId":"pending-attempt","execution":next.control(),
+            }),
+        );
+        assert!(
+            state
+                .execute_peer_command("fixture-peer", &cancelled_stop)
+                .is_err()
+        );
+        assert_eq!(state.threads[1].stop_serial, old_serial);
+        assert_eq!(
+            state.execute_peer_command("fixture-peer", &stop).unwrap(),
+            response
+        );
+        assert_eq!(
+            state.execute_peer_command("fixture-peer", &send).unwrap()["cancelled"],
+            true
+        );
+        assert!(state.threads[1].pending_injections.is_empty());
+        let snapshot = state.snapshot();
+        let mut restored = State::headless(state.data_dir.clone());
+        restored.restore_global(&snapshot).unwrap();
+        assert_eq!(
+            restored
+                .execute_peer_command("fixture-peer", &send)
+                .unwrap()["cancelled"],
+            true
+        );
+        assert_eq!(
+            restored.execution.get(&next.lease_id).unwrap().phase,
+            crate::execution::Phase::Terminal
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn pending_cancellation_receipts_require_the_exact_saved_input_before_consuming_controls() {
+        let (mut state, mut lease) = execution_reply_fixture();
+        let input = Command::new(
+            "peer.thread.send",
+            json!({"threadId":9,"execution":lease.value()}),
+        );
+        state.tasks[0].state = TaskState::Cancelled;
+        {
+            let remote = state.tasks[0].remote.as_mut().unwrap();
+            remote.send_command = Some(input.clone());
+            remote.stop_owed = true;
+            remote.stop_command_id = Some(uuid::Uuid::new_v4());
+        }
+        lease.phase = crate::execution::Phase::Terminal;
+        lease.terminal_status = Some("cancelled_before_dispatch".into());
+        let mut evidence = json!({"threadId":9,"stopped":true,"input":"accepted",
+            "cancelledBeforeDispatch":true,"cancelledInputCommandId":uuid::Uuid::new_v4().to_string(),
+            "execution":lease.value()});
+        let before = state.execution.projection();
+        reply(&mut state, "peer.thread.stop", accepted(evidence.clone()));
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert_eq!(remote.state, RemoteState::UpdateRequired);
+        assert!(remote.stop_owed);
+        assert_eq!(
+            remote.send_command.as_ref().unwrap().command_id,
+            input.command_id
+        );
+        assert_eq!(state.execution.projection(), before);
+        evidence["cancelledInputCommandId"] = json!(input.command_id.to_string());
+        reply(&mut state, "peer.thread.stop", accepted(evidence));
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert_eq!(remote.state, RemoteState::Done);
+        assert!(!remote.stop_owed);
+        assert!(remote.send_command.is_none());
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Terminal
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_queued_input_keeps_the_older_writer_addressable_until_settlement() {
+        let (mut state, first) = execution_reply_fixture();
+        state
+            .execution
+            .transition(
+                &first.lease_id,
+                crate::execution::Phase::Running,
+                2,
+                "provider started",
+            )
+            .unwrap();
+        let first = state.execution.get(&first.lease_id).unwrap().clone();
+        let mut queued = first.clone();
+        queued.lease_id = uuid::Uuid::new_v4().to_string();
+        queued.generation += 1;
+        queued.run_id = uuid::Uuid::new_v4().to_string();
+        queued.queued_behind_current = true;
+        queued.phase = crate::execution::Phase::Dispatched;
+        let (mut queued, _) = state.execution.accept_assignment(queued).unwrap();
+        let input = Command::new(
+            "peer.thread.send",
+            json!({"threadId":9,"execution":queued.value()}),
+        );
+        let original_stop = uuid::Uuid::new_v4();
+        state.tasks[0].state = TaskState::Cancelled;
+        {
+            let remote = state.tasks[0].remote.as_mut().unwrap();
+            remote.execution = Some(queued.clone());
+            remote
+                .execution_inputs
+                .insert(queued.lease_id.clone(), input.clone());
+            remote.accepted_send = Some(input.clone());
+            remote.stop_owed = true;
+            remote.stop_command_id = Some(original_stop);
+            remote.stop_attempt_id = queued.attempt_id.clone();
+        }
+        queued.phase = crate::execution::Phase::Terminal;
+        queued.terminal_status = Some("cancelled_before_dispatch".into());
+        reply(
+            &mut state,
+            "peer.thread.stop",
+            accepted(json!({
+                "threadId":9,"stopped":true,"input":"accepted",
+                "cancelledBeforeDispatch":true,"cancelledInputCommandId":input.command_id.to_string(),
+                "execution":queued.value()
+            })),
+        );
+        let remote = state.tasks[0].remote.as_ref().unwrap();
+        assert!(
+            remote.stop_owed,
+            "the running writer still owes an exact stop"
+        );
+        assert_eq!(remote.execution.as_ref().unwrap().lease_id, first.lease_id);
+        assert_eq!(remote.stop_attempt_id, first.attempt_id);
+        assert_ne!(remote.stop_command_id, Some(original_stop));
+        assert_eq!(remote.state, RemoteState::Running);
+        assert!(
+            remote.controlled_input().is_none(),
+            "the queued input cannot be attached to the writer's stop"
+        );
+        let saved = serde_json::to_value(remote).unwrap();
+        let restored: RemoteTask = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.stop_command_id, remote.stop_command_id);
+        assert_eq!(restored.execution_inputs.len(), 1);
+
+        // A writer stop receipt still proves only transport acceptance.
+        reply(
+            &mut state,
+            "peer.thread.stop",
+            accepted(json!({
+                "threadId":9,"stopped":true,"input":"queued","execution":first.value()
+            })),
+        );
+        assert_eq!(
+            state.tasks[0].remote.as_ref().unwrap().state,
+            RemoteState::Running
+        );
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        let mut terminal = first.clone();
+        terminal.phase = crate::execution::Phase::Terminal;
+        terminal.terminal_status = Some("cancelled".into());
+        reply(
+            &mut state,
+            "peer.thread.wait",
+            accepted(json!({
+                "threadId":9,"execution":terminal.value(),"finished":true,"acknowledged":true,
+                "result":{"status":"cancelled","attemptId":first.attempt_id,"runId":first.run_id}
+            })),
+        );
+        assert_eq!(
+            state.tasks[0].remote.as_ref().unwrap().state,
+            RemoteState::Done
+        );
+        assert!(
+            state
+                .execution
+                .leases
+                .iter()
+                .all(|lease| lease.phase == crate::execution::Phase::Terminal)
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_attempt_stop_chain_never_selects_newer_generations_or_other_attempts() {
+        let (mut state, first) = execution_reply_fixture();
+        let mut leases = Vec::new();
+        for generation in 2..=4 {
+            let mut lease = first.clone();
+            lease.lease_id = uuid::Uuid::new_v4().to_string();
+            lease.run_id = uuid::Uuid::new_v4().to_string();
+            lease.generation = generation;
+            lease.queued_behind_current = true;
+            if generation == 4 {
+                lease.attempt_id = Some("other-attempt".into());
+            }
+            let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+            leases.push(lease);
+        }
+        state
+            .execution
+            .terminal(
+                &leases[0].lease_id,
+                "cancelled_before_dispatch",
+                3,
+                "exact cancellation",
+            )
+            .unwrap();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        remote.execution = state.execution.get(&leases[0].lease_id).cloned();
+        assert!(remote.continue_attempt_stop(&state.execution).unwrap());
+        assert_eq!(remote.execution.as_ref().unwrap().lease_id, first.lease_id);
+        state
+            .execution
+            .terminal(&first.lease_id, "cancelled", 4, "provider settled")
+            .unwrap();
+        remote.execution = state.execution.get(&first.lease_id).cloned();
+        assert!(!remote.continue_attempt_stop(&state.execution).unwrap());
+        for lease in &leases[1..] {
+            assert_eq!(
+                state.execution.get(&lease.lease_id).unwrap().phase,
+                crate::execution::Phase::ExecutorAccepted
+            );
+        }
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_attempt_stop_chain_holds_when_an_older_queued_command_is_missing() {
+        let (mut state, first) = execution_reply_fixture();
+        let mut latest = first.clone();
+        for generation in 2..=3 {
+            let mut lease = first.clone();
+            lease.lease_id = uuid::Uuid::new_v4().to_string();
+            lease.run_id = uuid::Uuid::new_v4().to_string();
+            lease.generation = generation;
+            lease.queued_behind_current = true;
+            latest = state.execution.accept_assignment(lease).unwrap().0;
+        }
+        state
+            .execution
+            .terminal(
+                &latest.lease_id,
+                "cancelled_before_dispatch",
+                4,
+                "exact input cancelled",
+            )
+            .unwrap();
+        let remote = state.tasks[0].remote.as_mut().unwrap();
+        remote.execution = state.execution.get(&latest.lease_id).cloned();
+        remote.execution.as_mut().unwrap().executor_thread_alias = Some(999);
+        let before = serde_json::to_value(&*remote).unwrap();
+        assert!(
+            remote
+                .continue_attempt_stop(&state.execution)
+                .unwrap_err()
+                .contains("another physical worker")
+        );
+        assert_eq!(serde_json::to_value(&*remote).unwrap(), before);
+        remote.execution = state.execution.get(&latest.lease_id).cloned();
+        let before = serde_json::to_value(&*remote).unwrap();
+        assert!(
+            remote
+                .continue_attempt_stop(&state.execution)
+                .unwrap_err()
+                .contains("exact input command")
+        );
+        assert_eq!(serde_json::to_value(&*remote).unwrap(), before);
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::ExecutorAccepted
+        );
+        let mut older = state
+            .execution
+            .leases
+            .iter()
+            .find(|lease| lease.generation == 2)
+            .unwrap()
+            .clone();
+        older.executor_thread_uid = None;
+        state
+            .execution
+            .get_mut(&older.lease_id)
+            .unwrap()
+            .executor_thread_uid = None;
+        remote.execution_inputs.insert(
+            older.lease_id.clone(),
+            Command::new(
+                "peer.thread.send",
+                json!({"threadId":9,"execution":older.value()}),
+            ),
+        );
+        assert!(remote.continue_attempt_stop(&state.execution).unwrap());
+        assert_eq!(remote.execution.as_ref().unwrap().lease_id, older.lease_id);
+        assert_eq!(remote.execution.as_ref().unwrap().executor_thread_uid, None);
+        assert_eq!(
+            state.execution.get(&older.lease_id).unwrap().phase,
+            crate::execution::Phase::ExecutorAccepted
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn a_queued_provider_ack_belongs_to_its_input_not_the_running_writer() {
+        queued_provider_reply(false);
+    }
+
+    #[test]
+    fn rejecting_a_queued_provider_input_does_not_settle_the_running_writer() {
+        queued_provider_reply(true);
+    }
+
+    fn queued_provider_reply(rejected: bool) {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.identity.controller_id.clone();
+        let first = assigned_lease(
+            &state,
+            child,
+            &controller,
+            1,
+            "writer-run",
+            "same-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state
+            .execution
+            .transition(
+                &first.lease_id,
+                crate::execution::Phase::Running,
+                2,
+                "writer started",
+            )
+            .unwrap();
+        let next = assigned_lease(
+            &state,
+            child,
+            &controller,
+            2,
+            "queued-provider-run",
+            "same-attempt",
+            true,
+        );
+        let (next, _) = state.execution.accept_assignment(next).unwrap();
+        let input = uuid::Uuid::new_v4();
+        let text = tasks::delivery_text(&input.to_string(), "provider queued follow-up");
+        let thread = &mut state.threads[1];
+        thread.execution = Some(first.binding());
+        thread.run_id = Some(first.run_id.clone());
+        thread.peer_origin.as_mut().unwrap().attempt_id = first.attempt_id.clone();
+        thread
+            .peer_input_executions
+            .insert(input.to_string(), next.binding());
+        let (pi, commands, _events) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = false;
+        thread.history_loaded = true;
+        thread.model_provider = "cpa".into();
+        thread.pending_injections.push_back(Injection {
+            text: text.clone(),
+            shown: false,
+            steer: None,
+            peer_input: Some(input),
+        });
+        assert!(thread.flush_injection());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["runId"], next.run_id);
+        assert_eq!(thread.execution, Some(first.binding()));
+        assert_eq!(thread.run_id.as_deref(), Some(first.run_id.as_str()));
+        thread.apply(
+            json!({"type":"response","command":"prompt","id":prompt["id"],"success":!rejected,
+            "error":if rejected { json!("fixture rejected input") } else { Value::Null },
+            "data":{"disposition":"queued"}}),
+        );
+        state.refresh_execution(3);
+        assert_eq!(
+            state.execution.get(&next.lease_id).unwrap().phase,
+            if rejected {
+                crate::execution::Phase::Terminal
+            } else {
+                crate::execution::Phase::ProviderAccepted
+            }
+        );
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        if rejected {
+            assert_eq!(
+                state
+                    .execution
+                    .get(&next.lease_id)
+                    .unwrap()
+                    .terminal_status
+                    .as_deref(),
+                Some("rejected")
+            );
+            assert!(state.threads[1].peer_provider_inputs.is_empty());
+            assert_eq!(state.threads[1].status, Status::Running);
+            assert!(state.threads[1].pending_injections.is_empty());
+            assert_eq!(state.threads[1].task_result, None);
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+            return;
+        }
+        let thread = &mut state.threads[1];
+        thread.apply(json!({"type":"agent_settled","aborted":false}));
+        state.refresh_execution(4);
+        assert_eq!(
+            state.execution.get(&next.lease_id).unwrap().phase,
+            crate::execution::Phase::ProviderAccepted
+        );
+        let snapshot = state.snapshot();
+        let mut restored = State::headless(state.data_dir.clone());
+        restored.restore_global(&snapshot).unwrap();
+        assert!(
+            restored
+                .threads
+                .iter()
+                .find(|thread| thread.id == child)
+                .unwrap()
+                .queued()
+        );
+        let thread = &mut state.threads[1];
+        thread.apply(json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"[delivery unknown-input]"}]}}));
+        assert_eq!(thread.execution, Some(first.binding()));
+        assert!(thread.queued());
+        thread.apply(json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":text}]}}));
+        thread.apply(json!({"type":"agent_start"}));
+        assert_eq!(thread.execution, Some(next.binding()));
+        assert_eq!(thread.run_id.as_deref(), Some(next.run_id.as_str()));
+        state.refresh_execution(5);
+        assert_eq!(
+            state.execution.get(&next.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_peer_prompt_uses_its_controller_assigned_run() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        let lease = assigned_lease(
+            &state,
+            child,
+            &state.identity.controller_id,
+            1,
+            &uuid::Uuid::new_v4().to_string(),
+            &attempt,
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        let thread = &mut state.threads[1];
+        thread.execution = Some(lease.binding());
+        thread.next_execution = Some(lease.binding());
+        let (pi, commands, _) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.status = Status::Running;
+        thread.model_provider = "cpa".into();
+        thread.history_loaded = true;
+        thread.pending_injections.push_back(Injection {
+            text: "first controller prompt".into(),
+            shown: false,
+            steer: None,
+            peer_input: Some(uuid::Uuid::new_v4()),
+        });
+        assert!(thread.flush_injection());
+        assert_eq!(thread.run_id.as_deref(), Some(lease.run_id.as_str()));
+        assert_eq!(commands.try_recv().unwrap()["runId"], lease.run_id);
+        assert!(thread.next_execution.is_none());
+        assert_eq!(thread.execution.as_ref().unwrap(), &lease.binding());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn remote_send_uses_the_committed_peer_contract_before_the_next_metadata_poll() {
+        let mut state = fixture();
+        reply(
+            &mut state,
+            "peer.thread.launch",
+            accepted(json!({"threadId":9})),
+        );
+        let database = crate::database::Database::open(&state.data_dir).unwrap();
+        database.put_peer(&state.peers[0]).unwrap();
+        state.peers.clear();
+        state
+            .queue_remote_send(0, "use committed discovery", "follow_up")
+            .unwrap();
+        assert!(
+            state.tasks[0]
+                .remote
+                .as_ref()
+                .unwrap()
+                .send_command
+                .is_some()
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn execution_fence_refuses_every_pending_input_or_control() {
+        for pending in [
+            "injection",
+            "queued_prompt",
+            "native_queue",
+            "inflight",
+            "recovery",
+            "durable_input",
+            "durable_stop",
+        ] {
+            let mut state = fixture();
+            let child = peer_worker(&mut state);
+            let attempt = state.threads[1]
+                .peer_origin
+                .as_ref()
+                .unwrap()
+                .attempt_id
+                .clone()
+                .unwrap();
+            let lease = assigned_lease(
+                &state,
+                child,
+                &state.identity.controller_id,
+                1,
+                &uuid::Uuid::new_v4().to_string(),
+                &attempt,
+                false,
+            );
+            let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+            state
+                .execution
+                .uncertain(&lease.lease_id, 2, "link lost")
+                .unwrap();
+            state.threads[1].execution = Some(lease.binding());
+            state.threads[1].status = Status::Ready;
+            let prompt = Prompt::new("pending provider input".into(), vec![]);
+            match pending {
+                "injection" => state.threads[1].pending_injections.push_back(Injection {
+                    text: "pending".into(),
+                    shown: false,
+                    steer: None,
+                    peer_input: None,
+                }),
+                "queued_prompt" => state.threads[1].queued_prompt = Some((prompt, 0)),
+                "native_queue" => state.threads[1]
+                    .native
+                    .queue
+                    .push_back(pi_session::QueuedMessage { id: 1, prompt }),
+                "inflight" => state.threads[1].injection_id = Some("prompt-in-flight".into()),
+                "recovery" => state.threads[1].peer_recovery_held = true,
+                "durable_input" => state.peer_task_intents.push(PeerTaskIntent::input(
+                    uuid::Uuid::new_v4().to_string(),
+                    child,
+                    Some(attempt),
+                    None,
+                    None,
+                    "follow_up",
+                    "pending".into(),
+                    Some(lease.run_id.clone()),
+                )),
+                "durable_stop" => state.peer_task_intents.push(PeerTaskIntent::cancel(
+                    uuid::Uuid::new_v4().to_string(),
+                    child,
+                    Some(attempt),
+                    Some(lease.run_id.clone()),
+                )),
+                _ => unreachable!(),
+            }
+            let response = state.execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.execution.fence",
+                    json!({
+                        "threadId":child, "leaseId":lease.lease_id,
+                        "generation":lease.generation, "runId":lease.run_id,
+                        "evidence":"test has no live process"
+                    }),
+                ),
+            );
+            assert!(
+                response.is_err(),
+                "{pending} was incorrectly fenced: {response:?}"
+            );
+            assert_eq!(
+                state.execution.get(&lease.lease_id).unwrap().phase,
+                crate::execution::Phase::Uncertain,
+                "{pending}"
+            );
+            std::fs::remove_dir_all(state.data_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn held_or_fenced_executor_rejects_new_input_without_installing_a_lease() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let attempt = state.threads[1]
+            .peer_origin
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone()
+            .unwrap();
+        let assignment = |state: &State, generation| {
+            assigned_lease(
+                state,
+                child,
+                &state.identity.controller_id,
+                generation,
+                &uuid::Uuid::new_v4().to_string(),
+                &attempt,
+                generation > 1,
+            )
+        };
+        let first = assignment(&state, 1);
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].status = Status::Ready;
+        let next = assignment(&state, 2);
+        let send = |assignment: Value| {
+            Command::new(
+                "peer.thread.send",
+                json!({"threadId":child,"attemptId":attempt,"delivery":"follow_up",
+                    "message":"follow-up for the old executor","execution":assignment}),
+            )
+        };
+        let inputs_before = state.peer_task_intents.len();
+        state.threads[1].peer_recovery_held = true;
+        assert_eq!(
+            state
+                .execute_peer_command("fixture-peer", &send(next.assignment()))
+                .unwrap_err(),
+            PEER_INPUT_RECOVERY_HELD
+        );
+        assert!(state.execution.get(&next.lease_id).is_none());
+        state.threads[1].peer_recovery_held = false;
+        state
+            .execute_peer_command(
+                "fixture-peer",
+                &Command::new(
+                    "peer.execution.fence",
+                    json!({
+                        "threadId":child,"leaseId":first.lease_id,"generation":first.generation,
+                        "runId":first.run_id,"evidence":"fixture executor verified quiescence"
+                    }),
+                ),
+            )
+            .unwrap();
+        for input in [Value::Null, first.control(), next.assignment()] {
+            let error = state
+                .execute_peer_command("fixture-peer", &send(input))
+                .unwrap_err();
+            assert!(error.contains("was fenced"), "{error}");
+        }
+        assert_eq!(state.peer_task_intents.len(), inputs_before);
+        assert_eq!(state.execution.leases.len(), 1);
+        assert!(state.threads[1].pending_injections.is_empty());
+    }
+
+    #[test]
+    fn provider_acceptance_running_and_terminal_are_distinct_durable_evidence() {
+        let mut state = fixture();
+        let thread = state.threads[0].id;
+        let run = uuid::Uuid::new_v4().to_string();
+        state.threads[0].run_id = Some(run.clone());
+        let (lease, _) = state
+            .execution
+            .prepare(crate::execution::Prepare {
+                scope: crate::execution::Scope {
+                    workspace_id: state.identity.workspace_id.clone(),
+                    owner_id: state.identity.owner_id.clone(),
+                    run_as_owner_id: state.identity.owner_id.clone(),
+                    controller_id: state.identity.controller_id.clone(),
+                    initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+                    executor_id: state.identity.executor_id.clone(),
+                },
+                logical_captain_uid: None,
+                logical_thread_uid: state.snapshot_identity().thread_uid(thread).unwrap().into(),
+                executor_thread_alias: Some(thread as u64),
+                executor_thread_uid: state
+                    .snapshot_identity()
+                    .thread_uid(thread)
+                    .map(str::to_owned),
+                run_id: run.clone(),
+                attempt_id: None,
+                delivery_id: None,
+                request_key: None,
+                now: 1,
+                queues_behind_current: false,
+            })
+            .unwrap();
+        state
+            .execution
+            .transition(
+                &lease.lease_id,
+                crate::execution::Phase::Dispatched,
+                2,
+                "prompt committed",
+            )
+            .unwrap();
+        state.threads[0].execution = Some(lease.binding());
+
+        state.threads[0].status = Status::Running;
+        state.threads[0].pending_prompt = Some((
+            "prompt-1".into(),
+            Prompt::new("accepted prompt".into(), vec![]),
+            0,
+        ));
+        state.threads[0].apply(json!({
+            "type":"response","command":"prompt","id":"prompt-1",
+            "success":true,"data":{"disposition":"queued"}
+        }));
+        assert_eq!(
+            state.threads[0].provider_accepted_run.as_deref(),
+            Some(run.as_str())
+        );
+        assert!(state.refresh_execution(3));
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::ProviderAccepted
+        );
+        state.threads[0].apply(json!({"type":"agent_start"}));
+        assert_eq!(
+            state.threads[0].provider_running_run.as_deref(),
+            Some(run.as_str())
+        );
+        assert!(state.refresh_execution(4));
+        assert_eq!(
+            state.execution.get(&lease.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        state.threads[0].apply(json!({"type":"agent_settled","aborted":false}));
+        assert_eq!(
+            state.threads[0].provider_terminal_run.as_deref(),
+            Some(run.as_str())
+        );
+        assert!(state.refresh_execution(5));
+        let lease = state.execution.get(&lease.lease_id).unwrap();
+        assert_eq!(lease.phase, crate::execution::Phase::Terminal);
+        assert!(lease.terminal_status.is_some());
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_quiescent_fence_permits_exactly_one_new_generation() {
+        let mut state = fixture();
+        state.tasks.clear();
+        state.threads.truncate(1);
+        let thread = state.threads[0].id;
+        let run = uuid::Uuid::new_v4().to_string();
+        state.threads[0].run_id = Some(run.clone());
+        state.threads[0].pi = None;
+        state.threads[0].status = Status::Ready;
+        let lease = assigned_lease(
+            &state,
+            thread,
+            &state.identity.controller_id,
+            1,
+            &run,
+            "attempt-1",
+            false,
+        );
+        let (lease, _) = state.execution.accept_assignment(lease).unwrap();
+        state.threads[0].execution = Some(lease.binding());
+        let result = state
+            .execute_command(&Command::new(
+                "execution.reconcile",
+                json!({"threadId":thread,"leaseId":lease.lease_id,"generation":1,
+                    "runId":run,"outcome":"fence",
+                    "evidence":"fixture verified provider process absent"}),
+            ))
+            .unwrap();
+        assert_eq!(result["lease"]["phase"], "fenced");
+        let (next, _) = state
+            .execution
+            .prepare(crate::execution::Prepare {
+                scope: crate::execution::Scope {
+                    workspace_id: state.identity.workspace_id.clone(),
+                    owner_id: state.identity.owner_id.clone(),
+                    run_as_owner_id: state.identity.owner_id.clone(),
+                    controller_id: state.identity.controller_id.clone(),
+                    initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+                    executor_id: state.identity.executor_id.clone(),
+                },
+                logical_captain_uid: None,
+                logical_thread_uid: lease.logical_thread_uid.clone(),
+                executor_thread_alias: Some(thread as u64),
+                executor_thread_uid: Some(lease.executor_thread_uid.clone().unwrap()),
+                run_id: uuid::Uuid::new_v4().to_string(),
+                attempt_id: Some("attempt-2".into()),
+                delivery_id: Some("delivery-2".into()),
+                request_key: None,
+                now: 10,
+                queues_behind_current: false,
+            })
+            .unwrap();
+        assert_eq!(next.generation, 2);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
     #[test]
@@ -3136,7 +5166,8 @@ mod tests {
         let mut home = captain_fixture();
         home.peers[0].capabilities["contracts"] = json!([
             crate::protocol::CAPTAIN_PEER_DOCUMENTS,
-            crate::protocol::PLACEMENT
+            crate::protocol::PLACEMENT,
+            crate::protocol::EXECUTION_LEASES
         ]);
         home.mcp_call(1, "delegate_task", &captain_launch_args())
             .unwrap();
@@ -3372,7 +5403,8 @@ mod tests {
         let mut state = captain_fixture();
         state.peers[0].capabilities["contracts"] = json!([
             crate::protocol::CAPTAIN_PEER_DOCUMENTS,
-            crate::protocol::PLACEMENT
+            crate::protocol::PLACEMENT,
+            crate::protocol::EXECUTION_LEASES
         ]);
         let text = format!("{}TAIL", "x".repeat(10_000));
         state
@@ -3786,6 +5818,10 @@ pub struct RemoteTask {
     pub label: String,
     pub thread_id: Option<usize>,
     pub launch_command: Command,
+    /// Controller-issued lease for this logical run. The target thread id above
+    /// is only the executor-local physical alias.
+    #[serde(default)]
+    pub execution: Option<crate::execution::Lease>,
     /// The exact saved launch was rejected before target allocation. Unlike
     /// the scheduler's bounded audit tail, this proof survives until retry.
     #[serde(default)]
@@ -3810,6 +5846,14 @@ pub struct RemoteTask {
     pub child_stop_serial: u64,
     pub client_request_id: Option<String>,
     pub send_command: Option<Command>,
+    /// Keep an accepted input's exact command after its transport receipt.
+    /// During cancellation this follows the generation being controlled.
+    #[serde(default)]
+    pub accepted_send: Option<Command>,
+    /// Exact assigned input commands remain available after later sends replace
+    /// accepted_send. Attempt cancellation must address every queued generation.
+    #[serde(default)]
+    pub execution_inputs: std::collections::BTreeMap<String, Command>,
     /// Document pages owed to the worker, dispatched in order over the same
     /// authenticated link that carries every other command to the target.
     #[serde(default)]
@@ -3822,6 +5866,96 @@ pub struct RemoteTask {
     /// an older target that omits the field.
     #[serde(default)]
     pub evidence_supported: bool,
+}
+
+impl RemoteTask {
+    fn controlled_input(&self) -> Option<&Command> {
+        let Some(execution) = &self.execution else {
+            return self.send_command.as_ref().or(self.accepted_send.as_ref());
+        };
+        self.execution_inputs.get(&execution.lease_id).or_else(|| {
+            self.send_command
+                .iter()
+                .chain(self.accepted_send.iter())
+                .chain(std::iter::once(&self.launch_command))
+                .find(|command| command.params["execution"]["leaseId"] == execution.lease_id)
+        })
+    }
+
+    /// A task cancellation covers its observed attempt, not only its latest
+    /// input. Advance only after exact terminal evidence for the prior control.
+    fn continue_attempt_stop(&mut self, book: &crate::execution::Book) -> Result<bool, String> {
+        let Some(current) = &self.execution else {
+            return Ok(false);
+        };
+        if !matches!(
+            current.phase,
+            crate::execution::Phase::Terminal | crate::execution::Phase::Fenced
+        ) {
+            return Ok(false);
+        }
+        let next = book
+            .leases
+            .iter()
+            .filter(|lease| {
+                lease.logical_thread_uid == current.logical_thread_uid
+                    && lease.generation < current.generation
+                    && lease.attempt_id == current.attempt_id
+                    && lease.workspace_id == current.workspace_id
+                    && lease.owner_id == current.owner_id
+                    && lease.run_as_owner_id == current.run_as_owner_id
+                    && lease.controller_id == current.controller_id
+                    && lease.executor_id == current.executor_id
+                    && lease.logical_captain_uid == current.logical_captain_uid
+                    && !matches!(
+                        lease.phase,
+                        crate::execution::Phase::Terminal | crate::execution::Phase::Fenced
+                    )
+            })
+            .max_by_key(|lease| lease.generation)
+            .cloned();
+        let Some(next) = next else { return Ok(false) };
+        if current.attempt_id.is_none() {
+            return Err("Cancellation cannot expand to another generation without an exact attempt identity.".into());
+        }
+        if next
+            .executor_thread_alias
+            .zip(current.executor_thread_alias)
+            .is_some_and(|(next, current)| next != current)
+            || next
+                .executor_thread_uid
+                .as_ref()
+                .zip(current.executor_thread_uid.as_ref())
+                .is_some_and(|(next, current)| next != current)
+        {
+            return Err("Cancellation cannot move to another physical worker without exact executor reconciliation.".into());
+        }
+        let input = self
+            .execution_inputs
+            .get(&next.lease_id)
+            .cloned()
+            .or_else(|| {
+                self.send_command
+                    .iter()
+                    .chain(self.accepted_send.iter())
+                    .find(|command| command.params["execution"]["leaseId"] == next.lease_id)
+                    .cloned()
+            });
+        if next.queued_behind_current && input.is_none() {
+            return Err("Cancellation cannot identify an older queued generation's exact input command. Its occupancy remains unproven.".into());
+        }
+        self.execution = Some(next.clone());
+        self.accepted_send = input;
+        self.stop_owed = true;
+        self.stop_command_id = Some(uuid::Uuid::new_v4());
+        self.stop_attempt_id = next.attempt_id.clone();
+        self.wait_revision = None;
+        self.request = None;
+        self.needs_you = false;
+        self.state = RemoteState::Running;
+        self.next_retry_at = 0;
+        Ok(true)
+    }
 }
 
 #[derive(Default)]
@@ -4789,6 +6923,7 @@ impl State {
                 label: label.into(),
                 thread_id: Some(99),
                 launch_command: Command::new("peer.thread.launch", json!({})),
+                execution: None,
                 rejected_launch: None,
                 stop_owed: false,
                 stop_command_id: None,
@@ -4805,6 +6940,8 @@ impl State {
                 child_stop_serial: 0,
                 client_request_id: None,
                 send_command: None,
+                accepted_send: None,
+                execution_inputs: Default::default(),
                 document_replies: VecDeque::new(),
                 evidence_supported: false,
             });
@@ -4877,6 +7014,21 @@ impl State {
             );
         }
         let peer = matches[0];
+        if !peer.capabilities["contracts"]
+            .as_array()
+            .is_some_and(|contracts| {
+                contracts
+                    .iter()
+                    .any(|contract| contract == crate::protocol::EXECUTION_LEASES)
+            })
+        {
+            return Err(format!(
+                "{} Managed execution needs {} on {}; no task or lease was allocated.",
+                crate::protocol::EXECUTION_LEASES_UPDATE_REQUIRED,
+                crate::protocol::EXECUTION_LEASES,
+                peer.label
+            ));
+        }
         if let Some(error) = peer
             .last_error
             .as_deref()
@@ -5182,6 +7334,7 @@ impl State {
             label: peer.label.clone(),
             thread_id: None,
             launch_command: launch,
+            execution: None,
             rejected_launch: None,
             stop_owed: false,
             stop_command_id: None,
@@ -5197,6 +7350,8 @@ impl State {
             child_stop_serial: 0,
             client_request_id: request.map(str::to_owned),
             send_command: None,
+            accepted_send: None,
+            execution_inputs: Default::default(),
             document_replies: VecDeque::new(),
             evidence_supported: false,
             placement: Some(
@@ -5468,6 +7623,19 @@ impl State {
             .filter(|(_, intent)| intent.kind == "cancel" && intent.provider_state != "accepted")
             .collect();
         for (index, mut intent) in cancels {
+            let settled_execution = intent
+                .execution
+                .as_ref()
+                .and_then(|binding| {
+                    self.execution.get(&binding.lease_id).filter(|lease| {
+                        lease.binding() == *binding
+                            && matches!(
+                                lease.phase,
+                                crate::execution::Phase::Terminal | crate::execution::Phase::Fenced
+                            )
+                    })
+                })
+                .is_some();
             let Some(thread) = self
                 .threads
                 .iter_mut()
@@ -5479,7 +7647,20 @@ impl State {
                 .peer_origin
                 .as_ref()
                 .and_then(|origin| origin.attempt_id.as_deref());
-            if intent.attempt_id.as_deref().is_some() && intent.attempt_id.as_deref() != current {
+            if settled_execution {
+                intent.provider_state = "accepted".into();
+                intent.provider_basis = Some("exact_execution_settlement".into());
+                intent.queue_state = "settled".into();
+            } else if intent.execution.as_ref().is_some_and(|binding| {
+                thread.execution.as_ref().or(thread.next_execution.as_ref()) != Some(binding)
+            }) {
+                intent.provider_state = "rejected".into();
+                intent.provider_basis = Some("execution_fence".into());
+                intent.queue_state = "settled".into();
+                intent.error = Some("The target moved to a different execution.".into());
+            } else if intent.attempt_id.as_deref().is_some()
+                && intent.attempt_id.as_deref() != current
+            {
                 intent.provider_state = "rejected".into();
                 intent.provider_basis = Some("attempt_fence".into());
                 intent.queue_state = "settled".into();
@@ -5508,24 +7689,55 @@ impl State {
                 // The accepted stop intent is durable. Any uncertainty is in
                 // provider settlement, which stays unknown until the exact
                 // attempt observes it.
+                let mut future_inputs = VecDeque::new();
+                if let Some(binding) = &intent.execution {
+                    for injection in std::mem::take(&mut thread.pending_injections) {
+                        if injection
+                            .peer_input
+                            .as_ref()
+                            .and_then(|id| thread.peer_input_executions.get(&id.to_string()))
+                            .is_some_and(|queued| queued != binding)
+                        {
+                            future_inputs.push_back(injection);
+                        } else {
+                            thread.pending_injections.push_back(injection);
+                        }
+                    }
+                }
                 let _ = thread.stop_task();
                 let settled_locally = !thread.status.busy()
                     && thread.phase != "Stopping"
                     && thread.injection_id.is_none()
                     && thread.pending_injections.is_empty();
+                thread.pending_injections.extend(future_inputs);
                 if settled_locally {
-                    thread.task_result = Some("cancelled");
-                    thread.completion_notified = true;
-                    let attempt = intent.attempt_id.clone();
-                    if let Some(origin) = &mut thread.peer_origin {
-                        origin.result = Some(json!({
-                            "status":"cancelled","resultId":uuid::Uuid::new_v4().to_string(),
-                            "replyItemId":null,"attemptId":attempt,"runId":null,
-                            "error":null,"memorySuggestions":[]
-                        }));
+                    // The provider may have completed before this delayed stop
+                    // reached the intent driver, but before lease refresh.
+                    // Cancellation cannot rewrite that terminal outcome.
+                    thread.task_result.get_or_insert("cancelled");
+                    let cancelled = thread.task_result == Some("cancelled");
+                    if cancelled {
+                        thread.completion_notified = true;
+                        let attempt = intent.attempt_id.clone();
+                        if let Some(origin) = &mut thread.peer_origin
+                            && origin.result.is_none()
+                        {
+                            origin.result = Some(json!({
+                                "status":"cancelled","resultId":uuid::Uuid::new_v4().to_string(),
+                                "replyItemId":null,"attemptId":attempt,"runId":null,
+                                "error":null,"memorySuggestions":[]
+                            }));
+                        }
                     }
                     intent.provider_state = "accepted".into();
-                    intent.provider_basis = Some("target_cancelled_before_dispatch".into());
+                    intent.provider_basis = Some(
+                        if cancelled {
+                            "target_cancelled_before_dispatch"
+                        } else {
+                            "provider_settlement"
+                        }
+                        .into(),
+                    );
                     intent.queue_state = "settled".into();
                 } else {
                     intent.provider_state = if intent.provider_state == "requested" {
@@ -5564,16 +7776,40 @@ impl State {
                         stop.kind == "cancel"
                             && stop.thread_id == input.thread_id
                             && stop.attempt_id == input.attempt_id
+                            && stop.execution.as_ref().is_none_or(|binding| {
+                                self.threads
+                                    .iter()
+                                    .find(|thread| thread.id == input.thread_id)
+                                    // Older accepted inputs predate per-input
+                                    // bindings. The exact-attempt stop and
+                                    // removed-queue check below still prove
+                                    // non-delivery for those legacy rows.
+                                    .is_some_and(|thread| {
+                                        thread
+                                            .peer_input_executions
+                                            .get(&input.command_id)
+                                            .is_none_or(|input_binding| input_binding == binding)
+                                    })
+                            })
                             && (stop.queue_state == "applied"
                                 || (stop.queue_state == "settled"
-                                    && stop.provider_basis.as_deref()
-                                        == Some("target_cancelled_before_dispatch")))
+                                    && matches!(
+                                        stop.provider_basis.as_deref(),
+                                        Some(
+                                            "target_cancelled_before_dispatch"
+                                                | "provider_settlement"
+                                        )
+                                    )))
                             && self
                                 .threads
                                 .iter()
                                 .find(|thread| thread.id == input.thread_id)
                                 .is_none_or(|thread| {
-                                    !thread
+                                    !thread.pending_injections.iter().any(|injection| {
+                                        injection.peer_input.as_ref().is_some_and(|command| {
+                                            command.to_string() == input.command_id
+                                        })
+                                    }) && !thread
                                         .peer_dispatches
                                         .iter()
                                         .any(|(command, _, _)| command == &input.command_id)
@@ -5826,6 +8062,186 @@ impl State {
         }
     }
 
+    fn cancel_unaccepted_peer_input(
+        &mut self,
+        index: usize,
+        command: &Command,
+    ) -> Result<Option<Value>, String> {
+        let args = &command.params;
+        let Some(assignment) = args
+            .get("pendingExecution")
+            .filter(|value| !value.is_null())
+        else {
+            return Ok(None);
+        };
+        let lease_id = assignment["leaseId"]
+            .as_str()
+            .ok_or("Pending cancellation requires leaseId.")?;
+        let existing = self.execution.get(lease_id).cloned();
+        let input_id = args["sendCommandId"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .ok_or("Pending cancellation requires the exact input command id.")?;
+        let thread_id = self.threads[index].id;
+        let binding = self.threads[index]
+            .execution
+            .as_ref()
+            .or(self.threads[index].next_execution.as_ref())
+            .ok_or("Pending cancellation requires a lease-managed executor thread.")?;
+        let lease = crate::execution::lease_from_assignment(
+            assignment,
+            &self.identity.executor_id,
+            Some(thread_id as u64),
+            self.snapshot_identity()
+                .thread_uid(thread_id)
+                .map(str::to_owned),
+            lifecycle::now(),
+        )?;
+        if lease.logical_thread_uid != binding.logical_thread_uid
+            || args["execution"] != lease.control()
+            || args["attemptId"].as_str() != lease.attempt_id.as_deref()
+        {
+            return Err(
+                "Pending cancellation does not match the exact assignment and attempt.".into(),
+            );
+        }
+        // Validate on a clone before staging any durable mutation.
+        let mut execution = self.execution.clone();
+        let lease = if let Some(existing) = existing {
+            if existing.binding() != lease.binding()
+                || existing.request_key != lease.request_key
+                || existing.queued_behind_current != lease.queued_behind_current
+                || existing.executor_thread_alias != lease.executor_thread_alias
+                || existing.executor_thread_uid != lease.executor_thread_uid
+            {
+                return Err("Pending cancellation conflicts with the accepted assignment.".into());
+            }
+            if existing.terminal_status.as_deref() == Some("cancelled_before_dispatch") {
+                if !self.threads[index]
+                    .peer_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.cancelled_commands.contains(&input_id))
+                {
+                    return Err("This cancellation names a different input command.".into());
+                }
+                existing
+            } else {
+                // A launch can own the current binding before its first
+                // prompt dispatches. Once it has a run, use the normal stop.
+                let current = existing.lease_id == binding.lease_id;
+                if current
+                    && (existing.queued_behind_current
+                        || self.threads[index].run_id.is_some()
+                        || !existing.phase.blocks_replacement())
+                {
+                    return Ok(None);
+                }
+                let Some(input_index) =
+                    self.peer_task_intent_index(thread_id, &input_id.to_string())
+                else {
+                    return if current {
+                        Ok(None)
+                    } else {
+                        Err("The accepted assignment has no matching durable input.".into())
+                    };
+                };
+                let mut input = self.peer_task_intents[input_index].clone();
+                if self.threads[index]
+                    .peer_input_executions
+                    .get(&input.command_id)
+                    != Some(&existing.binding())
+                    || input.kind != "input"
+                    || input.queue_state != "queued"
+                    || input.provider_state != "not_observed"
+                    || input.attempt_id != existing.attempt_id
+                    || self.threads[index]
+                        .peer_dispatches
+                        .iter()
+                        .any(|(id, _, _)| *id == input.command_id)
+                    || self.threads[index]
+                        .peer_prompt
+                        .as_ref()
+                        .is_some_and(|(_, id)| *id == input_id)
+                {
+                    if current {
+                        return Ok(None);
+                    }
+                    return Err("This input may have reached the provider. Reconcile its exact execution; the current writer was not stopped.".into());
+                }
+                let cancelled = execution.terminal(
+                    &existing.lease_id,
+                    "cancelled_before_dispatch",
+                    lifecycle::now(),
+                    "executor removed this exact accepted input before any adapter dispatch",
+                )?;
+                input.provider_state = "rejected".into();
+                input.provider_basis = Some("target_cancelled_before_dispatch".into());
+                input.queue_state = "settled".into();
+                input.recovery = "cancelled_before_dispatch".into();
+                input.error = Some("Cancelled before the provider received this input.".into());
+                input.updated_at = lifecycle::now();
+                self.stage_peer_task_intent(input)?;
+                self.sync_peer_intent_evidence(input_index);
+                self.threads[index]
+                    .pending_injections
+                    .retain(|injection| injection.peer_input != Some(input_id));
+                let thread = &mut self.threads[index];
+                thread.peer_recovery_held &= self
+                    .peer_task_intents
+                    .iter()
+                    .any(|intent| intent.thread_id == thread_id && intent.holds_prompt_recovery());
+                if current {
+                    // The only current binding eligible here is an initial
+                    // launch with no run. Release its idle prewarm, if any.
+                    thread.disconnect();
+                    thread.recovering_task = false;
+                    thread.complete_task("cancelled");
+                } else if thread
+                    .next_execution
+                    .as_ref()
+                    .is_some_and(|binding| binding.lease_id == existing.lease_id)
+                {
+                    thread.next_execution = None;
+                }
+                cancelled
+            }
+        } else {
+            if self
+                .peer_task_intents
+                .iter()
+                .any(|intent| intent.command_id == input_id.to_string())
+            {
+                return Err("The pending input already has a durable delivery record. Reconcile its exact execution before cancellation.".into());
+            }
+            execution.cancel_unaccepted_assignment(lease, lifecycle::now())?
+        };
+        let mut intent = PeerTaskIntent::cancel(
+            command.command_id.to_string(),
+            thread_id,
+            lease.attempt_id.clone(),
+            Some(lease.run_id.clone()),
+        );
+        intent.execution = Some(lease.binding());
+        intent.provider_state = "accepted".into();
+        intent.provider_basis = Some("target_cancelled_before_dispatch".into());
+        intent.queue_state = "settled".into();
+        intent.recovery = "proved_not_delivered".into();
+        self.stage_peer_task_intent(intent)?;
+        self.execution = execution;
+        let origin = self.threads[index]
+            .peer_origin
+            .as_mut()
+            .expect("authorized peer origin");
+        if !origin.cancelled_commands.contains(&input_id) {
+            origin.cancelled_commands.push(input_id);
+        }
+        Ok(Some(json!({
+            "threadId":thread_id, "stopped":true, "input":"accepted",
+            "cancelledBeforeDispatch":true,"cancelledInputCommandId":input_id.to_string(),
+            "execution":lease.value(),
+        })))
+    }
+
     pub fn execute_peer_command(
         &mut self,
         device: &str,
@@ -5842,6 +8258,7 @@ impl State {
                 crate::protocol::PLACEMENT,
                 crate::protocol::PEER_TASK_FENCES,
                 crate::protocol::PEER_TASK_EVIDENCE,
+                crate::protocol::EXECUTION_LEASES,
                 crate::protocol::SCHEDULING,
             ];
             #[cfg(debug_assertions)]
@@ -5913,6 +8330,46 @@ impl State {
                     > memory::ESSENTIAL_BUDGET
             {
                 return Err("Invalid peer origin or memory budget.".into());
+            }
+            let execution = args.get("execution").filter(|value| value.is_object());
+            if let Some(execution) = execution
+                && (execution["controllerId"].as_str() != Some(origin.server_id.as_str())
+                    || execution["attemptId"].as_str() != origin.attempt_id.as_deref())
+            {
+                return Err(
+                    "Execution assignment does not match the authenticated controller origin."
+                        .into(),
+                );
+            }
+            if let Some(execution) = execution {
+                let logical_thread = execution["logicalThreadUid"]
+                    .as_str()
+                    .ok_or("Execution assignment is missing logicalThreadUid.")?;
+                let run_id = execution["runId"]
+                    .as_str()
+                    .ok_or("Execution assignment is missing runId.")?;
+                if let Some(existing) = self.execution.exact_run(logical_thread, run_id) {
+                    if existing.controller_id != origin.server_id
+                        || existing.lease_id != execution["leaseId"].as_str().unwrap_or("")
+                    {
+                        return Err(
+                            "This logical run is already bound to another controller generation."
+                                .into(),
+                        );
+                    }
+                    let thread_id = existing
+                        .executor_thread_alias
+                        .ok_or("The prior launch has no physical executor thread.")?;
+                    return Ok(json!({
+                        "threadId":thread_id,
+                        "replayed":true,
+                        "execution":existing.value(),
+                        "placement":self.threads.iter()
+                            .find(|thread| thread.id as u64 == thread_id)
+                            .and_then(|thread| thread.placement.as_ref())
+                            .map(placement::ThreadPlacement::value)
+                    }));
+                }
             }
             let project = self
                 .projects
@@ -6022,15 +8479,55 @@ impl State {
                 marked_brief,
                 None,
             ))?;
+            let mut execution = execution
+                .map(|assignment| {
+                    crate::execution::lease_from_assignment(
+                        assignment,
+                        &self.identity.executor_id,
+                        Some(id as u64),
+                        None,
+                        lifecycle::now(),
+                    )
+                })
+                .transpose()?;
+            if let Some(lease) = execution.as_mut() {
+                let (accepted, _) = self.execution.accept_assignment(lease.clone())?;
+                *lease = accepted;
+                thread.execution = Some(lease.binding());
+                thread.next_execution = thread.execution.clone();
+                thread
+                    .peer_input_executions
+                    .insert(command.command_id.to_string(), lease.binding());
+            }
             self.next_id += 1;
             self.threads.push(thread);
+            if let Some(lease) = execution.as_ref() {
+                let uid = self.snapshot_identity().thread_uid(id).map(str::to_owned);
+                if let Some(stored) = self.execution.get_mut(&lease.lease_id) {
+                    stored.executor_thread_alias = Some(id as u64);
+                    stored.executor_thread_uid = uid.clone();
+                }
+                if let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) {
+                    thread.execution = self
+                        .execution
+                        .get(&lease.lease_id)
+                        .map(crate::execution::Lease::binding);
+                    thread.next_execution = thread.execution.clone();
+                }
+            }
+            let execution_value = execution
+                .as_ref()
+                .and_then(|lease| self.execution.get(&lease.lease_id))
+                .map(crate::execution::Lease::value);
             // A peer-launched worker reserves admission on this executor
             // before its provider may start. Placement still pending keeps
             // it queued until the reservation provisions.
             self.ensure_thread_admission(self.threads.len() - 1, true, false);
             self.admission_pump();
-            return Ok(json!({"threadId":id,"placement":resolved.value(),
-                "admission":self.admission_value_for(id)}));
+            return Ok(
+                json!({"threadId":id,"placement":resolved.value(),"execution":execution_value,
+                "admission":self.admission_value_for(id)}),
+            );
         }
         if command.method == "peer.thread.list" {
             return self.readable_threads(None, &args["read"]);
@@ -6056,6 +8553,55 @@ impl State {
             return Err("Permission denied. This peer did not create that thread.".into());
         }
         match command.method.as_str() {
+            "peer.execution.fence" => {
+                let binding = self.threads[index]
+                    .next_execution
+                    .clone()
+                    .or_else(|| self.threads[index].execution.clone())
+                    .ok_or("This peer thread has no lease-managed execution.")?;
+                let lease_id = args["leaseId"].as_str().ok_or("leaseId is required.")?;
+                let generation = args["generation"]
+                    .as_u64()
+                    .ok_or("generation is required.")?;
+                let evidence = args["evidence"]
+                    .as_str()
+                    .filter(|evidence| !evidence.trim().is_empty())
+                    .ok_or("Fencing requires observed evidence.")?;
+                let lease = self.execution.control(
+                    &binding.logical_thread_uid,
+                    lease_id,
+                    generation,
+                    args["runId"].as_str(),
+                )?;
+                if lease.phase == crate::execution::Phase::Uncertain
+                    && lease
+                        .uncertain_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("restarted"))
+                {
+                    return Err(
+                        "A restart cannot prove an orphaned provider process stopped. Keep this execution uncertain until an executor-local process verifier supplies a fence."
+                            .into(),
+                    );
+                }
+                let lease_id = lease.lease_id.clone();
+                let thread = &self.threads[index];
+                if !self.execution_thread_quiescent(thread.id) {
+                    return Err(
+                        "Executor is not quiescent. Live provider processes cannot be fenced by a controller flag."
+                            .into(),
+                    );
+                }
+                let lease = self.execution.fence(
+                    &lease_id,
+                    lifecycle::now(),
+                    format!(
+                        "executor {} verified provider process absent for physical thread {}; {evidence}",
+                        self.identity.executor_id, thread.id
+                    ),
+                )?;
+                Ok(json!({"lease":lease,"executorId":self.identity.executor_id}))
+            }
             "peer.captain.document.reply" => {
                 // The origin answers a document read it saw in this thread's
                 // wait status. Only the device that launched the worker may
@@ -6121,6 +8667,33 @@ impl State {
                 Ok(json!({"result":result,"acknowledged":true}))
             }
             "peer.thread.stop" => {
+                if let Some(result) = self.cancel_unaccepted_peer_input(index, command)? {
+                    return Ok(result);
+                }
+                let binding = self.threads[index]
+                    .execution
+                    .clone()
+                    .or_else(|| self.threads[index].next_execution.clone());
+                if let Some(binding) = &binding {
+                    let control = args.get("execution").filter(|value| value.is_object()).ok_or(
+                        "This lease-managed peer thread requires an exact execution lease and generation to stop.",
+                    )?;
+                    let lease_id = control["leaseId"]
+                        .as_str()
+                        .ok_or("Execution control is missing leaseId.")?;
+                    let generation = control["generation"]
+                        .as_u64()
+                        .ok_or("Execution control is missing generation.")?;
+                    let controlled = self.execution.control(
+                        &binding.logical_thread_uid,
+                        lease_id,
+                        generation,
+                        control["runId"].as_str(),
+                    )?;
+                    if controlled.lease_id != binding.lease_id {
+                        return Err("This execution is not the current provider turn. Cancel its pending input explicitly; the current writer was not stopped.".into());
+                    }
+                }
                 // A stop fenced to an observed attempt must not land on newer
                 // work. An untracked legacy worker cannot prove a match, even
                 // after its server upgrades to support the contract.
@@ -6150,15 +8723,16 @@ impl State {
                     .as_ref()
                     .and_then(|origin| origin.attempt_id.clone());
                 let run = self.threads[index].run_id.clone();
-                // Persist the exact stop intent with this accepted command.
-                // The reducer applies it after the commit, so a crash cannot
-                // lose an acknowledged stop before the adapter sees it.
-                self.stage_peer_task_intent(PeerTaskIntent::cancel(
+                // Persist intent with the accepted peer receipt. Native stop
+                // effects run through the committed task-input driver.
+                let mut intent = PeerTaskIntent::cancel(
                     command.command_id.to_string(),
                     self.threads[index].id,
                     attempt,
                     run,
-                ))?;
+                );
+                intent.execution = binding;
+                self.stage_peer_task_intent(intent)?;
                 let mut result = json!({"stopped":true});
                 if self.peer_evidence_enabled() {
                     result["input"] = json!("queued");
@@ -6166,7 +8740,35 @@ impl State {
                 Ok(result)
             }
             "peer.thread.send" => {
+                let current_binding = self.threads[index]
+                    .execution
+                    .clone()
+                    .or_else(|| self.threads[index].next_execution.clone());
                 if let Some(request_id) = args["requestId"].as_str() {
+                    if let Some(binding) = &current_binding {
+                        let control = args.get("execution").filter(|value| value.is_object()).ok_or(
+                            "This lease-managed peer thread requires an exact execution control for a question answer.",
+                        )?;
+                        let lease_id = control["leaseId"]
+                            .as_str()
+                            .ok_or("Execution control is missing leaseId.")?;
+                        let generation = control["generation"]
+                            .as_u64()
+                            .ok_or("Execution control is missing generation.")?;
+                        let controlled = self.execution.control(
+                            &binding.logical_thread_uid,
+                            lease_id,
+                            generation,
+                            control["runId"].as_str(),
+                        )?;
+                        if controlled.lease_id != binding.lease_id || !controlled.phase.in_flight()
+                        {
+                            return Err(
+                                "Request or execution generation changed before the answer was delivered."
+                                    .into(),
+                            );
+                        }
+                    }
                     let thread = &self.threads[index];
                     let request = thread.request.as_ref().ok_or("Request expired.")?;
                     if request["id"] != json!(request_id)
@@ -6242,6 +8844,104 @@ impl State {
                 if thread.peer_recovery_held {
                     return Err(PEER_INPUT_RECOVERY_HELD.into());
                 }
+                if let Some(binding) = &current_binding
+                    && self
+                        .execution
+                        .get(&binding.lease_id)
+                        .is_some_and(|lease| lease.phase == crate::execution::Phase::Fenced)
+                {
+                    return Err("This executor thread was fenced. Start a new assignment on the selected executor.".into());
+                }
+                let execution_control = args.get("execution").filter(|value| value.is_object());
+                if current_binding.is_some() && execution_control.is_none() {
+                    return Err("This lease-managed peer thread requires an execution assignment or an exact run control.".into());
+                }
+                let exact_control = delivery == Some("steer") || args.get("requestId").is_some();
+                let next_binding = if exact_control {
+                    if let Some(binding) = &current_binding {
+                        let control = execution_control.ok_or(
+                            "This lease-managed peer thread requires an exact execution lease and generation.",
+                        )?;
+                        let lease_id = control["leaseId"]
+                            .as_str()
+                            .ok_or("Execution control is missing leaseId.")?;
+                        let generation = control["generation"]
+                            .as_u64()
+                            .ok_or("Execution control is missing generation.")?;
+                        let controlled = self.execution.control(
+                            &binding.logical_thread_uid,
+                            lease_id,
+                            generation,
+                            control["runId"].as_str(),
+                        )?;
+                        if controlled.lease_id != binding.lease_id || !controlled.phase.in_flight()
+                        {
+                            return Err(
+                                "This control names an earlier execution lease. The current or newer run was not changed."
+                                    .into(),
+                            );
+                        }
+                    }
+                    current_binding
+                } else if let Some(control) = execution_control {
+                    let lease_id = control["leaseId"]
+                        .as_str()
+                        .ok_or("Execution assignment is missing leaseId.")?;
+                    if let Some(existing) = self.execution.get(lease_id).cloned() {
+                        self.execution.control(
+                            &existing.logical_thread_uid,
+                            lease_id,
+                            control["generation"]
+                                .as_u64()
+                                .ok_or("Execution assignment is missing generation.")?,
+                            control["runId"].as_str(),
+                        )?;
+                        if !existing.phase.in_flight()
+                            || existing.executor_thread_alias != Some(self.threads[index].id as u64)
+                            || current_binding.as_ref().is_none_or(|binding| {
+                                binding.logical_thread_uid != existing.logical_thread_uid
+                            })
+                        {
+                            return Err("This input does not name an unsettled assignment for this executor thread.".into());
+                        }
+                        Some(existing.binding())
+                    } else {
+                        let lease = crate::execution::lease_from_assignment(
+                            control,
+                            &self.identity.executor_id,
+                            Some(self.threads[index].id as u64),
+                            self.snapshot_identity()
+                                .thread_uid(self.threads[index].id)
+                                .map(str::to_owned),
+                            lifecycle::now(),
+                        )?;
+                        if let Some(binding) = &current_binding
+                            && self.threads[index].provider_terminal_run.as_deref()
+                                == Some(binding.run_id.as_str())
+                            && let Some(status) =
+                                self.threads[index].provider_terminal_status.as_deref()
+                        {
+                            let _ = self.execution.terminal(
+                                &binding.lease_id,
+                                status,
+                                lifecycle::now(),
+                                "matching provider terminal event proves the prior run ended",
+                            );
+                        }
+                        if let Some(binding) = &current_binding
+                            && lease.logical_thread_uid != binding.logical_thread_uid
+                        {
+                            return Err(
+                                "Execution control names a different logical thread.".into()
+                            );
+                        }
+                        let (accepted, _) = self.execution.accept_assignment(lease)?;
+                        Some(accepted.binding())
+                    }
+                } else {
+                    current_binding
+                };
+                let thread = &self.threads[index];
                 if delivery == Some("steer") && !(thread.status.busy() && thread.can_steer()) {
                     return Err("This attempt cannot accept steering.".into());
                 }
@@ -6303,7 +9003,11 @@ impl State {
                 if let Some(reads) = document_reads {
                     thread.peer_origin.as_mut().expect("origin").document_reads = reads;
                 }
-                if delivery == Some("attempt") {
+                if delivery == Some("attempt")
+                    && (next_binding.is_none()
+                        || thread.execution.is_none()
+                        || thread.execution.as_ref() == next_binding.as_ref())
+                {
                     thread.peer_origin.as_mut().expect("origin").attempt_id = target_attempt;
                 }
                 if thread
@@ -6321,6 +9025,14 @@ impl State {
                     .clone();
                 thread.peer_origin.as_mut().expect("origin").result = None;
                 thread.peer_origin.as_mut().expect("origin").acknowledged = false;
+                if !exact_control && let Some(binding) = &next_binding {
+                    thread
+                        .peer_input_executions
+                        .insert(command.command_id.to_string(), binding.clone());
+                    if thread.next_execution.is_none() {
+                        thread.next_execution = Some(binding.clone());
+                    }
+                }
                 thread.peer_origin.as_mut().expect("origin").attempt_message =
                     marked_message.clone();
                 thread
@@ -6419,6 +9131,10 @@ impl State {
             .map(|intent| intent.thread_id)
             .collect();
         for thread in &mut self.threads {
+            let binding = thread.execution.as_ref().or(thread.next_execution.as_ref());
+            let lease = binding.and_then(|binding| self.execution.get(&binding.lease_id));
+            let needs_settlement =
+                binding.is_some() && lease.is_none_or(|lease| lease.phase.blocks_replacement());
             if thread.peer_origin.is_some() && thread.recovering_task {
                 if pending_inputs.contains(&thread.id) {
                     // A saved task record describes the previous attempt. The
@@ -6438,6 +9154,31 @@ impl State {
                         .attempt_message
                         .clone();
                     recovered.reconcile(&history);
+                    let proved_completion = thread.harness == "pi"
+                        && history["success"] == true
+                        && history["data"]["historyReplayed"] != false
+                        && recovered.state == TaskState::Completed
+                        && binding.is_some_and(|binding| {
+                            thread.run_id.as_deref() == Some(&binding.run_id)
+                                && thread
+                                    .peer_origin
+                                    .as_ref()
+                                    .is_some_and(|origin| origin.attempt_id == binding.attempt_id)
+                        });
+                    if needs_settlement && !proved_completion {
+                        thread.recovering_task = false;
+                        thread.task_result = None;
+                        thread.disconnect();
+                        thread.status = Status::Failed;
+                        thread.error = Some(
+                            "Recovery held: provider history did not prove this run ended.".into(),
+                        );
+                        changed = true;
+                        continue;
+                    }
+                    if needs_settlement {
+                        thread.note_provider_terminal("completed");
+                    }
                     let origin = thread.peer_origin.as_mut().expect("origin");
                     origin.result = Some(
                         json!({"status":if recovered.state==TaskState::Completed {"completed"}else{"failed"},
@@ -6450,7 +9191,10 @@ impl State {
                     changed = true;
                 } else if thread.status == Status::Failed {
                     thread.recovering_task = false;
-                    thread.task_result = Some("failed");
+                    if !needs_settlement {
+                        thread.task_result = Some("failed");
+                    }
+                    changed = true;
                 }
             }
             let Some(origin) = &mut thread.peer_origin else {
@@ -6470,7 +9214,12 @@ impl State {
             }
             // A follow-up can still display the previous Completed status while
             // its prompt is queued. Only settlement proves this attempt ended.
-            if let Some(status) = thread.task_result {
+            if let Some(status) = thread.task_result
+                && (!needs_settlement
+                    || lease.is_some_and(|lease| {
+                        thread.provider_terminal_run.as_deref() == Some(&lease.run_id)
+                    }))
+            {
                 origin.result = Some(
                     json!({"status":if status=="done" {"completed"} else {status},
                     "resultId":uuid::Uuid::new_v4(),"replyItemId":thread.messages.iter().enumerate().rfind(|(i,m)|*i>=origin.reply_after_position && m.role=="Pi").map(|(i,_)|i.to_string()),
@@ -6563,6 +9312,41 @@ impl State {
         message: &str,
         delivery: &str,
     ) -> Result<(), String> {
+        let server_id = self.tasks[task]
+            .remote
+            .as_ref()
+            .expect("remote task")
+            .server_id
+            .clone();
+        let label = self.tasks[task]
+            .remote
+            .as_ref()
+            .expect("remote task")
+            .label
+            .clone();
+        let peers = crate::database::for_path(&self.data_dir.join("index.json"))
+            .map(|database| database.peers())
+            .transpose()?
+            .unwrap_or_else(|| self.peers.clone());
+        if !peers
+            .iter()
+            .find(|peer| peer.server_id == server_id)
+            .is_some_and(|peer| {
+                peer.capabilities["contracts"]
+                    .as_array()
+                    .is_some_and(|contracts| {
+                        contracts
+                            .iter()
+                            .any(|contract| contract == crate::protocol::EXECUTION_LEASES)
+                    })
+            })
+        {
+            return Err(format!(
+                "{} Managed execution needs {} on {label}; the peer send was not queued.",
+                crate::protocol::EXECUTION_LEASES_UPDATE_REQUIRED,
+                crate::protocol::EXECUTION_LEASES
+            ));
+        }
         let document_reads = self.tasks[task]
             .remote
             .as_ref()
@@ -6713,11 +9497,26 @@ impl State {
             let command = if remote.thread_id.is_none() {
                 remote.launch_command.clone()
             } else if remote.stop_owed {
+                let saved_input = remote.controlled_input();
+                let mut params = json!({"threadId":remote.thread_id,"sendCommandId":saved_input.map(|command|command.command_id),
+                    "attemptId":remote.stop_attempt_id});
+                let execution = remote
+                    .execution
+                    .as_ref()
+                    .map(|lease| self.execution.get(&lease.lease_id).unwrap_or(lease));
+                if let Some(execution) = execution {
+                    params["execution"] = execution.control();
+                    if let Some(pending) = saved_input
+                        .and_then(|command| command.params.get("execution"))
+                        .filter(|assignment| assignment["leaseId"] == execution.lease_id)
+                    {
+                        params["pendingExecution"] = pending.clone();
+                    }
+                }
                 Command {
                     command_id: remote.stop_command_id.expect("owed stop id"),
                     method: "peer.thread.stop".into(),
-                    params: json!({"threadId":remote.thread_id,"sendCommandId":remote.send_command.as_ref().map(|command|command.command_id),
-                        "attemptId":remote.stop_attempt_id}),
+                    params,
                 }
             } else if let Some(reply) = remote.document_replies.front() {
                 reply.clone()
@@ -6726,7 +9525,8 @@ impl State {
             } else {
                 Command::new(
                     "peer.thread.wait",
-                    json!({"threadId":remote.thread_id,"afterRevision":remote.wait_revision}),
+                    json!({"threadId":remote.thread_id,"afterRevision":remote.wait_revision,
+                        "execution":remote.execution.as_ref().map(crate::execution::Lease::control)}),
                 )
             };
             let (cancel, cancelled) = tokio::sync::oneshot::channel();
@@ -6783,17 +9583,7 @@ impl State {
                                     }
                                     if status["finished"] == true {
                                         let _dispatch = db.claim_dispatch()?.ok_or("Dispatch is fenced.")?;
-                                        let mut completion = peer_completion(&link, &thread_id, &status["result"]).await?;
-                                        // A fast run can finish before the home observes a
-                                        // nonterminal wait. Keep the original authenticated
-                                        // wait's input evidence alongside the exact result ack.
-                                        if completion["status"] == "accepted"
-                                            && completion["result"]["acknowledged"] == true
-                                            && let Some(inputs) = status.get("inputs").filter(|value| value.is_array())
-                                        {
-                                            completion["result"]["inputs"] = inputs.clone();
-                                        }
-                                        return Ok(completion);
+                                        return peer_completion(&link, &thread_id, &status).await;
                                     }
                                 }
                                 Ok(receipt)
@@ -7064,12 +9854,28 @@ impl State {
             {
                 remote.rejected_launch = Some(remote.launch_command.command_id);
                 rejected_launches.push((task.id.clone(), task.attempt_id.clone()));
+                if let Some(lease) = &remote.execution
+                    && remote.launch_command.params["execution"] == lease.assignment()
+                    && lease.executor_id == remote.server_id
+                    && lease.attempt_id.as_deref() == Some(&task.attempt_id)
+                    && lease.executor_thread_alias.is_none()
+                    && let Ok(settled) = self.execution.terminal(
+                        &lease.lease_id,
+                        "launch_rejected",
+                        lifecycle::now(),
+                        "authenticated exact launch refusal proved no executor was allocated",
+                    )
+                {
+                    remote.execution = Some(settled);
+                }
             }
             let launch_delivery = remote.launch_command.command_id.to_string();
-            let send_delivery = remote
-                .send_command
-                .as_ref()
-                .map(|command| command.command_id.to_string());
+            let send_delivery = (if remote.stop_owed {
+                remote.controlled_input()
+            } else {
+                remote.send_command.as_ref()
+            })
+            .map(|command| command.command_id.to_string());
             let stop_delivery = remote.stop_command_id.map(|id| id.to_string());
             let result = result.and_then(|receipt| {
                 if receipt["status"] == "accepted"
@@ -7100,9 +9906,60 @@ impl State {
             changed = true;
             match result {
                 Ok(value) => {
+                    if matches!(
+                        method.as_str(),
+                        "peer.thread.launch"
+                            | "peer.thread.send"
+                            | "peer.thread.stop"
+                            | "peer.thread.wait"
+                            | "peer.task.ack"
+                    ) && let Err(error) = apply_execution_reply(
+                        &mut self.execution,
+                        remote,
+                        &value,
+                        matches!(method.as_str(), "peer.thread.launch" | "peer.thread.send"),
+                        method == "peer.thread.stop",
+                    ) {
+                        remote.state = RemoteState::UpdateRequired;
+                        remote.last_error = Some(error);
+                        continue;
+                    }
+                    let reached_at = lifecycle::now();
+                    if let Some(peer) = self
+                        .peers
+                        .iter_mut()
+                        .find(|peer| peer.server_id == source.server_id)
+                    {
+                        peer.last_reached_at =
+                            Some(peer.last_reached_at.unwrap_or(0).max(reached_at));
+                        if peer.last_error.as_deref() == Some("Target offline.") {
+                            peer.last_error = None;
+                        }
+                    }
+                    if let Some(database) =
+                        crate::database::for_path(&self.data_dir.join("index.json"))
+                        && let Err(error) =
+                            database.note_peer_reached(&source.server_id, reached_at)
+                    {
+                        self.storage_error = Some(error);
+                    }
                     remote.retry_attempt = 0;
                     remote.last_error = None;
                     remote.next_retry_at = 0;
+                    if task.state == TaskState::Cancelled
+                        && matches!(method.as_str(), "peer.thread.wait" | "peer.task.ack")
+                        && (value["finished"] == true || value["acknowledged"] == true)
+                    {
+                        match remote.continue_attempt_stop(&self.execution) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                remote.state = RemoteState::UpdateRequired;
+                                remote.last_error = Some(error);
+                                continue;
+                            }
+                        }
+                    }
                     if method == "peer.thread.wait"
                         && value["acknowledged"] == true
                         && task.state == TaskState::Cancelled
@@ -7157,6 +10014,39 @@ impl State {
                             remote.stop_owed = false;
                             remote.stop_command_id = None;
                             remote.stop_attempt_id = None;
+                            if value["cancelledBeforeDispatch"] == true {
+                                if let Some(delivery) = &send_delivery {
+                                    rejected_operations.push((
+                                        delivery.clone(),
+                                        "Input cancelled before executor dispatch.".into(),
+                                    ));
+                                }
+                                remote.send_command = None;
+                                remote.accepted_send = None;
+                                remote.request = None;
+                                remote.needs_you = false;
+                                remote.state = RemoteState::Done;
+                                match remote.continue_attempt_stop(&self.execution) {
+                                    Ok(true) => continue,
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        remote.state = RemoteState::UpdateRequired;
+                                        remote.last_error = Some(error);
+                                        continue;
+                                    }
+                                }
+                                if let Some(lease) = &remote.execution
+                                    && let Some(attempt) = &lease.attempt_id
+                                {
+                                    completed_operations.push((
+                                        task.id.clone(),
+                                        attempt.clone(),
+                                        Some(lease.run_id.clone()),
+                                        TaskState::Cancelled,
+                                    ));
+                                }
+                                continue;
+                            }
                             // A stop receipt proves transport acceptance only.
                             // Keep waiting for this attempt's provider settlement.
                             remote.state = RemoteState::Running;
@@ -7174,7 +10064,7 @@ impl State {
                                         || evidence_servers.contains(&remote.server_id),
                                 ));
                             }
-                            remote.send_command = None;
+                            remote.accepted_send = remote.send_command.take();
                             remote.request = None;
                             remote.needs_you = false;
                             remote.state = RemoteState::Accepted;
@@ -7457,6 +10347,15 @@ impl State {
                             task.finish(TaskState::Failed, "", &error);
                         }
                     } else {
+                        if let Some(lease) = &remote.execution
+                            && lease.phase.in_flight()
+                        {
+                            let _ = self.execution.uncertain(
+                                &lease.lease_id,
+                                lifecycle::now(),
+                                "executor link was lost before terminal or verified fence evidence",
+                            );
+                        }
                         remote.state = RemoteState::TargetOffline;
                         remote.next_retry_at = lifecycle::now() + retry_delay(remote.retry_attempt);
                         remote.retry_attempt = remote.retry_attempt.saturating_add(1);

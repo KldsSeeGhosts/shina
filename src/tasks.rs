@@ -879,6 +879,7 @@ impl State {
             return Err("Only a reconciled interrupted task can be resumed.".into());
         }
         self.require_active_thread_owner(self.tasks[index].child_thread_id)?;
+        self.require_execution_recovery(self.tasks[index].child_thread_id)?;
         let message = format!(
             "{RESUME_MESSAGE}\n\nOriginal brief for reference. Do not repeat completed actions:\n{}",
             self.tasks[index].brief
@@ -2370,10 +2371,15 @@ impl State {
                 // attempt needs a new command; replaying the old command would
                 // return its immutable rejected receipt forever.
                 let mut params = remote.launch_command.params.clone();
+                params
+                    .as_object_mut()
+                    .expect("saved launch parameters")
+                    .remove("execution");
                 params["brief"] = json!(message_with_context);
                 params["origin"]["attemptId"] = json!(attempt_id);
                 remote.launch_command = crate::protocol::Command::new("peer.thread.launch", params);
                 remote.rejected_launch = None;
+                remote.execution = None;
                 remote.send_command = None;
                 remote.last_error = None;
                 remote.launch_command.command_id.to_string()

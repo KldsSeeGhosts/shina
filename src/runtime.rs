@@ -103,7 +103,18 @@ impl RuntimeState {
     /// drain: the same `mcp_request` dispatch production runs.
     #[cfg(test)]
     pub(crate) fn test_inject_mcp(&mut self, request: crate::mcp::Request) {
+        let baseline = self.state.execution_baseline();
+        let initiator = self
+            .state
+            .execution_initiator_for_thread(request.thread)
+            .unwrap_or_else(|| self.state.identity.controller_id.clone());
         self.state.mcp_request(request);
+        if let Err(error) = self
+            .state
+            .prepare_execution_after_command(&baseline, &initiator)
+        {
+            self.failure = Some(format!("Execution fence failed before effects: {error}"));
+        }
         self.last_projection = self.state.projection();
     }
 
@@ -119,7 +130,12 @@ impl RuntimeState {
         if let Some(previous) = database.projection()? {
             runtime.last_projection = previous;
         }
+        runtime
+            .state
+            .settle_pending_prompt_effects(&database.undispatched_prompt_runs()?);
         runtime.database = Some(database);
+        runtime.state.refresh_execution(crate::lifecycle::now());
+        runtime.state.mark_execution_restart_uncertain();
         runtime.reconcile_provider_intents()?;
         if let Some(outcome) = &runtime.updates.outcome {
             runtime
@@ -314,6 +330,20 @@ impl RuntimeState {
                 "Server is draining for an update. Retry after restart or cancellation.".into(),
             );
         }
+        if self.database.is_none()
+            && matches!(
+                command.method.as_str(),
+                "peer.thread.launch"
+                    | "peer.thread.send"
+                    | "peer.thread.stop"
+                    | "peer.execution.fence"
+            )
+        {
+            return Err(
+                "This file-only profile cannot safely bind an execution lease or fence a peer run. Use a durable server profile."
+                    .into(),
+            );
+        }
         if matches!(
             command.method.as_str(),
             "peer.capabilities" | "peer.thread.read" | "peer.thread.list"
@@ -331,7 +361,9 @@ impl RuntimeState {
                 }
                 return Ok(json!(receipt));
             }
+            self.execution_preflight(device, &command)?;
             database.begin()?;
+            let execution_baseline = self.state.execution_baseline();
             let capture = crate::outbox::Capture::begin();
             let mut receipt = Receipt {
                 command_id: command.command_id,
@@ -393,8 +425,21 @@ impl RuntimeState {
             } else {
                 self.state.execute_command(&command)
             };
+            let mut execution_failed = false;
             match result {
-                Ok(result) => receipt.result = result,
+                Ok(result) => match self
+                    .state
+                    .prepare_execution_after_command(&execution_baseline, device)
+                {
+                    Ok(()) => receipt.result = result,
+                    Err(error) => {
+                        execution_failed = true;
+                        receipt.status = ReceiptStatus::Rejected;
+                        receipt.result = json!({
+                            "error":format!("Execution fence failed before provider or peer effects: {error}")
+                        });
+                    }
+                },
                 Err(error) => {
                     receipt.status = ReceiptStatus::Rejected;
                     receipt.result = json!({"error":error});
@@ -409,7 +454,15 @@ impl RuntimeState {
                     .unwrap_or_else(|| json!(uuid::Uuid::new_v4()));
             }
             self.state.record_command(receipt.clone(), None);
-            self.persist(Some(&receipt), capture.finish())?;
+            let captured = capture.finish();
+            self.persist(
+                Some(&receipt),
+                if execution_failed {
+                    Vec::new()
+                } else {
+                    captured
+                },
+            )?;
             if command.method == "providers.update" && receipt.result["updateAccepted"] == true {
                 self.start_provider_update(&receipt.result);
             }
@@ -526,12 +579,25 @@ impl RuntimeState {
             }
             let capture = crate::outbox::Capture::begin();
             self.state.persistence_scope = Some(Default::default());
+            let execution_baseline = self.state.execution_baseline();
+            let execution_initiator = self.state.identity.controller_id.clone();
             let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default());
+            let execution_changed = self.state.refresh_execution(crate::lifecycle::now());
+            if let Err(error) = self
+                .state
+                .prepare_execution_after_command(&execution_baseline, &execution_initiator)
+            {
+                let error = format!("Execution fence failed before effects: {error}");
+                database.fail(error.clone());
+                self.state.storage_error = Some(error.clone());
+                self.failure = Some(error);
+                return false;
+            }
             let recovered = self.state.collect_recovered_inputs();
             if recovered || update_changed {
                 self.state.persistence_scope = None;
             }
-            let changed = changed | recovered;
+            let changed = changed | recovered | execution_changed;
             let effects = capture.finish();
             if !changed
                 && !update_changed
@@ -563,6 +629,7 @@ impl RuntimeState {
         }
         let changed = crate::model::poll(&mut self.state, 0.0, &mut rune::Tx::default())
             | self.state.collect_recovered_inputs()
+            | self.state.refresh_execution(crate::lifecycle::now())
             | provider_changed;
         if !changed {
             return prepared_changed || before != self.maintenance.status();
@@ -697,6 +764,7 @@ impl RuntimeState {
         let database = self.database.clone().ok_or("No runtime database.")?;
         let result = (|| {
             let document_revision = database.document_revision();
+            self.state.mark_execution_prompts_dispatched(&effects);
             if effects.len() > 0
                 && self
                     .state
@@ -834,6 +902,106 @@ impl RuntimeState {
         self.state.lookup_command(device, params)
     }
 
+    fn execution_preflight(&self, device: &str, command: &Command) -> Result<(), String> {
+        let args = command
+            .params
+            .get("args")
+            .filter(|_| command.method.starts_with("task."))
+            .unwrap_or(&command.params);
+        let thread_id = args["threadId"]
+            .as_u64()
+            .or_else(|| args["thread_id"].as_u64())
+            .and_then(|id| usize::try_from(id).ok());
+        if let Some(thread_id) = thread_id
+            && let Some(thread) = self
+                .state
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+        {
+            let mut replacement = matches!(
+                command.method.as_str(),
+                "thread.resume" | "thread.retry" | "task.resume"
+            ) || matches!(
+                command.method.as_str(),
+                "thread.send" | "captain.crew.send" | "task.send" | "queue.sendNow"
+            ) && !thread.status.busy()
+                && !thread.queued();
+            if command.method == "task.send" && self.state.is_remote_task_thread(thread_id) {
+                // The executor checks the exact lease and generation. Leaving
+                // this command available lets it survive an offline target and
+                // report the precise refusal when the link returns.
+                replacement = false;
+            }
+            if replacement {
+                self.state.require_execution_recovery(thread_id)?;
+            }
+            if command.method == "request.respond" {
+                self.state.require_execution_certain(thread_id)?;
+            }
+        }
+
+        if !command.method.starts_with("peer.thread.")
+            && !command.method.starts_with("peer.execution.")
+        {
+            return Ok(());
+        }
+        let database = self
+            .database
+            .as_ref()
+            .ok_or("Peer execution requires a durable server profile.")?;
+        let Some(binding) = database.peer_binding(device)? else {
+            return Err(
+                "This peer credential predates authenticated controller binding. Re-pair with a peer code before assigning executions."
+                    .into(),
+            );
+        };
+        if command.method == "peer.thread.launch" {
+            let execution = &command.params["execution"];
+            if !execution.is_object() {
+                return Err(format!(
+                    "{} No worker or execution lease was created.",
+                    crate::protocol::EXECUTION_LEASES_UPDATE_REQUIRED
+                ));
+            }
+            let origin = &command.params["origin"];
+            for field in ["workspaceId", "ownerId", "controllerId"] {
+                if execution[field] != binding[field] {
+                    return Err(format!(
+                        "Peer assignment {field} does not match the authenticated paired controller."
+                    ));
+                }
+            }
+            if origin["serverId"] != binding["serverId"]
+                || execution["controllerId"] != binding["controllerId"]
+            {
+                return Err(
+                    "Peer assignment controller does not match the authenticated paired identity."
+                        .into(),
+                );
+            }
+        } else if matches!(
+            command.method.as_str(),
+            "peer.thread.send" | "peer.thread.stop" | "peer.execution.fence"
+        ) && let Some(execution) = command.params.get("execution")
+        {
+            if execution["controllerId"] != binding["controllerId"]
+                || execution["workspaceId"] != binding["workspaceId"]
+                || execution["ownerId"] != binding["ownerId"]
+            {
+                return Err(
+                    "Execution control does not match the authenticated paired controller.".into(),
+                );
+            }
+        }
+        if command.method == "peer.execution.fence"
+            && command.params["controllerId"] != binding["controllerId"]
+        {
+            return Err("Execution fence does not match the authenticated controller.".into());
+        }
+        Ok(())
+    }
+
     pub fn shutdown(&mut self) -> Result<(), String> {
         self.committed_history.clear();
         self.state.persistence_scope = None;
@@ -848,6 +1016,7 @@ impl RuntimeState {
             .as_ref()
             .map(|_| crate::outbox::Capture::begin());
         self.state.begin_runtime_shutdown();
+        self.state.mark_execution_restart_uncertain();
         if let Some(capture) = capture {
             self.persist(None, capture.finish())?;
             self.committed_history.clear();
@@ -862,6 +1031,7 @@ impl RuntimeState {
                 .as_ref()
                 .map(|_| crate::outbox::Capture::begin());
             let running = self.state.drain_runtime_shutdown();
+            self.state.refresh_execution(crate::lifecycle::now());
             if let Some(capture) = capture {
                 self.persist(None, capture.finish())?;
                 self.committed_history.clear();
@@ -2036,6 +2206,148 @@ mod tests {
                 "no saved:true may reach the caller after a failed persist"
             ),
         }
+    }
+
+    #[test]
+    fn uncertain_execution_is_refused_before_retry_or_resume_can_mutate_state() {
+        let mut runtime = durable();
+        let thread = runtime.state.current().id;
+        let run = uuid::Uuid::new_v4().to_string();
+        runtime.state.threads[runtime.state.active].run_id = Some(run.clone());
+        let (lease, _) = runtime
+            .state
+            .execution
+            .prepare(crate::execution::Prepare {
+                scope: crate::execution::Scope {
+                    workspace_id: runtime.state.identity.workspace_id.clone(),
+                    owner_id: runtime.state.identity.owner_id.clone(),
+                    run_as_owner_id: runtime.state.identity.owner_id.clone(),
+                    controller_id: runtime.state.identity.controller_id.clone(),
+                    initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+                    executor_id: runtime.state.identity.executor_id.clone(),
+                },
+                logical_captain_uid: None,
+                logical_thread_uid: runtime
+                    .state
+                    .snapshot_identity()
+                    .thread_uid(thread)
+                    .unwrap()
+                    .into(),
+                executor_thread_alias: Some(thread as u64),
+                executor_thread_uid: None,
+                run_id: run.clone(),
+                attempt_id: None,
+                delivery_id: None,
+                request_key: None,
+                now: 1,
+                queues_behind_current: false,
+            })
+            .unwrap();
+        runtime
+            .state
+            .execution
+            .transition(
+                &lease.lease_id,
+                crate::execution::Phase::Dispatched,
+                2,
+                "sent",
+            )
+            .unwrap();
+        runtime
+            .state
+            .execution
+            .uncertain(&lease.lease_id, 3, "executor disconnected")
+            .unwrap();
+        let before = runtime.seq;
+        let error = runtime
+            .command(
+                "maintainer",
+                Command::new("thread.retry", json!({"threadId":thread})),
+            )
+            .unwrap_err();
+        assert!(error.contains("verified fence"), "{error}");
+        assert_eq!(runtime.seq, before);
+        assert_eq!(
+            runtime.state.current().run_id.as_deref(),
+            Some(run.as_str())
+        );
+        assert_eq!(runtime.state.execution.leases.len(), 1);
+        runtime
+            .database
+            .clone()
+            .unwrap()
+            .fail("test complete".into());
+    }
+
+    #[test]
+    fn execution_commit_failure_dispatches_zero_provider_effects() {
+        let (mut runtime, database, _channels, worker) = runtime_fixture_with_crew();
+        let index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|thread| thread.id == worker)
+            .unwrap();
+        let (pi, commands, _events) = crate::harness::Session::test_connection();
+        runtime.state.threads[index].pi = Some(pi);
+        runtime.state.threads[index].model_provider = "cpa".into();
+        runtime.state.threads[index].model_id = "fixture".into();
+        runtime.state.threads[index].status = crate::model::Status::Running;
+        let run = runtime.state.threads[index].run_id.clone().unwrap();
+        let (lease, _) = runtime
+            .state
+            .execution
+            .prepare(crate::execution::Prepare {
+                scope: crate::execution::Scope {
+                    workspace_id: runtime.state.identity.workspace_id.clone(),
+                    owner_id: runtime.state.identity.owner_id.clone(),
+                    run_as_owner_id: runtime.state.identity.owner_id.clone(),
+                    controller_id: runtime.state.identity.controller_id.clone(),
+                    initiating_device_id: "44444444-4444-4444-8444-444444444444".into(),
+                    executor_id: runtime.state.identity.executor_id.clone(),
+                },
+                logical_captain_uid: None,
+                logical_thread_uid: runtime
+                    .state
+                    .snapshot_identity()
+                    .thread_uid(worker)
+                    .unwrap()
+                    .into(),
+                executor_thread_alias: Some(worker as u64),
+                executor_thread_uid: None,
+                run_id: run,
+                attempt_id: None,
+                delivery_id: None,
+                request_key: None,
+                now: 1,
+                queues_behind_current: false,
+            })
+            .unwrap();
+        runtime.state.threads[index].execution = Some(lease.binding());
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        assert!(
+            runtime.state.threads[index]
+                .command("prompt", json!({"message":"must never reach the provider"}),)
+        );
+        let effects = capture.finish();
+        assert!(!effects.is_empty());
+        database.fail("injected execution commit failure".into());
+        assert!(runtime.persist(None, effects).is_err());
+        assert!(
+            commands.try_recv().is_err(),
+            "a prompt effect must wait for the execution lease and receipt commit"
+        );
+        database.test_connection(|connection| {
+            let index = crate::projection_store::read(connection, "index.json")
+                .unwrap()
+                .unwrap();
+            assert!(
+                index["execution"]["leases"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty)
+            );
+        });
     }
 
     #[test]

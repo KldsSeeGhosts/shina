@@ -1059,6 +1059,7 @@ mod tests {
         thread.native.queue.clear();
         thread.status = Status::Completed;
         runtime.state.admission_pump();
+        runtime.state.refresh_execution(lifecycle::now());
         runtime.state.scheduler.limits.account_pending = Some(1);
         let serial = runtime.state.threads[index].serial;
         let before = runtime.state.scheduler.reservations.len();

@@ -1569,6 +1569,7 @@ impl State {
                 if self.runtime_enabled
                     && let Err(error) = self.admission_commit()
                 {
+                    self.settle_prepared_admission_failure(child);
                     self.tasks[task_index].state = TaskState::Interrupted;
                     self.tasks[task_index].error_excerpt = error.chars().take(2000).collect();
                     self.storage_error = Some(error);
@@ -2550,6 +2551,7 @@ mod tests {
             label: "Peer".into(),
             thread_id: Some(41),
             launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),
+            execution: None,
             rejected_launch: None,
             stop_owed: false,
             stop_command_id: None,
@@ -2565,6 +2567,8 @@ mod tests {
             child_stop_serial: 0,
             client_request_id: None,
             send_command: None,
+            accepted_send: None,
+            execution_inputs: Default::default(),
             document_replies: VecDeque::new(),
             placement: None,
             evidence_supported: false,
@@ -3259,6 +3263,7 @@ mod tests {
             label: "Peer".into(),
             thread_id: Some(41),
             launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),
+            execution: None,
             rejected_launch: None,
             stop_owed,
             stop_command_id: stop_owed.then(uuid::Uuid::new_v4),
@@ -3274,6 +3279,8 @@ mod tests {
             child_stop_serial: 0,
             client_request_id: None,
             send_command: None,
+            accepted_send: None,
+            execution_inputs: Default::default(),
             document_replies: VecDeque::new(),
             placement: None,
             evidence_supported: false,

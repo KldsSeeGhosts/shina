@@ -5351,6 +5351,274 @@ fn late_steer_records_follow_up_and_exact_run_attribution() {
     target.stop();
 }
 
+#[test]
+fn cancellation_before_peer_assignment_survives_restart_without_provider_input() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let gate = home.root.join("peer-send-release");
+    fs::write(
+        home.root.join("extra-env.json"),
+        json!({"SHINA_TEST_PEER_SEND_BARRIER":gate}).to_string(),
+    )
+    .unwrap();
+    target.launch(&["serve"]);
+    home.launch(&["serve"]);
+    let (discovery, mut executor, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/pending-cancellation.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "initial pending-cancel fixture",
+        "pending-cancel-launch",
+        &discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    let old = client.snapshot["index"]["tasks"][0]["remote"]["execution"].clone();
+    let send = json!({"threadId":parent,"args":{"thread_id":child,
+        "message":"cancel-before-assignment-must-not-deliver","client_request_id":"pending-send"}});
+    let accepted = client.command("task.send", send.clone(), uuid::Uuid::new_v4());
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    let attempt = accepted["result"]["result"]["attempt_id"].clone();
+    let cancel = json!({"threadId":parent,"args":{"thread_id":child,
+        "attempt_id":attempt,"client_request_id":"pending-stop"}});
+    let accepted = client.command("task.cancel", cancel.clone(), uuid::Uuid::new_v4());
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    client.until(|state| state["index"]["tasks"][0]["remote"]["stopOwed"] == true);
+    let assignment = client.snapshot["index"]["tasks"][0]["remote"]["execution"].clone();
+    assert_ne!(assignment["leaseId"], old["leaseId"]);
+    assert!(durable_task_inputs(&target).iter().all(|input| {
+        !input["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must-not-deliver"))
+    }));
+    drop(client);
+    home.crash_child(0);
+    fs::write(&gate, b"release only after the saved stop").unwrap();
+    home.launch(&["serve"]);
+    client = home.client(uuid::Uuid::new_v4());
+    client.until(|state| {
+        let task = &state["index"]["tasks"][0];
+        task["state"] == "cancelled"
+            && task["remote"]["stopOwed"] == false
+            && task["remote"]["state"] == "done"
+    });
+    assert!(client.snapshot["index"]["tasks"][0]["remote"]["sendCommand"].is_null());
+    assert_eq!(
+        client.snapshot["index"]["tasks"][0]["remote"]["execution"]["terminalStatus"],
+        "cancelled_before_dispatch"
+    );
+    let target_thread = client.snapshot["index"]["tasks"][0]["remote"]["threadId"].clone();
+    executor.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("pending-cancel-target"),
+    );
+    let thread = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == target_thread)
+        .unwrap();
+    assert_eq!(thread["execution"]["leaseId"], old["leaseId"]);
+    let prompts = target.root.join("workspace/fixture-prompts.jsonl");
+    let assert_no_cancelled_prompt = || {
+        assert!(
+            !fs::read_to_string(&prompts)
+                .unwrap()
+                .contains("cancel-before-assignment-must-not-deliver")
+        );
+    };
+    assert_no_cancelled_prompt();
+    drop(client);
+    drop(executor);
+    home.stop();
+    target.stop();
+    target.launch(&["serve", "--port", &discovery["port"].to_string()]);
+    home.launch(&["serve"]);
+    client = home.client(uuid::Uuid::new_v4());
+    for (method, args) in [("task.send", send), ("task.cancel", cancel)] {
+        let replay = client.command(method, args, uuid::Uuid::new_v4());
+        assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    }
+    assert_no_cancelled_prompt();
+    home.stop();
+    target.stop();
+}
+
+/// Task cancellation includes queued assignments and the running writer in
+/// the observed attempt. It remains unsettled until every exact control settles.
+#[test]
+fn task_cancel_settles_queued_inputs_and_the_observed_attempts_running_writer() {
+    let mut target = Profile::new();
+    let mut home = Profile::new();
+    let provider_gate = target.root.join("hold-followup-provider-input");
+    fs::write(&provider_gate, b"ready").unwrap();
+    fs::write(
+        target.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_PEER_INPUT":provider_gate}).to_string(),
+    )
+    .unwrap();
+    target.launch(&["serve"]);
+    home.launch(&["serve"]);
+    let (discovery, mut executor, mut client, parent) = link_peer_servers(
+        &mut target,
+        &mut home,
+        "https://example.com/accepted-queue-cancellation.git",
+    );
+    let delegated = delegate_fixture(
+        &mut client,
+        &parent,
+        "peer-documents-hold-fixture",
+        "accepted-queue-launch",
+        &discovery,
+    );
+    let child = delegated["result"]["result"]["thread_id"].clone();
+    client.until(|state| state["index"]["tasks"][0]["remote"]["execution"]["phase"] == "running");
+    // This contract covers cancellation before provider delivery. The separate
+    // acceptance test covers inputs already written into the provider queue.
+    fs::remove_file(&provider_gate).unwrap();
+    let first = client.snapshot["index"]["tasks"][0]["remote"]["execution"].clone();
+    let send = json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"accepted-queued-input-must-not-deliver",
+        "client_request_id":"accepted-queue-send","delivery":"follow_up",
+    }});
+    let accepted = client.command("task.send", send.clone(), uuid::Uuid::new_v4());
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    client.until(|state| {
+        let remote = &state["index"]["tasks"][0]["remote"];
+        remote["sendCommand"].is_null()
+            && remote["acceptedSend"].is_object()
+            && remote["execution"]["phase"] == "executorAccepted"
+    });
+    let remote = client.snapshot["index"]["tasks"][0]["remote"].clone();
+    let queued = remote["execution"].clone();
+    assert_ne!(first["leaseId"], queued["leaseId"]);
+    let input_id = remote["acceptedSend"]["commandId"].clone();
+    assert!(input_id.is_string(), "{remote}");
+    let durable = durable_task_inputs(&target);
+    assert!(
+        durable.iter().any(|input| {
+            input["command_id"] == input_id
+                && input["queue_state"] == "queued"
+                && input["provider_state"] == "not_observed"
+        }),
+        "{durable:?}"
+    );
+    let second_send = json!({"threadId":parent,"args":{
+        "thread_id":child,"message":"second-accepted-queued-input-must-not-deliver",
+        "client_request_id":"accepted-queue-second-send","delivery":"follow_up",
+    }});
+    let accepted = client.command("task.send", second_send.clone(), uuid::Uuid::new_v4());
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    client.until(|state| {
+        let remote = &state["index"]["tasks"][0]["remote"];
+        remote["sendCommand"].is_null()
+            && remote["acceptedSend"]["commandId"] != input_id
+            && remote["execution"]["generation"].as_u64() > queued["generation"].as_u64()
+    });
+    let target_thread = remote["threadId"].clone();
+    executor.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("accepted-queue-before"),
+    );
+    let before = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == target_thread)
+        .unwrap()
+        .clone();
+    assert_eq!(before["execution"]["leaseId"], first["leaseId"]);
+    let cancel = json!({"threadId":parent,"args":{
+        "thread_id":child,"attempt_id":first["attemptId"],
+        "client_request_id":"accepted-queue-stop",
+    }});
+    let accepted = client.command("task.cancel", cancel.clone(), uuid::Uuid::new_v4());
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    client.until(|state| {
+        let remote = &state["index"]["tasks"][0]["remote"];
+        remote["state"] == "done"
+            && remote["stopOwed"] == false
+            && remote["execution"]["leaseId"] == first["leaseId"]
+            && remote["execution"]["terminalStatus"] == "cancelled"
+    });
+    assert!(
+        client.snapshot["index"]["execution"]["leases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|lease| lease["logicalThreadUid"] == first["logicalThreadUid"])
+            .all(|lease| lease["phase"] == "terminal")
+    );
+    executor.rpc(
+        "workspace.subscribe",
+        json!({}),
+        json!("accepted-queue-after"),
+    );
+    let after = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|thread| thread["id"] == target_thread)
+        .unwrap();
+    assert_eq!(after["execution"], before["execution"]);
+    assert_eq!(after["runId"], before["runId"]);
+    assert_eq!(after["stopSerial"], before["stopSerial"]);
+    assert_eq!(after["providerTerminalRun"], first["runId"]);
+    let prompts = target.root.join("workspace/fixture-prompts.jsonl");
+    let assert_not_delivered = || {
+        assert!(
+            !fs::read_to_string(&prompts)
+                .unwrap()
+                .contains("accepted-queued-input-must-not-deliver")
+        );
+    };
+    assert_not_delivered();
+    drop(client);
+    drop(executor);
+    home.stop();
+    target.stop();
+    target.launch(&["serve", "--port", &discovery["port"].to_string()]);
+    home.launch(&["serve"]);
+    client = home.client(uuid::Uuid::new_v4());
+    for (method, args) in [
+        ("task.send", send),
+        ("task.send", second_send),
+        ("task.cancel", cancel),
+    ] {
+        let replay = client.command(method, args, uuid::Uuid::new_v4());
+        assert_eq!(replay["result"]["result"]["replayed"], true, "{replay}");
+    }
+    assert_not_delivered();
+    fs::write(&provider_gate, b"ready").unwrap();
+    let next = client.command(
+        "task.send",
+        json!({"threadId":parent,"args":{
+            "thread_id":child,"message":"after-attempt-cancel-fixture",
+            "client_request_id":"after-attempt-cancel",
+        }}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(next["result"]["status"], "accepted", "{next}");
+    client.until(|state| state["index"]["tasks"][0]["state"] == "completed");
+    assert_eq!(
+        fs::read_to_string(&prompts)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("after-attempt-cancel-fixture"))
+            .count(),
+        1
+    );
+    assert_not_delivered();
+    home.stop();
+    target.stop();
+}
+
 /// A cancel accepted while the fixed-link target is offline stays unobserved
 /// and blocks a newer send. Restarting the target at the same listener and
 /// identity lets the fenced stop settle without affecting later work.

@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 46;
+pub const MINOR: u32 = 47;
 /// Stable workspace/owner/controller identities are additive at protocol 1.42.
 /// Scheduler and effective-capability minors remain independently owned.
 pub const IDENTITY_MINOR: u32 = 42;
 pub const IDENTITY: &str = "identity-v1";
+pub const EXECUTION_LEASES_MINOR: u32 = 47;
+pub const EXECUTION_LEASES: &str = "execution-leases-v1";
+pub const EXECUTION_LEASES_UPDATE_REQUIRED: &str =
+    "Update required on the target machine before it can bind a controller execution lease.";
 pub const CAPTAIN_PEER_DOCUMENTS_MINOR: u32 = 37;
 pub const CAPTAIN_PEER_DOCUMENTS: &str = "captain-peer-documents-v1";
 pub const PEER_TASK_FENCES_MINOR: u32 = 39;
@@ -294,6 +298,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.reports.list"
         | "captain.promote.preview"
         | "captain.lifecycle.preview"
+        | "execution.inspect"
         | "scheduling.status" => "read",
         "request.respond" | "thread.user-input.dismiss" | "captain.report.answer" => "approve",
         "server.updateStatus"
@@ -322,6 +327,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "peer.thread.list"
         | "peer.thread.send"
         | "peer.thread.stop"
+        | "peer.execution.fence"
         | "peer.captain.document.reply" => "peer-delegate",
         "thread.send"
         | "notifications.push.register"
@@ -393,6 +399,7 @@ pub fn method_grant(method: &str) -> Option<&'static str> {
         | "captain.promote"
         | "captain.demote"
         | "captain.delete"
+        | "execution.reconcile"
         | "scheduling.configure" => "operate",
         _ => return None,
     })
@@ -797,6 +804,7 @@ mod tests {
                 | "captain.reports.list"
                 | "captain.promote.preview"
                 | "captain.lifecycle.preview"
+                | "execution.inspect"
                 | "scheduling.status" => "read",
                 "request.respond" | "captain.report.answer" => "approve",
                 "server.updateStatus"
@@ -817,9 +825,15 @@ mod tests {
                 | "server.clientReady"
                 | "server.commitRestart"
                 | "server.stop" => "maintain",
-                "peer.capabilities" | "peer.thread.launch" | "peer.thread.wait"
-                | "peer.task.ack" | "peer.thread.read" | "peer.thread.list"
-                | "peer.thread.send" | "peer.thread.stop" => "peer-delegate",
+                "peer.capabilities"
+                | "peer.thread.launch"
+                | "peer.thread.wait"
+                | "peer.task.ack"
+                | "peer.thread.read"
+                | "peer.thread.list"
+                | "peer.thread.send"
+                | "peer.thread.stop"
+                | "peer.execution.fence" => "peer-delegate",
                 _ => "operate",
             };
             assert_eq!(method_grant(method), Some(expected), "{method}");

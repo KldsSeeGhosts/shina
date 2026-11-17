@@ -249,9 +249,15 @@ impl Database {
                 receipt.result = json!({"error":"Server restarted before dispatch was confirmed. Review before retrying.","previousResult":receipt.result});
                 put_receipt(&tx, &receipt)?;
             }
+            tx.execute(
+                "UPDATE effect_outbox SET status='interrupted', error=?1
+                 WHERE kind='harness' AND status='pending'",
+                [crate::outbox::RESTARTED_BEFORE_DISPATCH],
+            )
+            .map_err(error)?;
             tx.execute_batch(
                 "UPDATE effect_outbox SET status='interrupted', error='Server restarted. Review before retrying.'
-                 WHERE kind='harness' AND status IN ('pending','dispatching');",
+                 WHERE kind='harness' AND status='dispatching';",
             ).map_err(error)?;
             tx.commit().map_err(error)?;
         }
@@ -1158,6 +1164,35 @@ impl Database {
             let text:String=inner.connection.query_row("SELECT payload FROM projection_records WHERE document='index.json' AND scope=?1 AND key='$'",[scope],|r|r.get(0)).map_err(error)?;
             serde_json::from_str(&text).map_err(error)
         };
+        let record = read(&format!("threads/{thread}"))?;
+        let mut index = json!({"threads":[record.clone()]});
+        let execution: Option<String> = inner.connection.query_row(
+            "SELECT payload FROM projection_records WHERE document='index.json' AND scope='$' AND key='execution'",
+            [], |row| row.get(0),
+        ).optional().map_err(error)?;
+        if let Some(execution) = execution {
+            let execution: Value = serde_json::from_str(&execution).map_err(error)?;
+            let leases = execution["leases"]
+                .as_array()
+                .ok_or("Invalid execution lease projection.")?
+                .iter()
+                .filter(|lease| {
+                    lease["leaseId"].as_str().is_some_and(|id| {
+                        record["execution"]["leaseId"].as_str() == Some(id)
+                            || record["nextExecution"]["leaseId"].as_str() == Some(id)
+                            || record["peerInputExecutions"]
+                                .as_object()
+                                .is_some_and(|inputs| {
+                                    inputs
+                                        .values()
+                                        .any(|binding| binding["leaseId"].as_str() == Some(id))
+                                })
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            index["execution"] = json!({"schema":execution["schema"],"leases":leases});
+        }
         let scheduler: Value = inner
             .connection
             .query_row(
@@ -1168,9 +1203,8 @@ impl Database {
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or(Value::Null);
-        Ok(
-            json!({"index":{"threads":[read(&format!("threads/{thread}"))?],"scheduler":scheduler},"threads":[read(&format!("threadViews/{thread}"))?]}),
-        )
+        index["scheduler"] = scheduler;
+        Ok(json!({"index":index,"threads":[read(&format!("threadViews/{thread}"))?]}))
     }
 
     pub fn replay(&self, after: u64, through: u64) -> Result<Option<Vec<Value>>, String> {
@@ -1203,6 +1237,26 @@ impl Database {
             );
         }
         Ok((events.len() as u64 == through - after).then_some(events))
+    }
+
+    pub(crate) fn undispatched_prompt_runs(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let inner = self.0.lock().expect("database");
+        let mut stmt = inner
+            .connection
+            .prepare(
+                "SELECT json_extract(payload,'$.runId') FROM effect_outbox
+             WHERE kind='harness' AND json_extract(payload,'$.type')='prompt'
+               AND json_type(payload,'$.runId')='text'
+             GROUP BY 1
+             HAVING count(*) = sum(CASE WHEN status='interrupted' AND error=?1 THEN 1 ELSE 0 END)",
+            )
+            .map_err(error)?;
+        stmt.query_map([crate::outbox::RESTARTED_BEFORE_DISPATCH], |row| row.get(0))
+            .map_err(error)?
+            .collect::<Result<_, _>>()
+            .map_err(error)
     }
 
     pub fn effect_status(
@@ -1238,6 +1292,35 @@ impl Database {
         id: &str,
         token: &str,
         scopes: &[&str],
+    ) -> Result<(), String> {
+        self.issue_scoped_device_binding(id, token, scopes, None)
+    }
+
+    /// A peer-delegate credential is bound during the user-approved pairing
+    /// exchange to the controller that owns it. The binding is authorization
+    /// metadata, never a bearer credential.
+    pub fn issue_peer_device(&self, id: &str, token: &str, binding: &Value) -> Result<(), String> {
+        for field in ["serverId", "workspaceId", "ownerId", "controllerId"] {
+            uuid::Uuid::parse_str(binding[field].as_str().unwrap_or(""))
+                .map_err(|_| format!("Invalid paired peer {field}."))?;
+        }
+        if binding["controllerId"] != binding["serverId"] {
+            return Err("Paired peer controller does not match its authenticated server.".into());
+        }
+        self.issue_scoped_device_binding(
+            id,
+            token,
+            &["read", "peer-delegate"],
+            Some(binding.clone()),
+        )
+    }
+
+    fn issue_scoped_device_binding(
+        &self,
+        id: &str,
+        token: &str,
+        scopes: &[&str],
+        peer_binding: Option<Value>,
     ) -> Result<(), String> {
         let mut inner = self.0.lock().expect("database");
         if let Some(failure) = &inner.failure {
@@ -1283,7 +1366,32 @@ impl Database {
             params![id, json!(scopes).to_string()],
         )
         .map_err(error)?;
+        if let Some(binding) = peer_binding {
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("peer-binding:{id}"), binding.to_string()],
+            )
+            .map_err(error)?;
+        }
         tx.commit().map_err(error)
+    }
+
+    pub fn peer_binding(&self, device: &str) -> Result<Option<Value>, String> {
+        let text: Option<String> = self
+            .0
+            .lock()
+            .expect("database")
+            .connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key=?1",
+                [format!("peer-binding:{device}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        text.map(|text| serde_json::from_str(&text).map_err(error))
+            .transpose()
     }
 
     pub fn authorize(&self, id: &str, method: &str, args: &Value) -> Result<(), String> {
@@ -1319,6 +1427,7 @@ impl Database {
                     | "peer.thread.list"
                     | "peer.thread.send"
                     | "peer.thread.stop"
+                    | "peer.execution.fence"
                     | "peer.captain.document.reply"
             )
             && !(method == "devices.revoke" && args["deviceId"] == id)
@@ -1427,6 +1536,25 @@ impl Database {
             "UPDATE peers SET capabilities=?2,last_reached_at=?3,last_error=?4 WHERE server_id=?1",
             params![peer.server_id,peer.capabilities.to_string(),peer.last_reached_at.map(|n|n as i64),peer.last_error]
         ).map_err(error)?;
+        Ok(())
+    }
+
+    /// An authenticated task reply is reachability evidence, not a new
+    /// capability exchange or authority to recreate a removed link.
+    pub(crate) fn note_peer_reached(&self, server: &str, now: u64) -> Result<(), String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        inner
+            .connection
+            .execute(
+                "UPDATE peers SET last_reached_at=max(coalesce(last_reached_at,0),?2),
+             last_error=CASE WHEN last_error='Target offline.' THEN NULL ELSE last_error END
+             WHERE server_id=?1",
+                params![server, now as i64],
+            )
+            .map_err(error)?;
         Ok(())
     }
 
@@ -1767,6 +1895,67 @@ fn put_receipt(connection: &Connection, receipt: &Receipt) -> Result<(), String>
 mod tests {
     use super::*;
     #[test]
+    fn scoped_peer_state_includes_only_its_bound_execution_leases() {
+        let directory = directory("scoped-execution");
+        let database = Database::open(&directory).unwrap();
+        let index = json!({
+            "threads":[{"id":7,"execution":{"leaseId":"current"},
+                "nextExecution":{"leaseId":"queued"},
+                "peerInputExecutions":{"third-input":{"leaseId":"third"}}}],
+            "threadViews":[{"id":7,"messages":[]}],
+            "execution":{"schema":1,"leases":[
+                {"leaseId":"current","ownerId":"owner-a"},
+                {"leaseId":"queued","ownerId":"owner-a"},
+                {"leaseId":"third","ownerId":"owner-a"},
+                {"leaseId":"unrelated","ownerId":"private-owner"}
+            ]}
+        });
+        database.test_connection(|connection| {
+            crate::projection_store::write(connection, "index.json", &index).unwrap();
+        });
+        let scoped = database.scoped_state(7).unwrap();
+        assert_eq!(
+            scoped["index"]["execution"]["leases"],
+            json!([
+                index["execution"]["leases"][0],
+                index["execution"]["leases"][1],
+                index["execution"]["leases"][2]
+            ])
+        );
+        assert!(!scoped.to_string().contains("private-owner"));
+        assert_eq!(scoped["index"]["threads"][0], index["threads"][0]);
+    }
+
+    #[test]
+    fn task_reply_reachability_keeps_capabilities_auth_denials_and_removed_links() {
+        let database = Database::open(&directory("peer-reachability")).unwrap();
+        let mut peer = crate::peer::Peer {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            host: "127.0.0.1:1".into(),
+            label: "fixture".into(),
+            linked_at: 1,
+            capabilities: json!({"contracts":["exact-contract"]}),
+            last_reached_at: Some(10),
+            last_error: Some("Target offline.".into()),
+        };
+        database.put_peer(&peer).unwrap();
+        database.note_peer_reached(&peer.server_id, 20).unwrap();
+        let reached = database.peers().unwrap().remove(0);
+        assert_eq!(reached.capabilities, peer.capabilities);
+        assert_eq!(reached.last_reached_at, Some(20));
+        assert!(reached.last_error.is_none());
+        peer.last_error = Some("Authentication denied. Re-pair manually.".into());
+        database.put_peer(&peer).unwrap();
+        database.note_peer_reached(&peer.server_id, 30).unwrap();
+        assert_eq!(database.peers().unwrap()[0].last_error, peer.last_error);
+        database.note_peer_reached(&peer.server_id, 5).unwrap();
+        assert_eq!(database.peers().unwrap()[0].last_reached_at, Some(30));
+        database.remove_peer(&peer.server_id).unwrap();
+        database.note_peer_reached(&peer.server_id, 40).unwrap();
+        assert!(database.peers().unwrap().is_empty());
+    }
+
+    #[test]
     fn persisted_thread_replay_has_a_hard_byte_budget() {
         let directory = crate::store::directory().unwrap();
         let database = Database::open(&directory).unwrap();
@@ -2013,7 +2202,12 @@ mod tests {
             database.write("index.json", index).unwrap();
             let capture = outbox::Capture::begin();
             let (sender, receiver) = std::sync::mpsc::sync_channel(8);
-            outbox::send(&sender, json!({"type":"prompt","message":"Only once"})).unwrap();
+            let run = uuid::Uuid::new_v4().to_string();
+            outbox::send(
+                &sender,
+                json!({"type":"prompt","message":"Only once","runId":run}),
+            )
+            .unwrap();
             let effects = capture.finish();
             assert!(
                 receiver.try_recv().is_err(),
@@ -2031,6 +2225,11 @@ mod tests {
             drop(database);
             let recovered = Database::open(&directory).unwrap();
             assert!(receiver.try_recv().is_err());
+            assert_eq!(
+                recovered.undispatched_prompt_runs().unwrap().contains(&run),
+                !dispatching,
+                "only a pending outbox row proves a run never reached its harness"
+            );
             assert!(matches!(
                 recovered
                     .receipt("device", command.command_id)
