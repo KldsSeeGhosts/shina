@@ -426,11 +426,106 @@ ledger. Do not infer a server implementation from these client contracts.
 The complete ten-record evidence bundle was exported outside the repository.
 Keep proprietary package bytes and the large evidence bundle out of Git.
 
-## Verification baseline
+## Issue #32 integration: effective capability contracts
 
-At commit `c710261`, before integration of this batch, `cargo build`,
-`cargo fmt --check` and the full `cargo test` suite passed on the local Apple
-Silicon Mac. The test run included 98 passing server-runtime integration tests.
-Paid provider smoke tests remain opt-in. Re-run the required checks after
-integrating implementation commits; this baseline is not verification of those
-changes.
+This tree ports the completed candidate `d36694a` onto published main
+`5e2eaa88`. The candidate's server projection prerequisite (`6a379b8`) was not
+replayed: main's `81c0605` already contains that fix. The port keeps main's
+schema 8 identity, schema 9 task operations and peer input intents, protocol 45
+`peer-task-evidence-v1`, and strict paged-snapshot test client unchanged.
+
+One `State` effective capability record per caller now drives what each thread
+is told and shown. `orchestrator_capabilities` returns the record as `contract`
+`shina-effective-capabilities/v1` with `caller` identity, `effective` sections
+(coordination rights with precise unavailable reasons, interaction fences,
+authorized reads, executable harnesses and models, placement modes, live
+capacity, negotiated peer features) and a per-tool `tools` table mirroring the
+advertised list. `initialize` and `tools/list` ride the same UI-thread request
+queue as `tools/call`, so each bearer token answers from its own thread's
+record: coordinators get the full catalog, delegated leaves get worker
+instructions and no coordination tools, remote workers get the remote-worker
+text and read scope, earlier homes and archived captains lose coordination.
+Advertisement stays discovery only; every `tools/call` still revalidates the
+gate at dispatch, so a stale `tools/list` can never widen authority.
+
+Role-derived instructions bind through each harness's real injection path:
+`Start::shina` prepends to Pi's instruction block, appends to Claude's
+`--append-system-prompt`, merges into Codex `developerInstructions`, and fills
+ACP's `<shina_context>`. Native Claude endpoint binding and allowlist, Pi
+read-only admission, Codex and ACP agent policy differences, AGENTS.md privacy,
+delivery receipts and attempt/question fences are unchanged.
+
+The caller role includes lifecycle. Active earlier homes get the earlier-home
+instructions, archived homes and crew get archived instructions, retired homes
+and crew get retired instructions, crew get their own coordinator text with
+authorized reports and `propose_memory`, and ordinary threads get ordinary
+thread text. A role change marks a live session for a
+`<shina_capability_update>` on its next prompt and clears the harness awareness
+flag so a reconnect re-injects the same current text. `initialize` answers from
+the current state, including an old endpoint after reset or archive.
+
+Reachability and harness discovery are part of the same record. An ACP harness is
+probed with a metadata-only `initialize` before allocation; an agent that
+advertises neither HTTP nor stdio MCP is reported as `executable: false` with
+its discovery and MCP state, and `delegate_task` or crew creation refuses before
+creating a thread. Linked peers publish those executable, discovery and MCP
+fields with each harness, so the origin refuses an advertised non-executable
+target before creating its metadata-only task. The target re-probes before its
+own allocation as well. A linked peer must also be reachable and free of a
+recorded reachability or authentication error before remote delegation,
+placement or document reads are reported available. A revoked origin device
+closes remote Captain document reads at discovery and dispatch.
+
+Coverage sits in `src/capabilities.rs` unit tests and
+`tests/support/capability_parity.rs`. The runtime tests drive real
+`initialize`, `tools/list` and `tools/call` over each thread's token endpoint
+recorded by the fake Pi, native Claude, native Codex (`fake_codex.js` app-server
+fixture) and ACP fixtures. The four fake agents now issue an actual
+`orchestrator_capabilities` and `list_threads` workflow from the MCP
+registration they were launched with; Claude's read-only crew additionally
+exercises `can_use_tool`, the `shina-policy` hook callback, and denied lookalike
+names. Tests compare the exact endpoint and bearer token, cover the primary
+read-only Captain home, crew, delegated leaves on all four harnesses, the
+earlier home after `captain.reset`, the archived Captain, a revoked bearer
+token, keyed `delegate_task` retry replay for lost responses, a `NOTES.md` near
+the document limit, stale `tools/list` revalidation at dispatch, unsupported
+remote independent roots, ACP MCP preflight refusal, unreachable peers and a
+revoked origin device. The remote test pairs two live serves and checks the
+negotiated peer feature table plus the remote leaf's contract on the target
+machine.
+
+`capacity.scheduler` reports `implemented: false`; admission stays the static
+per-coordinator limits until the separate scheduler work lands. The capability
+contract is additive under the existing protocol 45; this port changes no
+protocol constant, projection schema or migration.
+
+The parity test also keeps a shared `NOTES.md` at 34,019 bytes. The crew prompt
+carries its exact revision, size and hash plus a `captain_document_read`
+pointer, while the tool returns the complete document. Pi's resumed session
+records the actual `--append-system-prompt` text and checks that the former
+primary home receives the earlier-home text after reset. A separate fixture
+exits before ACP `initialize` and proves dispatch re-probes before allocation;
+discovery caching cannot turn that failure into authority.
+
+## Verification
+
+The integrated tree passed on the local Apple Silicon Mac with isolated Cargo
+artifacts:
+
+- `cargo fmt --check`
+- `cargo check --locked --all-targets`
+- `cargo build --locked`
+- `cargo test --locked`: 2,049 unit tests passed with 12 ignored; 119
+  server-runtime integration tests passed with zero failures. `npm ci` installed
+  the locked mobile-client dependencies, so the live TypeScript SDK test ran as
+  part of the integration suite.
+- `npm --prefix packages/mobile-client run typecheck`
+
+The four harnesses are deterministic local fixtures. They prove endpoint,
+bearer, MCP request and permission-policy integration, not live provider login,
+account entitlement or model availability. Those paid smoke checks remain
+ignored and opt-in. Remote independent crew roots and scheduler admission are
+reported unavailable, not simulated.
+
+Paid provider smoke tests remain opt-in. No issue was closed and no PR was
+published from this worktree.

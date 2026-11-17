@@ -177,6 +177,7 @@ impl State {
             .and_then(|target| target.harness.as_deref())
             .unwrap_or(&home.harness);
         self.validate_harness(harness)?;
+        self.require_harness_executable(harness)?;
         let provider = if harness == "pi" { "cpa" } else { harness };
         if target
             .as_ref()
@@ -300,6 +301,7 @@ impl State {
             .filter(|id| *id < usize::MAX)
             .ok_or("Thread IDs are exhausted.")?;
         self.crew_database()?;
+        self.scheduler.check_pending()?;
         #[cfg(test)]
         let git_ctx = self.test_git_context.clone().unwrap_or_default();
         #[cfg(not(test))]
@@ -314,7 +316,6 @@ impl State {
         if placement.read_only() {
             thread.native.access = AccessMode::ReadOnly;
         }
-        let pending = placement.phase == placement::PlacementPhase::Pending;
         if placement.uses_worktree() {
             thread.worktree_path = placement.checkout.clone();
             thread.branch = placement.branch.clone();
@@ -330,9 +331,12 @@ impl State {
         let index = self.threads.len() - 1;
         self.sync_memory_links();
         self.refresh_captain_contexts();
-        if !pending {
-            self.connect_thread(index);
-        }
+        // An independent crew root shares the one admission scheduler: it
+        // reserves before its provider may start and queues when capacity
+        // is full, exactly like a delegated attempt.
+        self.ensure_thread_admission(index, false, false);
+        self.admission_pump();
+        let admission = self.admission_value_for(id);
         // A synchronous startup refusal restores the prompt to a draft. Save
         // that exact input in this creation transaction, not on a later tick.
         if self.threads[index].has_draft_content() {
@@ -343,7 +347,7 @@ impl State {
         self.persistence_scope = None;
         Ok(
             json!({"saved":true,"captain":captain,"threadId":id,"runId":self.threads[index].run_id,
-            "runtimeGeneration":self.threads[index].request_generation,
+            "runtimeGeneration":self.threads[index].request_generation,"admission":admission,
             "placement":self.threads[index].placement.as_ref().map(placement::ThreadPlacement::value)}),
         )
     }
@@ -379,6 +383,7 @@ impl State {
             .checked_add(1)
             .ok_or("Queued input IDs are exhausted.")?;
         self.crew_database()?;
+        self.check_thread_admission(index)?;
         attachments::stage_prompt_files(&mut prompt)?;
         let thread = &mut self.threads[index];
         if placement_failed {
@@ -389,9 +394,6 @@ impl State {
             .native
             .queue
             .push_back(pi_session::QueuedMessage { id: serial, prompt });
-        // Existing queues serialize as held input at restart. Never rebuild a
-        // follow-up by replaying its tool receipt.
-        thread.drive_session();
         if self.threads[index]
             .placement
             .as_ref()
@@ -399,16 +401,20 @@ impl State {
         {
             self.request_reprovision(index);
         }
-        if self.threads[index].pi.is_none()
-            && self.threads[index]
-                .placement
-                .as_ref()
-                .is_none_or(|placement| placement.phase == placement::PlacementPhase::Ready)
-        {
-            self.connect_thread(index);
-        }
+        // Re-admission reserves a fresh run before this provider starts
+        // again; a live reservation already covers a connected member, and a
+        // pending placement keeps the reservation queued until it resolves.
+        self.ensure_thread_admission(index, false, false);
+        self.admission_pump();
+        // Existing queues serialize as held input at restart. Never rebuild a
+        // follow-up by replaying its tool receipt. The drive runs after
+        // admission so a queued reservation's delivery gate has settled.
+        self.threads[index].drive_session();
         self.persistence_scope = None;
-        Ok(json!({"saved":true,"captain":captain,"threadId":id,"inputId":serial}))
+        Ok(
+            json!({"saved":true,"captain":captain,"threadId":id,"inputId":serial,
+            "admission":self.admission_value_for(id)}),
+        )
     }
 
     pub fn captain_crew_stop(
@@ -1031,6 +1037,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn independent_crew_readmission_checks_pending_capacity_before_staging_input() {
+        let (mut runtime, _) = fixture();
+        runtime.state.scheduler.limits.account_running = Some(1);
+        create(&mut runtime, "running");
+        create(&mut runtime, "waiting");
+        let id = create(&mut runtime, "will finish without work");
+        let index = runtime
+            .state
+            .threads
+            .iter()
+            .position(|thread| thread.id == id)
+            .unwrap();
+        let thread = &mut runtime.state.threads[index];
+        thread.queued_prompt = None;
+        thread.pending_prompt = None;
+        thread.pending_injections.clear();
+        thread.native.queue.clear();
+        thread.status = Status::Completed;
+        runtime.state.admission_pump();
+        runtime.state.scheduler.limits.account_pending = Some(1);
+        let serial = runtime.state.threads[index].serial;
+        let before = runtime.state.scheduler.reservations.len();
+        let receipt = runtime
+            .command(
+                "maintainer",
+                Command::new(
+                    "captain.crew.send",
+                    json!({"captain":0,"threadId":id,"input":{"text":"must not stage"}}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(receipt["status"], "rejected", "{receipt}");
+        let error = receipt["result"]["error"].as_str().unwrap();
+        assert!(error.contains("queue is full"), "{error}");
+        assert_eq!(runtime.state.threads[index].serial, serial);
+        assert!(runtime.state.threads[index].native.queue.is_empty());
+        assert_eq!(runtime.state.scheduler.reservations.len(), before);
     }
 
     #[test]

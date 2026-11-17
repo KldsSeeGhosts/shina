@@ -67,7 +67,8 @@
       "captain-peer-documents-v1",
       "placement-v1",
       "identity-v1",
-      "execution-leases-v1"
+      "execution-leases-v1",
+      "admission-scheduler-v1"
     ],
     "controllerId": "<uuid>",
     "deviceId": "<uuid>",

@@ -1,8 +1,10 @@
 """Local JSONL ACP fixture. No providers, network, login, or non-fixture files."""
 import argparse
 import json
+import os
 import sys
 import time
+import urllib.request
 
 args = argparse.ArgumentParser()
 args.add_argument("--log", required=True)
@@ -12,10 +14,13 @@ args.add_argument("--resume", action="store_true")
 args.add_argument("--auth-denied", action="store_true")
 args.add_argument("--delay-seconds", type=float, default=0)
 args.add_argument("--no-history", action="store_true")
+args.add_argument("--no-mcp", action="store_true")
 opts = args.parse_args()
 session = "fixture-session"
 pending = None
 permission_prompt = None
+mcp_http = None
+session_cwd = None
 
 
 def send(value):
@@ -53,21 +58,33 @@ for line in sys.stdin:
             "loadSession": not opts.no_load and not opts.resume,
             "sessionCapabilities": {"resume": {}} if opts.resume else {},
             "promptCapabilities": {"image": True},
-            "mcpCapabilities": {"http": not opts.stdio, "stdio": True}}})
+            "mcpCapabilities": {"http": not opts.stdio and not opts.no_mcp,
+                                "stdio": not opts.no_mcp}}})
     elif method in ("session/new", "session/load", "session/resume"):
         if opts.auth_denied:
             send({"id": req_id, "error": {"code": -32000, "message": "Authentication required"}})
             continue
         assert params["cwd"]
+        session_cwd = params["cwd"]
         mcp = params["mcpServers"][0]
         assert mcp["name"] == "shina"
         if opts.stdio:
             assert mcp["args"] == ["--mcp-bridge"]
             assert {v["name"] for v in mcp["env"]} == {"SHINA_MCP_URL", "SHINA_MCP_TOKEN"}
+            endpoint = {v["name"]: v["value"] for v in mcp["env"]}
+            with open(os.path.join(params["cwd"], "fixture-mcp.json"), "w",
+                      encoding="utf8") as out:
+                json.dump({"url": endpoint["SHINA_MCP_URL"],
+                           "token": endpoint["SHINA_MCP_TOKEN"]}, out)
         else:
             assert mcp["type"] == "http"
             assert mcp["url"].startswith("http://127.0.0.1:")
             assert mcp["headers"][0]["value"].startswith("Bearer ")
+            mcp_http = mcp
+            with open(os.path.join(params["cwd"], "fixture-mcp.json"), "w",
+                      encoding="utf8") as out:
+                json.dump({"url": mcp["url"],
+                           "token": mcp["headers"][0]["value"][7:]}, out)
         if method != "session/new":
             assert params["sessionId"] == session
             if not opts.no_history:
@@ -96,6 +113,25 @@ for line in sys.stdin:
                     "title": "Choose **one** option.", "kind": "read"},
                 "options": [{"kind": "allow_once", "optionId": "choice-1", "name": "First"},
                             {"kind": "reject_once", "optionId": "choice-2", "name": "Second"}]}})
+        elif "shina-dispatch-fixture" in text and mcp_http:
+            token = mcp_http["headers"][0]["value"]
+            for name in ("orchestrator_capabilities", "list_threads"):
+                body = json.dumps({"jsonrpc": "2.0", "id": 9,
+                    "method": "tools/call", "params": {"name": name, "arguments": {}}}
+                ).encode("utf8")
+                request = urllib.request.Request(mcp_http["url"], data=body, method="POST",
+                    headers={"Authorization": token, "Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        payload = response.read().decode("utf8")
+                except Exception as error:
+                    payload = f"error: {error}"
+                with open(os.path.join(session_cwd, "acp-mcp-dispatch.jsonl"), "a",
+                          encoding="utf8") as out:
+                    out.write(json.dumps({"name": name, "url": mcp_http["url"],
+                                          "authorization": token, "result": payload}) + "\n")
+            update("agent_message_chunk", content={"type": "text", "text": "MCP workflow complete"})
+            result(req_id, {"stopReason": "end_turn"})
         elif text == "permission":
             permission_prompt = req_id
             update("agent_thought_chunk", content={"type": "text", "text": "Checking"})

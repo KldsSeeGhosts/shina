@@ -393,7 +393,7 @@ impl Client {
             ])
             .arg(format!(
                 "{}\n\n{}",
-                crate::mcp::INSTRUCTIONS,
+                self.start.shina,
                 self.start.instructions.as_deref().unwrap_or("")
             ))
             // Keep captain and MCP instructions fresh on resume, not a recorded old prompt.

@@ -1187,6 +1187,17 @@ impl Database {
                 .collect::<Vec<_>>();
             index["execution"] = json!({"schema":execution["schema"],"leases":leases});
         }
+        let scheduler: Value = inner
+            .connection
+            .query_row(
+                "SELECT payload FROM projection_records WHERE document='index.json' AND scope='$' AND key='scheduler'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or(Value::Null);
+        index["scheduler"] = scheduler;
         Ok(json!({"index":index,"threads":[read(&format!("threadViews/{thread}"))?]}))
     }
 

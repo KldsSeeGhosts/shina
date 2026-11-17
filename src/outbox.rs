@@ -202,6 +202,23 @@ pub fn peer_ack_boundary(
     let _ = (directory, method, result);
 }
 
+/// Debug-only commit-failure injection for admission ordering tests, restricted
+/// to isolated integration profiles. `SHINA_TEST_CRASH_EFFECT=admission-commit`
+/// makes `checkpoint_and_flush` report a failure instead of persisting, so a
+/// test can prove a reservation commits before any provider effect.
+#[cfg(debug_assertions)]
+pub fn commit_fault(directory: &std::path::Path) -> bool {
+    std::env::var("SHINA_TEST_CRASH_EFFECT").ok().as_deref() == Some("admission-commit")
+        && directory.starts_with(std::env::temp_dir())
+        && directory
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("shina-server-integration-")
+            })
+}
+
 /// Debug-only prompt crash injection, restricted to isolated integration profiles.
 #[cfg(debug_assertions)]
 fn crash_boundary(payload: &Value, phase: &str) {

@@ -318,3 +318,19 @@ provider dispatch rather than depending on timing.
 Formatting and diff checks pass. These results resolve the known provider-queue
 regression, not the remaining main composition, cross-executor continuity,
 exact-head CI or publication gates.
+
+## Published-main composition
+
+The candidate now includes published main `25340bb`, including the admission
+scheduler and effective-capability corrections. Peer wait snapshots retain both
+the scheduler reservation and exact input-bound leases. Launch reserves target
+admission while returning the accepted execution binding. Authenticated launch
+rejection proof remains available to release provably unused scheduler capacity.
+
+Protocol minor 48 retains both `execution-leases-v1` and
+`admission-scheduler-v1`. The all-target compiler check passes after updating the
+two scheduler test fixtures with the additive execution fields.
+
+On the combined source, both queued-provider unit tests pass. The unchanged
+provider-acceptance integration and task-wide cancellation/restart integration
+also pass. No full local suite was repeated.

@@ -6,7 +6,7 @@ use super::*;
 
 /// Captain commands are negotiated: hello at the current minor unlocks the
 /// archive, roles, delete and crew-control capability gates.
-fn hello(client: &mut Client, id: &str) {
+pub(crate) fn hello(client: &mut Client, id: &str) {
     let reply = client.rpc(
         "hello",
         json!({"protocolMajor":protocol::MAJOR,"protocolMinor":protocol::MINOR,
@@ -16,12 +16,12 @@ fn hello(client: &mut Client, id: &str) {
     assert!(reply["error"].is_null(), "{reply}");
 }
 
-fn accepted(reply: &Value) -> Value {
+pub(crate) fn accepted(reply: &Value) -> Value {
     assert_eq!(reply["result"]["status"], "accepted", "{reply}");
     reply["result"]["result"].clone()
 }
 
-fn rejected(reply: &Value) -> Value {
+pub(crate) fn rejected(reply: &Value) -> Value {
     assert_eq!(reply["result"]["status"], "rejected", "{reply}");
     reply["result"]["result"]["error"].clone()
 }
@@ -40,7 +40,7 @@ fn lifecycle_preview(client: &mut Client, captain: usize, action: &str) -> Value
     preview
 }
 
-fn index_thread(client: &Client, id: u64) -> Value {
+pub(crate) fn index_thread(client: &Client, id: u64) -> Value {
     client.snapshot["index"]["threads"]
         .as_array()
         .unwrap()
@@ -50,7 +50,7 @@ fn index_thread(client: &Client, id: u64) -> Value {
         .unwrap_or_else(|| panic!("thread {id} missing: {}", client.snapshot))
 }
 
-fn thread_view(client: &Client, id: u64) -> Value {
+pub(crate) fn thread_view(client: &Client, id: u64) -> Value {
     client.snapshot["threads"]
         .as_array()
         .unwrap()
@@ -60,7 +60,7 @@ fn thread_view(client: &Client, id: u64) -> Value {
         .unwrap_or_else(|| panic!("thread view {id} missing: {}", client.snapshot))
 }
 
-fn captain_open(client: &mut Client, name: &str) -> u64 {
+pub(crate) fn captain_open(client: &mut Client, name: &str) -> u64 {
     let put = client.command(
         "captain.put",
         json!({"record":{"name":name,"role":"Keeper","instructions":"Guard the harbor.","portrait":1}}),
@@ -75,7 +75,7 @@ fn captain_open(client: &mut Client, name: &str) -> u64 {
     accepted(&opened)["threadId"].as_u64().unwrap()
 }
 
-fn prompts(profile: &Profile, thread: u64) -> Vec<String> {
+pub(crate) fn prompts(profile: &Profile, thread: u64) -> Vec<String> {
     fs::read_to_string(
         profile
             .root
@@ -85,7 +85,7 @@ fn prompts(profile: &Profile, thread: u64) -> Vec<String> {
     .unwrap_or_default()
 }
 
-fn until_prompts(profile: &Profile, thread: u64, count: usize) {
+pub(crate) fn until_prompts(profile: &Profile, thread: u64, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while prompts(profile, thread).len() < count {
         assert!(

@@ -58,6 +58,8 @@ pub(crate) struct ThreadProjection {
     /// transcript payloads live in `fields`.
     pub(crate) record: Arc<Value>,
     pub(crate) fields: HashMap<&'static str, Arc<FieldItems>>,
+    /// A hydrated empty transcript is distinct from an unloaded one.
+    pub(crate) history_loaded: bool,
     pub(crate) structure: u64,
     pub(crate) content: u64,
     /// #25 seam: whether structure moved and whether record-level fields did.
@@ -173,6 +175,7 @@ impl ThreadProjection {
         Self {
             record: Arc::new(record),
             fields,
+            history_loaded: true,
             structure: revision,
             content: revision,
             structural: true,
@@ -1745,12 +1748,14 @@ impl ProjectionCache {
                             };
                         }
                         let mut fields = HashMap::new();
+                        let mut history_loaded = false;
                         let mut deferred: Option<Vec<Value>> = None;
                         let mut structural = true;
                         let mut items_changed = None;
                         let mut record_changed = true;
                         if let Some(view) = self.views.get_mut(&id) {
                             if let Some(installed) = view.installed.as_ref() {
+                                history_loaded = true;
                                 if let Some(scalars) = installed.scalars.as_object() {
                                     for (key, value) in scalars {
                                         thread[key] = value.clone();
@@ -1817,6 +1822,7 @@ impl ProjectionCache {
                         let emitted = Arc::new(ThreadProjection {
                             record: Arc::new(thread),
                             fields,
+                            history_loaded,
                             structure: structure_rev,
                             content: content_rev,
                             structural,
