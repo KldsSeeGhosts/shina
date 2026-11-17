@@ -2971,6 +2971,14 @@ impl State {
             task.error_excerpt = error.into();
         }
         self.tasks.push(task);
+        if matches!(
+            state,
+            TaskState::Queued | TaskState::Starting | TaskState::Running
+        ) {
+            // Demo projections use the same queue positions as production,
+            // without pumping admission or starting a provider.
+            self.admit_task_index(self.tasks.len() - 1);
+        }
     }
 }
 

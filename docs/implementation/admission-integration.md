@@ -111,6 +111,12 @@ preserved and accounted for, even when that puts the queue above its new bound.
 Task status queue positions now use the scheduler's global priority and fairness
 order rather than the old per-home task-list order.
 
+The first aggregate run after that change passed 2,092 unit tests and failed a
+crew-tray assertion because demo tasks had no scheduler records. The queued
+chip therefore had no position label. Demo tasks now record their active
+reservations without pumping admission or starting providers. The existing
+layout assertion and all 28 scheduler tests pass with that fixture correction.
+
 These corrections do not complete #23. Exact-head aggregate CI, publication and
 the final acceptance audit remain gates. Published migrations 008/009 and
 production authentication and CPA configuration are unchanged.
