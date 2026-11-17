@@ -4996,12 +4996,23 @@ fn target_queued_input_survives_restart_and_keyed_retry_without_loss_or_duplicat
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    client.until(|state| {
+    client.until_sequence(retried["result"]["seq"].as_u64().unwrap(), |state| {
         state["index"]["tasks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|task| task["state"] == "completed")
+            .any(|task| {
+                task["attempt_id"] == queued["result"]["result"]["attempt_id"]
+                    && task["state"] == "completed"
+            })
+            && state["index"]["taskOperations"]
+                .as_array()
+                .is_some_and(|operations| {
+                    operations.iter().any(|operation| {
+                        operation["request_key"] == "durable-target-input-send"
+                            && operation["acceptance"] == "accepted"
+                    })
+                })
     });
     let replay = client.command(
         "task.send",

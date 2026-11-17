@@ -90,3 +90,9 @@ No production implementation or gate is changed.
 The unchanged live restart/replay scenario passes with the corrected
 settlement barriers. Formatting and diff checks pass. Exact-head CI and the
 new main release remain required before closing #32.
+
+PR62 CI passed that scenario but exposed the same stale-state wait in the
+queued remote-input restart case. The target's durable acceptance was already
+proved; the home server had not yet observed it. That case now waits for the
+matching home attempt and operation acceptance before replaying the receipt.
+The original queued-input restart test passes with no assertion removed.
