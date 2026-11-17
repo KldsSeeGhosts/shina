@@ -66,7 +66,8 @@ This also avoids querying geometry that Rune has not yet recorded on the
 first unloaded frame. The combined reconnect/cache-reset regression passes
 with this callback-based anchor capture.
 
-The recorded run at `2f32971` is in `timeline-benchmark.json`. It uses 100,
+The recorded run at `8160ceb`, composed with main `25340bb`, is in
+`timeline-benchmark.json`. It uses 100,
 1,000 and 5,000 turns with 20 samples per phase. Scrolling makes two view
 builds across 20 samples, not one per wheel frame. Both scroll phases perform
 zero key walks, index rebuilds or completed-turn builds. The final mounted
@@ -74,9 +75,9 @@ window is 30 rows at all sizes. Prepending rebuilds the structure as required.
 
 | Turns | Scroll p50/p95 ms | Stream + scroll p50/p95 ms | Prepend p50/p95 ms |
 | --- | --- | --- | --- |
-| 100 | 2.393 / 7.353 | 4.441 / 4.971 | 13.021 / 16.190 |
-| 1,000 | 1.946 / 5.664 | 4.388 / 4.702 | 17.058 / 19.674 |
-| 5,000 | 2.078 / 6.801 | 4.811 / 5.181 | 34.935 / 40.928 |
+| 100 | 1.934 / 5.997 | 4.303 / 4.518 | 8.033 / 9.765 |
+| 1,000 | 1.954 / 5.912 | 4.331 / 4.651 | 11.886 / 12.912 |
+| 5,000 | 2.027 / 6.336 | 4.772 / 5.211 | 28.024 / 29.957 |
 
 These are debug-build CPU measurements, not production frame-rate claims.
 The existing search-navigation and sticky-bottom tests pass, as do the

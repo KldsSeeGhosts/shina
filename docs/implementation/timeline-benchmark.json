@@ -1,5 +1,5 @@
 {
-  "source_revision": "2f32971505296fd6c218e5dbe8524219846c831e",
+  "source_revision": "8160ceb17e9ed45c046b49df0f4ecf54da2cfc39",
   "platform": "macos",
   "arch": "aarch64",
   "profile": "debug",
@@ -7,14 +7,14 @@
   "height": 720,
   "scope": "headless native view/commit/layout CPU; no server receive, GPU or FPS measurement",
   "results": [
-    {"turns":100,"messages":200,"tools":100,"phase":"scroll_only","samples":20,"p50_ms":2.392709,"p95_ms":7.35275,"counts":{"views":2,"keys":0,"row_builders":60,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
-    {"turns":100,"messages":200,"tools":100,"phase":"stream_while_scrolling","samples":20,"p50_ms":4.441458,"p95_ms":4.971042,"counts":{"views":20,"keys":0,"row_builders":600,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
-    {"turns":100,"messages":200,"tools":100,"phase":"history_prepend","samples":20,"p50_ms":13.021083,"p95_ms":16.189625,"counts":{"views":20,"keys":4420,"row_builders":600,"built_turns":300,"index_builds":20},"mounted_rows_at_end":30},
-    {"turns":1000,"messages":2000,"tools":1000,"phase":"scroll_only","samples":20,"p50_ms":1.945667,"p95_ms":5.663958,"counts":{"views":2,"keys":0,"row_builders":60,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
-    {"turns":1000,"messages":2000,"tools":1000,"phase":"stream_while_scrolling","samples":20,"p50_ms":4.38775,"p95_ms":4.701875,"counts":{"views":20,"keys":0,"row_builders":600,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
-    {"turns":1000,"messages":2000,"tools":1000,"phase":"history_prepend","samples":20,"p50_ms":17.058083,"p95_ms":19.674084,"counts":{"views":20,"keys":40420,"row_builders":600,"built_turns":300,"index_builds":20},"mounted_rows_at_end":30},
-    {"turns":5000,"messages":10000,"tools":5000,"phase":"scroll_only","samples":20,"p50_ms":2.078084,"p95_ms":6.801042,"counts":{"views":2,"keys":0,"row_builders":60,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
-    {"turns":5000,"messages":10000,"tools":5000,"phase":"stream_while_scrolling","samples":20,"p50_ms":4.810834,"p95_ms":5.180916,"counts":{"views":20,"keys":0,"row_builders":600,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
-    {"turns":5000,"messages":10000,"tools":5000,"phase":"history_prepend","samples":20,"p50_ms":34.935125,"p95_ms":40.928292,"counts":{"views":20,"keys":200420,"row_builders":600,"built_turns":300,"index_builds":20},"mounted_rows_at_end":30}
+    {"turns":100,"messages":200,"tools":100,"phase":"scroll_only","samples":20,"p50_ms":1.934375,"p95_ms":5.996958,"counts":{"views":2,"keys":0,"row_builders":60,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
+    {"turns":100,"messages":200,"tools":100,"phase":"stream_while_scrolling","samples":20,"p50_ms":4.302875,"p95_ms":4.517583,"counts":{"views":20,"keys":0,"row_builders":600,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
+    {"turns":100,"messages":200,"tools":100,"phase":"history_prepend","samples":20,"p50_ms":8.032667,"p95_ms":9.765375,"counts":{"views":20,"keys":4420,"row_builders":600,"built_turns":300,"index_builds":20},"mounted_rows_at_end":30},
+    {"turns":1000,"messages":2000,"tools":1000,"phase":"scroll_only","samples":20,"p50_ms":1.9535,"p95_ms":5.912458,"counts":{"views":2,"keys":0,"row_builders":60,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
+    {"turns":1000,"messages":2000,"tools":1000,"phase":"stream_while_scrolling","samples":20,"p50_ms":4.330625,"p95_ms":4.651,"counts":{"views":20,"keys":0,"row_builders":600,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
+    {"turns":1000,"messages":2000,"tools":1000,"phase":"history_prepend","samples":20,"p50_ms":11.886375,"p95_ms":12.911792,"counts":{"views":20,"keys":40420,"row_builders":600,"built_turns":300,"index_builds":20},"mounted_rows_at_end":30},
+    {"turns":5000,"messages":10000,"tools":5000,"phase":"scroll_only","samples":20,"p50_ms":2.026958,"p95_ms":6.336375,"counts":{"views":2,"keys":0,"row_builders":60,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
+    {"turns":5000,"messages":10000,"tools":5000,"phase":"stream_while_scrolling","samples":20,"p50_ms":4.772417,"p95_ms":5.2105,"counts":{"views":20,"keys":0,"row_builders":600,"built_turns":0,"index_builds":0},"mounted_rows_at_end":30},
+    {"turns":5000,"messages":10000,"tools":5000,"phase":"history_prepend","samples":20,"p50_ms":28.024125,"p95_ms":29.956958,"counts":{"views":20,"keys":200420,"row_builders":600,"built_turns":300,"index_builds":20},"mounted_rows_at_end":30}
   ]
 }
