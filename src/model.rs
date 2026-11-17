@@ -4977,7 +4977,7 @@ impl State {
                 delivery_id: Some(task.delivery_id.clone()),
                 request_key,
                 now: lifecycle::now(),
-                queues_behind_current: true,
+                queues_behind_current: current.queued_behind_current,
             })?;
             (current, false)
         } else {

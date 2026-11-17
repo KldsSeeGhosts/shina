@@ -153,6 +153,25 @@ pub struct Lease {
 }
 
 impl Lease {
+    fn scope(&self) -> Scope {
+        Scope {
+            workspace_id: self.workspace_id.clone(),
+            owner_id: self.owner_id.clone(),
+            run_as_owner_id: self.run_as_owner_id.clone(),
+            controller_id: self.controller_id.clone(),
+            initiating_device_id: self.initiating_device_id.clone(),
+            executor_id: self.executor_id.clone(),
+        }
+    }
+
+    fn same_ownership(&self, scope: &Scope, captain: &Option<String>) -> bool {
+        self.workspace_id == scope.workspace_id
+            && self.owner_id == scope.owner_id
+            && self.run_as_owner_id == scope.run_as_owner_id
+            && self.controller_id == scope.controller_id
+            && self.logical_captain_uid == *captain
+    }
+
     pub fn binding(&self) -> Binding {
         Binding {
             lease_id: self.lease_id.clone(),
@@ -329,7 +348,17 @@ impl Book {
     pub fn prepare(&mut self, request: Prepare) -> Result<(Lease, bool), String> {
         validate_prepare(&request)?;
         if let Some(existing) = self.exact_run(&request.logical_thread_uid, &request.run_id) {
-            if existing.attempt_id != request.attempt_id
+            if existing.scope() != request.scope
+                || existing.logical_captain_uid != request.logical_captain_uid
+                || request
+                    .executor_thread_alias
+                    .is_some_and(|alias| existing.executor_thread_alias != Some(alias))
+                || request
+                    .executor_thread_uid
+                    .as_ref()
+                    .is_some_and(|uid| existing.executor_thread_uid.as_ref() != Some(uid))
+                || existing.queued_behind_current != request.queues_behind_current
+                || existing.attempt_id != request.attempt_id
                 || existing.delivery_id != request.delivery_id
                 || existing.request_key != request.request_key
             {
@@ -340,8 +369,24 @@ impl Book {
             return Ok((existing.clone(), true));
         }
         if let Some(previous) = self.latest(&request.logical_thread_uid)
+            && !previous.same_ownership(&request.scope, &request.logical_captain_uid)
+        {
+            return Err(
+                "The logical thread is owned by a different controller or workspace.".into(),
+            );
+        }
+        if let Some(uncertain) = self.leases.iter().find(|lease| {
+            lease.logical_thread_uid == request.logical_thread_uid
+                && lease.phase == Phase::Uncertain
+        }) {
+            return Err(format!(
+                "Execution {} is uncertain. A queued follow-up cannot replace an unverified writer.",
+                uncertain.lease_id,
+            ));
+        }
+        if let Some(previous) = self.latest(&request.logical_thread_uid)
             && previous.phase.blocks_replacement()
-            && !request.queues_behind_current
+            && (!request.queues_behind_current || previous.executor_id != request.scope.executor_id)
         {
             return Err(format!(
                 "Execution {} (generation {}) is {}. Observe a terminal result or verified executor fence before starting generation {}.",
@@ -413,17 +458,19 @@ impl Book {
     pub fn accept_assignment(&mut self, mut lease: Lease) -> Result<(Lease, bool), String> {
         validate_lease(&lease)?;
         if let Some(existing) = self.get(&lease.lease_id) {
-            if existing.controller_id != lease.controller_id
-                || existing.logical_thread_uid != lease.logical_thread_uid
+            if existing.binding() != lease.binding()
+                || existing.request_key != lease.request_key
+                || existing.queued_behind_current != lease.queued_behind_current
+                || existing.executor_thread_alias != lease.executor_thread_alias
+                || existing.executor_thread_uid != lease.executor_thread_uid
                 || existing.generation != lease.generation
-                || existing.run_id != lease.run_id
             {
                 return Err("Conflicting execution assignment for an existing lease.".into());
             }
             return Ok((existing.clone(), true));
         }
         if let Some(existing) = self.latest(&lease.logical_thread_uid) {
-            if existing.controller_id != lease.controller_id {
+            if !existing.same_ownership(&lease.scope(), &lease.logical_captain_uid) {
                 return Err(
                     "This logical thread already has a different authoritative controller.".into(),
                 );
@@ -434,13 +481,21 @@ impl Book {
             if existing.generation > lease.generation {
                 return Err("Execution generation is stale.".into());
             }
-            if existing.phase == Phase::Uncertain {
+            if self.leases.iter().any(|previous| {
+                previous.logical_thread_uid == lease.logical_thread_uid
+                    && previous.phase == Phase::Uncertain
+            }) {
                 return Err(format!(
                     "Execution {} is uncertain. The executor requires observed terminal or verified fence evidence before any newer generation.",
                     existing.lease_id
                 ));
             }
-            if existing.phase.blocks_replacement() && !lease.queued_behind_current {
+            if existing.phase.blocks_replacement()
+                && (!lease.queued_behind_current
+                    || existing.executor_id != lease.executor_id
+                    || existing.executor_thread_alias != lease.executor_thread_alias
+                    || existing.executor_thread_uid != lease.executor_thread_uid)
+            {
                 return Err(format!(
                     "Execution {} (generation {}) is {}. The executor requires observed terminal or verified fence evidence before accepting a replacement.",
                     existing.lease_id,
@@ -821,6 +876,120 @@ mod tests {
             now,
             queues_behind_current: false,
         }
+    }
+
+    #[test]
+    fn a_queued_followup_cannot_bypass_an_uncertain_execution() {
+        for uncertainty_on_older_generation in [false, true] {
+            let mut book = Book::default();
+            let (first, _) = book.prepare(prepare("first-run", 10)).unwrap();
+            book.transition(&first.lease_id, Phase::Dispatched, 10, "sent")
+                .unwrap();
+            if uncertainty_on_older_generation {
+                let mut second = prepare("queued-run", 11);
+                second.queues_behind_current = true;
+                book.prepare(second).unwrap();
+            }
+            book.uncertain(&first.lease_id, 12, "executor disconnected")
+                .unwrap();
+            let before = serde_json::to_value(&book).unwrap();
+            let mut next = prepare("replacement-run", 13);
+            next.queues_behind_current = true;
+            assert!(
+                book.prepare(next).is_err(),
+                "queueing must not authorize a generation while any prior writer is uncertain"
+            );
+            assert_eq!(serde_json::to_value(&book).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn keyed_prepare_replay_requires_the_original_controller_and_executor() {
+        for field in ["controller", "executor", "workspace", "captain"] {
+            let mut book = Book::default();
+            book.prepare(prepare("same-run", 10)).unwrap();
+            let mut replay = prepare("same-run", 11);
+            let other = "99999999-9999-4999-8999-999999999999".to_string();
+            match field {
+                "controller" => replay.scope.controller_id = other,
+                "executor" => replay.scope.executor_id = other,
+                "workspace" => replay.scope.workspace_id = other,
+                "captain" => replay.logical_captain_uid = Some(other),
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&book).unwrap();
+            assert!(book.prepare(replay).is_err(), "replay changed {field}");
+            assert_eq!(serde_json::to_value(&book).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn assignment_replay_requires_all_immutable_assignment_bindings() {
+        for field in ["executor", "owner", "attempt", "delivery"] {
+            let mut controller = Book::default();
+            let (lease, _) = controller.prepare(prepare("same-run", 10)).unwrap();
+            let mut executor = Book::default();
+            executor.accept_assignment(lease.clone()).unwrap();
+            let mut replay = lease;
+            let other = "99999999-9999-4999-8999-999999999999".to_string();
+            match field {
+                "executor" => replay.executor_id = other,
+                "owner" => {
+                    replay.owner_id = other.clone();
+                    replay.run_as_owner_id = other;
+                }
+                "attempt" => replay.attempt_id = Some("another-attempt".into()),
+                "delivery" => replay.delivery_id = Some("another-delivery".into()),
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&executor).unwrap();
+            assert!(
+                executor.accept_assignment(replay).is_err(),
+                "replay changed {field}"
+            );
+            assert_eq!(serde_json::to_value(&executor).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn queueing_cannot_move_an_unsettled_writer_to_another_executor() {
+        let mut book = Book::default();
+        let (first, _) = book.prepare(prepare("first-run", 10)).unwrap();
+        book.transition(&first.lease_id, Phase::Dispatched, 10, "sent")
+            .unwrap();
+        let mut next = prepare("another-executor", 11);
+        next.scope.executor_id = "99999999-9999-4999-8999-999999999999".into();
+        next.queues_behind_current = true;
+        assert!(book.prepare(next).is_err());
+        book.terminal(&first.lease_id, "completed", 12, "provider settled")
+            .unwrap();
+        let mut next = prepare("another-executor", 13);
+        next.scope.executor_id = "99999999-9999-4999-8999-999999999999".into();
+        assert!(
+            book.prepare(next).is_ok(),
+            "settled work may deliberately change executor"
+        );
+    }
+
+    #[test]
+    fn executor_refuses_queued_assignments_when_an_older_writer_is_uncertain() {
+        let mut controller = Book::default();
+        let (first, _) = controller.prepare(prepare("first-run", 10)).unwrap();
+        let mut second = prepare("second-run", 11);
+        second.queues_behind_current = true;
+        let (second, _) = controller.prepare(second).unwrap();
+        let mut third = prepare("third-run", 12);
+        third.queues_behind_current = true;
+        let (third, _) = controller.prepare(third).unwrap();
+        let mut executor = Book::default();
+        executor.accept_assignment(first.clone()).unwrap();
+        executor.accept_assignment(second).unwrap();
+        executor
+            .uncertain(&first.lease_id, 13, "provider link lost")
+            .unwrap();
+        let before = serde_json::to_value(&executor).unwrap();
+        assert!(executor.accept_assignment(third).is_err());
+        assert_eq!(serde_json::to_value(&executor).unwrap(), before);
     }
 
     #[test]
