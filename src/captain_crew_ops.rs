@@ -392,9 +392,6 @@ impl State {
             .native
             .queue
             .push_back(pi_session::QueuedMessage { id: serial, prompt });
-        // Existing queues serialize as held input at restart. Never rebuild a
-        // follow-up by replaying its tool receipt.
-        thread.drive_session();
         if self.threads[index]
             .placement
             .as_ref()
@@ -407,6 +404,10 @@ impl State {
         // pending placement keeps the reservation queued until it resolves.
         self.ensure_thread_admission(index, false, false);
         self.admission_pump();
+        // Existing queues serialize as held input at restart. Never rebuild a
+        // follow-up by replaying its tool receipt. The drive runs after
+        // admission so a queued reservation's delivery gate has settled.
+        self.threads[index].drive_session();
         self.persistence_scope = None;
         Ok(
             json!({"saved":true,"captain":captain,"threadId":id,"inputId":serial,

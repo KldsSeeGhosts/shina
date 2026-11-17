@@ -42,12 +42,60 @@ fn default_provider_running() -> Option<usize> {
     Some(PROVIDER_RUNNING)
 }
 
+/// Per-id caps layered over a scope's class limit. An id absent from its map
+/// uses the class limit; ids are the same keys the scope counts under
+/// ("captain:<id>" or "home:<thread>" for coordinator, decimal ids for
+/// captain and workspace, server ids for executor, provider ids).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ScopeOverrides {
+    pub coordinator: BTreeMap<String, usize>,
+    pub captain: BTreeMap<String, usize>,
+    pub executor: BTreeMap<String, usize>,
+    pub provider: BTreeMap<String, usize>,
+    pub workspace: BTreeMap<String, usize>,
+}
+
+impl ScopeOverrides {
+    const MAX_ENTRIES: usize = 256;
+
+    fn maps(&self) -> [&BTreeMap<String, usize>; 5] {
+        [
+            &self.coordinator,
+            &self.captain,
+            &self.executor,
+            &self.provider,
+            &self.workspace,
+        ]
+    }
+
+    fn valid(&self) -> bool {
+        self.maps().iter().all(|map| {
+            map.len() <= Self::MAX_ENTRIES
+                && map
+                    .iter()
+                    .all(|(id, cap)| !id.is_empty() && id.len() <= 64 && *cap >= 1)
+        })
+    }
+
+    fn value(&self) -> Value {
+        json!({
+            "coordinator": self.coordinator,
+            "captain": self.captain,
+            "executor": self.executor,
+            "provider": self.provider,
+            "workspace": self.workspace,
+        })
+    }
+}
+
 /// Effective limits. `None` means unlimited; `Some(n)` requires n >= 1, so
 /// `Some(0)` cannot accidentally mean "pause everything" or "unlimited".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct Limits {
-    /// Providers running under one coordinator (Captain home or parent thread).
+    /// Providers running under one coordinator: a Captain (stable across
+    /// home resets) or a parent thread.
     #[serde(default = "default_coordinator_running")]
     pub coordinator_running: Option<usize>,
     /// Unfinished delegated tasks admitted per coordinator.
@@ -67,10 +115,18 @@ pub struct Limits {
     /// Providers per provider id (cpa, codex, claude, acp) across machines.
     #[serde(default = "default_provider_running")]
     pub provider_running: Option<usize>,
+    /// Providers per Captain id, counting that Captain's crew roots and
+    /// delegated descendants together. `None` by default: the coordinator
+    /// class already covers the single-user envelope.
+    #[serde(default)]
+    pub captain_running: Option<usize>,
     /// Providers per local project. Remote work does not map onto local
     /// project ids, so it does not count here.
     #[serde(default)]
     pub workspace_running: Option<usize>,
+    /// Per-id caps that take precedence over the class limit for that scope.
+    #[serde(default)]
+    pub overrides: ScopeOverrides,
 }
 
 impl Default for Limits {
@@ -82,7 +138,9 @@ impl Default for Limits {
             account_pending: default_account_pending(),
             executor_running: default_executor_running(),
             provider_running: default_provider_running(),
+            captain_running: None,
             workspace_running: None,
+            overrides: ScopeOverrides::default(),
         }
     }
 }
@@ -96,10 +154,23 @@ impl Limits {
             self.account_pending,
             self.executor_running,
             self.provider_running,
+            self.captain_running,
             self.workspace_running,
         ]
         .iter()
         .all(|limit| limit.is_none_or(|limit| limit >= 1))
+            && self.overrides.valid()
+    }
+
+    /// The cap one scope id runs under: its override when configured, else
+    /// the class limit.
+    fn effective(
+        &self,
+        class: Option<usize>,
+        overrides: &BTreeMap<String, usize>,
+        id: &str,
+    ) -> Option<usize> {
+        overrides.get(id).copied().or(class)
     }
 
     pub fn value(&self) -> Value {
@@ -110,7 +181,9 @@ impl Limits {
             "accountPending": self.account_pending,
             "executorRunning": self.executor_running,
             "providerRunning": self.provider_running,
+            "captainRunning": self.captain_running,
             "workspaceRunning": self.workspace_running,
+            "overrides": self.overrides.value(),
         })
     }
 }
@@ -209,7 +282,7 @@ pub struct Reservation {
     pub release_reason: Option<String>,
     /// Why a queued reservation has not started: offline, recovering,
     /// placement, placement_failed, provider_update, owner_inactive,
-    /// worker_busy, provider_backoff, or a scope name.
+    /// worker_busy, backoff, provider_backoff, or a scope name.
     #[serde(default)]
     pub blocked_by: Option<String>,
     #[serde(default)]
@@ -220,6 +293,16 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// The stable coordinator scope id: a Captain outlives every home it
+    /// resets, so captain-owned work counts under "captain:<id>"; other
+    /// local work counts under its home thread.
+    pub fn coordinator_key(&self) -> String {
+        self.captain
+            .map(|captain| format!("captain:{captain}"))
+            .or_else(|| self.coordinator.map(|home| format!("home:{home}")))
+            .unwrap_or_default()
+    }
+
     fn value(&self, position: Option<usize>) -> Value {
         json!({
             "reservationId": self.id,
@@ -227,6 +310,7 @@ impl Reservation {
             "state": self.state.id(),
             "position": position,
             "coordinator": self.coordinator,
+            "coordinatorKey": self.coordinator_key(),
             "fair": self.fair,
             "executor": self.executor,
             "provider": self.provider,
@@ -239,6 +323,7 @@ impl Reservation {
             "releaseReason": self.release_reason,
             "blockedBy": self.blocked_by,
             "notBefore": self.not_before,
+            "retryAt": (self.not_before > 0).then_some(self.not_before),
             "uncertain": self.uncertain,
         })
     }
@@ -256,13 +341,19 @@ pub struct Scheduler {
     /// Consecutive refusals per provider; reset by a completed release.
     pub backoff_strikes: BTreeMap<String, u32>,
     pub sequence: u64,
+    /// Durable change counter. Every committed scheduler mutation bumps it,
+    /// so `scheduling.configure` can compare-and-set and subscribers can
+    /// read one consistent projection instead of polling.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 /// Held reservations tallied per scope.
 #[derive(Default)]
 struct HeldCounts {
     account: usize,
-    coordinator: HashMap<usize, usize>,
+    coordinator: HashMap<String, usize>,
+    captain: HashMap<usize, usize>,
     fair: HashMap<String, usize>,
     executor: HashMap<String, usize>,
     provider: HashMap<String, usize>,
@@ -284,8 +375,12 @@ impl Scheduler {
             .filter(|r| r.state == ReservationState::Held)
         {
             counts.account += 1;
-            if let Some(home) = reservation.coordinator {
-                *counts.coordinator.entry(home).or_insert(0) += 1;
+            let coordinator = reservation.coordinator_key();
+            if !coordinator.is_empty() {
+                *counts.coordinator.entry(coordinator).or_insert(0) += 1;
+            }
+            if let Some(captain) = reservation.captain {
+                *counts.captain.entry(captain).or_insert(0) += 1;
             }
             *counts.fair.entry(reservation.fair.clone()).or_insert(0) += 1;
             *counts
@@ -409,6 +504,9 @@ impl Scheduler {
         if self.provider_backoff.len() > 64 || self.backoff_strikes.len() > 64 {
             return Err("The saved scheduler has unbounded provider backoff state.".into());
         }
+        if !self.limits.valid() {
+            return Err("The saved scheduler has invalid scope overrides.".into());
+        }
         // Sequence must never collide with a surviving id.
         let highest = self
             .reservations
@@ -490,12 +588,22 @@ impl State {
             .unwrap_or_else(|| "cpa".into())
     }
 
-    /// The live reservation a subject currently holds, if any.
-    fn live_reservation_for(&self, thread_id: usize) -> Option<&Reservation> {
-        self.scheduler.reservations.iter().find(|reservation| {
-            reservation.state != ReservationState::Released
-                && reservation.subject.thread_id() == Some(thread_id)
-        })
+    /// Whether a held reservation's subject is still in the startup window
+    /// between grant and a confirmed provider turn.
+    fn reservation_starting(&self, reservation: &Reservation) -> bool {
+        if reservation.state != ReservationState::Held {
+            return false;
+        }
+        match &reservation.subject {
+            Subject::Task { task_id, .. } => self
+                .tasks
+                .iter()
+                .any(|task| task.id == *task_id && task.state == TaskState::Starting),
+            Subject::Crew { thread_id, .. } | Subject::PeerWorker { thread_id, .. } => self
+                .threads
+                .iter()
+                .any(|thread| thread.id == *thread_id && thread.pi.is_none()),
+        }
     }
 
     /// `connect_thread` calls this before spawning: a queued reservation
@@ -522,8 +630,11 @@ impl State {
 
     /// A new delegated task attempt reserves admission before its thread can
     /// connect. A still-queued reservation adopts the new attempt identity so
-    /// a pre-start correction keeps queue position; any other live
-    /// reservation for an older attempt is superseded.
+    /// a pre-start correction keeps queue position. A stale held reservation
+    /// is superseded only when its occupancy is proven gone — an unacked
+    /// remote stop keeps it held and uncertain — and the current attempt
+    /// always ends the call with its own live reservation: the durable
+    /// fence has no gap.
     pub(super) fn admit_task_index(&mut self, task_index: usize) {
         let task = &self.tasks[task_index];
         let subject = Subject::Task {
@@ -547,28 +658,82 @@ impl State {
         let fair = coordinator
             .map(|home| format!("coordinator:{home}"))
             .unwrap_or_else(|| format!("task:{task_id}"));
-        for index in 0..self.scheduler.reservations.len() {
-            let stale = matches!(
-                &self.scheduler.reservations[index].subject,
-                Subject::Task { task_id: id, .. } if *id == task_id
-            ) && self.scheduler.reservations[index].state != ReservationState::Released;
-            if !stale {
+        // Collect ids first: releasing prunes, so positions are unstable.
+        let stale: Vec<String> = self
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|r| {
+                r.state != ReservationState::Released
+                    && matches!(&r.subject, Subject::Task { task_id: id, .. } if *id == task_id)
+            })
+            .map(|r| r.id.clone())
+            .collect();
+        let mut adopted = false;
+        for id in stale {
+            let Some(position) = self.scheduler.reservations.iter().position(|r| r.id == id) else {
+                continue;
+            };
+            let reservation = self.scheduler.reservations[position].clone();
+            let attempt = match &reservation.subject {
+                Subject::Task { attempt_id, .. } => attempt_id.clone(),
+                _ => continue,
+            };
+            if attempt == self.tasks[task_index].attempt_id {
+                adopted = true;
                 continue;
             }
-            if self.scheduler.reservations[index].state == ReservationState::Queued {
-                let reservation = &mut self.scheduler.reservations[index];
-                reservation.subject = subject;
-                reservation.coordinator = coordinator;
-                reservation.fair = fair;
-                reservation.executor = executor;
-                reservation.provider = provider;
-                reservation.workspace = workspace;
-                reservation.captain = captain;
-                reservation.blocked_by = None;
-                reservation.uncertain = false;
-            } else {
-                self.release_reservation_at(index, "superseded");
+            match reservation.state {
+                ReservationState::Queued if !adopted => {
+                    // Adopt the queue slot for the corrected attempt.
+                    let reservation = &mut self.scheduler.reservations[position];
+                    reservation.subject = subject.clone();
+                    reservation.coordinator = coordinator;
+                    reservation.fair = fair.clone();
+                    reservation.executor = executor.clone();
+                    reservation.provider = provider.clone();
+                    reservation.workspace = workspace;
+                    reservation.captain = captain;
+                    reservation.blocked_by = None;
+                    reservation.uncertain = false;
+                    self.scheduler.revision += 1;
+                    adopted = true;
+                }
+                ReservationState::Held
+                    if Self::remote_occupancy_unproven(&self.tasks[task_index], &attempt) =>
+                {
+                    // The older attempt's remote process may still run; its
+                    // occupancy stays until the owed stop is acknowledged.
+                    if !reservation.uncertain {
+                        self.scheduler.reservations[position].uncertain = true;
+                        self.scheduler.revision += 1;
+                    }
+                }
+                _ => self.release_reservation_at(position, "superseded"),
             }
+        }
+        // The attempt reservation governs the child thread; a thread-scoped
+        // reservation left from an earlier crew life or a backfill race must
+        // not count the same provider occupancy a second time.
+        let child = self.tasks[task_index].child_thread_id;
+        let stray: Vec<String> = self
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|r| {
+                r.state != ReservationState::Released
+                    && r.subject
+                        .thread_id()
+                        .is_some_and(|thread_id| thread_id == child)
+            })
+            .map(|r| r.id.clone())
+            .collect();
+        for id in stray {
+            if let Some(position) = self.scheduler.reservations.iter().position(|r| r.id == id) {
+                self.release_reservation_at(position, "superseded");
+            }
+        }
+        if adopted {
             return;
         }
         if let Some(cap) = self.scheduler.limits.account_pending {
@@ -587,10 +752,20 @@ impl State {
             }
         }
         let id = self.scheduler.next_id();
+        // A backfilled attempt that already runs occupies its slot
+        // truthfully; only a queued attempt waits in line.
+        let occupying = matches!(
+            self.tasks[task_index].state,
+            TaskState::Starting | TaskState::Running
+        );
         self.scheduler.reservations.push(Reservation {
             id,
             subject,
-            state: ReservationState::Queued,
+            state: if occupying {
+                ReservationState::Held
+            } else {
+                ReservationState::Queued
+            },
             coordinator,
             fair,
             executor,
@@ -599,19 +774,45 @@ impl State {
             captain,
             priority: 0,
             queued_at: lifecycle::now(),
-            granted_at: None,
+            granted_at: occupying.then(lifecycle::now),
             released_at: None,
             release_reason: None,
             blocked_by: None,
             not_before: 0,
             uncertain: false,
         });
+        self.scheduler.revision += 1;
     }
 
-    /// A crew member or peer worker occupies admission while its provider or
-    /// pending work lives. `new_attempt` releases the live reservation and
-    /// issues a fresh run, which is how an `attempt` delivery supersedes the
-    /// worker's current occupancy without a duplicate.
+    /// Whether an attempt's remote process may still occupy the target: an
+    /// owed stop naming it (or landing unconditionally) is unacknowledged,
+    /// or the target is unreachable so nothing is proven either way.
+    fn remote_occupancy_unproven(task: &Task, attempt: &str) -> bool {
+        task.remote.as_ref().is_some_and(|remote| {
+            remote.stop_owed
+                && remote
+                    .stop_attempt_id
+                    .as_deref()
+                    .is_none_or(|named| named == attempt)
+                || remote.state == RemoteState::TargetOffline
+        })
+    }
+
+    /// A crew member or peer worker occupies admission while work or a live
+    /// provider turn exists. `new_attempt` supersedes the live reservation's
+    /// run identity in place, so the ledger never loses occupancy between
+    /// runs and a re-ensure cannot free a slot a still-running process holds.
+    /// A fresh reservation for a thread whose provider sits connected but
+    /// idle queues like any other work: an open CLI connection is not a run.
+    ///
+    /// A delegated child's occupancy lives on its task's attempt
+    /// reservation; it never holds a crew or peer-worker subject of its own.
+    fn thread_has_task(&self, thread_id: usize) -> bool {
+        self.tasks
+            .iter()
+            .any(|task| task.child_thread_id == thread_id && !task.state.finished())
+    }
+
     pub(super) fn ensure_thread_admission(
         &mut self,
         index: usize,
@@ -619,6 +820,12 @@ impl State {
         new_attempt: bool,
     ) {
         let thread_id = self.threads[index].id;
+        if self.thread_has_task(thread_id) {
+            // The task reservation governs this thread; a second subject
+            // would count the same provider occupancy twice.
+            self.sync_admission_flag(index);
+            return;
+        }
         if let Some(current) = self.threads[index].admission.clone() {
             if let Some(position) = self
                 .scheduler
@@ -627,9 +834,44 @@ impl State {
                 .position(|r| r.id == current && r.state != ReservationState::Released)
             {
                 if !new_attempt {
+                    self.sync_admission_flag(index);
                     return;
                 }
-                self.release_reservation_at(position, "superseded");
+                // Supersede in place: the reservation keeps its queue
+                // position and never drops out of the ledger, so capacity
+                // counting cannot see a gap where the old run was already
+                // released but the new one not yet issued.
+                self.threads[index].admission_run += 1;
+                let run = self.threads[index].admission_run;
+                let captain = if peer_worker {
+                    None
+                } else {
+                    self.threads[index].crew_captain
+                };
+                let coordinator = captain.and_then(|captain| self.captain_home(captain));
+                let fair = if let Some(origin) = self.threads[index].peer_origin.as_ref() {
+                    format!("origin:{}", origin.server_id)
+                } else if let Some(home) = coordinator {
+                    format!("coordinator:{home}")
+                } else {
+                    format!("thread:{thread_id}")
+                };
+                let provider = Self::thread_provider(&self.threads[index]);
+                let workspace = self.threads[index].project;
+                let reservation = &mut self.scheduler.reservations[position];
+                reservation.subject = if peer_worker {
+                    Subject::PeerWorker { thread_id, run }
+                } else {
+                    Subject::Crew { thread_id, run }
+                };
+                reservation.coordinator = coordinator;
+                reservation.fair = fair;
+                reservation.provider = provider;
+                reservation.workspace = workspace;
+                reservation.captain = captain;
+                self.scheduler.revision += 1;
+                self.sync_admission_flag(index);
+                return;
             }
         }
         self.threads[index].admission_run += 1;
@@ -650,9 +892,9 @@ impl State {
         };
         let provider = Self::thread_provider(thread);
         let workspace = thread.project;
-        // A connected provider already occupies the capacity this reservation
-        // records; it cannot wait behind its own running process.
-        let running = self.threads[index].pi.is_some();
+        // Only a provider mid-turn already occupies the slot truthfully;
+        // everything else waits for a grant, pending input included.
+        let running = self.threads[index].pi.is_some() && self.threads[index].status.busy();
         let id = self.scheduler.next_id();
         self.scheduler.reservations.push(Reservation {
             id: id.clone(),
@@ -681,16 +923,18 @@ impl State {
             not_before: 0,
             uncertain: false,
         });
+        self.scheduler.revision += 1;
         self.threads[index].admission = Some(id);
+        self.sync_admission_flag(index);
     }
 
     /// Whether a crew member or peer worker still has something a live
-    /// provider slot should cover: a running process, pending input, an
-    /// unacknowledged result, or a checkout still being provisioned.
+    /// provider slot should cover: a busy or queued turn, an unacknowledged
+    /// result, or a checkout still being provisioned. An open provider
+    /// connection alone is not work — an idle CLI holds no slot.
     fn admission_active(&self, index: usize) -> bool {
         let thread = &self.threads[index];
-        thread.pi.is_some()
-            || thread.status.busy()
+        thread.status.busy()
             || thread.queued()
             || thread.task_result.is_some()
             || thread
@@ -703,6 +947,21 @@ impl State {
                 .is_some_and(|placement| placement.phase == placement::PlacementPhase::Pending)
     }
 
+    /// The runtime gate provider delivery checks on every managed thread:
+    /// set while a covering reservation is queued, and for a managed thread
+    /// still waiting for lazy admission. Unmanaged interactive threads never
+    /// set it, so their sends behave exactly as before.
+    fn sync_admission_flag(&mut self, index: usize) {
+        let thread_id = self.threads[index].id;
+        let managed =
+            self.threads[index].peer_origin.is_some() || self.threads[index].crew_captain.is_some();
+        let blocked = match self.reservation_covering_thread(thread_id) {
+            Some(reservation) => reservation.state == ReservationState::Queued,
+            None => managed,
+        };
+        self.threads[index].admission_blocked = blocked;
+    }
+
     /// Idempotent release: the first call decides; later calls are no-ops.
     fn release_reservation_at(&mut self, index: usize, reason: &'static str) {
         let reservation = &mut self.scheduler.reservations[index];
@@ -710,6 +969,7 @@ impl State {
             return;
         }
         let provider = reservation.provider.clone();
+        let subject = reservation.subject.clone();
         reservation.state = ReservationState::Released;
         reservation.released_at = Some(lifecycle::now());
         reservation.release_reason = Some(reason.into());
@@ -719,7 +979,16 @@ impl State {
             self.scheduler.backoff_strikes.remove(&provider);
             self.scheduler.provider_backoff.remove(&provider);
         }
+        self.scheduler.revision += 1;
         self.scheduler.prune_released();
+        if let Subject::Crew { thread_id, .. } | Subject::PeerWorker { thread_id, .. } = subject
+            && let Some(index) = self
+                .threads
+                .iter()
+                .position(|thread| thread.id == thread_id)
+        {
+            self.sync_admission_flag(index);
+        }
     }
 
     /// A rate-limit signal backs off the provider scope with bounded
@@ -741,6 +1010,7 @@ impl State {
         self.scheduler
             .provider_backoff
             .insert(provider.to_owned(), lifecycle::now() + delay);
+        self.scheduler.revision += 1;
     }
 
     /// Whether `connect_thread` could spawn a provider at all. In demo, headless
@@ -752,14 +1022,17 @@ impl State {
 
     /// Release reservations whose subject reached an explicit terminal
     /// transition, was superseded, or vanished. Uncertain subjects keep
-    /// their slot until the outcome is proven.
+    /// their slot until the outcome is proven. Releases are collected by
+    /// reservation id, never by position: `release_reservation_at` prunes
+    /// the released audit tail, so any index saved earlier can go stale.
     fn scheduler_reconcile(&mut self) -> bool {
-        let mut releases: Vec<(usize, &'static str)> = Vec::new();
+        let mut releases: Vec<(String, &'static str)> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
-        let mut uncertain: Vec<(usize, bool)> = Vec::new();
-        let mut requeues: Vec<usize> = Vec::new();
+        let mut uncertain: Vec<(String, bool)> = Vec::new();
+        let mut requeues: Vec<String> = Vec::new();
+        let mut adoptions: Vec<(String, usize)> = Vec::new();
         for index in 0..self.scheduler.reservations.len() {
-            let reservation = &self.scheduler.reservations[index];
+            let reservation = self.scheduler.reservations[index].clone();
             if reservation.state == ReservationState::Released {
                 continue;
             }
@@ -769,24 +1042,29 @@ impl State {
                     attempt_id,
                 } => {
                     let Some(task) = self.tasks.iter().find(|task| task.id == *task_id) else {
-                        releases.push((index, "subject_gone"));
+                        releases.push((reservation.id.clone(), "subject_gone"));
                         continue;
                     };
                     if task.attempt_id != *attempt_id {
-                        releases.push((index, "superseded"));
+                        if Self::remote_occupancy_unproven(task, attempt_id) {
+                            uncertain.push((reservation.id.clone(), true));
+                        } else {
+                            releases.push((reservation.id.clone(), "superseded"));
+                        }
                         continue;
                     }
                     if task.recovering {
-                        uncertain.push((index, true));
+                        uncertain.push((reservation.id.clone(), true));
                         continue;
                     }
-                    uncertain.push((
-                        index,
-                        task.remote
-                            .as_ref()
-                            .is_some_and(|remote| remote.state == RemoteState::TargetOffline),
-                    ));
                     if task.state.finished() {
+                        if Self::remote_occupancy_unproven(task, attempt_id) {
+                            // Home marked the task done before an owed remote
+                            // stop landed; the target may still occupy a
+                            // worker, so the slot stays uncertain.
+                            uncertain.push((reservation.id.clone(), true));
+                            continue;
+                        }
                         let reason: &'static str = match task.state {
                             TaskState::Completed => "completed",
                             TaskState::Cancelled => "cancelled",
@@ -796,9 +1074,17 @@ impl State {
                             failures
                                 .push((reservation.provider.clone(), task.error_excerpt.clone()));
                         }
-                        releases.push((index, reason));
-                    } else if task.state == TaskState::Interrupted {
-                        releases.push((index, "interrupted"));
+                        releases.push((reservation.id.clone(), reason));
+                        continue;
+                    }
+                    uncertain.push((
+                        reservation.id.clone(),
+                        task.remote
+                            .as_ref()
+                            .is_some_and(|remote| remote.state == RemoteState::TargetOffline),
+                    ));
+                    if task.state == TaskState::Interrupted {
+                        releases.push((reservation.id.clone(), "interrupted"));
                     } else if reservation.state == ReservationState::Held
                         && task.remote.is_none()
                         && task.state == TaskState::Starting
@@ -817,15 +1103,15 @@ impl State {
                                     && child.status != Status::Failed
                                     && !child.archived() =>
                             {
-                                requeues.push(index);
+                                requeues.push(reservation.id.clone());
                             }
                             Some(child) if child.status == Status::Failed => {
                                 if let Some(error) = child.error.clone() {
                                     failures.push((reservation.provider.clone(), error));
                                 }
-                                releases.push((index, "failed"));
+                                releases.push((reservation.id.clone(), "failed"));
                             }
-                            None => releases.push((index, "subject_gone")),
+                            None => releases.push((reservation.id.clone(), "subject_gone")),
                             _ => {}
                         }
                     }
@@ -837,32 +1123,50 @@ impl State {
                         .iter()
                         .position(|thread| thread.id == *thread_id)
                     else {
-                        releases.push((index, "thread_gone"));
+                        releases.push((reservation.id.clone(), "thread_gone"));
                         continue;
                     };
                     let thread = &self.threads[position];
-                    if thread.admission.as_deref() != Some(reservation.id.as_str())
-                        || thread.archived()
-                    {
-                        releases.push((
-                            index,
-                            if thread.archived() {
-                                "thread_gone"
-                            } else {
-                                "superseded"
-                            },
-                        ));
+                    if thread.archived() {
+                        releases.push((reservation.id.clone(), "thread_gone"));
                         continue;
                     }
+                    if thread.admission.as_deref() != Some(reservation.id.as_str()) {
+                        // A restored ledger still holds this thread's
+                        // reservation while the thread lost its recorded id;
+                        // adopt the sole live reservation rather than
+                        // releasing capacity the work still needs.
+                        let recorded_live = thread.admission.as_deref().is_some_and(|id| {
+                            self.scheduler
+                                .reservations
+                                .iter()
+                                .any(|r| r.id == id && r.state != ReservationState::Released)
+                        });
+                        let siblings = self
+                            .scheduler
+                            .reservations
+                            .iter()
+                            .filter(|r| {
+                                r.state != ReservationState::Released
+                                    && r.subject.thread_id() == Some(*thread_id)
+                            })
+                            .count();
+                        if !recorded_live && siblings == 1 {
+                            adoptions.push((reservation.id.clone(), position));
+                        } else {
+                            releases.push((reservation.id.clone(), "superseded"));
+                            continue;
+                        }
+                    }
                     if !peer_worker && thread.crew_captain != reservation.captain {
-                        releases.push((index, "left_crew"));
+                        releases.push((reservation.id.clone(), "left_crew"));
                         continue;
                     }
                     if thread.recovering_task {
-                        uncertain.push((index, true));
+                        uncertain.push((reservation.id.clone(), true));
                         continue;
                     }
-                    uncertain.push((index, false));
+                    uncertain.push((reservation.id.clone(), false));
                     if !self.admission_active(position) {
                         if thread.status == Status::Failed
                             && let Some(error) = thread.error.clone()
@@ -870,7 +1174,7 @@ impl State {
                             failures.push((reservation.provider.clone(), error));
                         }
                         releases.push((
-                            index,
+                            reservation.id.clone(),
                             if thread.status == Status::Failed {
                                 "failed"
                             } else {
@@ -888,30 +1192,52 @@ impl State {
                             if let Some(error) = thread.error.clone() {
                                 failures.push((reservation.provider.clone(), error));
                             }
-                            releases.push((index, "failed"));
+                            releases.push((reservation.id.clone(), "failed"));
                         } else {
-                            requeues.push(index);
+                            requeues.push(reservation.id.clone());
                         }
                     }
                 }
             }
         }
-        let mut changed = !releases.is_empty()
-            || uncertain
+        let mut changed = !releases.is_empty() || !adoptions.is_empty();
+        for (id, value) in uncertain {
+            if let Some(reservation) = self.scheduler.reservations.iter_mut().find(|r| r.id == id) {
+                if reservation.uncertain != value {
+                    reservation.uncertain = value;
+                    changed = true;
+                }
+            }
+        }
+        for (id, position) in adoptions {
+            let run = self
+                .scheduler
+                .reservations
                 .iter()
-                .any(|(index, value)| self.scheduler.reservations[*index].uncertain != *value);
-        for (index, value) in uncertain {
-            self.scheduler.reservations[index].uncertain = value;
+                .find(|r| r.id == id)
+                .and_then(|r| match r.subject {
+                    Subject::Crew { run, .. } | Subject::PeerWorker { run, .. } => Some(run),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            self.threads[position].admission = Some(id);
+            self.threads[position].admission_run = self.threads[position].admission_run.max(run);
+            self.sync_admission_flag(position);
         }
         for (provider, error) in failures {
             self.scheduler_note_failure(&provider, &error);
             changed = true;
         }
-        for (index, reason) in releases {
-            self.release_reservation_at(index, reason);
+        for (id, reason) in releases {
+            if let Some(position) = self.scheduler.reservations.iter().position(|r| r.id == id) {
+                self.release_reservation_at(position, reason);
+            }
         }
-        for index in requeues {
-            let reservation = &mut self.scheduler.reservations[index];
+        for id in requeues {
+            let Some(position) = self.scheduler.reservations.iter().position(|r| r.id == id) else {
+                continue;
+            };
+            let reservation = &mut self.scheduler.reservations[position];
             if reservation.state != ReservationState::Held {
                 continue;
             }
@@ -936,6 +1262,7 @@ impl State {
                 task.state = TaskState::Queued;
                 task.started_at = None;
             }
+            self.scheduler.revision += 1;
             changed = true;
         }
         changed
@@ -1041,33 +1368,65 @@ impl State {
             return Some("provider_backoff".into());
         }
         let limits = &self.scheduler.limits;
-        if let (Some(home), Some(limit)) = (reservation.coordinator, limits.coordinator_running)
-            && counts.coordinator.get(&home).copied().unwrap_or(0) >= limit
+        let coordinator_key = reservation.coordinator_key();
+        if !coordinator_key.is_empty()
+            && let Some(limit) = limits.effective(
+                limits.coordinator_running,
+                &limits.overrides.coordinator,
+                &coordinator_key,
+            )
+            && counts
+                .coordinator
+                .get(&coordinator_key)
+                .copied()
+                .unwrap_or(0)
+                >= limit
         {
             return Some("coordinator".into());
         }
-        if let (Some(workspace), Some(limit)) = (reservation.workspace, limits.workspace_running)
+        if let Some(captain) = reservation.captain
+            && let Some(limit) = limits.effective(
+                limits.captain_running,
+                &limits.overrides.captain,
+                &captain.to_string(),
+            )
+            && counts.captain.get(&captain).copied().unwrap_or(0) >= limit
+        {
+            return Some("captain".into());
+        }
+        if let Some(workspace) = reservation.workspace
+            && let Some(limit) = limits.effective(
+                limits.workspace_running,
+                &limits.overrides.workspace,
+                &workspace.to_string(),
+            )
             && counts.workspace.get(&workspace).copied().unwrap_or(0) >= limit
         {
             return Some("workspace".into());
         }
-        if let Some(limit) = limits.provider_running
-            && counts
-                .provider
-                .get(&reservation.provider)
-                .copied()
-                .unwrap_or(0)
-                >= limit
+        if let Some(limit) = limits.effective(
+            limits.provider_running,
+            &limits.overrides.provider,
+            &reservation.provider,
+        ) && counts
+            .provider
+            .get(&reservation.provider)
+            .copied()
+            .unwrap_or(0)
+            >= limit
         {
             return Some("provider".into());
         }
-        if let Some(limit) = limits.executor_running
-            && counts
-                .executor
-                .get(&reservation.executor)
-                .copied()
-                .unwrap_or(0)
-                >= limit
+        if let Some(limit) = limits.effective(
+            limits.executor_running,
+            &limits.overrides.executor,
+            &reservation.executor,
+        ) && counts
+            .executor
+            .get(&reservation.executor)
+            .copied()
+            .unwrap_or(0)
+            >= limit
         {
             return Some("executor".into());
         }
@@ -1119,8 +1478,10 @@ impl State {
                 self.scheduler.reservations[reservation_index].state = ReservationState::Held;
                 self.scheduler.reservations[reservation_index].granted_at = Some(lifecycle::now());
                 self.scheduler.reservations[reservation_index].blocked_by = None;
+                self.scheduler.revision += 1;
                 self.tasks[task_index].state = TaskState::Starting;
                 self.tasks[task_index].started_at = Some(lifecycle::now());
+                self.sync_admission_flag(child);
                 if self.tasks[task_index].remote.is_some() {
                     // Committed state only: dispatch_peer_work sends the
                     // launch command on the next tick.
@@ -1128,7 +1489,7 @@ impl State {
                 }
                 // Persist intent before any prompt can reach the provider.
                 if self.runtime_enabled
-                    && let Err(error) = self.checkpoint_and_flush()
+                    && let Err(error) = self.admission_commit()
                 {
                     self.tasks[task_index].state = TaskState::Interrupted;
                     self.tasks[task_index].error_excerpt = error.chars().take(2000).collect();
@@ -1157,10 +1518,30 @@ impl State {
                 self.scheduler.reservations[reservation_index].state = ReservationState::Held;
                 self.scheduler.reservations[reservation_index].granted_at = Some(lifecycle::now());
                 self.scheduler.reservations[reservation_index].blocked_by = None;
+                self.scheduler.revision += 1;
+                self.sync_admission_flag(index);
                 self.connect_thread(index);
                 true
             }
         }
+    }
+
+    /// The live reservation, if any, that covers this thread: its own crew
+    /// or peer-worker reservation, or a delegated attempt reservation whose
+    /// task names it as the child. A delegated child carrying a Captain
+    /// scope must not double-count under two reservations.
+    pub(super) fn reservation_covering_thread(&self, thread_id: usize) -> Option<&Reservation> {
+        self.scheduler.reservations.iter().find(|r| {
+            r.state != ReservationState::Released
+                && match &r.subject {
+                    Subject::Crew { thread_id: id, .. }
+                    | Subject::PeerWorker { thread_id: id, .. } => *id == thread_id,
+                    Subject::Task { task_id, .. } => self
+                        .tasks
+                        .iter()
+                        .any(|task| task.id == *task_id && task.child_thread_id == thread_id),
+                }
+        })
     }
 
     /// Reconcile every live reservation, refresh queue reasons, then grant
@@ -1168,27 +1549,47 @@ impl State {
     /// per-home running-count loop in `start_queued_tasks`.
     pub(super) fn admission_pump(&mut self) -> bool {
         // Lazily admit subjects that predate the scheduler or lost their
-        // reservation to a crash: queued delegated attempts and crew or peer
-        // threads still holding live work.
+        // reservation to a crash: delegated attempts without a live
+        // reservation and crew or peer threads still holding live work.
         let mut changed = false;
         for index in 0..self.tasks.len() {
-            if self.tasks[index].state != TaskState::Queued {
-                continue;
-            }
-            let covered = self.scheduler.reservations.iter().any(|r| {
+            let uncovered = !self.scheduler.reservations.iter().any(|r| {
                 r.state != ReservationState::Released
                     && matches!(&r.subject, Subject::Task { task_id, .. }
                         if *task_id == self.tasks[index].id)
             });
-            if !covered {
-                self.admit_task_index(index);
-                changed = true;
+            match self.tasks[index].state {
+                // A queued attempt joins the line; an attempt already
+                // starting or running backfills a held reservation so its
+                // occupancy is counted rather than silently uncapped.
+                TaskState::Queued | TaskState::Starting | TaskState::Running if uncovered => {
+                    self.admit_task_index(index);
+                    changed = true;
+                }
+                _ => {}
             }
         }
         for index in 0..self.threads.len() {
-            let managed = self.threads[index].peer_origin.is_some()
-                || self.threads[index].crew_captain.is_some();
-            if managed && self.threads[index].admission.is_none() && self.admission_active(index) {
+            // Backfill only threads that never held a reservation: crew or
+            // peer workers restored from an index that predates the
+            // scheduler. A thread whose reservation released still carries
+            // its id on `admission`, and re-admitting it here would mint a
+            // phantom subject for work that is merely winding down. Its next
+            // run enters through an explicit send, not the pump.
+            // A delegated child is covered by its task reservation even
+            // after that task finishes; admitting it again as crew would
+            // double-count it. Any other managed thread with a released
+            // line re-admits when fresh input arrives.
+            let managed = (self.threads[index].peer_origin.is_some()
+                || self.threads[index].crew_captain.is_some())
+                && !self
+                    .tasks
+                    .iter()
+                    .any(|task| task.child_thread_id == self.threads[index].id);
+            let covered = self
+                .reservation_covering_thread(self.threads[index].id)
+                .is_some();
+            if managed && !covered && self.admission_active(index) {
                 let peer_worker = self.threads[index].peer_origin.is_some();
                 self.ensure_thread_admission(index, peer_worker, false);
                 changed = true;
@@ -1210,6 +1611,7 @@ impl State {
                 };
                 if self.scheduler.reservations[index].blocked_by != blocked {
                     self.scheduler.reservations[index].blocked_by = blocked.clone();
+                    self.scheduler.revision += 1;
                     changed = true;
                 }
                 if blocked.is_none() && grant.is_none() {
@@ -1224,17 +1626,24 @@ impl State {
                 // spin on the same candidate.
                 if let Some(index) = self.scheduler.reservations.iter().position(|r| r.id == id) {
                     self.scheduler.reservations[index].blocked_by = Some("superseded".into());
+                    self.scheduler.revision += 1;
                 }
                 break;
             }
             changed = true;
+        }
+        // Runtime delivery gates mirror the final ledger state.
+        for index in 0..self.threads.len() {
+            let blocked = self.threads[index].admission_blocked;
+            self.sync_admission_flag(index);
+            changed |= blocked != self.threads[index].admission_blocked;
         }
         changed
     }
 
     /// The scheduler's own queue position for a thread-bound reservation.
     pub(super) fn admission_value_for(&self, thread_id: usize) -> Value {
-        let Some(reservation) = self.live_reservation_for(thread_id) else {
+        let Some(reservation) = self.reservation_covering_thread(thread_id) else {
             return Value::Null;
         };
         let position = (reservation.state == ReservationState::Queued)
@@ -1289,13 +1698,66 @@ impl State {
         })
     }
 
+    /// Per-id usage rows for one scope class, including ids that only
+    /// queue: a scope the queue waits on is as visible as one that runs.
+    fn scope_usage_rows(
+        &self,
+        scope: &str,
+        key_of: impl Fn(&Reservation) -> Option<String>,
+        class: Option<usize>,
+        overrides: &BTreeMap<String, usize>,
+    ) -> Vec<Value> {
+        let mut rows: BTreeMap<String, [usize; 4]> = BTreeMap::new();
+        for reservation in self
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|r| r.state != ReservationState::Released)
+        {
+            let Some(id) = key_of(reservation) else {
+                continue;
+            };
+            let row = rows.entry(id).or_default();
+            match reservation.state {
+                ReservationState::Queued => row[3] += 1,
+                ReservationState::Held => {
+                    row[0] += 1;
+                    if self.reservation_starting(reservation) {
+                        row[1] += 1;
+                    }
+                    if reservation.uncertain {
+                        row[2] += 1;
+                    }
+                }
+                ReservationState::Released => {}
+            }
+        }
+        rows.into_iter()
+            .map(|(id, [held, starting, uncertain, queued])| {
+                json!({
+                    "scope": scope,
+                    "id": id,
+                    "held": held,
+                    "starting": starting,
+                    "uncertain": uncertain,
+                    "queued": queued,
+                    "limit": overrides.get(&id).copied().or(class),
+                    "classLimit": class,
+                })
+            })
+            .collect()
+    }
+
     /// The authoritative scheduling view the `scheduling.status` RPC serves:
-    /// effective limits, per-scope usage, the ordered queue with reasons,
-    /// held reservations with uncertainty, and provider backoff.
+    /// effective limits with defaults and editability, per-scope usage
+    /// (held, starting, uncertain, queued), the ordered queue with reasons
+    /// and retry times, held reservations with uncertainty, provider
+    /// backoff, and the durable revision subscribers compare against.
     pub fn scheduling_status_value(&self) -> Value {
-        let counts = self.scheduler.held_counts();
-        let order = self.scheduler.grant_order(&counts);
+        let order = self.scheduler.grant_order(&self.scheduler.held_counts());
         let now = lifecycle::now();
+        let limits = &self.scheduler.limits;
+        let defaults = Limits::default();
         let queued: Vec<Value> = order
             .iter()
             .enumerate()
@@ -1308,79 +1770,103 @@ impl State {
             .filter(|r| r.state == ReservationState::Held)
             .map(|r| r.value(None))
             .collect();
-        let coordinators: Vec<Value> = counts
-            .coordinator
-            .iter()
-            .map(|(home, running)| {
-                json!({
-                    "scope": "coordinator",
-                    "id": home,
-                    "running": running,
-                    "queued": self.scheduler.reservations.iter().filter(|r| {
-                        r.state == ReservationState::Queued && r.coordinator == Some(*home)
-                    }).count(),
-                    "limit": self.scheduler.limits.coordinator_running,
-                })
-            })
-            .collect();
-        let executors: Vec<Value> = counts
-            .executor
-            .iter()
-            .map(|(executor, running)| {
-                json!({
-                    "scope": "executor",
-                    "id": executor,
-                    "running": running,
-                    "limit": self.scheduler.limits.executor_running,
-                })
-            })
-            .collect();
-        let mut providers: Vec<Value> = counts
-            .provider
-            .iter()
-            .map(|(provider, running)| {
-                json!({
-                    "scope": "provider",
-                    "id": provider,
-                    "running": running,
-                    "limit": self.scheduler.limits.provider_running,
-                    "backoffUntil": self.scheduler.provider_backoff.get(provider).filter(|until| **until > now),
-                })
-            })
-            .collect();
+        let mut providers = self.scope_usage_rows(
+            "provider",
+            |r| Some(r.provider.clone()),
+            limits.provider_running,
+            &limits.overrides.provider,
+        );
+        for row in &mut providers {
+            let id = row["id"].as_str().unwrap_or_default();
+            row["backoffUntil"] = self
+                .scheduler
+                .provider_backoff
+                .get(id)
+                .filter(|until| **until > now)
+                .map(|until| json!(until))
+                .unwrap_or(Value::Null);
+        }
         for (provider, until) in &self.scheduler.provider_backoff {
-            if *until > now && !counts.provider.contains_key(provider) {
+            if *until > now
+                && !providers
+                    .iter()
+                    .any(|row| row["id"].as_str() == Some(provider.as_str()))
+            {
                 providers.push(json!({
                     "scope": "provider",
                     "id": provider,
-                    "running": 0,
-                    "limit": self.scheduler.limits.provider_running,
+                    "held": 0,
+                    "starting": 0,
+                    "uncertain": 0,
+                    "queued": 0,
+                    "limit": limits.effective(
+                        limits.provider_running,
+                        &limits.overrides.provider,
+                        provider,
+                    ),
+                    "classLimit": limits.provider_running,
                     "backoffUntil": until,
                 }));
             }
         }
-        let workspaces: Vec<Value> = counts
-            .workspace
+        let coordinators = self.scope_usage_rows(
+            "coordinator",
+            |r| (!r.coordinator_key().is_empty()).then(|| r.coordinator_key()),
+            limits.coordinator_running,
+            &limits.overrides.coordinator,
+        );
+        let captains = self.scope_usage_rows(
+            "captain",
+            |r| r.captain.map(|captain| captain.to_string()),
+            limits.captain_running,
+            &limits.overrides.captain,
+        );
+        let executors = self.scope_usage_rows(
+            "executor",
+            |r| Some(r.executor.clone()),
+            limits.executor_running,
+            &limits.overrides.executor,
+        );
+        let workspaces = self.scope_usage_rows(
+            "workspace",
+            |r| r.workspace.map(|workspace| workspace.to_string()),
+            limits.workspace_running,
+            &limits.overrides.workspace,
+        );
+        let pending = self
+            .scheduler
+            .reservations
             .iter()
-            .map(|(workspace, running)| {
-                json!({
-                    "scope": "workspace",
-                    "id": workspace,
-                    "running": running,
-                    "limit": self.scheduler.limits.workspace_running,
-                })
-            })
-            .collect();
+            .filter(|r| r.state == ReservationState::Queued)
+            .count();
+        let scope_meta = |scope: &str, limit: Option<usize>, default: Option<usize>| json!({"scope":scope,"limit":limit,"default":default,"editable":true});
         json!({
-            "limits": self.scheduler.limits.value(),
+            "revision": self.scheduler.revision,
+            "limits": limits.value(),
+            "defaults": defaults.value(),
+            "scopes": [
+                scope_meta("account", limits.account_running, defaults.account_running),
+                scope_meta("coordinator", limits.coordinator_running, defaults.coordinator_running),
+                scope_meta("coordinatorUnfinished", limits.coordinator_unfinished, defaults.coordinator_unfinished),
+                scope_meta("captain", limits.captain_running, defaults.captain_running),
+                scope_meta("executor", limits.executor_running, defaults.executor_running),
+                scope_meta("provider", limits.provider_running, defaults.provider_running),
+                scope_meta("workspace", limits.workspace_running, defaults.workspace_running),
+                scope_meta("pending", limits.account_pending, defaults.account_pending),
+            ],
             "usage": {
                 "account": {
-                    "running": counts.account,
-                    "queued": queued.len(),
-                    "limit": self.scheduler.limits.account_running,
-                    "pendingLimit": self.scheduler.limits.account_pending,
+                    "held": held.len(),
+                    "starting": self.scheduler.reservations.iter()
+                        .filter(|r| self.reservation_starting(r)).count(),
+                    "uncertain": self.scheduler.reservations.iter()
+                        .filter(|r| r.state == ReservationState::Held && r.uncertain).count(),
+                    "queued": pending,
+                    "limit": limits.account_running,
+                    "pendingLimit": limits.account_pending,
                 },
                 "coordinators": coordinators,
+                "captains": captains,
                 "executors": executors,
                 "providers": providers,
                 "workspaces": workspaces,
@@ -1410,13 +1896,38 @@ impl State {
                     .then(|| reservation.value(Some(position + 1)))
             })
             .collect();
+        // The caller's stable scope key: a Captain home counts under
+        // "captain:<id>", any other thread under "home:<id>".
+        let key = coordinator.map(|home| {
+            let captain = self
+                .threads
+                .iter()
+                .find(|thread| thread.id == home && thread.captain_home)
+                .and_then(|thread| thread.captain);
+            captain
+                .map(|captain| format!("captain:{captain}"))
+                .unwrap_or_else(|| format!("home:{home}"))
+        });
         json!({
+            "revision": self.scheduler.revision,
             "limits": self.scheduler.limits.value(),
-            "coordinator": coordinator.map(|home| json!({
-                "id": home,
-                "running": counts.coordinator.get(&home).copied().unwrap_or(0),
-                "limit": self.scheduler.limits.coordinator_running,
-            })),
+            "coordinator": coordinator.map(|home| {
+                let key = key.clone().unwrap_or_default();
+                json!({
+                    "id": home,
+                    "key": key,
+                    "running": counts.coordinator.get(&key).copied().unwrap_or(0),
+                    "uncertain": self.scheduler.reservations.iter().filter(|r| {
+                        r.state == ReservationState::Held && r.uncertain
+                            && r.coordinator_key() == key
+                    }).count(),
+                    "limit": self.scheduler.limits.effective(
+                        self.scheduler.limits.coordinator_running,
+                        &self.scheduler.limits.overrides.coordinator,
+                        &key,
+                    ),
+                })
+            }),
             "account": {
                 "running": counts.account,
                 "limit": self.scheduler.limits.account_running,
@@ -1428,44 +1939,146 @@ impl State {
         })
     }
 
-    /// `scheduling.configure`: merges the given limits and returns the new
-    /// authoritative status. `null` means unlimited; every positive number
-    /// is a cap. Unknown keys fail rather than being silently ignored.
+    /// One configure outcome for the UI contract: accepted, stale, or
+    /// rejected, always with the authoritative revision and full status so
+    /// the caller lands on the same projection the server persists.
+    fn configure_receipt(&self, outcome: &str, reason: Option<String>) -> Value {
+        json!({
+            "outcome": outcome,
+            "reason": reason,
+            "revision": self.scheduler.revision,
+            "status": self.scheduling_status_value(),
+        })
+    }
+
+    /// `scheduling.configure`: parses limits and per-id overrides onto a
+    /// clone, validates the whole result, then commits it in one write. A
+    /// rejected or stale call changes nothing, so a later invalid field can
+    /// never leave the earlier ones half-applied. `expectRevision` is the
+    /// compare-and-set fence: a caller holding an older revision gets a
+    /// stale receipt instead of silently overwriting a newer config.
+    /// Lowering a cap only queues future grants; live work is never killed
+    /// to satisfy a new limit.
     pub(super) fn scheduling_configure(&mut self, args: &Value) -> Result<Value, String> {
-        let limits = args
-            .get("limits")
-            .and_then(|value| value.as_object())
-            .ok_or("limits must be an object of scope limits.")?;
-        let fields: &[(&str, fn(&mut Limits) -> &mut Option<usize>)] = &[
-            ("coordinatorRunning", |limits| {
-                &mut limits.coordinator_running
-            }),
-            ("coordinatorUnfinished", |limits| {
-                &mut limits.coordinator_unfinished
-            }),
-            ("accountRunning", |limits| &mut limits.account_running),
-            ("accountPending", |limits| &mut limits.account_pending),
-            ("executorRunning", |limits| &mut limits.executor_running),
-            ("providerRunning", |limits| &mut limits.provider_running),
-            ("workspaceRunning", |limits| &mut limits.workspace_running),
-        ];
-        for (name, value) in limits {
-            let Some(field) = fields.iter().find(|(field, _)| field == name) else {
-                return Err(format!("Unknown scheduler limit {name}."));
-            };
-            let parsed = if value.is_null() {
-                None
-            } else {
-                let limit = value
-                    .as_u64()
-                    .filter(|limit| *limit >= 1 && *limit <= usize::MAX as u64)
-                    .ok_or(format!("{name} must be null or a positive integer."))?;
-                Some(usize::try_from(limit).map_err(|_| format!("{name} is too large."))?)
-            };
-            *field.1(&mut self.scheduler.limits) = parsed;
+        if let Some(expect) = args.get("expectRevision") {
+            let expect = expect
+                .as_u64()
+                .ok_or("expectRevision must be the revision from scheduling.status.")?;
+            if expect != self.scheduler.revision {
+                return Ok(self.configure_receipt(
+                    "stale",
+                    Some(format!(
+                        "The scheduler is at revision {}, not {expect}.",
+                        self.scheduler.revision
+                    )),
+                ));
+            }
         }
+        let mut limits = self.scheduler.limits.clone();
+        if let Some(value) = args.get("limits") {
+            let fields = value
+                .as_object()
+                .ok_or("limits must be an object of scope limits.")?;
+            let setters: &[(&str, fn(&mut Limits) -> &mut Option<usize>)] = &[
+                ("coordinatorRunning", |limits| {
+                    &mut limits.coordinator_running
+                }),
+                ("coordinatorUnfinished", |limits| {
+                    &mut limits.coordinator_unfinished
+                }),
+                ("accountRunning", |limits| &mut limits.account_running),
+                ("accountPending", |limits| &mut limits.account_pending),
+                ("executorRunning", |limits| &mut limits.executor_running),
+                ("providerRunning", |limits| &mut limits.provider_running),
+                ("captainRunning", |limits| &mut limits.captain_running),
+                ("workspaceRunning", |limits| &mut limits.workspace_running),
+            ];
+            for (name, value) in fields {
+                let Some(setter) = setters.iter().find(|(field, _)| field == name) else {
+                    return Ok(self.configure_receipt(
+                        "rejected",
+                        Some(format!("Unknown scheduler limit {name}.")),
+                    ));
+                };
+                let parsed = if value.is_null() {
+                    None
+                } else {
+                    match value
+                        .as_u64()
+                        .filter(|limit| *limit >= 1 && *limit <= usize::MAX as u64)
+                        .and_then(|limit| usize::try_from(limit).ok())
+                    {
+                        Some(limit) => Some(limit),
+                        None => {
+                            return Ok(self.configure_receipt(
+                                "rejected",
+                                Some(format!("{name} must be null or a positive integer.")),
+                            ));
+                        }
+                    }
+                };
+                *setter.1(&mut limits) = parsed;
+            }
+        }
+        if let Some(value) = args.get("overrides") {
+            let scopes = value
+                .as_object()
+                .ok_or("overrides must be an object of scope override maps.")?;
+            for (scope, entries) in scopes {
+                let map = match scope.as_str() {
+                    "coordinator" => &mut limits.overrides.coordinator,
+                    "captain" => &mut limits.overrides.captain,
+                    "executor" => &mut limits.overrides.executor,
+                    "provider" => &mut limits.overrides.provider,
+                    "workspace" => &mut limits.overrides.workspace,
+                    _ => {
+                        return Ok(self.configure_receipt(
+                            "rejected",
+                            Some(format!("Unknown override scope {scope}.")),
+                        ));
+                    }
+                };
+                let Some(entries) = entries.as_object() else {
+                    return Ok(self.configure_receipt(
+                        "rejected",
+                        Some(format!("overrides.{scope} must map scope ids to caps.")),
+                    ));
+                };
+                for (id, cap) in entries {
+                    if cap.is_null() {
+                        map.remove(id);
+                        continue;
+                    }
+                    match cap
+                        .as_u64()
+                        .filter(|cap| *cap >= 1 && *cap <= usize::MAX as u64)
+                        .and_then(|cap| usize::try_from(cap).ok())
+                    {
+                        Some(cap) => {
+                            map.insert(id.clone(), cap);
+                        }
+                        None => {
+                            return Ok(self.configure_receipt(
+                                "rejected",
+                                Some(format!(
+                                    "overrides.{scope}.{id} must be null or a positive integer."
+                                )),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        if !limits.valid() {
+            return Ok(self.configure_receipt(
+                "rejected",
+                Some("The resulting scheduler limits are invalid.".into()),
+            ));
+        }
+        self.scheduler.limits = limits;
+        self.scheduler.revision += 1;
         self.admission_pump();
-        Ok(self.scheduling_status_value())
+        Ok(self.configure_receipt("accepted", None))
     }
 }
 
@@ -1806,22 +2419,426 @@ mod tests {
     }
 
     #[test]
-    fn configure_merges_limits_and_rejects_unknown_keys() {
+    fn configure_receipts_are_atomic_and_compare_on_revision() {
         let mut state = demo();
-        let status = state
+        let receipt = state
             .scheduling_configure(&json!({"limits":{"accountRunning":2,"providerRunning":null}}))
             .unwrap();
-        assert_eq!(status["limits"]["accountRunning"], 2);
-        assert_eq!(status["limits"]["providerRunning"], Value::Null);
+        assert_eq!(receipt["outcome"], "accepted");
+        assert_eq!(receipt["status"]["limits"]["accountRunning"], 2);
+        assert_eq!(receipt["status"]["limits"]["providerRunning"], Value::Null);
+        let revision = receipt["revision"].as_u64().unwrap();
+        // A rejected call applies nothing, not even the valid earlier field.
+        let rejected = state
+            .scheduling_configure(&json!({"limits":{"executorRunning":4,"accountRunning":0}}))
+            .unwrap();
+        assert_eq!(rejected["outcome"], "rejected");
+        assert_eq!(
+            state.scheduler.limits.executor_running,
+            Some(EXECUTOR_RUNNING)
+        );
+        assert_eq!(state.scheduler.limits.account_running, Some(2));
+        assert_eq!(rejected["revision"].as_u64().unwrap(), revision);
+        // An unknown key rejects the same way.
+        let rejected = state
+            .scheduling_configure(&json!({"limits":{"bogus":1}}))
+            .unwrap();
+        assert_eq!(rejected["outcome"], "rejected");
+        // A caller holding an old revision gets a stale receipt, not a write.
+        let stale = state
+            .scheduling_configure(&json!({"expectRevision":0,"limits":{"accountRunning":9}}))
+            .unwrap();
+        assert_eq!(stale["outcome"], "stale");
+        assert_eq!(state.scheduler.limits.account_running, Some(2));
+        // The current revision commits and returns the new projection.
+        let accepted = state
+            .scheduling_configure(&json!({"expectRevision":revision,"limits":{"accountRunning":9}}))
+            .unwrap();
+        assert_eq!(accepted["outcome"], "accepted");
+        assert!(accepted["revision"].as_u64().unwrap() > revision);
+        assert_eq!(state.scheduler.limits.account_running, Some(9));
+    }
+
+    #[test]
+    fn configure_scopes_per_id_overrides() {
+        let mut state = demo();
+        captain(&mut state, 0, "Lead");
+        captain(&mut state, 1, "Scout");
+        let receipt = state
+            .scheduling_configure(&json!({"overrides":{"coordinator":{"captain:0":1}}}))
+            .unwrap();
+        assert_eq!(receipt["outcome"], "accepted");
+        // Captain 0 runs one provider; captain 1 keeps the class limit.
+        let first = crew_member(&mut state, 0, "first");
+        let second = crew_member(&mut state, 0, "second");
+        let other = crew_member(&mut state, 1, "other captain");
+        state.admission_pump();
+        assert_eq!(
+            reservation_for(&state, state.threads[first].id).state,
+            ReservationState::Held
+        );
+        let queued = reservation_for(&state, state.threads[second].id);
+        assert_eq!(queued.state, ReservationState::Queued);
+        assert_eq!(queued.blocked_by.as_deref(), Some("coordinator"));
+        assert_eq!(queued.coordinator_key(), "captain:0");
+        assert_eq!(
+            reservation_for(&state, state.threads[other].id).state,
+            ReservationState::Held
+        );
+        // A bad override map rejects without touching the committed one.
+        let rejected = state
+            .scheduling_configure(&json!({"overrides":{"provider":{"cpa":0}}}))
+            .unwrap();
+        assert_eq!(rejected["outcome"], "rejected");
+        assert_eq!(state.scheduler.limits.overrides.coordinator["captain:0"], 1);
+        assert!(state.scheduler.limits.overrides.provider.is_empty());
+    }
+
+    /// Registers an active Captain with a home thread, the minimum state the
+    /// owner and scope checks need.
+    fn captain(state: &mut State, id: usize, name: &str) {
+        state.captains.push(crate::captains::Captain {
+            name: name.into(),
+            role: String::new(),
+            instructions: String::new(),
+            portrait: 0,
+        });
+        state
+            .captain_lifecycles
+            .insert(id, captain_lifecycle::CaptainLifecycle::default());
+        let home_id = state.next_id;
+        state.next_id += 1;
+        let mut home = Thread::new(home_id);
+        home.captain = Some(id);
+        home.captain_home = true;
+        state.threads.push(home);
+        state.captain_homes.insert(id, home_id);
+    }
+
+    /// A managed crew member of an opened Captain with live input staged.
+    fn crew_member(state: &mut State, captain: usize, text: &str) -> usize {
+        let id = state.next_id;
+        state.next_id += 1;
+        let mut thread = Thread::new(id);
+        thread.model_provider = "cpa".into();
+        thread.crew_captain = Some(captain);
+        thread.pending_injections.push_back(Injection {
+            text: text.into(),
+            shown: false,
+            steer: None,
+        });
+        state.threads.push(thread);
+        let index = state.threads.len() - 1;
+        state.ensure_thread_admission(index, false, false);
+        index
+    }
+
+    /// A released audit record for history-pressure tests.
+    fn released_record(sequence: u64) -> Reservation {
+        Reservation {
+            id: format!("adm-hist-{sequence}"),
+            subject: Subject::PeerWorker {
+                thread_id: usize::MAX - sequence as usize,
+                run: 1,
+            },
+            state: ReservationState::Released,
+            coordinator: None,
+            fair: "origin:hist".into(),
+            executor: "local".into(),
+            provider: "cpa".into(),
+            workspace: None,
+            captain: None,
+            priority: 0,
+            queued_at: 1,
+            granted_at: Some(1),
+            released_at: Some(2),
+            release_reason: Some("settled".into()),
+            blocked_by: None,
+            not_before: 0,
+            uncertain: false,
+        }
+    }
+
+    #[test]
+    fn a_long_released_history_does_not_corrupt_reconcile() {
+        let mut state = demo();
+        // More than RELEASED_KEEP released records plus two live workers that
+        // settle in one reconcile pass. Releasing by saved index would hit a
+        // stale position after the first release prunes; ids stay valid.
+        for sequence in 0..205 {
+            state.scheduler.reservations.push(released_record(sequence));
+        }
+        let first = worker(&mut state, "first");
+        let second = worker(&mut state, "second");
+        state.admission_pump();
+        state.threads[first].pending_injections.clear();
+        state.threads[second].pending_injections.clear();
+        state.admission_pump();
+        let first_id = state.threads[first].id;
+        let second_id = state.threads[second].id;
+        let released: Vec<&Reservation> = state
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|r| r.state == ReservationState::Released)
+            .collect();
         assert!(
-            state
-                .scheduling_configure(&json!({"limits":{"bogus":1}}))
-                .is_err()
+            released
+                .iter()
+                .any(|r| r.subject.thread_id() == Some(first_id)
+                    && r.release_reason.as_deref() == Some("settled")),
+            "the first worker's reservation released"
         );
         assert!(
-            state
-                .scheduling_configure(&json!({"limits":{"accountRunning":0}}))
-                .is_err()
+            released
+                .iter()
+                .any(|r| r.subject.thread_id() == Some(second_id)
+                    && r.release_reason.as_deref() == Some("settled")),
+            "the second worker's reservation released after pruning"
+        );
+    }
+
+    #[test]
+    fn a_new_attempt_supersedes_in_place_without_a_gap() {
+        let mut state = demo();
+        let index = worker(&mut state, "first run");
+        state.admission_pump();
+        let id = state.threads[index].admission.clone().unwrap();
+        // A new attempt never releases the reservation first: the ledger
+        // keeps exactly one live record throughout the supersede.
+        state.ensure_thread_admission(index, false, true);
+        assert_eq!(state.threads[index].admission.as_deref(), Some(id.as_str()));
+        let reservation = reservation_for(&state, state.threads[index].id);
+        assert_eq!(reservation.state, ReservationState::Held);
+        assert!(matches!(reservation.subject, Subject::Crew { run: 2, .. }));
+        let live = state
+            .scheduler
+            .reservations
+            .iter()
+            .filter(|r| {
+                r.state != ReservationState::Released
+                    && r.subject.thread_id() == Some(state.threads[index].id)
+            })
+            .count();
+        assert_eq!(live, 1);
+    }
+
+    #[test]
+    fn a_cancelled_remote_attempt_stays_uncertain_until_the_stop_lands() {
+        let mut state = demo();
+        state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"Remote work"}))
+            .unwrap();
+        state.tasks[0].state = TaskState::Running;
+        let attempt = state.tasks[0].attempt_id.clone();
+        // Home cancelled before the target acknowledged the stop: the
+        // process may still occupy a worker there.
+        state.tasks[0].remote = Some(remote_fixture("peer-1", true, Some(&attempt)));
+        state.tasks[0].finish(TaskState::Cancelled, "", "cancelled");
+        state.admission_pump();
+        let reservation = &state.scheduler.reservations[0];
+        assert_eq!(reservation.state, ReservationState::Held);
+        assert!(reservation.uncertain);
+        // The acknowledged stop proves the occupancy is gone.
+        state.tasks[0].remote.as_mut().unwrap().stop_owed = false;
+        state.tasks[0].remote.as_mut().unwrap().state = RemoteState::Done;
+        state.admission_pump();
+        assert_eq!(
+            state.scheduler.reservations[0].state,
+            ReservationState::Released
+        );
+        assert_eq!(
+            state.scheduler.reservations[0].release_reason.as_deref(),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn a_superseded_remote_attempt_keeps_unproven_occupancy() {
+        let mut state = demo();
+        state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"Remote work"}))
+            .unwrap();
+        state.tasks[0].state = TaskState::Running;
+        let attempt_a = state.tasks[0].attempt_id.clone();
+        state.tasks[0].remote = Some(remote_fixture("peer-1", true, Some(&attempt_a)));
+        // A retry arrives while the old attempt's stop is still owed: the
+        // new attempt gets its own reservation, and the old one keeps its
+        // slot as uncertain rather than freeing it for a replacement.
+        state.tasks[0].attempt_id = "attempt-b".into();
+        state.tasks[0].state = TaskState::Queued;
+        state.admit_task_index(0);
+        state.admission_pump();
+        let old = state
+            .scheduler
+            .reservations
+            .iter()
+            .find(|r| {
+                matches!(&r.subject, Subject::Task { attempt_id, .. } if *attempt_id == attempt_a)
+            })
+            .unwrap();
+        assert_eq!(old.state, ReservationState::Held);
+        assert!(old.uncertain);
+        let current = state
+            .scheduler
+            .reservations
+            .iter()
+            .find(|r| {
+                matches!(&r.subject, Subject::Task { attempt_id, .. } if attempt_id == "attempt-b")
+            })
+            .unwrap();
+        assert_eq!(current.state, ReservationState::Held);
+    }
+
+    #[test]
+    fn a_running_task_backfills_a_held_reservation() {
+        let mut state = demo();
+        state
+            .mcp_call(1, "delegate_task", &json!({"prompt":"Legacy running work"}))
+            .unwrap();
+        // The ledger entry was lost (e.g. an older build); the attempt is
+        // already running, so its occupancy is counted, not queued.
+        state.scheduler.reservations.clear();
+        state.tasks[0].state = TaskState::Running;
+        state.admission_pump();
+        assert_eq!(state.scheduler.reservations.len(), 1);
+        let reservation = &state.scheduler.reservations[0];
+        assert_eq!(reservation.state, ReservationState::Held);
+        assert!(reservation.granted_at.is_some());
+    }
+
+    #[test]
+    fn a_restored_ledger_reservation_is_adopted_by_its_thread() {
+        let mut state = demo();
+        let index = worker(&mut state, "survived restore");
+        state.admission_pump();
+        let id = state.threads[index].admission.clone().unwrap();
+        // The thread record lost its reservation id (partial restore), but
+        // the ledger still holds it; reconcile adopts it back instead of
+        // releasing the capacity the live work needs.
+        state.threads[index].admission = Some("adm-lost".into());
+        state.admission_pump();
+        assert_eq!(state.threads[index].admission.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            reservation_for(&state, state.threads[index].id).state,
+            ReservationState::Held
+        );
+    }
+
+    #[test]
+    fn settled_crew_input_queues_a_new_run_and_the_flag_gates_delivery() {
+        let mut state = demo();
+        captain(&mut state, 0, "Lead");
+        state.scheduler.limits.account_running = Some(1);
+        let busy = crew_member(&mut state, 0, "occupies the slot");
+        let idle = crew_member(&mut state, 0, "first run");
+        state.admission_pump();
+        assert_eq!(
+            reservation_for(&state, state.threads[busy].id).state,
+            ReservationState::Held
+        );
+        // The idle member's turn finished and released; its flag blocks
+        // delivery until a new reservation grants.
+        state.threads[idle].pending_injections.clear();
+        state.admission_pump();
+        assert_eq!(
+            reservation_for(&state, state.threads[idle].id).state,
+            ReservationState::Released
+        );
+        assert!(state.threads[idle].admission_blocked);
+        // Fresh input on the managed thread re-admits and waits its turn.
+        state.threads[idle].pending_injections.push_back(Injection {
+            text: "second run".into(),
+            shown: false,
+            steer: None,
+        });
+        state.admission_pump();
+        let queued = reservation_for(&state, state.threads[idle].id);
+        assert_eq!(queued.state, ReservationState::Queued);
+        assert_eq!(queued.blocked_by.as_deref(), Some("account"));
+        assert!(state.threads[idle].admission_blocked);
+        // The busy member settling frees the account slot; the queued input
+        // grants and the delivery gate opens.
+        state.threads[busy].pending_injections.clear();
+        state.admission_pump();
+        assert_eq!(
+            reservation_for(&state, state.threads[idle].id).state,
+            ReservationState::Held
+        );
+        assert!(!state.threads[idle].admission_blocked);
+    }
+
+    fn remote_fixture(server: &str, stop_owed: bool, stop_attempt: Option<&str>) -> RemoteTask {
+        RemoteTask {
+            server_id: server.into(),
+            project: json!({}),
+            label: "Peer".into(),
+            thread_id: Some(41),
+            launch_command: crate::protocol::Command::new("peer.thread.launch", json!({})),
+            stop_owed,
+            stop_command_id: stop_owed.then(uuid::Uuid::new_v4),
+            stop_attempt_id: stop_attempt.map(str::to_owned),
+            last_error: None,
+            next_retry_at: 0,
+            retry_attempt: 0,
+            state: RemoteState::TargetOffline,
+            needs_you: false,
+            request: None,
+            wait_revision: None,
+            parent_stop_serial: 0,
+            child_stop_serial: 0,
+            client_request_id: None,
+            send_command: None,
+            document_replies: VecDeque::new(),
+            placement: None,
+        }
+    }
+    #[test]
+    fn a_queued_crew_roots_unsent_prompt_survives_a_restart() {
+        let mut state = demo();
+        state.scheduler.limits.account_running = Some(1);
+        captain(&mut state, 0, "Cap");
+        let first = worker(&mut state, "first");
+        let second = crew_member(&mut state, 0, "second");
+        state.threads[second].captain = Some(0);
+        state.threads[second].queued_prompt = Some((
+            crate::attachments::Prompt::new("crew-b-fixture".into(), vec![]),
+            0,
+        ));
+        state.threads[second].pending_injections.clear();
+        state.admission_pump();
+        let reservation = reservation_for(&state, state.threads[second].id);
+        eprintln!(
+            "state={:?} reason={:?} active={}",
+            reservation.state,
+            reservation.release_reason,
+            state.admission_active(second)
+        );
+        assert_eq!(
+            reservation_for(&state, state.threads[second].id).state,
+            ReservationState::Queued
+        );
+        let snapshot = state.snapshot();
+        let mut restored = State::new(PathBuf::new(), false);
+        restored.demo = true;
+        restored.restore_global(&snapshot).unwrap();
+        let second_id = state.threads[second].id;
+        let position = restored
+            .threads
+            .iter()
+            .position(|thread| thread.id == second_id)
+            .expect("restored crew root");
+        assert!(
+            restored.threads[position].queued_prompt.is_some(),
+            "the accepted-but-unsent input must be restored with the thread"
+        );
+        // The first root's live work died with the process: its runtime
+        // injections are not persisted, so the surviving queue line grants
+        // the restored crew root exactly once.
+        restored.admission_pump();
+        assert_eq!(
+            reservation_for(&restored, second_id).state,
+            ReservationState::Held
         );
     }
 }

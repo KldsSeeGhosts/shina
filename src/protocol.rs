@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const MAJOR: u32 = 1;
-pub const MINOR: u32 = 45;
+pub const MINOR: u32 = 46;
 /// Stable workspace/owner/controller identities are additive at protocol 1.42.
 /// Scheduler and effective-capability minors remain independently owned.
 pub const IDENTITY_MINOR: u32 = 42;
@@ -215,7 +215,9 @@ pub const PLACEMENT: &str = "placement-v1";
 /// The durable admission scheduler: scheduling.status/configure RPCs and
 /// admission fields on task, crew and peer-worker status replies. Older
 /// peers simply omit the fields; the server still enforces its own limits.
-pub const SCHEDULING_MINOR: u32 = 40;
+/// Tentative minor for the unpublished scheduler feature; serialized at
+/// publication time by the integrator.
+pub const SCHEDULING_MINOR: u32 = 46;
 pub const SCHEDULING: &str = "admission-scheduler-v1";
 pub const SCHEDULING_UPDATE_REQUIRED: &str =
     "Update required. Update Shina on the client and server to read or change scheduler limits.";

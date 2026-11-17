@@ -1145,6 +1145,11 @@ pub struct Thread {
     /// holds, and the monotonic run counter its reservations key to.
     pub admission: Option<String>,
     pub admission_run: u64,
+    /// Runtime-only mirror of the ledger: true while a covering reservation
+    /// is queued (or a managed thread waits for lazy admission). Delivery
+    /// loops consult it so queued managed work cannot reach a live provider
+    /// connection ahead of its grant; unmanaged threads never set it.
+    pub admission_blocked: bool,
     memory: Option<memory::MemoryLink>,
     learned_turn: Option<honcho::Turn>,
     memory_pending: VecDeque<mpsc::Receiver<Value>>,
@@ -1689,6 +1694,7 @@ impl Thread {
             task_history: None,
             admission: None,
             admission_run: 0,
+            admission_blocked: false,
             memory: None,
             learned_turn: None,
             memory_pending: VecDeque::new(),
@@ -2778,7 +2784,11 @@ impl Thread {
     }
 
     fn flush_injection(&mut self) -> bool {
-        if self.offline_blocked || self.provider_update_held || self.status == Status::Paused {
+        if self.offline_blocked
+            || self.provider_update_held
+            || self.admission_blocked
+            || self.status == Status::Paused
+        {
             return false;
         }
         #[cfg(debug_assertions)]
@@ -2980,6 +2990,7 @@ impl Thread {
             || matches!(self.status, Status::Failed | Status::Paused)
             || self.offline_blocked
             || self.provider_update_held
+            || self.admission_blocked
         {
             return;
         }
@@ -13746,6 +13757,20 @@ impl State {
         if let Some(arm) = fresh_arm {
             self.disarm_fresh_session(id, Some(arm));
         }
+        if self.current().queued_prompt.is_some() {
+            // An ordinary send to a managed thread is a run like
+            // crew.send's: it reserves admission before any delivery, so
+            // direct input cannot ride an idle provider connection around
+            // the scheduler. Unmanaged interactive threads skip this path.
+            let index = self.active;
+            if self.threads[index].peer_origin.is_some()
+                || self.threads[index].crew_captain.is_some()
+            {
+                let peer_worker = self.threads[index].peer_origin.is_some();
+                self.ensure_thread_admission(index, peer_worker, false);
+                self.admission_pump();
+            }
+        }
         if self.current().pi.is_none() && self.current().queued_prompt.is_some() {
             self.connect_thread(self.active);
         }
@@ -14565,6 +14590,40 @@ impl State {
                     thread.stop_serial = record["stopSerial"].as_u64().unwrap_or(0);
                     thread.admission = record["admission"].as_str().map(str::to_owned);
                     thread.admission_run = record["admissionRun"].as_u64().unwrap_or(0);
+                    if let Some(saved) = record
+                        .get("admissionPrompt")
+                        .filter(|value| !value.is_null())
+                    {
+                        // A malformed queued prompt must not invalidate the
+                        // thread record; the reservation it covers simply
+                        // releases at reconcile instead.
+                        let images: Vec<_> = saved["images"]
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Attachment::from_value)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let context = saved
+                            .get("context")
+                            .filter(|v| !v.is_null())
+                            .map(crate::composer_context::decode_message_context)
+                            .transpose()
+                            .ok()
+                            .flatten();
+                        if let Some(text) = saved["text"].as_str()
+                            && let Ok(prompt) = crate::composer_tokens::received_prompt_with_context(
+                                text.into(),
+                                images,
+                                saved.get("draft").cloned(),
+                                context,
+                            )
+                        {
+                            thread.queued_prompt = Some((prompt, thread.messages.len()));
+                        }
+                    }
                     thread.parent = if record["parent"].is_null() {
                         None
                     } else {
@@ -14751,6 +14810,7 @@ impl State {
                 .map_err(|error| format!("Invalid saved scheduler: {error}."))?;
             self.scheduler.validate()?;
         }
+        self.requeue_undelivered_managed_inputs();
         self.validate_captain_archives()?;
         self.sync_memory_links();
         self.refresh_captain_contexts();
@@ -14758,6 +14818,43 @@ impl State {
             self.restore_persisted_history(&index["threadViews"])?;
         }
         Ok(())
+    }
+    /// Accepted managed input that never reached a provider survives shutdown
+    /// as a recovered draft. A still-queued reservation proves the provider
+    /// never received it, so the prompt requeues under the same admission
+    /// instead of blocking on manual review while the line it owns releases.
+    fn requeue_undelivered_managed_inputs(&mut self) {
+        let ids: Vec<usize> = self.recovered_inputs.keys().copied().collect();
+        for id in ids {
+            let Some(position) = self.threads.iter().position(|thread| thread.id == id) else {
+                continue;
+            };
+            let covered = self
+                .reservation_covering_thread(id)
+                .is_some_and(|reservation| {
+                    reservation.state == admission::ReservationState::Queued
+                });
+            if !covered {
+                continue;
+            }
+            let value = self.recovered_inputs[&id].clone();
+            let Some(text) = value["text"].as_str() else {
+                continue;
+            };
+            let images: Vec<Attachment> =
+                serde_json::from_value(value["attachments"].clone()).unwrap_or_default();
+            let Ok(prompt) = crate::composer_tokens::received_prompt_with_context(
+                text.into(),
+                images,
+                value.get("draft").cloned(),
+                None,
+            ) else {
+                continue;
+            };
+            self.recovered_inputs.remove(&id);
+            let at = self.threads[position].messages.len();
+            self.threads[position].queued_prompt = Some((prompt, at));
+        }
     }
     pub fn keybindings_path(&self) -> PathBuf {
         self.data_dir.join("keybindings.json")
@@ -15150,6 +15247,17 @@ impl State {
     pub fn checkpoint_and_flush(&mut self) -> Result<(), String> {
         self.checkpoint();
         self.flush_stores()
+    }
+
+    /// The commit an admission grant performs before its provider effect.
+    /// Separate from `checkpoint_and_flush` so a test can fault exactly
+    /// this boundary without breaking unrelated commits in the process.
+    pub(super) fn admission_commit(&mut self) -> Result<(), String> {
+        #[cfg(debug_assertions)]
+        if crate::outbox::commit_fault(&self.data_dir) {
+            return Err("Injected commit failure for integration testing.".into());
+        }
+        self.checkpoint_and_flush()
     }
 
     #[cfg(test)]
@@ -15603,6 +15711,15 @@ impl Thread {
         record.as_object_mut().unwrap().extend(json!({
             "peerOrigin":self.peer_origin,"stopSerial":self.stop_serial,
             "admission":self.admission,"admissionRun":self.admission_run,
+            // A managed thread's accepted-but-unsent prompt is the durable
+            // payload of its admission reservation; without it a queued
+            // crew root would survive restart with nothing left to run.
+            "admissionPrompt":(self.crew_captain.is_some() || self.peer_origin.is_some())
+                .then(|| self.queued_prompt.as_ref().map(|(prompt, _)| json!({
+                    "text":prompt.text,"images":prompt.images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+                    "context":prompt.context,"draft":prompt.draft
+                })))
+                .flatten(),
             "project":self.project,"machine":self.machine,"updated":self.updated,
             "model":self.selected_model.as_ref().map(|(_,id)|id),"thinking":self.selected_thinking,
             "options":self.model_options,

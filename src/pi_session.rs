@@ -737,7 +737,7 @@ impl Thread {
     }
 
     pub(super) fn drive_native(&mut self) -> bool {
-        if self.offline_blocked || self.status == Status::Paused {
+        if self.offline_blocked || self.admission_blocked || self.status == Status::Paused {
             return true;
         }
         if self.initializing || self.pi.is_none() {
