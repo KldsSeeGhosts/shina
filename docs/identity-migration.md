@@ -16,8 +16,12 @@ The catalog stores:
   their domain IDs. These subjects are never inserted into `devices` and
   cannot authenticate.
 
-The executor and owner remain equal to the controller for this storage-only
-increment. Execution leases, placement changes and run fencing are later work.
+The executor initially equals the controller. The owner has a separate identity.
+Execution leases, placement changes and run fencing are later work.
+
+Authenticated `hello` exposes domain identities and logical record aliases.
+Public `/v1/identity` remains a pairing-discovery response with the server ID,
+machine label and protocol support. It does not enumerate workspace records.
 
 ## Migration rules
 

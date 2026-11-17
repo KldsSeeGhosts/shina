@@ -2104,18 +2104,10 @@ async fn identity(State(shared): State<Shared>, headers: HeaderMap) -> Response 
     if headers.contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Ok(identity) = identity_for_read(&shared) else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    // Pairing discovery is public. Domain identity and record aliases belong
+    // to the authenticated hello response, not this bootstrap endpoint.
     Json(json!({
         "serverId":shared.discovery.server_id,"label":machine_label(),
-        "workspaceId":identity["workspaceId"],"ownerId":identity["ownerId"],
-        "controllerId":identity["controllerId"],"executorId":identity["executorId"],
-        "logicalIds":{
-            "captains":identity["captainIds"],"threads":identity["threadIds"],
-            "projectCheckouts":identity["projectCheckoutIds"],"tasks":identity["taskIds"],
-            "routines":identity["routineIds"]
-        },
         "protocolMajor":protocol::MAJOR,"protocolMinor":shared.discovery.protocol_minor,
         "peerDelegation":shared.discovery.protocol_minor >= 5
     }))
@@ -5082,6 +5074,61 @@ mod tests {
             .await;
             assert!(refused.unwrap_err().contains("Update required"));
         });
+    }
+
+    #[tokio::test]
+    async fn public_identity_discovery_does_not_enumerate_domain_records() {
+        let fixture = Fixture::new("identity-public-discovery").await;
+        fixture
+            .local_command(
+                "captain.put",
+                json!({
+                    "record":crate::captains::Captain::presets()[0].to_value(),
+                    "project":null
+                }),
+            )
+            .await;
+        wait_until(|| {
+            fixture.shared.snapshots.borrow()["state"]["index"]["identity"]["captainIds"]["0"]
+                .is_string()
+        })
+        .await;
+        let response = crate::peer::http()
+            .unwrap()
+            .get(format!("http://{}/v1/identity", fixture.address))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let discovery: Value = response.json().await.unwrap();
+        let mut keys: Vec<_> = discovery
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "label",
+                "peerDelegation",
+                "protocolMajor",
+                "protocolMinor",
+                "serverId"
+            ]
+        );
+        assert_eq!(discovery["serverId"], fixture.shared.discovery.server_id);
+
+        fixture
+            .shared
+            .database
+            .issue_scoped_device("catalog-reader", "catalog-token", &["read", "paired"])
+            .unwrap();
+        let hello = hello_with_token(&fixture, "catalog-token").await;
+        assert!(hello["identity"]["logicalIds"]["captains"]["0"].is_string());
+        assert!(hello["workspaceId"].is_string());
+        assert!(hello["ownerId"].is_string());
     }
 
     #[tokio::test]
