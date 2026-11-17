@@ -941,6 +941,15 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
     )
     .unwrap();
     let original_status = git(&["status", "--porcelain"]);
+    let picked = target.root.join("picked");
+    git(&[
+        "worktree",
+        "add",
+        "-b",
+        "picked-branch",
+        picked.to_str().unwrap(),
+        "main",
+    ]);
     home.launch(&["serve"]);
     target.launch(&["serve"]);
     let mut executor = target.client(uuid::Uuid::new_v4());
@@ -1094,6 +1103,86 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
         assert!(placement == &first || placement == &second);
         assert!(homes.contains(&task["child_thread_id"]));
     }
+    let accepted = owner.command(
+        "task.delegate",
+        json!({"threadId":parent,"args":{
+            "prompt":"placement-writer-existing", "client_request_id":"placement-writer-existing",
+            "target":{"environmentId":discovery["serverId"],"projectId":project,"model":"fixture"},
+            "placement":{"mode":"existing","worktree":"picked-branch"}
+        }}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(accepted["result"]["status"], "accepted", "{accepted}");
+    let existing_home = accepted["result"]["result"]["thread_id"].clone();
+    assert!(existing_home.is_number(), "{accepted}");
+    executor.until(|state| {
+        let Some(threads) = state["index"]["threads"].as_array() else {
+            return false;
+        };
+        let workers: Vec<_> = threads
+            .iter()
+            .filter(|thread| thread["peerOrigin"].is_object())
+            .collect();
+        workers.len() == 3
+            && workers.iter().any(|thread| {
+                thread["placement"]["mode"] == "existing"
+                    && thread["placement"]["phase"] == "ready"
+                    && thread["placement"]["checkout"]
+                        .as_str()
+                        .is_some_and(|checkout| {
+                            fs::read_to_string(
+                                PathBuf::from(checkout).join("fixture-prompts.jsonl"),
+                            )
+                            .ok()
+                            .is_some_and(|text| {
+                                text.ends_with('\n') && text.contains("placement-writer-existing")
+                            })
+                        })
+            })
+    });
+    let workers: Vec<_> = executor.snapshot["index"]["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|thread| thread["peerOrigin"].is_object())
+        .collect();
+    assert_eq!(workers.len(), 3);
+    let existing = workers
+        .iter()
+        .find(|thread| thread["placement"]["mode"] == "existing")
+        .expect("existing worktree worker");
+    let placement = &existing["placement"];
+    assert_eq!(placement["branch"], "picked-branch");
+    assert_eq!(placement["newWorktree"], false);
+    assert_eq!(placement["primaryCheckout"], false);
+    assert_eq!(
+        fs::canonicalize(placement["checkout"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(&picked).unwrap()
+    );
+    assert_eq!(
+        executor.snapshot["directories"][existing["id"].as_u64().unwrap().to_string()],
+        placement["checkout"]
+    );
+    assert_eq!(
+        fs::read_to_string(picked.join("README.md")).unwrap(),
+        "committed base\n"
+    );
+    assert!(!picked.join("parent-only.txt").exists());
+    owner.until(|state| {
+        state["index"]["tasks"].as_array().is_some_and(|tasks| {
+            tasks.len() == 3
+                && tasks
+                    .iter()
+                    .all(|task| task["remote"]["placement"]["phase"] == "ready")
+        })
+    });
+    let existing_task = owner.snapshot["index"]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["child_thread_id"] == existing_home)
+        .expect("existing worktree task");
+    assert!(existing_task["remote"]["placement"] == *placement);
     assert_eq!(git(&["status", "--porcelain"]), original_status);
     assert_eq!(git(&["symbolic-ref", "--short", "HEAD"]).trim(), "main");
     assert_eq!(
@@ -1101,7 +1190,7 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
             .lines()
             .filter(|line| line.starts_with("worktree "))
             .count(),
-        3
+        4
     );
     assert!(!repository.join("fixture-prompts.jsonl").exists());
     drop(owner);
