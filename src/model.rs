@@ -927,6 +927,12 @@ pub struct Thread {
     /// A peer assignment accepted for the next provider turn. `begin_prompt`
     /// consumes it so a provider process can serve several distinct runs.
     pub(crate) next_execution: Option<crate::execution::Binding>,
+    /// Bind each durable peer input to its own controller-issued run. A single
+    /// next_execution slot cannot represent several accepted follow-ups.
+    pub(crate) peer_input_executions: std::collections::BTreeMap<String, crate::execution::Binding>,
+    /// Provider terminal observations survive changing the active binding
+    /// within a poll batch, until refresh_execution commits them to the book.
+    execution_settlements: Vec<(crate::execution::Binding, String)>,
     /// Durable provider evidence, matched by run id so a late event cannot
     /// settle a newer run.
     pub provider_accepted_run: Option<String>,
@@ -1192,6 +1198,12 @@ impl Thread {
         if let Some(run) = &self.run_id {
             self.provider_terminal_run = Some(run.clone());
             self.provider_terminal_status = Some(status.into());
+            if let Some(binding) = &self.execution
+                && binding.run_id == *run
+            {
+                self.execution_settlements
+                    .push((binding.clone(), status.to_owned()));
+            }
         }
     }
 
@@ -1580,6 +1592,8 @@ impl Thread {
             run_id: None,
             execution: None,
             next_execution: None,
+            peer_input_executions: Default::default(),
+            execution_settlements: Vec::new(),
             provider_accepted_run: None,
             provider_running_run: None,
             provider_terminal_run: None,
@@ -2872,6 +2886,21 @@ impl Thread {
         }
         let text = self.pending_injections[0].text.clone();
         let peer_input = self.pending_injections[0].peer_input;
+        let peer_execution = peer_input
+            .as_ref()
+            .and_then(|id| self.peer_input_executions.get(&id.to_string()))
+            .cloned();
+        if let Some(binding) = &peer_execution
+            && self.status.busy()
+            && self.run_id.is_some()
+            && self.provider_terminal_run != self.run_id
+            && self.execution.as_ref() != Some(binding)
+        {
+            // Keep a future managed turn in Shina's durable queue. Passing it
+            // into an adapter's follow-up queue would attribute it to the
+            // currently running lease and make exact cancellation impossible.
+            return false;
+        }
         // A steer injection pins the run it was declared against. If that run
         // already ended, the message becomes ordinary follow-up input so it
         // queues behind the newer work rather than vanishing.
@@ -2880,14 +2909,31 @@ impl Thread {
             .as_ref()
             .filter(|run| self.status.busy() && Some(*run) == self.run_id.as_ref())
             .is_some();
-        if !self.status.busy() || self.run_id.is_none() {
-            if let Some(binding) = self.next_execution.take() {
+        if !self.status.busy()
+            || self.run_id.is_none()
+            || peer_execution.is_some() && self.provider_terminal_run == self.run_id
+        {
+            if let Some(binding) = peer_execution.or_else(|| {
+                self.next_execution.clone().filter(|binding| {
+                    !self
+                        .peer_input_executions
+                        .values()
+                        .any(|peer| peer == binding)
+                })
+            }) {
+                if self.next_execution.as_ref() == Some(&binding) {
+                    self.next_execution = None;
+                }
                 self.run_id = Some(binding.run_id.clone());
+                if let Some(origin) = &mut self.peer_origin {
+                    origin.attempt_id = binding.attempt_id.clone();
+                }
                 self.execution = Some(binding);
             } else {
                 self.run_id = Some(uuid::Uuid::new_v4().to_string());
             }
             self.prompt_suggestion = None;
+            self.arm_task();
         }
         // prompt starts an idle Pi; followUp also covers a run starting before Pi reads it.
         let behavior = if steer { "steer" } else { "followUp" };
@@ -5263,6 +5309,23 @@ impl State {
     /// provider-accepted phase.
     pub(crate) fn refresh_execution(&mut self, now: u64) -> bool {
         let mut changed = false;
+        for thread in &mut self.threads {
+            for (binding, status) in std::mem::take(&mut thread.execution_settlements) {
+                if self.execution.get(&binding.lease_id).is_some_and(|lease| {
+                    lease.binding() == binding && lease.phase != crate::execution::Phase::Terminal
+                }) {
+                    changed |= self
+                        .execution
+                        .terminal(
+                            &binding.lease_id,
+                            &status,
+                            now,
+                            "executor observed provider terminal event for this exact turn",
+                        )
+                        .is_ok();
+                }
+            }
+        }
         let dangling: Vec<(usize, String, String)> = self
             .threads
             .iter()
@@ -15182,6 +15245,20 @@ impl State {
                         .map(|value| serde_json::from_value(value.clone()))
                         .transpose()
                         .ok()?;
+                    thread.peer_input_executions = record
+                        .get("peerInputExecutions")
+                        .filter(|value| !value.is_null())
+                        .map(|value| serde_json::from_value(value.clone()))
+                        .transpose()
+                        .ok()?
+                        .unwrap_or_default();
+                    if thread.peer_input_executions.iter().any(|(input, binding)| {
+                        uuid::Uuid::parse_str(input).is_err()
+                            || self.execution.get(&binding.lease_id)
+                                .is_none_or(|lease| lease.binding() != *binding)
+                    }) {
+                        return None;
+                    }
                     thread.provider_accepted_run =
                         record["providerAcceptedRun"].as_str().map(str::to_owned);
                     thread.provider_running_run =
@@ -16351,6 +16428,7 @@ impl Thread {
             "harness":self.harness, "harnessContextSent":self.harness_context_sent,
             "runId":self.run_id,"resumableRunId":self.resumable_run_id,"continuationOfRunId":self.continuation_of_run_id,
             "execution":self.execution,"nextExecution":self.next_execution,
+            "peerInputExecutions":self.peer_input_executions,
             "providerAcceptedRun":self.provider_accepted_run,
             "providerRunningRun":self.provider_running_run,
             "providerTerminalRun":self.provider_terminal_run,
@@ -19921,6 +19999,71 @@ mod tests {
             assert_eq!(thread.messages[0].display_text(), "Shina: task #2 finished");
             assert_eq!(thread.draft.text, "Keep this draft");
         }
+    }
+
+    #[test]
+    fn managed_peer_inputs_keep_distinct_run_bindings_while_queued() {
+        let mut thread = Thread::new(1);
+        let (commands, _events) = fake_pi(&mut thread, Status::Running);
+        thread.history_loaded = true;
+        let binding = |generation: u64| crate::execution::Binding {
+            lease_id: format!("lease-{generation}"),
+            generation,
+            workspace_id: "workspace".into(),
+            owner_id: "owner".into(),
+            run_as_owner_id: "owner".into(),
+            controller_id: "controller".into(),
+            initiating_device_id: "device".into(),
+            executor_id: "executor".into(),
+            logical_thread_uid: "logical".into(),
+            logical_captain_uid: None,
+            run_id: format!("run-{generation}"),
+            attempt_id: Some(format!("attempt-{generation}")),
+            delivery_id: None,
+        };
+        thread.execution = Some(binding(1));
+        thread.run_id = Some("run-1".into());
+        for generation in [2, 3] {
+            let input = uuid::Uuid::new_v4();
+            thread
+                .peer_input_executions
+                .insert(input.to_string(), binding(generation));
+            thread.pending_injections.push_back(Injection {
+                text: format!("input-{generation}"),
+                shown: false,
+                steer: None,
+                peer_input: Some(input),
+            });
+        }
+        assert!(!thread.flush_injection());
+        assert!(
+            commands.try_recv().is_err(),
+            "queued work must not enter the current adapter run"
+        );
+        assert_eq!(thread.execution, Some(binding(1)));
+        thread.note_provider_terminal("completed");
+        thread.status = Status::Completed;
+        assert!(thread.flush_injection());
+        let second = commands.try_recv().unwrap();
+        assert_eq!(second["message"], "input-2");
+        assert_eq!(second["runId"], "run-2");
+        assert_eq!(thread.execution, Some(binding(2)));
+        acknowledge(&mut thread, &second);
+        thread.status = Status::Running;
+        assert!(!thread.flush_injection());
+        thread.note_provider_terminal("completed");
+        thread.status = Status::Completed;
+        assert!(thread.flush_injection());
+        let third = commands
+            .try_iter()
+            .find(|command| command["type"] == "prompt")
+            .unwrap();
+        assert_eq!(third["message"], "input-3");
+        assert_eq!(third["runId"], "run-3");
+        assert_eq!(thread.execution, Some(binding(3)));
+        assert_eq!(thread.execution_settlements.len(), 2);
+        assert_eq!(thread.execution_settlements[0].0, binding(1));
+        assert_eq!(thread.execution_settlements[1].0, binding(2));
     }
 
     #[test]

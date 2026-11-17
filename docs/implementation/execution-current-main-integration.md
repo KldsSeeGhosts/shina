@@ -158,6 +158,54 @@ pass at this checkpoint. The new cancelled-generation regression also checks
 that its terminal record cannot hide an earlier writer from controller prepare
 or executor assignment checks. Exact source still needs a full combined run.
 
+The combined serial run at `6f8deb3` is now complete. All-target build passed,
+2,092 unit tests passed with 13 ignored, and all 123 integration tests passed.
+This closes the earlier 13 integration failures at that exact checkpoint.
+
+## Accepted queued generations
+
+The next correction separates a running provider turn from accepted inputs
+waiting behind it. The oldest unsettled lease remains active. Preparing a
+follow-up does not fence controls for that running turn.
+
+Each peer command retains its own execution binding in the durable thread
+record. Managed follow-ups wait in Shina's queue until the prior turn settles,
+rather than entering an adapter queue under the previous run id. Terminal
+observations retain their exact binding even when a later input starts within
+the same poll batch.
+
+Cancellation names both the queued assignment and input command. The executor
+can remove an accepted input only while its durable evidence proves no adapter
+dispatch. It settles that input and lease without stopping an earlier writer.
+Unknown or already-dispatched input remains subject to provider settlement.
+Current-turn stops retain future managed inputs and carry their own durable
+execution binding, so delayed stop replay cannot stop the next turn.
+
+Peer waits may name an exact saved lease. The response does not attach an older
+turn's question or completion to a queued generation. Scoped database reads
+include every input-bound lease belonging to that thread, but no unrelated
+thread leases. The new correction still requires its focused and combined
+verification before publication.
+
+The controller retains the last accepted send command after its transport
+receipt. A later cancellation can therefore name an input still queued at the
+executor. A live paired-server regression verifies this after transport
+acceptance, checks that the older execution, run, stop serial and provider
+terminal marker remain unchanged, then restarts both sides and replays the
+keyed send and cancel without delivering the cancelled prompt.
+
+This correction covers ordinary assigned follow-ups. A late steer still uses
+the existing steer-to-follow-up path. Controller-issued lease attribution for
+that fallback run needs a separate correction before issue 27 can close.
+Cross-executor continuity and dependency composition also remain unproven.
+
+Focused checks passed for this correction: 76 remote-task tests, 11 lease-book
+tests, the distinct queued-input run-binding regression and the scoped database
+lease regression. The accepted-queue cancellation/restart test and the existing
+live late-steer attribution test both passed. A delayed exact writer stop also
+has a regression proving that it preserves a later queued input and refuses to
+act after the current execution changes. Full combined verification is pending.
+
 Issue #27 remains open. Queued generations still need distinct current-run and
 already-accepted queued-run control semantics. Pending-assignment cancellation
 is now covered, but a full combined suite on this correction is still required.

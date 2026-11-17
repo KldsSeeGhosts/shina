@@ -141,7 +141,21 @@ pub async fn wait_for_peer_thread(
                 }
                 request
             });
-        let execution = record["execution"]["leaseId"]
+        let requested_execution = args.get("execution").filter(|value| !value.is_null());
+        if let Some(control) = requested_execution {
+            let id = control["leaseId"]
+                .as_str()
+                .ok_or("Execution wait requires leaseId.")?;
+            if record["execution"]["leaseId"] != id
+                && record["nextExecution"]["leaseId"] != id
+                && !record["peerInputExecutions"]
+                    .as_object()
+                    .is_some_and(|inputs| inputs.values().any(|binding| binding["leaseId"] == id))
+            {
+                return Err("This execution does not belong to the requested peer thread.".into());
+            }
+        }
+        let execution = requested_execution.unwrap_or(&record["execution"])["leaseId"]
             .as_str()
             .and_then(|lease_id| {
                 state["index"]["execution"]["leases"]
@@ -160,8 +174,19 @@ pub async fn wait_for_peer_thread(
             })
             .cloned()
             .unwrap_or(Value::Null);
+        if let Some(control) = requested_execution
+            && (execution.is_null()
+                || execution["generation"] != control["generation"]
+                || execution["runId"] != control["runId"])
+        {
+            return Err("Execution wait does not match the exact saved generation and run.".into());
+        }
+        let current =
+            requested_execution.is_none() || execution["leaseId"] == record["execution"]["leaseId"];
+        let request = current.then_some(request).flatten();
+        let document_request = current.then_some(document_request).flatten();
         let mut status = json!({"threadId":thread["id"],
-            "finished":record["peerOrigin"]["result"].is_object(),
+            "finished":current && record["peerOrigin"]["result"].is_object(),
             "request":request,"needsYou":request.is_some(),
             "documentRequest":document_request,"status":thread["status"],
             "attemptId":record["peerOrigin"]["attemptId"],"placement":record["placement"],
@@ -171,7 +196,11 @@ pub async fn wait_for_peer_thread(
             "providerRunningRun":record["providerRunningRun"],
             "providerTerminalRun":record["providerTerminalRun"],
             "providerTerminalStatus":record["providerTerminalStatus"]});
-        status["result"] = record["peerOrigin"]["result"].clone();
+        status["result"] = if current {
+            record["peerOrigin"]["result"].clone()
+        } else {
+            Value::Null
+        };
         status["revision"] = json!(crate::protocol::revision(&status));
         Ok(status)
     };
@@ -289,6 +318,7 @@ fn apply_execution_reply(
         let pending = remote
             .send_command
             .as_ref()
+            .or(remote.accepted_send.as_ref())
             .ok_or("Pending cancellation reply has no saved input command.")?;
         if !transport_receipt
             || !remote.stop_owed
@@ -522,6 +552,8 @@ pub(crate) struct PeerTaskIntent {
     pub message: Option<String>,
     #[serde(default)]
     pub target_run_id: Option<String>,
+    #[serde(default)]
+    pub execution: Option<crate::execution::Binding>,
     /// queued | stop_pending | applied | settled
     pub queue_state: String,
     /// not_observed | requested | accepted | rejected | unknown
@@ -562,6 +594,7 @@ impl PeerTaskIntent {
             requested_delivery: requested_delivery.into(),
             message: Some(message),
             target_run_id,
+            execution: None,
             queue_state: "queued".into(),
             provider_state: "not_observed".into(),
             provider_basis: None,
@@ -591,6 +624,7 @@ impl PeerTaskIntent {
             requested_delivery: "cancel".into(),
             message: None,
             target_run_id,
+            execution: None,
             queue_state: "stop_pending".into(),
             provider_state: "not_observed".into(),
             provider_basis: None,
@@ -2208,6 +2242,11 @@ mod tests {
         state.threads[1].peer_origin.as_mut().unwrap().attempt_id = Some("attempt-a".into());
         let second = assigned_lease(&state, child, &controller, 2, second_run, "attempt-b", true);
         let (second, _) = state.execution.accept_assignment(second).unwrap();
+        state
+            .execution
+            .terminal(&first.lease_id, "completed", 3, "provider settled")
+            .unwrap();
+        state.threads[1].execution = Some(second.binding());
         state.threads[1].next_execution = Some(second.binding());
 
         let stop_serial = state.threads[1].stop_serial;
@@ -2258,6 +2297,177 @@ mod tests {
         assert!(
             error.contains("different authoritative controller"),
             "{error}"
+        );
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_exact_writer_stop_preserves_later_inputs_and_cannot_replay_on_them() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.identity.controller_id.clone();
+        let first = assigned_lease(
+            &state,
+            child,
+            &controller,
+            1,
+            "current-run",
+            "shared-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].run_id = Some(first.run_id.clone());
+        state.threads[1].status = Status::Running;
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = first.attempt_id.clone();
+        let next = assigned_lease(
+            &state,
+            child,
+            &controller,
+            2,
+            "queued-run",
+            "shared-attempt",
+            true,
+        );
+        let mut assignment = next.value();
+        assignment["queuesBehindCurrent"] = json!(true);
+        let send = Command::new(
+            "peer.thread.send",
+            json!({
+                "threadId":child,"message":"preserve this future input",
+                "delivery":"follow_up","attemptId":"shared-attempt","execution":assignment,
+            }),
+        );
+        state.execute_peer_command("fixture-peer", &send).unwrap();
+        let stop = Command::new(
+            "peer.thread.stop",
+            json!({
+                "threadId":child,"attemptId":"shared-attempt","execution":first.control(),
+            }),
+        );
+        state.execute_peer_command("fixture-peer", &stop).unwrap();
+        state.reconcile_peer_task_intents();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert_eq!(
+            state.threads[1].pending_injections[0].peer_input,
+            Some(send.command_id)
+        );
+        assert_eq!(state.peer_task_intents[0].provider_state, "not_observed");
+        assert_eq!(state.peer_task_intents[0].queue_state, "queued");
+        state.threads[1].execution = Some(next.binding());
+        state.threads[1].run_id = Some(next.run_id.clone());
+        state.threads[1].task_result = None;
+        let input_count = state.threads[1].pending_injections.len();
+        let cancel_index = state
+            .peer_task_intent_index(child, &stop.command_id.to_string())
+            .unwrap();
+        state.peer_task_intents[cancel_index].provider_state = "not_observed".into();
+        state.reconcile_peer_task_intents();
+        assert_eq!(
+            state.peer_task_intents[cancel_index].provider_state,
+            "rejected"
+        );
+        assert_eq!(
+            state.peer_task_intents[cancel_index]
+                .provider_basis
+                .as_deref(),
+            Some("execution_fence")
+        );
+        assert_eq!(state.threads[1].pending_injections.len(), input_count);
+        assert_eq!(state.threads[1].task_result, None);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
+    fn an_accepted_queued_input_can_be_cancelled_without_stopping_the_writer() {
+        let mut state = fixture();
+        let child = peer_worker(&mut state);
+        let controller = state.identity.controller_id.clone();
+        let first = assigned_lease(
+            &state,
+            child,
+            &controller,
+            1,
+            "current-run",
+            "current-attempt",
+            false,
+        );
+        let (first, _) = state.execution.accept_assignment(first).unwrap();
+        state
+            .execution
+            .transition(
+                &first.lease_id,
+                crate::execution::Phase::Running,
+                2,
+                "running",
+            )
+            .unwrap();
+        state.threads[1].execution = Some(first.binding());
+        state.threads[1].run_id = Some(first.run_id.clone());
+        state.threads[1].peer_origin.as_mut().unwrap().attempt_id = first.attempt_id.clone();
+        let next = assigned_lease(
+            &state,
+            child,
+            &controller,
+            2,
+            "queued-run",
+            "queued-attempt",
+            true,
+        );
+        let mut assignment = next.value();
+        assignment["queuesBehindCurrent"] = json!(true);
+        let send = Command::new(
+            "peer.thread.send",
+            json!({
+                "threadId":child,"message":"cancel only this queued input",
+                "delivery":"attempt","attemptId":"queued-attempt","execution":assignment,
+            }),
+        );
+        state.execute_peer_command("fixture-peer", &send).unwrap();
+        assert_eq!(state.threads[1].pending_injections.len(), 1);
+        assert_eq!(
+            state.threads[1].peer_origin.as_ref().unwrap().attempt_id,
+            first.attempt_id
+        );
+        assert!(
+            state
+                .execution
+                .control(
+                    &first.logical_thread_uid,
+                    &first.lease_id,
+                    first.generation,
+                    Some(&first.run_id),
+                )
+                .is_ok()
+        );
+        let before_stop = state.threads[1].stop_serial;
+        let stop = Command::new(
+            "peer.thread.stop",
+            json!({
+                "threadId":child,"attemptId":"queued-attempt","execution":next.control(),
+                "sendCommandId":send.command_id,"pendingExecution":assignment,
+            }),
+        );
+        let response = state.execute_peer_command("fixture-peer", &stop).unwrap();
+        assert_eq!(response["cancelledBeforeDispatch"], true);
+        assert_eq!(response["execution"]["leaseId"], next.lease_id);
+        assert_eq!(
+            response["cancelledInputCommandId"],
+            send.command_id.to_string()
+        );
+        assert!(state.threads[1].pending_injections.is_empty());
+        assert_eq!(state.threads[1].execution, Some(first.binding()));
+        assert_eq!(state.threads[1].stop_serial, before_stop);
+        assert_eq!(
+            state.execution.get(&first.lease_id).unwrap().phase,
+            crate::execution::Phase::Running
+        );
+        assert_eq!(state.peer_task_intents[0].provider_state, "rejected");
+        assert_eq!(state.peer_task_intents[0].queue_state, "settled");
+        assert_eq!(
+            state.execute_peer_command("fixture-peer", &stop).unwrap(),
+            response,
+            "an exact retry must not stop the older writer"
         );
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
@@ -4558,6 +4768,10 @@ pub struct RemoteTask {
     pub child_stop_serial: u64,
     pub client_request_id: Option<String>,
     pub send_command: Option<Command>,
+    /// Keep the last accepted input's exact command and assignment after its
+    /// transport receipt. It can still be waiting in the executor queue.
+    #[serde(default)]
+    pub accepted_send: Option<Command>,
     /// Document pages owed to the worker, dispatched in order over the same
     /// authenticated link that carries every other command to the target.
     #[serde(default)]
@@ -5553,6 +5767,7 @@ impl State {
                 child_stop_serial: 0,
                 client_request_id: None,
                 send_command: None,
+                accepted_send: None,
                 document_replies: VecDeque::new(),
                 evidence_supported: false,
             });
@@ -5954,6 +6169,7 @@ impl State {
             child_stop_serial: 0,
             client_request_id: request.map(str::to_owned),
             send_command: None,
+            accepted_send: None,
             document_replies: VecDeque::new(),
             evidence_supported: false,
             placement: Some(
@@ -6221,6 +6437,19 @@ impl State {
             .filter(|(_, intent)| intent.kind == "cancel" && intent.provider_state != "accepted")
             .collect();
         for (index, mut intent) in cancels {
+            let settled_execution = intent
+                .execution
+                .as_ref()
+                .and_then(|binding| {
+                    self.execution.get(&binding.lease_id).filter(|lease| {
+                        lease.binding() == *binding
+                            && matches!(
+                                lease.phase,
+                                crate::execution::Phase::Terminal | crate::execution::Phase::Fenced
+                            )
+                    })
+                })
+                .is_some();
             let Some(thread) = self
                 .threads
                 .iter_mut()
@@ -6232,7 +6461,22 @@ impl State {
                 .peer_origin
                 .as_ref()
                 .and_then(|origin| origin.attempt_id.as_deref());
-            if intent.attempt_id.as_deref().is_some() && intent.attempt_id.as_deref() != current {
+            if settled_execution {
+                intent.provider_state = "accepted".into();
+                intent.provider_basis = Some("exact_execution_settlement".into());
+                intent.queue_state = "settled".into();
+            } else if intent
+                .execution
+                .as_ref()
+                .is_some_and(|binding| thread.execution.as_ref() != Some(binding))
+            {
+                intent.provider_state = "rejected".into();
+                intent.provider_basis = Some("execution_fence".into());
+                intent.queue_state = "settled".into();
+                intent.error = Some("The target moved to a different execution.".into());
+            } else if intent.attempt_id.as_deref().is_some()
+                && intent.attempt_id.as_deref() != current
+            {
                 intent.provider_state = "rejected".into();
                 intent.provider_basis = Some("attempt_fence".into());
                 intent.queue_state = "settled".into();
@@ -6261,11 +6505,27 @@ impl State {
                 // The accepted stop intent is durable. Any uncertainty is in
                 // provider settlement, which stays unknown until the exact
                 // attempt observes it.
+                let mut future_inputs = VecDeque::new();
+                if let Some(binding) = &intent.execution {
+                    for injection in std::mem::take(&mut thread.pending_injections) {
+                        if injection
+                            .peer_input
+                            .as_ref()
+                            .and_then(|id| thread.peer_input_executions.get(&id.to_string()))
+                            .is_some_and(|queued| queued != binding)
+                        {
+                            future_inputs.push_back(injection);
+                        } else {
+                            thread.pending_injections.push_back(injection);
+                        }
+                    }
+                }
                 let _ = thread.stop_task();
                 let settled_locally = !thread.status.busy()
                     && thread.phase != "Stopping"
                     && thread.injection_id.is_none()
                     && thread.pending_injections.is_empty();
+                thread.pending_injections.extend(future_inputs);
                 if settled_locally {
                     thread.task_result = Some("cancelled");
                     thread.completion_notified = true;
@@ -6317,6 +6577,15 @@ impl State {
                         stop.kind == "cancel"
                             && stop.thread_id == input.thread_id
                             && stop.attempt_id == input.attempt_id
+                            && stop.execution.as_ref().is_none_or(|binding| {
+                                self.threads
+                                    .iter()
+                                    .find(|thread| thread.id == input.thread_id)
+                                    .and_then(|thread| {
+                                        thread.peer_input_executions.get(&input.command_id)
+                                    })
+                                    == Some(binding)
+                            })
                             && (stop.queue_state == "applied"
                                 || (stop.queue_state == "settled"
                                     && stop.provider_basis.as_deref()
@@ -6570,24 +6839,11 @@ impl State {
         let lease_id = assignment["leaseId"]
             .as_str()
             .ok_or("Pending cancellation requires leaseId.")?;
-        if self.execution.get(lease_id).is_some_and(|lease| {
-            lease.terminal_status.as_deref() != Some("cancelled_before_dispatch")
-        }) {
-            // The assignment already reached the executor. Its normal exact
-            // stop route must observe provider settlement instead.
-            return Ok(None);
-        }
+        let existing = self.execution.get(lease_id).cloned();
         let input_id = args["sendCommandId"]
             .as_str()
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
             .ok_or("Pending cancellation requires the exact input command id.")?;
-        if self
-            .peer_task_intents
-            .iter()
-            .any(|intent| intent.command_id == input_id.to_string())
-        {
-            return Err("The pending input already has a durable delivery record. Reconcile its exact execution before cancellation.".into());
-        }
         let thread_id = self.threads[index].id;
         let binding = self.threads[index]
             .execution
@@ -6613,13 +6869,96 @@ impl State {
         }
         // Validate on a clone before staging any durable mutation.
         let mut execution = self.execution.clone();
-        let lease = execution.cancel_unaccepted_assignment(lease, lifecycle::now())?;
+        let lease = if let Some(existing) = existing {
+            if existing.binding() != lease.binding()
+                || existing.request_key != lease.request_key
+                || existing.queued_behind_current != lease.queued_behind_current
+                || existing.executor_thread_alias != lease.executor_thread_alias
+                || existing.executor_thread_uid != lease.executor_thread_uid
+            {
+                return Err("Pending cancellation conflicts with the accepted assignment.".into());
+            }
+            if existing.terminal_status.as_deref() == Some("cancelled_before_dispatch") {
+                if !self.threads[index]
+                    .peer_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.cancelled_commands.contains(&input_id))
+                {
+                    return Err("This cancellation names a different input command.".into());
+                }
+                existing
+            } else {
+                // A currently executing or already dispatched input requires
+                // provider settlement. Never turn its stop into a queue edit.
+                if existing.lease_id == binding.lease_id {
+                    return Ok(None);
+                }
+                let input_index = self
+                    .peer_task_intent_index(thread_id, &input_id.to_string())
+                    .ok_or("The accepted assignment has no matching durable input.")?;
+                let mut input = self.peer_task_intents[input_index].clone();
+                if self.threads[index]
+                    .peer_input_executions
+                    .get(&input.command_id)
+                    != Some(&existing.binding())
+                    || input.kind != "input"
+                    || input.queue_state != "queued"
+                    || input.provider_state != "not_observed"
+                    || input.attempt_id != existing.attempt_id
+                    || self.threads[index]
+                        .peer_dispatches
+                        .iter()
+                        .any(|(id, _, _)| *id == input.command_id)
+                    || self.threads[index]
+                        .peer_prompt
+                        .as_ref()
+                        .is_some_and(|(_, id)| *id == input_id)
+                {
+                    return Err("This input may have reached the provider. Reconcile its exact execution; the current writer was not stopped.".into());
+                }
+                let cancelled = execution.terminal(
+                    &existing.lease_id,
+                    "cancelled_before_dispatch",
+                    lifecycle::now(),
+                    "executor removed this exact accepted input before any adapter dispatch",
+                )?;
+                input.provider_state = "rejected".into();
+                input.provider_basis = Some("target_cancelled_before_dispatch".into());
+                input.queue_state = "settled".into();
+                input.recovery = "cancelled_before_dispatch".into();
+                input.error = Some("Cancelled before the provider received this input.".into());
+                input.updated_at = lifecycle::now();
+                self.stage_peer_task_intent(input)?;
+                self.sync_peer_intent_evidence(input_index);
+                self.threads[index]
+                    .pending_injections
+                    .retain(|injection| injection.peer_input != Some(input_id));
+                if self.threads[index]
+                    .next_execution
+                    .as_ref()
+                    .is_some_and(|binding| binding.lease_id == existing.lease_id)
+                {
+                    self.threads[index].next_execution = None;
+                }
+                cancelled
+            }
+        } else {
+            if self
+                .peer_task_intents
+                .iter()
+                .any(|intent| intent.command_id == input_id.to_string())
+            {
+                return Err("The pending input already has a durable delivery record. Reconcile its exact execution before cancellation.".into());
+            }
+            execution.cancel_unaccepted_assignment(lease, lifecycle::now())?
+        };
         let mut intent = PeerTaskIntent::cancel(
             command.command_id.to_string(),
             thread_id,
             lease.attempt_id.clone(),
             Some(lease.run_id.clone()),
         );
+        intent.execution = Some(lease.binding());
         intent.provider_state = "accepted".into();
         intent.provider_basis = Some("target_cancelled_before_dispatch".into());
         intent.queue_state = "settled".into();
@@ -6890,6 +7229,9 @@ impl State {
                 *lease = accepted;
                 thread.execution = Some(lease.binding());
                 thread.next_execution = thread.execution.clone();
+                thread
+                    .peer_input_executions
+                    .insert(command.command_id.to_string(), lease.binding());
             }
             self.next_id += 1;
             self.threads.push(thread);
@@ -7111,12 +7453,14 @@ impl State {
                 let run = self.threads[index].run_id.clone();
                 // Persist intent with the accepted peer receipt. Native stop
                 // effects run through the committed task-input driver.
-                self.stage_peer_task_intent(PeerTaskIntent::cancel(
+                let mut intent = PeerTaskIntent::cancel(
                     command.command_id.to_string(),
                     self.threads[index].id,
                     attempt,
                     run,
-                ))?;
+                );
+                intent.execution = self.threads[index].execution.clone();
+                self.stage_peer_task_intent(intent)?;
                 let mut result = json!({"stopped":true});
                 if self.peer_evidence_enabled() {
                     result["input"] = json!("queued");
@@ -7225,9 +7569,9 @@ impl State {
                     .transpose()?;
                 let execution_control = args.get("execution").filter(|value| value.is_object());
                 let current_binding = self.threads[index]
-                    .next_execution
+                    .execution
                     .clone()
-                    .or_else(|| self.threads[index].execution.clone());
+                    .or_else(|| self.threads[index].next_execution.clone());
                 let exact_control = delivery == Some("steer") || args.get("requestId").is_some();
                 let next_binding = if exact_control {
                     if let Some(binding) = &current_binding {
@@ -7367,7 +7711,11 @@ impl State {
                 if let Some(reads) = document_reads {
                     thread.peer_origin.as_mut().expect("origin").document_reads = reads;
                 }
-                if delivery == Some("attempt") {
+                if delivery == Some("attempt")
+                    && (next_binding.is_none()
+                        || thread.execution.is_none()
+                        || thread.execution.as_ref() == next_binding.as_ref())
+                {
                     thread.peer_origin.as_mut().expect("origin").attempt_id = target_attempt;
                 }
                 if thread
@@ -7386,7 +7734,12 @@ impl State {
                 thread.peer_origin.as_mut().expect("origin").result = None;
                 thread.peer_origin.as_mut().expect("origin").acknowledged = false;
                 if !exact_control && let Some(binding) = &next_binding {
-                    thread.next_execution = Some(binding.clone());
+                    thread
+                        .peer_input_executions
+                        .insert(command.command_id.to_string(), binding.clone());
+                    if thread.next_execution.is_none() {
+                        thread.next_execution = Some(binding.clone());
+                    }
                 }
                 thread.peer_origin.as_mut().expect("origin").attempt_message =
                     marked_message.clone();
@@ -7809,7 +8162,11 @@ impl State {
             let command = if remote.thread_id.is_none() {
                 remote.launch_command.clone()
             } else if remote.stop_owed {
-                let mut params = json!({"threadId":remote.thread_id,"sendCommandId":remote.send_command.as_ref().map(|command|command.command_id),
+                let saved_input = remote
+                    .send_command
+                    .as_ref()
+                    .or(remote.accepted_send.as_ref());
+                let mut params = json!({"threadId":remote.thread_id,"sendCommandId":saved_input.map(|command|command.command_id),
                     "attemptId":remote.stop_attempt_id});
                 let execution = remote
                     .execution
@@ -7817,9 +8174,7 @@ impl State {
                     .map(|lease| self.execution.get(&lease.lease_id).unwrap_or(lease));
                 if let Some(execution) = execution {
                     params["execution"] = execution.control();
-                    if let Some(pending) = remote
-                        .send_command
-                        .as_ref()
+                    if let Some(pending) = saved_input
                         .and_then(|command| command.params.get("execution"))
                         .filter(|assignment| assignment["leaseId"] == execution.lease_id)
                     {
@@ -7838,7 +8193,8 @@ impl State {
             } else {
                 Command::new(
                     "peer.thread.wait",
-                    json!({"threadId":remote.thread_id,"afterRevision":remote.wait_revision}),
+                    json!({"threadId":remote.thread_id,"afterRevision":remote.wait_revision,
+                        "execution":remote.execution.as_ref().map(crate::execution::Lease::control)}),
                 )
             };
             let (cancel, cancelled) = tokio::sync::oneshot::channel();
@@ -8140,6 +8496,12 @@ impl State {
             let send_delivery = remote
                 .send_command
                 .as_ref()
+                .or_else(|| {
+                    remote
+                        .stop_owed
+                        .then_some(remote.accepted_send.as_ref())
+                        .flatten()
+                })
                 .map(|command| command.command_id.to_string());
             let stop_delivery = remote.stop_command_id.map(|id| id.to_string());
             let result = result.and_then(|receipt| {
@@ -8269,6 +8631,7 @@ impl State {
                                     ));
                                 }
                                 remote.send_command = None;
+                                remote.accepted_send = None;
                                 remote.request = None;
                                 remote.needs_you = false;
                                 remote.state = RemoteState::Done;
@@ -8301,7 +8664,7 @@ impl State {
                                         || evidence_servers.contains(&remote.server_id),
                                 ));
                             }
-                            remote.send_command = None;
+                            remote.accepted_send = remote.send_command.take();
                             remote.request = None;
                             remote.needs_you = false;
                             remote.state = RemoteState::Accepted;

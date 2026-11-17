@@ -1174,6 +1174,13 @@ impl Database {
                     lease["leaseId"].as_str().is_some_and(|id| {
                         record["execution"]["leaseId"].as_str() == Some(id)
                             || record["nextExecution"]["leaseId"].as_str() == Some(id)
+                            || record["peerInputExecutions"]
+                                .as_object()
+                                .is_some_and(|inputs| {
+                                    inputs
+                                        .values()
+                                        .any(|binding| binding["leaseId"].as_str() == Some(id))
+                                })
                     })
                 })
                 .cloned()
@@ -1856,11 +1863,13 @@ mod tests {
         let database = Database::open(&directory).unwrap();
         let index = json!({
             "threads":[{"id":7,"execution":{"leaseId":"current"},
-                "nextExecution":{"leaseId":"queued"}}],
+                "nextExecution":{"leaseId":"queued"},
+                "peerInputExecutions":{"third-input":{"leaseId":"third"}}}],
             "threadViews":[{"id":7,"messages":[]}],
             "execution":{"schema":1,"leases":[
                 {"leaseId":"current","ownerId":"owner-a"},
                 {"leaseId":"queued","ownerId":"owner-a"},
+                {"leaseId":"third","ownerId":"owner-a"},
                 {"leaseId":"unrelated","ownerId":"private-owner"}
             ]}
         });
@@ -1872,7 +1881,8 @@ mod tests {
             scoped["index"]["execution"]["leases"],
             json!([
                 index["execution"]["leases"][0],
-                index["execution"]["leases"][1]
+                index["execution"]["leases"][1],
+                index["execution"]["leases"][2]
             ])
         );
         assert!(!scoped.to_string().contains("private-owner"));

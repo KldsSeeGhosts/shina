@@ -605,7 +605,7 @@ impl Book {
         self.leases
             .iter()
             .filter(|lease| lease.logical_thread_uid == thread && lease.phase.blocks_replacement())
-            .max_by_key(|lease| lease.generation)
+            .min_by_key(|lease| lease.generation)
     }
 
     pub fn for_executor(&self, executor: &str) -> Vec<Lease> {
@@ -804,14 +804,18 @@ impl Book {
             ));
         }
         let latest = self
-            .leases
-            .iter()
-            .filter(|lease| {
-                lease.logical_thread_uid == thread
-                    && !(lease.phase == Phase::Terminal
-                        && lease.terminal_status.as_deref() == Some("cancelled_before_dispatch"))
+            .active_for_thread(thread)
+            .or_else(|| {
+                self.leases
+                    .iter()
+                    .filter(|lease| {
+                        lease.logical_thread_uid == thread
+                            && !(lease.phase == Phase::Terminal
+                                && lease.terminal_status.as_deref()
+                                    == Some("cancelled_before_dispatch"))
+                    })
+                    .max_by_key(|lease| lease.generation)
             })
-            .max_by_key(|lease| lease.generation)
             .or_else(|| self.latest(thread))
             .ok_or("Unknown logical execution thread.")?;
         if latest.lease_id != lease.lease_id && latest.generation > lease.generation {
@@ -1167,8 +1171,36 @@ mod tests {
             book.active_for_thread("77777777-7777-4777-8777-777777777777")
                 .unwrap()
                 .lease_id,
-            second.0.lease_id,
-            "the newest generation fences old controls as soon as it is accepted"
+            first.0.lease_id,
+            "preparing queued work must not replace the current writer"
+        );
+        assert!(
+            book.control(
+                &first.0.logical_thread_uid,
+                &first.0.lease_id,
+                first.0.generation,
+                Some(&first.0.run_id),
+            )
+            .is_ok(),
+            "the running turn must remain controllable while a follow-up waits"
+        );
+        book.terminal(&first.0.lease_id, "completed", 12, "provider settled")
+            .unwrap();
+        assert_eq!(
+            book.active_for_thread(&first.0.logical_thread_uid)
+                .unwrap()
+                .lease_id,
+            second.0.lease_id
+        );
+        assert!(
+            book.control(
+                &first.0.logical_thread_uid,
+                &first.0.lease_id,
+                first.0.generation,
+                Some(&first.0.run_id),
+            )
+            .is_err(),
+            "the previous turn must be fenced once queued work becomes current"
         );
     }
 
