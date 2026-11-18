@@ -202,7 +202,7 @@ fn menu_row(
         .px(8.0)
         .gap(8.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .disabled(disabled)
         .child(
             label(
@@ -265,7 +265,7 @@ pub(super) fn move_picker(s: &State, p: Palette) -> Option<El> {
         .role("menu")
         .focus_group()
         .w(280.0)
-        .child(label(heading, PIXEL_LABEL, p.muted).px(8.0).pt(4.0).pb(2.0));
+        .child(label(heading, META_LABEL, p.muted).px(8.0).pt(4.0).pb(2.0));
     let mut any = false;
     for target in 0..s.captains.len() {
         if let MoveMode::Move { from } = picker.mode
@@ -309,7 +309,7 @@ pub(super) fn move_picker(s: &State, p: Palette) -> Option<El> {
             .px(8.0)
             .gap(10.0)
             .center_y()
-            .radius(4.0)
+            .radius(6.0)
             .disabled(reason.is_some())
             .child(avatar(s, p, target, 40.0, status))
             .child(
@@ -452,7 +452,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
             .mt(6.0)
             .h(28.0)
             .px(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(field_fill(s, p))
             .child({
                 let picker_focus = "crew-recruit-search".to_string();
@@ -558,7 +558,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
     }
     if !can.is_empty() {
         list = list.child(
-            label("Can join", PIXEL_LABEL, p.muted)
+            label("Can join", META_LABEL, p.muted)
                 .key("crew-recruit-can")
                 .px(8.0)
                 .pb(2.0),
@@ -582,7 +582,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
                     .px(8.0)
                     .gap(8.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .focusable(true)
                     .focus_highlight(hover_wash(s, p))
                     .hover(hover_wash(s, p))
@@ -615,7 +615,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
     }
     if !cannot.is_empty() {
         list = list.child(
-            label("Can't join yet", PIXEL_LABEL, p.muted)
+            label("Can't join yet", META_LABEL, p.muted)
                 .key("crew-recruit-cannot")
                 .px(8.0)
                 .pt(6.0)
@@ -638,7 +638,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
                     .py(4.0)
                     .gap(8.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .disabled(true)
                     .child(icon("thread", p.faint))
                     .child(

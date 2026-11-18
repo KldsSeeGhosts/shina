@@ -51,8 +51,8 @@ pub(super) fn ghost_button(
         .center_y()
         .h(28.0)
         .px(10.0)
-        .radius(4.0)
-        .border(2.0, p.frame)
+        .radius(6.0)
+        .border(1.0, p.frame)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -76,10 +76,10 @@ pub(super) fn solid_button(
             .center_y()
             .h(28.0)
             .px(12.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.coral)
             // Rune cannot move a button on press, so a pressed key darkens instead.
-            .press(p.coral.alpha(0.8))
+            .press(p.coral.alpha(0.9))
             .on_press(action)
             .child(label(title, TextStyle::new(12.5, 600.0), p.on_coral)),
         p,
@@ -305,9 +305,9 @@ pub(super) fn placement_block(
         .center_y()
         .min_w(0.0)
         .child(icon(glyph, p.muted).size(12.0, 12.0))
-        .child(pixel_text(placement_word(placement), p.muted).key(format!("{key}-mode")));
+        .child(meta_text(placement_word(placement), p.muted).key(format!("{key}-mode")));
     if let Some((word, ink)) = phase {
-        line = line.child(pixel_text(word, ink).key(format!("{key}-phase")));
+        line = line.child(meta_text(word, ink).key(format!("{key}-phase")));
     }
     if let Some(branch) = &placement.branch {
         line = line.child(
@@ -494,7 +494,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .center_y()
         .gap(8.0)
         .min_w(0.0)
-        .child(pixel_text(word, status_ink(status, p)))
+        .child(meta_text(word, status_ink(status, p)))
         .child(
             label(&task.workspace_label, SMALL, p.muted)
                 .truncate()
@@ -517,7 +517,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .gap(3.0)
         .px(12.0)
         .py(10.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
         .border(1.0, hairline(p))
         .hover(hover_wash(s, p))
@@ -662,13 +662,13 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
         .h(26.0)
         .px(6.0)
         .ml(-6.0)
-        .radius(4.0)
+        .radius(6.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(move |s: &mut State| open_thread(s, child))
         .child(mark_slot(status, p))
-        .child(super::pixel_text(word, super::status_ink(status, p)))
+        .child(super::meta_text(word, super::status_ink(status, p)))
         .child(
             label(completion.title, ACTIVITY, tertiary)
                 .truncate()
@@ -802,7 +802,7 @@ pub(super) fn report_message(s: &State, p: Palette, text: &str) -> Option<El> {
                     .gap(8.0)
                     .center_y()
                     .child(mark_slot(status, p))
-                    .child(pixel_text(word, status_ink(status, p)))
+                    .child(meta_text(word, status_ink(status, p)))
                     .child(
                         label(&report.title, ACTIVITY, p.muted)
                             .truncate()
@@ -864,7 +864,7 @@ pub(super) fn brief_block(
         .h(26.0)
         .px(6.0)
         .ml(-6.0)
-        .radius(4.0)
+        .radius(6.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -966,7 +966,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .gap(6.0)
                     .center_y()
                     .child(mark_slot(status, p))
-                    .child(super::pixel_text(
+                    .child(super::meta_text(
                         format!("{n} {word}"),
                         super::status_ink(status, p),
                     )),
@@ -1043,7 +1043,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             .child(
                 label(
                     clock,
-                    if waiting { super::PIXEL } else { TIMER },
+                    if waiting { super::META } else { TIMER },
                     if waiting { p.brass } else { tertiary },
                 )
                 .min_w(clock_width)
@@ -1089,7 +1089,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .px(4.0)
                     .gap(8.0)
                     .center_y()
-                    .child(pixel_label("Crew", p.muted))
+                    .child(meta_label("Crew", p.muted))
                     // One item per count, 8 px apart, never joined with a dot.
                     .child(summary)
                     .child(spacer())
@@ -1220,7 +1220,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                 ))
                 .padding(12.0)
                 .gap(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.card)
                 .border(1.0, hairline(p))
                 .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
@@ -1237,7 +1237,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                         .center_y()
                         .gap(8.0)
                         .child(mark_slot(Status::Waiting, p))
-                        .child(pixel_text(
+                        .child(meta_text(
                             if approval {
                                 "Approval needed from"
                             } else {
@@ -1342,7 +1342,7 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                 .px(20.0)
                 .gap(8.0)
                 .center_y()
-                .radius(6.0)
+                .radius(12.0)
                 .border(1.0, hairline(p))
                 .child(who),
         );
@@ -1429,7 +1429,7 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                 .shrink()
                 .min_w(0.0)
                 .child(mark_slot(status, p))
-                .child(pixel_text(word, status_ink(status, p)))
+                .child(meta_text(word, status_ink(status, p)))
                 .child(label(clock, TIMER, tertiary)),
         );
     }
@@ -1488,7 +1488,7 @@ fn with_placement(bar: El, placement: Option<El>, key: &str, name: String, p: Pa
         .key(key.to_owned())
         .role("group")
         .label(name)
-        .radius(6.0)
+        .radius(12.0)
         .border(1.0, hairline(p))
         .child(bar);
     if let Some(placement) = placement {
@@ -1654,7 +1654,7 @@ pub(super) fn attention_row(s: &State, p: Palette) -> Option<El> {
             .min_w(HEADER_BADGE)
             .px(4.0)
             .center()
-            .radius(4.0)
+            .radius(6.0)
             .fill(if open {
                 brass_darkened(p, 0.2)
             } else {
@@ -1667,8 +1667,7 @@ pub(super) fn attention_row(s: &State, p: Palette) -> Option<El> {
             .anchored_fit(ATTENTION_ANCHOR, rune::Side::Left, rune::Align::Center, 0.0)
             .on_press(|s: &mut State| s.attention_menu = !s.attention_menu)
             .child(
-                label(count.to_string(), PIXEL.features(TABULAR), p.on_brass)
-                    .key("attention-count"),
+                label(count.to_string(), META.features(TABULAR), p.on_brass).key("attention-count"),
             ),
         p,
     );
@@ -1719,7 +1718,7 @@ pub(super) fn attention_menu(s: &State, p: Palette, pane: Option<(f32, f32)>) ->
                 .px(8.0)
                 .gap(8.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .focus_highlight(hover_wash(s, p))
                 .press(active_wash(s, p))
                 .on_press(move |s: &mut State| {
@@ -1735,7 +1734,7 @@ pub(super) fn attention_menu(s: &State, p: Palette, pane: Option<(f32, f32)>) ->
                 )
                 .child(spacer())
                 .child(
-                    pixel_text(attention_word(item.kind), super::status_ink(status, p))
+                    meta_text(attention_word(item.kind), super::status_ink(status, p))
                         .key(format!("attention-reason-{id}"))
                         .w(ATTENTION_REASON_WIDTH)
                         .min_w(ATTENTION_REASON_WIDTH)
@@ -1791,7 +1790,7 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
             .mb(6.0)
             .padding(10.0)
             .gap(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.card)
             .border(1.0, p.frame)
             .transition(Transition::offset(0.0, -6.0).combined(Transition::opacity()))

@@ -1,4 +1,4 @@
-//! KSG Code settings/SettingsSidebarNav, settingsSearch and settingsLayout, in Pixel Voyage.
+//! KSG Code settings/SettingsSidebarNav, settingsSearch and settingsLayout.
 use super::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -789,7 +789,7 @@ fn setting(key: &str, title: &str, description: &str, control: El, p: Palette) -
         .child(el().h(1.0).w_full().fill(p.line))
 }
 fn info(key: &str, title: &str, description: &str, value: &str, p: Palette) -> El {
-    setting(key, title, description, pixel_text(value, p.muted), p)
+    setting(key, title, description, meta_text(value, p.muted), p)
 }
 fn add(mut pane: El, s: &State, key: &str, title: &str, note: &str, control: El, p: Palette) -> El {
     if matches(s, title) {
@@ -806,7 +806,7 @@ fn field(edit: &rune::TextEdit, key: &str, title: &str, p: Palette) -> El {
         .w(136.0)
         .h(32.0)
         .padding(8.0)
-        .radius(4.0)
+        .radius(6.0)
         .color(p.ink)
         .field_focus(edit, p)
 }
@@ -850,7 +850,7 @@ fn default_access(s: &State, p: Palette, current: &str) -> El {
         .w(220.0)
         .padding(2.0)
         .gap(2.0)
-        .radius(4.0)
+        .radius(6.0)
         .border(1.0, p.line);
     for mode in crate::model::AccessMode::ALL {
         let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
@@ -878,7 +878,7 @@ fn default_access(s: &State, p: Palette, current: &str) -> El {
             .px(8.0)
             .py(4.0)
             .center_y()
-            .radius(4.0)
+            .radius(6.0)
             .fill(if on { p.selected } else { Color::TRANSPARENT })
             .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
             .child(content);
@@ -919,7 +919,7 @@ fn send_shortcut_picker(s: &State, p: Palette) -> El {
                 .h(28.0)
                 .px(8.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if on { p.selected } else { Color::TRANSPARENT })
                 .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
                 .on_press(move |s: &mut State| {
@@ -953,7 +953,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                 .h(36.0)
                 .w_full()
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .focusable(true)
                 .focus_highlight(p.selected)
                 .fill(if selected {
@@ -1007,7 +1007,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
         .min_w(0.0)
         .h(32.0)
         .padding(8.0)
-        .radius(4.0)
+        .radius(6.0)
         .color(p.ink)
         .field_focus(&s.settings.search, p)
         .on_edit(|s: &mut State| &mut s.settings.search);
@@ -1027,7 +1027,7 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
             let (rows, found) = section_content(s, p, section);
             if found {
                 content = content
-                    .child(pixel_label(SECTIONS[section], p.muted).pt(12.0))
+                    .child(meta_label(SECTIONS[section], p.muted).pt(12.0))
                     .child(rows);
                 count += 1;
             }
@@ -1085,10 +1085,10 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
         } else {
             (s.viewport_height - 48.0).min(600.0)
         })
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .child(
             row()
                 .h(56.0)
@@ -1174,7 +1174,7 @@ fn when_clause_trigger(
                 .px(6.0)
                 .gap(4.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .border(1.0, p.line)
                 .on_press(on_open)
@@ -1308,7 +1308,7 @@ fn render_when_node_editor(
             .gap(6.0)
             .center_y()
             .flex_wrap()
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.panel)
             .border(1.0, p.line)
             .child(
@@ -1366,7 +1366,7 @@ fn render_when_node_editor(
                 })
                 .padding(4.0)
                 .gap(1.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.card)
                 .border(1.0, p.frame);
             for (v_idx, option) in vars_cycle.iter().enumerate() {
@@ -1382,7 +1382,7 @@ fn render_when_node_editor(
                         .h(24.0)
                         .px(8.0)
                         .center_y()
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(if is_curr {
                             p.selected
                         } else {
@@ -1425,7 +1425,7 @@ fn render_when_node_editor(
             .w_full()
             .padding(8.0)
             .gap(6.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.panel)
             .border(1.0, p.line)
             .child(
@@ -1473,7 +1473,7 @@ fn render_when_node_editor(
         .w_full()
         .padding(8.0)
         .gap(6.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.panel)
         .border(1.0, p.line)
         .child(
@@ -1607,7 +1607,7 @@ fn when_editor_popover(s: &State, p: Palette) -> El {
         .w_full()
         .h(30.0)
         .padding(7.0)
-        .radius(4.0)
+        .radius(6.0)
         .color(p.ink)
         .fill(field_fill(s, p))
         .border(
@@ -1645,10 +1645,10 @@ fn when_editor_popover(s: &State, p: Palette) -> El {
         })
         .padding(12.0)
         .gap(10.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .child(header)
         .child(expr_field);
 
@@ -1683,7 +1683,7 @@ fn when_editor_popover(s: &State, p: Palette) -> El {
                 .key("when-visual-blocked")
                 .w_full()
                 .padding(12.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.panel)
                 .border(1.0, p.danger)
                 .child(
@@ -1719,7 +1719,7 @@ fn when_editor_popover(s: &State, p: Palette) -> El {
                 .padding(10.0)
                 .gap(8.0)
                 .flex_wrap()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.panel)
                 .border(1.0, p.line)
                 .child(settings_button(
@@ -1821,10 +1821,10 @@ fn new_keybinding_command_menu(s: &State, p: Palette) -> El {
         })
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p));
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p));
     for (idx, cmd) in options.into_iter().enumerate() {
         let title = crate::keybindings::command_label(&cmd);
         let is_selected = cmd == selected;
@@ -1839,7 +1839,7 @@ fn new_keybinding_command_menu(s: &State, p: Palette) -> El {
                 .cursor(rune::Cursor::Pointer)
                 .h(28.0)
                 .px(8.0)
-                .radius(4.0)
+                .radius(6.0)
                 .center_y()
                 .fill(if is_selected {
                     p.selected
@@ -1891,19 +1891,19 @@ fn panel_animation_control(s: &State, p: Palette) -> El {
         .w(132.0)
         .h(24.0)
         .center_y()
-        .child(el().w_full().h(6.0).radius(2.0).fill(p.sea_bg))
+        .child(el().w_full().h(6.0).radius(4.0).fill(p.sea_bg))
         .child(
             el().w(8.0 + fraction * 116.0)
                 .h(6.0)
-                .radius(2.0)
+                .radius(4.0)
                 .fill(p.coral),
         )
         .child(
             el().absolute(fraction * 116.0, 4.0)
                 .size(16.0, 16.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.card)
-                .border(2.0, p.frame),
+                .border(1.0, p.frame),
         )
         .on_step(|s: &mut State, step, _| {
             s.preferences.panel_animation_duration_ms =
@@ -1925,7 +1925,7 @@ fn panel_animation_control(s: &State, p: Palette) -> El {
         .gap(12.0)
         .center_y()
         .child(outlined(
-            pixel_text(format!("{value} ms"), p.ink)
+            meta_text(format!("{value} ms"), p.ink)
                 .w(64.0)
                 .px(8.0)
                 .py(4.0),
@@ -1946,9 +1946,9 @@ fn provider_status_row(s: &State, p: Palette, provider: &Value) -> El {
     let update = &provider["update"];
     let running = matches!(update["status"].as_str(), Some("queued" | "running"));
     let mut content = row().gap(8.0).flex_wrap().center_y().grow(1.0).min_w(0.0);
-    content = content.child(pixel_text(format!("v{version}"), p.muted));
+    content = content.child(meta_text(format!("v{version}"), p.muted));
     if behind && !latest.is_empty() {
-        content = content.child(pixel_text(format!("Latest v{latest}"), p.muted));
+        content = content.child(meta_text(format!("Latest v{latest}"), p.muted));
     }
     let mut line = col().gap(4.0).w_full().child(content);
     if running {
@@ -2066,7 +2066,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
     match section {
         0 => {
             if s.client.as_ref().is_some_and(|c| !c.linked.is_empty()) {
-                pane = pane.child(pixel_text(
+                pane = pane.child(meta_text(
                     format!(
                         "Server settings on {}",
                         s.machine_label(&s.settings.machine)
@@ -2167,7 +2167,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
         }
         1 => {
             if s.client.as_ref().is_some_and(|c| !c.linked.is_empty()) {
-                let mut machines = row().gap(4.0).flex_wrap().child(pixel_text(
+                let mut machines = row().gap(4.0).flex_wrap().child(meta_text(
                     format!("Editing {}", s.machine_label(&s.settings.machine)),
                     p.muted,
                 ));
@@ -2302,7 +2302,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                         },
                     ));
                 }
-                pane=pane.child(setting("settings-model","Default model and effort","Provider, model ID and effort for new threads without an inherited choice.",pixel_text(&s.settings.model_harness,p.muted),p))
+                pane=pane.child(setting("settings-model","Default model and effort","Provider, model ID and effort for new threads without an inherited choice.",meta_text(&s.settings.model_harness,p.muted),p))
                     .child(harnesses)
                     .child(row().gap(4.0).flex_wrap()
                         .child(field(&s.settings.provider,"default-provider-input","Provider",p).on_edit(|s: &mut State| &mut s.settings.provider))
@@ -2558,8 +2558,8 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 pane = pane.child(
                     row()
                         .gap(8.0)
-                        .child(pixel_label("Server settings context", p.muted))
-                        .child(pixel_text(s.machine_label(&s.settings.machine), p.ink)),
+                        .child(meta_label("Server settings context", p.muted))
+                        .child(meta_text(s.machine_label(&s.settings.machine), p.ink)),
                 );
                 let mut context = row().gap(4.0).flex_wrap();
                 for machine in machine_options(s) {
@@ -2720,7 +2720,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 s,
                 "settings-licences",
                 "Licences",
-                "Shina and Pixelarticons: MIT. Departure Mono: SIL OFL. Inter: SIL OFL. Source Serif 4: SIL OFL.",
+                "Shina: MIT. Lucide: ISC. Inter: SIL OFL. Source Serif 4: SIL OFL.",
                 settings_button("settings-show-licences", "View licences", p, |s| {
                     s.settings.licences = !s.settings.licences
                 }),
@@ -2729,11 +2729,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             if s.settings.licences {
                 for (name, body) in [
                     ("Shina", include_str!("../LICENSE")),
-                    ("Pixelarticons", include_str!("../assets/icons-LICENSE.txt")),
-                    (
-                        "Departure Mono",
-                        include_str!("../assets/fonts/DepartureMono-LICENSE.txt"),
-                    ),
+                    ("Lucide", include_str!("../assets/icons-LICENSE.txt")),
                     ("Inter", include_str!("../assets/fonts/Inter-LICENSE.txt")),
                     (
                         "Source Serif 4",
@@ -2741,7 +2737,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                     ),
                 ] {
                     pane = pane
-                        .child(pixel_label(name, p.muted).pt(12.0))
+                        .child(meta_label(name, p.muted).pt(12.0))
                         .child(label(body, SMALL, p.muted).wrap());
                 }
             }
@@ -2785,7 +2781,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
             .min_w(160.0)
             .h(32.0)
             .padding(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .color(p.ink)
             .fill(field_fill(s, p))
             .field_focus(&s.settings.shortcut_search, p)
@@ -2829,7 +2825,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
             .w_full()
             .padding(8.0)
             .gap(4.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.panel)
             .border(1.0, p.danger);
         for (idx, issue) in s.settings.keybindings_issues.iter().enumerate() {
@@ -2884,7 +2880,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 .px(8.0)
                 .gap(4.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if draft.recording {
                     p.selected
                 } else {
@@ -2900,15 +2896,15 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 })
                 .on_key(|s: &mut State, event, tx| handle_new_keybinding_capture(s, event, tx));
             if draft.recording {
-                key_box = key_box.child(pixel_text("Press shortcut", p.muted));
+                key_box = key_box.child(meta_text("Press shortcut", p.muted));
             } else if draft.key_draft.trim().is_empty() {
-                key_box = key_box.child(pixel_text("Unassigned", p.muted));
+                key_box = key_box.child(meta_text("Unassigned", p.muted));
             } else if let Some(parsed) = parse_keybinding_shortcut(&draft.key_draft) {
                 for part in keycap_parts(&parsed, platform) {
                     key_box = key_box.child(keycap_chip(&part, p));
                 }
             } else {
-                key_box = key_box.child(pixel_text(&draft.key_draft, p.danger));
+                key_box = key_box.child(meta_text(&draft.key_draft, p.danger));
             }
             key_box
         };
@@ -3021,7 +3017,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 .key("new-keybinding-row")
                 .w_full()
                 .padding(8.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.selected)
                 .border(1.0, p.line)
                 .child(
@@ -3055,7 +3051,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for group in groups {
         pane = pane.child(
-            pixel_label(group.title, p.muted)
+            meta_label(group.title, p.muted)
                 .key(format!("keybindings-group-{}", group.id))
                 .pt(12.0)
                 .pb(4.0),
@@ -3080,11 +3076,11 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 .child(label(&title_text, TextStyle::new(14.0, 500.0), p.ink).wrap());
             if is_custom {
                 title_row = title_row.child(outlined(
-                    pixel_text("Custom", p.muted)
+                    meta_text("Custom", p.muted)
                         .key(format!("keybinding-source-{slug}"))
                         .px(4.0)
                         .py(1.0)
-                        .radius(4.0),
+                        .radius(6.0),
                     p,
                 ));
             }
@@ -3178,10 +3174,10 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                             .h(26.0)
                             .px(8.0)
                             .center_y()
-                            .radius(4.0)
+                            .radius(6.0)
                             .fill(p.selected)
-                            .border(2.0, p.coral)
-                            .child(pixel_text("Press shortcut", p.ink))
+                            .border(1.0, p.coral)
+                            .child(meta_text("Press shortcut", p.ink))
                             .on_key(move |s: &mut State, event, tx| {
                                 handle_shortcut_capture(s, event, tx)
                             }),
@@ -3213,7 +3209,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                         .focus_highlight(p.selected)
                         .hover(p.selected)
                         .padding(2.0)
-                        .radius(4.0)
+                        .radius(6.0)
                         .on_press_tx(move |s: &mut State, tx| {
                             s.settings.shortcut_capture = Some(row_id.clone());
                             s.settings.shortcut_notice = None;
@@ -3298,7 +3294,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
     if let Some(version) = &version {
         description = description
             .child(label("Shina", TextStyle::new(14.0, 400.0), p.muted))
-            .child(pixel_text(version, p.muted));
+            .child(meta_text(version, p.muted));
     }
     if providers_count > 0 {
         description = description.child(label(
@@ -3329,17 +3325,17 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
                 .role("row")
                 .gap(16.0)
                 .pb(6.0)
-                .child(el().w(128.0).child(pixel_label("MACHINE", p.muted)))
+                .child(el().w(128.0).child(meta_label("MACHINE", p.muted)))
                 .child(
                     el().key("fleet-column-shina")
                         .w(96.0)
-                        .child(pixel_label("SHINA", p.muted)),
+                        .child(meta_label("SHINA", p.muted)),
                 )
                 .child(
                     el().grow(1.0)
                         .min_w(0.0)
                         .key("fleet-column-providers")
-                        .child(pixel_label("PROVIDERS", p.muted)),
+                        .child(meta_label("PROVIDERS", p.muted)),
                 ),
         )
         .child(el().h(1.0).w_full().fill(p.line));
@@ -3506,10 +3502,10 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
         .max_h(s.viewport_height - 48.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_key(|s: &mut State, event, _| {
             if event.key == rune::Key::Escape {
                 s.fleet.open = false;
@@ -3554,10 +3550,10 @@ pub(super) fn archive_dialog(s: &State, p: Palette) -> El {
                 .w(360.0)
                 .padding(16.0)
                 .gap(12.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.card)
-                .border(2.0, p.frame)
-                .box_shadow(hard_shadow(p))
+                .border(1.0, p.frame)
+                .box_shadow(soft_shadow(p))
                 .child(label("Archive this thread?", DIALOG_TITLE, p.ink))
                 .child(
                     row()

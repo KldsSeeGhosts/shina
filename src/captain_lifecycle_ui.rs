@@ -66,8 +66,8 @@ fn danger_ghost(
         .center_y()
         .h(28.0)
         .px(10.0)
-        .radius(4.0)
-        .border(2.0, p.frame)
+        .radius(6.0)
+        .border(1.0, p.frame)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -87,7 +87,7 @@ fn danger_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State)
             .center_y()
             .h(32.0)
             .px(14.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.danger)
             .press(p.danger.alpha(0.8))
             .on_press(action)
@@ -364,7 +364,7 @@ fn archive_crew_row(s: &State, p: Palette, id: usize) -> El {
             )
             .child(label(
                 thread.status.label(),
-                PIXEL_LABEL,
+                META_LABEL,
                 status_ink(thread.status, p),
             ));
     } else {
@@ -376,7 +376,7 @@ fn archive_crew_row(s: &State, p: Palette, id: usize) -> El {
         );
     }
     if blocking {
-        row_ = row_.child(pixel_text("Blocks", p.danger));
+        row_ = row_.child(meta_text("Blocks", p.danger));
     }
     row_
 }
@@ -541,8 +541,8 @@ fn lifecycle_dialog(s: &State, p: Palette, dialog: &CaptainLifecycleDialog, cont
         .gap(10.0)
         .radius(CARD_RADIUS)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             col()
@@ -741,7 +741,7 @@ fn dialog_body(s: &State, p: Palette, dialog: &CaptainLifecycleDialog) -> El {
         A::Delete => {
             let homes = preview_ids(&dialog.preview, "homeThreads").len();
             body = body
-                .child(pixel_label("Removed for good", p.muted))
+                .child(meta_label("Removed for good", p.muted))
                 .child(
                     label(
                         format!(
@@ -767,7 +767,7 @@ fn dialog_body(s: &State, p: Palette, dialog: &CaptainLifecycleDialog) -> El {
                     .pl(8.0),
                 );
             }
-            body = body.child(pixel_label("Kept", p.muted));
+            body = body.child(meta_label("Kept", p.muted));
             if !crew.is_empty() {
                 body = body
                     .child(
@@ -819,7 +819,7 @@ fn dialog_body(s: &State, p: Palette, dialog: &CaptainLifecycleDialog) -> El {
             );
             let expected_server = dialog.server.clone();
             let expected_captain = dialog.captain;
-            body = body.child(pixel_label("Conversations", p.muted)).child(
+            body = body.child(meta_label("Conversations", p.muted)).child(
                 row()
                     .gap(8.0)
                     .center_y()
@@ -852,7 +852,7 @@ fn dialog_body(s: &State, p: Palette, dialog: &CaptainLifecycleDialog) -> El {
                 body = body.child(label(reason, META, p.danger).wrap());
             }
             body = body
-                .child(pixel_label(&format!("Type \"{name}\" to confirm"), p.muted))
+                .child(meta_label(&format!("Type \"{name}\" to confirm"), p.muted))
                 .child(
                     text_input(&dialog.confirm_name, TextStyle::new(14.0, 420.0).lh(20.0))
                         .key("captain-delete-name")
@@ -861,7 +861,7 @@ fn dialog_body(s: &State, p: Palette, dialog: &CaptainLifecycleDialog) -> El {
                         .w_full()
                         .px(10.0)
                         .py(7.0)
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(field_fill(s, p))
                         .field_focus(&dialog.confirm_name, p)
                         .single_line()

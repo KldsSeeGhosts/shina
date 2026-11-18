@@ -38,7 +38,6 @@ mod handoff;
 mod harness;
 mod history;
 mod history_work;
-mod horizon;
 mod html_fallback;
 #[cfg(any(target_os = "macos", windows, test))]
 mod html_network;

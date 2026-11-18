@@ -2,17 +2,18 @@
 
 Shina is a native Rust app built on [Rune](https://github.com/anomalyco/rune). Almost all UI lives in `src/ui.rs`.
 
-## Visual skin: Pixel Voyage
+## Visual skin: KSG Code
 
-The visual skin follows `docs/ui/pixel-voyage.md`: the palette, Departure Mono labels, Pixelarticons icons, 4 px and 6 px corners, 2 px pixel frames with hard shadows, and the horizon band and sea strip. Structure and behaviour are still ported from KSG Code, as described below. Where this section and the KSG Code section disagree about colour, type, radius or icons, the design document wins. Where they disagree about what goes where or what a click does, KSG Code wins.
+Since 2026-11-18 Shina matches KSG Code's own visual design (the redesign merged in `7959a26823` and its follow-ups), not the Pixel Voyage skin. The user moved away from Pixel Voyage's pixel-art chrome (pixel fonts, staircase icons, heavy 2 px frames, hard offset shadows, the horizon band and sea strip) because it tires the eyes over long sessions. `docs/ui/pixel-voyage.md` is kept as history only. Do not bring its chrome back. Colour, type, radius and icons come from KSG Code's `apps/web/src/index.css` like structure and behaviour do.
 
 Notes for the skin in code:
 
-- `Palette` in `src/ui.rs` holds the colours. `pixel(size)`, `PIXEL` and `PIXEL_LABEL` are the Departure Mono styles. Use the face at 11 px or 22 px only, and only for labels, counts, timers, status words, badges and keycaps. Prose, titles, composer text and code stay Inter, Source Serif 4 and the system mono.
-- `framed`, `hard_shadow` and `pixel_portrait` draw the pixel frame. Rune has no blur in this skin and cannot move a button on press, so a pressed framed button darkens. Use `framed` (frame and shadow) only for things you act on. `outlined` (frame only) is for keycaps, counts and badges that only inform. Text colours are `ink`, `muted` and `faint`, all opaque; do not put an alpha on text.
-- `fn icon` takes names from `src/pixel_icons.rs`. The glyphs sit on a 24 unit grid and draw at `ICON` (18 pt), because 2 unit squares then land on whole device pixels at 2x. Pixelarticons is MIT; its licence is `assets/icons-LICENSE.txt`. Departure Mono is SIL OFL; its licence is next to the font.
-- `src/crisp.rs` scales pixel art to whole device pixels, because Rune samples images with a filter. Never hand Rune a portrait or the mark at a size that is not a whole multiple of its cells. Ask `Artwork::face_pixels` or `Artwork::mark_pixels` (and `Portraits::pixels` for animated stages) for the size in points, and keep slot sizes at multiples of the art where you can (40 pt for the 40 cell busts). The view tells `Artwork` the device scale each frame.
-- `src/horizon.rs` builds the scenery from the app mark's palette. Tests there and in `src/ui.rs` pin its geometry.
+- `Palette` in `src/ui.rs` holds KSG's default dark and light themes: neutral chrome (`bg`), the chat pane (`panel`), raised cards (`card`), the composer tray (`tray`), hairlines (`line`, `frame`, `field_line`), the focus ring (`ring`), and KSG's info blue in `sea`. Some field names predate the theme: `coral` is the primary key (KSG's light `surface-lit` button in dark, near-black in light) and `brass` is KSG's warning. Text colours are `ink`, `muted` and `faint`, all opaque; do not put an alpha on text. Contrast tests in `src/ui.rs` and `src/markdown_ui.rs` keep text at 4.5:1 or better.
+- All UI text is Inter. `meta(size)`, `META` and `META_LABEL` are the small 12 px weight 500 styles for labels, counts, timers, status words and badges; section labels are sentence case. The system mono is only for code, inline code, keycaps, branch names and diff gutters. Prose, titles and the empty-thread greetings follow KSG's type scale (14/22.5 prose, `DraftHeroHeadline` at 30/500 with tight tracking).
+- Corners follow KSG's radii: 6 for rows and chips, 8 for buttons, inputs and tabs, 12 for cards, menus, dialogs and code blocks, 16 for user bubbles and the composer tray with the 15 px main card inside it.
+- `framed` is a 1 px `frame` border with KSG's soft control shadow, for things you act on. `outlined` is the border only, for keycaps, counts and badges. Menus, popovers and dialogs take `soft_shadow`. There are no hard offset shadows.
+- `fn icon` takes names from `src/icons.rs`: Lucide outlines on a 24 unit grid, stroked in `currentColor` with round caps and joins, drawn at `ICON` (16 pt) as KSG's `size-4` icons. Lucide is ISC; its licence is `assets/icons-LICENSE.txt`. A test there checks every name has its own glyph.
+- Captain portraits stay pixel art, framed with rounded corners and a 1 px hairline. `src/crisp.rs` scales pixel art to whole device pixels, because Rune samples images with a filter. Never hand Rune a portrait or the mark at a size that is not a whole multiple of its cells. Ask `Artwork::face_pixels` or `Artwork::mark_pixels` (and `Portraits::pixels` for animated stages) for the size in points, and keep slot sizes at multiples of the art where you can (40 pt for the 40 cell busts). The view tells `Artwork` the device scale each frame.
 
 ## Port UI from KSG Code. Do not invent it.
 
@@ -22,7 +23,7 @@ Workflow:
 
 1. Find the component in KSG Code. Search for its visible text (`rg "What should we work on" apps/web/src`) or its name.
 2. Read its markup and Tailwind classes, plus any CSS variables in `apps/web/src/index.css`.
-3. Convert the classes to Rune values with the table below. Copy KSG's proportions and structure. Keep Shina's palette (`Palette` in `src/ui.rs`) and its fonts.
+3. Convert the classes to Rune values with the table below. Copy KSG's proportions, structure and look. Use the matching `Palette` token for each KSG colour variable.
 4. Put a short comment on the Rune function that names the KSG source, such as "ported from KSG Code's `ComposerAttachmentStrip`".
 5. Add or update a headless layout test in `src/ui.rs` (`runtime(width)`, `rt.presented(key)`). Check at least 620, 960, 1280 and 1920 px wide.
 
@@ -38,6 +39,10 @@ Already ported:
 | `model_effort_trigger`, `settings_picker`, `model_list` | `chat/ComposerModelEffort.tsx`, `chat/ModelPickerContent.tsx`, `chat/ModelListRow.tsx` |
 | `context_ring`, `context_popover` | `chat/ContextWindowMeter.tsx`, `chat/ContextWindowMeter.logic.ts`, `ui/popover.tsx` |
 | `measure`, `lane_gutter`, `conversation`, `composer` lane | `index.css` (`.chat-content-lane`, `.chat-composer-lane`), `chat/MessagesTimeline.tsx`, `chat/TimelineUserMessageRow.tsx` |
+| `composer_shell`, `composer-prompt-body`, `composer_ui::controls` strip, `effort_trigger` | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx`, `chat/ComposerControlsBar.tsx`, `chat/ComposerModelEffort.tsx`, `index.css` (`.composer-prompt-body`) |
+| `assistant_message_meta` | `chat/TimelineAssistantRows.tsx` (`AssistantMessageMeta`) |
+| `work_fold_toggle` | `chat/TimelineWorkGroupRows.tsx` (`WorkFoldToggle`) |
+| `markdown_ui` style and `code_frame` | `ChatMarkdown.tsx`, `index.css` (`.chat-markdown`), `chat/MarkdownCodeBlock.tsx` |
 | `captain_editor` portrait grid | `settings/ProjectIconPickerDialog.tsx` (emoji grid) |
 | `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
 | `crew_ui::needs_you` | `chat/ChildThreadApprovals.tsx` |
@@ -70,7 +75,7 @@ Removed at the user's request. Do not add them back:
 | `absolute right-1 top-1` | `.pin(None, Some(4.0), Some(4.0), None)` |
 | `object-cover` image | `.pixels_fit(pixels, rune::SurfaceFit::Fill)` |
 | `text-center` on wrapping text | `.align(rune::Align::Center).wrap().w_full()` |
-| `max-w-(--chat-content-max-width)` (46 rem) | `measure(wide)` |
+| `max-w-(--chat-content-max-width)` (45 rem) | `measure(wide)` |
 | `flex-1 basis-0` | `.h(0.0).grow(1.0).min_h(0.0)` (Rune has no `basis`) |
 
 ## Checks

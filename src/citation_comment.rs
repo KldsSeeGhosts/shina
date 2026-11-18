@@ -359,7 +359,7 @@ pub(super) fn chip_actions(s: &State, p: Palette, cx: &Cx<State>, zoom: f32) -> 
                         None,
                     )
                     .size(ACTION_SLOT, rect[3] / zoom)
-                    .radius(4.0)
+                    .radius(6.0)
                     .hover(p.selected)
                     .center()
                     .on_press(move |s: &mut State| {
@@ -413,11 +413,11 @@ pub(super) fn popover(s: &State, p: Palette) -> Option<El> {
         .w(320.0)
         .px(12.0)
         .py(8.0)
-        .radius(6.0)
-        .clip_rounded(6.0)
+        .radius(12.0)
+        .clip_rounded(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored_fit(&ed.anchor, rune::Side::Top, rune::Align::End, 4.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| outside_dismiss(s))
@@ -458,7 +458,7 @@ pub(super) fn popover(s: &State, p: Palette) -> Option<El> {
                         .center_y()
                         .h(28.0)
                         .px(10.0)
-                        .radius(4.0)
+                        .radius(6.0)
                         .hover(p.selected)
                         .press(p.selected)
                         .on_press(|s: &mut State| cancel(s))
@@ -480,7 +480,7 @@ fn save_button(p: Palette, too_long: bool) -> El {
         .center_y()
         .h(28.0)
         .px(10.0)
-        .radius(4.0);
+        .radius(6.0);
     if too_long {
         button = button
             .fill(p.selected)
@@ -491,7 +491,7 @@ fn save_button(p: Palette, too_long: bool) -> El {
             .cursor(rune::Cursor::Pointer)
             .preserve_focus_on_press(true)
             .fill(p.coral)
-            .press(p.coral.alpha(0.8))
+            .press(p.coral.alpha(0.9))
             .on_press(|s: &mut State| {
                 save(s);
             })

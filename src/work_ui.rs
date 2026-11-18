@@ -47,7 +47,7 @@ pub(super) fn retry_row(s: &State, p: Palette, index: usize) -> El {
         .center_y()
         .child(el().size(24.0, 24.0).center().child(icon("clock", p.muted)))
         .child(if event["running"] == true || event["success"] == true {
-            pixel_text(title, p.muted)
+            meta_text(title, p.muted)
                 .min_w(0.0)
                 .shrink()
                 .wrap_anywhere()
@@ -258,7 +258,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
         .min_w(0.0)
         .mb(4.0)
         .ml(28.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.code_bg)
         .border(1.0, p.line);
     match tool.resolved_kind() {
@@ -270,7 +270,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         col()
                             .min_w(0.0)
                             .gap(4.0)
-                            .child(pixel_text("sh", p.muted))
+                            .child(meta_text("sh", p.muted))
                             .child(mono(input_text(tool, &["command", "cmd"]), p)),
                     ),
                     false,
@@ -296,7 +296,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         .cursor(rune::Cursor::Pointer)
                         .focusable(true)
                         .w_full()
-                        .radius(4.0)
+                        .radius(6.0)
                         .hover(p.selected)
                         .on_press(move |s: &mut State| {
                             let panel_key = s.panel_key();
@@ -307,9 +307,9 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                     heading =
                         heading.child(mono(format!("Previously {}", relative(old, &root)), p));
                 }
-                let mut meta = row().gap(8.0).child(pixel_text(&change.operation, p.muted));
+                let mut meta = row().gap(8.0).child(meta_text(&change.operation, p.muted));
                 if !change.diff.is_empty() {
-                    meta = meta.child(pixel_text(
+                    meta = meta.child(meta_text(
                         format!("+{} -{}", change.additions, change.deletions),
                         p.muted,
                     ));
@@ -453,7 +453,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
     }
     if let Some(exit) = tool.exit_code.filter(|exit| *exit != 0) {
         body = body.child(
-            padded(pixel_text(format!("Exit code {exit}"), p.muted)).key(format!("tool-exit-{id}")),
+            padded(meta_text(format!("Exit code {exit}"), p.muted)).key(format!("tool-exit-{id}")),
         );
     }
     if let Some(parent) = &tool.parent_call {
@@ -486,7 +486,7 @@ pub(super) fn html_card(s: &State, p: Palette, index: usize) -> El {
             .center_y()
             .gap(8.0)
             .min_w(0.0)
-            .child(pixel_text("HTML", p.muted))
+            .child(meta_text("HTML", p.muted))
             .child(
                 label(&reference.title, LABEL, p.ink)
                     .truncate()
@@ -530,7 +530,7 @@ pub(super) fn html_card(s: &State, p: Palette, index: usize) -> El {
         );
     }
     let key = format!("html-card-{}-{index}", t.id);
-    framed(body.fill(p.card).radius(6.0), p)
+    framed(body.fill(p.card).radius(12.0), p)
         .key(key)
         .role("button")
         .label(format!("Open {}", reference.title))
@@ -565,7 +565,7 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
             .px(12.0)
             .py(8.0)
             .hover(p.selected)
-            .child(pixel_text("Raw", p.muted))
+            .child(meta_text("Raw", p.muted))
             .child(icon(
                 if tool.raw_expanded { "chevron" } else { "open" },
                 p.faint,
@@ -688,7 +688,7 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
             .role("img")
             .label(word)
             .size(10.0, 10.0)
-            .border(2.0, p.muted);
+            .border(1.0, p.muted);
         square = match status {
             "completed" => square.fill(p.ink),
             "running" => square.child(el().size(5.0, 10.0).fill(p.muted)),
@@ -710,7 +710,7 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
                                 .wrap_anywhere()
                                 .selectable(true),
                         )
-                        .child(pixel_text(word, p.muted)),
+                        .child(meta_text(word, p.muted)),
                 ),
         );
     }
@@ -794,7 +794,7 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
             col()
                 .key(format!("plan-card-{id}"))
                 .min_w(0.0)
-                .radius(6.0)
+                .radius(12.0)
                 .child(body.padding(12.0)),
             p,
         ))
@@ -836,10 +836,10 @@ pub(super) fn plan_menu(s: &State, p: Palette) -> El {
         .w(212.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored_fit(
             format!("plan-actions-{id}"),
             rune::Side::Bottom,
@@ -940,10 +940,10 @@ pub(super) fn plan_save_dialog(s: &State, p: Palette) -> El {
         .max_w(540.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label("Save plan to workspace", DIALOG_TITLE, p.ink))
         .child(
@@ -963,7 +963,7 @@ pub(super) fn plan_save_dialog(s: &State, p: Palette) -> El {
                 .color(p.ink)
                 .w_full()
                 .padding(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(if s.dark { p.bg } else { p.panel })
                 .field_focus(&dialog.path_edit, p)
                 .on_edit(|s: &mut State| {

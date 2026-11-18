@@ -757,10 +757,10 @@ fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<S
         })
         .max_h(288.0)
         .padding(4.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
@@ -805,7 +805,7 @@ fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<S
             .min_h(32.0)
             .px(8.0)
             .gap(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .center_y()
             .cursor(rune::Cursor::Pointer)
             .fill(if i == at {
@@ -841,7 +841,7 @@ fn menu(s: &State, p: Palette, trigger: &Trigger, items: Vec<Item>, notes: Vec<S
                         .grow(1.0)
                         .min_w(0.0),
                 )
-                .child(pixel_label(&item.source, p.muted)),
+                .child(meta_label(&item.source, p.muted)),
         );
     }
     list
@@ -892,16 +892,16 @@ pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
     Some(match Token::decode(id)? {
         Token::File {
             directory: true, ..
-        } => pixel_icons::glyph("folder"),
-        Token::File { .. } => pixel_icons::glyph("file"),
-        Token::Thread { .. } => pixel_icons::glyph("thread"),
-        Token::Skill { .. } => pixel_icons::glyph("bolt"),
+        } => icons::glyph("folder"),
+        Token::File { .. } => icons::glyph("file"),
+        Token::Thread { .. } => icons::glyph("thread"),
+        Token::Skill { .. } => icons::glyph("bolt"),
         Token::Model {
             provider_instance,
             model,
             label,
         } => provider_glyph(model_vendor_for(&model, &provider_instance, &label)),
-        Token::Machine { machine, .. } => pixel_icons::glyph(if machine == "local" {
+        Token::Machine { machine, .. } => icons::glyph(if machine == "local" {
             "monitor"
         } else {
             "cloud"
@@ -911,18 +911,18 @@ pub(super) fn pill_icon(id: &str) -> Option<&'static Icon> {
 
 fn context_kind_icon(kind: &str, directory: bool) -> &'static Icon {
     match kind {
-        "image" => pixel_icons::glyph("image"),
-        "file" | "mention" if directory => pixel_icons::glyph("folder"),
-        "file" | "mention" => pixel_icons::glyph("file"),
-        "thread" => pixel_icons::glyph("thread"),
-        "skill" => pixel_icons::glyph("bolt"),
-        "terminal" => pixel_icons::glyph("terminal"),
-        "environment" => pixel_icons::glyph("monitor"),
-        "model" => pixel_icons::glyph("chip"),
-        "preview-annotation" | "element" => pixel_icons::glyph("eye"),
-        "review-comment" => pixel_icons::glyph("issue"),
-        "response" => pixel_icons::glyph("thread"),
-        _ => pixel_icons::glyph("unresolved"),
+        "image" => icons::glyph("image"),
+        "file" | "mention" if directory => icons::glyph("folder"),
+        "file" | "mention" => icons::glyph("file"),
+        "thread" => icons::glyph("thread"),
+        "skill" => icons::glyph("bolt"),
+        "terminal" => icons::glyph("terminal"),
+        "environment" => icons::glyph("monitor"),
+        "model" => icons::glyph("chip"),
+        "preview-annotation" | "element" => icons::glyph("eye"),
+        "review-comment" => icons::glyph("issue"),
+        "response" => icons::glyph("thread"),
+        _ => icons::glyph("unresolved"),
     }
 }
 
@@ -1018,18 +1018,14 @@ pub(super) fn pill_appearance(
     p: Palette,
 ) -> (Color, Color, &'static Icon) {
     match status {
-        ChipStatus::Unresolved => (
-            p.line.alpha(0.45),
-            p.muted,
-            pixel_icons::glyph("unresolved"),
-        ),
+        ChipStatus::Unresolved => (p.line.alpha(0.45), p.muted, icons::glyph("unresolved")),
         ChipStatus::Invalid => (
             p.danger.alpha(0.16),
             p.danger,
             if id.contains("thread") {
-                pixel_icons::glyph("thread")
+                icons::glyph("thread")
             } else {
-                pixel_icons::glyph("unresolved")
+                icons::glyph("unresolved")
             },
         ),
         ChipStatus::Resolved => {
@@ -1050,13 +1046,11 @@ pub(super) fn pill_appearance(
                         )),
                         crate::composer_context::ComposerContextData::Environment {
                             environment_id,
-                        } => pixel_icons::glyph(
-                            if environment_id == "local" || rec.label == "Local" {
-                                "monitor"
-                            } else {
-                                "cloud"
-                            },
-                        ),
+                        } => icons::glyph(if environment_id == "local" || rec.label == "Local" {
+                            "monitor"
+                        } else {
+                            "cloud"
+                        }),
                         _ => {
                             let directory = matches!(
                                 &rec.data,
@@ -1087,27 +1081,27 @@ pub(super) fn pill_appearance(
                 match token {
                     Token::File {
                         directory: true, ..
-                    } => pixel_icons::glyph("folder"),
-                    Token::File { .. } => pixel_icons::glyph("file"),
+                    } => icons::glyph("folder"),
+                    Token::File { .. } => icons::glyph("file"),
                     Token::Thread {
                         machine: Some(ref owner),
                         ..
-                    } if owner != machine => pixel_icons::glyph("thread"),
-                    Token::Thread { .. } => pixel_icons::glyph("thread"),
-                    Token::Skill { .. } => pixel_icons::glyph("bolt"),
+                    } if owner != machine => icons::glyph("thread"),
+                    Token::Thread { .. } => icons::glyph("thread"),
+                    Token::Skill { .. } => icons::glyph("bolt"),
                     Token::Model {
                         provider_instance,
                         model,
                         label,
                     } => provider_glyph(model_vendor_for(&model, &provider_instance, &label)),
-                    Token::Machine { machine, .. } => pixel_icons::glyph(if machine == "local" {
+                    Token::Machine { machine, .. } => icons::glyph(if machine == "local" {
                         "monitor"
                     } else {
                         "cloud"
                     }),
                 }
             } else {
-                pixel_icons::glyph("unresolved")
+                icons::glyph("unresolved")
             };
             (p.selected, p.ink, icon)
         }
