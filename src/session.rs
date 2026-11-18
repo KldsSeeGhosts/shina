@@ -360,14 +360,11 @@ impl NativeCatalog {
                             self.usage_account = record["value"].clone();
                         }
                         Some("updateRequiredModels") => {
-                            self.update_required_models = serde_json::from_value(
-                                record["value"].clone(),
-                            )
-                            .unwrap_or_default();
+                            self.update_required_models =
+                                serde_json::from_value(record["value"].clone()).unwrap_or_default();
                         }
                         Some("providerMessage") => {
-                            self.provider_message =
-                                record["value"].as_str().map(str::to_owned);
+                            self.provider_message = record["value"].as_str().map(str::to_owned);
                         }
                         Some("version") => {
                             self.version = record["value"].as_str().map(str::to_owned);

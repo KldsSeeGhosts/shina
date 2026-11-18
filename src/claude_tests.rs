@@ -1041,10 +1041,12 @@ fn model_effort_image_selection_and_live_access_control() {
         .unwrap();
     pump(&mut thread, |t| t.status == Status::Completed);
     let records = records(&log);
+    // `default` resolves to the manifest's default row and routes its slug, not an alias.
     assert!(
         records
             .iter()
-            .any(|r| r["request"]["subtype"] == "set_model")
+            .any(|r| r["request"]["subtype"] == "set_model"
+                && r["request"]["model"] == "claude-opus-5-5")
     );
     assert!(
         records

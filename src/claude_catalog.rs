@@ -114,8 +114,7 @@ pub struct ClaudeModelCatalog {
 /// `TrimmedNonEmptyString`: the manifest schema rejects empty and padded values.
 fn trimmed_non_empty(value: &Value) -> Option<String> {
     let trimmed = value.as_str()?.trim();
-    (!trimmed.is_empty() && trimmed.len() == value.as_str()?.len())
-        .then(|| trimmed.to_owned())
+    (!trimmed.is_empty() && trimmed.len() == value.as_str()?.len()).then(|| trimmed.to_owned())
 }
 
 /// Ported from `ClaudeModelManifest.ts` (`decodeClaudeProfileAdapter`): the
@@ -154,9 +153,7 @@ fn decode_claude_profile_adapter(adapter: &Value) -> Option<ClaudeCodeProfile> {
                     trimmed_non_empty(suffix)?,
                 );
             }
-            profile
-                .model_suffixes
-                .insert(option_id.clone(), entries);
+            profile.model_suffixes.insert(option_id.clone(), entries);
         }
     }
     if let Some(map) = claude.get("contextWindowTokens") {
@@ -164,13 +161,18 @@ fn decode_claude_profile_adapter(adapter: &Value) -> Option<ClaudeCodeProfile> {
         for (choice, tokens) in object {
             profile.context_window_tokens.insert(
                 trimmed_non_empty(&json!(choice))?,
-                tokens.as_u64().or_else(|| tokens.as_f64().map(|n| n as u64))?,
+                tokens
+                    .as_u64()
+                    .or_else(|| tokens.as_f64().map(|n| n as u64))?,
             );
         }
     }
     if let Some(tokens) = claude.get("fixedContextWindowTokens") {
-        profile.fixed_context_window_tokens =
-            Some(tokens.as_u64().or_else(|| tokens.as_f64().map(|n| n as u64))?);
+        profile.fixed_context_window_tokens = Some(
+            tokens
+                .as_u64()
+                .or_else(|| tokens.as_f64().map(|n| n as u64))?,
+        );
     }
     Some(profile)
 }
@@ -325,7 +327,11 @@ fn parse_release_ms(value: &str) -> Option<u64> {
     let mut ms = days as u64 * 86_400_000;
     if trimmed.len() > date.len() {
         let time = trimmed[date.len()..].trim_start_matches(['T', ' ']);
-        let time = time.trim_end_matches('Z').split(['+', '-']).next().unwrap_or("");
+        let time = time
+            .trim_end_matches('Z')
+            .split(['+', '-'])
+            .next()
+            .unwrap_or("");
         let mut segments = time.split(':');
         if let (Some(h), Some(m)) = (
             segments.next().and_then(|s| s.parse::<u64>().ok()),
@@ -396,7 +402,8 @@ fn resolve_claude_provider_catalog(manifest: &Value, now_ms: u64) -> Option<Prov
             .and_then(|v| v.as_str())
             .and_then(parse_release_ms);
         let badge = (status == "current"
-            && released_ms.is_some_and(|ms| now_ms >= ms && now_ms - ms < MODEL_NEW_BADGE_DURATION_MS))
+            && released_ms
+                .is_some_and(|ms| now_ms >= ms && now_ms - ms < MODEL_NEW_BADGE_DURATION_MS))
         .then(|| "new".to_owned());
         let aliases = entry["aliases"]
             .as_array()
@@ -407,12 +414,8 @@ fn resolve_claude_provider_catalog(manifest: &Value, now_ms: u64) -> Option<Prov
         models.push(ProviderCatalogModel {
             slug,
             name,
-            short_name: entry
-                .get("shortName")
-                .and_then(|v| trimmed_non_empty(v)),
-            sub_provider: entry
-                .get("subProvider")
-                .and_then(|v| trimmed_non_empty(v)),
+            short_name: entry.get("shortName").and_then(|v| trimmed_non_empty(v)),
+            sub_provider: entry.get("subProvider").and_then(|v| trimmed_non_empty(v)),
             aliases,
             badge,
             status: status.to_owned(),
@@ -439,10 +442,7 @@ fn resolve_claude_provider_catalog(manifest: &Value, now_ms: u64) -> Option<Prov
 }
 
 /// Ported from `packages/provider-core/src/server/ModelCatalog.ts` (`catalogServerModel`).
-fn catalog_server_model(
-    catalog: &ProviderCatalog,
-    entry: &ProviderCatalogModel,
-) -> ClaudeModelRow {
+fn catalog_server_model(catalog: &ProviderCatalog, entry: &ProviderCatalogModel) -> ClaudeModelRow {
     ClaudeModelRow {
         slug: entry.slug.clone(),
         name: entry.name.clone(),
@@ -458,7 +458,9 @@ fn catalog_server_model(
 }
 
 /// Ported from `ClaudeModelCatalog.ts` (`tryResolveClaudeModelCatalog`).
-fn try_resolve_claude_model_catalog(resolved: Option<ProviderCatalog>) -> Option<ClaudeModelCatalog> {
+fn try_resolve_claude_model_catalog(
+    resolved: Option<ProviderCatalog>,
+) -> Option<ClaudeModelCatalog> {
     let resolved = resolved?;
     let mut models = Vec::new();
     for entry in &resolved.models {
@@ -628,16 +630,13 @@ pub fn resolve_claude_catalog_model<'a>(
         .find(|entry| entry.model.slug == value)
         .or_else(|| {
             let lower = value.to_lowercase();
-            catalog
-                .models
-                .iter()
-                .find(|entry| {
-                    entry
-                        .model
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.to_lowercase() == lower)
-                })
+            catalog.models.iter().find(|entry| {
+                entry
+                    .model
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.to_lowercase() == lower)
+            })
         })
 }
 
@@ -669,7 +668,10 @@ pub fn with_claude_code_model_routes(
             continue;
         }
         let wire_model = strip_claude_context_window_suffix(
-            reported.resolved_model.as_deref().unwrap_or(&reported.value),
+            reported
+                .resolved_model
+                .as_deref()
+                .unwrap_or(&reported.value),
         );
         let first_party_model = strip_claude_backend_decoration(&wire_model);
         if first_party_model == wire_model {
@@ -777,9 +779,7 @@ pub fn resolve_claude_update_required_models(
         .iter()
         .filter_map(|entry| {
             let min_version = entry.compatibility.min_version.as_ref()?;
-            if entry.model.is_legacy
-                || compare_semver_versions(version, min_version) >= 0
-            {
+            if entry.model.is_legacy || compare_semver_versions(version, min_version) >= 0 {
                 return None;
             }
             Some(crate::model_picker::UpdateRequiredModel {
@@ -801,9 +801,11 @@ pub fn format_claude_version_upgrade_message(
         .models
         .iter()
         .filter(|entry| {
-            entry.compatibility.min_version.as_ref().is_some_and(|min| {
-                version.is_none_or(|v| compare_semver_versions(v, min) < 0)
-            })
+            entry
+                .compatibility
+                .min_version
+                .as_ref()
+                .is_some_and(|min| version.is_none_or(|v| compare_semver_versions(v, min) < 0))
         })
         .min_by(|left, right| {
             compare_semver_versions(
@@ -844,14 +846,9 @@ const CLAUDE_CODE_FAMILY_ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable
 /// Ported from `ClaudeModelCatalog.ts` (`resolveClaudeModelSettingsKey`): names the
 /// model a `modelSettings` key caps the way Claude Code does, narrower than the
 /// catalog's aliases.
-fn resolve_claude_model_settings_key(
-    catalog: &ClaudeModelCatalog,
-    key: &str,
-) -> Option<String> {
+fn resolve_claude_model_settings_key(catalog: &ClaudeModelCatalog, key: &str) -> Option<String> {
     let lowered = key.trim().to_lowercase();
-    let unsuffixed = lowered
-        .strip_suffix(CLAUDE_1M_SUFFIX)
-        .unwrap_or(&lowered);
+    let unsuffixed = lowered.strip_suffix(CLAUDE_1M_SUFFIX).unwrap_or(&lowered);
     if CLAUDE_CODE_FAMILY_ALIASES.contains(&unsuffixed) {
         return catalog
             .models
@@ -939,24 +936,23 @@ pub fn cap_claude_catalog_effort(
             if model.is_custom {
                 return model;
             }
-            let model_max = resolved
-                .iter()
-                .fold(None::<String>, |lowest, (max_level, per_model)| {
-                    let level = per_model
-                        .get(&model.slug)
-                        .or(max_level.as_ref());
-                    match level {
-                        Some(level)
-                            if level != "max"
-                                && (lowest.is_none()
-                                    || claude_effort_rank(Some(level.as_str()))
-                                        < claude_effort_rank(lowest.as_deref())) =>
-                        {
-                            Some(level.clone())
+            let model_max =
+                resolved
+                    .iter()
+                    .fold(None::<String>, |lowest, (max_level, per_model)| {
+                        let level = per_model.get(&model.slug).or(max_level.as_ref());
+                        match level {
+                            Some(level)
+                                if level != "max"
+                                    && (lowest.is_none()
+                                        || claude_effort_rank(Some(level.as_str()))
+                                            < claude_effort_rank(lowest.as_deref())) =>
+                            {
+                                Some(level.clone())
+                            }
+                            _ => lowest,
                         }
-                        _ => lowest,
-                    }
-                });
+                    });
             let Some(model_max) = model_max else {
                 return model;
             };
@@ -989,19 +985,17 @@ pub fn cap_claude_catalog_effort(
                             role,
                         };
                     }
-                    let cap = options
-                        .iter()
-                        .fold(None::<(i32, String)>, |best, option| {
-                            let rank = claude_effort_rank(Some(option.id.as_str()));
-                            if rank >= 0
-                                && rank <= cap_rank
-                                && rank > best.as_ref().map(|(r, _)| *r).unwrap_or(-1)
-                            {
-                                Some((rank, option.label.clone()))
-                            } else {
-                                best
-                            }
-                        });
+                    let cap = options.iter().fold(None::<(i32, String)>, |best, option| {
+                        let rank = claude_effort_rank(Some(option.id.as_str()));
+                        if rank >= 0
+                            && rank <= cap_rank
+                            && rank > best.as_ref().map(|(r, _)| *r).unwrap_or(-1)
+                        {
+                            Some((rank, option.label.clone()))
+                        } else {
+                            best
+                        }
+                    });
                     let Some((cap_rank, cap_label)) = cap else {
                         return ProviderOptionDescriptor::Select {
                             id,
@@ -1028,7 +1022,8 @@ pub fn cap_claude_catalog_effort(
                             let displayed_rank = if id_rank >= 0 { id_rank } else { sent_rank };
                             let runs_rank = if sent_rank >= 0 { sent_rank } else { id_rank };
                             if displayed_rank > cap_rank && runs_rank > cap_rank {
-                                option.label = format!("{} (capped to {})", option.label, cap_label);
+                                option.label =
+                                    format!("{} (capped to {})", option.label, cap_label);
                             }
                             option
                         })
@@ -1192,10 +1187,7 @@ pub fn claude_model_settings_key(settings: &Value) -> String {
             .into_iter()
             .flatten()
             .filter_map(|(key, value)| {
-                Some((
-                    key.clone(),
-                    value.as_str().unwrap_or_default().to_owned(),
-                ))
+                Some((key.clone(), value.as_str().unwrap_or_default().to_owned()))
             })
             .collect();
         entries.sort();
@@ -1295,7 +1287,12 @@ mod tests {
         }
     }
 
-    fn row(slug: &str, name: &str, aliases: &[&str], descriptors: Vec<ProviderOptionDescriptor>) -> ClaudeModelRow {
+    fn row(
+        slug: &str,
+        name: &str,
+        aliases: &[&str],
+        descriptors: Vec<ProviderOptionDescriptor>,
+    ) -> ClaudeModelRow {
         ClaudeModelRow {
             slug: slug.into(),
             name: name.into(),
@@ -1443,7 +1440,9 @@ mod tests {
         assert!(resolve_claude_update_required_models(&catalog, Some("3.2.0")).is_empty());
         assert_eq!(
             format_claude_version_upgrade_message(&catalog, Some("3.1.9")).as_deref(),
-            Some("Claude Code v3.1.9 is too old for Claude Synthetic Next. Upgrade to v3.2.0 or newer to access it.")
+            Some(
+                "Claude Code v3.1.9 is too old for Claude Synthetic Next. Upgrade to v3.2.0 or newer to access it."
+            )
         );
         // Claude Code below claude-fable-5-2's minVersion does not list it.
         let bundled = bundled_claude_model_catalog(0);
@@ -1518,10 +1517,19 @@ mod tests {
                 reported("haiku", "global.anthropic.claude-haiku-5-5"),
             ],
         );
-        assert_eq!(api_model(&configured_bedrock, "claude-haiku-5-5", vec![]), "haiku");
+        assert_eq!(
+            api_model(&configured_bedrock, "claude-haiku-5-5", vec![]),
+            "haiku"
+        );
         assert_eq!(api_model(&configured_bedrock, "haiku-5.5", vec![]), "haiku");
-        assert_eq!(api_model(&configured_bedrock, "claude-sonnet-5-5", vec![]), "sonnet");
-        assert_eq!(api_model(&configured_bedrock, "claude-opus-5-5", vec![]), "opus");
+        assert_eq!(
+            api_model(&configured_bedrock, "claude-sonnet-5-5", vec![]),
+            "sonnet"
+        );
+        assert_eq!(
+            api_model(&configured_bedrock, "claude-opus-5-5", vec![]),
+            "opus"
+        );
         assert_eq!(
             api_model(&configured_bedrock, "claude-opus-5", vec![]),
             "claude-opus-5"
@@ -1558,7 +1566,10 @@ mod tests {
             ),
             "us.anthropic.claude-opus-4-6-v1"
         );
-        assert_eq!(api_model(&default_bedrock, "claude-haiku-4-5", vec![]), "haiku");
+        assert_eq!(
+            api_model(&default_bedrock, "claude-haiku-4-5", vec![]),
+            "haiku"
+        );
         assert_eq!(
             api_model(&default_bedrock, "claude-haiku-5-5", vec![]),
             "claude-haiku-5-5"
@@ -1599,14 +1610,19 @@ mod tests {
                 ])],
             )
         };
-        let models = vec![effort_model("claude-plain"), effort_model("claude-remapped")];
+        let models = vec![
+            effort_model("claude-plain"),
+            effort_model("claude-remapped"),
+        ];
         let mut runtime_a = ClaudeCodeProfile::default();
         runtime_a
             .effort_map
             .insert("ultracode".into(), Some("xhigh".into()));
         runtime_a.effort_map.insert("ultrathink".into(), None);
         let mut runtime_b = ClaudeCodeProfile::default();
-        runtime_b.effort_map.insert("max".into(), Some("high".into()));
+        runtime_b
+            .effort_map
+            .insert("max".into(), Some("high".into()));
         runtime_b
             .effort_map
             .insert("xhigh".into(), Some("max".into()));
@@ -1684,8 +1700,22 @@ mod tests {
                 .map(|m| m.into_iter().map(|(_, l)| l).collect::<Vec<_>>())
                 .collect::<Vec<_>>(),
             vec![
-                vec!["Medium", "High", "Extra High", "Max (capped to Extra High)", "Ultracode", "Ultrathink"],
-                vec!["Medium", "High", "Extra High", "Max", "Ultracode", "Ultrathink"],
+                vec![
+                    "Medium",
+                    "High",
+                    "Extra High",
+                    "Max (capped to Extra High)",
+                    "Ultracode",
+                    "Ultrathink"
+                ],
+                vec![
+                    "Medium",
+                    "High",
+                    "Extra High",
+                    "Max",
+                    "Ultracode",
+                    "Ultrathink"
+                ],
             ]
         );
 
@@ -1715,11 +1745,25 @@ mod tests {
         };
         assert_eq!(
             labels_of(&capped[0]),
-            vec!["Medium", "High", "Extra High (capped to High)", "Max (capped to High)", "Ultracode (capped to High)", "Ultrathink"]
+            vec![
+                "Medium",
+                "High",
+                "Extra High (capped to High)",
+                "Max (capped to High)",
+                "Ultracode (capped to High)",
+                "Ultrathink"
+            ]
         );
         assert_eq!(
             labels_of(&capped[1]),
-            vec!["Medium", "High", "Extra High", "Max", "Ultracode", "Ultrathink"]
+            vec![
+                "Medium",
+                "High",
+                "Extra High",
+                "Max",
+                "Ultracode",
+                "Ultrathink"
+            ]
         );
 
         // Without an Extra High option (Opus 4.6), the CLI clamps an xhigh cap down to High.
@@ -1827,7 +1871,10 @@ mod tests {
         };
 
         // Claude Code matches family aliases and [1m] spellings case-insensitively.
-        assert_eq!(max_label(vec![per_model(&[("Opus", "medium")])]), "Max (capped to Medium)");
+        assert_eq!(
+            max_label(vec![per_model(&[("Opus", "medium")])]),
+            "Max (capped to Medium)"
+        );
         assert_eq!(
             max_label(vec![per_model(&[("claude-opus-5-5[1M]", "medium")])]),
             "Max (capped to Medium)"
@@ -1850,19 +1897,34 @@ mod tests {
                 "{key}"
             );
         }
-        for key in ["claude-opus-5.5", "opus-5.5", "opus-5-5", "opus [1m]", "claude-opus-5"] {
-            assert_eq!(max_label(vec![per_model(&[(key, "medium")])]), "Max", "{key}");
+        for key in [
+            "claude-opus-5.5",
+            "opus-5.5",
+            "opus-5-5",
+            "opus [1m]",
+            "claude-opus-5",
+        ] {
+            assert_eq!(
+                max_label(vec![per_model(&[(key, "medium")])]),
+                "Max",
+                "{key}"
+            );
         }
         // Keys naming the same model keep the lowest cap, and a `max` key does not exempt it.
         assert_eq!(
-            max_label(vec![per_model(&[("opus", "max"), ("claude-opus-5-5", "low")])]),
+            max_label(vec![per_model(&[
+                ("opus", "max"),
+                ("claude-opus-5-5", "low")
+            ])]),
             "Max (capped to Low)"
         );
         // A per-model `max` only exempts the model from its own source's top-level cap.
         assert_eq!(
             max_label(vec![ClaudeEffortCapSource {
                 max_effort_level: Some("medium".into()),
-                model_max_effort_levels: [("opus".to_owned(), "max".to_owned())].into_iter().collect(),
+                model_max_effort_levels: [("opus".to_owned(), "max".to_owned())]
+                    .into_iter()
+                    .collect(),
             }]),
             "Max"
         );

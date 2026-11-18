@@ -29454,6 +29454,79 @@ pub(crate) mod tests {
             .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
         assert_eq!(rt.state.current().thinking, "high");
     }
+
+    /// Claude Code reports aliases (`opus`, `sonnet[1m]`, ...); the catalog turns them into
+    /// manifest rows, so the tab shows names like "Claude Opus 5.5", keeps reported extras
+    /// such as `opusplan`, and a pick sends the routed slug, never the display name.
+    #[test]
+    fn claude_picker_lists_manifest_names_and_routes_slug_ids_at_all_widths() {
+        let reported = crate::claude_catalog::parse_claude_reported_models(&json!([
+            {"value":"default","displayName":"Default (recommended)",
+             "supportsEffort":true,"supportedEffortLevels":["low","high"]},
+            {"value":"opus","displayName":"Opus"},
+            {"value":"sonnet","displayName":"Sonnet"},
+            {"value":"haiku","displayName":"Haiku"},
+            {"value":"opusplan","displayName":""},
+            {"value":"sonnet[1m]","displayName":"Sonnet [1m]"},
+        ]));
+        let catalog = crate::claude_catalog::with_claude_code_model_routes(
+            &crate::claude_catalog::bundled_claude_model_catalog(crate::lifecycle::now()),
+            &reported,
+        );
+        let mut rows =
+            crate::claude_catalog::resolve_claude_models_for_version(&catalog, Some("9.9.9"));
+        rows.extend(crate::claude_catalog::claude_reported_models(
+            &catalog, &reported,
+        ));
+        assert!(
+            rows.iter().any(|row| row.slug == "opusplan")
+                && !rows.iter().any(|row| matches!(
+                    row.slug.as_str(),
+                    "default" | "opus" | "sonnet" | "haiku"
+                )),
+            "reported aliases collapse into manifest rows, extras stay: {:?}",
+            rows.iter().map(|row| &row.slug).collect::<Vec<_>>()
+        );
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.claude_catalog.models = rows
+                .iter()
+                .filter_map(|row| {
+                    crate::session::AgentModel::from_harness_value(
+                        &crate::claude::claude_row_model_value(&catalog, row),
+                        "claude",
+                    )
+                })
+                .collect();
+            rt.state.claude_catalog.installed = true;
+            rt.state.choose_harness("claude");
+            let (pi, commands, _events) = crate::backend::Pi::test_connection();
+            rt.state.current_mut().pi = Some(pi);
+            rt.state.current_mut().status = Status::Ready;
+            rt.frame(0.0);
+            open_picker(&mut rt, SettingsPicker::Model);
+            rt.frame(1.0 / 60.0);
+            let tree = rt.accessibility_json().to_string();
+            for name in [
+                "Claude Opus 5.5",
+                "Claude Sonnet 5.5",
+                "Claude Haiku 5.5",
+                "opusplan",
+            ] {
+                assert!(tree.contains(name), "{width}: {name} missing: {tree}");
+            }
+            // The aliases Claude Code reported must not shadow the manifest rows.
+            let list = rt.find("model-list");
+            assert!(list.is_some(), "{width}: model-list missing");
+            // "Claude Opus 5.5" is the first catalog row; picking it sends the routed id.
+            press(&mut rt, "choose-model-0");
+            let model = commands.try_recv().unwrap();
+            assert_eq!(model["type"], "set_model", "{width}");
+            assert_eq!(model["provider"], "claude", "{width}");
+            assert_eq!(model["modelId"], "claude-opus-5-5", "{width}");
+        }
+    }
     /// Opens the model picker or the reasoning menu and draws it.
     fn open_picker(rt: &mut Runtime<State>, picker: SettingsPicker) {
         rt.state.open_model_picker(picker);

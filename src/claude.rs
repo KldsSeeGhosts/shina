@@ -615,33 +615,9 @@ impl Client {
             &self.catalog,
             &self.reported,
         ));
-        let catalog = &self.catalog;
         self.models = rows
             .iter()
-            .map(|row| {
-                let mut value = json!({"provider":"claude","id":row.slug,
-                    "name":row.name,"shortName":row.short_name,
-                    "subProvider":row.sub_provider,"aliases":row.aliases,
-                    "badge":row.badge,"isDefault":row.is_default,"isCustom":row.is_custom,
-                    "isLegacy":row.is_legacy,
-                    "thinkingLevels":crate::claude_catalog::claude_thinking_levels(&row.capabilities),
-                    "capabilities":row.capabilities,
-                    "input":["text","image"]});
-                let selection = crate::model_selection::ModelSelection {
-                    instance_id: "claude".into(),
-                    model: row.slug.clone(),
-                    options: vec![],
-                };
-                if let Some(tokens) =
-                    crate::claude_catalog::resolve_claude_catalog_context_window_tokens(
-                        catalog,
-                        Some(&selection),
-                    )
-                {
-                    value["contextWindow"] = json!(tokens);
-                }
-                value
-            })
+            .map(|row| claude_row_model_value(&self.catalog, row))
             .collect();
         self.model = self
             .models
@@ -656,10 +632,12 @@ impl Client {
             }
             self.update(
                 "updateRequiredModels",
-                json!(crate::claude_catalog::resolve_claude_update_required_models(
-                    &self.catalog,
-                    self.version.as_deref()
-                )),
+                json!(
+                    crate::claude_catalog::resolve_claude_update_required_models(
+                        &self.catalog,
+                        self.version.as_deref()
+                    )
+                ),
             );
             if let Some(message) = crate::claude_catalog::format_claude_version_upgrade_message(
                 &self.catalog,
@@ -831,9 +809,10 @@ impl Client {
                                 )
                             })
                             .or_else(|| self.model["id"].as_str().map(str::to_owned));
-                        if let Some(model) = slug.as_ref().and_then(|slug| {
-                            self.models.iter().find(|m| m["id"] == *slug)
-                        }) {
+                        if let Some(model) = slug
+                            .as_ref()
+                            .and_then(|slug| self.models.iter().find(|m| m["id"] == *slug))
+                        {
                             self.model = model.clone();
                         }
                         self.usage = Value::Null;
@@ -1086,9 +1065,9 @@ impl Client {
                                 id,
                             ))
                         };
-                        if let Some(model) = slug.and_then(|slug| {
-                            self.models.iter().find(|m| m["id"] == slug)
-                        }) {
+                        if let Some(model) =
+                            slug.and_then(|slug| self.models.iter().find(|m| m["id"] == slug))
+                        {
                             self.model = model.clone();
                         }
                     }
@@ -1520,14 +1499,10 @@ impl Client {
                 let reported = record["modelId"].as_str().unwrap_or("");
                 // `resolveClaudeModelSlug` resolves aliases; `resolveClaudeReportedModelSlug`
                 // additionally strips the `-\d{8}` date suffix Claude reports on ids.
-                let mut slug = crate::claude_catalog::resolve_claude_model_slug(
-                    &self.catalog,
-                    reported,
-                );
-                slug = crate::claude_catalog::resolve_claude_reported_model_slug(
-                    &self.catalog,
-                    &slug,
-                );
+                let mut slug =
+                    crate::claude_catalog::resolve_claude_model_slug(&self.catalog, reported);
+                slug =
+                    crate::claude_catalog::resolve_claude_reported_model_slug(&self.catalog, &slug);
                 if slug == "default"
                     && let Some(default) = self
                         .models
@@ -1543,10 +1518,7 @@ impl Client {
                     // KSG `resolveClaudeCatalogApiModelId`: apiModel, else slug, never
                     // the display name, with manifest modelSuffixes applied.
                     let api_id = self.api_model_id(&slug);
-                    self.request(
-                        json!({"subtype":"set_model","model":api_id}),
-                        record,
-                    );
+                    self.request(json!({"subtype":"set_model","model":api_id}), record);
                 }
             }
             "set_thinking_level" => {
@@ -1568,7 +1540,10 @@ impl Client {
                         model,
                     )
                     .unwrap_or_default();
-                    self.request(json!({"subtype":"apply_flag_settings","settings":{"effortLevel":mapped}}), record);
+                    self.request(
+                        json!({"subtype":"apply_flag_settings","settings":{"effortLevel":mapped}}),
+                        record,
+                    );
                 }
             }
             "set_option" => {
@@ -2028,6 +2003,34 @@ impl Client {
             }
         }
     }
+}
+
+/// The `get_available_models` value a catalog row becomes. Shared with UI tests
+/// so the picker sees exactly what a session advertises.
+pub(crate) fn claude_row_model_value(
+    catalog: &crate::claude_catalog::ClaudeModelCatalog,
+    row: &crate::claude_catalog::ClaudeModelRow,
+) -> Value {
+    let mut value = json!({"provider":"claude","id":row.slug,
+        "name":row.name,"shortName":row.short_name,
+        "subProvider":row.sub_provider,"aliases":row.aliases,
+        "badge":row.badge,"isDefault":row.is_default,"isCustom":row.is_custom,
+        "isLegacy":row.is_legacy,
+        "thinkingLevels":crate::claude_catalog::claude_thinking_levels(&row.capabilities),
+        "capabilities":row.capabilities,
+        "input":["text","image"]});
+    let selection = crate::model_selection::ModelSelection {
+        instance_id: "claude".into(),
+        model: row.slug.clone(),
+        options: vec![],
+    };
+    if let Some(tokens) = crate::claude_catalog::resolve_claude_catalog_context_window_tokens(
+        catalog,
+        Some(&selection),
+    ) {
+        value["contextWindow"] = json!(tokens);
+    }
+    value
 }
 
 fn auth_error(message: &str) -> bool {
