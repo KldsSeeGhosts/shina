@@ -1,7 +1,13 @@
 //! Shared provider model catalog, ported function by function from KSG Code:
 //! - `apps/server/src/provider/ModelManifest.ts` (`resolveProviderCatalog`)
-//! - `packages/provider-core/src/server/ModelCatalog.ts` (`catalogServerModel`)
+//! - `packages/provider-core/src/server/ModelCatalog.ts` (`catalogServerModel`,
+//!   `classifyCatalogModels`, `applyCatalogDefault`, `applyModelCatalog`,
+//!   `CatalogMatching`)
 //! - `packages/shared/src/semver.ts` (`parseSemver`, `compareSemverVersions`)
+//!
+//! The classify/default functions operate on Shina's compact model values, where
+//! `"id"` carries KSG's `slug` and `"isCustom"`, `"isLegacy"`, `"isDefault"` and
+//! `"aliases"` keep the KSG `ServerProviderModel` names.
 use crate::descriptors::ModelCapabilities;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -293,10 +299,276 @@ pub fn catalog_server_model(
     }
 }
 
+/// KSG `ModelCatalog.CatalogMatching`: `family` reduces a wire slug to the slug
+/// family the manifest catalogues (e.g. `openai.gpt-6-sol` -> `gpt-6-sol`).
+#[derive(Clone, Copy, Default)]
+pub struct CatalogMatching {
+    pub family: Option<fn(&str) -> String>,
+}
+
+fn family_of(matching: &CatalogMatching, slug: &str) -> String {
+    matching
+        .family
+        .map(|family| family(slug))
+        .unwrap_or_else(|| slug.to_owned())
+}
+
+/// The exact-then-family catalog lookup KSG inlines in `classifyCatalogModels`
+/// and `applyCatalogDefault`.
+pub fn catalog_entry<'a>(
+    catalog: Option<&'a ProviderCatalog>,
+    matching: &CatalogMatching,
+    slug: &str,
+) -> Option<&'a ProviderCatalogModel> {
+    catalog.and_then(|catalog| {
+        catalog
+            .models
+            .iter()
+            .find(|candidate| candidate.slug == slug)
+            .or_else(|| {
+                let family = family_of(matching, slug);
+                catalog
+                    .models
+                    .iter()
+                    .find(|candidate| candidate.slug == family)
+            })
+    })
+}
+
+/// Ported from `ModelCatalog.ts` (`classifyCatalogModels`). Flags known-legacy
+/// models and clears stale flags; custom models are never reclassified.
+pub fn classify_catalog_models(
+    models: &mut Vec<Value>,
+    catalog: Option<&ProviderCatalog>,
+    matching: &CatalogMatching,
+) {
+    for model in models.iter_mut() {
+        if model["isCustom"] == true {
+            continue;
+        }
+        let slug = model["id"].as_str().unwrap_or_default().to_owned();
+        let entry = catalog_entry(catalog, matching, &slug);
+        if entry.is_some_and(|entry| entry.status == "legacy") {
+            model["isLegacy"] = json!(true);
+        } else if let Some(object) = model.as_object_mut() {
+            object.remove("isLegacy");
+        }
+    }
+}
+
+/// Ported from `ModelCatalog.ts` (`applyCatalogDefault`). Moves `isDefault` and
+/// its aliases from the wire default to the catalog's `defaults.chat` model,
+/// resolving the target through the family when no exact slug matches.
+pub fn apply_catalog_default(
+    models: &mut Vec<Value>,
+    catalog: Option<&ProviderCatalog>,
+    matching: &CatalogMatching,
+) {
+    let Some(requested) = catalog.and_then(|catalog| catalog.default_chat_model.as_deref()) else {
+        return;
+    };
+    let slug = models
+        .iter()
+        .find(|model| model["id"].as_str() == Some(requested))
+        .and_then(|model| model["id"].as_str().map(str::to_owned))
+        .or_else(|| {
+            if matching.family.is_none() {
+                return None;
+            }
+            let wanted = family_of(matching, requested);
+            models
+                .iter()
+                .find(|model| {
+                    model["isCustom"] != true
+                        && family_of(matching, model["id"].as_str().unwrap_or_default()) == wanted
+                })
+                .and_then(|model| model["id"].as_str().map(str::to_owned))
+        });
+    let Some(slug) = slug else {
+        return;
+    };
+    let Some((previous_index, moved_aliases)) = models.iter().enumerate().find_map(|(index, m)| {
+        (m["isDefault"] == true && m["id"].as_str() != Some(slug.as_str())).then(|| {
+            (
+                index,
+                m["aliases"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>(),
+            )
+        })
+    }) else {
+        return;
+    };
+    for (index, model) in models.iter_mut().enumerate() {
+        if index == previous_index {
+            if let Some(object) = model.as_object_mut() {
+                object.remove("isDefault");
+                object.remove("aliases");
+            }
+        } else if model["id"].as_str() == Some(slug.as_str()) {
+            let mut aliases: Vec<String> = model["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(str::to_owned))
+                .collect();
+            for alias in &moved_aliases {
+                if !aliases.iter().any(|a| a == alias) {
+                    aliases.push(alias.clone());
+                }
+            }
+            model["isDefault"] = json!(true);
+            if !aliases.is_empty() {
+                model["aliases"] = json!(aliases);
+            }
+        }
+    }
+}
+
+/// Ported from `ModelCatalog.ts` (`applyModelCatalog`), minus KSG's
+/// `updateRequiredModels` field removal: the caller computes those separately,
+/// as `applyCodexModelCatalog` does.
+pub fn apply_model_catalog(
+    mut models: Vec<Value>,
+    catalog: Option<&ProviderCatalog>,
+    matching: &CatalogMatching,
+) -> Vec<Value> {
+    classify_catalog_models(&mut models, catalog, matching);
+    apply_catalog_default(&mut models, catalog, matching);
+    models
+}
+
 #[cfg(test)]
 mod tests {
-    //! Ports of KSG's `ModelManifest.test.ts` (`resolveProviderCatalog`).
+    //! Ports of KSG's `ModelCatalog.test.ts` (`classifyCatalogModels`,
+    //! `applyCatalogDefault`) and `ModelManifest.test.ts`
+    //! (`resolveProviderCatalog`).
     use super::*;
+
+    /// KSG `ModelCatalog.test.ts`'s `model` helper, on Shina's model values.
+    fn model(overrides: Value) -> Value {
+        let mut model = json!({"id":"model-test","name":"Model Test","isCustom":false});
+        if let Some(overrides) = overrides.as_object() {
+            for (key, value) in overrides {
+                model[key] = value.clone();
+            }
+        }
+        model
+    }
+
+    /// KSG `ModelCatalog.test.ts`'s `catalogModel` helper.
+    fn catalog_model(slug: &str, status: &str) -> ProviderCatalogModel {
+        ProviderCatalogModel {
+            slug: slug.into(),
+            name: slug.into(),
+            short_name: None,
+            sub_provider: None,
+            aliases: vec![],
+            badge: None,
+            status: status.into(),
+            capabilities: Default::default(),
+            adapter: json!({}),
+            profile_adapter: json!({}),
+        }
+    }
+
+    /// KSG `ModelCatalog.test.ts`'s `prefixFamily`.
+    const PREFIX_FAMILY: CatalogMatching = CatalogMatching {
+        family: Some(|slug| slug.strip_prefix("vendor.").unwrap_or(slug).to_owned()),
+    };
+
+    fn catalog(models: Vec<ProviderCatalogModel>, default: Option<&str>) -> ProviderCatalog {
+        ProviderCatalog {
+            models,
+            default_chat_model: default.map(str::to_owned),
+        }
+    }
+
+    fn legacy_pairs(models: &[Value]) -> Vec<(String, bool)> {
+        models
+            .iter()
+            .map(|model| {
+                (
+                    model["id"].as_str().unwrap().to_owned(),
+                    model["isLegacy"] == true,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flags_only_known_legacy_models_clears_stale_flags_and_skips_custom() {
+        let catalog = catalog(vec![catalog_model("old-model", "legacy")], None);
+        let mut models = vec![
+            model(json!({"id":"current-a"})),
+            model(json!({"id":"current-b","isLegacy":true})),
+            model(json!({"id":"old-model"})),
+            model(json!({"id":"my-own-model","isCustom":true,"isLegacy":true})),
+        ];
+        classify_catalog_models(&mut models, Some(&catalog), &CatalogMatching::default());
+        assert_eq!(
+            legacy_pairs(&models),
+            vec![
+                ("current-a".to_owned(), false),
+                ("current-b".to_owned(), false),
+                ("old-model".to_owned(), true),
+                ("my-own-model".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_qualified_slugs_through_the_drivers_family_without_changing_ids() {
+        let catalog = catalog(vec![catalog_model("model-old", "legacy")], None);
+        let mut models = vec![
+            model(json!({"id":"vendor.model-test","isLegacy":true})),
+            model(json!({"id":"vendor.model-old"})),
+        ];
+        classify_catalog_models(&mut models, Some(&catalog), &PREFIX_FAMILY);
+        assert_eq!(
+            legacy_pairs(&models),
+            vec![
+                ("vendor.model-test".to_owned(), false),
+                ("vendor.model-old".to_owned(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn moves_the_default_flag_and_its_aliases_to_the_catalogs_chat_default() {
+        let catalog = catalog(
+            vec![catalog_model("model-new", "current")],
+            Some("model-new"),
+        );
+        let mut models = vec![
+            model(json!({"id":"model-old","isDefault":true,"aliases":["provider-default"]})),
+            model(json!({"id":"model-new"})),
+        ];
+        apply_catalog_default(&mut models, Some(&catalog), &CatalogMatching::default());
+        assert!(models[0].get("isDefault").is_none() && models[0].get("aliases").is_none());
+        assert_eq!(models[1]["isDefault"], true);
+        assert_eq!(models[1]["aliases"], json!(["provider-default"]));
+        // No matching default target leaves the wire default alone.
+        let mut partial = models[..1].to_vec();
+        let before = partial.clone();
+        apply_catalog_default(&mut partial, Some(&catalog), &CatalogMatching::default());
+        assert_eq!(partial, before);
+    }
+
+    #[test]
+    fn resolves_the_catalog_default_to_a_qualified_discovered_model() {
+        let catalog = catalog(vec![], Some("model-test"));
+        let mut models = vec![
+            model(json!({"id":"vendor.model-old","isDefault":true})),
+            model(json!({"id":"vendor.model-test"})),
+        ];
+        apply_catalog_default(&mut models, Some(&catalog), &PREFIX_FAMILY);
+        let default = models.iter().find(|m| m["isDefault"] == true).unwrap();
+        assert_eq!(default["id"], "vendor.model-test");
+    }
 
     /// KSG `ModelManifest.test.ts`'s badge matrix: `releasedAt` yields "new" only
     /// for the week after release, on a `current` model.

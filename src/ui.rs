@@ -29614,6 +29614,81 @@ pub(crate) mod tests {
         }
     }
 
+    /// KSG's `ModelPickerContent` on `applyCodexModelCatalog` output: the Codex tab
+    /// shows manifest names, folds manifest legacies behind "Show more", keeps the
+    /// row the manifest lacks, and carries the update-required notice.
+    #[test]
+    fn codex_tab_lists_manifest_names_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            // `model/list` rows after `model_value`, including one qualified wire id
+            // and one slug the manifest lacks.
+            let wire = vec![
+                json!({"provider":"codex","id":"gpt-6-astra","name":"GPT-6 Astra Wire",
+                    "thinkingLevels":["low","medium","high"],"isDefault":true,
+                    "serviceTiers":[{"id":"default","name":"Standard","isDefault":true},
+                                    {"id":"fast","name":"Fast","isDefault":false}]}),
+                json!({"provider":"codex","id":"zzz-fixture","name":"Fixture Unknown",
+                    "thinkingLevels":["xhigh"],"contextWindow":32000}),
+                json!({"provider":"codex","id":"openai.gpt-6-sol","name":"GPT-6 Sol Wire",
+                    "thinkingLevels":["high"]}),
+                json!({"provider":"codex","id":"gpt-5.5","name":"GPT-5.5 Wire",
+                    "thinkingLevels":["high"]}),
+            ];
+            let catalog =
+                crate::codex_catalog::bundled_codex_provider_catalog(crate::lifecycle::now());
+            let (merged, update_required) = crate::codex_catalog::apply_codex_model_catalog(
+                wire,
+                catalog.as_ref(),
+                Some("0.150.0"),
+            );
+            let models: Vec<crate::session::AgentModel> = merged
+                .iter()
+                .filter_map(|m| crate::session::AgentModel::from_harness_value(m, "codex"))
+                .collect();
+            rt.state.codex_catalog.models = models.clone();
+            rt.state.codex_catalog.update_required_models = update_required;
+            let t = rt.state.current_mut();
+            t.harness = "codex".into();
+            t.models = models;
+            open_picker(&mut rt, SettingsPicker::Model);
+            rt.frame(1.0);
+            press(&mut rt, "choose-harness-codex");
+            rt.frame(1.0);
+            let tree = rt.accessibility_json().to_string();
+            // Manifest names replace the wire display names; the unknown slug keeps its own.
+            assert!(tree.contains("GPT-6 Astra"), "{width}: {tree}");
+            assert!(!tree.contains("GPT-6 Astra Wire"), "{width}: {tree}");
+            assert!(tree.contains("Fixture Unknown"), "{width}: {tree}");
+            // Manifest legacies collapse behind the section toggle until expanded.
+            assert!(
+                rt.presented("legacy-models-codex").is_some(),
+                "{width}: legacy toggle"
+            );
+            assert!(!tree.contains("GPT-5.5"), "{width}: {tree}");
+            // Models the installed CLI predates surface through the existing notice.
+            assert!(
+                rt.presented("update-required-notice-codex").is_some(),
+                "{width}: update-required notice"
+            );
+            assert!(
+                tree.contains("Update the Codex CLI to v0.155.0 or newer"),
+                "{width}: {tree}"
+            );
+            // The toggle may sit below the fold of the model list's clip.
+            rt.update(|_, tx| tx.scroll_to_bottom_instant("model-list"));
+            rt.frame(0.0);
+            press(&mut rt, "legacy-models-codex");
+            rt.invalidate();
+            rt.frame(1.0);
+            let expanded = rt.accessibility_json().to_string();
+            assert!(expanded.contains("GPT-6 Sol"), "{width}: {expanded}");
+            assert!(expanded.contains("GPT-5.5"), "{width}: {expanded}");
+            assert!(!expanded.contains("GPT-6 Sol Wire"), "{width}: {expanded}");
+        }
+    }
+
     /// Short windows used to leave the combined picker taller than the room above the
     /// composer, so its rows ran out of the card over the input. Each popover now stays inside
     /// the window and its rows inside the card.

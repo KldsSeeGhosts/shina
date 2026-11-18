@@ -903,14 +903,10 @@ fn codex_reasoning_effort_label(effort: &str) -> &str {
     }
 }
 
-fn codex_model_family(slug: &str) -> &str {
-    slug.strip_prefix("openai.")
-        .filter(|s| s.starts_with("gpt-"))
-        .unwrap_or(slug)
-}
-
+/// Ported from `CodexProvider.ts` (`codexDefaultReasoningEffortOverride`):
+/// the Astra family defaults to `medium` rather than its wire effort.
 pub fn codex_default_reasoning_effort_override(model: &str) -> Option<&'static str> {
-    (codex_model_family(model) == "gpt-6-astra").then_some("medium")
+    (crate::codex_catalog::codex_model_family(model) == "gpt-6-astra").then_some("medium")
 }
 
 /// Ported from `apps/server/src/provider/CodexProvider.ts` (`mapCodexModelCapabilities`).

@@ -217,6 +217,9 @@ struct Client {
     probe: Option<bool>,
     skills_loaded: bool,
     native_extensions: bool,
+    /// The installed Codex CLI version from `initialize.userAgent` (KSG's
+    /// `snapshot.version`); drives the manifest's update-required advisory.
+    version: Option<String>,
     service_tier: Option<String>,
     turns: Vec<Value>,
     turn_items: Vec<Value>,
@@ -275,6 +278,7 @@ impl Client {
             probe: None,
             skills_loaded: false,
             native_extensions: false,
+            version: None,
             service_tier: None,
             turns: vec![],
             turn_items: vec![],
@@ -478,6 +482,17 @@ impl Client {
                     json!({"type":"harness_update","field":"codexNativeExtensions",
                     "value":self.native_extensions}),
                 );
+                // KSG `snapshot.version`: `initialize.userAgent` names the CLI.
+                self.version = crate::codex_catalog::codex_cli_version(
+                    result["userAgent"].as_str().unwrap_or(""),
+                );
+                if self.probe.is_some()
+                    && let Some(version) = &self.version
+                {
+                    self.events
+                        .push(json!({"type":"harness_update","field":"version",
+                        "value":version}));
+                }
                 self.wire.push(json!({"method":"initialized"}));
                 self.request(
                     "skills/list",
@@ -566,26 +581,23 @@ impl Client {
                         .filter(|m| m["hidden"] != true)
                         .filter_map(model_value)
                         .collect();
-                    let preferred = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]
-                        .iter()
-                        .find_map(|target| {
-                            self.models
-                                .iter()
-                                .find(|m| {
-                                    let id = m["id"].as_str().unwrap_or("");
-                                    let fam = id
-                                        .strip_prefix("openai.")
-                                        .filter(|s| s.starts_with("gpt-"))
-                                        .unwrap_or(id);
-                                    fam == *target
-                                })
-                                .and_then(|m| m["id"].as_str())
-                                .map(str::to_owned)
-                        });
-                    if let Some(preferred_slug) = preferred {
-                        for m in &mut self.models {
-                            m["isDefault"] = json!(m["id"] == preferred_slug);
-                        }
+                    // KSG orders `applyPreferredCodexDefaultModel` before the catalog.
+                    crate::codex_catalog::apply_preferred_codex_default_model(&mut self.models);
+                    // `applyCodexModelCatalog`: the manifest's `codex` section
+                    // classifies rows by family, fills in catalog metadata, and
+                    // names models the installed CLI predates.
+                    let catalog = crate::codex_catalog::bundled_codex_provider_catalog(
+                        crate::lifecycle::now(),
+                    );
+                    let (models, update_required) = crate::codex_catalog::apply_codex_model_catalog(
+                        std::mem::take(&mut self.models),
+                        catalog.as_ref(),
+                        self.version.as_deref(),
+                    );
+                    self.models = models;
+                    if self.probe.is_some() {
+                        self.events.push(json!({"type":"harness_update",
+                            "field":"updateRequiredModels","value":update_required}));
                     }
                     if self.ready && self.probe.is_none() {
                         if let Some(model) = self

@@ -15,6 +15,8 @@ parser.add_argument("--legacy-compaction", action="store_true")
 parser.add_argument("--all-items", action="store_true")
 parser.add_argument("--paginated-models", action="store_true")
 parser.add_argument("--legacy-version", action="store_true")
+parser.add_argument("--manifest-models", action="store_true")
+parser.add_argument("--cli-version", default=None)
 parser.add_argument("--model-failure", action="store_true")
 parser.add_argument("--skills-unsupported", action="store_true")
 args = parser.parse_args()
@@ -143,12 +145,30 @@ for line in sys.stdin:
         assert not initialized
         assert params["clientInfo"]["name"] == "shina"
         initialized = True
-        send({"id": request_id, "result": {"userAgent": "fake-codex/" + ("0.166.0" if args.legacy_version else "0.167.2")}})
+        version = args.cli_version or ("0.166.0" if args.legacy_version else "0.167.2")
+        send({"id": request_id, "result": {"userAgent": "fake-codex/" + version}})
     elif method == "initialized":
         assert initialized
     elif method == "model/list":
         if args.model_failure:
             send({"id": request_id, "error": {"code": -32000, "message": "Fixture model failure"}})
+            continue
+        if args.manifest_models:
+            send({"id": request_id, "result": {"data": [
+                dict(id="gpt-6-astra", model="gpt-6-astra", displayName="GPT-6 Astra Wire",
+                     supportedReasoningEfforts=[{"reasoningEffort": "low"},
+                                                {"reasoningEffort": "medium"},
+                                                {"reasoningEffort": "high"}],
+                     defaultReasoningEffort="high",
+                     serviceTiers=[{"id": "fast", "name": "Fast", "description": "Faster responses"}]),
+                dict(id="zzz-fixture", model="zzz-fixture", displayName="Fixture Unknown",
+                     supportedReasoningEfforts=[{"reasoningEffort": "xhigh"}],
+                     contextWindow=32000),
+                dict(id="openai.gpt-6-sol", model="openai.gpt-6-sol", displayName="GPT-6 Sol Wire",
+                     supportedReasoningEfforts=[{"reasoningEffort": "high"}]),
+                dict(id="gpt-5.5", model="gpt-5.5", displayName="GPT-5.5 Wire",
+                     supportedReasoningEfforts=[{"reasoningEffort": "high"}]),
+            ], "nextCursor": None}})
             continue
         if params.get("cursor"):
             assert params["cursor"] == "second-page"

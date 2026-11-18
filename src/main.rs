@@ -19,6 +19,7 @@ mod claude_catalog;
 mod client;
 mod client_history;
 mod codex;
+mod codex_catalog;
 mod composer;
 mod composer_code_highlight;
 mod composer_code_languages;
