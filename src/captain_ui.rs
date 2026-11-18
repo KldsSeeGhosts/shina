@@ -1069,6 +1069,7 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
     )
     .child(rows)
     .child(super::captain_activity_ui::policy_block(s, p, captain))
+    .child(super::captain_activity_ui::recovery_block(s, p, captain))
 }
 
 fn machine_label(s: &State) -> String {

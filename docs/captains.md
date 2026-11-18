@@ -201,7 +201,7 @@ An authenticated client with the controller's existing operate grant can call:
 - `captain.inbox.await` with `captain`, `correlationId`, `reason`, and optional `expiresAt`. An accepted event for that Captain and correlation satisfies the wait. Cancellation or expiry of an event does not count as acceptance.
 - `captain.inbox.cancel` with `captain` and one `eventId` or `waitId`. This cancels a watch or external event, or an explicit event wait, without claiming an in-flight input was recalled. Use routine controls to cancel a routine.
 
-The controller consumes these events without a desktop. This is an authenticated server command, not a public webhook or a repository watcher. Issue #31 owns repository work tracking and #42 owns external identity routing. The desktop still needs inbox and recovery controls. Provider input with incomplete recovery evidence remains held or unknown.
+The controller consumes these events without a desktop. This is an authenticated server command, not a public webhook or a repository watcher. Issue #31 owns repository work tracking and #42 owns external identity routing. In the desktop Captain Brief, the Crew section shows the current restart recovery mode and active waits. Choose **Allow unattended recovery** to opt in or **Wait for me after restart** to turn it off. The inbox event ledger remains available through `captain.inbox.list`. Provider input with incomplete recovery evidence remains held or unknown.
 
 ## Explicit memory
 

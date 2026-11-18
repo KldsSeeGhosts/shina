@@ -2002,6 +2002,7 @@ impl State {
                 && (self.fleet_receipt(&server, command, value)
                     || self.captain_lifecycle_receipt(&server, command, value)
                     || self.captain_policy_receipt(&server, command, value)
+                    || self.captain_recovery_receipt(&server, command, value)
                     || self.captain_promotion_receipt(&server, command, value)
                     || self.crew_question_receipt(&server, command, value)
                     || self.crew_draft_receipt(&server, command, value)

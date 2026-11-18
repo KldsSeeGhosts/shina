@@ -161,6 +161,7 @@ pub use run_control::{StopControl, TurnCapabilities};
 mod captain_event_policy;
 #[path = "captain_inbox.rs"]
 mod captain_inbox;
+pub use captain_inbox::RecoveryMode;
 #[path = "captain_state.rs"]
 mod captain_state;
 pub use captain_event_policy::ReportPolicy;
@@ -5023,6 +5024,8 @@ pub struct State {
     pub captain_policy_pending:
         std::collections::BTreeMap<(String, uuid::Uuid), CaptainPolicyChange>,
     pub captain_policy_errors: std::collections::BTreeMap<(String, usize), String>,
+    captain_recovery_pending: std::collections::BTreeMap<(String, uuid::Uuid), usize>,
+    pub captain_recovery_errors: std::collections::BTreeMap<(String, usize), String>,
     pub crew_question_drafts: std::collections::BTreeMap<(String, String), CrewQuestionDraft>,
     pub crew_questions_captain_open: bool,
     /// A dirty-draft close parked behind the discard confirmation.
@@ -6088,6 +6091,8 @@ impl State {
             promotion_pending: Default::default(),
             captain_policy_pending: Default::default(),
             captain_policy_errors: Default::default(),
+            captain_recovery_pending: Default::default(),
+            captain_recovery_errors: Default::default(),
             crew_question_drafts: Default::default(),
             crew_questions_captain_open: false,
             doc_discard: None,

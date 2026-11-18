@@ -832,7 +832,8 @@ impl State {
         });
         // Ambiguous interrupted work must reconcile before anything replays.
         if self.tasks.iter().any(|task| {
-            task.recovering && home.is_some_and(|home| self.task_home(task) == Some(home))
+            (task.recovering || task.state == TaskState::Interrupted)
+                && home.is_some_and(|home| self.task_home(task) == Some(home))
         }) || self
             .threads
             .iter()
@@ -886,6 +887,27 @@ impl State {
             return Some((
                 WaitAwaited::Connectivity,
                 "Waiting for connectivity before resuming unattended work.".into(),
+            ));
+        }
+        let auth_error = crate::usage_limits::authentication_error;
+        if self.threads.iter().any(|t| {
+            group.contains(&t.id)
+                && !t.archived()
+                && t.status == Status::Failed
+                && t.error.as_deref().is_some_and(auth_error)
+        }) || self.tasks.iter().any(|task| {
+            task.state == TaskState::Failed
+                && home.is_some_and(|home| self.task_home(task) == Some(home))
+                && group.contains(&task.child_thread_id)
+                && !self
+                    .threads
+                    .iter()
+                    .any(|t| t.id == task.child_thread_id && t.archived())
+                && auth_error(&task.error_excerpt)
+        }) {
+            return Some((
+                WaitAwaited::WorkerUnavailable,
+                "Waiting for a worker to sign in to its provider.".into(),
             ));
         }
         if peers.clone().any(|remote| {
@@ -1392,6 +1414,14 @@ impl State {
             .collect()
     }
 
+    pub fn active_captain_wait_reasons(&self, captain: usize) -> impl Iterator<Item = &str> {
+        self.captain_waits
+            .iter()
+            .rev()
+            .filter(move |wait| wait.captain == captain && wait.state == WaitState::Waiting)
+            .map(|wait| wait.reason.as_str())
+    }
+
     /// `captain.inbox.list` RPC: user paging over one Captain's inbox events
     /// plus its waits, bounded by the protocol page budget like
     /// `captain.reports.list`.
@@ -1826,9 +1856,32 @@ mod tests {
             )
         );
         assert_eq!(event(&restored, &id).state, InboxState::Held);
+        thread(&mut restored, worker).request = None;
+        thread(&mut restored, worker).offline_blocked = true;
+        restored.poll_tasks(Instant::now());
+        assert!(restored.captain_waits.iter().any(|wait| {
+            wait.awaited == WaitAwaited::Connectivity && wait.state == WaitState::Waiting
+        }));
+        assert_eq!(event(&restored, &id).state, InboxState::Held);
+
+        let crew = thread(&mut restored, worker);
+        crew.offline_blocked = false;
+        let before = crew.status;
+        crew.status = Status::Failed;
+        crew.error = Some("Authentication required".into());
+        restored.poll_tasks(Instant::now());
+        assert!(restored.captain_waits.iter().any(|wait| {
+            wait.awaited == WaitAwaited::WorkerUnavailable
+                && wait.state == WaitState::Waiting
+                && wait.reason.contains("sign in")
+        }));
+        assert_eq!(event(&restored, &id).state, InboxState::Held);
+
         // Clearing the blocker releases recovery holds: the watch event
         // delivers, the Context report keeps its hold.
-        thread(&mut restored, worker).request = None;
+        let crew = thread(&mut restored, worker);
+        crew.status = before;
+        crew.error = None;
         restored.poll_tasks(Instant::now());
         assert!(
             restored
