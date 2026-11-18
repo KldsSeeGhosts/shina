@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod acp;
+mod antigravity;
 mod approval;
 mod assistant_citation;
 mod attachment_intake;
@@ -1183,6 +1184,15 @@ fn main() {
             eprintln!("{error}");
             std::process::exit(1);
         }
+        return;
+    }
+    // Antigravity's BROWSER suppression helper: echo the sign-in URL to stderr, never open it.
+    if let Some(url) = std::env::args()
+        .nth(1)
+        .filter(|arg| arg == "--antigravity-browser-helper")
+        .and_then(|_| std::env::args().nth(2))
+    {
+        antigravity::browser_helper(&url);
         return;
     }
     // The window icon follows the saved theme: the night sail for dark, the day sail for light.
