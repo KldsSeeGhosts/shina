@@ -48,9 +48,9 @@ pub(super) fn policy_badge(key: String, policy: ReportPolicy, p: Palette) -> Opt
             el().key(key)
                 .h(16.0)
                 .px(4.0)
-                .radius(4.0)
+                .radius(6.0)
                 .center()
-                .child(label(word, PIXEL_LABEL, p.muted)),
+                .child(label(word, META_LABEL, p.muted)),
             p,
         )
         .a11y_hidden(),
@@ -139,7 +139,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         .center_y()
         .gap(8.0)
         .child(crew_ui::mark_slot(status, p))
-        .child(pixel_text("Question from", status_ink(status, p)))
+        .child(meta_text("Question from", status_ink(status, p)))
         .child(
             label(&view.title, TextStyle::new(13.0, 560.0), p.ink)
                 .truncate()
@@ -147,10 +147,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
                 .min_w(0.0),
         )
         .child(spacer())
-        .child(pixel_text(
-            outcome_word(view.outcome),
-            status_ink(status, p),
-        ));
+        .child(meta_text(outcome_word(view.outcome), status_ink(status, p)));
     let mut detail = col().gap(8.0);
     let question = truncate(&view.question, 2000);
     detail = detail.child(
@@ -241,7 +238,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
                     .max_h(120.0)
                     .px(8.0)
                     .py(6.0)
-                    .radius(6.0)
+                    .radius(12.0)
                     .fill(p.card)
                     .field_focus(edit, p)
                     .disabled(pending)
@@ -315,7 +312,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         .gap(8.0)
         .center_y()
         .child(label(delivery.clone(), META, p.faint))
-        .child(pixel_text(age, p.faint));
+        .child(meta_text(age, p.faint));
     if let Some(badge) = policy_badge(format!("needs-you-report-{rid}-tag"), view.policy, p) {
         footer = footer.child(badge);
     }
@@ -331,7 +328,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         ))
         .padding(12.0)
         .gap(8.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
         .border(1.0, crew_ui::hairline(p))
         .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
@@ -381,7 +378,7 @@ pub(super) fn cards(s: &State, p: Palette) -> Option<El> {
                 .gap(6.0)
                 .h(32.0)
                 .px(8.0)
-                .radius(4.0)
+                .radius(6.0)
                 .hover(crew_ui::hover_wash(s, p))
                 .press(crew_ui::active_wash(s, p))
                 .hover_motion(crew_ui::motion(), crew_ui::motion())
@@ -389,7 +386,7 @@ pub(super) fn cards(s: &State, p: Palette) -> Option<El> {
                     s.crew_questions_captain_open = !s.crew_questions_captain_open;
                 })
                 .child(icon(if open { "chevron-up" } else { "chevron" }, p.muted))
-                .child(pixel_text(
+                .child(meta_text(
                     format!("{count} questions waiting on {name}"),
                     p.muted,
                 )),

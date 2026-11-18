@@ -645,7 +645,7 @@ fn header(p: Palette, panel_key: &str, ready: &diff_panel::Ready) -> El {
         .gap(4.0)
         .child(label("Files", SMALL, p.ink).px(4.0))
         .child(spacer())
-        .child(pixel_text(files.to_string(), p.muted));
+        .child(meta_text(files.to_string(), p.muted));
     if dirs {
         let panel_key = panel_key.to_string();
         bar = bar.child(
@@ -660,7 +660,7 @@ fn header(p: Palette, panel_key: &str, ready: &diff_panel::Ready) -> El {
                 .focusable(true)
                 .size(24.0, 24.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .press(p.selected)
                 .on_press(move |s: &mut State| s.diff_toggle_all_dirs(&panel_key))
@@ -733,7 +733,7 @@ fn tree_row(s: &State, p: Palette, panel_key: &str, i: usize) -> El {
                 .child(icon("file", p.muted).size(16.0, 16.0))
                 .child(label(name, SMALL, p.ink).truncate().shrink())
                 .child(spacer())
-                .child(pixel_text(letter, ink).pr(8.0));
+                .child(meta_text(letter, ink).pr(8.0));
             if current {
                 // KSG's `data-[active]` row: selected fill plus the 2 px
                 // left-edge bar.

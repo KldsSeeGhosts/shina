@@ -6,7 +6,7 @@
 //! status badge follows `ProposedPlanCard`'s "Plan" badge beside a truncating title. KSG has
 //! no counterpart for an editable dependency graph, revision checks, launch receipts or the
 //! audited override confirmation: those rows are Shina designs in the crew tray's language
-//! (4 px rows, 1 px `line` chips, Departure Mono status words, `framed` only on actions).
+//! (4 px rows, 1 px `line` chips, Inter status words, `framed` only on actions).
 //!
 //! Everything shown is the value the MCP `task_plan` tool returns for this Captain home, and
 //! every action is a `task.plan.*` command routed to the same reducer as the MCP tools.
@@ -82,9 +82,9 @@ pub(super) fn plan_toggle(s: &State, p: Palette) -> Option<El> {
         .disabled(unavailable.is_some())
         .on_press(|s: &mut State| s.toggle_plan_panel())
         .child(icon("list", if open { p.ink } else { p.muted }))
-        .child(pixel_label("Plan", if open { p.ink } else { p.muted }));
+        .child(meta_label("Plan", if open { p.ink } else { p.muted }));
     if count > 0 {
-        button = button.child(pixel_text(count.to_string(), p.muted).key("crew-tray-plan-count"));
+        button = button.child(meta_text(count.to_string(), p.muted).key("crew-tray-plan-count"));
     }
     Some(match unavailable {
         Some(reason) => button.help(reason).opacity(0.5),
@@ -107,7 +107,7 @@ fn checkbox(key: String, title: String, on: bool, enabled: bool, p: Palette, nod
         })
         .size(14.0, 14.0)
         .min_w(14.0)
-        .border(2.0, if enabled { p.ink } else { p.line })
+        .border(1.0, if enabled { p.ink } else { p.line })
         .center()
         .fill(if on { p.coral } else { Color::TRANSPARENT });
     if on {
@@ -155,8 +155,8 @@ fn node_row(s: &State, p: Palette, node: &Value, busy: bool) -> El {
                     .h(18.0)
                     .px(5.0)
                     .center_y()
-                    .radius(2.0)
-                    .child(pixel_label(word, ink)),
+                    .radius(4.0)
+                    .child(meta_label(word, ink)),
                 p,
             )
             .min_w(0.0),
@@ -170,7 +170,7 @@ fn node_row(s: &State, p: Palette, node: &Value, busy: bool) -> El {
         )
         .child(spacer())
         .child(
-            pixel_text(format!("{key} r{}", node["revision"]), p.faint)
+            meta_text(format!("{key} r{}", node["revision"]), p.faint)
                 .key(format!("plan-revision-{key}"))
                 .truncate()
                 .shrink()
@@ -232,14 +232,14 @@ fn node_row(s: &State, p: Palette, node: &Value, busy: bool) -> El {
                 .center_y()
                 .px(5.0)
                 .h(20.0)
-                .radius(2.0)
+                .radius(4.0)
                 .border(1.0, p.line)
                 .label(format!("{name}: {detail}"))
                 .help(detail.to_owned())
                 .child(label(name, META, p.ink))
-                .child(pixel_text(state, dep_ink(state, p)));
+                .child(meta_text(state, dep_ink(state, p)));
             if stacked == Some(name) {
-                chip = chip.child(pixel_text("base", p.muted));
+                chip = chip.child(meta_text("base", p.muted));
             }
             line = line.child(chip);
         }
@@ -457,7 +457,7 @@ fn editor(s: &State, p: Palette, plan: Option<&Value>) -> El {
             let mut chip = row()
                 .gap(2.0)
                 .center_y()
-                .radius(2.0)
+                .radius(4.0)
                 .border(1.0, if on { p.frame } else { p.line })
                 .child(
                     row()
@@ -495,7 +495,7 @@ fn editor(s: &State, p: Palette, plan: Option<&Value>) -> El {
                         })
                         .hover(hover_wash(s, p))
                         .on_press(move |s: &mut State| s.plan_toggle_stack(&stack))
-                        .child(pixel_text("base", if stacked { p.ink } else { p.faint })),
+                        .child(meta_text("base", if stacked { p.ink } else { p.faint })),
                 );
             }
             deps = deps.child(chip);
@@ -655,8 +655,8 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
                 .h(18.0)
                 .px(5.0)
                 .center_y()
-                .radius(2.0)
-                .child(pixel_label("Plan", p.ink)),
+                .radius(4.0)
+                .child(meta_label("Plan", p.ink)),
             p,
         ))
         .child(
@@ -675,7 +675,7 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .child(spacer());
     if !nodes.is_empty() {
         header = header.child(
-            pixel_text(format!("{ready} ready of {}", nodes.len()), p.muted).key("plan-count"),
+            meta_text(format!("{ready} ready of {}", nodes.len()), p.muted).key("plan-count"),
         );
     }
     header = header.child(icon_button(
@@ -691,7 +691,7 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .label("Task plan")
         .gap(6.0)
         .padding(6.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
         .border(1.0, hairline(p))
         .child(header);
@@ -712,7 +712,7 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
                     .h(22.0)
                     .px(6.0)
                     .center_y()
-                    .radius(2.0)
+                    .radius(4.0)
                     .border(1.0, if on { p.frame } else { p.line })
                     .hover(hover_wash(s, p))
                     .on_press(move |s: &mut State| s.plan_select(&pick))

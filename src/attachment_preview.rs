@@ -926,7 +926,7 @@ fn notebook_view(s: &State, p: Palette, width: f32) -> El {
                 .center_y()
                 .h(32.0)
                 .px(14.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.card)
                 .hover(p.selected)
                 .press(p.selected)
@@ -946,7 +946,7 @@ fn notebook_view(s: &State, p: Palette, width: f32) -> El {
         .grow(1.0)
         .min_h(0.0)
         .gap(8.0)
-        .child(pixel_text(
+        .child(meta_text(
             format!(
                 "{} cells · {} · {}",
                 notebook.cells.len(),
@@ -991,8 +991,8 @@ fn notebook_cell(
         .label(format!("Cell {}", index + 1))
         .w_full()
         .min_w(0.0)
-        .radius(6.0)
-        .clip_rounded(6.0)
+        .radius(12.0)
+        .clip_rounded(12.0)
         .border(1.0, p.line)
         .child(
             el().w_full()
@@ -1000,7 +1000,7 @@ fn notebook_cell(
                 .px(12.0)
                 .py(6.0)
                 .fill(p.code_bg)
-                .child(pixel_label(
+                .child(meta_label(
                     &format!(
                         "{} · {}",
                         if cell.kind == CellKind::Code {
@@ -1088,7 +1088,7 @@ fn notebook_cell(
 fn notebook_source(cell: &attachment_notebook_preview::NotebookCell, p: Palette) -> El {
     let mut body = row().w_full().min_w(0.0).px(10.0).py(8.0).gap(10.0);
     if cell.kind == attachment_notebook_preview::CellKind::Code {
-        body = body.child(pixel_text(
+        body = body.child(meta_text(
             cell.execution_count
                 .map(|count| format!("[{count}]"))
                 .unwrap_or_else(|| "[ ]".into()),
@@ -1113,8 +1113,8 @@ fn notebook_source(cell: &attachment_notebook_preview::NotebookCell, p: Palette)
     el().w_full().min_w(0.0).px(16.0).py(8.0).child(
         el().w_full()
             .min_w(0.0)
-            .radius(4.0)
-            .clip_rounded(4.0)
+            .radius(6.0)
+            .clip_rounded(6.0)
             .fill(p.message_bg)
             .child(body),
     )
@@ -1181,7 +1181,7 @@ fn archive_view(s: &State, p: Palette) -> El {
                     .grow(1.0)
                     .min_w(0.0),
                 )
-                .child(pixel_text(
+                .child(meta_text(
                     format!("{} entries", archive.entries.len()),
                     p.muted,
                 )),
@@ -1295,7 +1295,7 @@ fn archive_view(s: &State, p: Palette) -> El {
                                     .grow(1.0)
                                     .min_w(0.0),
                             )
-                            .child(pixel_text(
+                            .child(meta_text(
                                 if size.div_ceil(1024) >= 1024 {
                                     format!("{:.1} MB", size as f64 / 1048576.0)
                                 } else {
@@ -1473,7 +1473,7 @@ fn table_preview(
                     .w(content)
                     .border_sides([0.0, 0.0, 1.0, 0.0], palette.frame)
                     .child(
-                        pixel_text((i + 1).to_string(), palette.faint)
+                        meta_text((i + 1).to_string(), palette.faint)
                             .align(rune::Align::End)
                             .w(t::GUTTER)
                             .px(8.0)
@@ -1504,7 +1504,7 @@ fn table_preview(
         .h(0.0)
         .grow(1.0)
         .min_h(0.0)
-        .clip_rounded(4.0)
+        .clip_rounded(6.0)
         .scroll_x()
         .on_scroll_offset(move |at| {
             let mut pos = scroll_x.lock().unwrap_or_else(|e| e.into_inner());
@@ -1604,7 +1604,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
             .min_w(0.0),
     );
     if preview.draft && !media {
-        header = header.child(pixel_text("Draft", p.muted));
+        header = header.child(meta_text("Draft", p.muted));
     }
     let file = attachment.clone();
     header = header.child(
@@ -1689,10 +1689,10 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         .min_h(0.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(header);
     let mut menu = None;
@@ -1857,7 +1857,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                 },
                             ),
                         )
-                        .child(pixel_text(
+                        .child(meta_text(
                             format!("{}%", (preview.zoom * 100.0) as u32),
                             p.muted,
                         ))
@@ -2003,7 +2003,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                 .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                                 .center_y()
                                 .child(el().w(0.0).grow(volume))
-                                .child(el().size(12.0, 12.0).radius(4.0).fill(p.ink))
+                                .child(el().size(12.0, 12.0).radius(6.0).fill(p.ink))
                                 .child(el().w(0.0).grow(1.0 - volume)),
                         );
                     let mut controls = row()
@@ -2022,7 +2022,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                 }
                             },
                         ))
-                        .child(pixel_text(
+                        .child(meta_text(
                             format!(
                                 "{:.0} / {:.0} s",
                                 player.time(),
@@ -2057,7 +2057,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                 .center_y()
                                 .h(24.0)
                                 .px(10.0)
-                                .radius(4.0)
+                                .radius(6.0)
                                 .hover(p.selected)
                                 .press(p.selected)
                                 .on_press(|s: &mut State| {
@@ -2065,7 +2065,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                         preview.rate_menu = !preview.rate_menu;
                                     }
                                 })
-                                .child(pixel_text(format!("{}x", player.rate()), p.ink)),
+                                .child(meta_text(format!("{}x", player.rate()), p.ink)),
                             p,
                         ))
                         .child(
@@ -2088,10 +2088,10 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                             .w(160.0)
                             .padding(4.0)
                             .gap(1.0)
-                            .radius(6.0)
+                            .radius(12.0)
                             .fill(p.card)
-                            .border(2.0, p.frame)
-                            .box_shadow(hard_shadow(p))
+                            .border(1.0, p.frame)
+                            .box_shadow(soft_shadow(p))
                             .on_press(|_: &mut State| {})
                             // Left and Right still reach the overlay's attachment
                             // navigation, so the menu swallows them.
@@ -2117,7 +2117,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                 .px(8.0)
                                 .gap(8.0)
                                 .center_y()
-                                .radius(4.0)
+                                .radius(6.0)
                                 .hover(p.selected)
                                 .focus_highlight(p.selected)
                                 .on_press(move |s: &mut State| {
@@ -2235,7 +2235,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                     let count = document.len();
                     // KSG LargeTextViewer's status line: rows and columns for a
                     // table, lines for text, then the size or "Indexing…".
-                    card = card.child(pixel_text(
+                    card = card.child(meta_text(
                         format!(
                             "{} · {}",
                             if table {
@@ -2585,7 +2585,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                     p,
                     |s| s.navigate_attachment_preview(-1),
                 ))
-                .child(pixel_text(
+                .child(meta_text(
                     format!("{}/{}", preview.index + 1, preview.items.len()),
                     p.muted,
                 ))

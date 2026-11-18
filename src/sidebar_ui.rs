@@ -337,7 +337,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         .focusable(true)
         .w_full()
         .min_w(0.0)
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .on_press(move |s: &mut State| {
             if has_hit {
@@ -410,7 +410,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
             .w_full()
             .gap(8.0)
             .center_y()
-            .child(pixel_text(status.label(), status_ink(status, p)))
+            .child(meta_text(status.label(), status_ink(status, p)))
             // The workspace keeps `WORKSPACE_FLOOR`, so the machine name gives way first, down
             // to its icon alone.
             .child(
@@ -456,12 +456,12 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
             .child(spacer());
         if let Some(seconds) = timer {
             status_line = status_line.child(
-                label(elapsed_label(seconds), PIXEL.features(TABULAR), p.muted)
+                label(elapsed_label(seconds), META.features(TABULAR), p.muted)
                     .w(TIMER_SLOT)
                     .align(rune::Align::End),
             );
         }
-        return item.radius(4.0).child(
+        return item.radius(6.0).child(
             rune::row()
                 .h(CAPTAIN_SLOT + 12.0)
                 .w_full()
@@ -603,7 +603,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         } else {
             p.muted
         };
-        meta = meta.child(label(age, PIXEL.features(TABULAR), ink));
+        meta = meta.child(label(age, META.features(TABULAR), ink));
     }
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
@@ -640,7 +640,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                     } else {
                         relative_time(entry.life.settled_at.unwrap_or(0) / 1000).unwrap_or_default()
                     },
-                    PIXEL,
+                    META,
                     p.muted,
                 )),
         )

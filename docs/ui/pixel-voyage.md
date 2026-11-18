@@ -1,8 +1,12 @@
 # Pixel Voyage: Shina's visual redesign
 
-Status: implemented, 2026-11-11, with the revisions listed at the end. Owner of design
-decisions: the orchestrator. Implementers follow this document and raise conflicts instead of
-improvising.
+Status: retired, 2026-11-18. The user moved Shina away from this pixel-art chrome because it
+tires the eyes over long sessions. Shina now matches KSG Code's own visual design (its redesign
+merged in `7959a26823` and follow-ups); see "Visual skin: KSG Code" in `AGENTS.md`. This
+document is kept as history. Do not implement from it. Captain portraits and the app mark are
+still pixel art.
+
+Earlier status: implemented, 2026-11-11, with the revisions listed at the end.
 
 ## Why
 

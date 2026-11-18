@@ -93,7 +93,7 @@ pub(super) fn document_panel(s: &State, p: Palette, captain: usize, name: &str) 
     let mut meta = row()
         .gap(8.0)
         .center_y()
-        .child(label(name.to_string(), PIXEL_LABEL, p.faint))
+        .child(label(name.to_string(), META_LABEL, p.faint))
         .child(label(age, META, p.muted))
         .child(
             label(sharing_note(name), META, p.muted)
@@ -104,11 +104,11 @@ pub(super) fn document_panel(s: &State, p: Palette, captain: usize, name: &str) 
         meta = el()
             .children([
                 outlined(
-                    el().h(16.0).px(5.0).center().radius(3.0).child(label(
-                        "Private",
-                        PIXEL_LABEL,
-                        p.muted,
-                    )),
+                    el().h(16.0)
+                        .px(5.0)
+                        .center()
+                        .radius(3.0)
+                        .child(label("Private", META_LABEL, p.muted)),
                     p,
                 ),
                 meta,
@@ -232,8 +232,8 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
             .px(10.0)
             .py(8.0)
             .gap(8.0)
-            .radius(4.0)
-            .border(2.0, p.brass)
+            .radius(6.0)
+            .border(1.0, p.brass)
             .fill(p.brass.alpha(0.12))
             .child(icon("alert", p.brass))
             .child(
@@ -399,7 +399,7 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
                     bytes as f32 / 1024.0,
                     TEXT_CAP / 1024
                 ),
-                PIXEL_LABEL,
+                META_LABEL,
                 if oversized { p.danger } else { p.muted },
             )
             .key("captain-doc-bytes"),
@@ -523,7 +523,7 @@ fn error_row(key: &str, message: &str, p: Palette) -> El {
         .px(10.0)
         .py(8.0)
         .gap(8.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.danger.alpha(0.08))
         .child(icon("alert", p.danger))
         .child(
@@ -553,10 +553,10 @@ pub(super) fn discard_dialog(s: &State, p: Palette) -> Option<El> {
         .max_w(s.viewport_width - 32.0)
         .padding(16.0)
         .gap(10.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label(title, DIALOG_TITLE, p.ink))
         .child(

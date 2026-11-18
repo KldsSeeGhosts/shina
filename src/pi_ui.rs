@@ -38,19 +38,21 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
     let mut options = col().gap(2.0).w_full();
     for (i, option) in question.options.iter().enumerate() {
         let selected = !custom && answer.selected.contains(&option.value);
-        // A square mark: a filled coral square for a chosen checkbox, a coral square inside the
-        // frame for a chosen radio.
+        // KSG checkbox (rounded-kbd, 4 px) and radio (circle) indicators.
         let indicator = el()
             .size(14.0, 14.0)
+            .radius(if question.multi { 4.0 } else { 7.0 })
             .center()
-            .border(2.0, if selected { p.coral } else { p.field_line })
+            .border(1.0, if selected { p.coral } else { p.field_line })
             .fill(if selected && question.multi {
                 p.coral
             } else {
                 Color::TRANSPARENT
             })
-            .child(if selected && !question.multi {
-                el().size(6.0, 6.0).fill(p.coral)
+            .child(if selected && question.multi {
+                icon("check", p.on_coral).size(10.0, 10.0)
+            } else if selected {
+                el().size(6.0, 6.0).radius(3.0).fill(p.coral)
             } else {
                 el()
             })
@@ -72,7 +74,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                 .py(6.0)
                 .px(8.0)
                 .gap(10.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if selected {
                     p.selected
                 } else {
@@ -123,10 +125,10 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                 .w_full()
                 .padding(16.0)
                 .gap(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.card)
-                .border(2.0, p.frame)
-                .box_shadow(hard_shadow(p))
+                .border(1.0, p.frame)
+                .box_shadow(soft_shadow(p))
                 .child(
                     row()
                         .key("questionnaire-toggle")
@@ -146,7 +148,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                             }
                         })
                         .child(
-                            pixel_label(&question.header, p.muted)
+                            meta_label(&question.header, p.muted)
                                 .grow(if collapsed { 0.0 } else { 1.0 })
                                 .max_w(if collapsed {
                                     (lane - 32.0).max(0.0) * 0.5
@@ -249,7 +251,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                         .max_h(72.0)
                         .px(8.0)
                         .py(6.0)
-                        .radius(6.0)
+                        .radius(12.0)
                         .fill(p.card)
                         .field_focus(&t.reply, p)
                         .disabled(disabled)
@@ -396,7 +398,7 @@ pub(super) fn notifications(s: &State, p: Palette) -> El {
                 .key(format!("pi-notification-{i}"))
                 .wrap_anywhere()
                 .padding(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.coral_bg)
                 .border(0.5, p.line),
         );
@@ -723,7 +725,7 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
             .gap(6.0)
             .px(12.0)
             .py(8.0)
-            .radius(6.0)
+            .radius(12.0)
             .border(1.0, p.line)
             .max_w(580.0)
             .shrink()
@@ -791,7 +793,7 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
                 .key(format!("pi-subagent-{}-{i}", tool.id))
                 .padding(8.0)
                 .gap(4.0)
-                .radius(6.0)
+                .radius(12.0)
                 .border(0.5, p.line)
                 .child(
                     row()
@@ -877,14 +879,14 @@ pub(super) fn compaction_activity(s: &State, p: Palette, selected: usize) -> El 
             .gap(6.0)
             .px(12.0)
             .py(8.0)
-            .radius(6.0)
+            .radius(12.0)
             .border(0.5, p.line)
             .child(
                 row()
                     .gap(8.0)
                     .center_y()
                     .child(
-                        pixel_text(title, p.muted)
+                        meta_text(title, p.muted)
                             .min_w(0.0)
                             .shrink()
                             .wrap_anywhere(),
@@ -905,7 +907,7 @@ pub(super) fn compaction_activity(s: &State, p: Palette, selected: usize) -> El 
                     )),
             );
         if let Some(before) = result["tokensBefore"].as_u64() {
-            card = card.child(pixel_text(
+            card = card.child(meta_text(
                 match result["estimatedTokensAfter"].as_u64() {
                     Some(after) => format!("{before} tokens before, about {after} after"),
                     None => format!("{before} tokens before"),
@@ -957,10 +959,10 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
         .max_h((s.viewport_height - 120.0).max(240.0))
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p));
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p));
     if let Some(entry) = &t.native.confirm_rewind {
         let entry = entry.clone();
         card = card.child(label("Edit from here?", TextStyle::new(16.0,600.0),p.ink))
@@ -998,7 +1000,7 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
                     .min_h(36.0)
                     .px(8.0)
                     .py(6.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .hover(p.selected)
                     .child(
                         label(crate::model::string(point, "text"), BODY, p.ink)
@@ -1041,10 +1043,10 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
         .w((s.viewport_width - 32.0).clamp(280.0, 400.0))
         .padding(8.0)
         .gap(4.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p));
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p));
     for mode in modes {
         let description = mode.description();
         let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
@@ -1056,7 +1058,7 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
             .disabled(disabled)
             .padding(8.0)
             .gap(4.0)
-            .radius(4.0)
+            .radius(6.0)
             .child(label(
                 mode.label(),
                 LABEL,

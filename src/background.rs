@@ -195,14 +195,8 @@ impl State {
         (self.wake)();
         Ok(())
     }
-    /// Threads running now (`Thread::running_now`): what "Working in the background" counts.
-    /// `background_work_count` is wider on purpose, because queued and blocked work also keeps
-    /// the app alive in the tray.
-    pub fn working_now_count(&self) -> usize {
-        self.threads.iter().filter(|t| t.running_now()).count()
-    }
-    /// `working_now_count` for one captain's home thread and its crew, what that captain's
-    /// header and band count, so they agree with its crew line.
+    /// Threads running now (`Thread::running_now`) in one captain's home thread and its crew,
+    /// what that captain's header counts, so it agrees with its crew line.
     pub fn crew_working_now(&self, home: usize) -> usize {
         let group = self.home_group_ids(home);
         self.threads

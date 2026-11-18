@@ -85,12 +85,12 @@ pub(crate) mod crew_ui;
 pub(crate) mod diff_panel;
 #[path = "diff_tree.rs"]
 pub(crate) mod diff_tree;
+#[path = "icons.rs"]
+mod icons;
 #[path = "markdown_ui.rs"]
 mod markdown_ui;
 #[path = "pi_ui.rs"]
 mod pi_ui;
-#[path = "pixel_icons.rs"]
-mod pixel_icons;
 #[path = "plan_ui.rs"]
 mod plan_ui;
 #[path = "settings_ui.rs"]
@@ -140,14 +140,18 @@ pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
     rows
 }
 
-// The two scenes of the icon (night sky, day sail) with a coral hull for the accent, set out
-// in docs/ui/pixel-voyage.md. Coral is the primary accent, brass marks anything waiting on the
-// user and sea marks running work and links.
+// KSG Code's default theme (`apps/web/src/index.css`, the dark and light palettes after the
+// 2026 redesign): calm neutral chrome, a slightly lighter chat pane, raised cards for the
+// composer and menus, hairline borders and one soft blue for links, focus and running work.
+// The field names are older than the theme: `coral` is the primary key (KSG's light `surface-lit`
+// button in dark, near-black in light), `sea` is KSG's info blue and `brass` its warning.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: Color,
     panel: Color,
     card: Color,
+    /// KSG's `surface-tray`: the composer shell around the card and the context strip.
+    tray: Color,
     line: Color,
     ink: Color,
     muted: Color,
@@ -166,13 +170,15 @@ struct Palette {
     sea: Color,
     sea_bg: Color,
     danger: Color,
-    /// The 2 px pixel border, and the hard shadow it casts down and to the right.
+    /// A control's 1 px border.
     frame: Color,
-    /// The outline of portraits and project tiles. In the dark theme it stays the darker navy,
-    /// so a face reads apart from the lighter frames of buttons, tabs and the composer.
+    /// The outline of portraits and project tiles.
     portrait_frame: Color,
+    /// The colour of the soft drop shadows under cards, menus and dialogs.
     shadow: Color,
     field_line: Color,
+    /// The focus ring and a focused field's border.
+    ring: Color,
     message_bg: Color,
     code_bg: Color,
 }
@@ -182,66 +188,60 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: color("#101727"),
-            panel: color("#162036"),
-            card: color("#1d2a45"),
-            line: color("#f4efe3").alpha(0.12),
-            ink: color("#f4efe3"),
-            // Muted and faint are two steps, 6.3:1 and 4.6:1 on a hovered card, so the quiet text
-            // still reads as quieter than the secondary text.
-            muted: color("#b8c7e0"),
-            faint: color("#98aac5"),
+            bg: color("#0e0f12"),
+            panel: color("#151619"),
+            card: color("#1e1f23"),
+            tray: color("#191a1e"),
+            line: color("#ffffff").alpha(0.08),
+            ink: color("#e6e7ea"),
+            muted: color("#b2b7bf"),
+            faint: color("#9ca2ac"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
-            selected: color("#9fb0cc").alpha(0.06),
-            row: color("#1d2a45").alpha(0.85),
-            coral: color("#e07a54"),
-            coral_bg: color("#e07a54").alpha(0.16),
-            on_coral: color("#1a0f0a"),
-            brass: color("#d3ba6b"),
-            on_brass: color("#1a0f0a"),
-            sea: color("#7ab4d2"),
-            sea_bg: color("#24406a"),
-            danger: color("#f0a39c"),
-            // The document's #0a0f1c frame vanishes on these surfaces, so night frames are a
-            // lighter blue-grey and only the hard shadows stay near-black.
-            frame: color("#52688e"),
-            portrait_frame: color("#3a4a6c"),
-            shadow: color("#060a13"),
-            field_line: color("#3d507a"),
-            message_bg: color("#24406a"),
-            code_bg: color("#0c1220"),
+            selected: color("#ffffff").alpha(0.02),
+            row: color("#1e1f23"),
+            coral: color("#eceef2"),
+            coral_bg: color("#8aa4ff").alpha(0.16),
+            on_coral: color("#111215"),
+            brass: color("#d29922"),
+            on_brass: color("#111215"),
+            sea: color("#8aa4ff"),
+            sea_bg: color("#1d2338"),
+            danger: color("#f85149"),
+            frame: color("#ffffff").alpha(0.11),
+            portrait_frame: color("#ffffff").alpha(0.11),
+            shadow: color("#000000").alpha(0.45),
+            field_line: color("#ffffff").alpha(0.13),
+            ring: color("#8aa4ff"),
+            message_bg: color("#25262b"),
+            code_bg: color("#111215"),
         }
     } else {
         Palette {
-            // The day sky of the icon, between its #b9e0ee and white: the window and sidebar
-            // are sky, the sea strip is the horizon, and the chat pane is sailcloth.
-            bg: color("#d5e8ef"),
-            panel: color("#f8f4ea"),
-            card: color("#fffdf7"),
-            line: color("#1f2538").alpha(0.14),
-            ink: color("#1f2538"),
-            // The document's #5d6478 is 4.25:1 on a hovered sidebar row; this is 4.7:1.
-            muted: color("#565d71"),
-            faint: color("#595f73"),
-            selected: color("#1f2538").alpha(0.075),
-            row: color("#fffdf7").alpha(0.7),
-            coral: color("#d2643c"),
-            coral_bg: color("#d2643c").alpha(0.12),
-            // Cream on #d2643c is 3.7:1. Near-black reaches 5.2:1, so coral fills keep it.
-            on_coral: color("#1a0f0a"),
-            // The document's #8a6a2f is 3.97:1 as a status word on the sky; the same hue at
-            // 91% reaches 4.6:1 there.
-            brass: color("#7e602b"),
-            on_brass: color("#fffdf7"),
-            sea: color("#1f6d62"),
-            sea_bg: color("#d6ebe4"),
-            danger: color("#a33e38"),
-            frame: color("#1f2538"),
-            portrait_frame: color("#1f2538"),
-            shadow: color("#1f2538").alpha(0.30),
-            field_line: color("#b5ac94"),
-            message_bg: color("#e0d6ba"),
-            code_bg: color("#ebe6d3"),
+            bg: color("#e8e8ea"),
+            panel: color("#f5f5f6"),
+            card: color("#ffffff"),
+            tray: color("#efeff1"),
+            line: color("#000000").alpha(0.08),
+            ink: color("#1c1d20"),
+            muted: color("#5e626a"),
+            faint: color("#62666e"),
+            selected: color("#000000").alpha(0.045),
+            row: color("#ffffff"),
+            coral: color("#141518"),
+            coral_bg: color("#1d4ed8").alpha(0.10),
+            on_coral: color("#f7f7f8"),
+            brass: color("#8a5a00"),
+            on_brass: color("#ffffff"),
+            sea: color("#1d4ed8"),
+            sea_bg: color("#e3e9fb"),
+            danger: color("#b42318"),
+            frame: color("#000000").alpha(0.11),
+            portrait_frame: color("#000000").alpha(0.11),
+            shadow: color("#000000").alpha(0.10),
+            field_line: color("#000000").alpha(0.14),
+            ring: color("#1d4ed8"),
+            message_bg: color("#ececef"),
+            code_bg: color("#ededef"),
         }
     }
 }
@@ -281,7 +281,7 @@ pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
         ("secondary-foreground", p.ink),
         ("border", p.frame),
         ("input", p.field_line),
-        ("ring", p.coral),
+        ("ring", p.ring),
         ("primary", p.coral),
         ("primary-foreground", p.on_coral),
         ("accent", p.coral),
@@ -309,7 +309,7 @@ pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
     ] {
         variables.insert(format!("--{name}"), css(color).into());
     }
-    variables.insert("--radius".into(), "4px".into());
+    variables.insert("--radius".into(), "8px".into());
     variables.insert(
         "--font-sans".into(),
         r#"Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif"#.into(),
@@ -321,35 +321,31 @@ pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
     serde_json::json!({"appearance":if dark {"dark"} else {"light"},"variables":variables})
 }
 pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
-/// The pixel face: section labels, counts, timers, status words, badges and the wordmark. It is
-/// drawn for 11 px and its multiples, so use it at 11 or 22 only.
-pub const PIXEL_FAMILY: &str = "Departure Mono";
 pub const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/InterVariable.ttf"),
     include_bytes!("../assets/fonts/SourceSerif4Variable.ttf"),
-    include_bytes!("../assets/fonts/DepartureMono-Regular.otf"),
 ];
-/// A Departure Mono style at 11 px (the grid it is drawn on) or 22 px.
-const fn pixel(size: f32) -> TextStyle {
-    TextStyle::new(size, 400.0)
-        .lh(size + 3.0)
-        .family(rune::Family::Named(PIXEL_FAMILY))
+/// KSG Code's small UI text: Inter at `size`, weight 500, for section labels, counts, timers,
+/// status words, badges and the controls under the composer. The wordmark uses it at 15.
+const fn meta(size: f32) -> TextStyle {
+    TextStyle::new(size, 500.0)
+        .lh(size + 5.0)
+        .family(rune::Family::Named("Inter Variable"))
 }
 /// Section labels, counts and status words.
-const PIXEL: TextStyle = pixel(11.0);
-/// Section labels are uppercase with a little air between the letters.
-const PIXEL_LABEL: TextStyle = pixel(11.0).tracking(0.6);
+const META: TextStyle = meta(12.0);
+/// Section labels: KSG's sidebar group headings, sentence case with a little air.
+const META_LABEL: TextStyle = meta(12.0).tracking(0.1);
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
-/// Assistant answers use Cursor's agent-window text: 15/24 sans with slightly tight tracking.
-const PROSE: TextStyle = TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.20);
+/// Assistant answers use KSG Code's `.chat-markdown`: `text-sm leading-relaxed`, 14/22.5.
+const PROSE: TextStyle = TextStyle::new(14.0, 400.0).lh(22.5).tracking(-0.10);
 const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10);
-/// The new-thread greeting, ported from KSG Code's `DraftHeroHeadline`: centred sans,
-/// `text-3xl font-normal tracking-tight`, or `text-2xl` when the pane is narrow.
-/// Shina uses its bundled serif for greetings, the only typographic departure.
-const HEADING: TextStyle = TextStyle::new(30.0, 400.0)
+/// The new-thread greeting, ported from KSG Code's `DraftHeroHeadline`: centred Inter,
+/// `text-3xl font-medium tracking-tight`, or `text-2xl` when the pane is narrow.
+const HEADING: TextStyle = TextStyle::new(30.0, 500.0)
     .lh(36.0)
-    .tracking(-0.45)
-    .family(rune::Family::Named("Source Serif 4"));
+    .tracking(-0.75)
+    .family(rune::Family::Named("Inter Variable"));
 /// Dialog titles: Source Serif 4 at 20/600, tight.
 const DIALOG_TITLE: TextStyle = TextStyle::new(20.0, 600.0)
     .lh(26.0)
@@ -360,10 +356,10 @@ const CAPTAIN_SERIF: TextStyle = TextStyle::new(16.0, 600.0)
     .lh(22.0)
     .tracking(-0.2)
     .family(rune::Family::Named("Source Serif 4"));
-const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 400.0)
+const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 500.0)
     .lh(32.0)
-    .tracking(-0.3)
-    .family(rune::Family::Named("Source Serif 4"));
+    .tracking(-0.6)
+    .family(rune::Family::Named("Inter Variable"));
 /// A chat pane this wide (a 1600 px window with the sidebar open) gets a longer measure and
 /// larger body text. It follows the pane, not the window, so an open session panel or a wide
 /// sidebar keeps the reading size that fits the lane.
@@ -377,16 +373,16 @@ fn body_style(wide: bool) -> TextStyle {
 }
 fn prose_style(wide: bool) -> TextStyle {
     if wide {
-        TextStyle::new(16.0, 400.0).lh(25.0).tracking(-0.20)
+        TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.15)
     } else {
         PROSE
     }
 }
 /// The chat lane's content width, ported from KSG Code's `.chat-content-lane`
-/// (`max-width: var(--chat-content-max-width)`, 46 rem). Wide panes get 54 rem for the larger
+/// (`max-width: var(--chat-content-max-width)`, 45 rem). Wide panes get 54 rem for the larger
 /// text. Messages, tool rows, the queue and the composer all share it.
 fn measure(wide: bool) -> f32 {
-    if wide { 864.0 } else { 736.0 }
+    if wide { 864.0 } else { 720.0 }
 }
 /// The lane's side padding, from KSG Code's `.chat-composer-lane` and
 /// `.messages-timeline-scroll`: 0.75 rem below `sm` (640 px) and 3 rem from `sm` up. KSG reads
@@ -400,7 +396,7 @@ fn lane_width(pane_width: f32, wide: bool) -> f32 {
 }
 /// Live timers and counts use tabular figures, so "12m 05s" never shifts as a digit changes.
 const TABULAR: &str = "'tnum' 1";
-const TIMER: TextStyle = PIXEL.features(TABULAR);
+const TIMER: TextStyle = META.features(TABULAR);
 const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
 /// The project line of a sidebar card.
@@ -414,18 +410,15 @@ const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
 /// Workers sit a step below their captain: shorter rows on the captain's rail.
 const CREW_ROW: f32 = 30.0;
 
-/// A text field's focus look, shared by every field: a coral caret, and a border that is 1 px
-/// `field_line` at rest and 2 px coral while the field has focus. Put it on the box that draws
-/// the field's edge.
+/// A text field's focus look, shared by every field: KSG's 1 px `--input` border that turns the
+/// `--ring` blue while the field has focus. Put it on the box that draws the field's edge.
 trait FieldFocus {
     fn field_focus(self, edit: &rune::TextEdit, p: Palette) -> Self;
 }
 impl FieldFocus for El {
     fn field_focus(self, edit: &rune::TextEdit, p: Palette) -> Self {
-        self.caret(p.coral, p.coral_bg).border(
-            if edit.focused { 2.0 } else { 1.0 },
-            if edit.focused { p.coral } else { p.field_line },
-        )
+        self.caret(p.ink, p.coral_bg)
+            .border(1.0, if edit.focused { p.ring } else { p.field_line })
     }
 }
 /// The fill of a text field inside a dialog: the panel colour in light, the window colour in dark.
@@ -445,24 +438,33 @@ fn spacer() -> El {
 fn rule(p: Palette) -> El {
     el().h(1.0).w_full().fill(p.line)
 }
-/// A hard 2 px shadow below and to the right, with no blur anywhere in the app.
-fn hard_shadow(p: Palette) -> rune::Shadow {
+/// KSG Code's soft control shadow (`shadow-xs`): one point down, a few points of blur.
+fn control_shadow(p: Palette) -> rune::Shadow {
     rune::Shadow {
-        x: 2.0,
-        y: 2.0,
-        blur: 0.0,
+        x: 0.0,
+        y: 1.0,
+        blur: 3.0,
+        spread: 0.0,
+        color: p.shadow.alpha(p.shadow.a * 0.6),
+        inset: false,
+    }
+}
+/// KSG Code's popover, menu and dialog shadow (`shadow-lg`): deeper and diffuse.
+fn soft_shadow(p: Palette) -> rune::Shadow {
+    rune::Shadow {
+        x: 0.0,
+        y: 8.0,
+        blur: 24.0,
         spread: 0.0,
         color: p.shadow,
         inset: false,
     }
 }
-/// The pixel frame: a 2 px `frame` border and the hard shadow.
+/// A raised surface you act on: KSG's 1 px `--border` and the soft control shadow.
 fn framed(el: El, p: Palette) -> El {
-    el.border(2.0, p.frame).box_shadow(hard_shadow(p))
+    el.border(1.0, p.frame).box_shadow(control_shadow(p))
 }
-/// The pixel frame for something that only informs (a keycap, a count, the Demo badge): the
-/// outline without the hard shadow. Shadows belong to portraits, buttons you can press, the
-/// composer, menus and dialogs.
+/// A surface that only informs (a keycap, a count, a badge): the 1 px border, no shadow.
 fn outlined(el: El, p: Palette) -> El {
     el.border(1.0, p.frame)
 }
@@ -476,95 +478,13 @@ fn rgb_bytes([red, green, blue]: [u8; 3]) -> Color {
         a: 1.0,
     }
 }
-/// A scene from `horizon` as one shape of flat rectangles.
-fn scenery(rects: &[crate::horizon::Rect]) -> Shape {
-    rects.iter().fold(Shape::new(), |shape, r| {
-        shape.fill(
-            vec![
-                [r.x, r.y],
-                [r.x + r.w, r.y],
-                [r.x + r.w, r.y + r.h],
-                [r.x, r.y + r.h],
-            ],
-            rgb_bytes(r.color),
-        )
-    })
-}
-/// The horizon band over the new-thread screen: `width` by `HORIZON_HEIGHT`, 6 px corners and
-/// a pixel frame. The frame is an overlay, so the scenery cannot paint over it.
-///
-/// `fleet` is the number of working threads or tasks, one distant sail each (at most four).
-///
-/// The scenery is rebuilt only when the width, the theme, a captain's backdrop or the fleet
-/// size changes. Its polygons are the costly part, and nothing else in the view moves them.
-fn horizon_band(
-    width: f32,
-    dark: bool,
-    subject: crate::horizon::Subject,
-    fleet: usize,
-    p: Palette,
-) -> El {
-    let fleet = fleet.min(crate::horizon::FLEET_MAX);
-    let backdrop = match subject {
-        crate::horizon::Subject::Boat => (false, [0u8; 3]),
-        crate::horizon::Subject::Sky(rgb) => (true, rgb),
-    };
-    rune::memo(
-        "horizon-band",
-        (width.to_bits(), dark, backdrop, fleet),
-        move || {
-            let shape = scenery(&crate::horizon::band(
-                width,
-                HORIZON_HEIGHT,
-                dark,
-                subject,
-                fleet,
-            ));
-            // The scenery is clipped in its own layer, because a clipped element also clips its
-            // hard shadow.
-            el().key("horizon-band")
-                .w(width)
-                .h(HORIZON_HEIGHT)
-                .radius(6.0)
-                .box_shadow(hard_shadow(p))
-                .child(
-                    el().size(width, HORIZON_HEIGHT)
-                        .radius(6.0)
-                        .clip_rounded(6.0)
-                        .shape(shape),
-                )
-                .child(
-                    el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                        .radius(6.0)
-                        .border(2.0, p.frame)
-                        .a11y_hidden(),
-                )
-                .a11y_hidden()
-        },
-    )
-}
-/// The number of distant sails: the working count the captain header shows ("Working in the
-/// background, 2 tasks"), threads running now, so the scenery and the words never disagree.
-/// `horizon_band` caps it.
-fn fleet_size(s: &State) -> usize {
-    if let Some(captain) = captain_ui::brief_captain(s) {
-        s.crew_working_now(s.captain_home(captain).unwrap_or(s.current().id))
-    } else {
-        s.working_now_count()
-    }
-}
-/// Height of the horizon band, 36 cells of 3 pt.
-const HORIZON_HEIGHT: f32 = 108.0;
-/// Height of the sea strip at the foot of the sidebar, 9 cells of 3 pt.
-const SEA_HEIGHT: f32 = 27.0;
-/// A portrait in a pixel frame. The image sits under a border overlay, because Rune paints a
-/// clipped image over its own border. Below 30 px the frame is 1 px so the face keeps its room.
+/// A portrait with rounded corners and a 1 px hairline, as KSG's avatars. The image sits under
+/// a border overlay, because Rune paints a clipped image over its own border.
 fn pixel_portrait(s: &State, pixels: &rune::Pixels, size: f32, p: Palette) -> El {
     pixel_portrait_framed(s, pixels, size, p, None)
 }
-/// `pixel_portrait` with an accent for a selected portrait: the frame and the hard shadow both
-/// take that colour. The frame keeps its width and the shadow lies outside the box, so the
-/// outer bounds do not change.
+/// `pixel_portrait` with an accent ring for a selected portrait. The ring keeps the 1 px width,
+/// so the outer bounds do not change.
 fn pixel_portrait_framed(
     s: &State,
     pixels: &rune::Pixels,
@@ -573,15 +493,10 @@ fn pixel_portrait_framed(
     accent: Option<Color>,
 ) -> El {
     let size = s.artwork.snap_points(size);
-    let (radius, frame) = if size >= 30.0 { (4.0, 2.0) } else { (2.0, 1.0) };
+    let radius = if size >= 30.0 { 8.0 } else { 6.0 };
     let edge = accent.unwrap_or(p.portrait_frame);
-    let mut shadow = hard_shadow(p);
-    if let Some(accent) = accent {
-        shadow.color = accent;
-    }
     el().size(size, size)
         .radius(radius)
-        .box_shadow(shadow)
         .child(
             el().size(size, size)
                 .radius(radius)
@@ -591,23 +506,28 @@ fn pixel_portrait_framed(
         .child(
             el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .radius(radius)
-                .border(frame, edge),
+                .border(if accent.is_some() { 2.0 } else { 1.0 }, edge),
         )
 }
-/// Uppercase Departure Mono, for section labels and status words.
-fn pixel_label(value: &str, ink: Color) -> El {
-    label(value.to_uppercase(), PIXEL_LABEL, ink)
+/// A section label: Inter 12/500 in sentence case, as KSG's sidebar group headings.
+fn meta_label(value: &str, ink: Color) -> El {
+    let mut chars = value.chars();
+    let value = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars.as_str().chars()).collect(),
+        None => String::new(),
+    };
+    label(value, META_LABEL, ink)
 }
-/// Departure Mono at 11 px as written, for counts, ages and timers.
-fn pixel_text(value: impl Into<String>, ink: Color) -> El {
-    label(value, PIXEL, ink)
+/// Inter 12/500 as written, for counts, ages and timers.
+fn meta_text(value: impl Into<String>, ink: Color) -> El {
+    label(value, META, ink)
 }
 fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
     button_in(key, title, TextStyle::new(12.0, 450.0), p, action)
 }
-/// A quiet button whose label is Departure Mono, for the rows of state under the composer.
-fn pixel_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
-    button_in(key, title, PIXEL, p, action)
+/// A quiet button with a 12 px Inter label, for the rows of state under the composer.
+fn meta_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
+    button_in(key, title, META, p, action)
 }
 fn button_in(
     key: &str,
@@ -624,20 +544,19 @@ fn button_in(
         .focusable(true)
         .center_y()
         .gap(7.0)
-        .px(10.0)
+        .px(8.0)
         .h(24.0)
-        .radius(4.0)
+        .radius(12.0)
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
         .child(label(title, style, p.ink).truncate().shrink())
 }
-/// Icon size in points. The glyphs sit on a 24 unit grid of 2 unit squares, so 18 pt puts each
-/// square on 3 device pixels at 2x and keeps the edges hard. 16 pt lands on 2.67 and blurs.
-const ICON: f32 = 18.0;
-/// A Pixelarticons glyph (24 grid, 2 px squares).
+/// Icon size in points: KSG's `size-4` Lucide icons.
+const ICON: f32 = 16.0;
+/// A Lucide outline glyph from `icons`.
 fn icon(kind: &str, ink: Color) -> El {
-    rune::icon(pixel_icons::glyph(kind), ICON)
+    rune::icon(icons::glyph(kind), ICON)
         .color(ink)
         .a11y_hidden()
 }
@@ -655,17 +574,16 @@ fn primary_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State
             .center_y()
             .h(32.0)
             .px(14.0)
-            .radius(4.0)
+            .radius(8.0)
             .fill(p.coral)
-            // Rune cannot move a button on press, so a pressed key darkens instead.
-            .press(p.coral.alpha(0.8))
+            .press(p.coral.alpha(0.9))
             .on_press(action)
             .child(label(title, TextStyle::new(13.0, 600.0), p.on_coral)),
         p,
     )
 }
-/// The secondary action beside a primary one, such as Cancel: the same size and the 2 px frame,
-/// with no shadow and no fill, so the pair reads as one set.
+/// The secondary action beside a primary one, such as Cancel: the same size with a 1 px border
+/// on the card fill, as KSG's `outline` button.
 fn secondary_button(
     key: &str,
     title: &str,
@@ -681,9 +599,9 @@ fn secondary_button(
         .center_y()
         .h(32.0)
         .px(14.0)
-        .radius(4.0)
+        .radius(8.0)
         .fill(p.card)
-        .border(2.0, p.frame)
+        .border(1.0, p.frame)
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
@@ -703,7 +621,7 @@ fn icon_button(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
@@ -725,7 +643,7 @@ fn toggle_button(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(4.0)
+        .radius(6.0)
         .fill(if on { p.selected } else { Color::TRANSPARENT })
         .hover(p.selected)
         .on_press(action)
@@ -750,17 +668,17 @@ fn status_ink(status: Status, p: Palette) -> Color {
         _ => p.muted,
     }
 }
-/// One status vocabulary everywhere, in squares: a filled one for working, a hollow one for
-/// needs you, a smaller filled one for failed, and a check for settled. Ready and offline get
-/// a faint square.
+/// One status vocabulary everywhere, in dots: a filled one for working, a ring for needs you,
+/// a smaller filled one for failed, and a check for settled. Ready and offline get a faint dot.
 fn status_mark(status: Status, p: Palette, size: f32) -> El {
     let ink = status_ink(status, p);
+    let dot = |side: f32| el().size(side, side).radius(side / 2.0);
     match status {
-        Status::Running => el().size(size, size).fill(ink),
-        Status::Waiting => el().size(size, size).border(2.0, ink),
-        Status::Failed => el().size(size - 2.0, size - 2.0).fill(ink),
+        Status::Running => dot(size).fill(ink),
+        Status::Waiting => dot(size).border(1.5, ink),
+        Status::Failed => dot(size - 2.0).fill(ink),
         Status::Completed => icon("check", ink).size(size + 7.0, size + 7.0),
-        _ => el().size(size, size).fill(ink.alpha(0.6)),
+        _ => dot(size).fill(ink.alpha(0.6)),
     }
     .a11y_hidden()
 }
@@ -774,7 +692,7 @@ fn status(status: Status, p: Palette) -> El {
         .center_y()
         .gap(6.0)
         .child(status_mark(status, p, 6.0))
-        .child(pixel_text(status.label(), status_ink(status, p)))
+        .child(meta_text(status.label(), status_ink(status, p)))
 }
 /// Room for "Working for 59m 59s" in the chat header, so live status never reflows the row
 /// around it.
@@ -804,7 +722,7 @@ fn status_slot(key: &str, status: Status, text: Option<String>, width: f32, p: P
             .opacity_motion(slider_curve(false))
             .child(status_mark(status, p, 6.0))
             .child(
-                label(text, PIXEL.features(TABULAR), status_ink(status, p))
+                label(text, META.features(TABULAR), status_ink(status, p))
                     .key(format!("{key}-text")),
             ),
     );
@@ -837,7 +755,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let p = palette(s.dark);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
-    cx.focus_ring(2.0, 2.0, p.coral);
+    cx.focus_ring(2.0, 2.0, p.ring);
     // Every enabled button, tab, link and switch is a Tab stop in document order, as on the web,
     // even one that never said `focusable(true)`. Disabled controls stay out.
     cx.web_focus();
@@ -1024,7 +942,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             main.child(empty_thread(
                 s,
                 p,
-                narrow,
                 wide,
                 main_width,
                 hero_fits,
@@ -1035,7 +952,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(composer(
                     s,
                     p,
-                    narrow,
                     wide,
                     main_width,
                     composer_caret_edges(cx, zoom),
@@ -1365,7 +1281,7 @@ fn provider_glyph(vendor: Vendor) -> &'static Icon {
     match vendor {
         Vendor::OpenAi => &OPENAI_ICON,
         Vendor::Anthropic => &CLAUDE_ICON,
-        Vendor::Antigravity | Vendor::Other => &pixel_icons::CHIP,
+        Vendor::Antigravity | Vendor::Other => &icons::CHIP,
     }
 }
 
@@ -1378,9 +1294,7 @@ fn provider_icon(s: &State, p: Palette, vendor: Vendor, size: f32) -> El {
             .a11y_hidden(),
         Vendor::OpenAi => rune::icon(&OPENAI_ICON, size).color(p.ink).a11y_hidden(),
         Vendor::Anthropic => rune::icon(&CLAUDE_ICON, size).a11y_hidden(),
-        Vendor::Other => rune::icon(&pixel_icons::CHIP, size)
-            .color(p.muted)
-            .a11y_hidden(),
+        Vendor::Other => rune::icon(&icons::CHIP, size).color(p.muted).a11y_hidden(),
     }
 }
 
@@ -1401,23 +1315,12 @@ fn effort_name(level: &str) -> String {
 
 /// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
 /// provider's mark, the model's name without its route, and descriptor-driven traits.
-fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
+/// The reasoning effort the composer shows, as KSG's `ComposerModelEffort` trigger reads it,
+/// with the descriptors' trigger display. `None` when both the model and effort are defaults.
+fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTriggerDisplay) {
     let t = s.current();
     let (resolved_instance, resolved_model_id, resolved_opts) =
         s.resolved_composer_model_selection();
-    let entries = s.provider_instance_entries();
-    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
-    let active_model_option = s
-        .picker_models_by_instance()
-        .get(&resolved_instance)
-        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
-        .or_else(|| {
-            crate::model_picker::retained_model_while_provider_locked(
-                active_entry,
-                &[],
-                &resolved_model_id,
-            )
-        });
     let (name, _) = split_model_label(&t.model);
     let descriptors = s.active_model_descriptors();
     let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
@@ -1469,6 +1372,71 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         && display.speed_label.is_none()
         && !display.ultracode
         && display.context_window.is_none();
+    (effort, both_default, display)
+}
+
+fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
+    model_trigger(s, p, narrow, locked, true)
+}
+
+/// Ported from KSG Code's `ComposerModelEffort` reasoning trigger: a gauge and the effort,
+/// beside the model in the context strip. It opens the same model and effort picker.
+/// `compact` drops the label for a narrow strip, as KSG's controls bar does.
+fn effort_trigger(s: &State, p: Palette, locked: bool, compact: bool) -> Option<El> {
+    let (effort, both_default, _) = composer_effort(s);
+    if both_default || effort.is_empty() || s.multi_model_selections().len() > 1 {
+        return None;
+    }
+    let mut trigger = row()
+        .key("composer-effort")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(format!("Reasoning {effort}. Change reasoning"))
+        .help(format!("Reasoning: {effort}"))
+        .preserve_focus_on_press(true)
+        .center_y()
+        .gap(6.0)
+        .h(24.0)
+        .px(7.0)
+        .radius(6.0)
+        .shrink()
+        .min_w(0.0)
+        .opacity(if locked { 0.65 } else { 1.0 })
+        .disabled(locked)
+        .hover(p.selected)
+        .press(p.selected)
+        .child(icon("gauge", p.muted).size(14.0, 14.0));
+    if !compact {
+        trigger = trigger.child(label(effort, SMALL, p.muted).truncate().shrink().min_w(0.0));
+    }
+    if !locked {
+        trigger = trigger.on_press(|s: &mut State| {
+            s.begin_composer_menu();
+            s.open_model_picker(SettingsPicker::Thinking);
+        });
+    }
+    Some(trigger)
+}
+
+/// The model trigger. `with_effort` keeps the effort inside it, as the resting composer does.
+fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort: bool) -> El {
+    let t = s.current();
+    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
+    let entries = s.provider_instance_entries();
+    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
+    let active_model_option = s
+        .picker_models_by_instance()
+        .get(&resolved_instance)
+        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
+        .or_else(|| {
+            crate::model_picker::retained_model_while_provider_locked(
+                active_entry,
+                &[],
+                &resolved_model_id,
+            )
+        });
+    let (name, _) = split_model_label(&t.model);
+    let (effort, both_default, display) = composer_effort(s);
     let multi_selections = s.multi_model_selections();
     if multi_selections.len() > 1 {
         let picker_models = s.picker_models_by_instance();
@@ -1541,7 +1509,7 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             .gap(7.0)
             .h(28.0)
             .px(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .shrink()
             .min_w(0.0)
             .max_w(if narrow { 200.0 } else { 340.0 })
@@ -1565,11 +1533,11 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             );
         }
         return trigger.child(outlined(
-            pixel_text(format!("{}", multi_selections.len()), p.muted)
+            meta_text(format!("{}", multi_selections.len()), p.muted)
                 .key("model-multi-count")
                 .px(4.0)
                 .py(1.0)
-                .radius(4.0),
+                .radius(6.0),
             p,
         ));
     }
@@ -1587,7 +1555,7 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         .gap(7.0)
         .h(28.0)
         .px(8.0)
-        .radius(4.0)
+        .radius(6.0)
         .shrink()
         .min_w(0.0)
         .max_w(if narrow { 200.0 } else { 340.0 })
@@ -1615,21 +1583,29 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
             )
         })
         .unwrap_or_else(|| name.to_owned());
-    let mut trigger = trigger
-        .child(provider_icon(
-            s,
-            p,
-            model_vendor(&t.model_id, &t.model),
-            14.0,
-        ))
-        .child(
+    let trigger = trigger.child(provider_icon(
+        s,
+        p,
+        model_vendor(&t.model_id, &t.model),
+        14.0,
+    ));
+    // A narrow context strip shows the model as its provider icon; the name is in the help.
+    if !with_effort && narrow {
+        return trigger;
+    }
+    let mut trigger = trigger.child(
+        if with_effort {
             label(&display_name, TextStyle::new(13.0, 600.0), p.ink)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    if !both_default {
-        trigger = trigger.child(pixel_text(effort, p.muted).truncate().shrink().min_w(0.0));
+        } else {
+            // In the context strip the model reads like KSG's other strip controls.
+            label(&display_name, SMALL, p.muted)
+        }
+        .truncate()
+        .shrink()
+        .min_w(0.0),
+    );
+    if with_effort && !both_default {
+        trigger = trigger.child(meta_text(effort, p.muted).truncate().shrink().min_w(0.0));
     }
     if display.speed_label.is_some() {
         trigger = trigger.child(icon("bolt", p.brass));
@@ -1638,14 +1614,14 @@ fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El
         trigger = trigger.child(icon("workflow", p.sea));
     }
     if let Some(cw) = &display.context_window {
-        trigger = trigger.child(pixel_text(cw, p.muted).truncate().shrink().min_w(0.0));
+        trigger = trigger.child(meta_text(cw, p.muted).truncate().shrink().min_w(0.0));
     }
     if trigger_unavailable {
         trigger = trigger.child(outlined(
-            pixel_text("Unavailable", p.muted)
+            meta_text("Unavailable", p.muted)
                 .px(4.0)
                 .py(1.0)
-                .radius(4.0),
+                .radius(6.0),
             p,
         ));
     }
@@ -1720,10 +1696,10 @@ fn settings_picker(s: &State, p: Palette) -> El {
             "Model and reasoning"
         })
         .w(width)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(body);
     if let Some(error) = &t.error {
@@ -1757,10 +1733,10 @@ fn settings_picker(s: &State, p: Palette) -> El {
             .w(220.0)
             .padding(4.0)
             .gap(2.0)
-            .radius(6.0)
+            .radius(12.0)
             .fill(p.card)
-            .border(2.0, p.frame)
-            .box_shadow(hard_shadow(p));
+            .border(1.0, p.frame)
+            .box_shadow(soft_shadow(p));
         for choice in choices {
             let selected = choice.id == current_id;
             let oid = id.clone();
@@ -1774,7 +1750,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 .py(5.0)
                 .gap(6.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if selected {
                     p.selected
                 } else {
@@ -1801,7 +1777,7 @@ fn settings_picker(s: &State, p: Palette) -> El {
                         }),
                 );
             if choice.is_default {
-                crow = crow.child(pixel_text("Default", p.muted));
+                crow = crow.child(meta_text("Default", p.muted));
             }
             if selected {
                 crow = crow.child(icon("check", p.sea));
@@ -1954,7 +1930,7 @@ fn effort_column(
                         .mx(6.0)
                         .px(8.0)
                         .center_y()
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(if checked {
                             p.selected
                         } else {
@@ -2029,7 +2005,7 @@ fn effort_column(
                             .py(6.0)
                             .gap(8.0)
                             .center_y()
-                            .radius(4.0)
+                            .radius(6.0)
                             .hover(p.selected)
                             .cursor(rune::Cursor::Pointer)
                             .on_press(move |s: &mut State| {
@@ -2060,7 +2036,7 @@ fn effort_column(
                                 if on {
                                     track = track.justify_end();
                                 }
-                                track.child(el().size(12.0, 12.0).radius(6.0).fill(p.card))
+                                track.child(el().size(12.0, 12.0).radius(12.0).fill(p.card))
                             }),
                     );
                 }
@@ -2095,7 +2071,7 @@ fn effort_column(
                             .py(6.0)
                             .gap(6.0)
                             .center_y()
-                            .radius(4.0)
+                            .radius(6.0)
                             .fill(if is_open {
                                 p.selected
                             } else {
@@ -2164,7 +2140,7 @@ fn composer_picker_footer(
             .label("Service Tier")
             .gap(2.0)
             .padding(2.0)
-            .radius(6.0)
+            .radius(12.0)
             .fill(p.bg)
             .border(1.0, p.line);
         for (index, opt) in options.iter().enumerate() {
@@ -2181,7 +2157,7 @@ fn composer_picker_footer(
                 .px(8.0)
                 .gap(4.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if on { p.selected } else { Color::TRANSPARENT })
                 .hover(p.selected)
                 .cursor(rune::Cursor::Pointer)
@@ -2217,7 +2193,7 @@ fn composer_picker_footer(
             .label("Fast Mode")
             .gap(2.0)
             .padding(2.0)
-            .radius(6.0)
+            .radius(12.0)
             .fill(p.bg)
             .border(1.0, p.line)
             .child(
@@ -2231,7 +2207,7 @@ fn composer_picker_footer(
                     .h(24.0)
                     .px(8.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(if !is_fast {
                         p.selected
                     } else {
@@ -2263,7 +2239,7 @@ fn composer_picker_footer(
                     .px(8.0)
                     .gap(4.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(if is_fast {
                         p.selected
                     } else {
@@ -2304,7 +2280,7 @@ fn composer_picker_footer(
                 .px(8.0)
                 .gap(4.0)
                 .center_y()
-                .radius(6.0)
+                .radius(12.0)
                 .fill(if on { p.selected } else { p.bg })
                 .border(1.0, p.line)
                 .hover(p.selected)
@@ -2375,7 +2351,7 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
                 .px(8.0)
                 .center_y()
                 .justify_center()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if on { p.selected } else { Color::TRANSPARENT })
                 .hover(p.selected)
                 .focus_fill(p.selected)
@@ -2391,7 +2367,7 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
         .px(16.0)
         .pb(12.0)
         .gap(8.0)
-        .child(pixel_text("Service tier", p.muted))
+        .child(meta_text("Service tier", p.muted))
         .child(choices)
 }
 
@@ -2575,7 +2551,7 @@ fn effort_slider_with_levels(
         dots = dots.child(
             el().key(format!("choose-thinking-{index}"))
                 .size(4.0, 4.0)
-                .radius(2.0)
+                .radius(4.0)
                 .fill(if Some(index) == shown {
                     Color::TRANSPARENT
                 } else if lit {
@@ -2601,7 +2577,7 @@ fn effort_slider_with_levels(
                             .size(SLIDER_H, SLIDER_H)
                             .radius(cap)
                             .fill(p.card)
-                            .border(2.0, p.frame),
+                            .border(1.0, p.frame),
                     ),
                 )
                 .child(el().key("effort-thumb-after").w(0.0).grow(1.0 - frac)),
@@ -2963,7 +2939,7 @@ fn model_list(
         .label("Search models")
         .placeholder("Search models...", p.muted)
         .color(p.ink)
-        .caret(p.coral, p.coral_bg)
+        .caret(p.ink, p.coral_bg)
         .grow(1.0)
         .min_w(0.0)
         .on_edit(|s: &mut State| &mut s.model_search)
@@ -2996,7 +2972,7 @@ fn model_list(
             .gap(6.0)
             .h(30.0)
             .px(10.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.selected)
             .field_focus(&s.model_search, p)
             .grow(1.0)
@@ -3026,7 +3002,7 @@ fn model_list(
                 .w_full()
                 .h(36.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if fav_selected {
                     p.selected
                 } else {
@@ -3087,10 +3063,10 @@ fn model_list(
             .child(harness_icon(s, p, &entry.instance_id, &entry.display_name));
         if entry.is_acp {
             btn_content = btn_content.child(outlined(
-                pixel_text("ACP", p.muted)
+                meta_text("ACP", p.muted)
                     .key(format!("harness-tag-{}", entry.instance_id))
                     .px(2.0)
-                    .radius(2.0),
+                    .radius(4.0),
                 p,
             ));
         }
@@ -3106,7 +3082,7 @@ fn model_list(
             .w_full()
             .h(if entry.is_acp { 42.0 } else { 36.0 })
             .center_y()
-            .radius(4.0)
+            .radius(6.0)
             .fill(if is_selected {
                 p.selected
             } else {
@@ -3199,20 +3175,20 @@ fn model_list(
         }
         if model.badge.as_deref() == Some("new") {
             name_row = name_row.child(outlined(
-                pixel_text("New", p.coral)
+                meta_text("New", p.coral)
                     .label("New model")
                     .px(4.0)
                     .py(1.0)
-                    .radius(4.0),
+                    .radius(6.0),
                 p,
             ));
         }
         if model.is_unavailable {
             name_row = name_row.child(outlined(
-                pixel_text("Unavailable", p.muted)
+                meta_text("Unavailable", p.muted)
                     .px(4.0)
                     .py(1.0)
-                    .radius(4.0),
+                    .radius(6.0),
                 p,
             ));
         }
@@ -3249,7 +3225,7 @@ fn model_list(
             .focusable(false)
             .size(22.0, 22.0)
             .center()
-            .radius(4.0)
+            .radius(6.0)
             .disabled(!enabled)
             .child(icon(
                 if is_favorite { "star" } else { "star-off" },
@@ -3283,7 +3259,7 @@ fn model_list(
             .mx(4.0)
             .pl(12.0)
             .pr(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(if selected {
                 p.coral_bg
             } else {
@@ -3307,7 +3283,7 @@ fn model_list(
                 .disabled(!enabled)
                 .size(14.0, 14.0)
                 .radius(0.0)
-                .border(2.0, p.ink)
+                .border(1.0, p.ink)
                 .center()
                 .shrink()
                 .fill(if selected {
@@ -3368,7 +3344,7 @@ fn model_list(
                 .h(32.0)
                 .mx(4.0)
                 .px(12.0)
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .focus_fill(p.selected)
                 .cursor(rune::Cursor::Pointer)
@@ -3444,7 +3420,7 @@ fn model_list(
         list = list
             .child(rule(p).mt(6.0))
             .child(
-                pixel_label("Models", p.muted)
+                meta_label("Models", p.muted)
                     .key("models-group")
                     .px(16.0)
                     .pt(8.0)
@@ -3604,14 +3580,14 @@ fn shina_mark(s: &State, p: Palette) -> El {
             s.artwork.snap_points(HEADER_MARK),
             s.artwork.snap_points(HEADER_MARK),
         )
-        .radius(4.0)
-        .clip_rounded(4.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .pixels(&s.artwork.mark_pixels(s.dark, HEADER_MARK))
         // The day mark's sky is the chrome's sky, so a 1 px frame keeps its edge. The frame is
         // an overlay because Rune paints a clipped image over its border.
         .child(
             el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-                .radius(4.0)
+                .radius(6.0)
                 .border(1.0, p.frame)
                 .a11y_hidden(),
         )
@@ -3638,8 +3614,8 @@ fn empty_list(s: &State, p: Palette, key: &str, text: &str) -> El {
                     s.artwork.snap_points(EMPTY_MARK),
                     s.artwork.snap_points(EMPTY_MARK),
                 )
-                .radius(4.0)
-                .clip_rounded(4.0)
+                .radius(6.0)
+                .clip_rounded(6.0)
                 .pixels(&s.artwork.mark_pixels(s.dark, EMPTY_MARK))
                 .a11y_hidden(),
         )
@@ -3651,9 +3627,9 @@ fn empty_list(s: &State, p: Palette, key: &str, text: &str) -> El {
         )
 }
 
-/// The wordmark's size in Departure Mono points, for a header `line` points wide after the
-/// native controls and the gap before the tabs. 22 px whenever it clears the attention badge,
-/// 11 px (the face's other native size) in a narrow sidebar, and none in a truly narrow one.
+/// The wordmark's size in points, for a header `line` points wide after the native controls
+/// and the gap before the tabs: Inter 15/600 whenever it clears the attention badge, 12 in a
+/// narrow sidebar, and none in a truly narrow one.
 /// Width a macOS title strip reserves for the window buttons, which every platform assumes when
 /// it sizes the wordmark.
 const TITLE_CONTROLS: f32 = 72.0;
@@ -3665,10 +3641,10 @@ fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
         0.0
     };
     let before = HEADER_TOGGLE + HEADER_MARK;
-    if line >= before + wordmark_gap(22.0) + WORDMARK_WIDTH + badge {
-        Some(22.0)
-    } else if line >= before + wordmark_gap(11.0) + WORDMARK_WIDTH / 2.0 + badge {
-        Some(11.0)
+    if line >= before + wordmark_gap(15.0) + WORDMARK_WIDTH + badge {
+        Some(15.0)
+    } else if line >= before + wordmark_gap(12.0) + WORDMARK_WIDTH * 0.8 + badge {
+        Some(12.0)
     } else {
         None
     }
@@ -3677,7 +3653,7 @@ fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
 /// under macOS's real 76 pt traffic-light inset leaves 112 pt, and the 11 px wordmark with the
 /// badge then takes 111.
 fn wordmark_gap(size: f32) -> f32 {
-    if size < 22.0 { 4.0 } else { WORDMARK_GAP }
+    if size < 15.0 { 4.0 } else { WORDMARK_GAP }
 }
 
 /// The sidebar's half of the title strip, left-aligned as T3 Code lays it out: the sidebar
@@ -3688,9 +3664,15 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
         header = header.child(shina_mark(s, p));
         if let Some(size) = wordmark_size(wordmark_line, !s.attention().is_empty()) {
             header = header.child(
-                label("Shina", pixel(size), p.ink)
-                    .key("shina-wordmark")
-                    .ml(wordmark_gap(size)),
+                label(
+                    "Shina",
+                    TextStyle::new(size, 600.0)
+                        .tracking(-0.01 * size)
+                        .family(rune::Family::Named("Inter Variable")),
+                    p.ink,
+                )
+                .key("shina-wordmark")
+                .ml(wordmark_gap(size)),
             );
         }
     }
@@ -3724,8 +3706,8 @@ const HEADER_TOGGLE: f32 = 24.0;
 const HEADER_MARK: f32 = 24.0;
 /// The attention badge's width.
 const HEADER_BADGE: f32 = 20.0;
-/// "Shina" at 22 px: five cells of 14 px.
-const WORDMARK_WIDTH: f32 = 70.0;
+/// "Shina" in Inter 15/600.
+const WORDMARK_WIDTH: f32 = 40.0;
 
 fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let mut side = col()
@@ -3802,7 +3784,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .px(ROW_INSET)
                     .gap(8.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .grow(1.0)
                     .min_w(0.0)
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
@@ -3930,7 +3912,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         let mut heading = section_title("Captains", p);
         if !captains.is_empty() {
             heading = heading.child(
-                pixel_text(captains.len().to_string(), p.muted)
+                meta_text(captains.len().to_string(), p.muted)
                     .key("captain-count")
                     .mr(6.0),
             );
@@ -4014,7 +3996,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         .px(8.0)
                         .gap(10.0)
                         .center_y()
-                        .radius(4.0)
+                        .radius(6.0)
                         .hover(p.row)
                         .child(pixel_portrait(s, &pixels, 40.0, p))
                         .child(
@@ -4023,7 +4005,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                 .min_w(0.0)
                                 .gap(4.0)
                                 .child(label(&profile.name, CAPTAIN_NAME, p.ink).truncate())
-                                .child(pixel_text("Demoted", p.muted)),
+                                .child(meta_text("Demoted", p.muted)),
                         )
                         .on_press(move |s: &mut State| {
                             if s.machines.selected == server
@@ -4140,7 +4122,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                 .pr(8.0)
                                 .gap(6.0)
                                 .center_y()
-                                .radius(4.0)
+                                .radius(6.0)
                                 .hover(p.selected)
                                 .on_drawn_layout(move |s: &mut State, rect| {
                                     s.drop_rects.insert(marker.clone(), rect);
@@ -4149,9 +4131,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                     s.shelves[shelf] = !s.shelves[shelf];
                                     s.checkpoint();
                                 })
-                                .child(pixel_label(&title, p.muted))
+                                .child(meta_label(&title, p.muted))
                                 .child(spacer())
-                                .child(pixel_text(rows.len().to_string(), p.muted))
+                                .child(meta_text(rows.len().to_string(), p.muted))
                                 .child(icon(if open { "chevron" } else { "open" }, p.muted)),
                         ),
                 );
@@ -4168,7 +4150,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         .on_drawn_layout(move |s: &mut State, rect| {
                             s.drop_rects.insert(marker.clone(), rect);
                         })
-                        .child(pixel_label(&format!("{section:?}"), p.muted)),
+                        .child(meta_label(&format!("{section:?}"), p.muted)),
                 );
             }
             let limit = if section == Section::Settled && s.search.text.is_empty() {
@@ -4322,7 +4304,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .px(8.0)
                 .gap(8.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.card)
                 .border(1.0, p.frame)
                 .hover(p.selected)
@@ -4374,23 +4356,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             )
             .child(spacer()),
     );
-    // The waterline of the app: a sea strip the footer icons sit above. It bleeds to the
-    // window's left edge (the workspace inset is 8 px), sits on the window's bottom edge like
-    // the chat pane, and runs the sidebar's full width, with square corners.
-    let bleed = width + 8.0;
-    let dark = s.dark;
-    side = side.child(rune::memo(
-        "sidebar-sea",
-        (bleed.to_bits(), dark),
-        move || {
-            el().key("sidebar-sea")
-                .w(bleed)
-                .h(SEA_HEIGHT)
-                .ml(-8.0)
-                .shape(scenery(&crate::horizon::strip(bleed, SEA_HEIGHT, dark)))
-                .a11y_hidden()
-        },
-    ));
     side
 }
 
@@ -4415,7 +4380,7 @@ fn danger_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
 fn menu_value_item(key: &str, title: &str, value: &str, glyph: &str, p: Palette) -> El {
     menu_item(key, title, glyph, p)
         .label(format!("{title}, {value}"))
-        .child(pixel_text(value, p.muted))
+        .child(meta_text(value, p.muted))
 }
 fn menu_item_in(
     key: &str,
@@ -4435,7 +4400,7 @@ fn menu_item_in(
         .px(8.0)
         .gap(10.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         // Keys and the pointer share one highlight, as in an NSMenu. Every row asks for focus;
         // the menu's modal gives it to the first, so arrows work as soon as the menu opens.
         .focus_highlight(p.selected)
@@ -4460,10 +4425,10 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .w(460.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -4490,7 +4455,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Repository", p.muted))
+                .child(meta_label("Repository", p.muted))
                 .child(
                     text_input(&projects.clone_source, BODY)
                         .key("clone-source")
@@ -4498,10 +4463,10 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                         .placeholder("owner/repo or https://github.com/owner/repo", p.muted)
                         .single_line()
                         .color(p.ink)
-                        .caret(p.coral, p.coral_bg)
+                        .caret(p.ink, p.coral_bg)
                         .w_full()
                         .padding(8.0)
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(field)
                         .field_focus(&projects.clone_source, p)
                         .disabled(cloning)
@@ -4512,7 +4477,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Clone into", p.muted))
+                .child(meta_label("Clone into", p.muted))
                 .child(
                     row()
                         .gap(8.0)
@@ -4524,7 +4489,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                                 .center_y()
                                 .grow(1.0)
                                 .min_w(0.0)
-                                .radius(4.0)
+                                .radius(6.0)
                                 .fill(field)
                                 .border(1.0, p.field_line)
                                 .child(
@@ -4542,7 +4507,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         );
     if s.machines.selected != "local" {
         card = card
-            .child(pixel_label("Destination path on this server", p.muted))
+            .child(meta_label("Destination path on this server", p.muted))
             .child(
                 text_input(
                     &s.projects.clone_path,
@@ -4553,7 +4518,7 @@ fn clone_dialog(s: &State, p: Palette) -> El {
                 .single_line()
                 .w_full()
                 .padding(8.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(field)
                 .field_focus(&s.projects.clone_path, p)
                 .color(p.ink)
@@ -4631,10 +4596,10 @@ fn machine_notice(text: &str, p: Palette) -> El {
             .px(8.0)
             .py(7.0)
             .gap(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.card)
             .child(el().size(8.0, 8.0).mt(3.0).fill(p.brass).a11y_hidden())
-            .child(pixel_text(text, p.ink).wrap().grow(1.0).min_w(0.0)),
+            .child(meta_text(text, p.ink).wrap().grow(1.0).min_w(0.0)),
         p,
     )
 }
@@ -4685,7 +4650,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                     .px(10.0)
                     .gap(8.0)
                     .center_y()
-                    .radius(6.0)
+                    .radius(12.0)
                     .fill(p.sea_bg)
                     .child(icon("send", p.sea))
                     .child(label(title, TextStyle::new(12.5, 520.0), p.sea)),
@@ -4707,7 +4672,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                 .px(10.0)
                 .gap(8.0)
                 .center_y()
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.sea_bg)
                 .disabled(blocker.is_some())
                 .a11y_value(description.unwrap_or_default())
@@ -4738,7 +4703,7 @@ fn update_everything_button(summary: &str, p: Palette) -> El {
         .px(10.0)
         .gap(8.0)
         .center_y()
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.sea_bg)
         .focusable(true)
         .hover(p.selected)
@@ -4766,7 +4731,7 @@ fn update_capsule(view: &crate::fleet_update::CapsuleView, p: Palette) -> El {
         .gap(4.0)
         .child(label(&view.label, TextStyle::new(12.0, 400.0), label_color).truncate());
     if let Some(elapsed) = &view.elapsed {
-        content = content.child(pixel_text(elapsed, p.brass));
+        content = content.child(meta_text(elapsed, p.brass));
     }
     let action = match view.action {
         CapsuleAction::Later => Some("Later"),
@@ -4790,7 +4755,7 @@ fn update_capsule(view: &crate::fleet_update::CapsuleView, p: Palette) -> El {
         .mb(8.0)
         .pl(10.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.card)
         .border(1.0, border)
         .focusable(true)
@@ -4847,7 +4812,7 @@ fn capsule_popover(s: &State, p: Palette) -> El {
                 |s| s.restart_postponed_update(),
             ));
         } else if let Some(status) = &local_status {
-            app_row = app_row.child(pixel_text(status, p.muted));
+            app_row = app_row.child(meta_text(status, p.muted));
         }
         list = list.child(app_row);
     }
@@ -4867,7 +4832,7 @@ fn capsule_popover(s: &State, p: Palette) -> El {
         );
         let word = crate::fleet_update::status_word(status);
         if matches!(status, "providers" | "downloading" | "restarting") {
-            machine_row = machine_row.child(pixel_text(
+            machine_row = machine_row.child(meta_text(
                 format!(
                     "{word} {}",
                     crate::fleet_update::format_update_elapsed(machine.started_at.elapsed())
@@ -4875,7 +4840,7 @@ fn capsule_popover(s: &State, p: Palette) -> El {
                 p.muted,
             ));
         } else {
-            machine_row = machine_row.child(pixel_text(
+            machine_row = machine_row.child(meta_text(
                 word,
                 if status == "failed" {
                     p.danger
@@ -4924,9 +4889,9 @@ fn capsule_popover(s: &State, p: Palette) -> El {
     list.padding(4.0)
         .key("update-capsule-popover")
         .fill(p.card)
-        .border(2.0, p.frame)
-        .radius(4.0)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .radius(6.0)
+        .box_shadow(soft_shadow(p))
         .anchored_fit("update-capsule", rune::Side::Top, rune::Align::End, 4.0)
 }
 
@@ -4950,7 +4915,7 @@ fn provider_pill(view: &crate::fleet_update::ProviderPillView, p: Palette) -> El
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.card)
         .border(1.0, border)
         .focusable(true)
@@ -4996,7 +4961,7 @@ fn update_result_notice(notice: &crate::fleet_update::ResultNotice, p: Palette) 
         .mb(8.0)
         .px(8.0)
         .py(4.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.card)
         .border(1.0, if notice.success { p.line } else { p.danger })
         .child(card)
@@ -5009,14 +4974,14 @@ fn update_result_notice(notice: &crate::fleet_update::ResultNotice, p: Palette) 
         ))
 }
 
-/// A sidebar section label: Departure Mono, uppercase, muted. Counts and buttons follow it.
+/// A sidebar section label: Inter 12/500, sentence case, muted. Counts and buttons follow it.
 fn section_title(title: &str, p: Palette) -> El {
     row()
         .h(30.0)
         .pl(ROW_INSET)
         .pr(4.0)
         .center_y()
-        .child(pixel_label(title, p.muted))
+        .child(meta_label(title, p.muted))
         .child(spacer())
 }
 /// The dotted divider (2 px on, 2 px off) between sidebar sections.
@@ -5030,18 +4995,12 @@ fn dotted_rule(p: Palette) -> El {
         .border_dash(2.0, 2.0)
         .a11y_hidden()
 }
-/// A selected sidebar row: the `row` fill and a 3 px coral bar on the left edge, the full
-/// height of the row, with square ends. Hover is a fill only.
+/// A selected sidebar row: KSG's rounded `row` fill with a hairline. Hover is a fill only.
 fn select_bar(item: El, selected: bool, p: Palette) -> El {
     if !selected {
         return item;
     }
-    item.fill(p.row).corners([0.0, 4.0, 4.0, 0.0]).child(
-        el().w(3.0)
-            .fill(p.coral)
-            .pin(Some(0.0), Some(0.0), None, Some(0.0))
-            .a11y_hidden(),
-    )
+    item.fill(p.row).radius(8.0).border(1.0, p.line)
 }
 fn face_for(status: Status) -> crate::visuals::Face {
     use crate::visuals::Face;
@@ -5095,7 +5054,7 @@ fn portrait_face(
 const PICKER_PORTRAIT: f32 = 40.0;
 /// Every machine uses the same portrait size, including before a captain is selected.
 const CAPTAIN_SLOT: f32 = 44.0;
-/// A sidebar portrait is 40 px inside its 44 px slot, so the pixel frame's shadow fits in it.
+/// A sidebar portrait is 40 px inside its 44 px slot.
 const CAPTAIN_FACE: f32 = 40.0;
 /// Room for one badge at the end of the name line, kept even when there is none, so a
 /// badge arriving never moves the name.
@@ -5160,16 +5119,16 @@ fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
         CountKind::NeedsYou => (p.brass, p.on_brass, p.frame),
         CountKind::Unread => (p.card, p.ink, p.frame),
     };
-    // A square with Departure Mono digits and a 1 px frame, no shadow.
+    // A square with Inter digits and a 1 px frame, no shadow.
     row()
         .h(18.0)
         .min_w(18.0)
         .px(3.0)
-        .radius(2.0)
+        .radius(4.0)
         .fill(fill)
         .border(1.0, frame)
         .center()
-        .child(label(text, PIXEL, ink))
+        .child(label(text, META, ink))
 }
 
 /// A row's hover and selection washes, after Grok Bot's bot list: ink at about 6% on hover
@@ -5260,7 +5219,7 @@ fn captain_row(
         .h(18.0)
         .gap(8.0)
         .center_y()
-        .child(pixel_text(status_label, status_ink).key(format!("captain-state-{id}")));
+        .child(meta_text(status_label, status_ink).key(format!("captain-state-{id}")));
     if !detail.is_empty() {
         status_line = status_line.child(
             label(detail.clone(), CAPTAIN_STATUS, p.muted)
@@ -5310,7 +5269,7 @@ fn captain_row(
         status_line = status_line.child(
             label(
                 elapsed_label(start.elapsed().as_secs()),
-                PIXEL.features(TABULAR),
+                META.features(TABULAR),
                 p.muted,
             )
             .key(format!("captain-timer-{id}"))
@@ -5365,7 +5324,7 @@ fn captain_row(
     }
     select_bar(
         item.label(description)
-            .radius(4.0)
+            .radius(6.0)
             .fill(Color::TRANSPARENT)
             .hover(hover)
             .press(active)
@@ -5415,7 +5374,7 @@ fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
         return el().size(size, size).child(portrait).child(
             el().absolute(offset, offset)
                 .size(backing, backing)
-                .radius(2.0)
+                .radius(backing / 2.0)
                 .fill(p.panel)
                 .border(1.0, p.frame)
                 .center()
@@ -5451,7 +5410,7 @@ fn row_status(s: &State, thread: &Thread) -> (Status, bool) {
 }
 
 /// Ported from KSG Code's `Toasts` (`components/ui/toast.tsx`) and `stackedThreadToast`,
-/// styled with Shina's Pixel Voyage framed card.
+/// styled as a framed card.
 fn toast_stack(s: &State, p: Palette, top: f32) -> El {
     let mut stack = col()
         .key("toast-stack")
@@ -5473,10 +5432,10 @@ fn toast_stack(s: &State, p: Palette, top: f32) -> El {
             .w_full()
             .padding(12.0)
             .gap(6.0)
-            .radius(6.0)
+            .radius(12.0)
             .fill(p.card)
-            .border(2.0, p.frame)
-            .box_shadow(hard_shadow(p))
+            .border(1.0, p.frame)
+            .box_shadow(soft_shadow(p))
             .child(
                 row()
                     .w_full()
@@ -5625,7 +5584,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         ))
         .focusable(true)
         .w_full()
-        .radius(4.0)
+        .radius(6.0)
         .fill(Color::TRANSPARENT)
         .hover(p.selected)
         .on_press_tx({
@@ -5676,7 +5635,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
 
     // The mark only shows what deserves a glance: work in progress, something that needs the
     // user, a failure, an unread result, a draft or a pin. Quiet rows leave it out.
-    let dot = |ink: Color| el().size(6.0, 6.0).fill(ink);
+    let dot = |ink: Color| el().size(6.0, 6.0).radius(3.0).fill(ink);
     let mark = if approval || thread.request.is_some() || row_status == Status::Waiting {
         Some(dot(p.brass))
     } else if row_status == Status::Running || row_status == Status::Failed {
@@ -5766,7 +5725,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     .px(6.0)
                     .gap(4.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .hover(p.line)
                     .child(tool_icon(glyph, p.muted))
                     .child(label(title, SMALL, p.muted))
@@ -5807,7 +5766,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         }
     } else if thread.life.woke(at) {
         slot = slot.child(
-            pixel_text("Woke", p.sea)
+            meta_text("Woke", p.sea)
                 .key(format!("thread-woke-{id}"))
                 .role("button")
                 .cursor(rune::Cursor::Pointer)
@@ -5832,7 +5791,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             }
             _ => state_label.to_string(),
         };
-        slot = slot.child(label(text, PIXEL.features(TABULAR), ink));
+        slot = slot.child(label(text, META.features(TABULAR), ink));
     } else {
         let time = match section {
             Section::Snoozed => Some(lifecycle::wake_label(
@@ -5843,7 +5802,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             _ => relative_time(thread.updated),
         };
         if let Some(time) = time {
-            slot = slot.child(pixel_text(time, p.muted).key(format!("thread-age-{id}")));
+            slot = slot.child(meta_text(time, p.muted).key(format!("thread-age-{id}")));
         }
     }
     if thread.machine != "local" {
@@ -6009,8 +5968,8 @@ fn project_tile(
     // A pixel-framed square. At 16 px the frame is 1 px, so the initial still has room.
     let tile = el()
         .size(size, size)
-        .radius(2.0)
-        .clip_rounded(2.0)
+        .radius(4.0)
+        .clip_rounded(4.0)
         .border(1.0, p.frame)
         .a11y_hidden();
     let Some(project) = project else {
@@ -6035,7 +5994,7 @@ fn project_tile(
         .unwrap_or_default();
     tile.center()
         .fill(hue.alpha(if s.dark { 0.45 } else { 0.35 }))
-        .child(label(initial, PIXEL, p.ink))
+        .child(label(initial, META, p.ink))
 }
 
 /// A row's workspace name, unless the Workspace filter already names that one workspace.
@@ -6089,7 +6048,7 @@ fn sidebar_row_width(s: &State) -> f32 {
     sidebar - 8.0
 }
 
-/// About how wide a status or age slot is: Departure Mono 11 px cells of 6.6 pt, with room for
+/// About how wide a status or age slot is: 12 px Inter figures of about 6.6 pt, with room for
 /// "1m" when the row shows nothing.
 fn slot_width(text: Option<&str>) -> f32 {
     text.map_or(14.0, |text| text.chars().count() as f32 * 6.6)
@@ -6211,7 +6170,7 @@ fn captain_selector_trigger(s: &State, p: Palette, icon_only: bool) -> El {
         .center_y()
         .min_w(0.0)
         .shrink()
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .focusable(!locked)
         .cursor(if locked {
@@ -6275,7 +6234,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .gap(6.0)
             .h(30.0)
             .px(10.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.selected)
             .field_focus(&s.captain_picker_query, p)
             .grow(1.0)
@@ -6287,7 +6246,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     .label("Search captains")
                     .placeholder("Search captains", p.muted)
                     .color(p.ink)
-                    .caret(p.coral, p.coral_bg)
+                    .caret(p.ink, p.coral_bg)
                     .grow(1.0)
                     .min_w(0.0)
                     .on_edit(|s: &mut State| &mut s.captain_picker_query)
@@ -6328,7 +6287,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .mx(4.0)
         .pl(12.0)
         .pr(8.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(if no_captain_selected {
             p.coral_bg
         } else {
@@ -6364,7 +6323,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
     list = list.child(no_captain);
 
     if !filtered.is_empty() {
-        list = list.child(pixel_label("Captains", p.muted).px(16.0).pt(6.0).pb(4.0));
+        list = list.child(meta_label("Captains", p.muted).px(16.0).pt(6.0).pb(4.0));
     }
 
     let filtered_empty = filtered.is_empty() && !query.is_empty();
@@ -6385,7 +6344,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .mx(4.0)
             .pl(12.0)
             .pr(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(if selected {
                 p.coral_bg
             } else {
@@ -6433,10 +6392,10 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .role("dialog")
         .label("Choose a captain")
         .w(PICKER_WIDTH)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(header)
         .child(list)
@@ -6453,7 +6412,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .mx(4.0)
         .pl(12.0)
         .pr(8.0)
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .focus_fill(p.selected)
         .on_press(|s: &mut State| s.begin_new_captain())
@@ -6537,13 +6496,13 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                     .focusable(true)
                     .size(PICKER_CELL, PICKER_CELL)
                     .center()
-                    .radius(4.0)
+                    .radius(6.0)
                     .hover(p.selected)
                     .on_press(move |s: &mut State| {
                         s.captain_editor.as_mut().unwrap().portrait = portrait;
                     })
-                    // The selected portrait's own 2 px frame and hard shadow turn coral. There is
-                    // no ring or wash around it, so all twelve keep the same outer bounds.
+                    // The selected portrait's own frame turns the ring colour. There is no wash
+                    // around it, so all twelve keep the same outer bounds.
                     .child(
                         portrait_face(
                             s,
@@ -6551,7 +6510,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                             portrait,
                             PICKER_PORTRAIT,
                             Status::Ready,
-                            selected.then_some(p.coral),
+                            selected.then_some(p.ring),
                         )
                         // The editor's header shows the chosen portrait at the same size.
                         .key(format!("captain-portrait-face-{portrait}")),
@@ -6579,7 +6538,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 let mut lives = col()
                     .key("captain-machine-row")
                     .gap(5.0)
-                    .child(pixel_label("Lives on", p.muted))
+                    .child(meta_label("Lives on", p.muted))
                     .child(
                         menu_item(
                             if promotion.is_some() { "captain-promote-machine" } else { "captain-machine-choice" },
@@ -6625,7 +6584,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Workspace", p.muted))
+                .child(meta_label("Workspace", p.muted))
                 .child(
                     row()
                         .key(if promotion.is_some() { "captain-promote-workspace" } else { "captain-project-choice" })
@@ -6644,7 +6603,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .px(8.0)
                         .gap(10.0)
                         .center_y()
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(field)
                         .border(1.0, p.field_line)
                         .opacity(if editing { 0.6 } else { 1.0 })
@@ -6678,23 +6637,23 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                 .child(
                     row()
                         .gap(6.0)
-                        .child(pixel_label("Portrait", p.muted))
+                        .child(meta_label("Portrait", p.muted))
                         .child(label(crate::visuals::PORTRAIT_NAMES[chosen], SMALL, p.ink)),
                 )
                 .child(portraits),
         )
         .child(
-            col().gap(5.0).child(pixel_label("Name", p.muted)).child(
+            col().gap(5.0).child(meta_label("Name", p.muted)).child(
                 text_input(&editor.name, BODY)
                     .key("captain-name")
                     .label("Captain name")
                     .placeholder("e.g. Atlas", p.muted)
                     .single_line()
                     .color(p.ink)
-                    .caret(p.coral, p.coral_bg)
+                    .caret(p.ink, p.coral_bg)
                     .w_full()
                     .padding(8.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(field)
                     .field_focus(&editor.name, p)
                     .disabled(profile_locked)
@@ -6704,7 +6663,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Role (optional)", p.muted))
+                .child(meta_label("Role (optional)", p.muted))
                 .child(
                     text_input(&editor.role, BODY)
                         .key("captain-role")
@@ -6712,10 +6671,10 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                         .placeholder("e.g. Code review", p.muted)
                         .single_line()
                         .color(p.ink)
-                        .caret(p.coral, p.coral_bg)
+                        .caret(p.ink, p.coral_bg)
                         .w_full()
                         .padding(8.0)
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(field)
                         .field_focus(&editor.role, p)
                         .disabled(profile_locked)
@@ -6725,19 +6684,19 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Instructions for Pi", p.muted))
+                .child(meta_label("Instructions for Pi", p.muted))
                 .child(
                     text_input(&editor.instructions, BODY)
                         .key("captain-instructions")
                         .label("Captain instructions")
                         .placeholder("What should this captain focus on? Optional.", p.muted)
                         .color(p.ink)
-                        .caret(p.coral, p.coral_bg)
+                        .caret(p.ink, p.coral_bg)
                         .w_full()
                         .min_h(76.0)
                         .max_h(140.0)
                         .padding(8.0)
-                        .radius(4.0)
+                        .radius(6.0)
                         .fill(field)
                         .field_focus(&editor.instructions, p)
                         .disabled(profile_locked)
@@ -6763,9 +6722,9 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         // ProjectIconPickerDialog layout with the approved role-change summary.
         body = body.child(
             col().key("captain-promote-summary").gap(6.0)
-                .child(pixel_label("What stays", p.muted))
+                .child(meta_label("What stays", p.muted))
                 .child(label("The conversation, its model, access mode, workspace, machine, tasks and pull requests.", BODY, p.muted).wrap())
-                .child(pixel_label("What changes", p.muted))
+                .child(meta_label("What changes", p.muted))
                 .child(label("It moves to Captains and gets a Brief. Its scope starts as this workspace.", BODY, p.muted).wrap()),
         );
         if let Some(captain) = promotion.restore_candidate {
@@ -6843,10 +6802,10 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
         .max_h((height - 32.0).max(240.0))
         .padding(18.0)
         .gap(14.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -6922,18 +6881,13 @@ const TAB_MIN_WIDTH: f32 = 120.0;
 const TAB_MAX_WIDTH: f32 = 260.0;
 /// Inter 13/520, the title in a tab.
 const TAB_TITLE: TextStyle = TextStyle::new(13.0, 520.0);
-/// A tab's look. The active tab is a `card` with a pixel frame (no shadow) and a 2 px coral bar
-/// along the bottom inside it. Others have no fill.
+/// A tab's look, as KSG's chat tabs: the active tab is a `card` with a hairline and 8 px
+/// corners. Others have no fill.
 fn tab_frame(tab: El, active: bool, p: Palette) -> El {
     if !active {
         return tab.hover(p.selected);
     }
-    tab.fill(p.card).border(2.0, p.frame).child(
-        el().h(2.0)
-            .fill(p.coral)
-            .pin(Some(2.0), None, Some(2.0), Some(2.0))
-            .a11y_hidden(),
-    )
+    tab.fill(p.card).radius(8.0).border(1.0, p.line)
 }
 
 /// The new-tab plus: a framed 24 px square.
@@ -6994,7 +6948,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                 .pl(8.0)
                 .pr(if s.tabs.len() > 1 { 2.0 } else { 8.0 })
                 .h(TAB_HEIGHT)
-                .radius(4.0)
+                .radius(6.0)
                 .w(tab_width)
                 .min_w(tab_width)
                 .hover_group()
@@ -7006,7 +6960,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
             p,
         )
         .child(if tab_width >= TAB_PREFIX_WIDTH {
-            pixel_text(project, p.muted).max_w(85.0).truncate()
+            meta_text(project, p.muted).max_w(85.0).truncate()
         } else {
             // A tab at its minimum gives the width to the title.
             el()
@@ -7022,7 +6976,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                 .focusable(true)
                 .size(22.0, 22.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .press(p.selected)
                 .on_press(move |s: &mut State| s.close_tab(id))
@@ -7120,7 +7074,7 @@ fn right_panel_tab(
             .focusable(true)
             .cursor(rune::Cursor::Pointer)
             .center()
-            .radius(4.0)
+            .radius(6.0)
             .hover(p.selected)
             .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
             .on_press(move |s: &mut State| {
@@ -7163,7 +7117,7 @@ fn right_panel_tab(
             })
             .child(
                 el().size(20.0, 20.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .center()
                     .child(icon(glyph, p.ink).size(12.0, 12.0))
                     .child(close_face),
@@ -7458,10 +7412,10 @@ fn right_panel_tab_menu(s: &State, p: Palette) -> El {
         .w(222.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored_fit(anchor, rune::Side::Right, rune::Align::Start, 2.0)
         .modal(true, |s: &mut State| s.right_panel_menu = None)
         .child(item(
@@ -7545,11 +7499,11 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 .h(20.0)
                 .px(6.0)
                 .mr(6.0)
-                .radius(4.0)
+                .radius(6.0)
                 .center_y()
                 .fill(p.card)
                 .label("Demo data, read-only")
-                .child(pixel_label("Demo", p.brass)),
+                .child(meta_label("Demo", p.brass)),
             p,
         )
     } else {
@@ -7657,10 +7611,10 @@ fn thread_menu(s: &State, p: Palette) -> El {
         .w(232.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored_fit("thread-actions", rune::Side::Bottom, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.thread_menu = false)
         .child(thread_actions(s, s.current().id, p, "thread-actions"))
@@ -8220,17 +8174,12 @@ fn snooze_menu(s: &State, p: Palette) -> El {
         .w(280.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         // The title is a pixel label, inset 8 px so it lines up with the rows' icons.
-        .child(
-            pixel_label("Snooze thread", p.muted)
-                .px(8.0)
-                .pt(6.0)
-                .pb(4.0),
-        );
+        .child(meta_label("Snooze thread", p.muted).px(8.0).pt(6.0).pb(4.0));
     if s.custom_snooze_open {
         card = card
             .child(label("Local date and time, or duration", SMALL, p.muted).px(8.0))
@@ -8244,7 +8193,7 @@ fn snooze_menu(s: &State, p: Palette) -> El {
                     .w_full()
                     .padding(8.0)
                     .mx(4.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(field_fill(s, p))
                     .field_focus(&s.snooze_edit, p)
                     .on_edit(|s: &mut State| &mut s.snooze_edit),
@@ -8422,10 +8371,10 @@ fn row_menu(s: &State, p: Palette) -> El {
         .w(222.0)
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored_fit(
             if s.row_menu_at.is_some() {
                 "row-menu-point".into()
@@ -8468,10 +8417,10 @@ fn thread_dialog(s: &State, p: Palette) -> El {
         .max_w(540.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label(title, DIALOG_TITLE, p.ink));
     if renaming {
@@ -8493,7 +8442,7 @@ fn thread_dialog(s: &State, p: Palette) -> El {
                 .color(p.ink)
                 .w_full()
                 .padding(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(if s.dark { p.bg } else { p.panel })
                 .field_focus(&s.rename_edit, p)
                 .on_edit(|s: &mut State| &mut s.rename_edit)
@@ -8573,16 +8522,16 @@ fn modal_frame(key: &str, s: &State, close: fn(&mut State), card: El) -> El {
 }
 
 /// A keyboard hint for a modal's footer: the key in a small cap, then what it does.
-/// A key name in an outlined Departure Mono chip.
+/// A key name in an outlined chip.
 fn keycap_chip(keys: &str, p: Palette) -> El {
     outlined(
         row()
             .h(20.0)
             .px(6.0)
             .center_y()
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.card)
-            .child(pixel_text(keys, p.muted)),
+            .child(meta_text(keys, p.muted)),
         p,
     )
 }
@@ -8602,10 +8551,10 @@ fn popover(key: &str, name: &str, _: &State, p: Palette) -> El {
         .label(name)
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -8816,7 +8765,7 @@ fn project_picker(s: &State, p: Palette) -> El {
         .w(520.0)
         .max_h(460.0)
         .padding(4.0)
-        .radius(6.0)
+        .radius(12.0)
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -8826,7 +8775,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                 .px(8.0)
                 .gap(10.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(field_fill(s, p))
                 .field_focus(&s.picker_query, p)
                 .child(
@@ -8986,7 +8935,7 @@ fn project_picker(s: &State, p: Palette) -> El {
             .pr(8.0)
             .gap(10.0)
             .center_y()
-            .radius(4.0)
+            .radius(6.0)
             .fill(if index == highlight {
                 p.coral_bg
             } else {
@@ -9261,7 +9210,7 @@ fn palette_row(key: String, glyph: &str, title: &str, detail: &str, lit: bool, p
         .py(6.0)
         .gap(10.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .fill(if lit { p.coral_bg } else { Color::TRANSPARENT })
         .hover(p.selected)
         .child(el().size(16.0, 16.0).center().child(icon(glyph, p.muted)))
@@ -9325,7 +9274,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         .px(8.0)
         .gap(10.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .fill(field_fill(s, p))
         .field_focus(&s.picker_query, p)
         .child(el().size(16.0, 16.0).center().child(icon(
@@ -9432,7 +9381,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .px(8.0)
                 .gap(8.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .border(1.0, p.frame)
                 .hover(p.selected)
                 .disabled(s.client.is_some() && !s.machine_connected(&s.machines.selected))
@@ -9445,7 +9394,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                     },
                 ))
                 .child(
-                    pixel_text(
+                    meta_text(
                         if folders.is_empty() {
                             "Enter"
                         } else {
@@ -9454,7 +9403,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                         p.muted,
                     )
                     .px(4.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(p.selected),
                 ),
         );
@@ -9464,7 +9413,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
         .w(560.0)
         .max_h(480.0)
         .padding(4.0)
-        .radius(6.0)
+        .radius(12.0)
         .on_press(|_: &mut State| {});
     if machine_options(s).len() > 1 {
         let mut machines = col().key("project-machine-row").gap(1.0);
@@ -9553,7 +9502,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 != Some(&(s.machines.selected.clone(), query.clone()))
         {
             list = list.child(
-                pixel_text("Loading", p.muted)
+                meta_text("Loading", p.muted)
                     .key("browse-loading")
                     .px(8.0)
                     .py(10.0),
@@ -9677,8 +9626,13 @@ fn add_project_palette(s: &State, p: Palette) -> El {
 
 /// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
 fn tool_verb(tool: &Tool) -> String {
+    tool_verb_in(tool, tool.done || tool.failed)
+}
+
+/// The verb for a call in a given tense. KSG's live activity row keeps the present tense
+/// ("Reading") while its turn is still acting on the result (`liveActivityToolStatus`).
+fn tool_verb_in(tool: &Tool, done: bool) -> String {
     use crate::work::ToolKind::*;
-    let done = tool.done || tool.failed;
     match (tool.resolved_kind(), done) {
         (Read, true) => "Read".into(),
         (Read, false) => "Reading".into(),
@@ -9735,15 +9689,84 @@ enum TranscriptPart {
         from: usize,
         to: usize,
     },
+    /// Cards that keep their own place: plans, rendered HTML and a captain's delegations.
     Tools(Vec<usize>),
+    /// Thinking before grouping; `turn_parts` folds every run of it into `Work`.
     Thought(Vec<usize>),
+    /// One streak of thoughts and ordinary tool calls between prose, in order.
+    Work(Vec<WorkEntry>),
     Compaction(usize),
     Retry(usize),
+}
+
+/// A step of a work streak: a tool call or a thought, by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum WorkEntry {
+    Tool(usize),
+    Thought(usize),
 }
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
 fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
     turn_parts_in(t, &timeline_structure(t).events, start, end)
+}
+
+/// A tool that shows as its own card rather than a step: a plan, rendered HTML, a captain's
+/// delegation, or a subagent run with its result cards (KSG keeps subagent events out of
+/// work groups too).
+fn is_card_tool(t: &Thread, index: usize) -> bool {
+    let tool = &t.tools[index];
+    if !tool.subagents.is_empty() {
+        return true;
+    }
+    match tool.resolved_kind() {
+        crate::work::ToolKind::Plan | crate::work::ToolKind::Subagent => true,
+        crate::work::ToolKind::Html => {
+            crate::html_render::find_reference(&tool.structured).is_some()
+        }
+        _ => t.captain_home && !t.delegated && crew_ui::is_delegation(tool),
+    }
+}
+
+/// Ported from KSG Code's `deriveTimelineRows` grouping (`MessagesTimeline.logic.ts`): every
+/// contiguous run of reasoning and tool entries between prose is one work group. Cards,
+/// compactions and retries end a run.
+fn group_work(t: &Thread, parts: Vec<TranscriptPart>) -> Vec<TranscriptPart> {
+    let mut out: Vec<TranscriptPart> = Vec::with_capacity(parts.len());
+    let push_entry = |out: &mut Vec<TranscriptPart>, entry: WorkEntry| {
+        if let Some(TranscriptPart::Work(entries)) = out.last_mut() {
+            entries.push(entry);
+        } else {
+            out.push(TranscriptPart::Work(vec![entry]));
+        }
+    };
+    for part in parts {
+        match part {
+            TranscriptPart::Thought(indices) => {
+                for index in indices {
+                    push_entry(&mut out, WorkEntry::Thought(index));
+                }
+            }
+            TranscriptPart::Tools(indices) => {
+                // Cards from one call batch stay one part, as the crew's task cards expect.
+                let mut cards_open = false;
+                for index in indices {
+                    if !is_card_tool(t, index) {
+                        push_entry(&mut out, WorkEntry::Tool(index));
+                        cards_open = false;
+                    } else if cards_open && let Some(TranscriptPart::Tools(cards)) = out.last_mut()
+                    {
+                        cards.push(index);
+                    } else {
+                        out.push(TranscriptPart::Tools(vec![index]));
+                        cards_open = true;
+                    }
+                }
+            }
+            part => out.push(part),
+        }
+    }
+    out
 }
 
 fn turn_events(events: &[TimelineEvent], start: usize, end: usize) -> &[TimelineEvent] {
@@ -9753,6 +9776,16 @@ fn turn_events(events: &[TimelineEvent], start: usize, end: usize) -> &[Timeline
 }
 
 fn turn_parts_in(
+    t: &Thread,
+    events: &[TimelineEvent],
+    start: usize,
+    end: usize,
+) -> Vec<TranscriptPart> {
+    group_work(t, event_parts_in(t, events, start, end))
+}
+
+/// A turn's parts in event order, before thoughts and tools are grouped into work streaks.
+fn event_parts_in(
     t: &Thread,
     events: &[TimelineEvent],
     start: usize,
@@ -9846,15 +9879,19 @@ fn activity_line(
         .min_h(26.0)
         .px(6.0)
         .ml(-6.0)
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .child(
             el().size(24.0, 24.0)
                 .center()
                 .child(tool_icon(glyph, secondary)),
         )
-        // The verb is Departure Mono in sentence case; what it acted on stays Inter.
-        .child(pixel_text(verb, if failed { p.danger } else { secondary }));
+        // The verb is medium weight; what it acted on is regular, as KSG's tool rows.
+        .child(label(
+            verb,
+            TextStyle::new(13.0, 500.0).tracking(-0.08),
+            if failed { p.danger } else { secondary },
+        ));
     if !detail.is_empty() {
         line = line.child(
             label(detail, ACTIVITY, tertiary)
@@ -9864,10 +9901,95 @@ fn activity_line(
         );
     }
     if failed {
-        line = line.child(pixel_text("failed", p.danger));
+        line = line.child(meta_text("failed", p.danger));
     }
     line.child(icon(if open { "chevron" } else { "open" }, tertiary).opacity(0.8))
         .child(spacer())
+}
+
+/// KSG Code's `WORKING_BAR_CLASS_NAME` (`chat/TimelineRowParts.tsx`): a 32 pt bar over a 1 px
+/// `--timeline-working-rule`, 5 pt in at the start and 4 pt at the end. A running turn's
+/// "Working for" and a finished turn's "Worked for" are this one bar.
+fn working_bar_frame(dark: bool, p: Palette) -> El {
+    row()
+        .w_full()
+        .min_w(0.0)
+        .h(32.0)
+        .center_y()
+        .gap(10.0)
+        .pl(5.0)
+        .pr(4.0)
+        .border_sides(
+            [0.0, 0.0, 1.0, 0.0],
+            if dark { color("#242424") } else { p.line },
+        )
+}
+
+/// The folded work bar's button, ported from KSG Code's `WorkFoldToggle` and `WorkFoldCaret`:
+/// muted 13 px text that brightens on hover, with a 12 pt chevron 8 pt after it. It goes in
+/// a `working_bar_frame`.
+fn work_fold_toggle(key: String, a11y: String, title: &str, open: bool, p: Palette) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(a11y)
+        .focusable(true)
+        .hover_group()
+        .h_full()
+        .center_y()
+        .gap(8.0)
+        .radius(6.0)
+        .child(label(title, ACTIVITY, p.muted).group_color(p.ink))
+        .child(icon(if open { "chevron" } else { "open" }, p.faint).size(12.0, 12.0))
+}
+
+/// The bar's live label, as KSG's `WorkingTimelineRow` words it: stopping, paused on a
+/// request (the clock stops), compacting, or working, with the turn's tabular timer.
+fn working_label(t: &Thread) -> (&'static str, Option<u64>) {
+    let elapsed = t.started.map(|start| start.elapsed().as_secs());
+    let mut cache = t.timeline_cache.borrow_mut();
+    if t.request.is_none() {
+        cache.paused_at = None;
+    }
+    if t.phase == "Stopping" || t.stop_control.phase().is_some() {
+        return ("Stopping…", None);
+    }
+    if t.request.is_some() {
+        let at = *cache.paused_at.get_or_insert(elapsed.unwrap_or(0));
+        return ("Paused at ", Some(at));
+    }
+    match (t.phase == "Compacting context", elapsed) {
+        (true, Some(seconds)) => ("Compacting for ", Some(seconds)),
+        (true, None) => ("Compacting…", None),
+        (false, Some(seconds)) if seconds > 0 => ("Working for ", Some(seconds)),
+        (false, _) => ("Working...", None),
+    }
+}
+
+/// The tabular timer in the bar's own 13 px type, so each tick keeps its width.
+const BAR_TIMER: TextStyle = ACTIVITY.features(TABULAR);
+
+/// Ported from KSG Code's `WorkingTimelineRow`: the running turn's bar at its top, under the
+/// captain's name. It is not a toggle while the turn runs, so it has no chevron.
+fn working_bar(t: &Thread, dark: bool, p: Palette) -> El {
+    let (words, seconds) = working_label(t);
+    let mut text = row().center_y().min_w(0.0).shrink().child(
+        label(words, ACTIVITY, p.muted)
+            .key(format!("working-label-{}", t.id))
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+    );
+    if let Some(seconds) = seconds {
+        text = text.child(
+            label(timer_label(seconds), BAR_TIMER, p.muted).key(format!("live-timer-{}", t.id)),
+        );
+    }
+    working_bar_frame(dark, p)
+        .key(format!("working-bar-{}", t.id))
+        .role("status")
+        .child(text)
 }
 
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
@@ -9918,54 +10040,134 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
 }
 
 fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
-    if indices.len() == 1 {
-        return inline_tool(s, p, indices[0]);
+    let entries: Vec<_> = indices.iter().map(|&i| WorkEntry::Tool(i)).collect();
+    work_part(s, p, &entries)
+}
+
+/// The tool calls of a work streak, in order.
+fn entry_tools(entries: &[WorkEntry]) -> impl Iterator<Item = usize> + '_ {
+    entries.iter().filter_map(|entry| match entry {
+        WorkEntry::Tool(index) => Some(*index),
+        WorkEntry::Thought(_) => None,
+    })
+}
+
+/// The thoughts of a work streak, in order.
+fn entry_thoughts(entries: &[WorkEntry]) -> Vec<usize> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            WorkEntry::Thought(index) => Some(*index),
+            WorkEntry::Tool(_) => None,
+        })
+        .collect()
+}
+
+/// Whether a work streak is unfolded. Its first tool call holds the flag, as a tool group's did;
+/// a streak of thinking alone opens with its first thought.
+fn group_open(t: &Thread, entries: &[WorkEntry]) -> bool {
+    match entry_tools(entries).next() {
+        Some(index) => t.tools[index].group_expanded,
+        None => entry_thoughts(entries)
+            .first()
+            .is_some_and(|&index| t.thoughts[index].expanded),
     }
+}
+
+/// Flips a work streak's fold flag. `tool_id` names its first call; `None` is a streak of
+/// thinking alone, which folds with its first thought (`thought`).
+fn toggle_group(t: &mut Thread, tool_id: Option<&str>, thought: Option<(usize, usize, usize)>) {
+    if let Some(id) = tool_id {
+        if let Some(tool) = t.tools.iter_mut().find(|tool| tool.id == id) {
+            tool.group_expanded = !tool.group_expanded;
+            let message = tool.anchor.message;
+            t.timeline_cache.get_mut().touch_message(message);
+        }
+    } else if let Some((message, block, offset)) = thought
+        && let Some(thought) = t.thoughts.iter_mut().find(|thought| {
+            thought.anchor.message == message
+                && thought.block == block
+                && thought.anchor.offset == offset
+        })
+    {
+        thought.expanded = !thought.expanded;
+        t.timeline_cache.get_mut().touch_message(message);
+    }
+}
+
+/// One step of an unfolded work streak.
+fn work_entry_row(s: &State, p: Palette, entry: WorkEntry) -> El {
+    match entry {
+        WorkEntry::Tool(index) => inline_tool(s, p, index),
+        WorkEntry::Thought(index) => work_ui::thoughts(s, p, &[index]),
+    }
+}
+
+/// A work streak as one transcript part: a lone call is its own row, thinking alone keeps its
+/// "Thought" disclosure, and anything longer folds under one header, as KSG Code's
+/// `WorkGroupToggleTimelineRow` and `WorkLogList` (16 pt in, `ps-4`) show it.
+fn work_part(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
     let t = s.current();
-    let mut group = tool_group_head(s, p, indices);
-    if t.tools[indices[0]].group_expanded {
-        let mut rows = col().pl(14.0).gap(0.0);
-        for index in indices {
-            rows = rows.child(inline_tool(s, p, *index));
+    let thoughts = entry_thoughts(entries);
+    if thoughts.len() == entries.len() {
+        return work_ui::thoughts(s, p, &thoughts);
+    }
+    if entries.len() == 1 {
+        return work_entry_row(s, p, entries[0]);
+    }
+    let mut group = work_group_head(s, p, entries);
+    if group_open(t, entries) {
+        let mut rows = col().pl(WORK_LIST_INDENT).gap(WORK_GAP);
+        for entry in entries {
+            rows = rows.child(work_entry_row(s, p, *entry));
         }
         group = group.child(rows);
     }
     group
 }
 
-/// A tool group's keyed column and summary line, without its rows. Long turns
-/// place each grouped row in its own transcript slice.
-fn tool_group_head(s: &State, p: Palette, indices: &[usize]) -> El {
+/// KSG's `WorkLogList` indent (`ps-4`) for the steps of an unfolded group.
+const WORK_LIST_INDENT: f32 = 16.0;
+/// The space between work rows.
+const WORK_GAP: f32 = 2.0;
+
+/// A work streak's keyed column and summary line, without its rows, ported from KSG Code's
+/// `WorkGroupHeader`. The summary counts the calls (`summarizeToolGroup` leaves thinking out);
+/// the icon is the calls' own when they are all one kind. Long turns place each row of an
+/// unfolded streak in its own transcript slice.
+fn work_group_head(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
     let t = s.current();
+    let indices: Vec<usize> = entry_tools(entries).collect();
     let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
     let first = indices[0];
     let first_id = tools[0].id.clone();
-    let expanded = tools[0].group_expanded;
-    let failed = tools.iter().filter(|tool| tool.failed).count();
+    let expanded = group_open(t, entries);
+    let failed = tools.last().is_some_and(|tool| tool.failed);
     let summary = tool_summary(&tools);
+    let kind = tools[0].resolved_kind();
+    let glyph = if tools.iter().all(|tool| tool.resolved_kind() == kind) {
+        work_ui::kind_icon(kind)
+    } else {
+        "list"
+    };
     let toggle_key = format!("toggle-tool-group-{}-{first}", t.id);
     let press_key = toggle_key.clone();
     col()
         .key(format!("tool-group-{}-{first}", t.id))
-        .gap(2.0)
+        .gap(WORK_GAP)
         .child(
             activity_line(
                 toggle_key,
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
                 (summary.clone(), ""),
-                failed > 0,
+                failed,
                 expanded,
-                "list",
+                glyph,
                 p,
             )
             .on_press_tx(move |s: &mut State, tx| {
                 tx.keep_on_screen(press_key.clone());
-                let thread = s.current_mut();
-                if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == first_id) {
-                    tool.group_expanded = !tool.group_expanded;
-                    let message = tool.anchor.message;
-                    thread.timeline_cache.get_mut().touch_message(message);
-                }
+                toggle_group(s.current_mut(), Some(&first_id), None);
             }),
         )
 }
@@ -9992,6 +10194,7 @@ fn transcript_part(
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
         TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
+        TranscriptPart::Work(entries) => work_part(s, p, entries),
         TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
         TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
@@ -10024,7 +10227,7 @@ fn transcript_part(
                     .filter(|m| m.entry_id == *message_id)
                     .and_then(|m| {
                         (m.occurrence >= *occ_base && m.occurrence < *occ_base + hits)
-                            .then_some(m.occurrence - *occ_base)
+                            .then(|| m.occurrence - *occ_base)
                     });
                 *occ_base += hits;
                 Some((query, active_occ))
@@ -10056,7 +10259,7 @@ fn transcript_part(
                 },
             );
             if cite_query.is_some() && !cite_matched {
-                rendered.fill(p.coral_bg).radius(4.0)
+                rendered.fill(p.coral_bg).radius(6.0)
             } else {
                 rendered
             }
@@ -10064,20 +10267,417 @@ fn transcript_part(
     }
 }
 
-/// What the agent is doing right now, for the live status line at the end of a turn. A
-/// running tool or thought already names itself in its own row, so the line says Working.
-fn live_status(t: &Thread) -> String {
-    let _ = timeline_structure(t);
-    if !t.timeline_cache.borrow().unfinished_tools.is_empty()
-        || t.thoughts.last().is_some_and(|thought| !thought.done)
-    {
-        return "Working".into();
+/// What the agent is doing while no step of the live tail is in progress, as KSG Code's
+/// `ThinkingTimelineRow` words it: "Thinking", "Waiting on subagents", or a phase that says
+/// more, such as a retry.
+fn live_status(t: &Thread, start: usize) -> String {
+    let waiting = t.tools.iter().any(|tool| {
+        tool.anchor.message >= start
+            && !tool.done
+            && !tool.failed
+            && (tool.resolved_kind() == crate::work::ToolKind::Subagent
+                || crew_ui::is_delegation(tool))
+    });
+    if waiting {
+        return "Waiting on subagents".into();
     }
     match t.phase.as_str() {
-        "" | "Working" | "Waiting for the model" => "Planning next moves".into(),
-        phase if phase.starts_with("Running ") => "Working".into(),
+        ""
+        | "Working"
+        | "Waiting for the model"
+        | "Thinking"
+        | "Stopping"
+        | "Compacting context" => "Thinking".into(),
+        phase if phase.starts_with("Running ") => "Thinking".into(),
         phase => phase.into(),
     }
+}
+
+/// The live tail of a running turn: the work streak after its latest prose, which KSG Code's
+/// `activeWorkRow` shows as one `work-live` row.
+#[derive(Clone, Copy, Debug)]
+struct LiveTail {
+    part: usize,
+    /// The newest step with something to show (thinking with no text yet has none).
+    latest: WorkEntry,
+    /// The newest step still in progress.
+    running: Option<WorkEntry>,
+    /// The newest step is a call that failed, and nothing is running.
+    failed: bool,
+    /// The row stands for what the turn is doing now: a step runs, or the last call
+    /// succeeded and nothing waits on the user.
+    active: bool,
+    /// The newest thought with text, for the preview line.
+    thought: Option<usize>,
+}
+
+fn live_tail(t: &Thread, parts: &[TranscriptPart]) -> Option<LiveTail> {
+    let part = parts.len().checked_sub(1)?;
+    let TranscriptPart::Work(entries) = &parts[part] else {
+        return None;
+    };
+    let visible = |entry: &&WorkEntry| match entry {
+        WorkEntry::Tool(_) => true,
+        WorkEntry::Thought(index) => !t.thoughts[*index].text.trim().is_empty(),
+    };
+    let latest = *entries.iter().rfind(visible)?;
+    let running = entries
+        .iter()
+        .filter(visible)
+        .rfind(|entry| match entry {
+            WorkEntry::Tool(index) => !t.tools[*index].done && !t.tools[*index].failed,
+            WorkEntry::Thought(index) => !t.thoughts[*index].done,
+        })
+        .copied();
+    let latest_tool = match latest {
+        WorkEntry::Tool(index) => Some(&t.tools[index]),
+        WorkEntry::Thought(_) => None,
+    };
+    let failed = running.is_none() && latest_tool.is_some_and(|tool| tool.failed);
+    let active = running.is_some()
+        || latest_tool.is_some_and(|tool| tool.done && !tool.failed) && t.request.is_none();
+    let thought = entries
+        .iter()
+        .filter(visible)
+        .rev()
+        .find_map(|entry| match entry {
+            WorkEntry::Thought(index) => Some(*index),
+            WorkEntry::Tool(_) => None,
+        });
+    Some(LiveTail {
+        part,
+        latest,
+        running,
+        failed,
+        active,
+        thought,
+    })
+}
+
+/// How much of a thought KSG reads for its preview (`THOUGHT_PREVIEW_SOURCE_MAX_LENGTH`).
+const THOUGHT_PREVIEW_SOURCE: usize = 8_192;
+
+/// Ported from KSG Code's `liveThoughtLine` (`work-log/presentation.ts`): a thought's bold
+/// heading, or else its first sentence, as plain text.
+fn live_thought_line(markdown: &str) -> String {
+    let markdown = match markdown.char_indices().nth(THOUGHT_PREVIEW_SOURCE) {
+        Some((at, _)) => &markdown[..at],
+        None => markdown,
+    };
+    let heading = markdown.trim_start().strip_prefix("**").and_then(|rest| {
+        let end = rest.find("**")?;
+        let inner = &rest[..end];
+        let after = rest[end + 2..].split('\n').next().unwrap_or("");
+        (!inner.is_empty()
+            && !inner.contains(['*', '\r', '\n'])
+            && after
+                .trim_end_matches('\r')
+                .chars()
+                .all(|c| c == ' ' || c == '\t'))
+        .then_some(inner)
+    });
+    let source = heading.unwrap_or(markdown);
+    // Links and images keep their text.
+    let mut unlinked = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find('[') {
+        let (before, from) = rest.split_at(open);
+        let close = from.find(']');
+        let link = close
+            .filter(|close| from[close + 1..].starts_with('('))
+            .and_then(|close| {
+                let end = from[close + 2..].find(')')?;
+                Some((close, close + 2 + end))
+            });
+        match link {
+            Some((close, end)) if !from[1..close].contains(']') => {
+                unlinked.push_str(before.strip_suffix('!').unwrap_or(before));
+                unlinked.push_str(&from[1..close]);
+                rest = &from[end + 1..];
+            }
+            _ => {
+                unlinked.push_str(before);
+                unlinked.push('[');
+                rest = &from[1..];
+            }
+        }
+    }
+    unlinked.push_str(rest);
+    // Headings, bullets and list numbers at the start of a line.
+    let mut lines = vec![];
+    for line in unlinked.split('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let marker = trimmed
+            .find([' ', '\t'])
+            .filter(|&at| {
+                let mark = &trimmed[..at];
+                (1..=6).contains(&mark.len()) && mark.chars().all(|c| c == '#')
+                    || matches!(mark, "-" | "*" | "+")
+                    || mark.len() > 1
+                        && mark.ends_with('.')
+                        && mark[..mark.len() - 1].chars().all(|c| c.is_ascii_digit())
+            })
+            .map(|at| trimmed[at..].trim_start_matches([' ', '\t']));
+        lines.push(marker.unwrap_or(line));
+    }
+    let joined = lines
+        .join("\n")
+        .replace("**", "")
+        .replace("~~", "")
+        .replace('`', "");
+    // Single `*` or `_` emphasis around words.
+    let chars: Vec<char> = joined.chars().collect();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    let mut plain = String::with_capacity(joined.len());
+    for (i, c) in chars.iter().enumerate() {
+        let (before, after) = (
+            i.checked_sub(1).and_then(|i| chars.get(i)),
+            chars.get(i + 1),
+        );
+        let opens = !word(before) && word(after) && after != Some(&'_');
+        let closes = word(before) && !word(after) && after != Some(&'*');
+        if matches!(c, '*' | '_') && (opens || closes) {
+            continue;
+        }
+        plain.push(*c);
+    }
+    let text = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    if heading.is_some() {
+        return text;
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for (i, &(at, c)) in chars.iter().enumerate() {
+        if !matches!(c, '.' | '?' | '!') {
+            continue;
+        }
+        let mut end = at + c.len_utf8();
+        let mut next = chars.get(i + 1).map(|&(_, c)| c);
+        if let Some(close) = next.filter(|c| matches!(c, '"' | '\'' | '”' | '’' | ')')) {
+            end += close.len_utf8();
+            next = chars.get(i + 2).map(|&(_, c)| c);
+        }
+        if next.is_some_and(char::is_whitespace) {
+            return text[..end].to_owned();
+        }
+    }
+    text
+}
+
+/// The sweep's window (`--live-activity-focus-width`, 4.5 rem) and period.
+const SHIMMER_WINDOW: f32 = 72.0;
+const SHIMMER_PERIOD: f64 = 2.2;
+
+/// Ported from KSG Code's `ActivityShimmerOverlay` and `.live-activity-focus`: a copy of the
+/// row in the foreground colour shows through a 72 pt window with soft edges that sweeps the
+/// row every 2.2 s. The window slides one way and the copy inside it the other, so the copy
+/// stays over the row. The renderer runs both slides on its own clock, so the sweep costs no
+/// view runs or wakes, and it leaves with the live row: a settled window draws nothing.
+fn shimmer(base: El, highlight: El, width: f32) -> El {
+    let travel = width + SHIMMER_WINDOW;
+    let sweep = |to: f32| {
+        rune::LoopSpec::slide(SHIMMER_PERIOD, [0.0, 0.0], [to, 0.0]).easing(rune::Easing::LINEAR)
+    };
+    el().w_full().min_w(0.0).child(base).child(
+        el().absolute(-SHIMMER_WINDOW, 0.0)
+            .w(SHIMMER_WINDOW)
+            .h_full()
+            .clip_fade(SHIMMER_WINDOW / 2.0, 0.0, SHIMMER_WINDOW / 2.0, 0.0)
+            .looping(sweep(travel))
+            .inert()
+            .a11y_hidden()
+            .child(
+                el().absolute(SHIMMER_WINDOW, 0.0)
+                    .w(width)
+                    .looping(sweep(-travel))
+                    .child(highlight),
+            ),
+    )
+}
+
+/// Whether live rows sweep: the turn runs, nothing waits on the user, and motion is allowed.
+fn shimmer_allowed(s: &State, t: &Thread) -> bool {
+    t.request.is_none() && !s.portraits.reduced_motion()
+}
+
+/// The width a live row lays out at, for the shimmer's copy: the lane, less the work indent.
+fn live_row_width(s: &State) -> f32 {
+    (s.html_lane_width as f32 - WORK_INDENT).max(0.0)
+}
+
+/// KSG Code's `LiveActivityContent`: a 24 pt icon slot and one truncating label.
+fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) -> El {
+    let mut words = label(text, ACTIVITY, ink).truncate().shrink().min_w(0.0);
+    if let Some(key) = key {
+        words = words.key(key);
+    }
+    row()
+        .min_h(26.0)
+        .center_y()
+        .gap(5.0)
+        .min_w(0.0)
+        .child(el().size(24.0, 24.0).center().child(tool_icon(glyph, ink)))
+        .child(words)
+}
+
+/// KSG Code's `LiveActivityRow`: the muted row, swept by the shimmer while it is the turn's
+/// current activity.
+fn live_activity(
+    s: &State,
+    p: Palette,
+    glyph: &str,
+    text: &str,
+    animated: bool,
+    key: Option<String>,
+) -> El {
+    let base = activity_content(glyph, text, p.muted, key);
+    if !animated {
+        return base;
+    }
+    shimmer(
+        base,
+        activity_content(glyph, text, p.ink, None),
+        live_row_width(s),
+    )
+}
+
+/// Ported from KSG Code's `ThinkingTimelineRow`: "Thinking" with the brain icon at the bottom
+/// of a running turn, while no step of its tail is in progress.
+fn live_status_row(s: &State, t: &Thread, start: usize, p: Palette) -> El {
+    row()
+        .key(format!("live-status-{}", t.id))
+        .role("status")
+        .w_full()
+        .min_w(0.0)
+        .child(live_activity(
+            s,
+            p,
+            "brain",
+            &live_status(t, start),
+            shimmer_allowed(s, t),
+            Some(format!("live-status-text-{}", t.id)),
+        ))
+}
+
+/// KSG Code's `LiveWorkToggle`: a live row that is its work group's disclosure.
+fn live_toggle(key: String, a11y: String, p: Palette) -> El {
+    col()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(a11y)
+        .focusable(true)
+        .w_full()
+        .min_w(0.0)
+        .px(6.0)
+        .ml(-6.0)
+        .radius(6.0)
+        .hover(p.selected)
+}
+
+/// Ported from KSG Code's `LiveWorkEntryTimelineRow`: a running turn's tail as one row. The
+/// newest thought's first line sits above the step in progress, which replaces itself as
+/// each call starts and ends; the whole row unfolds the tail's steps. When the last call
+/// failed, the "Thinking" row stands in for it and does the unfolding, as KSG's does.
+fn live_work(s: &State, p: Palette, parts: &[TranscriptPart], tail: LiveTail, start: usize) -> El {
+    let t = s.current();
+    let TranscriptPart::Work(entries) = &parts[tail.part] else {
+        return el();
+    };
+    let open = group_open(t, entries);
+    let first_tool = entry_tools(entries)
+        .next()
+        .map(|index| t.tools[index].id.clone());
+    let first_thought = entry_thoughts(entries).first().map(|&index| {
+        let thought = &t.thoughts[index];
+        (thought.anchor.message, thought.block, thought.anchor.offset)
+    });
+    let toggle = move |key: String| {
+        move |s: &mut State, tx: &mut rune::Tx| {
+            tx.keep_on_screen(key.clone());
+            toggle_group(s.current_mut(), first_tool.as_deref(), first_thought);
+        }
+    };
+    let verb = if open { "Hide" } else { "Show" };
+    if tail.failed {
+        let key = format!("live-status-{}", t.id);
+        return live_toggle(key.clone(), format!("{verb} steps. A tool call failed"), p)
+            .child(live_activity(
+                s,
+                p,
+                "brain",
+                &live_status(t, start),
+                shimmer_allowed(s, t),
+                Some(format!("live-status-text-{}", t.id)),
+            ))
+            .on_press_tx(toggle(key));
+    }
+    let thought_line = tail
+        .thought
+        .filter(|_| !open)
+        .map(|index| live_thought_line(&t.thoughts[index].text))
+        .filter(|line| !line.is_empty());
+    let entry = tail.running.unwrap_or(tail.latest);
+    let (glyph, text) = match entry {
+        WorkEntry::Thought(index) => (
+            "brain",
+            if open || thought_line.is_some() {
+                if tail.active { "Thinking" } else { "Thought" }.to_owned()
+            } else {
+                t.thoughts[index]
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+        ),
+        WorkEntry::Tool(index) => {
+            let tool = &t.tools[index];
+            let verb = tool_verb_in(tool, tool.failed || !tail.active && tool.done);
+            (
+                work_ui::kind_icon(tool.resolved_kind()),
+                if tool.detail.is_empty() {
+                    verb
+                } else {
+                    format!("{verb} {}", tool.detail)
+                },
+            )
+        }
+    };
+    let key = format!("live-work-{}", t.id);
+    let mut live_row = live_toggle(key.clone(), format!("{verb} steps. {text}"), p);
+    if let Some(line) = thought_line {
+        live_row = live_row.child(
+            row()
+                .key(format!("live-thought-{}", t.id))
+                .gap(5.0)
+                .min_w(0.0)
+                .child(
+                    el().size(24.0, 24.0)
+                        .center()
+                        .child(tool_icon("brain", p.muted)),
+                )
+                .child(
+                    label(line, ACTIVITY.lh(20.0), p.muted)
+                        .wrap()
+                        .max_lines(4)
+                        .pt(2.0)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0),
+                ),
+        );
+    }
+    let failed = matches!(entry, WorkEntry::Tool(index) if t.tools[index].failed);
+    live_row
+        .child(live_activity(
+            s,
+            p,
+            glyph,
+            &text,
+            tail.active && !failed && shimmer_allowed(s, t),
+            Some(format!("live-work-text-{}", t.id)),
+        ))
+        .on_press_tx(toggle(key))
 }
 
 /// How far a turn's tool rows and its live status words sit in from the prose lane's edge. The
@@ -10127,6 +10727,21 @@ fn assistant_turn_piece(
         .citation_highlight
         .as_ref()
         .map(|h| (&h.machine, h.thread_id, &h.message_id, &h.text));
+    // The response actions: a Copy check on one of this turn's messages, and whether Fork shows.
+    let copied = s.copied_message.as_ref().and_then(|(id, _)| {
+        t.messages[start..end.min(t.messages.len())]
+            .iter()
+            .any(|m| &m.id == id)
+            .then_some(id.as_str())
+    });
+    let actions = (
+        copied,
+        t.session.is_some(),
+        t.can_change_conversation(),
+        t.can_rewind_conversation(),
+        t.status.busy(),
+        t.configuring,
+    );
     memo(
         format!(
             "assistant-turn-{}{}",
@@ -10149,6 +10764,7 @@ fn assistant_turn_piece(
                 t.native.compaction_expanded,
             ),
             (t.harness.as_str(), s.working_directory(), find, cite),
+            actions,
         ),
         || build_assistant_turn(s, p, wide, start, end, piece),
     )
@@ -10229,15 +10845,19 @@ fn segment_min_items() -> usize {
 /// side, so mounted entries follow the viewport, not the turn's length.
 const SLICE_ITEMS: usize = 4;
 
-/// One entry of a turn's work column, in display order. Expanded tool groups and
-/// thought runs contribute their heading and each row separately.
+/// One entry of a turn's work column, in display order. Unfolded work streaks and thought
+/// runs contribute their heading and each row separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkItem {
     Part(usize),
+    /// A streak's folded or unfolded header.
     GroupHead(usize),
-    GroupTool(usize, usize),
+    /// Step `k` of an unfolded streak.
+    GroupEntry(usize, usize),
     ThoughtHead(usize),
     ThoughtBody(usize, usize),
+    /// A running turn's tail (`work-live`).
+    Live(usize),
 }
 
 impl WorkItem {
@@ -10245,42 +10865,64 @@ impl WorkItem {
         match self {
             Self::Part(part)
             | Self::GroupHead(part)
-            | Self::GroupTool(part, _)
+            | Self::GroupEntry(part, _)
             | Self::ThoughtHead(part)
-            | Self::ThoughtBody(part, _) => part,
+            | Self::ThoughtBody(part, _)
+            | Self::Live(part) => part,
         }
     }
 }
 
+/// A running turn's work column ends in its live tail, which folds into one `work-live` row
+/// and unfolds below it. Before prose, and in a finished turn, a streak of two or more steps
+/// folds under its header (KSG's `work-toggle`); a lone call stays its own row.
 fn work_items(
     t: &Thread,
     parts: &[TranscriptPart],
     last_work: Option<usize>,
     preamble: Option<usize>,
-    lift_cards: bool,
+    live: bool,
 ) -> Vec<WorkItem> {
     let Some(last) = last_work else {
         return vec![];
     };
-    let captain_home = t.captain_home && !t.delegated;
+    let tail = live.then(|| live_tail(t, parts)).flatten();
     let mut items = Vec::with_capacity(last + 1);
     for (index, part) in parts[..=last].iter().enumerate() {
-        if Some(index) == preamble || lift_cards && is_lifted_card(t, part) {
+        if Some(index) == preamble || !live && is_lifted_card(t, part) {
             continue;
         }
         match part {
-            TranscriptPart::Tools(indices)
-                if indices.len() > 1
-                    && t.tools[indices[0]].group_expanded
-                    && !(captain_home
-                        && indices.iter().any(|&i| crew_ui::is_delegation(&t.tools[i]))) =>
-            {
-                items.push(WorkItem::GroupHead(index));
-                items.extend((0..indices.len()).map(|k| WorkItem::GroupTool(index, k)));
+            TranscriptPart::Work(entries) if live && index + 1 == parts.len() => {
+                // The live tail. With nothing to show yet, the Thinking row speaks for it.
+                if tail.is_none() {
+                    continue;
+                }
+                items.push(WorkItem::Live(index));
+                if group_open(t, entries) {
+                    let thinking = entry_tools(entries).next().is_none();
+                    items.extend((0..entries.len()).map(|k| {
+                        if thinking {
+                            WorkItem::ThoughtBody(index, k)
+                        } else {
+                            WorkItem::GroupEntry(index, k)
+                        }
+                    }));
+                }
             }
-            TranscriptPart::Thought(indices) if t.thoughts[indices[0]].expanded => {
-                items.push(WorkItem::ThoughtHead(index));
-                items.extend((0..indices.len()).map(|k| WorkItem::ThoughtBody(index, k)));
+            TranscriptPart::Work(entries) if entry_tools(entries).next().is_none() => {
+                if t.thoughts[entry_thoughts(entries)[0]].expanded {
+                    items.push(WorkItem::ThoughtHead(index));
+                    items.extend((0..entries.len()).map(|k| WorkItem::ThoughtBody(index, k)));
+                } else {
+                    items.push(WorkItem::Part(index));
+                }
+            }
+            TranscriptPart::Work(entries) if entries.len() > 1 => {
+                items.push(WorkItem::GroupHead(index));
+                if group_open(t, entries) {
+                    items.extend((0..entries.len()).map(|k| WorkItem::GroupEntry(index, k)));
+                }
             }
             _ => items.push(WorkItem::Part(index)),
         }
@@ -10288,38 +10930,43 @@ fn work_items(
     items
 }
 
-/// The space above a work entry, as the nested columns of an unsplit turn give it.
-fn work_item_gap(previous: WorkItem, item: WorkItem) -> f32 {
-    match (previous, item) {
-        (WorkItem::GroupTool(..), WorkItem::GroupTool(..)) => 0.0,
-        (_, WorkItem::ThoughtBody(..)) => 4.0,
-        _ => 2.0,
+/// The space above a work entry.
+fn work_item_gap(item: WorkItem) -> f32 {
+    match item {
+        WorkItem::ThoughtBody(..) => 4.0,
+        _ => WORK_GAP,
     }
 }
 
 /// The key part of an entry that does not move when entries are added after it.
 fn work_item_id(t: &Thread, parts: &[TranscriptPart], item: WorkItem) -> String {
-    let part = &parts[item.part()];
-    match (part, item) {
-        (TranscriptPart::Tools(indices), WorkItem::GroupTool(_, k)) => {
-            format!("tool-{}", t.tools[indices[k]].id)
+    let thought_id = |index: usize, k: usize| {
+        let thought = &t.thoughts[index];
+        let message = t
+            .messages
+            .get(thought.anchor.message)
+            .map_or("end", |message| message.id.as_str());
+        format!(
+            "thought-{message}-{}-{}-{k}",
+            thought.block, thought.anchor.offset
+        )
+    };
+    let entry_id = |entry: WorkEntry, k: usize| match entry {
+        WorkEntry::Tool(index) => format!("tool-{}", t.tools[index].id),
+        WorkEntry::Thought(index) => thought_id(index, k),
+    };
+    match (&parts[item.part()], item) {
+        (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => entry_id(entries[k], 0),
+        (TranscriptPart::Work(entries), WorkItem::ThoughtBody(_, k)) => entry_id(entries[k], k + 1),
+        (TranscriptPart::Work(entries), WorkItem::Live(_)) => {
+            format!("live-{}", entry_id(entries[0], 0))
         }
+        (TranscriptPart::Work(entries), _) => match entries[0] {
+            WorkEntry::Tool(index) => format!("tools-{}", t.tools[index].id),
+            WorkEntry::Thought(index) => thought_id(index, 0),
+        },
         (TranscriptPart::Tools(indices), _) => format!("tools-{}", t.tools[indices[0]].id),
-        (TranscriptPart::Thought(indices), item) => {
-            let k = match item {
-                WorkItem::ThoughtBody(_, k) => k + 1,
-                _ => 0,
-            };
-            let thought = &t.thoughts[indices[0]];
-            let message = t
-                .messages
-                .get(thought.anchor.message)
-                .map_or("end", |message| message.id.as_str());
-            format!(
-                "thought-{message}-{}-{}-{k}",
-                thought.block, thought.anchor.offset
-            )
-        }
+        (TranscriptPart::Thought(indices), _) => thought_id(indices[0], 0),
         (TranscriptPart::Text { message, from, .. }, _) => {
             format!("text-{}-{from}", t.messages[*message].id)
         }
@@ -10372,26 +11019,41 @@ fn find_occurrence_base(t: &Thread, parts: &[TranscriptPart], index: usize, quer
         .sum()
 }
 
-/// One work entry, indented as the unsplit work column indents it.
-fn work_item(s: &State, p: Palette, wide: bool, parts: &[TranscriptPart], item: WorkItem) -> El {
+/// One work entry, indented as the work column indents it.
+fn work_item(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    parts: &[TranscriptPart],
+    item: WorkItem,
+    start: usize,
+) -> El {
     let t = s.current();
     let part = &parts[item.part()];
     match (part, item) {
-        (TranscriptPart::Tools(indices), WorkItem::GroupHead(_)) => {
-            tool_group_head(s, p, indices).ml(WORK_INDENT)
+        (TranscriptPart::Work(entries), WorkItem::GroupHead(_)) => {
+            work_group_head(s, p, entries).ml(WORK_INDENT)
         }
-        (TranscriptPart::Tools(indices), WorkItem::GroupTool(_, k)) => col()
-            .ml(WORK_INDENT)
-            .pl(14.0)
-            .child(inline_tool(s, p, indices[k])),
-        (TranscriptPart::Thought(indices), WorkItem::ThoughtHead(_)) => col()
+        (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => col()
             .min_w(0.0)
             .ml(WORK_INDENT)
-            .child(work_ui::thought_head(s, p, indices)),
-        (TranscriptPart::Thought(indices), WorkItem::ThoughtBody(_, k)) => col()
+            .pl(WORK_LIST_INDENT)
+            .child(work_entry_row(s, p, entries[k])),
+        (TranscriptPart::Work(entries), WorkItem::ThoughtHead(_)) => col()
             .min_w(0.0)
             .ml(WORK_INDENT)
-            .child(work_ui::thought_body(s, p, indices[k])),
+            .child(work_ui::thought_head(s, p, &entry_thoughts(entries))),
+        (TranscriptPart::Work(entries), WorkItem::ThoughtBody(_, k)) => col()
+            .min_w(0.0)
+            .ml(WORK_INDENT)
+            .child(work_ui::thought_body(s, p, entry_thoughts(entries)[k])),
+        (TranscriptPart::Work(_), WorkItem::Live(_)) => match live_tail(t, parts) {
+            Some(tail) => col()
+                .min_w(0.0)
+                .ml(WORK_INDENT)
+                .child(live_work(s, p, parts, tail, start)),
+            None => el(),
+        },
         (part, _) => {
             let query = (s.thread_find_active() && !s.thread_find.query.text.trim().is_empty())
                 .then(|| s.thread_find.query.text.trim());
@@ -10408,6 +11070,28 @@ fn work_item(s: &State, p: Palette, wide: bool, parts: &[TranscriptPart], item: 
             }
         }
     }
+}
+
+/// A turn's work entries as one column, `gap` above each as the slices space them.
+fn work_column(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    parts: &[TranscriptPart],
+    items: &[WorkItem],
+    start: usize,
+    key: String,
+) -> El {
+    let mut rows = col().key(key).min_w(0.0);
+    for (index, item) in items.iter().enumerate() {
+        let row = work_item(s, p, wide, parts, *item, start);
+        rows = rows.child(if index == 0 {
+            row
+        } else {
+            col().min_w(0.0).pt(work_item_gap(*item)).child(row)
+        });
+    }
+    rows
 }
 
 /// What a slice's entries show, so a slice rebuilds only when one of them changed.
@@ -10443,6 +11127,34 @@ fn work_slice_fingerprint(t: &Thread, parts: &[TranscriptPart], items: &[WorkIte
                     (thought.text.len(), thought.done, thought.expanded).hash(&mut hasher);
                 }
             }
+            TranscriptPart::Work(entries) => {
+                for entry in entries {
+                    match *entry {
+                        WorkEntry::Tool(i) => {
+                            let tool = &t.tools[i];
+                            (
+                                &tool.id,
+                                tool.done,
+                                tool.failed,
+                                tool.expanded,
+                                tool.raw_expanded,
+                                tool.group_expanded,
+                                tool.output.len(),
+                                tool.detail.len(),
+                                tool.changes.len(),
+                                tool.images.len(),
+                                tool.subagents.len(),
+                                tool.exit_code,
+                            )
+                                .hash(&mut hasher);
+                        }
+                        WorkEntry::Thought(i) => {
+                            let thought = &t.thoughts[i];
+                            (thought.text.len(), thought.done, thought.expanded).hash(&mut hasher);
+                        }
+                    }
+                }
+            }
             TranscriptPart::Text { message, from, to } => (
                 &t.messages[*message].id,
                 from,
@@ -10464,9 +11176,10 @@ impl WorkItem {
         match self {
             Self::Part(i) => (0u8, i, 0usize),
             Self::GroupHead(i) => (1, i, 0),
-            Self::GroupTool(i, k) => (2, i, k),
+            Self::GroupEntry(i, k) => (2, i, k),
             Self::ThoughtHead(i) => (3, i, 0),
             Self::ThoughtBody(i, k) => (4, i, k),
+            Self::Live(i) => (5, i, 0),
         }
         .hash(hasher);
     }
@@ -10488,39 +11201,22 @@ fn work_slice(
     let parts = turn_parts(t, start, end);
     let (last_work, preamble) = turn_shape(t, &parts);
     let live = end == t.messages.len() && t.status.busy();
-    let items = work_items(t, &parts, last_work, preamble, !live);
+    let items = work_items(t, &parts, last_work, preamble, live);
     let lo = lo.min(items.len());
     let hi = hi.min(items.len());
-    // Above the first slice: the work column's place in the turn. A running turn
-    // with no captain or preamble has an empty head.
-    let top = if lo > 0 {
-        work_item_gap(items[lo - 1], items[lo])
-    } else if !live {
-        4.0
-    } else if t.captain.is_some() || preamble.is_some() {
-        12.0
+    // Above the first slice: the head's bar, 12 pt up in the turn's column.
+    let top = if lo > 0 && lo < items.len() {
+        work_item_gap(items[lo])
     } else {
-        0.0
+        12.0
     };
     let key = format!("work-rows-{}-{lo}", message_key(t, start));
     let build = || {
         #[cfg(test)]
         timeline_count(|counts| counts.built_slices += 1);
-        let mut rows = col().key(key.clone()).mt(top - LANE_GAP);
-        for index in lo..hi {
-            let gap = if index == lo {
-                0.0
-            } else {
-                work_item_gap(items[index - 1], items[index])
-            };
-            let item = work_item(s, p, wide, &parts, items[index]);
-            rows = rows.child(if gap > 0.0 {
-                col().pt(gap).child(item)
-            } else {
-                item
-            });
-        }
-        col().child(rows)
+        col().child(
+            work_column(s, p, wide, &parts, &items[lo..hi], start, key.clone()).mt(top - LANE_GAP),
+        )
     };
     if t.transcript_structure == 0 || timeline_structure(t).external_turns.contains(&start) {
         return build();
@@ -10538,6 +11234,21 @@ fn work_slice(
         .citation_highlight
         .as_ref()
         .map(|h| (&h.machine, h.thread_id, &h.message_id, &h.text));
+    // The response actions: a Copy check on one of this turn's messages, and whether Fork shows.
+    let copied = s.copied_message.as_ref().and_then(|(id, _)| {
+        t.messages[start..end.min(t.messages.len())]
+            .iter()
+            .any(|m| &m.id == id)
+            .then_some(id.as_str())
+    });
+    let actions = (
+        copied,
+        t.session.is_some(),
+        t.can_change_conversation(),
+        t.can_rewind_conversation(),
+        t.status.busy(),
+        t.configuring,
+    );
     memo(
         key.clone(),
         (
@@ -10547,6 +11258,11 @@ fn work_slice(
                 hi,
                 top.to_bits(),
                 live,
+                (
+                    t.request.is_some(),
+                    s.portraits.reduced_motion(),
+                    s.html_lane_width,
+                ),
             ),
             (
                 s.dark,
@@ -10555,42 +11271,10 @@ fn work_slice(
                 s.viewport_width.to_bits(),
             ),
             (t.harness.as_str(), s.working_directory(), find, cite),
+            actions,
         ),
         build,
     )
-}
-
-fn live_status_row(t: &Thread, p: Palette) -> El {
-    let seconds = t.started.map(|start| start.elapsed().as_secs());
-    row()
-        .key(format!("live-status-{}", t.id))
-        .min_h(26.0)
-        // The square sits on the prose lane's left edge and the words start one
-        // indent in, where the tool rows above do.
-        .center_y()
-        .gap(WORK_INDENT - 6.0)
-        .child(status_mark(Status::Running, p, 6.0))
-        .child(
-            row()
-                .gap(5.0)
-                .center_y()
-                .min_w(0.0)
-                .shrink()
-                .child(
-                    pixel_text(live_status(t), p.muted)
-                        .key(format!("live-status-text-{}", t.id))
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0),
-                )
-                // The phase gives way before the timer, whose tabular figures and
-                // padded seconds keep each tick the same width.
-                .child(match seconds {
-                    Some(seconds) => label(timer_label(seconds), TIMER, p.sea)
-                        .key(format!("live-timer-{}", t.id)),
-                    None => el(),
-                }),
-        )
 }
 
 fn build_assistant_turn(
@@ -10605,7 +11289,6 @@ fn build_assistant_turn(
     timeline_count(|counts| counts.built_turns += 1);
     let t = s.current();
     let parts = turn_parts(t, start, end);
-    let html_card = |part: &TranscriptPart| is_html_card(t, part);
     let card = |part: &TranscriptPart| is_lifted_card(t, part);
     let (last_work, preamble) = turn_shape(t, &parts);
     let live = end == t.messages.len() && t.status.busy();
@@ -10666,53 +11349,13 @@ fn build_assistant_turn(
         let mut base = part_occs[part_index];
         transcript_part(s, p, wide, &parts[part_index], &mut base)
     };
-    if !head {
-    } else if let Some(index) = preamble {
-        response = response.child(render_part(index));
-    } else if live && last_work.is_none() {
-        // Until Pi emits work, streamed text is the preamble.
-        for index in 0..parts.len() {
-            response = response.child(render_part(index));
+    let items = work_items(t, &parts, last_work, preamble, live);
+    let work_key = format!("work-rows-{}", message_key(t, start));
+    if live {
+        // KSG's `WorkingTimelineRow`: the turn's bar at its top while it runs.
+        if head {
+            response = response.child(working_bar(t, s.dark, p));
         }
-    }
-    let work_rows = |mut rows: El, lift_cards: bool| {
-        if let Some(last) = last_work {
-            for (index, part) in parts[..=last].iter().enumerate() {
-                if Some(index) != preamble && !(lift_cards && card(part)) {
-                    let row = render_part(index);
-                    // Prose between tool rows keeps its paragraph rhythm and the lane's one
-                    // left margin. Tool rows are indented as a group by the same amount while
-                    // the turn runs and after it ends, so nothing jumps when it finishes.
-                    rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
-                        row.py(6.0)
-                    } else if html_card(part) {
-                        row
-                    } else {
-                        row.ml(WORK_INDENT)
-                    });
-                }
-            }
-        }
-        rows
-    };
-    if live && !whole {
-        // A split running turn: the slices hold its steps and the tail its status line,
-        // two points below the last step, as the unsplit work column spaces them.
-        if tail {
-            response = response.child(live_status_row(t, p));
-            tail_children += 1;
-        }
-    } else if live {
-        // While Pi works, its steps show as they happen, and one status line says what it
-        // is doing now. The turn folds into "Worked for" when it ends.
-        let rows = work_rows(
-            col()
-                .key(format!("work-rows-{}", message_key(t, start)))
-                .gap(2.0),
-            false,
-        )
-        .child(live_status_row(t, p));
-        response = response.child(rows);
     } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
         let (work_failed, loading) = structure
@@ -10736,67 +11379,68 @@ fn build_assistant_turn(
         let toggle_key = format!("toggle-work-{}-{start}", t.id);
         let press_key = toggle_key.clone();
         let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
+        // The running turn's bar, now its fold: KSG's `WorkFoldToggle` in the same place.
         let mut section = col()
             .key(format!("work-section-{}", message_key(t, start)))
-            .gap(4.0)
+            .w_full()
             .child(
-                activity_line(
-                    toggle_key,
-                    format!(
-                        "{} work section. {title}",
-                        if expanded { "Collapse" } else { "Expand" }
-                    ),
-                    (title.clone(), ""),
-                    false,
-                    expanded,
-                    "clock",
-                    p,
-                )
-                .on_press_tx(move |s: &mut State, tx| {
-                    tx.keep_on_screen(press_key.clone());
-                    let t = s.current_mut();
-                    let current_start = match turn_msg_id.as_deref() {
-                        Some(id) => {
-                            let Some(index) = t.messages.iter().position(|m| m.id == id) else {
-                                return;
-                            };
-                            index
+                working_bar_frame(s.dark, p).child(
+                    work_fold_toggle(
+                        toggle_key,
+                        format!(
+                            "{} work section. {title}",
+                            if expanded { "Collapse" } else { "Expand" }
+                        ),
+                        &title,
+                        expanded,
+                        p,
+                    )
+                    .on_press_tx(move |s: &mut State, tx| {
+                        tx.keep_on_screen(press_key.clone());
+                        let t = s.current_mut();
+                        let current_start = match turn_msg_id.as_deref() {
+                            Some(id) => {
+                                let Some(index) = t.messages.iter().position(|m| m.id == id) else {
+                                    return;
+                                };
+                                index
+                            }
+                            None => start,
+                        };
+                        t.timeline_cache.get_mut().touch_message(current_start);
+                        let retry = t
+                            .work
+                            .iter()
+                            .any(|work| work.start == current_start && work.expanded)
+                            && t.deferred_work.iter().any(|marker| {
+                                marker["start"] == current_start && marker["error"].is_string()
+                            });
+                        if retry {
+                            s.load_deferred_work(current_start, true);
+                            return;
                         }
-                        None => start,
-                    };
-                    t.timeline_cache.get_mut().touch_message(current_start);
-                    let retry = t
-                        .work
-                        .iter()
-                        .any(|work| work.start == current_start && work.expanded)
-                        && t.deferred_work.iter().any(|marker| {
-                            marker["start"] == current_start && marker["error"].is_string()
-                        });
-                    if retry {
-                        s.load_deferred_work(current_start, true);
-                        return;
-                    }
-                    match t.work.iter_mut().find(|work| work.start == current_start) {
-                        Some(work) => work.expanded = !work.expanded,
-                        // Turns from before work records existed fold too; opening one
-                        // records it.
-                        None => t.work.push(crate::model::AssistantWork {
-                            start: current_start,
-                            stopped: false,
-                            stopped_order: 0,
-                            expanded: true,
-                            elapsed: None,
-                            outcome: None,
-                        }),
-                    }
-                    if s.current()
-                        .work
-                        .iter()
-                        .any(|work| work.start == current_start && work.expanded)
-                    {
-                        s.load_deferred_work(current_start, false);
-                    }
-                }),
+                        match t.work.iter_mut().find(|work| work.start == current_start) {
+                            Some(work) => work.expanded = !work.expanded,
+                            // Turns from before work records existed fold too; opening one
+                            // records it.
+                            None => t.work.push(crate::model::AssistantWork {
+                                start: current_start,
+                                stopped: false,
+                                stopped_order: 0,
+                                expanded: true,
+                                elapsed: None,
+                                outcome: None,
+                            }),
+                        }
+                        if s.current()
+                            .work
+                            .iter()
+                            .any(|work| work.start == current_start && work.expanded)
+                        {
+                            s.load_deferred_work(current_start, false);
+                        }
+                    }),
+                ),
             );
         if expanded {
             let restored_id = t.messages.get(start).map(|message| message.id.clone());
@@ -10811,13 +11455,17 @@ fn build_assistant_turn(
                 }
                 tx.live_only();
             });
-            // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
+        }
+        if head {
+            response = response.child(section);
+            if let Some(index) = preamble {
+                response = response.child(render_part(index));
+            }
             if work_loading {
                 let mut skeleton = col()
                     .key(format!("work-loading-{}", message_key(t, start)))
                     .role("status")
                     .label("Loading work history")
-                    .pt(12.0)
                     .pb(4.0)
                     .px(4.0)
                     .gap(8.0);
@@ -10834,18 +11482,18 @@ fn build_assistant_turn(
                             ),
                     );
                 }
-                section = section.child(skeleton);
-            } else if !work_failed && whole {
-                section = section.child(work_rows(
-                    col()
-                        .key(format!("work-rows-{}", message_key(t, start)))
-                        .gap(2.0),
-                    true,
+                response = response.child(skeleton);
+            } else if expanded && !work_failed && whole && !items.is_empty() {
+                response = response.child(work_column(
+                    s,
+                    p,
+                    wide,
+                    &parts,
+                    &items,
+                    start,
+                    work_key.clone(),
                 ));
             }
-        }
-        if head {
-            response = response.child(section);
         }
         if let Some(last) = last_work.filter(|_| tail) {
             for (index, part) in parts[..=last].iter().enumerate() {
@@ -10856,12 +11504,51 @@ fn build_assistant_turn(
             }
         }
     }
+    if live && head {
+        if let Some(index) = preamble {
+            response = response.child(render_part(index));
+        } else if last_work.is_none() {
+            // Until Pi emits work, streamed text is the preamble.
+            for index in 0..parts.len() {
+                response = response.child(render_part(index));
+            }
+        }
+    }
+    // KSG's `ThinkingTimelineRow`: while the turn runs and its tail is not the activity, the
+    // Thinking row sits at the very bottom. A failed last call puts it in the tail instead.
+    let thinking = live
+        && t.phase != "Compacting context"
+        && match live_tail(t, &parts) {
+            Some(tail) if tail.failed => false,
+            Some(tail) => !tail.active && t.request.is_none(),
+            None => t.request.is_none(),
+        };
+    let from = last_work.map_or(0, |index| index + 1);
+    let trailing = tail && last_work.is_some() && from < parts.len();
+    let mut thinking_after_text = thinking;
+    if live && whole && !items.is_empty() {
+        let mut rows = work_column(s, p, wide, &parts, &items, start, work_key.clone());
+        if thinking && !trailing {
+            rows = rows.child(col().pt(WORK_GAP).child(live_status_row(s, t, start, p)));
+            thinking_after_text = false;
+        }
+        response = response.child(rows);
+    }
     if tail && (!live || last_work.is_some()) {
-        let from = last_work.map_or(0, |index| index + 1);
         for index in from..parts.len() {
             response = response.child(render_part(index));
             tail_children += 1;
         }
+    }
+    // A split running turn's tail follows its last slice, 2 pt below it as the work column
+    // spaces its rows, or 12 pt below prose that ends the turn.
+    let mut tail_gap = 12.0;
+    if live && tail && thinking_after_text {
+        if !whole && !items.is_empty() && !trailing {
+            tail_gap = WORK_GAP;
+        }
+        response = response.child(live_status_row(s, t, start, p));
+        tail_children += 1;
     }
     if tail
         && !live
@@ -10872,34 +11559,107 @@ fn build_assistant_turn(
             .rev()
             .find(|m| m.role == "Pi" && !m.text.trim().is_empty())
     {
-        let reply_id = reply_msg.id.clone();
-        let on_press_id = reply_id.clone();
-        response = response.child(
-            row()
-                .key(format!("assistant-actions-{}-{reply_id}", t.id))
-                .gap(8.0)
-                .center_y()
-                .child(
-                    icon_button(
-                        &format!("reply-message-{reply_id}"),
-                        "Reply to this response",
-                        "back",
-                        p,
-                        move |s| {
-                            s.reply_to_message(&on_press_id);
-                        },
-                    )
-                    .help("Reply to this response"),
-                ),
-        );
+        response = response.child(assistant_message_meta(
+            s,
+            p,
+            reply_msg,
+            end == t.messages.len(),
+        ));
         tail_children += 1;
     }
     if piece == Some(TurnPiece::Tail) && tail_children > 0 {
-        // The status line sits in the work column, 2 pt below the last step; what
-        // follows a folded turn's work takes the response column's 12 pt.
-        return col().child(response.mt(if live { 2.0 } else { 12.0 } - LANE_GAP));
+        return col().child(response.mt(tail_gap - LANE_GAP));
     }
     response
+}
+
+/// How long a copied message shows its check, as KSG's `useCopyToClipboard` timeout.
+pub(crate) const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
+
+/// One quiet action under an assistant turn: a 24 pt icon button in the faint colour.
+fn meta_action(key: String, title: &'static str, glyph: &str, p: Palette) -> El {
+    el().key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(title)
+        .help(title)
+        .focusable(true)
+        .size(24.0, 24.0)
+        .center()
+        .radius(6.0)
+        .hover(p.selected)
+        .press(p.selected)
+        .child(icon(glyph, p.faint).size(14.0, 14.0))
+}
+
+/// Ported from KSG Code's `AssistantMessageMeta` (`chat/TimelineAssistantRows.tsx`): Copy, Fork
+/// and Reply under the response, on the prose's left edge. Shina messages carry no timestamp,
+/// so the time KSG shows after the actions is left out.
+fn assistant_message_meta(
+    s: &State,
+    p: Palette,
+    message: &crate::model::Message,
+    latest: bool,
+) -> El {
+    let t = s.current();
+    let id = message.id.clone();
+    let copied = s
+        .copied_message
+        .as_ref()
+        .is_some_and(|(copied, _)| copied == &id);
+    let text = message.display_text().to_owned();
+    let copy_id = id.clone();
+    let mut actions = row()
+        .key(format!("assistant-actions-{}-{id}", t.id))
+        .gap(4.0)
+        .ml(-4.0)
+        .center_y()
+        .child(
+            meta_action(
+                format!("copy-message-{id}"),
+                if copied { "Copied" } else { "Copy message" },
+                if copied { "check" } else { "copy" },
+                p,
+            )
+            .on_press_tx(move |s: &mut State, tx| {
+                tx.copy(text.clone());
+                s.copied_message = Some((copy_id.clone(), std::time::Instant::now()));
+                tx.wake_after(COPIED_FEEDBACK + Duration::from_millis(50));
+            }),
+        );
+    if t.session.is_some() && t.can_change_conversation() {
+        let locked = t.status.busy() || t.configuring || (!latest && !t.can_rewind_conversation());
+        actions = actions.child(
+            meta_action(
+                format!("fork-message-{id}"),
+                "Fork from this response",
+                "fork",
+                p,
+            )
+            .disabled(locked)
+            .on_press(move |s: &mut State| {
+                // The newest response forks the whole conversation. An older one opens the
+                // fork points, where the user picks the turn to branch from.
+                if latest {
+                    s.fork_conversation(None);
+                } else {
+                    s.conversation_points(crate::model::ConversationMode::Fork);
+                }
+            }),
+        );
+    }
+    let reply_id = id.clone();
+    actions.child(
+        meta_action(
+            format!("reply-message-{id}"),
+            "Reply to this response",
+            "reply",
+            p,
+        )
+        .on_press(move |s: &mut State| {
+            s.reply_to_message(&reply_id);
+        }),
+    )
 }
 
 /// Ported from KSG Code's `TimelineHistoryControl` (`MessagesTimeline.tsx`).
@@ -10968,6 +11728,9 @@ pub(crate) struct TimelineCache {
     unfinished_tools: std::collections::HashSet<usize>,
     /// Bumped when a long turn's fold opens or closes, which splits or joins its rows.
     disclosure: u64,
+    /// The turn's elapsed seconds when a request began waiting on the user, so the working
+    /// bar's "Paused at" clock stops there.
+    paused_at: Option<u64>,
 }
 
 impl TimelineCache {
@@ -11455,7 +12218,7 @@ pub(crate) fn timeline_text_row(
     } else if last_work.is_none_or(|last| target > last) {
         TurnPiece::Tail
     } else {
-        let item = work_items(t, &parts, last_work, preamble, !live)
+        let item = work_items(t, &parts, last_work, preamble, live)
             .iter()
             .position(|item| item.part() == target)?;
         return pieces.iter().find_map(|(_, _, piece, key)| match piece {
@@ -11495,11 +12258,19 @@ fn push_turn_pieces(
     let parts = turn_parts_in(t, &structure.events, start, end);
     for part in &parts {
         match part {
+            TranscriptPart::Work(entries) => {
+                // The streak's fold flag: its first call's, or for thinking alone its first
+                // thought's.
+                match entry_tools(entries).next() {
+                    Some(index) => probe.push((0, index, t.tools[index].group_expanded)),
+                    None => {
+                        let index = entry_thoughts(entries)[0];
+                        probe.push((1, index, t.thoughts[index].expanded));
+                    }
+                }
+            }
             TranscriptPart::Tools(indices) if indices.len() > 1 => {
                 probe.push((0, indices[0], t.tools[indices[0]].group_expanded));
-            }
-            TranscriptPart::Thought(indices) => {
-                probe.push((1, indices[0], t.thoughts[indices[0]].expanded));
             }
             _ => {}
         }
@@ -11508,7 +12279,7 @@ fn push_turn_pieces(
         return false;
     }
     let (last_work, preamble) = turn_shape(t, &parts);
-    let items = work_items(t, &parts, last_work, preamble, !live);
+    let items = work_items(t, &parts, last_work, preamble, live);
     if items.len() < segment_min_items() {
         return false;
     }
@@ -11658,7 +12429,7 @@ fn build_user_or_system_row(
                     .max_w(max_width)
                     .min_w(0.0)
                     .padding(12.0)
-                    .radius(6.0)
+                    .radius(12.0)
                     .fill(p.message_bg)
                     // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
                     // `line` colour disappeared on the `message_bg` fill). No shadow.
@@ -11700,7 +12471,7 @@ fn build_user_or_system_row(
                 lbl = lbl.text_highlights(ranges.into_iter().enumerate().map(|(i, range)| {
                     let is_active = Some(i) == active_occ;
                     let bg = if is_active {
-                        p.coral.alpha(0.42)
+                        p.sea.alpha(0.32)
                     } else {
                         p.brass.alpha(0.32)
                     };
@@ -11716,7 +12487,7 @@ fn build_user_or_system_row(
             .gap(4.0)
             .px(12.0)
             .py(8.0)
-            .radius(6.0)
+            .radius(12.0)
             .fill(p.coral_bg)
             .child(label("Shina", TextStyle::new(13.0, 600.0), p.ink))
             .child(lbl)
@@ -11746,7 +12517,7 @@ fn fresh_session_row(message_id: &str, p: Palette) -> El {
                 .center_y()
                 .gap(6.0)
                 .child(icon("alert", p.muted))
-                .child(pixel_text("New session", p.muted)),
+                .child(meta_text("New session", p.muted)),
         )
         .child(el().h(1.0).grow(1.0).fill(p.line))
 }
@@ -11777,7 +12548,7 @@ fn handoff_row(s: &State, index: usize, handoff: &crate::handoff::Handoff, p: Pa
             .min_w(0.0)
             .shrink()
             .child(provider_icon(s, p, model_vendor(name, ""), 12.0))
-            .child(pixel_text(name, p.muted).truncate().shrink().min_w(0.0))
+            .child(meta_text(name, p.muted).truncate().shrink().min_w(0.0))
     };
     let mut detail = row().center_y().gap(6.0).min_w(0.0).shrink();
     let sources: Vec<(&str, Option<&str>)> = if handoff.from_models.is_empty() {
@@ -11800,18 +12571,18 @@ fn handoff_row(s: &State, index: usize, handoff: &crate::handoff::Handoff, p: Pa
     };
     for (position, (instance, model)) in sources.iter().enumerate() {
         if position > 0 {
-            detail = detail.child(pixel_text(",", p.muted));
+            detail = detail.child(meta_text(",", p.muted));
         }
         detail = detail.child(endpoint(instance, *model));
     }
     if !sources.is_empty() {
-        detail = detail.child(pixel_text("→", p.muted));
+        detail = detail.child(meta_text("→", p.muted));
     }
     detail = detail.child(endpoint(&handoff.to_instance, handoff.to_model.as_deref()));
     if handoff.delivery.status == crate::handoff::DeliveryStatus::Inline {
         let covered = handoff.delivery.delivered_item_ids.len();
         let omitted = handoff.delivery.omitted_item_ids.len();
-        detail = detail.child(pixel_text(
+        detail = detail.child(meta_text(
             format!("· {covered} items, {omitted} omitted"),
             p.muted,
         ));
@@ -11833,7 +12604,7 @@ fn handoff_row(s: &State, index: usize, handoff: &crate::handoff::Handoff, p: Pa
                 .min_w(0.0)
                 .shrink()
                 .child(icon("swap", tone))
-                .child(pixel_text(title, tone).shrink())
+                .child(meta_text(title, tone).shrink())
                 .child(detail),
         )
         .child(el().h(1.0).grow(1.0).fill(p.line))
@@ -11879,7 +12650,7 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
         .px(10.0)
         .gap(4.0)
         .center_y()
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
         .on_layout_tx(|s: &mut State, _rect, tx| {
             let changed = s.sync_thread_find_input();
@@ -11941,7 +12712,7 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
                 .focusable(true)
                 .px(4.0)
                 .py(2.0)
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .on_press(|s: &mut State| s.retry_thread_find()),
         );
@@ -12013,20 +12784,13 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
             introduction = introduction
                 .items_center()
                 .pb(16.0)
-                .child(captain_hero(s, p, captain, wide, pane_width));
+                .child(captain_hero(s, p, captain, pane_width));
         } else {
             introduction = introduction
                 .items_center()
                 .px(0.0)
                 .pb(16.0)
                 .gap(24.0)
-                .child(horizon_band(
-                    lane_width(pane_width, wide),
-                    s.dark,
-                    crate::horizon::Subject::Boat,
-                    fleet_size(s),
-                    p,
-                ))
                 .child(draft_headline(s, p, pane_width));
         }
         if t.restoring_history() {
@@ -12088,11 +12852,20 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                         .get(*index)
                         .map(|handoff| handoff_row(s, *index, handoff, p))
                         .unwrap_or_else(el),
+                    // A running turn grows at the stack's streaming pace behind its feathered
+                    // edge. A finished one folds its work open and shut over 200 ms, as KSG
+                    // Code's `transition-[height] duration-200 ease-out` does.
                     TimelineRow::AssistantTurn { start, end, .. } => {
-                        assistant_turn(s, p, wide, *start, *end)
+                        let turn = assistant_turn(s, p, wide, *start, *end);
+                        if *end == s.current().messages.len() && s.current().status.busy() {
+                            turn.streaming(true)
+                        } else {
+                            turn.fold_glide(rune::Spring::new(0.20, 0.0))
+                                .fold_feather(14.0)
+                        }
                     }
                     TimelineRow::LiveTurn { start, .. } => {
-                        assistant_turn(s, p, wide, *start, *start)
+                        assistant_turn(s, p, wide, *start, *start).streaming(true)
                     }
                     TimelineRow::TurnPiece {
                         start, end, piece, ..
@@ -12222,7 +12995,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                 .px(10.0)
                 .gap(6.0)
                 .center_y()
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.card)
                 .hover(p.selected)
                 .press(p.selected)
@@ -12248,7 +13021,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     wrapper
 }
 
-/// Ported from KSG Code's `WorktreeSetupCard.tsx`, skinned in Pixel Voyage.
+/// Ported from KSG Code's `WorktreeSetupCard.tsx`.
 fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
     let t = s.current();
     let setup = t.worktree_setup.as_ref()?;
@@ -12282,21 +13055,21 @@ fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
                 .grow(1.0)
                 .min_w(0.0),
         )
-        .child(pixel_text(status_word, tone));
+        .child(meta_text(status_word, tone));
     if setup.duration_ms > 0 {
         let dur = if setup.duration_ms < 1000 {
             format!("{}ms", setup.duration_ms)
         } else {
             format!("{:.1}s", setup.duration_ms as f64 / 1000.0)
         };
-        header = header.child(pixel_text(dur, p.muted));
+        header = header.child(meta_text(dur, p.muted));
     }
 
     let mut card = col()
         .w_full()
         .padding(12.0)
         .gap(8.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
         .child(header);
 
@@ -12326,14 +13099,14 @@ fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
             .gap(6.0)
             .h(24.0)
             .px(6.0)
-            .radius(4.0)
+            .radius(6.0)
             .hover(p.selected)
             .on_press(|s: &mut State| {
                 s.current_mut().worktree_setup_output_open =
                     !s.current().worktree_setup_output_open;
             })
             .child(icon(if open { "chevron-up" } else { "chevron" }, p.muted).size(12.0, 12.0))
-            .child(pixel_text("Output", p.muted));
+            .child(meta_text("Output", p.muted));
         card = card.child(toggle);
         if open {
             let mono = TextStyle::new(12.0, 400.0)
@@ -12345,7 +13118,7 @@ fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
                     .w_full()
                     .px(10.0)
                     .py(6.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(if setup.phase == crate::model::WorktreeSetupPhase::Failed {
                         p.coral_bg
                     } else {
@@ -12397,8 +13170,8 @@ fn worktree_setup_card(s: &State, p: Palette) -> Option<El> {
         col().w_full().child(
             card.key("worktree-setup-card")
                 .w_full()
-                .radius(6.0)
-                .border(2.0, p.frame),
+                .radius(12.0)
+                .border(1.0, p.frame),
         ),
     )
 }
@@ -12475,12 +13248,12 @@ fn assistant_selection_toolbar(s: &State, p: Palette, cx: &Cx<State>) -> Option<
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.card)
         .keeps_text_selection()
         .disabled(too_long)
         .child(icon("thread", if too_long { p.muted } else { p.ink }))
-        .child(pixel_text(
+        .child(meta_text(
             if too_long {
                 "Shorten selection"
             } else {
@@ -12526,14 +13299,14 @@ const TRANSCRIPT_CAP: f32 = 8.0;
 /// The sidebar portraits' animation stage also plays the captain hero, under this row id.
 pub(crate) const HERO_PORTRAIT_ROW: usize = usize::MAX;
 const HERO_PORTRAIT: f32 = 72.0;
-/// The captain hero with a one-line heading: band, portrait overlap, heading, role and status.
-const CAPTAIN_HERO_HEIGHT: f32 = 272.0;
+/// The captain hero with a one-line heading: portrait, heading, role and status.
+const CAPTAIN_HERO_HEIGHT: f32 = 210.0;
 
 /// An empty captain home greets like KSG Code's draft hero (`DraftHeroHeadline`: centred
 /// `text-3xl font-normal tracking-tight`, `text-2xl` on a narrow pane), with the captain's
 /// animated portrait above it. A home with a goal shows the goal; otherwise the captain asks
 /// what to look after. The live status keeps one 20 px line, so it never moves the composer.
-fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f32) -> El {
+fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
     let t = s.current();
     let profile = &s.captains[captain];
     let status = shown_status(s);
@@ -12590,7 +13363,7 @@ fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f
                 .child(status_mark(line_status, p, 6.0))
                 .child(label(
                     text,
-                    PIXEL.features(TABULAR),
+                    META.features(TABULAR),
                     status_ink(line_status, p),
                 )),
         );
@@ -12601,27 +13374,12 @@ fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f
         .next()
         .filter(|line| !line.trim().is_empty())
         .map_or_else(|| profile.role.clone(), str::to_owned);
-    // A profile banner: the portrait overlaps the band's bottom edge, the band's sky takes
-    // the portrait's backdrop colour, and the boat flies it as a pennant. One distant sail
-    // shows for each crew thread that works.
-    let band = horizon_band(
-        lane_width(pane_width, wide),
-        s.dark,
-        crate::horizon::Subject::Sky(crate::visuals::portrait_backdrop(portrait_index)),
-        fleet_size(s),
-        p,
-    );
     col()
         .key("captain-hero")
         .w_full()
         .items_center()
         .gap(10.0)
-        .child(band)
-        .child(
-            status_badge(p, portrait, HERO_PORTRAIT, status)
-                .mt(-(HERO_PORTRAIT / 2.0) - 10.0)
-                .mb(6.0),
-        )
+        .child(status_badge(p, portrait, HERO_PORTRAIT, status).mb(6.0))
         .child(
             label(
                 heading,
@@ -12665,7 +13423,6 @@ fn captain_hero(s: &State, p: Palette, captain: usize, wide: bool, pane_width: f
 fn empty_thread(
     s: &State,
     p: Palette,
-    narrow: bool,
     wide: bool,
     pane_width: f32,
     hero_fits: bool,
@@ -12696,7 +13453,7 @@ fn empty_thread(
         .min_h(0.0)
         .items_center()
         .child(above)
-        .child(composer(s, p, narrow, wide, pane_width, caret_edges))
+        .child(composer(s, p, wide, pane_width, caret_edges))
         .child(below)
 }
 
@@ -12726,7 +13483,7 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
             .center_y()
             .pl(4.0)
             .pr(1.0)
-            .radius(6.0)
+            .radius(12.0)
             .shrink()
             .min_w(0.0)
             .hover(p.selected)
@@ -12797,7 +13554,7 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
                     .px(10.0)
                     .gap(6.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(p.coral)
                     .hover(p.coral)
                     .on_press(|s: &mut State| s.open_picker(ProjectPicker::AddProject))
@@ -12877,8 +13634,8 @@ fn image_preview(
         return el()
             .key(key)
             .size(width, height)
-            .radius(4.0)
-            .clip_rounded(4.0)
+            .radius(6.0)
+            .clip_rounded(6.0)
             .video(&player, rune::SurfaceFit::Fill)
             .child(
                 el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
@@ -12889,8 +13646,8 @@ fn image_preview(
     let mut preview = el()
         .key(key)
         .size(width, height)
-        .radius(4.0)
-        .clip_rounded(4.0)
+        .radius(6.0)
+        .clip_rounded(6.0)
         .border(0.5, p.line);
     if let Some(path) = crate::attachments::preview_path_for(image) {
         let handle = s.attachment_cache.file(path, width.max(height), 2.0);
@@ -12982,8 +13739,8 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 ATTACHMENT_THUMB,
                 format!("attachment-thumb-{id}"),
             )
-            .radius(4.0)
-            .clip_rounded(4.0)
+            .radius(6.0)
+            .clip_rounded(6.0)
             .role("button")
             .label(format!("Preview {}", image.name))
             .focusable(true)
@@ -13001,7 +13758,7 @@ fn attachment_chip(s: &State, p: Palette, image: &Attachment) -> El {
                 .pin(None, Some(4.0), Some(4.0), None)
                 .size(18.0, 18.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(Color::BLACK.alpha(0.6))
                 .hover(Color::BLACK.alpha(0.8))
                 .on_press(move |s: &mut State| s.request_remove_attachment(&id))
@@ -13064,7 +13821,7 @@ fn attachment_upload_status(s: &State, p: Palette, id: &str) -> Option<El> {
             .px(4.0)
             .justify_center()
             .fill(p.card)
-            .child(pixel_text(status, p.ink))
+            .child(meta_text(status, p.ink))
     })
 }
 
@@ -13090,7 +13847,7 @@ fn preparing_attachment_chip(
     let mut tile = el()
         .key(format!("attachment-{id}"))
         .size(64.0, 64.0)
-        .radius(4.0)
+        .radius(6.0)
         .border(0.5, p.line)
         .fill(p.selected)
         .center()
@@ -13166,7 +13923,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
                             )
                         }),
                 )
-                .child(pixel_text(size, p.muted))
+                .child(meta_text(size, p.muted))
                 .child(icon_button(
                     &format!("remove-attachment-{id}"),
                     &format!("Remove {}", file.name),
@@ -13205,7 +13962,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
                             .grow(1.0)
                             .min_w(0.0),
                     )
-                    .child(pixel_text(
+                    .child(meta_text(
                         if can_attach {
                             "Attach again"
                         } else {
@@ -13263,7 +14020,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
                     .grow(1.0)
                     .min_w(0.0),
             )
-            .child(pixel_text(status, p.muted).key(format!("attachment-status-{}", entry.id)));
+            .child(meta_text(status, p.muted).key(format!("attachment-status-{}", entry.id)));
         if let Phase::Failed(reason) = &entry.phase {
             let id = entry.id.clone();
             file = file.child(
@@ -13342,10 +14099,10 @@ fn remove_attachment_dialog(s: &State, p: Palette) -> El {
         .max_w(540.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label("Remove attachment", DIALOG_TITLE, p.ink))
         .child(
@@ -13427,7 +14184,7 @@ fn attach_control(locked: bool, p: Palette) -> El {
         .help("Attach files. Shift-click for a folder.")
         .size(24.0, 24.0)
         .center()
-        .radius(4.0)
+        .radius(6.0)
         .opacity(if locked { 0.65 } else { 1.0 })
         .hover(p.selected)
         .disabled(locked)
@@ -13709,9 +14466,34 @@ fn attach_composer_notices(s: &State, p: Palette, lane: f32, composer_card: El) 
     }
 }
 
+/// KSG Code's `ComposerSurface.Shell`: the 16 px tray that holds the attached notices, the
+/// 15 px main card and the context strip under it, with a hairline rim and a soft shadow. The
+/// resting composer has no strip, so its shell draws nothing; it is there so the card keeps
+/// one place in the tree and never animates out when the composer expands.
+fn composer_shell(p: Palette, inner: El, strip: Option<El>) -> El {
+    let shell = col().key("composer-shell").w_full();
+    let Some(strip) = strip else {
+        return shell.child(inner);
+    };
+    shell
+        .radius(16.0)
+        .fill(p.tray)
+        .border(1.0, p.line)
+        .box_shadow(rune::Shadow {
+            x: 0.0,
+            y: 4.0,
+            blur: 16.0,
+            spread: 0.0,
+            color: p.shadow.alpha(p.shadow.a * 0.6),
+            inset: false,
+        })
+        .child(inner)
+        .child(strip)
+}
+
 /// Ported from KSG Code's `ComposerBannerStack` and `ComposerBanner` (`attached`,
-/// `density="comfortable"`), skinned per Pixel Voyage: 2 px `outlined` frame, 6 px outer corners
-/// only on the top card, variant colour on the icon and a 2 px left edge.
+/// `density="comfortable"`), inside the composer tray: 15 px outer corners on the top notice,
+/// variant colour on the icon and a 2 px left edge.
 fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
     use crate::composer_notices::Variant;
     let notices = s.composer_notices.ordered();
@@ -13724,7 +14506,11 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
     let mut stack = col().key("composer-notices").w_full().gap(0.0);
     for (index, notice) in notices.iter().enumerate() {
         let top = index == 0;
-        let corners = if top { [6.0, 6.0, 0.0, 0.0] } else { [0.0; 4] };
+        let corners = if top {
+            [15.0, 15.0, 0.0, 0.0]
+        } else {
+            [0.0; 4]
+        };
         let variant_color = match notice.variant {
             Variant::Error => p.danger,
             Variant::Warning => p.brass,
@@ -13838,8 +14624,6 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
             .py(5.0)
             .corners(corners)
             .clip_corners(corners)
-            .fill(p.card)
-            .border(2.0, p.frame)
             .child(
                 el().w(2.0)
                     .fill(variant_color)
@@ -13865,8 +14649,8 @@ fn usage_progress_bar(key: String, fill_key: Option<String>, percent: f64, p: Pa
     let mut fill = el()
         .w_frac(fraction)
         .h_full()
-        .radius(2.0)
-        .fill(if percent >= 90.0 { p.coral } else { p.faint });
+        .radius(4.0)
+        .fill(if percent >= 90.0 { p.danger } else { p.faint });
     if let Some(fill_key) = fill_key {
         fill = fill.key(fill_key);
     }
@@ -13876,15 +14660,15 @@ fn usage_progress_bar(key: String, fill_key: Option<String>, percent: f64, p: Pa
         .label(format!("{} used", context_percent_text(percent)))
         .w_full()
         .h(6.0)
-        .radius(2.0)
-        .clip_rounded(2.0)
+        .radius(4.0)
+        .clip_rounded(4.0)
         .fill(p.line)
         .child(fill)
 }
 
 /// Ported from KSG Code's `UsageLimitsBannerBody` (`ComposerUsageLimits.tsx`) and
 /// `ComposerBanner.Scroll` (`ComposerBanner.tsx`: `max-h-[min(24rem,40dvh)]`), skinned per
-/// Pixel Voyage using `usage_progress_bar` and 11 px Departure Mono figures.
+/// KSG Code's theme using `usage_progress_bar` and 12 px Inter figures.
 fn usage_limits_notice_body(
     s: &State,
     report: &crate::usage_limits::UsageLimitsReport,
@@ -13952,7 +14736,7 @@ fn usage_limits_notice_body(
                                     .min_w(0.0)
                                     .grow(1.0),
                             )
-                            .child(pixel_text(context_percent_text(window.used_percent), p.ink)),
+                            .child(meta_text(context_percent_text(window.used_percent), p.ink)),
                     )
                     .child(row().grow(1.0).min_w(48.0).center_y().child(bar))
                     .child(
@@ -13960,7 +14744,7 @@ fn usage_limits_notice_body(
                             .min_w(84.0)
                             .justify_end()
                             .center_y()
-                            .child(pixel_text(reset_text, p.muted)),
+                            .child(meta_text(reset_text, p.muted)),
                     );
                 acc_col = acc_col.child(win_row);
             }
@@ -13998,7 +14782,7 @@ fn usage_limits_notice_body(
                         .min_w(0.0)
                         .center_y()
                         .gap(12.0)
-                        .child(pixel_text(choice.summary, p.muted))
+                        .child(meta_text(choice.summary, p.muted))
                         .child(button(&btn_key, &choice.action_label, p, move |s| {
                             s.redeem_usage_reset_credit(choice_input.clone())
                         })),
@@ -14031,11 +14815,11 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
         .max_w(480.0)
         .padding(12.0)
         .gap(8.0)
-        .radius(6.0)
-        .clip_rounded(6.0)
+        .radius(12.0)
+        .clip_rounded(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored(
             &format!("composer-notice-details-{}", notice.id),
             rune::Side::Top,
@@ -14055,7 +14839,7 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
             row()
                 .center_y()
                 .gap(12.0)
-                .child(pixel_label("Notice details", p.muted))
+                .child(meta_label("Notice details", p.muted))
                 .child(spacer())
                 .child(icon_button(
                     "close-notice-details",
@@ -14222,7 +15006,7 @@ fn context_breakdown_view(
             .h_full()
             .opacity(opacity);
         if item.kind == ContextLegendKind::Buffer {
-            segment = segment.border(2.0, p.faint);
+            segment = segment.border(1.0, p.faint);
         } else {
             segment = segment.fill(color);
         }
@@ -14246,7 +15030,7 @@ fn context_breakdown_view(
 
         let mut swatch = el().size(8.0, 8.0);
         if item.kind == ContextLegendKind::Buffer {
-            swatch = swatch.border(2.0, p.faint);
+            swatch = swatch.border(1.0, p.faint);
         } else {
             swatch = swatch.fill(color);
         }
@@ -14322,7 +15106,7 @@ fn context_breakdown_view(
 
     let framed_bar = el()
         .w_full()
-        .border(2.0, p.frame)
+        .border(1.0, p.frame)
         .border_layout()
         .child(bar);
     col().w_full().gap(8.0).child(framed_bar).child(rows)
@@ -14342,7 +15126,7 @@ fn context_popover(s: &State, p: Palette) -> El {
         .as_deref()
         .and_then(|items| breakdown_keys(items).into_iter().last())
         .map(|(_, legend_key)| legend_key);
-    // Figures are Departure Mono with tabular digits; their names stay Inter.
+    // Figures use tabular digits; their names stay regular weight.
     let secondary = TIMER;
     let strong = TIMER;
     let mut figures = row().center_y().gap(8.0);
@@ -14371,11 +15155,11 @@ fn context_popover(s: &State, p: Palette) -> El {
         .w(if legend.is_some() { 320.0 } else { 256.0 })
         .padding(12.0)
         .gap(8.0)
-        .radius(6.0)
-        .clip_rounded(6.0)
+        .radius(12.0)
+        .clip_rounded(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .anchored("context-usage-ring", rune::Side::Top, rune::Align::End, 4.0)
         .on_key(|s: &mut State, event, _| context_escape(s, event))
         .on_hover_change(|s: &mut State, inside, _| s.current_mut().context.hover(false, inside))
@@ -14384,7 +15168,7 @@ fn context_popover(s: &State, p: Palette) -> El {
             row()
                 .center_y()
                 .gap(12.0)
-                .child(pixel_label("Context window", p.muted))
+                .child(meta_label("Context window", p.muted))
                 .child(spacer())
                 .child(figures),
         );
@@ -14408,11 +15192,11 @@ fn context_popover(s: &State, p: Palette) -> El {
             .label("Context window usage")
             .w_full()
             .h(6.0)
-            .radius(2.0)
-            .clip_rounded(2.0)
+            .radius(4.0)
+            .clip_rounded(4.0)
             .fill(p.line);
         if usage.percent.is_some() {
-            bar = bar.child(el().w_frac(fraction).h_full().radius(2.0).fill(ink));
+            bar = bar.child(el().w_frac(fraction).h_full().radius(4.0).fill(ink));
         }
         card = card.child(bar);
     }
@@ -14445,7 +15229,7 @@ fn context_popover(s: &State, p: Palette) -> El {
             .key("context-usage-limits")
             .gap(8.0)
             .child(rule(p))
-            .child(pixel_text("Usage", p.muted).key("usage-heading"));
+            .child(meta_text("Usage", p.muted).key("usage-heading"));
         for (index, window) in windows.iter().take(16).enumerate() {
             let Some(percent) = window["usedPercent"].as_f64().filter(|n| n.is_finite()) else {
                 continue;
@@ -14470,7 +15254,7 @@ fn context_popover(s: &State, p: Palette) -> El {
                                     .grow(1.0),
                             )
                             .child(
-                                pixel_text(context_percent_text(percent), p.ink)
+                                meta_text(context_percent_text(percent), p.ink)
                                     .key(format!("usage-percent-{index}")),
                             ),
                     )
@@ -14481,7 +15265,7 @@ fn context_popover(s: &State, p: Palette) -> El {
                         p,
                     ))
                     .child(
-                        pixel_text(reset, p.muted)
+                        meta_text(reset, p.muted)
                             .key(format!("usage-reset-{index}"))
                             .wrap(),
                     ),
@@ -14513,8 +15297,8 @@ fn context_popover(s: &State, p: Palette) -> El {
         .gap(6.0)
         .justify_center()
         .center_y()
-        .radius(4.0)
-        .border(2.0, p.frame)
+        .radius(6.0)
+        .border(1.0, p.frame)
         .hover(p.selected)
         .press(p.selected)
         .opacity(if can_compact { 1.0 } else { 0.55 })
@@ -14567,6 +15351,8 @@ fn context_popover(s: &State, p: Palette) -> El {
 const COMPOSER_FIELD_MIN: f32 = 36.0;
 /// The composer text field's own padding, inside `composer-input`.
 const COMPOSER_FIELD_PAD: f32 = 4.0;
+/// About how wide the prompt body's inline actions are: attach, the gap and the send key.
+const COMPOSER_ACTIONS_W: f32 = 28.0 + 6.0 + 32.0;
 /// KSG's `max-h-52`: a 200 pt text window inside the 4 pt padding, then the field scrolls.
 const COMPOSER_FIELD_MAX: f32 = 208.0;
 /// A composer that cannot send: demo data, an archived thread or an unreachable machine.
@@ -14579,7 +15365,7 @@ fn composer_frame(s: &State, p: Palette) -> Color {
     if composer_disabled(s) {
         p.line
     } else if s.attachment_drop_hover || s.current().draft.focused {
-        p.coral
+        p.ring.alpha(0.6)
     } else {
         p.frame
     }
@@ -14668,7 +15454,7 @@ fn composer_reply_banner(t: &Thread, p: Palette) -> Option<El> {
                     .min_w(0.0)
                     .gap(4.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .hover(p.selected)
                     .press(p.selected)
                     .on_press_tx(move |s: &mut State, tx| {
@@ -14690,7 +15476,7 @@ fn composer_reply_banner(t: &Thread, p: Palette) -> Option<El> {
                     .focusable(true)
                     .size(20.0, 20.0)
                     .center()
-                    .radius(4.0)
+                    .radius(6.0)
                     .hover(p.selected)
                     .press(p.selected)
                     .on_press(|s: &mut State| {
@@ -14730,7 +15516,6 @@ fn composer_decorations(
 fn composer(
     s: &State,
     p: Palette,
-    narrow: bool,
     wide: bool,
     pane_width: f32,
     caret_edges: Option<[bool; 2]>,
@@ -14746,7 +15531,11 @@ fn composer(
             .draft_images
             .iter()
             .any(|a| !a.is_image() && !attachment_is_video(a) && !inline_files.contains(&a.id))
-        && composer_ui::collapsed(s, s.composer_ui.viewport.get(), lane - 32.0);
+        && composer_ui::collapsed(
+            s,
+            s.composer_ui.viewport.get(),
+            lane - 32.0 - COMPOSER_ACTIONS_W,
+        );
     let mut area = col().w_full().max_w(measure(wide)).pb(16.0).gap(8.0);
     if !t.native.notifications.is_empty() {
         area = area.child(pi_ui::notifications(s, p));
@@ -14882,11 +15671,15 @@ fn composer(
             "Submit message"
         })
         .size(32.0, 32.0)
-        .radius(4.0)
+        .radius(8.0)
         .center()
-        // A framed key. Rune cannot move it on press, so a pressed key darkens instead.
-        .press(if can_send { p.coral.alpha(0.8) } else { p.line })
-        .fill(if can_send { p.coral } else { p.line })
+        // KSG's send key: the primary fill when it can send, a faint tile when it cannot.
+        .press(if can_send {
+            p.coral.alpha(0.9)
+        } else {
+            p.selected
+        })
+        .fill(if can_send { p.coral } else { p.selected })
         .child(icon(
             if show_resume {
                 "play"
@@ -14898,9 +15691,6 @@ fn composer(
             if can_send { p.on_coral } else { p.muted },
         ))
         .disabled(!can_send);
-    if can_send {
-        send = framed(send, p);
-    }
     if can_send && show_resume {
         send = send
             .focusable(true)
@@ -14915,10 +15705,7 @@ fn composer(
             s.current_mut().native.follow_up = previous;
         });
     }
-    let [action_x, mut action_y] = composer_ui::anchor_offset(s, 1, true);
-    if !collapsed {
-        action_y -= composer_ui::footer_offset(s);
-    }
+    let [action_x, action_y] = composer_ui::anchor_offset(s, 1, true);
     let mut action = composer_ui::bind_anchor(
         s,
         1,
@@ -14945,7 +15732,7 @@ fn composer(
                 .focusable(true)
                 .h(28.0)
                 .px(8.0)
-                .radius(4.0)
+                .radius(6.0)
                 .center_y()
                 .gap(6.0)
                 .hover(p.selected)
@@ -14966,7 +15753,7 @@ fn composer(
                     p.ink,
                 ));
             }
-            toggle = toggle.child(label(&amount, PIXEL.features(TABULAR), p.muted));
+            toggle = toggle.child(label(&amount, META.features(TABULAR), p.muted));
             action = action.child(toggle);
         }
         action = action.child(send);
@@ -14987,10 +15774,10 @@ fn composer(
                         || s.client.is_some() && !s.machine_connected(&s.machines.selected),
                 )
                 .size(32.0, 32.0)
-                .radius(4.0)
+                .radius(8.0)
                 .center()
                 .fill(p.coral)
-                .press(p.coral.alpha(0.8))
+                .press(p.coral.alpha(0.9))
                 .on_press(|s: &mut State| s.current_mut().stop())
                 .child(icon("stop", p.on_coral)),
             p,
@@ -15017,11 +15804,11 @@ fn composer(
         area = area.child(part);
     }
     area = area.child(pi_ui::queued_messages(s, p));
-    // KSG Code's composer: a 16 px card with a hairline outline and a 1 px shadow, text at
-    // px-4 pt-4, and the controls in a px-2 pb-2 row so their hover fills sit near the edge.
-    // A composer that cannot send has nothing to act on, so it drops the hard shadow. Its frame
-    // keeps the same 2 px shape in the lighter `line` colour, so the box does not change size.
-    let mut card = col().key("composer-natural").w_full();
+    // KSG Code's `ComposerSurface.Main`: a 15 px card with a hairline outline. A composer that
+    // cannot send drops its shadow and its frame takes the lighter `line` colour.
+    // The resting row and the prompt body swap at once, so a press right after expanding
+    // never lands on the leaving row.
+    let mut card = col().key("composer-natural").w_full().instant_changes();
     card = card
         .on_drop_files(|s: &mut State, files, _| {
             s.attachment_drop_hover = false;
@@ -15114,10 +15901,10 @@ fn composer(
             }
         } else if offered_suggestion.is_some() {
             String::new()
-        } else if collapsed {
+        } else if collapsed || lane < 560.0 {
             "Ask anything...".to_string()
         } else {
-            "Ask anything. Shift Enter for a new line".to_string()
+            "Ask anything, @tag files/folders, $use skills, or / for commands".to_string()
         },
         p.muted,
     )
@@ -15149,7 +15936,7 @@ fn composer(
         checkbox_stroke: 2.0,
         checkbox_color: Some(p.ink),
         checkbox_checked_fill: Some(p.coral),
-        checkbox_mark_color: Some(p.ink),
+        checkbox_mark_color: Some(p.on_coral),
         rule_thickness: 2.0,
         rule_color: Some(p.line),
         // KSG's `.composer-tiptap hr { margin: 0.65rem 0 }`.
@@ -15157,7 +15944,7 @@ fn composer(
         rule_margin_bottom: Some(10.4),
     })
     .code_language_headers(s, p, locked)
-    .caret(p.coral, p.coral_bg)
+    .caret(p.ink, p.coral_bg)
     .w_full()
     .min_h(COMPOSER_FIELD_MIN)
     .padding(COMPOSER_FIELD_PAD)
@@ -15354,108 +16141,29 @@ fn composer(
             .w_full()
             .px(lane_gutter(pane_width))
             .items_center()
-            .child(area.child(attach_composer_notices(s, p, lane, composer_card)));
+            .child(area.child(composer_shell(
+                p,
+                attach_composer_notices(s, p, lane, composer_card),
+                None,
+            )));
     }
-    card = card.child(
-        col()
-            .key("composer-body")
-            .w_full()
-            .px(12.0)
-            .pt(10.0)
-            .pb(2.0)
-            // A press in the body's padding still lands in the field, as KSG's surface does.
-            .on_press(|s: &mut State| s.restore_composer_focus(composer_ui::FocusReason::Explicit))
-            // The field inside is the Tab stop, not this.
-            .focusable(false)
-            .child(composer_ui::prompt_surface(
-                s,
-                col()
-                    .key("composer-scroll")
-                    .w_full()
-                    .shrink()
-                    .min_h(COMPOSER_FIELD_MIN)
-                    .max_h(COMPOSER_FIELD_MAX)
-                    .scroll(ScrollSpec {
-                        stick_bottom: false,
-                    })
-                    // ProseMirror's scroll margin: the caret line keeps the 4 pt padding in view.
-                    .scroll_margin(4.0)
-                    .child({
-                        let mut host = el().key("composer-input-host").w_full();
-                        let field = if let Some(suggestion) = offered_suggestion {
-                            let content_w = (lane - 24.0 - COMPOSER_FIELD_PAD * 2.0).max(40.0);
-                            let (natural_w, _) =
-                                rune::text::measure(suggestion, &[], composer_style, None);
-                            let min_h = if natural_w + 48.0 <= content_w {
-                                COMPOSER_FIELD_MIN
-                            } else {
-                                let (_, text_h) = rune::text::measure(
-                                    suggestion,
-                                    &[],
-                                    composer_style,
-                                    Some(content_w),
-                                );
-                                (text_h + 24.0 + COMPOSER_FIELD_PAD * 2.0).max(COMPOSER_FIELD_MIN)
-                            };
-                            host = host.min_h(min_h);
-                            field.min_h(min_h)
-                        } else {
-                            host = host.min_h(COMPOSER_FIELD_MIN);
-                            field
-                        };
-                        host = host.child(field);
-                        if let Some(suggestion) = offered_suggestion {
-                            host = host.child(
-                                row()
-                                    .key("composer-suggestion")
-                                    .inert()
-                                    .flex_wrap()
-                                    .center_y()
-                                    .gap(8.0)
-                                    .pin(
-                                        Some(COMPOSER_FIELD_PAD),
-                                        Some(COMPOSER_FIELD_PAD),
-                                        None,
-                                        Some(COMPOSER_FIELD_PAD),
-                                    )
-                                    .child(
-                                        label(suggestion, composer_style, p.muted)
-                                            .wrap()
-                                            .min_w(0.0)
-                                            .shrink(),
-                                    )
-                                    .child(keycap_chip("Tab", p).key("composer-suggestion-key")),
-                            );
-                        }
-                        host
-                    }),
-                false,
-            )),
-    );
-    let [model_x, model_y] = composer_ui::anchor_offset(s, 3, true);
-    let mut actions = row()
+    // KSG Code's `.composer-prompt-body`: the editor on the left and the attach, compact,
+    // dispatch and send controls inline on the right. A one-line draft centres them on the
+    // prompt line; a wrapped draft anchors them to the bottom right.
+    let multiline = t.draft.text.contains('\n') || s.composer_ui.wrapped();
+    let mut cluster = row()
         .key("composer-actions")
-        .offset(0.0, composer_ui::footer_offset(s))
         .on_key(composer_ui::control_key)
         .keeps_text_selection()
         .center_y()
-        .gap(2.0)
-        .px(8.0)
-        .pb(8.0)
+        .gap(6.0)
         .child(
             attach_control(attach_locked, p)
                 .size(28.0, 28.0)
-                .radius(4.0),
-        )
-        .child(spacer())
-        .child(composer_ui::bind_anchor(
-            s,
-            3,
-            model_effort_trigger(s, p, narrow, locked)
-                .offset(model_x, model_y - composer_ui::footer_offset(s)),
-        ));
+                .radius(8.0),
+        );
     if t.status.busy() && t.has_draft_content() && t.queued_edit.is_none() {
-        actions = actions.child(
+        cluster = cluster.child(
             button(
                 "dispatch-mode",
                 if t.follow_up_queues() {
@@ -15472,9 +16180,108 @@ fn composer(
             .disabled(!t.can_steer()),
         );
     }
-    if context_ring_shown(t) {
-        actions = actions.child(context_ring(t, p));
-    }
+    cluster = cluster.child(action);
+    let mut prompt_body = row()
+        .key("composer-prompt-body")
+        .w_full()
+        .min_h(48.0)
+        .py(6.0)
+        .pl(10.0)
+        .pr(8.0)
+        .gap(6.0);
+    prompt_body = if multiline {
+        prompt_body.items_end()
+    } else {
+        prompt_body.center_y()
+    };
+    card = card.child(
+        prompt_body
+            .child(
+                col()
+                    .key("composer-body")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    // A press in the body's padding still lands in the field, as KSG's surface does.
+                    .on_press(|s: &mut State| {
+                        s.restore_composer_focus(composer_ui::FocusReason::Explicit)
+                    })
+                    // The field inside is the Tab stop, not this.
+                    .focusable(false)
+                    .child(composer_ui::prompt_surface(
+                        s,
+                        col()
+                            .key("composer-scroll")
+                            .w_full()
+                            .shrink()
+                            .min_h(COMPOSER_FIELD_MIN)
+                            .max_h(COMPOSER_FIELD_MAX)
+                            .scroll(ScrollSpec {
+                                stick_bottom: false,
+                            })
+                            // ProseMirror's scroll margin: the caret line keeps the 4 pt padding in view.
+                            .scroll_margin(4.0)
+                            .child({
+                                let mut host = el().key("composer-input-host").w_full();
+                                let field = if let Some(suggestion) = offered_suggestion {
+                                    let content_w = (lane
+                                        - COMPOSER_ACTIONS_W
+                                        - 26.0
+                                        - COMPOSER_FIELD_PAD * 2.0)
+                                        .max(40.0);
+                                    let (natural_w, _) =
+                                        rune::text::measure(suggestion, &[], composer_style, None);
+                                    let min_h = if natural_w + 48.0 <= content_w {
+                                        COMPOSER_FIELD_MIN
+                                    } else {
+                                        let (_, text_h) = rune::text::measure(
+                                            suggestion,
+                                            &[],
+                                            composer_style,
+                                            Some(content_w),
+                                        );
+                                        (text_h + 24.0 + COMPOSER_FIELD_PAD * 2.0)
+                                            .max(COMPOSER_FIELD_MIN)
+                                    };
+                                    host = host.min_h(min_h);
+                                    field.min_h(min_h)
+                                } else {
+                                    host = host.min_h(COMPOSER_FIELD_MIN);
+                                    field
+                                };
+                                host = host.child(field);
+                                if let Some(suggestion) = offered_suggestion {
+                                    host = host.child(
+                                        row()
+                                            .key("composer-suggestion")
+                                            .inert()
+                                            .flex_wrap()
+                                            .center_y()
+                                            .gap(8.0)
+                                            .pin(
+                                                Some(COMPOSER_FIELD_PAD),
+                                                Some(COMPOSER_FIELD_PAD),
+                                                None,
+                                                Some(COMPOSER_FIELD_PAD),
+                                            )
+                                            .child(
+                                                label(suggestion, composer_style, p.muted)
+                                                    .wrap()
+                                                    .min_w(0.0)
+                                                    .shrink(),
+                                            )
+                                            .child(
+                                                keycap_chip("Tab", p)
+                                                    .key("composer-suggestion-key"),
+                                            ),
+                                    );
+                                }
+                                host
+                            }),
+                        false,
+                    )),
+            )
+            .child(cluster),
+    );
     if let Some(error) = &t.submission_error {
         card = card.child(
             col()
@@ -15484,20 +16291,17 @@ fn composer(
                 .child(label(error, SMALL, p.danger).wrap().selectable(true)),
         );
     }
-    let composer_card = composer_ui::frame_card(s, p, card.child(actions.child(action.ml(4.0))));
-    area = area.child(attach_composer_notices(s, p, lane, composer_card));
-    // KSG Code's context strip: a bare muted row under the card, machine on the left and the
-    // access mode on the right, inset to line up with the card's controls.
-    let mut footer = row()
-        .key("composer-footer")
-        .min_h(if s.client.is_some() { 28.0 } else { 24.0 })
-        .px(10.0)
-        .flex_wrap()
-        .center_y()
-        .gap(6.0);
-    footer = if s.demo {
-        footer
-            .child(pixel_text("Demo data", p.muted))
+    let composer_card = composer_ui::frame_card(s, p, card);
+    // KSG Code's `ComposerSurface.ContextStrip`: a 30 px muted row inside the tray, the run
+    // context on the left and the model, effort, context and access on the right.
+    let footer = if s.demo {
+        row()
+            .key("composer-footer")
+            .h(30.0)
+            .px(10.0)
+            .center_y()
+            .gap(6.0)
+            .child(meta_text("Demo data", p.muted))
             .child(spacer())
             .child(
                 row()
@@ -15507,19 +16311,23 @@ fn composer(
                     .label("Open a real workspace")
                     .focusable(true)
                     .center_y()
-                    .h(20.0)
+                    .h(22.0)
                     .px(6.0)
-                    .radius(4.0)
-                    .hover(p.coral_bg)
+                    .radius(6.0)
+                    .hover(p.selected)
                     .on_press(|s: &mut State| {
                         s.leave_demo();
                     })
-                    .child(pixel_text("Open a real workspace", p.sea)),
+                    .child(meta_text("Open a real workspace", p.sea)),
             )
     } else {
-        composer_ui::controls(s, p, lane - 20.0, false, locked)
+        composer_ui::controls(s, p, lane - 16.0, false, locked)
     };
-    area = area.child(footer);
+    area = area.child(composer_shell(
+        p,
+        attach_composer_notices(s, p, lane, composer_card),
+        Some(footer),
+    ));
     if let Some(reason) = crew_blocker.as_ref().or(t.crew_draft_notice.as_ref()) {
         area = area.child(
             label(
@@ -15576,9 +16384,9 @@ fn crew_draft_chip(s: &State, p: Palette, width: f32) -> El {
         .px(4.0)
         .gap(4.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .border(1.0, if blocked { p.brass } else { p.line })
-        .child(pixel_text(&text, if blocked { p.brass } else { p.muted }).truncate().grow(1.0).min_w(0.0))
+        .child(meta_text(&text, if blocked { p.brass } else { p.muted }).truncate().grow(1.0).min_w(0.0))
         .child(
             icon_button(
                 "composer-crew-chip-remove",
@@ -15619,7 +16427,7 @@ fn machine_selector(s: &State, p: Palette, icon_only: bool) -> El {
         .center_y()
         .min_w(0.0)
         .shrink()
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .preserve_focus_on_press(true)
         .cursor(rune::Cursor::Pointer)
@@ -15707,7 +16515,7 @@ fn env_mode_trigger(
         .center_y()
         .min_w(0.0)
         .shrink()
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .preserve_focus_on_press(true)
         .cursor(rune::Cursor::Pointer)
@@ -15769,7 +16577,7 @@ fn base_branch_trigger(
         .min_w(0.0)
         .max_w(max_w)
         .shrink()
-        .radius(4.0)
+        .radius(6.0)
         .hover(p.selected)
         .preserve_focus_on_press(true)
         .cursor(rune::Cursor::Pointer)
@@ -15787,7 +16595,7 @@ fn base_branch_trigger(
         .child(
             label(
                 title,
-                PIXEL,
+                META,
                 if base_branch.is_some() {
                     p.ink
                 } else {
@@ -15827,7 +16635,7 @@ fn worktree_branch_indicator(
         .max_w(max_w)
         .shrink()
         .child(icon("branch", p.muted).size(12.0, 12.0))
-        .child(label(title, PIXEL, p.muted).truncate().shrink().min_w(0.0))
+        .child(label(title, META, p.muted).truncate().shrink().min_w(0.0))
 }
 
 pub(crate) fn step_reasoning_effort(state: &mut State, direction: isize) -> bool {
@@ -15934,7 +16742,7 @@ fn machine_option(key: &str, title: &str, server: &str, online: bool, p: Palette
     if online {
         item
     } else {
-        item.child(pixel_text("Offline", p.muted))
+        item.child(meta_text("Offline", p.muted))
     }
 }
 
@@ -15952,11 +16760,11 @@ fn machine_picker(s: &State, p: Palette) -> El {
         })
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
-        .child(pixel_label("Run on", p.muted).px(8.0).py(6.0));
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .child(meta_label("Run on", p.muted).px(8.0).py(6.0));
     for server in machine_options(s) {
         let title = s.machine_label(&server);
         let key = format!("machine-option-{server}");
@@ -16012,11 +16820,11 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         })
         .padding(4.0)
         .gap(1.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
-        .child(pixel_label("Workspace", p.muted).px(8.0).py(6.0));
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .child(meta_label("Workspace", p.muted).px(8.0).py(6.0));
     let crew = s.crew_draft_placement();
     for (mode, slug, glyph) in [
         (
@@ -16048,7 +16856,7 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
             .gap(8.0)
             .h(if crew { 44.0 } else { 30.0 })
             .px(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(if selected {
                 p.selected
             } else {
@@ -16119,7 +16927,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
             .gap(6.0)
             .h(30.0)
             .px(10.0)
-            .radius(4.0)
+            .radius(6.0)
             .fill(p.selected)
             .field_focus(&s.base_branch_query, p)
             .grow(1.0)
@@ -16131,7 +16939,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
                     .label("Search refs")
                     .placeholder("Search refs...", p.muted)
                     .color(p.ink)
-                    .caret(p.coral, p.coral_bg)
+                    .caret(p.ink, p.coral_bg)
                     .grow(1.0)
                     .min_w(0.0)
                     .autofocus()
@@ -16217,7 +17025,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
                     .h(30.0)
                     .mx(4.0)
                     .px(8.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(if selected {
                         p.coral_bg
                     } else {
@@ -16240,7 +17048,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
                     item = item.child(icon("check", p.sea));
                 }
                 if let Some(badge) = badge {
-                    item = item.child(pixel_text(badge, p.faint));
+                    item = item.child(meta_text(badge, p.faint));
                 }
                 list = list.child(item);
             }
@@ -16280,10 +17088,10 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
         .role("dialog")
         .label("Base branch")
         .w(320.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .child(header)
         .child(rule(p))
         .child(list)
@@ -16366,7 +17174,7 @@ fn mobile_pairing_card(s: &State, p: Palette) -> El {
             );
     } else {
         card = card
-            .child(pixel_label("This computer's tailnet host", p.muted))
+            .child(meta_label("This computer's tailnet host", p.muted))
             .child(
                 text_input(&s.machines.mobile_host, BODY)
                     .key("mobile-pairing-host")
@@ -16375,7 +17183,7 @@ fn mobile_pairing_card(s: &State, p: Palette) -> El {
                     .single_line()
                     .w_full()
                     .padding(8.0)
-                    .radius(6.0)
+                    .radius(12.0)
                     .field_focus(&s.machines.mobile_host, p)
                     .color(p.ink)
                     .disabled(s.machines.pending.is_some())
@@ -16423,13 +17231,13 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     }
     card = card.child(mobile_pairing_card(s, p)).child(rule(p));
     card=card.child(label("Create a code on the other machine with shina pair. Paste its MagicDNS host and code here.",SMALL,p.muted).wrap())
-        .child(pixel_label("Host",p.muted))
+        .child(meta_label("Host",p.muted))
         .child(text_input(&s.machines.host,BODY).key("machine-host").label("Host").placeholder("studio-mac",p.muted)
-            .single_line().w_full().padding(8.0).radius(6.0).field_focus(&s.machines.host, p).color(p.ink)
+            .single_line().w_full().padding(8.0).radius(12.0).field_focus(&s.machines.host, p).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.host))
-        .child(pixel_label("Pairing code",p.muted))
+        .child(meta_label("Pairing code",p.muted))
         .child(text_input(&s.machines.code,BODY).key("machine-code").label("Pairing code").placeholder("PAIRCODE",p.muted)
-            .single_line().w_full().padding(8.0).radius(6.0).field_focus(&s.machines.code, p).color(p.ink)
+            .single_line().w_full().padding(8.0).radius(12.0).field_focus(&s.machines.code, p).color(p.ink)
             .disabled(busy).on_edit(|s: &mut State| &mut s.machines.code))
         .child(primary_button("machine-link-submit","Link machine",p,|s| s.machine_action("link","")).disabled(busy))
         .child(row().flex_wrap().gap(8.0)
@@ -16486,8 +17294,8 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                                         row()
                                             .gap(8.0)
                                             .flex_wrap()
-                                            .child(pixel_text(version, p.muted))
-                                            .child(pixel_text(
+                                            .child(meta_text(version, p.muted))
+                                            .child(meta_text(
                                                 if !enabled {
                                                     "Disabled"
                                                 } else if s.machine_connected(id) {
@@ -16514,7 +17322,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                             .key(format!("settings-linked-enabled-row-{id}"))
                             .center_y()
                             .gap(8.0)
-                            .child(pixel_text("Enabled", p.muted))
+                            .child(meta_text("Enabled", p.muted))
                             .child(spacer())
                             .child(
                                 captain_ui::switch(
@@ -16552,7 +17360,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                 .center_y()
                 .gap(8.0)
                 .child(label(title, SMALL, p.muted).grow(1.0))
-                .child(pixel_text("Updates", p.muted))
+                .child(meta_text("Updates", p.muted))
                 .child(
                     captain_ui::switch(
                         s,
@@ -16592,7 +17400,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
     }
     // The existing AddEnvironmentDialog fields also redeem a server-to-server peer code.
     // Outbound links belong to the selected server, not to this desktop's client links.
-    card=card.child(rule(p)).child(pixel_label("Peers",p.muted))
+    card=card.child(rule(p)).child(meta_label("Peers",p.muted))
         .child(label("A peer link lets this server delegate work. Create its code on the target with shina pair --peer.",SMALL,p.muted).wrap());
     let peer_busy = busy || s.machines.selected != "local";
     for peer in &s.peers {
@@ -16612,7 +17420,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                         .grow(1.0)
                         .min_w(0.0),
                 )
-                .child(pixel_text(
+                .child(meta_text(
                     if reachable { "Reachable" } else { "Offline" },
                     p.muted,
                 ))
@@ -16628,7 +17436,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
         );
     }
     card = card
-        .child(pixel_label("Peer host", p.muted))
+        .child(meta_label("Peer host", p.muted))
         .child(
             text_input(&s.machines.peer_host, BODY)
                 .key("peer-host")
@@ -16636,13 +17444,13 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                 .single_line()
                 .w_full()
                 .padding(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .field_focus(&s.machines.peer_host, p)
                 .color(p.ink)
                 .disabled(peer_busy)
                 .on_edit(|s: &mut State| &mut s.machines.peer_host),
         )
-        .child(pixel_label("Peer code", p.muted))
+        .child(meta_label("Peer code", p.muted))
         .child(
             text_input(&s.machines.peer_code, BODY)
                 .key("peer-code")
@@ -16650,7 +17458,7 @@ fn machine_panel(s: &State, p: Palette, embedded: bool) -> El {
                 .single_line()
                 .w_full()
                 .padding(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .field_focus(&s.machines.peer_code, p)
                 .color(p.ink)
                 .disabled(peer_busy)
@@ -16698,10 +17506,10 @@ fn machine_dialog(s: &State, p: Palette) -> El {
                     stick_bottom: false,
                 })
                 .padding(16.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.card)
-                .border(2.0, p.frame)
-                .box_shadow(hard_shadow(p)),
+                .border(1.0, p.frame)
+                .box_shadow(soft_shadow(p)),
         )
 }
 
@@ -16726,7 +17534,7 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
                     .gap(6.0)
                     .px(8.0)
                     .h(25.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(p.selected)
                     .child(icon("thread", p.muted))
                     .child(label("Session", SMALL, p.ink)),
@@ -16765,13 +17573,13 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Model", p.muted))
+                .child(meta_label("Model", p.muted))
                 .child(label(&t.model, LABEL, p.ink).wrap()),
         )
         .child(
             col()
                 .gap(5.0)
-                .child(pixel_label("Conversation", p.muted))
+                .child(meta_label("Conversation", p.muted))
                 .child(label(
                     if t.session.is_some() {
                         "Saved locally by Pi"
@@ -16877,7 +17685,7 @@ fn approval_actions(s: &State, id: usize, inline: bool, allowed: bool, p: Palett
                 .gap(4.0)
                 .px(8.0)
                 .min_h(24.0)
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .press(p.selected)
                 .fill(if option.decision == "accept" {
@@ -16978,7 +17786,7 @@ fn dialog(s: &State, p: Palette) -> El {
         .label("Pi needs your input")
         .padding(13.0)
         .gap(10.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.coral_bg)
         .border(1.0, p.line)
         .child(label(crate::model::string(request, "title"), LABEL, p.ink).wrap())
@@ -17020,7 +17828,7 @@ fn dialog(s: &State, p: Palette) -> El {
                     .max_h(120.0)
                     .px(8.0)
                     .py(6.0)
-                    .radius(6.0)
+                    .radius(12.0)
                     .fill(p.card)
                     .field_focus(&t.reply, p)
                     .disabled(!can_answer)
@@ -17374,32 +18182,40 @@ pub(crate) mod tests {
                             .collect::<Vec<_>>()
                     )
                 });
-                let fixed = if resting { m[0] } else { 0.0 };
                 let blocks = [m[1], m[2], if resting { m[6] } else { m[3] }];
                 let icons = [m[4], m[5], m[6]];
-                let width_at = |step: usize| {
+                // The expanded strip's room for the model depends on its own width, so settle
+                // the width a step needs in a few passes.
+                let width_at = |state: &State, step: usize| {
                     let hidden = step.saturating_sub(3);
                     let compact = step.min(3);
-                    fixed
-                        + (0..3 - hidden)
-                            .map(|i| {
-                                if i >= 3 - compact {
-                                    icons[i]
-                                } else {
-                                    blocks[i]
-                                }
-                            })
-                            .sum::<f32>()
+                    let blocks_w = (0..3 - hidden)
+                        .map(|i| {
+                            if i >= 3 - compact {
+                                icons[i]
+                            } else {
+                                blocks[i]
+                            }
+                        })
+                        .sum::<f32>()
                         + if hidden > 0 { 28.0 } else { 0.0 }
-                        + 4.0 * (3 - hidden + usize::from(hidden > 0)) as f32
+                        + 4.0 * (3 - hidden + usize::from(hidden > 0)) as f32;
+                    if resting {
+                        return m[0] + blocks_w;
+                    }
+                    let mut width = blocks_w + composer_ui::strip_fixed(state, 580.0);
+                    for _ in 0..3 {
+                        width = blocks_w + composer_ui::strip_fixed(state, width);
+                    }
+                    width
                 };
                 for step in 0..=6 {
                     // Equal-width steps have no distinct arrangement. In particular, replacing
                     // a 28 px access icon with a 28 px overflow trigger saves no width.
-                    if step > 0 && width_at(step - 1) - width_at(step) < 0.5 {
+                    if step > 0 && width_at(&rt.state, step - 1) - width_at(&rt.state, step) < 0.5 {
                         continue;
                     }
-                    let host = width_at(step) + 0.1;
+                    let host = width_at(&rt.state, step) + 0.1;
                     rt.state.viewport_width = host;
                     rt.state.composer_ui.layout.set(ControlsLayout {
                         visible: true,
@@ -17425,13 +18241,25 @@ pub(crate) mod tests {
                     assert_eq!(rt.presented("access-mode").is_some(), layout.hidden == 0);
                     let (footer, _) = rt.presented("composer-footer").unwrap();
                     let mut right = footer[0];
-                    for key in [
-                        "model-effort",
-                        "machine-selector",
-                        "captain-selector",
-                        "access-mode",
-                        "composer-overflow",
-                    ] {
+                    // The resting row leads with the model; the expanded strip ends with it.
+                    let order: &[&str] = if resting {
+                        &[
+                            "model-effort",
+                            "machine-selector",
+                            "captain-selector",
+                            "access-mode",
+                            "composer-overflow",
+                        ]
+                    } else {
+                        &[
+                            "machine-selector",
+                            "captain-selector",
+                            "model-effort",
+                            "access-mode",
+                            "composer-overflow",
+                        ]
+                    };
+                    for key in order {
                         if let Some((rect, _)) = rt.presented(key) {
                             assert!(
                                 rect[0] >= right - 0.5
@@ -18088,7 +18916,7 @@ pub(crate) mod tests {
         }
     }
     #[test]
-    fn the_composer_frame_turns_coral_when_tab_focuses_its_field() {
+    fn the_composer_frame_takes_the_ring_colour_when_tab_focuses_its_field() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             for dark in [false, true] {
                 let mut rt = runtime(width);
@@ -18108,7 +18936,7 @@ pub(crate) mod tests {
                     tab_to(&mut rt, "composer-input");
                 }
                 assert!(rt.state.current().draft.focused, "{width}: Tab focus");
-                assert_eq!(composer_frame(&rt.state, p), p.coral, "{width}");
+                assert_eq!(composer_frame(&rt.state, p), p.ring.alpha(0.6), "{width}");
                 tab(&mut rt);
                 assert!(!rt.state.current().draft.focused, "{width}: Tab away");
                 assert_eq!(composer_frame(&rt.state, p), p.frame, "{width}");
@@ -22048,27 +22876,29 @@ pub(crate) mod tests {
             rt.frame(1.0);
             let (card, _) = rt.presented("composer").unwrap();
             assert!(card[1] >= 0.0 && card[1] + card[3] <= 480.5);
-            let mut previous_right = card[0];
-            for key in [
-                "attach-image",
-                "model-effort",
-                "context-usage-ring",
-                "send-message",
-            ] {
-                let (rect, _) = rt
-                    .presented(key)
-                    .unwrap_or_else(|| panic!("{key} is missing"));
-                assert!(
-                    rect[0] >= previous_right - 0.5
-                        && rect[0] + rect[2] <= card[0] + card[2] + 0.5
-                        && rect[1] >= card[1]
-                        && rect[1] + rect[3] <= card[1] + card[3] + 0.5,
-                    "{key} overlaps or overflows at {width}, sidebar={sidebar}: {rect:?} in {card:?}"
-                );
-                previous_right = rect[0] + rect[2];
-            }
+            // The prompt body's actions sit in the card, the model and context ring in the
+            // context strip under it, each row left to right without overlaps.
             let (footer, _) = rt.presented("composer-footer").unwrap();
             assert!(footer[1] + footer[3] <= 480.5);
+            for (container, keys) in [
+                (card, &["attach-image", "send-message"][..]),
+                (footer, &["model-effort", "context-usage-ring"][..]),
+            ] {
+                let mut previous_right = container[0];
+                for key in keys {
+                    let (rect, _) = rt
+                        .presented(key)
+                        .unwrap_or_else(|| panic!("{key} is missing"));
+                    assert!(
+                        rect[0] >= previous_right - 0.5
+                            && rect[0] + rect[2] <= container[0] + container[2] + 0.5
+                            && rect[1] >= container[1] - 0.5
+                            && rect[1] + rect[3] <= container[1] + container[3] + 0.5,
+                        "{key} overlaps or overflows at {width}, sidebar={sidebar}: {rect:?} in {container:?}"
+                    );
+                    previous_right = rect[0] + rect[2];
+                }
+            }
         }
     }
 
@@ -23155,7 +23985,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_long_draft_scrolls_inside_the_composer_above_its_actions() {
+    fn a_long_draft_scrolls_inside_the_composer_beside_its_actions() {
         for zoom in [1.0, 1.25] {
             for width in [620.0, 960.0, 1280.0, 1920.0] {
                 let rt = long_draft(width, zoom);
@@ -23179,25 +24009,21 @@ pub(crate) mod tests {
                     (text_bottom - (view[1] + view[3] - 4.0 * zoom)).abs() <= 1.0,
                     "{at}: the field {field:?} is not scrolled to its end in {view:?}"
                 );
-                assert!(
-                    text_bottom <= actions[1] + 0.5,
-                    "{at}: the text ends at {text_bottom}, under the actions {actions:?}"
-                );
                 assert!(field[3] > view[3], "{at}: the draft fits; it should not");
-                // The actions (with their own 8 pt bottom padding) sit at the card's bottom, and
-                // the card is the input over the actions. Rune draws the frame over the edge
-                // without insetting layout, so no frame term enters.
+                // KSG's prompt body: the actions sit beside the text at the bottom right of a
+                // wrapped draft, never over it, and the card is the body's height.
                 assert!(
-                    (card[1] + card[3] - (actions[1] + actions[3])).abs() <= 1.0,
-                    "{at}: a strip under the actions {actions:?} in the card {card:?}"
-                );
-                assert!(
-                    (card[3] - (input[3] + actions[3])).abs() <= 1.0,
-                    "{at}: card {card:?} is not input {input:?} plus actions {actions:?}"
-                );
-                assert!(
-                    input[1] + input[3] <= actions[1] + 0.5,
+                    input[0] + input[2] <= actions[0] + 0.5,
                     "{at}: the input {input:?} runs under the actions {actions:?}"
+                );
+                assert!(
+                    (input[1] + input[3] - (actions[1] + actions[3])).abs() <= 1.5,
+                    "{at}: the actions {actions:?} are not on the input's last line {input:?}"
+                );
+                assert!(
+                    actions[1] + actions[3] <= card[1] + card[3] + 0.5
+                        && card[1] + card[3] - (actions[1] + actions[3]) <= 10.0,
+                    "{at}: the actions {actions:?} are not at the card's bottom {card:?}"
                 );
                 // A press on the last visual line lands in the field and places the caret there,
                 // not on the actions row.
@@ -23267,7 +24093,8 @@ pub(crate) mod tests {
             let cap = heights.last().copied().unwrap();
             assert!(heights[0] < cap, "width {width}: {heights:?}");
             assert!(
-                (cap - (10.0 + COMPOSER_FIELD_MAX + 2.0 + 40.0)).abs() <= 0.5,
+                // The prompt body's 6 pt padding above and below the field.
+                (cap - (12.0 + COMPOSER_FIELD_MAX)).abs() <= 0.5,
                 "width {width}: {heights:?}"
             );
         }
@@ -23374,7 +24201,7 @@ pub(crate) mod tests {
                 rt.frame(1.0);
                 let at = format!("width {width}, sidebar {sidebar}");
                 let (count, _) = rt.presented("captain-away-count").unwrap();
-                let natural = rune::text::measure("6 tasks", &[], PIXEL, None).0;
+                let natural = rune::text::measure("6 tasks", &[], META, None).0;
                 assert!(
                     count[2] >= natural - 0.5,
                     "{at}: the count shrank to {count:?}"
@@ -23402,7 +24229,7 @@ pub(crate) mod tests {
                     "{at}: {words:?}"
                 );
                 if words[0] == "Working in the background" {
-                    let needed = rune::text::measure(&words[0], &[], PIXEL, None).0;
+                    let needed = rune::text::measure(&words[0], &[], META, None).0;
                     let phrase = rt
                         .elements()
                         .into_iter()
@@ -24011,11 +24838,13 @@ pub(crate) mod tests {
                 .position(|message| message.role != "Pi")
                 .map_or(t.messages.len(), |offset| work.start + offset);
             for part in turn_parts(t, work.start, end) {
-                if let TranscriptPart::Tools(indices) = part {
-                    let key = if indices.len() > 1 {
-                        format!("toggle-tool-group-{id}-{}", indices[0])
+                if let TranscriptPart::Work(entries) = part
+                    && let Some(first) = entry_tools(&entries).next()
+                {
+                    let key = if entries.len() > 1 {
+                        format!("toggle-tool-group-{id}-{first}")
                     } else {
-                        format!("inline-tool-{id}-{}", indices[0])
+                        format!("inline-tool-{id}-{first}")
                     };
                     assert!(
                         rt.presented(&key).is_some(),
@@ -24133,15 +24962,17 @@ pub(crate) mod tests {
             "the popover replaces the native tooltip"
         );
 
+        // KSG's `ComposerControlsBar`: the ring sits in the context strip beside the model.
         let (ring_rect, _) = rt.presented("context-usage-ring").unwrap();
-        let (send_rect, _) = rt.presented("send-message").unwrap();
+        let (model_rect, _) = rt.presented("model-effort").unwrap();
+        let (strip, _) = rt.presented("composer-footer").unwrap();
         assert!(
-            ring_rect[0] + ring_rect[2] <= send_rect[0],
-            "ring must sit beside, not over, send"
+            model_rect[0] + model_rect[2] <= ring_rect[0] + 0.5,
+            "ring must sit beside, not over, the model"
         );
         assert!(
-            (ring_rect[1] + ring_rect[3] / 2.0 - (send_rect[1] + send_rect[3] / 2.0)).abs() < 2.0,
-            "ring and send share a centre line"
+            (ring_rect[1] + ring_rect[3] / 2.0 - (strip[1] + strip[3] / 2.0)).abs() < 2.0,
+            "the ring is centred in the context strip"
         );
 
         let mut tabs = 0;
@@ -24513,7 +25344,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .fill
             };
-            assert_eq!(fill(&rt, "usage-fill-0"), palette(rt.state.dark).coral);
+            assert_eq!(fill(&rt, "usage-fill-0"), palette(rt.state.dark).danger);
             assert_eq!(fill(&rt, "usage-fill-1"), palette(rt.state.dark).faint);
             rt.state.current_mut().context = Default::default();
             rt.state.current_mut().context_window = None;
@@ -25060,7 +25891,8 @@ pub(crate) mod tests {
         }
         assert!(matches!(
             &turn_parts(thread, 3, 4)[0],
-            TranscriptPart::Tools(indices) if *indices == vec![0, 1]
+            TranscriptPart::Work(entries)
+                if entries.starts_with(&[WorkEntry::Tool(0), WorkEntry::Tool(1)])
         ));
 
         let start = thread.work[0].start;
@@ -25172,6 +26004,11 @@ pub(crate) mod tests {
             );
             assert_eq!(scroll.keys, 0);
             assert_eq!(scroll.index_builds, 0);
+            // A row the wheel brought into the virtual window's overscan builds on the next
+            // commit. Settle that commit first, so the stream below measures only itself.
+            rt.update(|_, _| {});
+            rt.frame(1.0 / 60.0);
+            take_timeline_counts();
             rt.update(|s, _| {
                 let t = s.current_mut();
                 let last = t.messages.len() - 1;
@@ -25271,8 +26108,25 @@ pub(crate) mod tests {
     fn long_turn_runtime(width: f32, parts: usize, live: bool) -> Runtime<State> {
         let mut rt = runtime(width);
         long_turn_fixture(&mut rt.state, parts, live);
+        open_work_streaks(rt.state.current_mut());
         settle(&mut rt);
         rt
+    }
+
+    /// Unfolds every work streak of the long turn, so each step is its own work entry.
+    /// Folded, a streak of hundreds of steps is one header row.
+    fn open_work_streaks(t: &mut Thread) {
+        let firsts: Vec<usize> = turn_parts(t, 1, 2)
+            .iter()
+            .filter_map(|part| match part {
+                TranscriptPart::Work(entries) => entry_tools(entries).next(),
+                _ => None,
+            })
+            .collect();
+        for index in firsts {
+            t.tools[index].group_expanded = true;
+        }
+        t.timeline_cache.get_mut().touch_message(1);
     }
 
     fn settle(rt: &mut Runtime<State>) {
@@ -25298,6 +26152,11 @@ pub(crate) mod tests {
 
     /// The key of the work slice halfway through the long turn.
     fn middle_slice(rt: &Runtime<State>) -> String {
+        slice_at(rt, 2)
+    }
+
+    /// The key of the work slice `1 / divisor` of the way through the long turn.
+    fn slice_at(rt: &Runtime<State>, divisor: usize) -> String {
         let rows = timeline_structure(rt.state.current()).rows.clone();
         let slices: Vec<_> = rows
             .iter()
@@ -25311,7 +26170,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        slices[slices.len() / 2].key().to_owned()
+        slices[slices.len() / divisor].key().to_owned()
     }
 
     fn center_on(rt: &mut Runtime<State>, key: &str) {
@@ -25362,18 +26221,22 @@ pub(crate) mod tests {
                     "{live} {width}: {slices} slices"
                 );
                 assert!(rows.iter().any(|row| row.key() == "turn-1-long-answer"));
-                let middle = middle_slice(&rt);
+                // A quarter in: inside the first streak of both fixtures, away from the prose
+                // that splits each turn in half.
+                let middle = slice_at(&rt, 4);
                 center_on(&mut rt, &middle);
                 assert!(rt.presented(&middle).is_some(), "{live} {width}: {middle}");
                 let short = mounted_work(&rt);
                 // Twice the work: the same viewport mounts the same number of rows.
                 let mut longer = long_turn_runtime(width, 2_000, live);
-                let middle = middle_slice(&longer);
+                let middle = slice_at(&longer, 4);
                 center_on(&mut longer, &middle);
                 let long = mounted_work(&longer);
                 assert!(short > 0 && short < 400, "{live} {width}: {short} mounted");
+                // Rune mounts two viewports either side; the longer list's estimated rows can
+                // carry up to two more slices of slack at that edge.
                 assert!(
-                    long.abs_diff(short) <= 2 * SLICE_ITEMS,
+                    long.abs_diff(short) <= 4 * SLICE_ITEMS,
                     "{live} {width}: {short} mounted for 1,000 parts, {long} for 2,000"
                 );
                 // Every slice of a completed turn rebuilt only the mounted ones.
@@ -25647,7 +26510,9 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
-        assert_eq!(items.len(), 1_000 + 1);
+        // Two streaks of 500 steps and 10 paired calls each, their headers, and the prose
+        // between them.
+        assert_eq!(items.len(), 1_000 + 1_000 / 50 + 3);
         // Search and copy read the thread, not the mounted rows.
         let text = &t.messages[1].text;
         assert!(text.contains("Halfway marker") && text.contains("Every package passed"));
@@ -25870,10 +26735,12 @@ pub(crate) mod tests {
         s.populate_demo();
         let t = s.current();
         assert!(
-            matches!(&turn_parts(t, 2, 3)[0], TranscriptPart::Tools(indices) if *indices == vec![0, 1])
+            matches!(&turn_parts(t, 2, 3)[0], TranscriptPart::Work(entries)
+            if entries.starts_with(&[WorkEntry::Tool(0), WorkEntry::Tool(1)]))
         );
         assert!(
-            matches!(&turn_parts(t, 3, 4)[0], TranscriptPart::Tools(indices) if *indices == vec![2, 3])
+            matches!(&turn_parts(t, 3, 4)[0], TranscriptPart::Work(entries)
+            if entries.starts_with(&[WorkEntry::Tool(2), WorkEntry::Tool(3)]))
         );
         assert_eq!(
             tool_summary(&t.tools[..2].iter().collect::<Vec<_>>()),
@@ -25895,7 +26762,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn thinking_between_tools_at_the_same_offset_separates_the_groups() {
+    fn thinking_between_tools_joins_their_work_streak() {
         let mut thread = Thread::new(1);
         thread.apply(
             json!({"type":"response","id":"history","command":"get_messages","success":true,
@@ -25910,9 +26777,11 @@ pub(crate) mod tests {
         assert_eq!(
             turn_parts(&thread, 0, 1),
             vec![
-                TranscriptPart::Tools(vec![0]),
-                TranscriptPart::Thought(vec![0]),
-                TranscriptPart::Tools(vec![1]),
+                TranscriptPart::Work(vec![
+                    WorkEntry::Tool(0),
+                    WorkEntry::Thought(0),
+                    WorkEntry::Tool(1)
+                ]),
                 TranscriptPart::Text {
                     message: 0,
                     from: 0,
@@ -25954,8 +26823,15 @@ pub(crate) mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         let y = |rt: &Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
-        assert!(y(&rt, &assistant_body_key(rt.state.current(), 1, 0)) < y(&rt, "toggle-work-1-1"));
-        assert!(y(&rt, "toggle-work-1-1") < y(&rt, "toggle-tool-group-1-0"));
+        // The "Worked for" bar heads the turn, where its "Working for" bar ran.
+        assert!(y(&rt, "toggle-work-1-1") < y(&rt, &assistant_body_key(rt.state.current(), 1, 0)));
+        assert!(
+            y(&rt, &assistant_body_key(rt.state.current(), 1, 0)) < y(&rt, "toggle-tool-group-1-0")
+        );
+        if rt.presented("inline-thought-1-0").is_none() {
+            press(&mut rt, "toggle-tool-group-1-0");
+            rt.frame(1.0);
+        }
         assert!(y(&rt, "toggle-tool-group-1-0") < y(&rt, "inline-thought-1-0"));
         assert!(
             y(&rt, "inline-thought-1-0") < y(&rt, &assistant_body_key(rt.state.current(), 3, 0))
@@ -26019,6 +26895,8 @@ pub(crate) mod tests {
             .presented(&assistant_body_key(rt.state.current(), 0, 0))
             .unwrap()
             .0[1];
+        // The working bar heads the turn and Thinking waits under the streamed text.
+        assert!(rt.presented("working-bar-1").unwrap().0[1] < text_y);
         assert!(text_y < rt.presented("live-status-1").unwrap().0[1]);
         assert!(
             rt.presented("toggle-work-1-0").is_none(),
@@ -26041,13 +26919,16 @@ pub(crate) mod tests {
                 .0[1],
             text_y
         );
-        let tool_y = rt.presented("inline-tool-1-0").unwrap().0[1];
-        assert!(tool_y < rt.presented("live-status-1").unwrap().0[1]);
+        // The running call is the turn's one live row, under the text.
+        let live_y = rt.presented("live-work-1").unwrap().0[1];
+        assert!(text_y < live_y);
+        assert!(rt.presented("inline-tool-1-0").is_none());
+        assert!(rt.presented("live-status-1").is_none());
     }
 
     #[test]
     fn tool_rows_keep_one_indent_while_the_turn_runs_and_after_it_ends() {
-        for width in [620.0, 1280.0] {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.current_mut().apply(json!({"type":"agent_start"}));
             rt.state
@@ -26065,14 +26946,16 @@ pub(crate) mod tests {
                 .presented(&assistant_body_key(rt.state.current(), 0, 0))
                 .unwrap()
                 .0;
-            let live_tool = rt.presented("inline-tool-1-0").unwrap().0;
-            let (status, _) = rt.presented("live-status-1").unwrap();
+            let bar = rt.presented("working-bar-1").unwrap().0;
+            let live_tool = rt.presented("live-work-1").unwrap().0;
+            let lane = rt.presented("chat-lane").unwrap().0;
             assert_eq!(
-                status[0], prose[0],
-                "{width}: the status square is on the prose edge"
+                bar[0], prose[0],
+                "{width}: the bar starts on the prose edge"
             );
+            assert_eq!(bar[3], 32.0, "{width}: a 32 pt bar");
             assert!(
-                live_tool[0] > prose[0],
+                live_tool[0] > prose[0] && live_tool[0] + live_tool[2] <= lane[0] + lane[2] + 0.5,
                 "{width}: {live_tool:?} against {prose:?}"
             );
             rt.state
@@ -26084,6 +26967,20 @@ pub(crate) mod tests {
             rt.frame(2.0);
             let done_tool = rt.presented("inline-tool-1-0").unwrap().0;
             assert_eq!(done_tool[0], live_tool[0], "{width}: the indent jumped");
+            // The running bar became the fold, in the same place and size.
+            let fold = rt
+                .presented(&format!(
+                    "work-section-{}",
+                    message_key(rt.state.current(), 0)
+                ))
+                .unwrap()
+                .0;
+            assert_eq!(
+                (fold[0], fold[1], fold[2]),
+                (bar[0], bar[1], bar[2]),
+                "{width}"
+            );
+            assert!(rt.presented("working-bar-1").is_none());
         }
     }
 
@@ -26096,15 +26993,30 @@ pub(crate) mod tests {
             .apply(json!({"type":"message_update","assistantMessageEvent":{
                 "type":"thinking_start","contentIndex":0
             }}));
+        rt.frame(0.0);
+        // No thinking text yet: the Thinking row speaks for the turn.
+        assert!(rt.presented("live-work-1").is_none());
+        assert!(rt.presented("live-status-1").is_some());
         rt.state
             .current_mut()
             .apply(json!({"type":"message_update","assistantMessageEvent":{
-                "type":"thinking_delta","contentIndex":0,"delta":"Checking the file."
+                "type":"thinking_delta","contentIndex":0,"delta":"Checking the file. Then the tests."
             }}));
-        rt.frame(0.0);
-        let (thought, _) = rt.presented("inline-thought-1-0").unwrap();
-        let (status, _) = rt.presented("live-status-1").unwrap();
+        rt.invalidate();
+        rt.frame(1.0);
+        // KSG's `work-live`: the thought's first sentence above "Thinking", in one row.
+        let (thought, _) = rt.presented("live-thought-1").unwrap();
+        let (status, _) = rt.presented("live-work-text-1").unwrap();
         assert!(thought[1] < status[1]);
+        let texts: Vec<_> = rt
+            .elements()
+            .iter()
+            .filter_map(|e| e.text.clone())
+            .collect();
+        assert!(texts.iter().any(|text| text == "Checking the file."));
+        assert!(texts.iter().any(|text| text == "Thinking"));
+        assert!(rt.presented("live-status-1").is_none());
+        assert!(rt.presented("inline-thought-1-0").is_none());
         rt.state
             .current_mut()
             .apply(json!({"type":"agent_settled"}));
@@ -26112,10 +27024,246 @@ pub(crate) mod tests {
         rt.frame(1.0);
         rt.frame(2.0);
         assert!(rt.presented("live-status-1").is_none());
+        assert!(rt.presented("live-work-1").is_none());
         assert!(rt.presented("toggle-work-1-0").is_some());
         assert!(!rt.state.current().work[0].expanded);
         assert!(rt.presented("inline-thought-1-0").is_none());
     }
+
+    /// A running turn shaped as KSG Code's timeline tests shape theirs: a streak of thoughts and
+    /// calls, interim prose, then a live streak whose last call is running.
+    fn streak_runtime(width: f32) -> Runtime<State> {
+        let mut rt = runtime(width);
+        let t = rt.state.current_mut();
+        t.apply(
+            json!({"type":"response","id":"history","command":"get_messages","success":true,
+            "data":{"messages":[{"role":"assistant","content":[
+                {"type":"thinking","thinking":"Plan the audit."},
+                {"type":"toolCall","id":"a","name":"read","arguments":{"path":"a.rs"}},
+                {"type":"thinking","thinking":"Now the second file."},
+                {"type":"toolCall","id":"b","name":"read","arguments":{"path":"b.rs"}},
+                {"type":"text","text":"Both files parse."},
+                {"type":"thinking","thinking":"**Checking the tests**\n\nThe suite lives in tests/."},
+                {"type":"toolCall","id":"c","name":"read","arguments":{"path":"c.rs"}},
+                {"type":"toolCall","id":"d","name":"read","arguments":{"path":"d.rs"}}
+            ]}]}}),
+        );
+        for tool in &mut t.tools {
+            tool.done = true;
+            tool.failed = false;
+        }
+        for (tool, detail) in t.tools.iter_mut().zip(["a.rs", "b.rs", "c.rs", "d.rs"]) {
+            tool.detail = detail.into();
+        }
+        t.tools[3].done = false;
+        t.status = Status::Running;
+        t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        t.work.clear();
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        rt
+    }
+
+    fn texts(rt: &Runtime<State>) -> Vec<String> {
+        rt.elements()
+            .iter()
+            .filter_map(|e| e.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn thought_and_tool_streaks_fold_before_prose_and_into_one_live_row() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = streak_runtime(width);
+            let t = rt.state.current();
+            let parts = turn_parts(t, 0, 1);
+            use WorkEntry::{Thought, Tool};
+            assert_eq!(
+                parts[0],
+                TranscriptPart::Work(vec![Thought(0), Tool(0), Thought(1), Tool(1)])
+            );
+            assert!(matches!(parts[1], TranscriptPart::Text { .. }));
+            assert_eq!(
+                parts[2],
+                TranscriptPart::Work(vec![Thought(2), Tool(2), Tool(3)])
+            );
+            let lane = rt.presented("chat-lane").unwrap().0;
+            let inside = |rect: [f32; 4]| {
+                rect[0] >= lane[0] - 0.5 && rect[0] + rect[2] <= lane[0] + lane[2] + 0.5
+            };
+            // "Working for 12s" heads the turn.
+            assert!(texts(&rt).iter().any(|text| text == "Working for "));
+            assert!(texts(&rt).iter().any(|text| text == "12s"));
+            // The streak before the prose is one folded header, even while the turn runs.
+            let group = rt.presented("toggle-tool-group-1-0").unwrap().0;
+            assert!(inside(group), "{width}: {group:?}");
+            assert!(texts(&rt).iter().any(|text| text == "Read 2 files"));
+            for key in ["inline-tool-1-0", "inline-tool-1-1", "inline-thought-1-0"] {
+                assert!(rt.presented(key).is_none(), "{width}: {key}");
+            }
+            // The live streak is one row: its thought's heading over the running call.
+            let live = rt.presented("live-work-1").unwrap().0;
+            assert!(inside(live), "{width}: {live:?}");
+            assert!(group[1] < live[1]);
+            let thought = rt.presented("live-thought-1").unwrap().0;
+            let step = rt.presented("live-work-text-1").unwrap().0;
+            assert!(thought[1] < step[1]);
+            assert!(texts(&rt).iter().any(|text| text == "Checking the tests"));
+            assert!(texts(&rt).iter().any(|text| text == "Reading d.rs"));
+            for key in ["inline-tool-1-2", "inline-tool-1-3", "live-status-1"] {
+                assert!(rt.presented(key).is_none(), "{width}: {key}");
+            }
+
+            // The live row unfolds its steps under itself, and folds them again.
+            press(&mut rt, "live-work-1");
+            rt.frame(1.0);
+            for key in ["inline-thought-1-2", "inline-tool-1-2", "inline-tool-1-3"] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(rect[1] > live[1] && inside(rect), "{width}: {key} {rect:?}");
+            }
+            assert!(rt.presented("live-thought-1").is_none());
+            press(&mut rt, "live-work-1");
+            rt.frame(1.0);
+            assert!(rt.presented("inline-tool-1-3").is_none());
+
+            // The newest call finishes: the row keeps standing for the turn, in the present
+            // tense, as KSG's does until the next step starts.
+            rt.state.current_mut().tools[3].done = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(texts(&rt).iter().any(|text| text == "Reading d.rs"));
+            assert!(rt.presented("live-status-1").is_none());
+
+            // It failed instead: the Thinking row stands in, at the bottom, and unfolds the tail.
+            rt.state.current_mut().tools[3].failed = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(rt.presented("live-work-1").is_none());
+            let thinking = rt.presented("live-status-1").unwrap().0;
+            assert!(thinking[1] > group[1] && inside(thinking));
+            press(&mut rt, "live-status-1");
+            rt.frame(1.0);
+            assert!(rt.presented("inline-tool-1-3").unwrap().0[1] > thinking[1]);
+            press(&mut rt, "live-status-1");
+            rt.frame(1.0);
+
+            // Interim prose after the streak: Thinking waits under it, at the very bottom.
+            let t = rt.state.current_mut();
+            t.tools[3].failed = false;
+            t.messages[0].text.push_str(" Next, the fixtures.");
+            rt.invalidate();
+            rt.frame(1.0);
+            let offset = rt.state.current().tools[3].anchor.offset;
+            let answer = rt
+                .presented(&assistant_body_key(rt.state.current(), 0, offset))
+                .unwrap_or_else(|| panic!("{width}: the interim prose"))
+                .0;
+            let thinking = rt.presented("live-status-1").unwrap().0;
+            assert!(answer[1] < thinking[1], "{width}");
+            // The tail is now a finished streak before prose: folded like the first.
+            assert!(rt.presented("live-work-1").is_none());
+            assert!(rt.presented("toggle-tool-group-1-2").is_some());
+
+            // The turn ends: the bar becomes "Worked for", and the live rows leave.
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"agent_settled"}));
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.frame(2.0);
+            assert!(rt.presented("working-bar-1").is_none());
+            assert!(rt.presented("live-status-1").is_none());
+            assert!(texts(&rt).iter().any(|text| text.starts_with("Worked")));
+            press(&mut rt, "toggle-work-1-0");
+            rt.frame(3.0);
+            press(&mut rt, "toggle-tool-group-1-0");
+            rt.frame(4.0);
+            for key in [
+                "inline-thought-1-0",
+                "inline-tool-1-0",
+                "inline-thought-1-1",
+                "inline-tool-1-1",
+            ] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(inside(rect), "{width}: {key}");
+            }
+            // The steps sit 16 pt in from the header, as KSG's `WorkLogList` (`ps-4`).
+            assert_eq!(
+                rt.presented("inline-tool-1-0").unwrap().0[0],
+                rt.presented("toggle-tool-group-1-0").unwrap().0[0] + WORK_LIST_INDENT,
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_working_bar_words_stopping_pauses_and_compaction() {
+        let mut rt = streak_runtime(1280.0);
+        rt.state.current_mut().request = Some(json!({"id":"q","method":"confirm"}));
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(texts(&rt).iter().any(|text| text == "Paused at "));
+        rt.state.current_mut().started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(40));
+        rt.invalidate();
+        rt.frame(2.0);
+        // The clock stopped when the request arrived.
+        assert!(texts(&rt).iter().any(|text| text == "12s"));
+        rt.state.current_mut().request = None;
+        rt.state.current_mut().phase = "Compacting context".into();
+        rt.invalidate();
+        rt.frame(3.0);
+        assert!(texts(&rt).iter().any(|text| text == "Compacting for "));
+        rt.state.current_mut().phase = "Stopping".into();
+        rt.invalidate();
+        rt.frame(4.0);
+        assert!(texts(&rt).iter().any(|text| text == "Stopping…"));
+    }
+
+    #[test]
+    fn live_rows_sweep_while_running_and_a_settled_turn_draws_nothing() {
+        let mut rt = streak_runtime(1280.0);
+        // The shimmer runs on the renderer's clock: a live row keeps frames coming.
+        assert!((0..10).all(|_| rt.frame(1.0 / 60.0)));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"agent_settled"}));
+        rt.invalidate();
+        let mut rested = false;
+        for _ in 0..240 {
+            if !rt.frame(1.0 / 60.0) {
+                rested = true;
+                break;
+            }
+        }
+        assert!(rested, "a settled turn keeps drawing");
+    }
+
+    #[test]
+    fn live_thought_lines_take_the_heading_or_the_first_sentence() {
+        assert_eq!(
+            live_thought_line("**Checking the tests**\n\nThe suite lives in tests/."),
+            "Checking the tests"
+        );
+        assert_eq!(
+            live_thought_line("I'll read `main.rs` first. Then [the docs](https://x.y)."),
+            "I'll read main.rs first."
+        );
+        assert_eq!(
+            live_thought_line("- Look at *this* and **that**\n- then go"),
+            "Look at this and that then go"
+        );
+        assert_eq!(live_thought_line("No end in sight"), "No end in sight");
+        assert_eq!(live_thought_line("Done (really.) Next"), "Done (really.)");
+    }
+
     #[test]
     fn captain_assignment_has_one_control_and_no_per_project_placeholders() {
         let mut rt = runtime(1280.0);
@@ -27619,69 +28767,47 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_horizon_band_crowns_the_greeting_and_the_portrait_overlaps_its_edge() {
+    fn the_empty_heroes_have_no_scenery_and_center_in_the_lane() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.set_viewport((width, 900.0), 1.0);
             rt.frame(0.0);
             rt.frame(1.0);
+            assert!(rt.presented("horizon-band").is_none(), "{width}");
             let (pane, _) = rt.presented("chat-pane").unwrap();
-            let (band, _) = rt.presented("horizon-band").unwrap();
             let (heading, _) = rt.presented("empty-heading").unwrap();
-            assert_eq!(band[3], HORIZON_HEIGHT);
-            assert!(band[3] >= 96.0 && band[3] <= 120.0, "96 to 120 pt tall");
-            assert!(band[2] <= measure(true) + 0.5, "inside the content lane");
+            let (composer, _) = rt.presented("composer").unwrap();
+            assert!(heading[1] + heading[3] < composer[1], "{width}");
+            let centre = heading[0] + heading[2] / 2.0;
             assert!(
-                band[0] >= pane[0] - 0.5 && band[0] + band[2] <= pane[0] + pane[2] + 0.5,
-                "band overflows the pane at {width}: {band:?} in {pane:?}"
-            );
-            assert!(
-                band[1] + band[3] <= heading[1],
-                "the band never sits behind text at {width}: {band:?} {heading:?}"
+                (centre - (pane[0] + pane[2] / 2.0)).abs() < 2.0,
+                "the greeting centres in the pane at {width}: {heading:?} {pane:?}"
             );
 
             let mut rt = runtime(width);
             rt.state.captains = crate::captains::Captain::presets();
             rt.state.open_captain(0);
             rt.frame(0.0);
-            let (band, _) = rt.presented("horizon-band").unwrap();
+            assert!(rt.presented("horizon-band").is_none(), "{width}");
             let (portrait, _) = rt.presented("captain-hero-portrait").unwrap();
             let (heading, _) = rt.presented("captain-goal-heading").unwrap();
-            assert!(
-                portrait[1] < band[1] + band[3] && portrait[1] + portrait[3] > band[1] + band[3],
-                "the portrait crosses the band's bottom edge at {width}"
-            );
-            assert!(
-                portrait[1] > band[1],
-                "the portrait stays inside the band's top"
-            );
+            let (pane, _) = rt.presented("chat-pane").unwrap();
+            assert!(portrait[1] > pane[1], "{width}");
             assert!(portrait[1] + portrait[3] < heading[1]);
         }
     }
 
     #[test]
-    fn the_sidebar_sea_strip_sits_under_the_footer_icons() {
+    fn the_sidebar_footer_sits_on_the_window_bottom_without_a_sea_strip() {
         for width in [960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.frame(0.0);
-            let (sidebar, _) = rt.presented("sidebar").unwrap();
+            assert!(rt.presented("sidebar-sea").is_none(), "{width}");
             let (footer, _) = rt.presented("sidebar-footer").unwrap();
-            let (sea, _) = rt.presented("sidebar-sea").unwrap();
-            assert_eq!(sea[3], SEA_HEIGHT);
-            assert!(
-                sea[1] >= footer[1] + footer[3] - 0.5,
-                "icons sit above the sea"
-            );
-            // It bleeds: flush to the window's left and bottom edges, and as wide as the sidebar.
             let (root, _) = rt.presented("workspace-root").unwrap();
-            assert!(sea[0].abs() < 0.5, "flush left at {width}: {sea:?}");
             assert!(
-                (sea[1] + sea[3] - (root[1] + root[3])).abs() < 0.5,
-                "flush to the bottom at {width}: {sea:?} in {root:?}"
-            );
-            assert!(
-                (sea[0] + sea[2] - (sidebar[0] + sidebar[2])).abs() < 0.5,
-                "the sidebar's full width at {width}: {sea:?} {sidebar:?}"
+                footer[1] + footer[3] <= root[1] + root[3] + 0.5,
+                "the footer stays in the window at {width}: {footer:?} {root:?}"
             );
         }
     }
@@ -27815,7 +28941,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_enabled_send_button_is_coral_and_the_stop_button_is_the_same_key() {
+    fn the_enabled_send_button_is_the_primary_key_and_the_stop_button_is_the_same_key() {
         for dark in [false, true] {
             let p = palette(dark);
             let fill_of = |rt: &Runtime<State>, key: &str| {
@@ -27832,7 +28958,7 @@ pub(crate) mod tests {
             rt.frame(1.0);
             assert_eq!(
                 fill_of(&rt, "send-message"),
-                p.line,
+                p.selected,
                 "disabled, dark={dark}"
             );
             rt.state.current_mut().draft.replace_text("Hello");
@@ -27872,9 +28998,9 @@ pub(crate) mod tests {
                 word[0] + word[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
                 "{width}: the badge crowds the wordmark {word:?} {badge:?}"
             );
-            // At 22 px the five cells are 70 px wide; the narrow fallback is 11 px.
+            // At 15 px Inter semibold "Shina" is about 40 pt wide; the narrow fallback is 12 px.
             assert!(
-                (word[2] - WORDMARK_WIDTH).abs() < 1.0 || word[2] < 40.0,
+                (word[2] - WORDMARK_WIDTH).abs() < 2.0 || word[2] < 38.0,
                 "{width}: {word:?}"
             );
         }
@@ -27939,19 +29065,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_wordmark_keeps_22_px_in_a_normal_sidebar_with_the_traffic_lights_and_a_badge() {
+    fn the_wordmark_keeps_15_px_in_a_normal_sidebar_with_the_traffic_lights_and_a_badge() {
         // A macOS title strip reserves about 72 pt for the window buttons on the left, and the
         // header keeps HEADER_TAB_GAP at its end.
         let line = |sidebar: f32| sidebar - TITLE_CONTROLS - HEADER_TAB_GAP;
-        assert_eq!(wordmark_size(line(232.0), true), Some(22.0));
-        assert_eq!(wordmark_size(line(232.0), false), Some(22.0));
-        assert_eq!(wordmark_size(line(216.0), true), Some(11.0));
-        assert_eq!(wordmark_size(line(200.0), true), Some(11.0));
+        assert_eq!(wordmark_size(line(232.0), true), Some(15.0));
+        assert_eq!(wordmark_size(line(232.0), false), Some(15.0));
+        assert!(wordmark_size(line(216.0), true).is_some());
+        assert!(wordmark_size(line(200.0), true).is_some());
         assert_eq!(wordmark_size(line(120.0), true), None);
     }
 
     #[test]
-    fn a_narrow_sidebar_shows_the_11_px_wordmark_under_the_real_traffic_light_inset() {
+    fn a_narrow_sidebar_shows_a_small_wordmark_under_the_real_traffic_light_inset() {
         // macOS reports a 76 pt leading inset; Windows and Linux report none.
         for leading in [76.0, 0.0] {
             for sidebar in [200.0, 208.0, 216.0] {
@@ -27973,7 +29099,7 @@ pub(crate) mod tests {
                     .find(|e| e.key.as_deref() == Some("shina-wordmark"))
                     .unwrap()
                     .rect[3];
-                assert!(size < 20.0, "{at}: the wordmark is not 11 px ({size})");
+                assert!(size < 20.0, "{at}: the wordmark is not small ({size})");
                 let (badge, _) = rt.presented("attention-row").unwrap();
                 assert!(
                     mark[0] + mark[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
@@ -31966,6 +33092,46 @@ pub(crate) mod tests {
         );
     }
 
+    /// KSG's `AssistantMessageMeta`: Copy then Reply on the prose's left edge, in one row
+    /// under the response, and Copy shows its check after a press.
+    #[test]
+    fn assistant_response_actions_sit_under_the_prose_at_supported_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.current_mut().messages.push(crate::model::Message {
+                id: "msg-meta".into(),
+                role: "Pi",
+                text: "An answer with **actions** under it.".into(),
+                images: Vec::new(),
+                context: None,
+            });
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (copy, _) = rt.presented("copy-message-msg-meta").expect("copy");
+            let (reply, _) = rt.presented("reply-message-msg-meta").expect("reply");
+            let (lane, _) = rt.presented("chat-lane").expect("lane");
+            assert!((copy[1] - reply[1]).abs() < 0.5, "{width}: one row");
+            assert!(copy[0] + copy[2] <= reply[0], "{width}: Copy before Reply");
+            assert!(
+                (copy[0] - lane[0]).abs() <= 6.0,
+                "{width}: the actions start at the prose edge {copy:?} {lane:?}"
+            );
+            assert_eq!((copy[2], copy[3]), (24.0, 24.0));
+            assert!(
+                rt.presented("fork-message-msg-meta").is_none(),
+                "{width}: no session"
+            );
+            press(&mut rt, "copy-message-msg-meta");
+            rt.frame(0.1);
+            assert!(rt.state.copied_message.is_some(), "{width}");
+            assert_eq!(
+                element_text(&rt, "copy-message-msg-meta").as_deref(),
+                Some("Copied"),
+                "{width}: the cached turn shows the check"
+            );
+        }
+    }
+
     #[test]
     fn reply_banner_and_selection_toolbar_layout_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
@@ -32255,9 +33421,10 @@ pub(crate) mod tests {
             assert!(rt.presented("env-mode-picker").is_none());
             assert!(rt.presented("base-branch-trigger").is_none());
             if inline {
+                // A narrow strip shows the trigger as its icon; its name stays in the label.
                 assert_eq!(
-                    element_text(&rt, "env-mode-trigger-label").as_deref(),
-                    Some("Read-only checkout")
+                    element_text(&rt, "env-mode-trigger").as_deref(),
+                    Some("Workspace: Read-only checkout")
                 );
             }
             // This headless state has no captain records; the checkout choice never blocks.

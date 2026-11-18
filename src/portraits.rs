@@ -107,6 +107,12 @@ impl Portraits {
         self.reduced.set(reduced);
     }
 
+    /// The window's Reduce Motion setting as the view last saw it. The transcript's live
+    /// shimmer reads it here, since its builders run without the `Cx`.
+    pub fn reduced_motion(&self) -> bool {
+        self.reduced.get()
+    }
+
     /// Advances every stage to `now` for the sidebar's portraits, given as (row, portrait,
     /// face). Returns how long until the next frame is due, or None when nothing plays.
     pub fn tick(

@@ -29,22 +29,33 @@ pub(super) fn user_source(source: &str) -> Cow<'_, str> {
     Cow::Owned(rendered)
 }
 
+/// KSG's heading style: Inter semibold at `size` on `line`.
+fn heading_style(size: f32, line: f32) -> TextStyle {
+    TextStyle::new(size, 600.0).lh(line).tracking(-0.01 * size)
+}
+
+/// KSG's `MarkdownCodeBlockFrame`: a 12 px card with a hairline, a 32 px header with the
+/// lowercase language in 11.5 px mono and a quiet copy button.
 fn code_frame(code: El, language: &str, source: String, identity: &str, p: Palette) -> El {
     col()
         .key(format!("code-{identity}"))
         .min_w(0.0)
-        .radius(6.0)
-        .clip_rounded(6.0)
+        .radius(12.0)
+        .clip_rounded(12.0)
         .border(1.0, p.line)
         .fill(p.code_bg)
         .child(
             row()
-                .h(30.0)
+                .h(32.0)
                 .pl(12.0)
                 .pr(6.0)
                 .gap(6.0)
                 .center_y()
-                .child(pixel_label(language, p.muted))
+                .child(label(
+                    language.to_lowercase(),
+                    TextStyle::new(11.5, 400.0).family(rune::Family::SystemMono),
+                    p.muted,
+                ))
                 .child(spacer())
                 .child(
                     icon_button(
@@ -117,14 +128,10 @@ pub(super) fn render_with_find(
     } else {
         Cow::Borrowed(source)
     };
-    // The dark coral wash is too faint on the code fill to read as a removed line, but 28%
-    // was too loud. 17% of coral over `code_bg`, mixed in sRGB as a paint program would, is
-    // about #2f2126. Rune's `mix` works in linear light and would give a much brighter red.
-    let removed = if dark {
-        mix_srgb(p.code_bg, p.coral, 0.17)
-    } else {
-        p.coral_bg
-    };
+    // KSG's diff rows: a quiet wash of the destructive red and the success green over the
+    // code fill, mixed in sRGB as a browser blends `color-mix`. Rune's `mix` works in linear
+    // light and would give much brighter washes.
+    let (added, removed) = diff_washes(dark, p);
     let style = MarkdownStyle::neutral(dark)
         .syntax_theme(syntax_theme(dark, p))
         .text(p.ink)
@@ -134,15 +141,38 @@ pub(super) fn render_with_find(
         } else {
             prose_style(wide)
         })
-        // Rune's inline code chip has a fixed corner radius; only its fill is ours.
-        .inline_code_bg(p.code_bg)
+        // KSG's `.chat-markdown` headings: h1 1.25rem, h2 1.125rem, h3 0.9375rem, h4+ 0.875rem,
+        // all semibold in the foreground colour.
+        .heading_font(1, heading_style(20.0, 26.0))
+        .heading_font(2, heading_style(18.0, 23.5))
+        .heading_font(3, heading_style(15.0, 20.0))
+        .heading_font(4, heading_style(14.0, 18.5))
+        .strong_weight(650.0)
+        // `ul, ol { padding-left: 1.25rem }` with markers outside the text, as a browser draws.
+        .list(20.0, 4.0)
+        .list_markers_outside(true)
+        .list_nested_indent(20.0, 24.0)
+        // Inline code: 12.5 px SF Mono on a faint chip.
+        .inline_code_font(if wide { 13.0 / 15.0 } else { 12.5 / 14.0 }, 400.0)
+        .inline_code_pad(3.0)
+        .inline_code_bg(if dark {
+            Color::WHITE.alpha(0.07)
+        } else {
+            Color::BLACK.alpha(0.05)
+        })
+        // Links are the info blue with no underline at rest, underlined on hover.
+        .link(p.sea)
+        .link_underline(Color::TRANSPARENT)
+        .link_hover(p.sea)
+        .rule(p.line)
+        .quote(p.frame, 2.0, 12.0, p.muted)
         .selection(p.coral_bg)
         .highlight_bg(p.brass.alpha(0.32))
-        .highlight_current_bg(p.coral.alpha(0.42))
-        .highlight_current_ring(Some((p.coral, 1.5)))
+        .highlight_current_bg(p.sea.alpha(0.32))
+        .highlight_current_ring(Some((p.ring, 1.5)))
         // The header frame owns the visible border. Rune's inner card has none.
         .code_block(p.code_bg, Color::TRANSPARENT)
-        .diff(p.sea_bg, removed)
+        .diff(added, removed)
         .code_block_font(
             TextStyle::new(12.0, 400.0)
                 .family(rune::Family::SystemMono)
@@ -315,6 +345,16 @@ pub(super) fn syntax_theme(dark: bool, p: Palette) -> SyntaxTheme {
     theme
 }
 
+/// The added and removed row fills: 14% of KSG's success green and destructive red over the
+/// code fill.
+fn diff_washes(dark: bool, p: Palette) -> (Color, Color) {
+    let green = if dark { "#3fb950" } else { "#1a7f37" };
+    (
+        mix_srgb(p.code_bg, color(green), 0.14),
+        mix_srgb(p.code_bg, p.danger, 0.14),
+    )
+}
+
 /// `t` of the way from `a` to `b`, mixed in sRGB-encoded space.
 fn mix_srgb(a: Color, b: Color, t: f32) -> Color {
     use rune::color::{srgb_decode, srgb_encode};
@@ -355,7 +395,7 @@ mod tests {
         }
     }
 
-    /// Text that carries meaning: on-coral text on a coral key at rest and pressed (80% coral
+    /// Text that carries meaning: on-coral text on a coral key at rest and pressed (90% coral
     /// over the card, panel or sky), and every status word on each surface a status sits on,
     /// including the selected sidebar row.
     #[test]
@@ -365,7 +405,7 @@ mod tests {
             let selected_row = p.bg.mix(p.row, p.row.a);
             let mut pairs = vec![("on coral, rest", p.on_coral, p.coral)];
             for (name, under) in [("card", p.card), ("panel", p.panel), ("bg", p.bg)] {
-                pairs.push((name, p.on_coral, under.mix(p.coral, 0.8)));
+                pairs.push((name, p.on_coral, under.mix(p.coral, 0.9)));
             }
             for status in [
                 Status::Running,
@@ -388,12 +428,16 @@ mod tests {
     }
 
     #[test]
-    fn the_dark_removed_line_is_a_quiet_red_not_a_loud_one() {
-        let p = palette(true);
-        let hex = mix_srgb(p.code_bg, p.coral, 0.17).hex();
-        let channel = |at: usize| i32::from_str_radix(&hex[at..at + 2], 16).unwrap();
-        for (at, want) in [(1, 0x2f), (3, 0x21), (5, 0x26)] {
-            assert!((channel(at) - want).abs() <= 6, "{hex}");
+    fn diff_rows_are_quiet_red_and_green_washes() {
+        for dark in [true, false] {
+            let p = palette(dark);
+            let (added, removed) = diff_washes(dark, p);
+            for (wash, name) in [(added, "added"), (removed, "removed")] {
+                // A wash, not a loud fill: code text keeps 4.5:1 on it.
+                assert!(contrast(p.ink, wash) >= 4.5, "{name} dark={dark}");
+            }
+            assert!(removed.r > removed.g, "removed is red, dark={dark}");
+            assert!(added.g > added.r, "added is green, dark={dark}");
         }
     }
     #[test]

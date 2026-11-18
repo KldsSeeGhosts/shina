@@ -4952,6 +4952,8 @@ pub struct State {
     pub html_lane_width: u32,
     /// The composer is showing a valid drop highlight.
     pub attachment_drop_hover: bool,
+    /// The assistant message whose Copy button last copied, and when, for its check feedback.
+    pub copied_message: Option<(String, std::time::Instant)>,
     pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
     pub(crate) attachment_preview: Option<crate::ui::attachment_preview::Preview>,
     pasted_text_names: Option<(String, usize, std::collections::HashSet<String>)>,
@@ -6038,6 +6040,7 @@ impl State {
             attachment_video_posters: Default::default(),
             attachment_poster_clock: Default::default(),
             attachment_drop_hover: false,
+            copied_message: None,
             transcript_preview: None,
             attachment_preview: None,
             pasted_text_names: None,

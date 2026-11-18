@@ -767,10 +767,10 @@ pub(super) fn preview(s: &State, p: Palette) -> El {
         .max_h(600.0)
         .padding(16.0)
         .gap(12.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()

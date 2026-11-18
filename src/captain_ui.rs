@@ -100,7 +100,7 @@ pub(super) fn icon_action(
         .focusable(true)
         .size(24.0, 24.0)
         .center()
-        .radius(4.0)
+        .radius(6.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -132,13 +132,13 @@ pub(super) fn switch(
         .cursor(rune::Cursor::Pointer)
         .focusable(true)
         // Its own ring, since a switch in a menu's focus group would otherwise show none.
-        .focus_ring(2.0, 2.0, p.coral)
+        .focus_ring(2.0, 2.0, p.ring)
         .size(34.0, 20.0)
         .min_w(34.0)
-        .radius(2.0)
+        .radius(4.0)
         .padding(4.0)
         .center_y()
-        .border(2.0, p.frame)
+        .border(1.0, p.frame)
         .fill(if on { p.coral } else { p.line })
         .motion(rune::Spring::new(0.2, 0.0))
         .on_press(action)
@@ -166,7 +166,7 @@ pub(super) fn section(
         .px(10.0)
         .gap(6.0)
         .center_y()
-        .child(pixel_label(title, p.muted));
+        .child(meta_label(title, p.muted));
     // The count sits at the heading's end, as the sidebar's section counts do.
     heading = heading.child(spacer());
     if let Some(meta) = meta {
@@ -191,7 +191,6 @@ pub(super) fn quiet_note(text: impl Into<String>, p: Palette) -> El {
 }
 
 /// One cell of the Brief header's pennant, in points.
-const PENNANT_CELL: f32 = 2.0;
 
 /// The Brief: a captain's standing instructions to Shina, beside its home conversation.
 pub(super) fn brief_panel(s: &State, p: Palette) -> El {
@@ -215,7 +214,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .gap(6.0)
                 .px(8.0)
                 .h(25.0)
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.selected)
                 .child(icon("list", p.muted))
                 .child(label(
@@ -269,16 +268,14 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                                 .shrink()
                                 .min_w(0.0),
                         )
-                        // The pennant from the home band, in the captain's tile colour, so the
-                        // colour over the horizon belongs to a named captain. Six by four cells
-                        // of 2 pt: whole device pixels at 1x and 2x.
+                        // A small swatch in the captain's tile colour, so the Brief carries
+                        // the same colour as the captain's portrait backdrop.
                         .child(
                             el().key("brief-pennant")
-                                .size(PENNANT_CELL * 6.0, PENNANT_CELL * 4.0)
-                                .shape(super::scenery(&crate::horizon::pennant_rects(
-                                    s.dark,
-                                    crate::visuals::portrait_backdrop(profile.portrait),
-                                    PENNANT_CELL,
+                                .size(8.0, 8.0)
+                                .radius(4.0)
+                                .fill(super::rgb_bytes(crate::visuals::portrait_backdrop(
+                                    profile.portrait,
                                 )))
                                 .a11y_hidden(),
                         ),
@@ -457,9 +454,9 @@ pub(super) fn brief_side(s: &State, p: Palette) -> El {
                 brief_panel(s, p)
                     .w(width)
                     .fill(p.panel)
-                    .radius(6.0)
-                    .border(2.0, p.frame)
-                    .box_shadow(hard_shadow(p))
+                    .radius(12.0)
+                    .border(1.0, p.frame)
+                    .box_shadow(soft_shadow(p))
                     .on_press(|_: &mut State| {})
                     .transition(Transition::offset(16.0, 0.0).combined(Transition::opacity())),
             );
@@ -488,9 +485,9 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
             brief_panel(s, p)
                 .w(width)
                 .fill(p.panel)
-                .radius(6.0)
-                .border(2.0, p.frame)
-                .box_shadow(hard_shadow(p))
+                .radius(12.0)
+                .border(1.0, p.frame)
+                .box_shadow(soft_shadow(p))
                 .on_press(|_: &mut State| {})
                 .transition(Transition::offset(16.0, 0.0).combined(Transition::opacity())),
         )
@@ -545,7 +542,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .gap(6.0)
                 .center_y()
                 .max_w(PANEL_WIDTH - 32.0)
-                .radius(4.0)
+                .radius(6.0)
                 .border(1.0, hairline(p))
                 .child(project_tile(s, p, project, 14.0))
                 .child(
@@ -593,7 +590,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .gap(6.0)
                 .center_y()
                 .max_w(PANEL_WIDTH - 32.0)
-                .radius(4.0)
+                .radius(6.0)
                 .border(1.0, hairline(p))
                 .child(
                     label(text.clone(), TextStyle::new(12.5, 500.0), p.ink)
@@ -657,10 +654,10 @@ fn digest_section(s: &State, p: Palette, captain: usize) -> El {
         .h(20.0)
         .px(10.0)
         .center_y()
-        .child(pixel_label("Saved digest", p.muted))
+        .child(meta_label("Saved digest", p.muted))
         .child(spacer());
     if let Some(age) = age {
-        summary = summary.child(pixel_text(age, p.faint));
+        summary = summary.child(meta_text(age, p.faint));
     }
     section = section.child(summary);
     if empty {
@@ -766,17 +763,17 @@ fn documents_section(s: &State, p: Palette, captain: usize) -> El {
             .child(label(title, ROW_TEXT, p.ink).truncate().min_w(0.0));
         if name == "AGENTS.md" {
             title_line = title_line.child(outlined(
-                el().h(16.0).px(5.0).center().radius(3.0).child(label(
-                    "Private",
-                    PIXEL_LABEL,
-                    p.muted,
-                )),
+                el().h(16.0)
+                    .px(5.0)
+                    .center()
+                    .radius(3.0)
+                    .child(label("Private", META_LABEL, p.muted)),
                 p,
             ));
         }
         let mut file_line = row().gap(8.0).center_y().min_w(0.0).child(label(
             name.to_string(),
-            PIXEL_LABEL,
+            META_LABEL,
             p.faint,
         ));
         if dirty {
@@ -788,10 +785,10 @@ fn documents_section(s: &State, p: Palette, captain: usize) -> El {
             );
         }
         if saving {
-            file_line = file_line.child(label("Saving", PIXEL_LABEL, p.muted));
+            file_line = file_line.child(label("Saving", META_LABEL, p.muted));
         }
         file_line = file_line.child(
-            label(age.clone(), PIXEL_LABEL, p.muted)
+            label(age.clone(), META_LABEL, p.muted)
                 .truncate()
                 .min_w(0.0),
         );
@@ -811,7 +808,7 @@ fn documents_section(s: &State, p: Palette, captain: usize) -> El {
                 .min_h(44.0)
                 .center_y()
                 .gap(8.0)
-                .radius(4.0)
+                .radius(6.0)
                 .hover(hover_wash(s, p))
                 .press(active_wash(s, p))
                 .hover_motion(motion(), motion())
@@ -923,11 +920,11 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
             .unwrap_or_default();
         let mut meta = row().gap(8.0).center_y();
         if let Some(word) = pending_word {
-            meta = meta.child(label(word, PIXEL_LABEL, p.muted));
+            meta = meta.child(label(word, META_LABEL, p.muted));
         } else {
             meta = meta.child(label(
                 status_word(thread.status),
-                PIXEL_LABEL,
+                META_LABEL,
                 status_ink(thread.status, p),
             ));
         }
@@ -949,7 +946,7 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
             .min_h(44.0)
             .center_y()
             .gap(8.0)
-            .radius(4.0)
+            .radius(6.0)
             .hover(hover_wash(s, p))
             .press(active_wash(s, p))
             .hover_motion(motion(), motion())
@@ -1134,8 +1131,8 @@ fn budget_meter(memories: &[MemoryView], p: Palette) -> El {
             row()
                 .h(4.0)
                 .w_full()
-                .radius(2.0)
-                .clip_rounded(2.0)
+                .radius(4.0)
+                .clip_rounded(4.0)
                 .fill(p.ink.alpha(0.08))
                 .child(el().h(4.0).grow(fraction).min_w(0.0).fill(ink))
                 .child(el().h(4.0).grow(1.0 - fraction).min_w(0.0)),
@@ -1204,7 +1201,7 @@ fn memory_input(p: Palette, edit: &rune::TextEdit, key: String, title: &str) -> 
         .max_h(140.0)
         .px(10.0)
         .py(8.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
         .field_focus(edit, p)
 }
@@ -1305,7 +1302,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
             .focusable(true)
             .size(24.0, 24.0)
             .center()
-            .radius(4.0)
+            .radius(6.0)
             .hover(hover_wash(s, p))
             .press(active_wash(s, p))
             .on_press(move |s: &mut State| {
@@ -1314,9 +1311,9 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
             })
             .child(glyph_icon(
                 if essential {
-                    &super::pixel_icons::PIN_ON
+                    &super::icons::PIN_ON
                 } else {
-                    &super::pixel_icons::PIN
+                    &super::icons::PIN
                 },
                 if essential { p.sea } else { p.faint },
             ))
@@ -1338,14 +1335,14 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
                     .px(6.0)
                     .gap(4.0)
                     .center_y()
-                    .radius(4.0)
+                    .radius(6.0)
                     .fill(p.ink.alpha(if s.dark { 0.06 } else { 0.05 }))
                     .child(
-                        rune::icon(&super::pixel_icons::LOCK, super::ICON)
+                        rune::icon(&super::icons::LOCK, super::ICON)
                             .color(p.muted)
                             .a11y_hidden(),
                     )
-                    .child(pixel_label("Yours", p.muted)),
+                    .child(meta_label("Yours", p.muted)),
             ),
         );
     }
@@ -1400,7 +1397,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
                 s,
                 format!("memory-delete-{id}"),
                 "Delete memory",
-                glyph_icon(&super::pixel_icons::TRASH, p.muted),
+                glyph_icon(&super::icons::TRASH, p.muted),
                 p,
                 move |s| {
                     let result = s.delete_memory(captain, &id);
@@ -1532,7 +1529,7 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         .size(16.0, 16.0)
         .mt(2.0)
         .center()
-        .child(glyph_icon(&super::pixel_icons::CALENDAR, p.muted));
+        .child(glyph_icon(&super::icons::CALENDAR, p.muted));
     if let Some(dot) = dot {
         // A panel-coloured square under the dot keeps it from smearing the glyph's lines.
         calendar = calendar.child(
@@ -1628,7 +1625,7 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
                     s,
                     format!("routine-delete-{id}"),
                     &format!("Delete {}", routine.name),
-                    glyph_icon(&super::pixel_icons::TRASH, p.muted),
+                    glyph_icon(&super::icons::TRASH, p.muted),
                     p,
                     move |s| {
                         let result = s.delete_routine(id);
@@ -1742,10 +1739,10 @@ fn reset_dialog(s: &State, p: Palette) -> Option<El> {
         .max_w(s.viewport_width - 32.0)
         .padding(20.0)
         .gap(10.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(label(
             format!("Reset the conversation with {name}?"),
@@ -1819,7 +1816,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .radius(CARD_RADIUS)
         .border(1.0, hairline(p))
         .child(
-            rune::icon(&super::pixel_icons::LOCK, super::ICON)
+            rune::icon(&super::icons::LOCK, super::ICON)
                 .color(p.muted)
                 .a11y_hidden(),
         )
@@ -1891,7 +1888,7 @@ pub(super) fn away_status(s: &State, p: Palette, available: Option<f32>) -> Opti
     };
     let word = match (&detail, available) {
         (Some(detail), Some(available)) => {
-            let width = |t: &str| rune::text::measure(t, &[], super::PIXEL, None).0;
+            let width = |t: &str| rune::text::measure(t, &[], super::META, None).0;
             // The line's 4 pt padding each side, the 18 pt icon and two 8 pt gaps.
             let full = 8.0 + super::ICON + 16.0 + width(word) + width(detail);
             if full > available + 0.5 {
@@ -1918,9 +1915,9 @@ pub(super) fn away_status(s: &State, p: Palette, available: Option<f32>) -> Opti
             if detail.is_some() { "bolt" } else { "crescent" },
             ink,
         ))
-        .child(super::pixel_text(word, ink).truncate().shrink().min_w(0.0));
+        .child(super::meta_text(word, ink).truncate().shrink().min_w(0.0));
     if let Some(detail) = detail {
-        line = line.child(super::pixel_text(detail, ink).key("captain-away-count"));
+        line = line.child(super::meta_text(detail, ink).key("captain-away-count"));
     }
     Some(line)
 }
@@ -1958,7 +1955,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         .px(8.0)
         .gap(6.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
@@ -2069,7 +2066,7 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
         .w_full()
         .padding(2.0)
         .gap(2.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.ink.alpha(if s.dark { 0.07 } else { 0.06 }))
         .border(1.0, p.line);
     for (key, title, choice) in [
@@ -2094,7 +2091,7 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .px(8.0)
                 .grow(if choice == KeepAwake::Off { 0.0 } else { 1.0 })
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if on { p.card } else { Color::TRANSPARENT })
                 // The chosen segment has a 1 px frame. Idle ones keep a clear border so no
                 // segment changes size when the choice moves.
@@ -2160,16 +2157,16 @@ pub(super) fn profile_item(s: &State, p: Palette) -> El {
         .px(8.0)
         .gap(10.0)
         .center_y()
-        .radius(6.0)
+        .radius(12.0)
         .focus_highlight(p.selected)
         .on_press(open_profile)
         .child(
             el().size(28.0, 28.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.coral)
                 .border(1.0, p.frame)
-                .child(super::pixel_text(
+                .child(super::meta_text(
                     profile
                         .name
                         .trim()
@@ -2248,7 +2245,7 @@ fn profile_field(p: Palette, title: &str, note: &str, field: El) -> El {
             row()
                 .gap(8.0)
                 .center_y()
-                .child(pixel_label(title, p.muted))
+                .child(meta_label(title, p.muted))
                 .child(
                     label(note, TextStyle::new(12.0, 420.0), p.muted)
                         .truncate()
@@ -2267,7 +2264,7 @@ fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title:
         .w_full()
         .px(10.0)
         .py(7.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(field_fill(s, p))
         .field_focus(edit, p)
 }
@@ -2333,10 +2330,10 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
         .max_w(s.viewport_width - 32.0)
         .padding(20.0)
         .gap(16.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p))
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()

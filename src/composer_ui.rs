@@ -37,6 +37,13 @@ pub(crate) struct Behavior {
     prompt_height: Cell<f32>,
 }
 
+impl Behavior {
+    /// Whether the draft wraps past one line at the expanded width.
+    pub(super) fn wrapped(&self) -> bool {
+        self.wrapped_prompt.get()
+    }
+}
+
 impl Default for Behavior {
     fn default() -> Self {
         Self {
@@ -307,12 +314,20 @@ pub(crate) fn tick(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         false
     };
     let comment_changed = super::citation_comment::settle(s);
+    // A copied response's check returns to the copy icon when its moment is over.
+    let copy_settled = s
+        .copied_message
+        .as_ref()
+        .is_some_and(|(_, at)| at.elapsed() >= super::COPIED_FEEDBACK);
+    if copy_settled {
+        s.copied_message = None;
+    }
     let transition = s.composer_ui.transition.get();
     let active = transition.duration > 0.0 && now < transition.start + transition.duration + 0.050;
     if active {
         tx.wake_after(std::time::Duration::from_millis(16));
     }
-    active || restore.is_some() || highlight_due || jumped || comment_changed
+    active || restore.is_some() || highlight_due || jumped || comment_changed || copy_settled
 }
 
 /// Keep the expanded form mounted while Tab moves among its controls. Rune routes a field's
@@ -357,21 +372,17 @@ pub(super) fn control_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) ->
 pub(super) fn frame_card(s: &State, p: Palette, card: El) -> El {
     let now = s.composer_ui.clock.get();
     let transition = s.composer_ui.transition.get();
-    let has_notices = !s.composer_notices.ordered().is_empty();
     let mut frame = col()
         .key("composer")
         .w_full()
-        .corners(if has_notices {
-            [0.0, 0.0, 6.0, 6.0]
-        } else {
-            [6.0; 4]
-        })
+        // KSG's `ComposerSurface.Main`: 15 px corners, concentric with the 16 px tray.
+        .radius(15.0)
         .fill(p.card)
-        .border(2.0, composer_frame(s, p))
+        .border(1.0, composer_frame(s, p))
         // The numerical transition owns geometry. Rune must not spring each sampled height.
         .instant_changes();
     if !composer_disabled(s) {
-        frame = frame.box_shadow(hard_shadow(p));
+        frame = frame.box_shadow(control_shadow(p));
     }
     let mut content = col().key("composer-clip").w_full().child(card);
     let mut slot = col()
@@ -384,8 +395,8 @@ pub(super) fn frame_card(s: &State, p: Palette, card: El) -> El {
         frame = frame
             .h(transition.height(now))
             .min_h(transition.height(now));
-        // Clip only the content, never the frame's hard shadow.
-        content = content.h_full().clip_rounded(4.0);
+        // Clip only the content, never the frame's shadow.
+        content = content.h_full().clip_rounded(15.0);
         slot = slot.h(transition.target);
     }
     slot.child(frame.child(content))
@@ -490,11 +501,10 @@ pub(super) fn measurement_probes(s: &State, p: Palette) -> El {
         .child(row().child(model_effort_trigger(s, p, true, false).key("measure-model")))
         .child(row().child(machine_selector(s, p, false).key("measure-machine")))
         .child(row().child(captain_selector_trigger(s, p, false).key("measure-captain")))
-        .child(row().child(pixel_button(
+        .child(row().child(access_trigger(
             "measure-access",
             s.current().native.access.label(),
             p,
-            |_| {},
         )))
         .child(row().child(machine_selector(s, p, true).key("measure-machine-icon")))
         .child(row().child(captain_selector_trigger(s, p, true).key("measure-captain-icon")))
@@ -781,9 +791,9 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
             .h(32.0)
             .px(10.0)
             .center_y()
-            .child(pixel_text("Demo data", p.muted))
+            .child(meta_text("Demo data", p.muted))
             .child(spacer())
-            .child(pixel_button(
+            .child(meta_button(
                 "leave-example",
                 "Open a real workspace",
                 p,
@@ -802,7 +812,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     let captain_width = text_width(captain.map_or("No captain", |c| c.name.as_str()), SMALL)
         + if captain.is_some() { 52.0 } else { 50.0 };
     let display_access = s.effective_access_mode(t);
-    let access = text_width(display_access.label(), PIXEL) + 20.0;
+    let access = text_width(display_access.label(), SMALL) + 41.0;
     let (name, _) = split_model_label(&t.model);
     let fixed = if resting {
         (text_width(name, TextStyle::new(13.0, 600.0))
@@ -810,7 +820,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
             + if name == crate::model::DEFAULT_MODEL && t.thinking.is_empty() {
                 0.0
             } else {
-                7.0 + text_width(&effort_name(&t.thinking), PIXEL)
+                7.0 + text_width(&effort_name(&t.thinking), META)
             })
         .min(200.0)
     } else {
@@ -845,7 +855,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
                     is_remote,
                     *start_from_origin,
                 );
-                (text_width(&label, PIXEL) + 46.0).min(branch_max_w) + 4.0
+                (text_width(&label, META) + 46.0).min(branch_max_w) + 4.0
             } else {
                 0.0
             };
@@ -853,7 +863,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         }
         crate::model::ComposerVcsControls::LockedWorktree { branch, .. } => {
             let label = branch.as_deref().unwrap_or("Worktree");
-            let branch_w = (text_width(label, PIXEL) + 32.0).min(branch_max_w) + 4.0;
+            let branch_w = (text_width(label, META) + 32.0).min(branch_max_w) + 4.0;
             (0.0, 0.0, branch_w)
         }
     };
@@ -869,10 +879,13 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         blocks[2] = icon_widths[2];
     }
     let count = if show_access { 3 } else { 2 };
+    // The expanded strip carries the model and effort triggers and the context ring on its
+    // right, as KSG's `ComposerControlsBar`; they keep their room before the blocks shrink.
+    let expanded_fixed = if resting { 0.0 } else { strip_fixed(s, width) };
     let fixed = (if resting {
         measurement.map_or(fixed, |m| m[0])
     } else {
-        0.0
+        expanded_fixed
     }) + vcs_fixed;
     let layout = resolve(
         // The stash badge takes 28 px plus its gap when the stash has entries.
@@ -917,8 +930,8 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         .center_y()
         .gap(4.0)
         .min_w(0.0)
-        .h(32.0)
-        .px(if resting { 16.0 } else { 10.0 });
+        .h(if resting { 32.0 } else { 30.0 })
+        .px(if resting { 16.0 } else { 6.0 });
     controls = bind_anchor(s, 2, controls.offset(controls_x, controls_y));
     if resting {
         let [model_x, model_y] = anchor_offset(s, 3, true);
@@ -975,7 +988,22 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         controls = controls.child(captain_selector_trigger(s, p, icon_only(1)));
     }
     if !resting {
-        controls = controls.child(spacer());
+        let [model_x, model_y] = anchor_offset(s, 3, false);
+        controls = controls.child(spacer()).child(bind_anchor(
+            s,
+            3,
+            model_trigger(s, p, strip_model_icon_only(width), locked, false)
+                .h(24.0)
+                .px(7.0)
+                .max_w(strip_model_max(width))
+                .offset(model_x - controls_x, model_y - controls_y),
+        ));
+        if let Some(effort) = effort_trigger(s, p, locked, strip_compact(width)) {
+            controls = controls.child(effort);
+        }
+        if context_ring_shown(t) {
+            controls = controls.child(context_ring(t, p));
+        }
     }
     if visible > 2 {
         let mut access_control = if resting || icon_only(2) {
@@ -985,7 +1013,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
             })
             .size(28.0, 24.0)
         } else {
-            pixel_button("access-mode", display_access.label(), p, |s| {
+            access_trigger("access-mode", display_access.label(), p).on_press(|s: &mut State| {
                 s.begin_composer_menu();
                 s.open_access_picker();
             })
@@ -1020,6 +1048,67 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     controls
 }
 
+/// A context strip this narrow shows the effort as its gauge only.
+fn strip_compact(width: f32) -> bool {
+    width < 700.0
+}
+
+/// A context strip this narrow shows the model as its provider icon only.
+fn strip_model_icon_only(width: f32) -> bool {
+    width < 440.0
+}
+
+/// The widest the model trigger grows in a context strip `width` wide.
+fn strip_model_max(width: f32) -> f32 {
+    if strip_compact(width) { 150.0 } else { 200.0 }
+}
+
+/// The room the context strip keeps on its right for the model and effort triggers and the
+/// context ring, before the run context blocks lose labels or move into the overflow menu.
+pub(super) fn strip_fixed(s: &State, width: f32) -> f32 {
+    let t = s.current();
+    let text_width = |value: &str| rune::text::measure(value, &[], SMALL, None).0;
+    // Provider icon, gap and padding around the model's name.
+    let model = if strip_model_icon_only(width) {
+        28.0
+    } else {
+        (text_width(split_model_label(&t.model).0) + 14.0 + 7.0 + 14.0).min(strip_model_max(width))
+    };
+    let (effort, both_default, _) = composer_effort(s);
+    let effort = if both_default || effort.is_empty() || s.multi_model_selections().len() > 1 {
+        0.0
+    } else {
+        // Gauge, gap, padding and the strip's 4 pt gap.
+        let label = if strip_compact(width) {
+            -6.0
+        } else {
+            text_width(&effort)
+        };
+        label + 14.0 + 6.0 + 14.0 + 4.0
+    };
+    let ring = if context_ring_shown(t) { 28.0 } else { 0.0 };
+    model + effort + ring
+}
+
+/// KSG's access mode control in the context strip: a shield and the mode, muted.
+fn access_trigger(key: &str, title: &str, p: Palette) -> El {
+    row()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(title)
+        .focusable(true)
+        .center_y()
+        .gap(6.0)
+        .px(7.0)
+        .h(24.0)
+        .radius(6.0)
+        .hover(p.selected)
+        .press(p.selected)
+        .child(icon("shield", p.muted).size(14.0, 14.0))
+        .child(label(title, SMALL, p.muted).truncate().shrink())
+}
+
 pub(super) fn overflow_menu(s: &State, p: Palette) -> El {
     let visible = s.composer_ui.visible_blocks.get();
     let mut menu = col()
@@ -1028,10 +1117,10 @@ pub(super) fn overflow_menu(s: &State, p: Palette) -> El {
         .focus_group()
         .w(288.0)
         .padding(4.0)
-        .radius(6.0)
+        .radius(12.0)
         .fill(p.card)
-        .border(2.0, p.frame)
-        .box_shadow(hard_shadow(p));
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p));
     // Machine, captain, permissions. Hiding is from the end of this order.
     if visible == 0 {
         menu = menu.child(
@@ -1141,8 +1230,8 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
         .px(8.0)
         .py(6.0)
         .gap(6.0)
-        .child(pixel_label("Permissions", p.muted));
-    let mut options = row().gap(2.0).padding(2.0).radius(4.0).fill(p.selected);
+        .child(meta_label("Permissions", p.muted));
+    let mut options = row().gap(2.0).padding(2.0).radius(6.0).fill(p.selected);
     let mut description = "";
     for mode in modes {
         let text = mode.description();
@@ -1160,7 +1249,7 @@ pub(super) fn permissions_section(s: &State, p: Palette) -> El {
                 .h(24.0)
                 .grow(1.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(if mode == current_mode {
                     p.card
                 } else {

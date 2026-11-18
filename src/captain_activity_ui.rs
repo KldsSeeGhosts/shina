@@ -145,7 +145,7 @@ fn status_line(s: &State, p: Palette, entry: &Value, tag_key: String, captain_na
         .gap(8.0)
         .center_y()
         .h(16.0)
-        .child(pixel_text(word, status_ink(status, p)));
+        .child(meta_text(word, status_ink(status, p)));
     if !detail.is_empty() {
         line = line.child(label(detail, META, p.muted).truncate().shrink().min_w(0.0));
     }
@@ -155,7 +155,7 @@ fn status_line(s: &State, p: Palette, entry: &Value, tag_key: String, captain_na
         .filter(|at| *at > 0)
         .and_then(|at| relative_time(at / 1000))
     {
-        line = line.child(pixel_text(age, p.faint));
+        line = line.child(meta_text(age, p.faint));
     }
     if let Some(badge) = policy_badge(tag_key, entry_policy(entry), p) {
         line = line.child(badge);
@@ -293,7 +293,7 @@ fn entry_row(
         .px(10.0)
         .py(5.0)
         .gap(2.0)
-        .radius(4.0)
+        .radius(6.0)
         .child(label(title, ROW_TEXT, p.ink).truncate().min_w(0.0).w_full());
     if !summary.is_empty() {
         row = row.child(
@@ -352,10 +352,10 @@ fn in_progress_row(
         .h(28.0)
         .gap(8.0)
         .center_y()
-        .radius(4.0)
+        .radius(6.0)
         .child(label(title, ROW_TEXT, p.ink).truncate().shrink().min_w(0.0))
         .child(spacer())
-        .child(pixel_text(word.clone(), status_ink(status, p)));
+        .child(meta_text(word.clone(), status_ink(status, p)));
     if known {
         let machine = server.to_string();
         let entry = entry.clone();
@@ -416,9 +416,9 @@ fn group(
                 .h(20.0)
                 .px(10.0)
                 .center_y()
-                .child(pixel_label(title, p.muted))
+                .child(meta_label(title, p.muted))
                 .child(spacer())
-                .child(pixel_text(total.to_string(), p.faint)),
+                .child(meta_text(total.to_string(), p.faint)),
         );
     for entry in entries.iter().take(shown) {
         group = group.child(if key == "in-progress" {
@@ -447,7 +447,7 @@ fn group(
                 .px(10.0)
                 .min_h(28.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .hover(hover_wash(s, p))
                 .press(active_wash(s, p))
                 .hover_motion(motion(), motion())
@@ -631,7 +631,7 @@ pub(super) fn policy_block(s: &State, p: Palette, captain: usize) -> El {
                 .px(10.0)
                 .py(6.0)
                 .gap(8.0)
-                .radius(6.0)
+                .radius(12.0)
                 .fill(p.danger.alpha(0.08))
                 .child(icon("alert", p.danger))
                 .child(label(error, META, p.danger).wrap().grow(1.0).min_w(0.0))
@@ -672,7 +672,7 @@ pub(super) fn policy_block(s: &State, p: Palette, captain: usize) -> El {
         .label("Crew reports")
         .padding(2.0)
         .gap(2.0)
-        .radius(4.0)
+        .radius(6.0)
         .fill(p.ink.alpha(if s.dark { 0.07 } else { 0.06 }))
         .border(1.0, p.line)
         .w(220.0)
@@ -730,7 +730,7 @@ pub(super) fn policy_block(s: &State, p: Palette, captain: usize) -> El {
             .h(24.0)
             .grow(1.0)
             .center()
-            .radius(4.0)
+            .radius(6.0)
             .fill(if on { p.card } else { Color::TRANSPARENT })
             // The chosen segment has a 1 px frame. Idle ones keep a clear
             // border so no segment changes size when the choice moves.
@@ -750,12 +750,12 @@ pub(super) fn policy_block(s: &State, p: Palette, captain: usize) -> El {
     }
     let mut control = row().h(28.0).gap(8.0).center_y();
     if !narrow {
-        control = control.child(pixel_label("Reports", p.muted));
+        control = control.child(meta_label("Reports", p.muted));
     }
     control = control.child(spacer()).child(group);
     block = block.child(control);
     if pending.is_some() {
-        block = block.child(pixel_label("Updating", p.faint).key("captain-report-policy-pending"));
+        block = block.child(meta_label("Updating", p.faint).key("captain-report-policy-pending"));
     } else if let Some(reason) = reason {
         block = block.child(quiet_note(reason, p).key("captain-report-policy-reason"));
     } else {
@@ -804,7 +804,7 @@ pub(super) fn recovery_block(s: &State, p: Palette, captain: usize) -> El {
         .child(
             row()
                 .center_y()
-                .child(pixel_label("Restart recovery", p.muted))
+                .child(meta_label("Restart recovery", p.muted))
                 .child(spacer())
                 .child(label(mode, META, p.ink).key("captain-recovery-mode")),
         )
@@ -838,7 +838,7 @@ pub(super) fn recovery_block(s: &State, p: Palette, captain: usize) -> El {
             row()
                 .key(format!("captain-recovery-wait-{index}"))
                 .gap(6.0)
-                .child(pixel_label("Waiting", p.brass))
+                .child(meta_label("Waiting", p.brass))
                 .child(label(reason, META, p.ink).wrap().grow(1.0).min_w(0.0)),
         );
     }

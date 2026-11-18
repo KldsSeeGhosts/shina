@@ -187,16 +187,25 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
                 {"type":"thinking","thinking":"First thought."},
                 {"type":"thinking","thinking":"Second thought."},
                 {"type":"thinking","thinking":"Third thought."},
+                {"type":"text","text":"Checking a.rs."},
                 {"type":"toolCall","id":"read","name":"read","arguments":{"path":"a.rs"}},
-                {"type":"thinking","thinking":"After the tool."}]}]}}),
+                {"type":"thinking","thinking":"After the tool."},
+                {"type":"text","text":" Done."}]}]}}),
         );
+        let parts = turn_parts(t, 0, 1);
         assert_eq!(
-            turn_parts(t, 0, 1),
-            vec![
-                TranscriptPart::Thought(vec![0, 1, 2]),
-                TranscriptPart::Tools(vec![0]),
-                TranscriptPart::Thought(vec![3])
-            ]
+            parts[0],
+            TranscriptPart::Work(vec![
+                WorkEntry::Thought(0),
+                WorkEntry::Thought(1),
+                WorkEntry::Thought(2)
+            ])
+        );
+        assert!(matches!(parts[1], TranscriptPart::Text { .. }));
+        // KSG Code's work streak: the call and the thinking after it are one group.
+        assert_eq!(
+            parts[2],
+            TranscriptPart::Work(vec![WorkEntry::Tool(0), WorkEntry::Thought(3)])
         );
         t.work[0].expanded = true;
         let id = t.id;
@@ -209,6 +218,11 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
                 .iter()
                 .any(|e| e.text.as_deref() == Some("Thought ×3"))
         );
+        // The mixed streak folds under its summary; unfolded, its thought is its own row.
+        assert!(rt.find(&format!("inline-thought-{id}-3")).is_none());
+        press(&mut rt, &format!("toggle-tool-group-{id}-0"));
+        rt.frame(2.0);
+        assert!(rt.find(&format!("inline-thought-{id}-3")).is_some());
         assert!(
             rt.elements()
                 .iter()
@@ -440,10 +454,10 @@ fn compactions_retries_and_tools_keep_their_order_at_the_same_text_offset() {
     assert_eq!(
         turn_parts(&thread, 0, 1),
         vec![
-            TranscriptPart::Tools(vec![0]),
+            TranscriptPart::Work(vec![WorkEntry::Tool(0)]),
             TranscriptPart::Compaction(0),
             TranscriptPart::Retry(0),
-            TranscriptPart::Tools(vec![1])
+            TranscriptPart::Work(vec![WorkEntry::Tool(1)])
         ]
     );
     let anchor = thread.native.compactions[0]["anchor"].clone();

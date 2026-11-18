@@ -508,7 +508,7 @@ pub(super) fn badge(s: &State, p: Palette) -> El {
         .cursor(rune::Cursor::Pointer)
         .hover(p.selected)
         .press(p.selected)
-        .radius(4.0)
+        .radius(6.0)
         .preserve_focus_on_press(true)
         .on_key(|s, event, tx| menu_key(s, event, tx))
         .on_press(|s: &mut State| {
@@ -522,11 +522,11 @@ pub(super) fn badge(s: &State, p: Palette) -> El {
                 .px(5.0)
                 .gap(4.0)
                 .center_y()
-                .radius(4.0)
+                .radius(6.0)
                 .fill(p.panel)
                 .sequence(rune::Sequence::new(STASH_PULSE))
                 .child(icon("archive", p.muted))
-                .child(pixel_text(format!("{count}"), p.muted)),
+                .child(meta_text(format!("{count}"), p.muted)),
             p,
         ))
 }
@@ -592,7 +592,7 @@ pub(super) fn menu(s: &State, p: Palette, lane: f32) -> El {
             .px(10.0)
             .gap(8.0)
             .center_y()
-            .radius(4.0)
+            .radius(6.0)
             .preserve_focus_on_press(true)
             .on_press(move |s: &mut State| restore(s, &id))
             .child(
@@ -602,7 +602,7 @@ pub(super) fn menu(s: &State, p: Palette, lane: f32) -> El {
                     .min_w(0.0)
                     .gap(2.0)
                     .child(label(snippet(entry), SMALL, p.ink).truncate())
-                    .child(label(meta.join(" \u{00b7} "), PIXEL, p.muted).truncate()),
+                    .child(label(meta.join(" \u{00b7} "), META, p.muted).truncate()),
             )
             .child(
                 el().key(format!("composer-stash-delete-{index}"))
@@ -613,7 +613,7 @@ pub(super) fn menu(s: &State, p: Palette, lane: f32) -> El {
                     .center()
                     .cursor(rune::Cursor::Pointer)
                     .hover(p.selected)
-                    .radius(4.0)
+                    .radius(6.0)
                     .preserve_focus_on_press(true)
                     .on_press(move |s: &mut State| delete(s, &delete_id))
                     .child(icon("close", p.muted)),
@@ -637,15 +637,15 @@ pub(super) fn menu(s: &State, p: Palette, lane: f32) -> El {
             .label("Stashed drafts")
             .on_key(|s, event, tx| menu_key(s, event, tx))
             .fill(p.panel)
-            .radius(6.0)
-            .clip_rounded(6.0)
+            .radius(12.0)
+            .clip_rounded(12.0)
             .w((lane - 2.0 * DRAWER_INSET).max(240.0))
             .max_h(288.0)
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
             .child(list)
-            .box_shadow(hard_shadow(p)),
+            .box_shadow(soft_shadow(p)),
         p,
     )
     .anchored_fit(

@@ -269,7 +269,7 @@ It does not replace a full Windows build, link test or native runtime test.
 The `html-render` and `html-render-dark` snapshot scenes use isolated temporary
 profiles. The card ports KSG's tool-row placement. Its requested native-specific
 presentation has a 6 px corner, a 2 px pixel frame and hard shadow, an 11 px
-Departure Mono HTML label, an Inter title and the existing open icon. Images keep
+Inter HTML label, an Inter title and the existing open icon. Images keep
 their aspect ratio and clip below 480 pt. Finished cards remain visible outside
 the collapsed work log.
 
@@ -313,7 +313,7 @@ not the thread's context-window capacity.
 
 The context popover shows a Usage block only when windows exist. Each row has its
 window name, used percent, a 6 px bar and the local reset date and time, or
-"Reset not reported". Counts and times use 11 px Departure Mono. Bars use the
+"Reset not reported". Counts and times use 12 px Inter. Bars use the
 existing faint ink and coral at 90 percent or more. The card keeps its existing
 palette, frame, spacing and Compact context action. Service-tier segments follow
 KSG's `ComposerModelEffort.SpeedControl` footer style.

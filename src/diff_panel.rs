@@ -1389,15 +1389,11 @@ fn scope_option(scope: Scope, current: Scope, key: &str, p: Palette) -> El {
         .hover(if on { p.selected } else { p.card })
         .press(p.selected)
         .on_press(move |s: &mut State| s.diff_set_scope(scope))
-        .child(label(
-            scope.label(),
-            PIXEL,
-            if on { p.ink } else { p.muted },
-        ))
+        .child(label(scope.label(), META, if on { p.ink } else { p.muted }))
 }
 
-/// KSG `DiffStatLabel`: `+N -N` in the addition and deletion colours, Departure
-/// Mono, with its group aria label.
+/// KSG `DiffStatLabel`: `+N -N` in the addition and deletion colours, 12 px
+/// Inter, with its group aria label.
 pub(super) fn diff_stat_label(key: &str, additions: u32, deletions: u32, p: Palette) -> El {
     row()
         .key(key)
@@ -1406,12 +1402,12 @@ pub(super) fn diff_stat_label(key: &str, additions: u32, deletions: u32, p: Pale
         .center_y()
         .gap(8.0)
         .child(
-            pixel_text(format!("+{}", format_compact_diff_count(additions)), p.sea)
+            meta_text(format!("+{}", format_compact_diff_count(additions)), p.sea)
                 .align(rune::Align::End)
                 .w(28.0),
         )
         .child(
-            pixel_text(
+            meta_text(
                 format!("-{}", format_compact_diff_count(deletions)),
                 p.danger,
             )
@@ -1462,7 +1458,7 @@ pub(super) fn header(s: &State, p: Palette) -> El {
                 .key("diff-scope")
                 .center_y()
                 .border(1.0, p.frame)
-                .radius(4.0)
+                .radius(6.0)
                 .child(scope_option(
                     Scope::Uncommitted,
                     scope,
@@ -1507,7 +1503,7 @@ pub(super) fn header(s: &State, p: Palette) -> El {
                 .focusable(true)
                 .size(24.0, 24.0)
                 .center()
-                .radius(4.0)
+                .radius(6.0)
                 .hover(p.selected)
                 .press(p.selected)
                 .on_press(|s: &mut State| s.diff_toggle_all())
@@ -1534,7 +1530,7 @@ pub(super) fn header(s: &State, p: Palette) -> El {
             .focusable(true)
             .size(24.0, 24.0)
             .center()
-            .radius(4.0)
+            .radius(6.0)
             .hover(p.selected)
             .press(p.selected)
             .on_press(|s: &mut State| s.diff_request())
@@ -1692,7 +1688,7 @@ fn file_header(
     let truncated = entry.truncated;
     let mut stat = row().center_y().gap(4.0);
     if truncated {
-        stat = stat.child(pixel_text("truncated", p.brass));
+        stat = stat.child(meta_text("truncated", p.brass));
     }
     if entry.additions > 0 || entry.deletions > 0 {
         stat = stat.child(diff_stat_inline(entry.additions, entry.deletions, p));
@@ -1721,7 +1717,7 @@ fn file_header(
                 .child(
                     icon(if is_collapsed { "open" } else { "chevron" }, p.muted).size(12.0, 12.0),
                 )
-                .child(pixel_text(letter, ink).w(10.0))
+                .child(meta_text(letter, ink).w(10.0))
                 .child(file_title(entry, p))
                 .child(spacer())
                 .child(stat),
@@ -1738,12 +1734,12 @@ fn diff_stat_inline(additions: u32, deletions: u32, p: Palette) -> El {
         .center_y()
         .gap(8.0)
         .child(
-            pixel_text(format!("+{}", format_compact_diff_count(additions)), p.sea)
+            meta_text(format!("+{}", format_compact_diff_count(additions)), p.sea)
                 .align(rune::Align::End)
                 .w(28.0),
         )
         .child(
-            pixel_text(
+            meta_text(
                 format!("-{}", format_compact_diff_count(deletions)),
                 p.danger,
             )
@@ -1752,7 +1748,7 @@ fn diff_stat_inline(additions: u32, deletions: u32, p: Palette) -> El {
         )
 }
 
-/// A number gutter cell: 44 px wide, right aligned, Departure Mono, sticky so
+/// A number gutter cell: 44 px wide, right aligned, Inter figures, sticky so
 /// horizontally scrolled lines keep their numbers — KSG's sticky line-number
 /// columns.
 fn gutter(number: Option<u32>, bg: Color, p: Palette, left: f32) -> El {
@@ -1763,7 +1759,7 @@ fn gutter(number: Option<u32>, bg: Color, p: Palette, left: f32) -> El {
         .center_y()
         .px(6.0)
         .child(
-            pixel_text(number.map(|n| n.to_string()).unwrap_or_default(), p.faint)
+            meta_text(number.map(|n| n.to_string()).unwrap_or_default(), p.faint)
                 .align(rune::Align::End)
                 .w_full(),
         )
@@ -1821,7 +1817,7 @@ fn line_row(
         .child(gutter(old, bg, p, 0.0))
         .child(gutter(new, bg, p, 44.0))
         .child(
-            pixel_text(marker, marker_ink)
+            meta_text(marker, marker_ink)
                 .align(rune::Align::Center)
                 .w(12.0),
         )
@@ -1869,13 +1865,13 @@ fn note_row(
                     .center()
                     .h(18.0)
                     .px(8.0)
-                    .radius(4.0)
+                    .radius(6.0)
                     .border(1.0, p.frame)
                     .fill(p.card)
                     .hover(p.selected)
                     .press(p.selected)
                     .on_press(move |s: &mut State| s.diff_retry_file(&key, &id))
-                    .child(pixel_text("Retry", p.muted)),
+                    .child(meta_text("Retry", p.muted)),
             )
             .into()
     } else {
@@ -1938,7 +1934,7 @@ fn diff_row(s: &State, p: Palette, panel_key: &str, i: usize) -> El {
             .h(28.0)
             .center()
             .looping(rune::LoopSpec::opacity(1.2, 0.0, 0.4, 0.95))
-            .child(pixel_text(
+            .child(meta_text(
                 format!("Loading {remaining} file diffs..."),
                 p.faint,
             ))
