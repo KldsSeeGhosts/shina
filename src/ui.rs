@@ -15703,10 +15703,25 @@ fn composer(
                     el()
                 }),
         );
+        // Antigravity's captured OAuth link opens only on click (KSG sign-in flow).
+        if t.harness == "antigravity"
+            && let Some(url) = t.harness_state["signInUrl"].as_str()
+        {
+            let url = url.to_owned();
+            area = area.child(
+                button("open-sign-in-link", "Sign in with Google", p, |_| {}).on_press_tx(
+                    move |_: &mut State, _| {
+                        let _ = crate::antigravity::open_browser(&url);
+                    },
+                ),
+            );
+        }
         let command = if t.harness == "codex" && error.contains("`codex login`") {
             Some("codex login")
         } else if t.harness == "claude" && error.contains("`claude auth login`") {
             Some("claude auth login")
+        } else if t.harness == "antigravity" && error.contains("`agy acp --login`") {
+            Some("agy acp --login")
         } else {
             None
         };
@@ -29472,6 +29487,58 @@ pub(crate) mod tests {
         t.thinking_levels = vec!["off".into(), "low".into(), "medium".into(), "high".into()];
         t.thinking = "medium".into();
         rt.invalidate();
+    }
+
+    /// KSG AntigravityProvider picker: the Antigravity tab shows in the rail and lists
+    /// its combined `family-level` models at every width.
+    #[test]
+    fn antigravity_tab_lists_models_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            // The picker re-reads harnesses.json on open, so the agent lives there.
+            std::fs::write(
+                rt.state.data_dir.join("harnesses.json"),
+                serde_json::json!([{"id":"antigravity","name":"Antigravity",
+                    "command":"agy","args":["acp"],"env":[]}])
+                .to_string(),
+            )
+            .unwrap();
+            rt.state.harnesses = crate::harness::Registry::read();
+            let t = rt.state.current_mut();
+            t.harness = "antigravity".into();
+            t.models = [
+                "gemini-3.8-flash-high",
+                "gemini-3.8-flash-medium",
+                "gemini-3.8-flash-low",
+                "gemini-4-carbon",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| crate::session::AgentModel {
+                provider: "antigravity".into(),
+                id: (*id).into(),
+                name: (*id).into(),
+                is_default: index == 0,
+                ..Default::default()
+            })
+            .collect();
+            open_picker(&mut rt, SettingsPicker::Model);
+            rt.frame(1.0);
+            assert!(
+                rt.presented("choose-harness-antigravity").is_some(),
+                "{width}: Antigravity rail tab"
+            );
+            press(&mut rt, "choose-harness-antigravity");
+            rt.frame(1.0);
+            assert!(rt.presented("model-list").is_some(), "{width}");
+            for index in 0..4 {
+                assert!(
+                    rt.presented(&format!("choose-model-{index}")).is_some(),
+                    "{width}: model row {index}"
+                );
+            }
+        }
     }
 
     /// Short windows used to leave the combined picker taller than the room above the

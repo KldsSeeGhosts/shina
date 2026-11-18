@@ -383,6 +383,15 @@ impl State {
     /// Harness ids a thread can use: built-ins, then registered ACP agents.
     pub(crate) fn harness_ids(&self) -> Vec<String> {
         let mut ids = vec!["pi".to_string(), "codex".to_string(), "claude".to_string()];
+        if crate::antigravity::cli_available()
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "antigravity")
+        {
+            ids.push("antigravity".to_string());
+        }
         ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
         ids
     }
@@ -615,6 +624,32 @@ impl State {
                 message: error,
                 compatibility_broken_message: None,
                 update_required_models,
+            });
+        }
+
+        // Built-in Antigravity (KSG provider instance): `agy` on PATH, no ACP tag.
+        if crate::antigravity::cli_available()
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "antigravity")
+        {
+            entries.push(ProviderInstanceEntry {
+                instance_id: "antigravity".into(),
+                driver_kind: "antigravity".into(),
+                display_name: "Antigravity".into(),
+                continuation_group_key: None,
+                enabled: true,
+                installed: true,
+                status: ProviderStatusKind::Ready,
+                auth_status: ProviderAuthStatus::Unknown,
+                can_setup: true,
+                is_available: true,
+                is_acp: false,
+                message: None,
+                compatibility_broken_message: None,
+                update_required_models: vec![],
             });
         }
 
