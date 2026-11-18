@@ -14,6 +14,7 @@ mod cache_persistence;
 mod captains;
 mod claude;
 mod claude_attachment_budget;
+mod claude_catalog;
 mod client;
 mod client_history;
 mod codex;
