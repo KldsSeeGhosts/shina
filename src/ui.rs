@@ -9626,8 +9626,13 @@ fn add_project_palette(s: &State, p: Palette) -> El {
 
 /// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
 fn tool_verb(tool: &Tool) -> String {
+    tool_verb_in(tool, tool.done || tool.failed)
+}
+
+/// The verb for a call in a given tense. KSG's live activity row keeps the present tense
+/// ("Reading") while its turn is still acting on the result (`liveActivityToolStatus`).
+fn tool_verb_in(tool: &Tool, done: bool) -> String {
     use crate::work::ToolKind::*;
-    let done = tool.done || tool.failed;
     match (tool.resolved_kind(), done) {
         (Read, true) => "Read".into(),
         (Read, false) => "Reading".into(),
@@ -9684,15 +9689,84 @@ enum TranscriptPart {
         from: usize,
         to: usize,
     },
+    /// Cards that keep their own place: plans, rendered HTML and a captain's delegations.
     Tools(Vec<usize>),
+    /// Thinking before grouping; `turn_parts` folds every run of it into `Work`.
     Thought(Vec<usize>),
+    /// One streak of thoughts and ordinary tool calls between prose, in order.
+    Work(Vec<WorkEntry>),
     Compaction(usize),
     Retry(usize),
+}
+
+/// A step of a work streak: a tool call or a thought, by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum WorkEntry {
+    Tool(usize),
+    Thought(usize),
 }
 
 /// Content indices preserve thinking/tool order even when neither adds visible message text.
 fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
     turn_parts_in(t, &timeline_structure(t).events, start, end)
+}
+
+/// A tool that shows as its own card rather than a step: a plan, rendered HTML, a captain's
+/// delegation, or a subagent run with its result cards (KSG keeps subagent events out of
+/// work groups too).
+fn is_card_tool(t: &Thread, index: usize) -> bool {
+    let tool = &t.tools[index];
+    if !tool.subagents.is_empty() {
+        return true;
+    }
+    match tool.resolved_kind() {
+        crate::work::ToolKind::Plan | crate::work::ToolKind::Subagent => true,
+        crate::work::ToolKind::Html => {
+            crate::html_render::find_reference(&tool.structured).is_some()
+        }
+        _ => t.captain_home && !t.delegated && crew_ui::is_delegation(tool),
+    }
+}
+
+/// Ported from KSG Code's `deriveTimelineRows` grouping (`MessagesTimeline.logic.ts`): every
+/// contiguous run of reasoning and tool entries between prose is one work group. Cards,
+/// compactions and retries end a run.
+fn group_work(t: &Thread, parts: Vec<TranscriptPart>) -> Vec<TranscriptPart> {
+    let mut out: Vec<TranscriptPart> = Vec::with_capacity(parts.len());
+    let push_entry = |out: &mut Vec<TranscriptPart>, entry: WorkEntry| {
+        if let Some(TranscriptPart::Work(entries)) = out.last_mut() {
+            entries.push(entry);
+        } else {
+            out.push(TranscriptPart::Work(vec![entry]));
+        }
+    };
+    for part in parts {
+        match part {
+            TranscriptPart::Thought(indices) => {
+                for index in indices {
+                    push_entry(&mut out, WorkEntry::Thought(index));
+                }
+            }
+            TranscriptPart::Tools(indices) => {
+                // Cards from one call batch stay one part, as the crew's task cards expect.
+                let mut cards_open = false;
+                for index in indices {
+                    if !is_card_tool(t, index) {
+                        push_entry(&mut out, WorkEntry::Tool(index));
+                        cards_open = false;
+                    } else if cards_open && let Some(TranscriptPart::Tools(cards)) = out.last_mut()
+                    {
+                        cards.push(index);
+                    } else {
+                        out.push(TranscriptPart::Tools(vec![index]));
+                        cards_open = true;
+                    }
+                }
+            }
+            part => out.push(part),
+        }
+    }
+    out
 }
 
 fn turn_events(events: &[TimelineEvent], start: usize, end: usize) -> &[TimelineEvent] {
@@ -9702,6 +9776,16 @@ fn turn_events(events: &[TimelineEvent], start: usize, end: usize) -> &[Timeline
 }
 
 fn turn_parts_in(
+    t: &Thread,
+    events: &[TimelineEvent],
+    start: usize,
+    end: usize,
+) -> Vec<TranscriptPart> {
+    group_work(t, event_parts_in(t, events, start, end))
+}
+
+/// A turn's parts in event order, before thoughts and tools are grouped into work streaks.
+fn event_parts_in(
     t: &Thread,
     events: &[TimelineEvent],
     start: usize,
@@ -9823,8 +9907,27 @@ fn activity_line(
         .child(spacer())
 }
 
-/// The folded work line, ported from KSG Code's `WorkFoldToggle` (`WORKING_BAR_CLASS_NAME`):
-/// a 32 pt row of 13 px muted text with the chevron right after the label.
+/// KSG Code's `WORKING_BAR_CLASS_NAME` (`chat/TimelineRowParts.tsx`): a 32 pt bar over a 1 px
+/// `--timeline-working-rule`, 5 pt in at the start and 4 pt at the end. A running turn's
+/// "Working for" and a finished turn's "Worked for" are this one bar.
+fn working_bar_frame(dark: bool, p: Palette) -> El {
+    row()
+        .w_full()
+        .min_w(0.0)
+        .h(32.0)
+        .center_y()
+        .gap(10.0)
+        .pl(5.0)
+        .pr(4.0)
+        .border_sides(
+            [0.0, 0.0, 1.0, 0.0],
+            if dark { color("#242424") } else { p.line },
+        )
+}
+
+/// The folded work bar's button, ported from KSG Code's `WorkFoldToggle` and `WorkFoldCaret`:
+/// muted 13 px text that brightens on hover, with a 12 pt chevron 8 pt after it. It goes in
+/// a `working_bar_frame`.
 fn work_fold_toggle(key: String, a11y: String, title: &str, open: bool, p: Palette) -> El {
     row()
         .key(key)
@@ -9832,20 +9935,61 @@ fn work_fold_toggle(key: String, a11y: String, title: &str, open: bool, p: Palet
         .cursor(rune::Cursor::Pointer)
         .label(a11y)
         .focusable(true)
+        .hover_group()
+        .h_full()
         .center_y()
-        .gap(4.0)
-        .h(32.0)
-        .px(6.0)
-        .ml(-6.0)
+        .gap(8.0)
         .radius(6.0)
-        .hover(p.selected)
-        .child(
-            label(title, ACTIVITY, p.muted)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        )
-        .child(icon(if open { "chevron" } else { "open" }, p.faint).size(14.0, 14.0))
+        .child(label(title, ACTIVITY, p.muted).group_color(p.ink))
+        .child(icon(if open { "chevron" } else { "open" }, p.faint).size(12.0, 12.0))
+}
+
+/// The bar's live label, as KSG's `WorkingTimelineRow` words it: stopping, paused on a
+/// request (the clock stops), compacting, or working, with the turn's tabular timer.
+fn working_label(t: &Thread) -> (&'static str, Option<u64>) {
+    let elapsed = t.started.map(|start| start.elapsed().as_secs());
+    let mut cache = t.timeline_cache.borrow_mut();
+    if t.request.is_none() {
+        cache.paused_at = None;
+    }
+    if t.phase == "Stopping" || t.stop_control.phase().is_some() {
+        return ("Stopping…", None);
+    }
+    if t.request.is_some() {
+        let at = *cache.paused_at.get_or_insert(elapsed.unwrap_or(0));
+        return ("Paused at ", Some(at));
+    }
+    match (t.phase == "Compacting context", elapsed) {
+        (true, Some(seconds)) => ("Compacting for ", Some(seconds)),
+        (true, None) => ("Compacting…", None),
+        (false, Some(seconds)) if seconds > 0 => ("Working for ", Some(seconds)),
+        (false, _) => ("Working...", None),
+    }
+}
+
+/// The tabular timer in the bar's own 13 px type, so each tick keeps its width.
+const BAR_TIMER: TextStyle = ACTIVITY.features(TABULAR);
+
+/// Ported from KSG Code's `WorkingTimelineRow`: the running turn's bar at its top, under the
+/// captain's name. It is not a toggle while the turn runs, so it has no chevron.
+fn working_bar(t: &Thread, dark: bool, p: Palette) -> El {
+    let (words, seconds) = working_label(t);
+    let mut text = row().center_y().min_w(0.0).shrink().child(
+        label(words, ACTIVITY, p.muted)
+            .key(format!("working-label-{}", t.id))
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+    );
+    if let Some(seconds) = seconds {
+        text = text.child(
+            label(timer_label(seconds), BAR_TIMER, p.muted).key(format!("live-timer-{}", t.id)),
+        );
+    }
+    working_bar_frame(dark, p)
+        .key(format!("working-bar-{}", t.id))
+        .role("status")
+        .child(text)
 }
 
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
@@ -9896,54 +10040,134 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
 }
 
 fn inline_tools(s: &State, p: Palette, indices: &[usize]) -> El {
-    if indices.len() == 1 {
-        return inline_tool(s, p, indices[0]);
+    let entries: Vec<_> = indices.iter().map(|&i| WorkEntry::Tool(i)).collect();
+    work_part(s, p, &entries)
+}
+
+/// The tool calls of a work streak, in order.
+fn entry_tools(entries: &[WorkEntry]) -> impl Iterator<Item = usize> + '_ {
+    entries.iter().filter_map(|entry| match entry {
+        WorkEntry::Tool(index) => Some(*index),
+        WorkEntry::Thought(_) => None,
+    })
+}
+
+/// The thoughts of a work streak, in order.
+fn entry_thoughts(entries: &[WorkEntry]) -> Vec<usize> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            WorkEntry::Thought(index) => Some(*index),
+            WorkEntry::Tool(_) => None,
+        })
+        .collect()
+}
+
+/// Whether a work streak is unfolded. Its first tool call holds the flag, as a tool group's did;
+/// a streak of thinking alone opens with its first thought.
+fn group_open(t: &Thread, entries: &[WorkEntry]) -> bool {
+    match entry_tools(entries).next() {
+        Some(index) => t.tools[index].group_expanded,
+        None => entry_thoughts(entries)
+            .first()
+            .is_some_and(|&index| t.thoughts[index].expanded),
     }
+}
+
+/// Flips a work streak's fold flag. `tool_id` names its first call; `None` is a streak of
+/// thinking alone, which folds with its first thought (`thought`).
+fn toggle_group(t: &mut Thread, tool_id: Option<&str>, thought: Option<(usize, usize, usize)>) {
+    if let Some(id) = tool_id {
+        if let Some(tool) = t.tools.iter_mut().find(|tool| tool.id == id) {
+            tool.group_expanded = !tool.group_expanded;
+            let message = tool.anchor.message;
+            t.timeline_cache.get_mut().touch_message(message);
+        }
+    } else if let Some((message, block, offset)) = thought
+        && let Some(thought) = t.thoughts.iter_mut().find(|thought| {
+            thought.anchor.message == message
+                && thought.block == block
+                && thought.anchor.offset == offset
+        })
+    {
+        thought.expanded = !thought.expanded;
+        t.timeline_cache.get_mut().touch_message(message);
+    }
+}
+
+/// One step of an unfolded work streak.
+fn work_entry_row(s: &State, p: Palette, entry: WorkEntry) -> El {
+    match entry {
+        WorkEntry::Tool(index) => inline_tool(s, p, index),
+        WorkEntry::Thought(index) => work_ui::thoughts(s, p, &[index]),
+    }
+}
+
+/// A work streak as one transcript part: a lone call is its own row, thinking alone keeps its
+/// "Thought" disclosure, and anything longer folds under one header, as KSG Code's
+/// `WorkGroupToggleTimelineRow` and `WorkLogList` (16 pt in, `ps-4`) show it.
+fn work_part(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
     let t = s.current();
-    let mut group = tool_group_head(s, p, indices);
-    if t.tools[indices[0]].group_expanded {
-        let mut rows = col().pl(14.0).gap(0.0);
-        for index in indices {
-            rows = rows.child(inline_tool(s, p, *index));
+    let thoughts = entry_thoughts(entries);
+    if thoughts.len() == entries.len() {
+        return work_ui::thoughts(s, p, &thoughts);
+    }
+    if entries.len() == 1 {
+        return work_entry_row(s, p, entries[0]);
+    }
+    let mut group = work_group_head(s, p, entries);
+    if group_open(t, entries) {
+        let mut rows = col().pl(WORK_LIST_INDENT).gap(WORK_GAP);
+        for entry in entries {
+            rows = rows.child(work_entry_row(s, p, *entry));
         }
         group = group.child(rows);
     }
     group
 }
 
-/// A tool group's keyed column and summary line, without its rows. Long turns
-/// place each grouped row in its own transcript slice.
-fn tool_group_head(s: &State, p: Palette, indices: &[usize]) -> El {
+/// KSG's `WorkLogList` indent (`ps-4`) for the steps of an unfolded group.
+const WORK_LIST_INDENT: f32 = 16.0;
+/// The space between work rows.
+const WORK_GAP: f32 = 2.0;
+
+/// A work streak's keyed column and summary line, without its rows, ported from KSG Code's
+/// `WorkGroupHeader`. The summary counts the calls (`summarizeToolGroup` leaves thinking out);
+/// the icon is the calls' own when they are all one kind. Long turns place each row of an
+/// unfolded streak in its own transcript slice.
+fn work_group_head(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
     let t = s.current();
+    let indices: Vec<usize> = entry_tools(entries).collect();
     let tools: Vec<_> = indices.iter().map(|index| &t.tools[*index]).collect();
     let first = indices[0];
     let first_id = tools[0].id.clone();
-    let expanded = tools[0].group_expanded;
-    let failed = tools.iter().filter(|tool| tool.failed).count();
+    let expanded = group_open(t, entries);
+    let failed = tools.last().is_some_and(|tool| tool.failed);
     let summary = tool_summary(&tools);
+    let kind = tools[0].resolved_kind();
+    let glyph = if tools.iter().all(|tool| tool.resolved_kind() == kind) {
+        work_ui::kind_icon(kind)
+    } else {
+        "list"
+    };
     let toggle_key = format!("toggle-tool-group-{}-{first}", t.id);
     let press_key = toggle_key.clone();
     col()
         .key(format!("tool-group-{}-{first}", t.id))
-        .gap(2.0)
+        .gap(WORK_GAP)
         .child(
             activity_line(
                 toggle_key,
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
                 (summary.clone(), ""),
-                failed > 0,
+                failed,
                 expanded,
-                "list",
+                glyph,
                 p,
             )
             .on_press_tx(move |s: &mut State, tx| {
                 tx.keep_on_screen(press_key.clone());
-                let thread = s.current_mut();
-                if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == first_id) {
-                    tool.group_expanded = !tool.group_expanded;
-                    let message = tool.anchor.message;
-                    thread.timeline_cache.get_mut().touch_message(message);
-                }
+                toggle_group(s.current_mut(), Some(&first_id), None);
             }),
         )
 }
@@ -9970,6 +10194,7 @@ fn transcript_part(
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
         TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
+        TranscriptPart::Work(entries) => work_part(s, p, entries),
         TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
         TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
         TranscriptPart::Text { message, from, to } => {
@@ -10002,7 +10227,7 @@ fn transcript_part(
                     .filter(|m| m.entry_id == *message_id)
                     .and_then(|m| {
                         (m.occurrence >= *occ_base && m.occurrence < *occ_base + hits)
-                            .then_some(m.occurrence - *occ_base)
+                            .then(|| m.occurrence - *occ_base)
                     });
                 *occ_base += hits;
                 Some((query, active_occ))
@@ -10042,20 +10267,417 @@ fn transcript_part(
     }
 }
 
-/// What the agent is doing right now, for the live status line at the end of a turn. A
-/// running tool or thought already names itself in its own row, so the line says Working.
-fn live_status(t: &Thread) -> String {
-    let _ = timeline_structure(t);
-    if !t.timeline_cache.borrow().unfinished_tools.is_empty()
-        || t.thoughts.last().is_some_and(|thought| !thought.done)
-    {
-        return "Working".into();
+/// What the agent is doing while no step of the live tail is in progress, as KSG Code's
+/// `ThinkingTimelineRow` words it: "Thinking", "Waiting on subagents", or a phase that says
+/// more, such as a retry.
+fn live_status(t: &Thread, start: usize) -> String {
+    let waiting = t.tools.iter().any(|tool| {
+        tool.anchor.message >= start
+            && !tool.done
+            && !tool.failed
+            && (tool.resolved_kind() == crate::work::ToolKind::Subagent
+                || crew_ui::is_delegation(tool))
+    });
+    if waiting {
+        return "Waiting on subagents".into();
     }
     match t.phase.as_str() {
-        "" | "Working" | "Waiting for the model" => "Planning next moves".into(),
-        phase if phase.starts_with("Running ") => "Working".into(),
+        ""
+        | "Working"
+        | "Waiting for the model"
+        | "Thinking"
+        | "Stopping"
+        | "Compacting context" => "Thinking".into(),
+        phase if phase.starts_with("Running ") => "Thinking".into(),
         phase => phase.into(),
     }
+}
+
+/// The live tail of a running turn: the work streak after its latest prose, which KSG Code's
+/// `activeWorkRow` shows as one `work-live` row.
+#[derive(Clone, Copy, Debug)]
+struct LiveTail {
+    part: usize,
+    /// The newest step with something to show (thinking with no text yet has none).
+    latest: WorkEntry,
+    /// The newest step still in progress.
+    running: Option<WorkEntry>,
+    /// The newest step is a call that failed, and nothing is running.
+    failed: bool,
+    /// The row stands for what the turn is doing now: a step runs, or the last call
+    /// succeeded and nothing waits on the user.
+    active: bool,
+    /// The newest thought with text, for the preview line.
+    thought: Option<usize>,
+}
+
+fn live_tail(t: &Thread, parts: &[TranscriptPart]) -> Option<LiveTail> {
+    let part = parts.len().checked_sub(1)?;
+    let TranscriptPart::Work(entries) = &parts[part] else {
+        return None;
+    };
+    let visible = |entry: &&WorkEntry| match entry {
+        WorkEntry::Tool(_) => true,
+        WorkEntry::Thought(index) => !t.thoughts[*index].text.trim().is_empty(),
+    };
+    let latest = *entries.iter().rfind(visible)?;
+    let running = entries
+        .iter()
+        .filter(visible)
+        .rfind(|entry| match entry {
+            WorkEntry::Tool(index) => !t.tools[*index].done && !t.tools[*index].failed,
+            WorkEntry::Thought(index) => !t.thoughts[*index].done,
+        })
+        .copied();
+    let latest_tool = match latest {
+        WorkEntry::Tool(index) => Some(&t.tools[index]),
+        WorkEntry::Thought(_) => None,
+    };
+    let failed = running.is_none() && latest_tool.is_some_and(|tool| tool.failed);
+    let active = running.is_some()
+        || latest_tool.is_some_and(|tool| tool.done && !tool.failed) && t.request.is_none();
+    let thought = entries
+        .iter()
+        .filter(visible)
+        .rev()
+        .find_map(|entry| match entry {
+            WorkEntry::Thought(index) => Some(*index),
+            WorkEntry::Tool(_) => None,
+        });
+    Some(LiveTail {
+        part,
+        latest,
+        running,
+        failed,
+        active,
+        thought,
+    })
+}
+
+/// How much of a thought KSG reads for its preview (`THOUGHT_PREVIEW_SOURCE_MAX_LENGTH`).
+const THOUGHT_PREVIEW_SOURCE: usize = 8_192;
+
+/// Ported from KSG Code's `liveThoughtLine` (`work-log/presentation.ts`): a thought's bold
+/// heading, or else its first sentence, as plain text.
+fn live_thought_line(markdown: &str) -> String {
+    let markdown = match markdown.char_indices().nth(THOUGHT_PREVIEW_SOURCE) {
+        Some((at, _)) => &markdown[..at],
+        None => markdown,
+    };
+    let heading = markdown.trim_start().strip_prefix("**").and_then(|rest| {
+        let end = rest.find("**")?;
+        let inner = &rest[..end];
+        let after = rest[end + 2..].split('\n').next().unwrap_or("");
+        (!inner.is_empty()
+            && !inner.contains(['*', '\r', '\n'])
+            && after
+                .trim_end_matches('\r')
+                .chars()
+                .all(|c| c == ' ' || c == '\t'))
+        .then_some(inner)
+    });
+    let source = heading.unwrap_or(markdown);
+    // Links and images keep their text.
+    let mut unlinked = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find('[') {
+        let (before, from) = rest.split_at(open);
+        let close = from.find(']');
+        let link = close
+            .filter(|close| from[close + 1..].starts_with('('))
+            .and_then(|close| {
+                let end = from[close + 2..].find(')')?;
+                Some((close, close + 2 + end))
+            });
+        match link {
+            Some((close, end)) if !from[1..close].contains(']') => {
+                unlinked.push_str(before.strip_suffix('!').unwrap_or(before));
+                unlinked.push_str(&from[1..close]);
+                rest = &from[end + 1..];
+            }
+            _ => {
+                unlinked.push_str(before);
+                unlinked.push('[');
+                rest = &from[1..];
+            }
+        }
+    }
+    unlinked.push_str(rest);
+    // Headings, bullets and list numbers at the start of a line.
+    let mut lines = vec![];
+    for line in unlinked.split('\n') {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let marker = trimmed
+            .find([' ', '\t'])
+            .filter(|&at| {
+                let mark = &trimmed[..at];
+                (1..=6).contains(&mark.len()) && mark.chars().all(|c| c == '#')
+                    || matches!(mark, "-" | "*" | "+")
+                    || mark.len() > 1
+                        && mark.ends_with('.')
+                        && mark[..mark.len() - 1].chars().all(|c| c.is_ascii_digit())
+            })
+            .map(|at| trimmed[at..].trim_start_matches([' ', '\t']));
+        lines.push(marker.unwrap_or(line));
+    }
+    let joined = lines
+        .join("\n")
+        .replace("**", "")
+        .replace("~~", "")
+        .replace('`', "");
+    // Single `*` or `_` emphasis around words.
+    let chars: Vec<char> = joined.chars().collect();
+    let word = |c: Option<&char>| c.is_some_and(|c| c.is_alphanumeric() || *c == '_');
+    let mut plain = String::with_capacity(joined.len());
+    for (i, c) in chars.iter().enumerate() {
+        let (before, after) = (
+            i.checked_sub(1).and_then(|i| chars.get(i)),
+            chars.get(i + 1),
+        );
+        let opens = !word(before) && word(after) && after != Some(&'_');
+        let closes = word(before) && !word(after) && after != Some(&'*');
+        if matches!(c, '*' | '_') && (opens || closes) {
+            continue;
+        }
+        plain.push(*c);
+    }
+    let text = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    if heading.is_some() {
+        return text;
+    }
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for (i, &(at, c)) in chars.iter().enumerate() {
+        if !matches!(c, '.' | '?' | '!') {
+            continue;
+        }
+        let mut end = at + c.len_utf8();
+        let mut next = chars.get(i + 1).map(|&(_, c)| c);
+        if let Some(close) = next.filter(|c| matches!(c, '"' | '\'' | '”' | '’' | ')')) {
+            end += close.len_utf8();
+            next = chars.get(i + 2).map(|&(_, c)| c);
+        }
+        if next.is_some_and(char::is_whitespace) {
+            return text[..end].to_owned();
+        }
+    }
+    text
+}
+
+/// The sweep's window (`--live-activity-focus-width`, 4.5 rem) and period.
+const SHIMMER_WINDOW: f32 = 72.0;
+const SHIMMER_PERIOD: f64 = 2.2;
+
+/// Ported from KSG Code's `ActivityShimmerOverlay` and `.live-activity-focus`: a copy of the
+/// row in the foreground colour shows through a 72 pt window with soft edges that sweeps the
+/// row every 2.2 s. The window slides one way and the copy inside it the other, so the copy
+/// stays over the row. The renderer runs both slides on its own clock, so the sweep costs no
+/// view runs or wakes, and it leaves with the live row: a settled window draws nothing.
+fn shimmer(base: El, highlight: El, width: f32) -> El {
+    let travel = width + SHIMMER_WINDOW;
+    let sweep = |to: f32| {
+        rune::LoopSpec::slide(SHIMMER_PERIOD, [0.0, 0.0], [to, 0.0]).easing(rune::Easing::LINEAR)
+    };
+    el().w_full().min_w(0.0).child(base).child(
+        el().absolute(-SHIMMER_WINDOW, 0.0)
+            .w(SHIMMER_WINDOW)
+            .h_full()
+            .clip_fade(SHIMMER_WINDOW / 2.0, 0.0, SHIMMER_WINDOW / 2.0, 0.0)
+            .looping(sweep(travel))
+            .inert()
+            .a11y_hidden()
+            .child(
+                el().absolute(SHIMMER_WINDOW, 0.0)
+                    .w(width)
+                    .looping(sweep(-travel))
+                    .child(highlight),
+            ),
+    )
+}
+
+/// Whether live rows sweep: the turn runs, nothing waits on the user, and motion is allowed.
+fn shimmer_allowed(s: &State, t: &Thread) -> bool {
+    t.request.is_none() && !s.portraits.reduced_motion()
+}
+
+/// The width a live row lays out at, for the shimmer's copy: the lane, less the work indent.
+fn live_row_width(s: &State) -> f32 {
+    (s.html_lane_width as f32 - WORK_INDENT).max(0.0)
+}
+
+/// KSG Code's `LiveActivityContent`: a 24 pt icon slot and one truncating label.
+fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) -> El {
+    let mut words = label(text, ACTIVITY, ink).truncate().shrink().min_w(0.0);
+    if let Some(key) = key {
+        words = words.key(key);
+    }
+    row()
+        .min_h(26.0)
+        .center_y()
+        .gap(5.0)
+        .min_w(0.0)
+        .child(el().size(24.0, 24.0).center().child(tool_icon(glyph, ink)))
+        .child(words)
+}
+
+/// KSG Code's `LiveActivityRow`: the muted row, swept by the shimmer while it is the turn's
+/// current activity.
+fn live_activity(
+    s: &State,
+    p: Palette,
+    glyph: &str,
+    text: &str,
+    animated: bool,
+    key: Option<String>,
+) -> El {
+    let base = activity_content(glyph, text, p.muted, key);
+    if !animated {
+        return base;
+    }
+    shimmer(
+        base,
+        activity_content(glyph, text, p.ink, None),
+        live_row_width(s),
+    )
+}
+
+/// Ported from KSG Code's `ThinkingTimelineRow`: "Thinking" with the brain icon at the bottom
+/// of a running turn, while no step of its tail is in progress.
+fn live_status_row(s: &State, t: &Thread, start: usize, p: Palette) -> El {
+    row()
+        .key(format!("live-status-{}", t.id))
+        .role("status")
+        .w_full()
+        .min_w(0.0)
+        .child(live_activity(
+            s,
+            p,
+            "brain",
+            &live_status(t, start),
+            shimmer_allowed(s, t),
+            Some(format!("live-status-text-{}", t.id)),
+        ))
+}
+
+/// KSG Code's `LiveWorkToggle`: a live row that is its work group's disclosure.
+fn live_toggle(key: String, a11y: String, p: Palette) -> El {
+    col()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(a11y)
+        .focusable(true)
+        .w_full()
+        .min_w(0.0)
+        .px(6.0)
+        .ml(-6.0)
+        .radius(6.0)
+        .hover(p.selected)
+}
+
+/// Ported from KSG Code's `LiveWorkEntryTimelineRow`: a running turn's tail as one row. The
+/// newest thought's first line sits above the step in progress, which replaces itself as
+/// each call starts and ends; the whole row unfolds the tail's steps. When the last call
+/// failed, the "Thinking" row stands in for it and does the unfolding, as KSG's does.
+fn live_work(s: &State, p: Palette, parts: &[TranscriptPart], tail: LiveTail, start: usize) -> El {
+    let t = s.current();
+    let TranscriptPart::Work(entries) = &parts[tail.part] else {
+        return el();
+    };
+    let open = group_open(t, entries);
+    let first_tool = entry_tools(entries)
+        .next()
+        .map(|index| t.tools[index].id.clone());
+    let first_thought = entry_thoughts(entries).first().map(|&index| {
+        let thought = &t.thoughts[index];
+        (thought.anchor.message, thought.block, thought.anchor.offset)
+    });
+    let toggle = move |key: String| {
+        move |s: &mut State, tx: &mut rune::Tx| {
+            tx.keep_on_screen(key.clone());
+            toggle_group(s.current_mut(), first_tool.as_deref(), first_thought);
+        }
+    };
+    let verb = if open { "Hide" } else { "Show" };
+    if tail.failed {
+        let key = format!("live-status-{}", t.id);
+        return live_toggle(key.clone(), format!("{verb} steps. A tool call failed"), p)
+            .child(live_activity(
+                s,
+                p,
+                "brain",
+                &live_status(t, start),
+                shimmer_allowed(s, t),
+                Some(format!("live-status-text-{}", t.id)),
+            ))
+            .on_press_tx(toggle(key));
+    }
+    let thought_line = tail
+        .thought
+        .filter(|_| !open)
+        .map(|index| live_thought_line(&t.thoughts[index].text))
+        .filter(|line| !line.is_empty());
+    let entry = tail.running.unwrap_or(tail.latest);
+    let (glyph, text) = match entry {
+        WorkEntry::Thought(index) => (
+            "brain",
+            if open || thought_line.is_some() {
+                if tail.active { "Thinking" } else { "Thought" }.to_owned()
+            } else {
+                t.thoughts[index]
+                    .text
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            },
+        ),
+        WorkEntry::Tool(index) => {
+            let tool = &t.tools[index];
+            let verb = tool_verb_in(tool, tool.failed || !tail.active && tool.done);
+            (
+                work_ui::kind_icon(tool.resolved_kind()),
+                if tool.detail.is_empty() {
+                    verb
+                } else {
+                    format!("{verb} {}", tool.detail)
+                },
+            )
+        }
+    };
+    let key = format!("live-work-{}", t.id);
+    let mut live_row = live_toggle(key.clone(), format!("{verb} steps. {text}"), p);
+    if let Some(line) = thought_line {
+        live_row = live_row.child(
+            row()
+                .key(format!("live-thought-{}", t.id))
+                .gap(5.0)
+                .min_w(0.0)
+                .child(
+                    el().size(24.0, 24.0)
+                        .center()
+                        .child(tool_icon("brain", p.muted)),
+                )
+                .child(
+                    label(line, ACTIVITY.lh(20.0), p.muted)
+                        .wrap()
+                        .max_lines(4)
+                        .pt(2.0)
+                        .grow(1.0)
+                        .shrink()
+                        .min_w(0.0),
+                ),
+        );
+    }
+    let failed = matches!(entry, WorkEntry::Tool(index) if t.tools[index].failed);
+    live_row
+        .child(live_activity(
+            s,
+            p,
+            glyph,
+            &text,
+            tail.active && !failed && shimmer_allowed(s, t),
+            Some(format!("live-work-text-{}", t.id)),
+        ))
+        .on_press_tx(toggle(key))
 }
 
 /// How far a turn's tool rows and its live status words sit in from the prose lane's edge. The
@@ -10223,15 +10845,19 @@ fn segment_min_items() -> usize {
 /// side, so mounted entries follow the viewport, not the turn's length.
 const SLICE_ITEMS: usize = 4;
 
-/// One entry of a turn's work column, in display order. Expanded tool groups and
-/// thought runs contribute their heading and each row separately.
+/// One entry of a turn's work column, in display order. Unfolded work streaks and thought
+/// runs contribute their heading and each row separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkItem {
     Part(usize),
+    /// A streak's folded or unfolded header.
     GroupHead(usize),
-    GroupTool(usize, usize),
+    /// Step `k` of an unfolded streak.
+    GroupEntry(usize, usize),
     ThoughtHead(usize),
     ThoughtBody(usize, usize),
+    /// A running turn's tail (`work-live`).
+    Live(usize),
 }
 
 impl WorkItem {
@@ -10239,42 +10865,64 @@ impl WorkItem {
         match self {
             Self::Part(part)
             | Self::GroupHead(part)
-            | Self::GroupTool(part, _)
+            | Self::GroupEntry(part, _)
             | Self::ThoughtHead(part)
-            | Self::ThoughtBody(part, _) => part,
+            | Self::ThoughtBody(part, _)
+            | Self::Live(part) => part,
         }
     }
 }
 
+/// A running turn's work column ends in its live tail, which folds into one `work-live` row
+/// and unfolds below it. Before prose, and in a finished turn, a streak of two or more steps
+/// folds under its header (KSG's `work-toggle`); a lone call stays its own row.
 fn work_items(
     t: &Thread,
     parts: &[TranscriptPart],
     last_work: Option<usize>,
     preamble: Option<usize>,
-    lift_cards: bool,
+    live: bool,
 ) -> Vec<WorkItem> {
     let Some(last) = last_work else {
         return vec![];
     };
-    let captain_home = t.captain_home && !t.delegated;
+    let tail = live.then(|| live_tail(t, parts)).flatten();
     let mut items = Vec::with_capacity(last + 1);
     for (index, part) in parts[..=last].iter().enumerate() {
-        if Some(index) == preamble || lift_cards && is_lifted_card(t, part) {
+        if Some(index) == preamble || !live && is_lifted_card(t, part) {
             continue;
         }
         match part {
-            TranscriptPart::Tools(indices)
-                if indices.len() > 1
-                    && t.tools[indices[0]].group_expanded
-                    && !(captain_home
-                        && indices.iter().any(|&i| crew_ui::is_delegation(&t.tools[i]))) =>
-            {
-                items.push(WorkItem::GroupHead(index));
-                items.extend((0..indices.len()).map(|k| WorkItem::GroupTool(index, k)));
+            TranscriptPart::Work(entries) if live && index + 1 == parts.len() => {
+                // The live tail. With nothing to show yet, the Thinking row speaks for it.
+                if tail.is_none() {
+                    continue;
+                }
+                items.push(WorkItem::Live(index));
+                if group_open(t, entries) {
+                    let thinking = entry_tools(entries).next().is_none();
+                    items.extend((0..entries.len()).map(|k| {
+                        if thinking {
+                            WorkItem::ThoughtBody(index, k)
+                        } else {
+                            WorkItem::GroupEntry(index, k)
+                        }
+                    }));
+                }
             }
-            TranscriptPart::Thought(indices) if t.thoughts[indices[0]].expanded => {
-                items.push(WorkItem::ThoughtHead(index));
-                items.extend((0..indices.len()).map(|k| WorkItem::ThoughtBody(index, k)));
+            TranscriptPart::Work(entries) if entry_tools(entries).next().is_none() => {
+                if t.thoughts[entry_thoughts(entries)[0]].expanded {
+                    items.push(WorkItem::ThoughtHead(index));
+                    items.extend((0..entries.len()).map(|k| WorkItem::ThoughtBody(index, k)));
+                } else {
+                    items.push(WorkItem::Part(index));
+                }
+            }
+            TranscriptPart::Work(entries) if entries.len() > 1 => {
+                items.push(WorkItem::GroupHead(index));
+                if group_open(t, entries) {
+                    items.extend((0..entries.len()).map(|k| WorkItem::GroupEntry(index, k)));
+                }
             }
             _ => items.push(WorkItem::Part(index)),
         }
@@ -10282,38 +10930,43 @@ fn work_items(
     items
 }
 
-/// The space above a work entry, as the nested columns of an unsplit turn give it.
-fn work_item_gap(previous: WorkItem, item: WorkItem) -> f32 {
-    match (previous, item) {
-        (WorkItem::GroupTool(..), WorkItem::GroupTool(..)) => 0.0,
-        (_, WorkItem::ThoughtBody(..)) => 4.0,
-        _ => 2.0,
+/// The space above a work entry.
+fn work_item_gap(item: WorkItem) -> f32 {
+    match item {
+        WorkItem::ThoughtBody(..) => 4.0,
+        _ => WORK_GAP,
     }
 }
 
 /// The key part of an entry that does not move when entries are added after it.
 fn work_item_id(t: &Thread, parts: &[TranscriptPart], item: WorkItem) -> String {
-    let part = &parts[item.part()];
-    match (part, item) {
-        (TranscriptPart::Tools(indices), WorkItem::GroupTool(_, k)) => {
-            format!("tool-{}", t.tools[indices[k]].id)
+    let thought_id = |index: usize, k: usize| {
+        let thought = &t.thoughts[index];
+        let message = t
+            .messages
+            .get(thought.anchor.message)
+            .map_or("end", |message| message.id.as_str());
+        format!(
+            "thought-{message}-{}-{}-{k}",
+            thought.block, thought.anchor.offset
+        )
+    };
+    let entry_id = |entry: WorkEntry, k: usize| match entry {
+        WorkEntry::Tool(index) => format!("tool-{}", t.tools[index].id),
+        WorkEntry::Thought(index) => thought_id(index, k),
+    };
+    match (&parts[item.part()], item) {
+        (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => entry_id(entries[k], 0),
+        (TranscriptPart::Work(entries), WorkItem::ThoughtBody(_, k)) => entry_id(entries[k], k + 1),
+        (TranscriptPart::Work(entries), WorkItem::Live(_)) => {
+            format!("live-{}", entry_id(entries[0], 0))
         }
+        (TranscriptPart::Work(entries), _) => match entries[0] {
+            WorkEntry::Tool(index) => format!("tools-{}", t.tools[index].id),
+            WorkEntry::Thought(index) => thought_id(index, 0),
+        },
         (TranscriptPart::Tools(indices), _) => format!("tools-{}", t.tools[indices[0]].id),
-        (TranscriptPart::Thought(indices), item) => {
-            let k = match item {
-                WorkItem::ThoughtBody(_, k) => k + 1,
-                _ => 0,
-            };
-            let thought = &t.thoughts[indices[0]];
-            let message = t
-                .messages
-                .get(thought.anchor.message)
-                .map_or("end", |message| message.id.as_str());
-            format!(
-                "thought-{message}-{}-{}-{k}",
-                thought.block, thought.anchor.offset
-            )
-        }
+        (TranscriptPart::Thought(indices), _) => thought_id(indices[0], 0),
         (TranscriptPart::Text { message, from, .. }, _) => {
             format!("text-{}-{from}", t.messages[*message].id)
         }
@@ -10366,26 +11019,41 @@ fn find_occurrence_base(t: &Thread, parts: &[TranscriptPart], index: usize, quer
         .sum()
 }
 
-/// One work entry, indented as the unsplit work column indents it.
-fn work_item(s: &State, p: Palette, wide: bool, parts: &[TranscriptPart], item: WorkItem) -> El {
+/// One work entry, indented as the work column indents it.
+fn work_item(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    parts: &[TranscriptPart],
+    item: WorkItem,
+    start: usize,
+) -> El {
     let t = s.current();
     let part = &parts[item.part()];
     match (part, item) {
-        (TranscriptPart::Tools(indices), WorkItem::GroupHead(_)) => {
-            tool_group_head(s, p, indices).ml(WORK_INDENT)
+        (TranscriptPart::Work(entries), WorkItem::GroupHead(_)) => {
+            work_group_head(s, p, entries).ml(WORK_INDENT)
         }
-        (TranscriptPart::Tools(indices), WorkItem::GroupTool(_, k)) => col()
-            .ml(WORK_INDENT)
-            .pl(14.0)
-            .child(inline_tool(s, p, indices[k])),
-        (TranscriptPart::Thought(indices), WorkItem::ThoughtHead(_)) => col()
+        (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => col()
             .min_w(0.0)
             .ml(WORK_INDENT)
-            .child(work_ui::thought_head(s, p, indices)),
-        (TranscriptPart::Thought(indices), WorkItem::ThoughtBody(_, k)) => col()
+            .pl(WORK_LIST_INDENT)
+            .child(work_entry_row(s, p, entries[k])),
+        (TranscriptPart::Work(entries), WorkItem::ThoughtHead(_)) => col()
             .min_w(0.0)
             .ml(WORK_INDENT)
-            .child(work_ui::thought_body(s, p, indices[k])),
+            .child(work_ui::thought_head(s, p, &entry_thoughts(entries))),
+        (TranscriptPart::Work(entries), WorkItem::ThoughtBody(_, k)) => col()
+            .min_w(0.0)
+            .ml(WORK_INDENT)
+            .child(work_ui::thought_body(s, p, entry_thoughts(entries)[k])),
+        (TranscriptPart::Work(_), WorkItem::Live(_)) => match live_tail(t, parts) {
+            Some(tail) => col()
+                .min_w(0.0)
+                .ml(WORK_INDENT)
+                .child(live_work(s, p, parts, tail, start)),
+            None => el(),
+        },
         (part, _) => {
             let query = (s.thread_find_active() && !s.thread_find.query.text.trim().is_empty())
                 .then(|| s.thread_find.query.text.trim());
@@ -10402,6 +11070,28 @@ fn work_item(s: &State, p: Palette, wide: bool, parts: &[TranscriptPart], item: 
             }
         }
     }
+}
+
+/// A turn's work entries as one column, `gap` above each as the slices space them.
+fn work_column(
+    s: &State,
+    p: Palette,
+    wide: bool,
+    parts: &[TranscriptPart],
+    items: &[WorkItem],
+    start: usize,
+    key: String,
+) -> El {
+    let mut rows = col().key(key).min_w(0.0);
+    for (index, item) in items.iter().enumerate() {
+        let row = work_item(s, p, wide, parts, *item, start);
+        rows = rows.child(if index == 0 {
+            row
+        } else {
+            col().min_w(0.0).pt(work_item_gap(*item)).child(row)
+        });
+    }
+    rows
 }
 
 /// What a slice's entries show, so a slice rebuilds only when one of them changed.
@@ -10437,6 +11127,34 @@ fn work_slice_fingerprint(t: &Thread, parts: &[TranscriptPart], items: &[WorkIte
                     (thought.text.len(), thought.done, thought.expanded).hash(&mut hasher);
                 }
             }
+            TranscriptPart::Work(entries) => {
+                for entry in entries {
+                    match *entry {
+                        WorkEntry::Tool(i) => {
+                            let tool = &t.tools[i];
+                            (
+                                &tool.id,
+                                tool.done,
+                                tool.failed,
+                                tool.expanded,
+                                tool.raw_expanded,
+                                tool.group_expanded,
+                                tool.output.len(),
+                                tool.detail.len(),
+                                tool.changes.len(),
+                                tool.images.len(),
+                                tool.subagents.len(),
+                                tool.exit_code,
+                            )
+                                .hash(&mut hasher);
+                        }
+                        WorkEntry::Thought(i) => {
+                            let thought = &t.thoughts[i];
+                            (thought.text.len(), thought.done, thought.expanded).hash(&mut hasher);
+                        }
+                    }
+                }
+            }
             TranscriptPart::Text { message, from, to } => (
                 &t.messages[*message].id,
                 from,
@@ -10458,9 +11176,10 @@ impl WorkItem {
         match self {
             Self::Part(i) => (0u8, i, 0usize),
             Self::GroupHead(i) => (1, i, 0),
-            Self::GroupTool(i, k) => (2, i, k),
+            Self::GroupEntry(i, k) => (2, i, k),
             Self::ThoughtHead(i) => (3, i, 0),
             Self::ThoughtBody(i, k) => (4, i, k),
+            Self::Live(i) => (5, i, 0),
         }
         .hash(hasher);
     }
@@ -10482,39 +11201,22 @@ fn work_slice(
     let parts = turn_parts(t, start, end);
     let (last_work, preamble) = turn_shape(t, &parts);
     let live = end == t.messages.len() && t.status.busy();
-    let items = work_items(t, &parts, last_work, preamble, !live);
+    let items = work_items(t, &parts, last_work, preamble, live);
     let lo = lo.min(items.len());
     let hi = hi.min(items.len());
-    // Above the first slice: the work column's place in the turn. A running turn
-    // with no captain or preamble has an empty head.
-    let top = if lo > 0 {
-        work_item_gap(items[lo - 1], items[lo])
-    } else if !live {
-        4.0
-    } else if t.captain.is_some() || preamble.is_some() {
-        12.0
+    // Above the first slice: the head's bar, 12 pt up in the turn's column.
+    let top = if lo > 0 && lo < items.len() {
+        work_item_gap(items[lo])
     } else {
-        0.0
+        12.0
     };
     let key = format!("work-rows-{}-{lo}", message_key(t, start));
     let build = || {
         #[cfg(test)]
         timeline_count(|counts| counts.built_slices += 1);
-        let mut rows = col().key(key.clone()).mt(top - LANE_GAP);
-        for index in lo..hi {
-            let gap = if index == lo {
-                0.0
-            } else {
-                work_item_gap(items[index - 1], items[index])
-            };
-            let item = work_item(s, p, wide, &parts, items[index]);
-            rows = rows.child(if gap > 0.0 {
-                col().pt(gap).child(item)
-            } else {
-                item
-            });
-        }
-        col().child(rows)
+        col().child(
+            work_column(s, p, wide, &parts, &items[lo..hi], start, key.clone()).mt(top - LANE_GAP),
+        )
     };
     if t.transcript_structure == 0 || timeline_structure(t).external_turns.contains(&start) {
         return build();
@@ -10556,6 +11258,11 @@ fn work_slice(
                 hi,
                 top.to_bits(),
                 live,
+                (
+                    t.request.is_some(),
+                    s.portraits.reduced_motion(),
+                    s.html_lane_width,
+                ),
             ),
             (
                 s.dark,
@@ -10570,39 +11277,6 @@ fn work_slice(
     )
 }
 
-fn live_status_row(t: &Thread, p: Palette) -> El {
-    let seconds = t.started.map(|start| start.elapsed().as_secs());
-    row()
-        .key(format!("live-status-{}", t.id))
-        .min_h(26.0)
-        // The square sits on the prose lane's left edge and the words start one
-        // indent in, where the tool rows above do.
-        .center_y()
-        .gap(WORK_INDENT - 6.0)
-        .child(status_mark(Status::Running, p, 6.0))
-        .child(
-            row()
-                .gap(5.0)
-                .center_y()
-                .min_w(0.0)
-                .shrink()
-                .child(
-                    meta_text(live_status(t), p.muted)
-                        .key(format!("live-status-text-{}", t.id))
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0),
-                )
-                // The phase gives way before the timer, whose tabular figures and
-                // padded seconds keep each tick the same width.
-                .child(match seconds {
-                    Some(seconds) => label(timer_label(seconds), TIMER, p.sea)
-                        .key(format!("live-timer-{}", t.id)),
-                    None => el(),
-                }),
-        )
-}
-
 fn build_assistant_turn(
     s: &State,
     p: Palette,
@@ -10615,7 +11289,6 @@ fn build_assistant_turn(
     timeline_count(|counts| counts.built_turns += 1);
     let t = s.current();
     let parts = turn_parts(t, start, end);
-    let html_card = |part: &TranscriptPart| is_html_card(t, part);
     let card = |part: &TranscriptPart| is_lifted_card(t, part);
     let (last_work, preamble) = turn_shape(t, &parts);
     let live = end == t.messages.len() && t.status.busy();
@@ -10676,53 +11349,13 @@ fn build_assistant_turn(
         let mut base = part_occs[part_index];
         transcript_part(s, p, wide, &parts[part_index], &mut base)
     };
-    if !head {
-    } else if let Some(index) = preamble {
-        response = response.child(render_part(index));
-    } else if live && last_work.is_none() {
-        // Until Pi emits work, streamed text is the preamble.
-        for index in 0..parts.len() {
-            response = response.child(render_part(index));
+    let items = work_items(t, &parts, last_work, preamble, live);
+    let work_key = format!("work-rows-{}", message_key(t, start));
+    if live {
+        // KSG's `WorkingTimelineRow`: the turn's bar at its top while it runs.
+        if head {
+            response = response.child(working_bar(t, s.dark, p));
         }
-    }
-    let work_rows = |mut rows: El, lift_cards: bool| {
-        if let Some(last) = last_work {
-            for (index, part) in parts[..=last].iter().enumerate() {
-                if Some(index) != preamble && !(lift_cards && card(part)) {
-                    let row = render_part(index);
-                    // Prose between tool rows keeps its paragraph rhythm and the lane's one
-                    // left margin. Tool rows are indented as a group by the same amount while
-                    // the turn runs and after it ends, so nothing jumps when it finishes.
-                    rows = rows.child(if matches!(part, TranscriptPart::Text { .. }) {
-                        row.py(6.0)
-                    } else if html_card(part) {
-                        row
-                    } else {
-                        row.ml(WORK_INDENT)
-                    });
-                }
-            }
-        }
-        rows
-    };
-    if live && !whole {
-        // A split running turn: the slices hold its steps and the tail its status line,
-        // two points below the last step, as the unsplit work column spaces them.
-        if tail {
-            response = response.child(live_status_row(t, p));
-            tail_children += 1;
-        }
-    } else if live {
-        // While Pi works, its steps show as they happen, and one status line says what it
-        // is doing now. The turn folds into "Worked for" when it ends.
-        let rows = work_rows(
-            col()
-                .key(format!("work-rows-{}", message_key(t, start)))
-                .gap(2.0),
-            false,
-        )
-        .child(live_status_row(t, p));
-        response = response.child(rows);
     } else if last_work.is_some() || work.is_some_and(|work| work.stopped) {
         let expanded = work.is_some_and(|work| work.expanded);
         let (work_failed, loading) = structure
@@ -10746,65 +11379,68 @@ fn build_assistant_turn(
         let toggle_key = format!("toggle-work-{}-{start}", t.id);
         let press_key = toggle_key.clone();
         let turn_msg_id = t.messages.get(start).map(|m| m.id.clone());
+        // The running turn's bar, now its fold: KSG's `WorkFoldToggle` in the same place.
         let mut section = col()
             .key(format!("work-section-{}", message_key(t, start)))
-            .gap(4.0)
+            .w_full()
             .child(
-                work_fold_toggle(
-                    toggle_key,
-                    format!(
-                        "{} work section. {title}",
-                        if expanded { "Collapse" } else { "Expand" }
-                    ),
-                    &title,
-                    expanded,
-                    p,
-                )
-                .on_press_tx(move |s: &mut State, tx| {
-                    tx.keep_on_screen(press_key.clone());
-                    let t = s.current_mut();
-                    let current_start = match turn_msg_id.as_deref() {
-                        Some(id) => {
-                            let Some(index) = t.messages.iter().position(|m| m.id == id) else {
-                                return;
-                            };
-                            index
+                working_bar_frame(s.dark, p).child(
+                    work_fold_toggle(
+                        toggle_key,
+                        format!(
+                            "{} work section. {title}",
+                            if expanded { "Collapse" } else { "Expand" }
+                        ),
+                        &title,
+                        expanded,
+                        p,
+                    )
+                    .on_press_tx(move |s: &mut State, tx| {
+                        tx.keep_on_screen(press_key.clone());
+                        let t = s.current_mut();
+                        let current_start = match turn_msg_id.as_deref() {
+                            Some(id) => {
+                                let Some(index) = t.messages.iter().position(|m| m.id == id) else {
+                                    return;
+                                };
+                                index
+                            }
+                            None => start,
+                        };
+                        t.timeline_cache.get_mut().touch_message(current_start);
+                        let retry = t
+                            .work
+                            .iter()
+                            .any(|work| work.start == current_start && work.expanded)
+                            && t.deferred_work.iter().any(|marker| {
+                                marker["start"] == current_start && marker["error"].is_string()
+                            });
+                        if retry {
+                            s.load_deferred_work(current_start, true);
+                            return;
                         }
-                        None => start,
-                    };
-                    t.timeline_cache.get_mut().touch_message(current_start);
-                    let retry = t
-                        .work
-                        .iter()
-                        .any(|work| work.start == current_start && work.expanded)
-                        && t.deferred_work.iter().any(|marker| {
-                            marker["start"] == current_start && marker["error"].is_string()
-                        });
-                    if retry {
-                        s.load_deferred_work(current_start, true);
-                        return;
-                    }
-                    match t.work.iter_mut().find(|work| work.start == current_start) {
-                        Some(work) => work.expanded = !work.expanded,
-                        // Turns from before work records existed fold too; opening one
-                        // records it.
-                        None => t.work.push(crate::model::AssistantWork {
-                            start: current_start,
-                            stopped: false,
-                            stopped_order: 0,
-                            expanded: true,
-                            elapsed: None,
-                            outcome: None,
-                        }),
-                    }
-                    if s.current()
-                        .work
-                        .iter()
-                        .any(|work| work.start == current_start && work.expanded)
-                    {
-                        s.load_deferred_work(current_start, false);
-                    }
-                }),
+                        match t.work.iter_mut().find(|work| work.start == current_start) {
+                            Some(work) => work.expanded = !work.expanded,
+                            // Turns from before work records existed fold too; opening one
+                            // records it.
+                            None => t.work.push(crate::model::AssistantWork {
+                                start: current_start,
+                                stopped: false,
+                                stopped_order: 0,
+                                expanded: true,
+                                elapsed: None,
+                                outcome: None,
+                            }),
+                        }
+                        if s.current()
+                            .work
+                            .iter()
+                            .any(|work| work.start == current_start && work.expanded)
+                        {
+                            s.load_deferred_work(current_start, false);
+                        }
+                    }),
+                ),
             );
         if expanded {
             let restored_id = t.messages.get(start).map(|message| message.id.clone());
@@ -10819,13 +11455,17 @@ fn build_assistant_turn(
                 }
                 tx.live_only();
             });
-            // Tool rows nest under the "Worked for" line; prose stays on the lane's margin.
+        }
+        if head {
+            response = response.child(section);
+            if let Some(index) = preamble {
+                response = response.child(render_part(index));
+            }
             if work_loading {
                 let mut skeleton = col()
                     .key(format!("work-loading-{}", message_key(t, start)))
                     .role("status")
                     .label("Loading work history")
-                    .pt(12.0)
                     .pb(4.0)
                     .px(4.0)
                     .gap(8.0);
@@ -10842,18 +11482,18 @@ fn build_assistant_turn(
                             ),
                     );
                 }
-                section = section.child(skeleton);
-            } else if !work_failed && whole {
-                section = section.child(work_rows(
-                    col()
-                        .key(format!("work-rows-{}", message_key(t, start)))
-                        .gap(2.0),
-                    true,
+                response = response.child(skeleton);
+            } else if expanded && !work_failed && whole && !items.is_empty() {
+                response = response.child(work_column(
+                    s,
+                    p,
+                    wide,
+                    &parts,
+                    &items,
+                    start,
+                    work_key.clone(),
                 ));
             }
-        }
-        if head {
-            response = response.child(section);
         }
         if let Some(last) = last_work.filter(|_| tail) {
             for (index, part) in parts[..=last].iter().enumerate() {
@@ -10864,12 +11504,51 @@ fn build_assistant_turn(
             }
         }
     }
+    if live && head {
+        if let Some(index) = preamble {
+            response = response.child(render_part(index));
+        } else if last_work.is_none() {
+            // Until Pi emits work, streamed text is the preamble.
+            for index in 0..parts.len() {
+                response = response.child(render_part(index));
+            }
+        }
+    }
+    // KSG's `ThinkingTimelineRow`: while the turn runs and its tail is not the activity, the
+    // Thinking row sits at the very bottom. A failed last call puts it in the tail instead.
+    let thinking = live
+        && t.phase != "Compacting context"
+        && match live_tail(t, &parts) {
+            Some(tail) if tail.failed => false,
+            Some(tail) => !tail.active && t.request.is_none(),
+            None => t.request.is_none(),
+        };
+    let from = last_work.map_or(0, |index| index + 1);
+    let trailing = tail && last_work.is_some() && from < parts.len();
+    let mut thinking_after_text = thinking;
+    if live && whole && !items.is_empty() {
+        let mut rows = work_column(s, p, wide, &parts, &items, start, work_key.clone());
+        if thinking && !trailing {
+            rows = rows.child(col().pt(WORK_GAP).child(live_status_row(s, t, start, p)));
+            thinking_after_text = false;
+        }
+        response = response.child(rows);
+    }
     if tail && (!live || last_work.is_some()) {
-        let from = last_work.map_or(0, |index| index + 1);
         for index in from..parts.len() {
             response = response.child(render_part(index));
             tail_children += 1;
         }
+    }
+    // A split running turn's tail follows its last slice, 2 pt below it as the work column
+    // spaces its rows, or 12 pt below prose that ends the turn.
+    let mut tail_gap = 12.0;
+    if live && tail && thinking_after_text {
+        if !whole && !items.is_empty() && !trailing {
+            tail_gap = WORK_GAP;
+        }
+        response = response.child(live_status_row(s, t, start, p));
+        tail_children += 1;
     }
     if tail
         && !live
@@ -10889,9 +11568,7 @@ fn build_assistant_turn(
         tail_children += 1;
     }
     if piece == Some(TurnPiece::Tail) && tail_children > 0 {
-        // The status line sits in the work column, 2 pt below the last step; what
-        // follows a folded turn's work takes the response column's 12 pt.
-        return col().child(response.mt(if live { 2.0 } else { 12.0 } - LANE_GAP));
+        return col().child(response.mt(tail_gap - LANE_GAP));
     }
     response
 }
@@ -11051,6 +11728,9 @@ pub(crate) struct TimelineCache {
     unfinished_tools: std::collections::HashSet<usize>,
     /// Bumped when a long turn's fold opens or closes, which splits or joins its rows.
     disclosure: u64,
+    /// The turn's elapsed seconds when a request began waiting on the user, so the working
+    /// bar's "Paused at" clock stops there.
+    paused_at: Option<u64>,
 }
 
 impl TimelineCache {
@@ -11538,7 +12218,7 @@ pub(crate) fn timeline_text_row(
     } else if last_work.is_none_or(|last| target > last) {
         TurnPiece::Tail
     } else {
-        let item = work_items(t, &parts, last_work, preamble, !live)
+        let item = work_items(t, &parts, last_work, preamble, live)
             .iter()
             .position(|item| item.part() == target)?;
         return pieces.iter().find_map(|(_, _, piece, key)| match piece {
@@ -11578,11 +12258,19 @@ fn push_turn_pieces(
     let parts = turn_parts_in(t, &structure.events, start, end);
     for part in &parts {
         match part {
+            TranscriptPart::Work(entries) => {
+                // The streak's fold flag: its first call's, or for thinking alone its first
+                // thought's.
+                match entry_tools(entries).next() {
+                    Some(index) => probe.push((0, index, t.tools[index].group_expanded)),
+                    None => {
+                        let index = entry_thoughts(entries)[0];
+                        probe.push((1, index, t.thoughts[index].expanded));
+                    }
+                }
+            }
             TranscriptPart::Tools(indices) if indices.len() > 1 => {
                 probe.push((0, indices[0], t.tools[indices[0]].group_expanded));
-            }
-            TranscriptPart::Thought(indices) => {
-                probe.push((1, indices[0], t.thoughts[indices[0]].expanded));
             }
             _ => {}
         }
@@ -11591,7 +12279,7 @@ fn push_turn_pieces(
         return false;
     }
     let (last_work, preamble) = turn_shape(t, &parts);
-    let items = work_items(t, &parts, last_work, preamble, !live);
+    let items = work_items(t, &parts, last_work, preamble, live);
     if items.len() < segment_min_items() {
         return false;
     }
@@ -12164,11 +12852,20 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                         .get(*index)
                         .map(|handoff| handoff_row(s, *index, handoff, p))
                         .unwrap_or_else(el),
+                    // A running turn grows at the stack's streaming pace behind its feathered
+                    // edge. A finished one folds its work open and shut over 200 ms, as KSG
+                    // Code's `transition-[height] duration-200 ease-out` does.
                     TimelineRow::AssistantTurn { start, end, .. } => {
-                        assistant_turn(s, p, wide, *start, *end)
+                        let turn = assistant_turn(s, p, wide, *start, *end);
+                        if *end == s.current().messages.len() && s.current().status.busy() {
+                            turn.streaming(true)
+                        } else {
+                            turn.fold_glide(rune::Spring::new(0.20, 0.0))
+                                .fold_feather(14.0)
+                        }
                     }
                     TimelineRow::LiveTurn { start, .. } => {
-                        assistant_turn(s, p, wide, *start, *start)
+                        assistant_turn(s, p, wide, *start, *start).streaming(true)
                     }
                     TimelineRow::TurnPiece {
                         start, end, piece, ..
@@ -24141,11 +24838,13 @@ pub(crate) mod tests {
                 .position(|message| message.role != "Pi")
                 .map_or(t.messages.len(), |offset| work.start + offset);
             for part in turn_parts(t, work.start, end) {
-                if let TranscriptPart::Tools(indices) = part {
-                    let key = if indices.len() > 1 {
-                        format!("toggle-tool-group-{id}-{}", indices[0])
+                if let TranscriptPart::Work(entries) = part
+                    && let Some(first) = entry_tools(&entries).next()
+                {
+                    let key = if entries.len() > 1 {
+                        format!("toggle-tool-group-{id}-{first}")
                     } else {
-                        format!("inline-tool-{id}-{}", indices[0])
+                        format!("inline-tool-{id}-{first}")
                     };
                     assert!(
                         rt.presented(&key).is_some(),
@@ -25192,7 +25891,8 @@ pub(crate) mod tests {
         }
         assert!(matches!(
             &turn_parts(thread, 3, 4)[0],
-            TranscriptPart::Tools(indices) if *indices == vec![0, 1]
+            TranscriptPart::Work(entries)
+                if entries.starts_with(&[WorkEntry::Tool(0), WorkEntry::Tool(1)])
         ));
 
         let start = thread.work[0].start;
@@ -25408,8 +26108,25 @@ pub(crate) mod tests {
     fn long_turn_runtime(width: f32, parts: usize, live: bool) -> Runtime<State> {
         let mut rt = runtime(width);
         long_turn_fixture(&mut rt.state, parts, live);
+        open_work_streaks(rt.state.current_mut());
         settle(&mut rt);
         rt
+    }
+
+    /// Unfolds every work streak of the long turn, so each step is its own work entry.
+    /// Folded, a streak of hundreds of steps is one header row.
+    fn open_work_streaks(t: &mut Thread) {
+        let firsts: Vec<usize> = turn_parts(t, 1, 2)
+            .iter()
+            .filter_map(|part| match part {
+                TranscriptPart::Work(entries) => entry_tools(entries).next(),
+                _ => None,
+            })
+            .collect();
+        for index in firsts {
+            t.tools[index].group_expanded = true;
+        }
+        t.timeline_cache.get_mut().touch_message(1);
     }
 
     fn settle(rt: &mut Runtime<State>) {
@@ -25435,6 +26152,11 @@ pub(crate) mod tests {
 
     /// The key of the work slice halfway through the long turn.
     fn middle_slice(rt: &Runtime<State>) -> String {
+        slice_at(rt, 2)
+    }
+
+    /// The key of the work slice `1 / divisor` of the way through the long turn.
+    fn slice_at(rt: &Runtime<State>, divisor: usize) -> String {
         let rows = timeline_structure(rt.state.current()).rows.clone();
         let slices: Vec<_> = rows
             .iter()
@@ -25448,7 +26170,7 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        slices[slices.len() / 2].key().to_owned()
+        slices[slices.len() / divisor].key().to_owned()
     }
 
     fn center_on(rt: &mut Runtime<State>, key: &str) {
@@ -25499,18 +26221,22 @@ pub(crate) mod tests {
                     "{live} {width}: {slices} slices"
                 );
                 assert!(rows.iter().any(|row| row.key() == "turn-1-long-answer"));
-                let middle = middle_slice(&rt);
+                // A quarter in: inside the first streak of both fixtures, away from the prose
+                // that splits each turn in half.
+                let middle = slice_at(&rt, 4);
                 center_on(&mut rt, &middle);
                 assert!(rt.presented(&middle).is_some(), "{live} {width}: {middle}");
                 let short = mounted_work(&rt);
                 // Twice the work: the same viewport mounts the same number of rows.
                 let mut longer = long_turn_runtime(width, 2_000, live);
-                let middle = middle_slice(&longer);
+                let middle = slice_at(&longer, 4);
                 center_on(&mut longer, &middle);
                 let long = mounted_work(&longer);
                 assert!(short > 0 && short < 400, "{live} {width}: {short} mounted");
+                // Rune mounts two viewports either side; the longer list's estimated rows can
+                // carry up to two more slices of slack at that edge.
                 assert!(
-                    long.abs_diff(short) <= 2 * SLICE_ITEMS,
+                    long.abs_diff(short) <= 4 * SLICE_ITEMS,
                     "{live} {width}: {short} mounted for 1,000 parts, {long} for 2,000"
                 );
                 // Every slice of a completed turn rebuilt only the mounted ones.
@@ -25784,7 +26510,9 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(covered, (0..items.len()).collect::<Vec<_>>());
-        assert_eq!(items.len(), 1_000 + 1);
+        // Two streaks of 500 steps and 10 paired calls each, their headers, and the prose
+        // between them.
+        assert_eq!(items.len(), 1_000 + 1_000 / 50 + 3);
         // Search and copy read the thread, not the mounted rows.
         let text = &t.messages[1].text;
         assert!(text.contains("Halfway marker") && text.contains("Every package passed"));
@@ -26007,10 +26735,12 @@ pub(crate) mod tests {
         s.populate_demo();
         let t = s.current();
         assert!(
-            matches!(&turn_parts(t, 2, 3)[0], TranscriptPart::Tools(indices) if *indices == vec![0, 1])
+            matches!(&turn_parts(t, 2, 3)[0], TranscriptPart::Work(entries)
+            if entries.starts_with(&[WorkEntry::Tool(0), WorkEntry::Tool(1)]))
         );
         assert!(
-            matches!(&turn_parts(t, 3, 4)[0], TranscriptPart::Tools(indices) if *indices == vec![2, 3])
+            matches!(&turn_parts(t, 3, 4)[0], TranscriptPart::Work(entries)
+            if entries.starts_with(&[WorkEntry::Tool(2), WorkEntry::Tool(3)]))
         );
         assert_eq!(
             tool_summary(&t.tools[..2].iter().collect::<Vec<_>>()),
@@ -26032,7 +26762,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn thinking_between_tools_at_the_same_offset_separates_the_groups() {
+    fn thinking_between_tools_joins_their_work_streak() {
         let mut thread = Thread::new(1);
         thread.apply(
             json!({"type":"response","id":"history","command":"get_messages","success":true,
@@ -26047,9 +26777,11 @@ pub(crate) mod tests {
         assert_eq!(
             turn_parts(&thread, 0, 1),
             vec![
-                TranscriptPart::Tools(vec![0]),
-                TranscriptPart::Thought(vec![0]),
-                TranscriptPart::Tools(vec![1]),
+                TranscriptPart::Work(vec![
+                    WorkEntry::Tool(0),
+                    WorkEntry::Thought(0),
+                    WorkEntry::Tool(1)
+                ]),
                 TranscriptPart::Text {
                     message: 0,
                     from: 0,
@@ -26091,8 +26823,15 @@ pub(crate) mod tests {
         rt.state.populate_demo();
         rt.frame(0.0);
         let y = |rt: &Runtime<State>, key: &str| rt.presented(key).unwrap().0[1];
-        assert!(y(&rt, &assistant_body_key(rt.state.current(), 1, 0)) < y(&rt, "toggle-work-1-1"));
-        assert!(y(&rt, "toggle-work-1-1") < y(&rt, "toggle-tool-group-1-0"));
+        // The "Worked for" bar heads the turn, where its "Working for" bar ran.
+        assert!(y(&rt, "toggle-work-1-1") < y(&rt, &assistant_body_key(rt.state.current(), 1, 0)));
+        assert!(
+            y(&rt, &assistant_body_key(rt.state.current(), 1, 0)) < y(&rt, "toggle-tool-group-1-0")
+        );
+        if rt.presented("inline-thought-1-0").is_none() {
+            press(&mut rt, "toggle-tool-group-1-0");
+            rt.frame(1.0);
+        }
         assert!(y(&rt, "toggle-tool-group-1-0") < y(&rt, "inline-thought-1-0"));
         assert!(
             y(&rt, "inline-thought-1-0") < y(&rt, &assistant_body_key(rt.state.current(), 3, 0))
@@ -26156,6 +26895,8 @@ pub(crate) mod tests {
             .presented(&assistant_body_key(rt.state.current(), 0, 0))
             .unwrap()
             .0[1];
+        // The working bar heads the turn and Thinking waits under the streamed text.
+        assert!(rt.presented("working-bar-1").unwrap().0[1] < text_y);
         assert!(text_y < rt.presented("live-status-1").unwrap().0[1]);
         assert!(
             rt.presented("toggle-work-1-0").is_none(),
@@ -26178,13 +26919,16 @@ pub(crate) mod tests {
                 .0[1],
             text_y
         );
-        let tool_y = rt.presented("inline-tool-1-0").unwrap().0[1];
-        assert!(tool_y < rt.presented("live-status-1").unwrap().0[1]);
+        // The running call is the turn's one live row, under the text.
+        let live_y = rt.presented("live-work-1").unwrap().0[1];
+        assert!(text_y < live_y);
+        assert!(rt.presented("inline-tool-1-0").is_none());
+        assert!(rt.presented("live-status-1").is_none());
     }
 
     #[test]
     fn tool_rows_keep_one_indent_while_the_turn_runs_and_after_it_ends() {
-        for width in [620.0, 1280.0] {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.current_mut().apply(json!({"type":"agent_start"}));
             rt.state
@@ -26202,14 +26946,16 @@ pub(crate) mod tests {
                 .presented(&assistant_body_key(rt.state.current(), 0, 0))
                 .unwrap()
                 .0;
-            let live_tool = rt.presented("inline-tool-1-0").unwrap().0;
-            let (status, _) = rt.presented("live-status-1").unwrap();
+            let bar = rt.presented("working-bar-1").unwrap().0;
+            let live_tool = rt.presented("live-work-1").unwrap().0;
+            let lane = rt.presented("chat-lane").unwrap().0;
             assert_eq!(
-                status[0], prose[0],
-                "{width}: the status square is on the prose edge"
+                bar[0], prose[0],
+                "{width}: the bar starts on the prose edge"
             );
+            assert_eq!(bar[3], 32.0, "{width}: a 32 pt bar");
             assert!(
-                live_tool[0] > prose[0],
+                live_tool[0] > prose[0] && live_tool[0] + live_tool[2] <= lane[0] + lane[2] + 0.5,
                 "{width}: {live_tool:?} against {prose:?}"
             );
             rt.state
@@ -26221,6 +26967,20 @@ pub(crate) mod tests {
             rt.frame(2.0);
             let done_tool = rt.presented("inline-tool-1-0").unwrap().0;
             assert_eq!(done_tool[0], live_tool[0], "{width}: the indent jumped");
+            // The running bar became the fold, in the same place and size.
+            let fold = rt
+                .presented(&format!(
+                    "work-section-{}",
+                    message_key(rt.state.current(), 0)
+                ))
+                .unwrap()
+                .0;
+            assert_eq!(
+                (fold[0], fold[1], fold[2]),
+                (bar[0], bar[1], bar[2]),
+                "{width}"
+            );
+            assert!(rt.presented("working-bar-1").is_none());
         }
     }
 
@@ -26233,15 +26993,30 @@ pub(crate) mod tests {
             .apply(json!({"type":"message_update","assistantMessageEvent":{
                 "type":"thinking_start","contentIndex":0
             }}));
+        rt.frame(0.0);
+        // No thinking text yet: the Thinking row speaks for the turn.
+        assert!(rt.presented("live-work-1").is_none());
+        assert!(rt.presented("live-status-1").is_some());
         rt.state
             .current_mut()
             .apply(json!({"type":"message_update","assistantMessageEvent":{
-                "type":"thinking_delta","contentIndex":0,"delta":"Checking the file."
+                "type":"thinking_delta","contentIndex":0,"delta":"Checking the file. Then the tests."
             }}));
-        rt.frame(0.0);
-        let (thought, _) = rt.presented("inline-thought-1-0").unwrap();
-        let (status, _) = rt.presented("live-status-1").unwrap();
+        rt.invalidate();
+        rt.frame(1.0);
+        // KSG's `work-live`: the thought's first sentence above "Thinking", in one row.
+        let (thought, _) = rt.presented("live-thought-1").unwrap();
+        let (status, _) = rt.presented("live-work-text-1").unwrap();
         assert!(thought[1] < status[1]);
+        let texts: Vec<_> = rt
+            .elements()
+            .iter()
+            .filter_map(|e| e.text.clone())
+            .collect();
+        assert!(texts.iter().any(|text| text == "Checking the file."));
+        assert!(texts.iter().any(|text| text == "Thinking"));
+        assert!(rt.presented("live-status-1").is_none());
+        assert!(rt.presented("inline-thought-1-0").is_none());
         rt.state
             .current_mut()
             .apply(json!({"type":"agent_settled"}));
@@ -26249,10 +27024,246 @@ pub(crate) mod tests {
         rt.frame(1.0);
         rt.frame(2.0);
         assert!(rt.presented("live-status-1").is_none());
+        assert!(rt.presented("live-work-1").is_none());
         assert!(rt.presented("toggle-work-1-0").is_some());
         assert!(!rt.state.current().work[0].expanded);
         assert!(rt.presented("inline-thought-1-0").is_none());
     }
+
+    /// A running turn shaped as KSG Code's timeline tests shape theirs: a streak of thoughts and
+    /// calls, interim prose, then a live streak whose last call is running.
+    fn streak_runtime(width: f32) -> Runtime<State> {
+        let mut rt = runtime(width);
+        let t = rt.state.current_mut();
+        t.apply(
+            json!({"type":"response","id":"history","command":"get_messages","success":true,
+            "data":{"messages":[{"role":"assistant","content":[
+                {"type":"thinking","thinking":"Plan the audit."},
+                {"type":"toolCall","id":"a","name":"read","arguments":{"path":"a.rs"}},
+                {"type":"thinking","thinking":"Now the second file."},
+                {"type":"toolCall","id":"b","name":"read","arguments":{"path":"b.rs"}},
+                {"type":"text","text":"Both files parse."},
+                {"type":"thinking","thinking":"**Checking the tests**\n\nThe suite lives in tests/."},
+                {"type":"toolCall","id":"c","name":"read","arguments":{"path":"c.rs"}},
+                {"type":"toolCall","id":"d","name":"read","arguments":{"path":"d.rs"}}
+            ]}]}}),
+        );
+        for tool in &mut t.tools {
+            tool.done = true;
+            tool.failed = false;
+        }
+        for (tool, detail) in t.tools.iter_mut().zip(["a.rs", "b.rs", "c.rs", "d.rs"]) {
+            tool.detail = detail.into();
+        }
+        t.tools[3].done = false;
+        t.status = Status::Running;
+        t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+        t.work.clear();
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        rt
+    }
+
+    fn texts(rt: &Runtime<State>) -> Vec<String> {
+        rt.elements()
+            .iter()
+            .filter_map(|e| e.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn thought_and_tool_streaks_fold_before_prose_and_into_one_live_row() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = streak_runtime(width);
+            let t = rt.state.current();
+            let parts = turn_parts(t, 0, 1);
+            use WorkEntry::{Thought, Tool};
+            assert_eq!(
+                parts[0],
+                TranscriptPart::Work(vec![Thought(0), Tool(0), Thought(1), Tool(1)])
+            );
+            assert!(matches!(parts[1], TranscriptPart::Text { .. }));
+            assert_eq!(
+                parts[2],
+                TranscriptPart::Work(vec![Thought(2), Tool(2), Tool(3)])
+            );
+            let lane = rt.presented("chat-lane").unwrap().0;
+            let inside = |rect: [f32; 4]| {
+                rect[0] >= lane[0] - 0.5 && rect[0] + rect[2] <= lane[0] + lane[2] + 0.5
+            };
+            // "Working for 12s" heads the turn.
+            assert!(texts(&rt).iter().any(|text| text == "Working for "));
+            assert!(texts(&rt).iter().any(|text| text == "12s"));
+            // The streak before the prose is one folded header, even while the turn runs.
+            let group = rt.presented("toggle-tool-group-1-0").unwrap().0;
+            assert!(inside(group), "{width}: {group:?}");
+            assert!(texts(&rt).iter().any(|text| text == "Read 2 files"));
+            for key in ["inline-tool-1-0", "inline-tool-1-1", "inline-thought-1-0"] {
+                assert!(rt.presented(key).is_none(), "{width}: {key}");
+            }
+            // The live streak is one row: its thought's heading over the running call.
+            let live = rt.presented("live-work-1").unwrap().0;
+            assert!(inside(live), "{width}: {live:?}");
+            assert!(group[1] < live[1]);
+            let thought = rt.presented("live-thought-1").unwrap().0;
+            let step = rt.presented("live-work-text-1").unwrap().0;
+            assert!(thought[1] < step[1]);
+            assert!(texts(&rt).iter().any(|text| text == "Checking the tests"));
+            assert!(texts(&rt).iter().any(|text| text == "Reading d.rs"));
+            for key in ["inline-tool-1-2", "inline-tool-1-3", "live-status-1"] {
+                assert!(rt.presented(key).is_none(), "{width}: {key}");
+            }
+
+            // The live row unfolds its steps under itself, and folds them again.
+            press(&mut rt, "live-work-1");
+            rt.frame(1.0);
+            for key in ["inline-thought-1-2", "inline-tool-1-2", "inline-tool-1-3"] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(rect[1] > live[1] && inside(rect), "{width}: {key} {rect:?}");
+            }
+            assert!(rt.presented("live-thought-1").is_none());
+            press(&mut rt, "live-work-1");
+            rt.frame(1.0);
+            assert!(rt.presented("inline-tool-1-3").is_none());
+
+            // The newest call finishes: the row keeps standing for the turn, in the present
+            // tense, as KSG's does until the next step starts.
+            rt.state.current_mut().tools[3].done = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(texts(&rt).iter().any(|text| text == "Reading d.rs"));
+            assert!(rt.presented("live-status-1").is_none());
+
+            // It failed instead: the Thinking row stands in, at the bottom, and unfolds the tail.
+            rt.state.current_mut().tools[3].failed = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            assert!(rt.presented("live-work-1").is_none());
+            let thinking = rt.presented("live-status-1").unwrap().0;
+            assert!(thinking[1] > group[1] && inside(thinking));
+            press(&mut rt, "live-status-1");
+            rt.frame(1.0);
+            assert!(rt.presented("inline-tool-1-3").unwrap().0[1] > thinking[1]);
+            press(&mut rt, "live-status-1");
+            rt.frame(1.0);
+
+            // Interim prose after the streak: Thinking waits under it, at the very bottom.
+            let t = rt.state.current_mut();
+            t.tools[3].failed = false;
+            t.messages[0].text.push_str(" Next, the fixtures.");
+            rt.invalidate();
+            rt.frame(1.0);
+            let offset = rt.state.current().tools[3].anchor.offset;
+            let answer = rt
+                .presented(&assistant_body_key(rt.state.current(), 0, offset))
+                .unwrap_or_else(|| panic!("{width}: the interim prose"))
+                .0;
+            let thinking = rt.presented("live-status-1").unwrap().0;
+            assert!(answer[1] < thinking[1], "{width}");
+            // The tail is now a finished streak before prose: folded like the first.
+            assert!(rt.presented("live-work-1").is_none());
+            assert!(rt.presented("toggle-tool-group-1-2").is_some());
+
+            // The turn ends: the bar becomes "Worked for", and the live rows leave.
+            rt.state
+                .current_mut()
+                .apply(json!({"type":"agent_settled"}));
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.frame(2.0);
+            assert!(rt.presented("working-bar-1").is_none());
+            assert!(rt.presented("live-status-1").is_none());
+            assert!(texts(&rt).iter().any(|text| text.starts_with("Worked")));
+            press(&mut rt, "toggle-work-1-0");
+            rt.frame(3.0);
+            press(&mut rt, "toggle-tool-group-1-0");
+            rt.frame(4.0);
+            for key in [
+                "inline-thought-1-0",
+                "inline-tool-1-0",
+                "inline-thought-1-1",
+                "inline-tool-1-1",
+            ] {
+                let rect = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"))
+                    .0;
+                assert!(inside(rect), "{width}: {key}");
+            }
+            // The steps sit 16 pt in from the header, as KSG's `WorkLogList` (`ps-4`).
+            assert_eq!(
+                rt.presented("inline-tool-1-0").unwrap().0[0],
+                rt.presented("toggle-tool-group-1-0").unwrap().0[0] + WORK_LIST_INDENT,
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_working_bar_words_stopping_pauses_and_compaction() {
+        let mut rt = streak_runtime(1280.0);
+        rt.state.current_mut().request = Some(json!({"id":"q","method":"confirm"}));
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(texts(&rt).iter().any(|text| text == "Paused at "));
+        rt.state.current_mut().started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(40));
+        rt.invalidate();
+        rt.frame(2.0);
+        // The clock stopped when the request arrived.
+        assert!(texts(&rt).iter().any(|text| text == "12s"));
+        rt.state.current_mut().request = None;
+        rt.state.current_mut().phase = "Compacting context".into();
+        rt.invalidate();
+        rt.frame(3.0);
+        assert!(texts(&rt).iter().any(|text| text == "Compacting for "));
+        rt.state.current_mut().phase = "Stopping".into();
+        rt.invalidate();
+        rt.frame(4.0);
+        assert!(texts(&rt).iter().any(|text| text == "Stopping…"));
+    }
+
+    #[test]
+    fn live_rows_sweep_while_running_and_a_settled_turn_draws_nothing() {
+        let mut rt = streak_runtime(1280.0);
+        // The shimmer runs on the renderer's clock: a live row keeps frames coming.
+        assert!((0..10).all(|_| rt.frame(1.0 / 60.0)));
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"agent_settled"}));
+        rt.invalidate();
+        let mut rested = false;
+        for _ in 0..240 {
+            if !rt.frame(1.0 / 60.0) {
+                rested = true;
+                break;
+            }
+        }
+        assert!(rested, "a settled turn keeps drawing");
+    }
+
+    #[test]
+    fn live_thought_lines_take_the_heading_or_the_first_sentence() {
+        assert_eq!(
+            live_thought_line("**Checking the tests**\n\nThe suite lives in tests/."),
+            "Checking the tests"
+        );
+        assert_eq!(
+            live_thought_line("I'll read `main.rs` first. Then [the docs](https://x.y)."),
+            "I'll read main.rs first."
+        );
+        assert_eq!(
+            live_thought_line("- Look at *this* and **that**\n- then go"),
+            "Look at this and that then go"
+        );
+        assert_eq!(live_thought_line("No end in sight"), "No end in sight");
+        assert_eq!(live_thought_line("Done (really.) Next"), "Done (really.)");
+    }
+
     #[test]
     fn captain_assignment_has_one_control_and_no_per_project_placeholders() {
         let mut rt = runtime(1280.0);
