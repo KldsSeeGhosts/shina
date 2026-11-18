@@ -556,10 +556,25 @@ fn running_demo(state: &mut State) {
     thread.elapsed = None;
     thread.phase = "Running powershell".into();
     thread.messages.truncate(3);
+    let tail_offset = thread.messages[2].text.len();
     for tool in &mut thread.tools[2..] {
         tool.anchor.message = 2;
-        tool.anchor.offset = thread.messages[2].text.len();
+        tool.anchor.offset = tail_offset;
+        tool.group_expanded = false;
     }
+    thread.thoughts.push(model::Thought {
+        order: 0,
+        anchor: model::ToolAnchor {
+            message: 2,
+            offset: tail_offset,
+        },
+        block: 0,
+        text: "Verify the reconnect test suite passes with the listener registered ahead of socket.open().".into(),
+        expanded: false,
+        done: true,
+        started: None,
+        duration_ms: Some(4000),
+    });
     let tool = &mut thread.tools[3];
     tool.done = false;
     tool.duration_ms = None;

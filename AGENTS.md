@@ -41,7 +41,7 @@ Already ported:
 | `measure`, `lane_gutter`, `conversation`, `composer` lane | `index.css` (`.chat-content-lane`, `.chat-composer-lane`), `chat/MessagesTimeline.tsx`, `chat/TimelineUserMessageRow.tsx` |
 | `composer_shell`, `composer-prompt-body`, `composer_ui::controls` strip, `effort_trigger` | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx`, `chat/ComposerControlsBar.tsx`, `chat/ComposerModelEffort.tsx`, `index.css` (`.composer-prompt-body`) |
 | `assistant_message_meta` | `chat/TimelineAssistantRows.tsx` (`AssistantMessageMeta`) |
-| `work_fold_toggle` | `chat/TimelineWorkGroupRows.tsx` (`WorkFoldToggle`) |
+| `working_bar_frame`, `work_fold_toggle`, `group_work`, `work_live_row`, `activity_shimmer` | `chat/MessagesTimeline.logic.ts` (`deriveTimelineRows`, `activeWorkRow`), `chat/TimelineWorkGroupRows.tsx` (`WorkingTimelineRow`, `LiveWorkEntryTimelineRow`, `ThinkingTimelineRow`), `chat/TimelineRowParts.tsx` (`WORKING_BAR_CLASS_NAME`, `WorkFoldToggle`, `ActivityShimmerOverlay`) |
 | `markdown_ui` style and `code_frame` | `ChatMarkdown.tsx`, `index.css` (`.chat-markdown`), `chat/MarkdownCodeBlock.tsx` |
 | `captain_editor` portrait grid | `settings/ProjectIconPickerDialog.tsx` (emoji grid) |
 | `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
