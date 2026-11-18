@@ -638,6 +638,53 @@ fn html_demo(state: &mut State) {
 }
 
 /// An offline, read-only fleet fixture for native navigation and sidebar checks.
+/// A dark demo on Claude Opus with a few Claude models, for the model picker and reasoning
+/// menu scenes.
+fn claude_picker_demo(state: &mut State) {
+    state.populate_demo();
+    state.dark = true;
+    let model = |id: &str, name: &str| {
+        let capabilities = descriptors::claude_manifest_model_entry(id)
+            .map(|entry| entry.capabilities)
+            .unwrap_or_default();
+        session::AgentModel {
+            provider: "claude".into(),
+            id: id.into(),
+            name: name.into(),
+            thinking_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            capabilities,
+            ..Default::default()
+        }
+    };
+    state.claude_catalog.models = vec![
+        model("claude-opus-5-5", "Claude Opus 5.5"),
+        model("claude-fable-5-2", "Claude Fable 5.2"),
+        model("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+        model("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ];
+    state.claude_catalog.installed = true;
+    // A fresh thread, so the pick is not a context handoff.
+    state.new_thread();
+    state.choose_harness("claude");
+    let t = state.current_mut();
+    t.set_model("claude".into(), "claude-opus-5-5".into());
+    t.thinking_levels = vec![
+        "low".into(),
+        "medium".into(),
+        "high".into(),
+        "xhigh".into(),
+        "max".into(),
+    ];
+    t.thinking = "high".into();
+    state.model_picker_tab = Some(model_picker::ModelPickerTab::Instance("claude".into()));
+}
+
 fn fleet_demo(state: &mut State) {
     state.populate_demo();
     let mut projections = Vec::new();
@@ -1515,6 +1562,14 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
             ("picker", |state| {
                 state.populate_demo();
                 state.captain_picker = true;
+            }),
+            ("model-picker", |state| {
+                claude_picker_demo(state);
+                state.settings_picker = Some(model::SettingsPicker::Model);
+            }),
+            ("reasoning-picker", |state| {
+                claude_picker_demo(state);
+                state.settings_picker = Some(model::SettingsPicker::Thinking);
             }),
             ("harness-picker", |state| {
                 state.populate_demo();

@@ -1520,7 +1520,7 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
         if !locked {
             trigger = trigger.on_press(|s: &mut State| {
                 s.begin_composer_menu();
-                s.open_model_picker(SettingsPicker::Thinking);
+                s.open_model_picker(SettingsPicker::Model);
             });
         }
         trigger = trigger.child(icons);
@@ -1566,7 +1566,7 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
     if !locked {
         trigger = trigger.on_press(|s: &mut State| {
             s.begin_composer_menu();
-            s.open_model_picker(SettingsPicker::Thinking);
+            s.open_model_picker(SettingsPicker::Model);
         });
     }
     let trigger_unavailable = active_model_option
@@ -1629,27 +1629,29 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
 }
 
 const PICKER_WIDTH: f32 = 320.0;
+/// KSG Code's model list column, `max-w-90`.
+const MODEL_LIST_W: f32 = 360.0;
+/// KSG Code's docked options column, `w-48`.
+const MODEL_OPTIONS_W: f32 = 192.0;
+/// KSG Code's docked picker height, `h-86.5`. A short window shrinks it.
+const MODEL_PICKER_H: f32 = 346.0;
+/// The reasoning menu's width: KSG's `w-60` menu, widened so five levels keep room on the slider.
+const REASONING_W: f32 = 272.0;
 
-/// Ported from KSG Code's `ProviderModelPicker` + `ComposerModelEffort`: docked model list on
-/// the left, effort slider and descriptor options on the right, and speed/ultracode/permissions
-/// in the footer. Stacks vertically below 640 px.
+/// The model picker or the reasoning menu, whichever is open. KSG Code keeps them apart:
+/// `ProviderModelPicker` for the model and `ComposerReasoningPicker` for its levels.
 fn settings_picker(s: &State, p: Palette) -> El {
-    let t = s.current();
-    let is_model = s.settings_picker == Some(SettingsPicker::Model);
-    let can_choose = !t.status.busy() && !t.configuring;
-    let stacked = s.viewport_width <= 640.0;
-    let width = if stacked {
-        (s.viewport_width - 16.0).clamp(280.0, 380.0)
+    if s.settings_picker == Some(SettingsPicker::Thinking) {
+        reasoning_picker(s, p)
     } else {
-        544.0_f32.min((s.viewport_width - 16.0).max(320.0))
-    };
-    let list_max_h = if stacked { 180.0 } else { 296.0 };
+        model_picker(s, p)
+    }
+}
 
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+/// The selected model's short name, for the headers of the options column and reasoning menu.
+fn picker_model_label(s: &State) -> String {
     let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
-    let model_label = s
-        .picker_models_by_instance()
+    s.picker_models_by_instance()
         .get(&resolved_instance)
         .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id))
         .map(|m| {
@@ -1660,143 +1662,14 @@ fn settings_picker(s: &State, p: Palette) -> El {
                 true,
             )
         })
-        .unwrap_or_else(|| split_model_label(&t.model).0.to_owned());
+        .unwrap_or_else(|| split_model_label(&s.current().model).0.to_owned())
+}
 
-    let left_col = model_list(
-        s,
-        p,
-        can_choose,
-        list_max_h,
-        col().key("model-picker-list-col").grow(1.0).min_w(0.0),
-        is_model,
-    );
-    let right_col = effort_column(s, p, can_choose, stacked, &model_label, &controls);
-
-    let body = if stacked {
-        col()
-            .w_full()
-            .min_w(0.0)
-            .child(left_col)
-            .child(rule(p))
-            .child(right_col)
-    } else {
-        row()
-            .w_full()
-            .min_w(0.0)
-            .child(left_col)
-            .child(el().w(1.0).h_full().fill(p.line))
-            .child(right_col)
-    };
-    let mut card = col()
-        .key("pi-settings-picker")
-        .role("dialog")
-        .label(if is_model {
-            "Choose a model"
-        } else {
-            "Model and reasoning"
-        })
-        .w(width)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.frame)
-        .box_shadow(soft_shadow(p))
-        .on_press(|_: &mut State| {})
-        .child(body);
-    if let Some(error) = &t.error {
-        card = card.child(
-            label(error, SMALL, p.danger)
-                .wrap_anywhere()
-                .px(16.0)
-                .pb(10.0),
-        );
-    }
-    card = card
-        .child(rule(p))
-        .child(composer_picker_footer(s, p, can_choose, &controls));
-    if let Some(open_id) = &s.open_option_menu
-        && let Some(
-            desc @ crate::descriptors::ProviderOptionDescriptor::Select {
-                id,
-                options,
-                current_value,
-                ..
-            },
-        ) = controls.others.iter().find(|d| d.id() == open_id)
-    {
-        let choices = crate::descriptors::selectable_provider_option_choices(desc);
-        let current_id = current_value
-            .as_deref()
-            .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
-            .unwrap_or("");
-        let mut choice_col = col()
-            .key(format!("option-popup-{id}"))
-            .w(220.0)
-            .padding(4.0)
-            .gap(2.0)
-            .radius(12.0)
-            .fill(p.card)
-            .border(1.0, p.frame)
-            .box_shadow(soft_shadow(p));
-        for choice in choices {
-            let selected = choice.id == current_id;
-            let oid = id.clone();
-            let cid = choice.id.clone();
-            let mut crow = row()
-                .key(format!("option-choice-{id}-{}", choice.id))
-                .role("menuitemradio")
-                .checked(selected)
-                .focusable(can_choose)
-                .px(8.0)
-                .py(5.0)
-                .gap(6.0)
-                .center_y()
-                .radius(6.0)
-                .fill(if selected {
-                    p.selected
-                } else {
-                    Color::TRANSPARENT
-                })
-                .hover(p.selected)
-                .cursor(rune::Cursor::Pointer)
-                .on_press(move |s: &mut State| {
-                    s.set_composer_option_sticky(
-                        oid.clone(),
-                        crate::model_selection::OptionValue::Str(cid.clone()),
-                    );
-                    s.open_option_menu = None;
-                })
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .child(label(&choice.label, SMALL, p.ink).truncate())
-                        .child(if let Some(d) = &choice.description {
-                            label(d, TextStyle::new(11.0, 400.0), p.muted).wrap()
-                        } else {
-                            el()
-                        }),
-                );
-            if choice.is_default {
-                crow = crow.child(meta_text("Default", p.muted));
-            }
-            if selected {
-                crow = crow.child(icon("check", p.sea));
-            }
-            choice_col = choice_col.child(crow);
-        }
-        card = card.child(choice_col.anchored_fit(
-            format!("option-menu-{id}"),
-            if stacked {
-                rune::Side::Bottom
-            } else {
-                rune::Side::Right
-            },
-            rune::Align::Start,
-            6.0,
-        ));
-    }
-    // Above the composer, right edges aligned, as KSG Code's popover opens. Rune's anchored
-    // layer draws over the page and shifts the card to stay inside the window.
+/// A popover above the composer, right edges aligned, sized to the window (Floating UI's
+/// `size` and `shift`), modal, and handing focus back to the composer when it closes. It
+/// anchors to the composer rather than a trigger: the composer is always on screen, and its
+/// edge stays put while a trigger's label changes width under the open menu.
+fn composer_popover(card: El) -> El {
     card.anchored_fit("composer", rune::Side::Top, rune::Align::End, 8.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| {
@@ -1806,8 +1679,245 @@ fn settings_picker(s: &State, p: Palette) -> El {
         })
 }
 
-/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerEffortColumn`).
-fn effort_column(
+/// KSG's `handleInstanceModelChange`: with an options column docked the popup stays open for
+/// them; otherwise picking a model closes it.
+fn finish_model_pick(s: &mut State) {
+    let descriptors = s.active_model_descriptors();
+    if crate::descriptors::split_column_and_footer_controls(&descriptors)
+        .others
+        .is_empty()
+    {
+        s.settings_picker = None;
+        s.open_option_menu = None;
+        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+    } else {
+        s.settings_picker = Some(SettingsPicker::Model);
+    }
+}
+
+/// Ported from KSG Code's `ProviderModelPicker` (docked): the provider rail, search and model
+/// list at one fixed height, and the `ComposerEffortColumn` (`optionsOnly`) beside it when the
+/// model has options besides reasoning. Below 640 px the column stacks under the list, as
+/// KSG's `max-sm` classes do. Reasoning, speed and permissions have their own controls.
+fn model_picker(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let can_choose = !t.status.busy() && !t.configuring;
+    let stacked = s.viewport_width <= 640.0;
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let has_options = !controls.others.is_empty();
+    let room = (s.viewport_width - 16.0).max(240.0);
+    let width = if stacked {
+        room
+    } else if has_options {
+        MODEL_LIST_W + 1.0 + MODEL_OPTIONS_W
+    } else {
+        MODEL_LIST_W
+    }
+    .min(room);
+
+    // Docked beside options, KSG holds one fixed height; alone, the list is as tall as its
+    // tallest tab, so switching tabs or searching never resizes it.
+    let list_h = if stacked && has_options {
+        224.0
+    } else if has_options {
+        MODEL_PICKER_H
+    } else {
+        tallest_model_tab_h(s).min(if stacked { 320.0 } else { MODEL_PICKER_H })
+    };
+    let list_col = col()
+        .key("model-picker-list-col")
+        .w(if stacked {
+            width
+        } else {
+            MODEL_LIST_W.min(width)
+        })
+        .h(list_h)
+        .shrink()
+        .min_w(0.0)
+        .min_h(0.0);
+    let list_col = model_list(s, p, can_choose, list_col, true, !(stacked && has_options));
+    let mut body = if stacked { col() } else { row() }
+        .key("model-picker-body")
+        .w_full()
+        .min_w(0.0)
+        .min_h(0.0)
+        .shrink()
+        .child(list_col);
+    if has_options {
+        let model_label = picker_model_label(s);
+        body = body
+            .child(if stacked {
+                rule(p)
+            } else {
+                el().w(1.0).h_full().fill(p.line)
+            })
+            .child(options_column(
+                s,
+                p,
+                can_choose,
+                stacked,
+                &model_label,
+                &controls,
+            ));
+    }
+    let mut card = col()
+        .key("pi-settings-picker")
+        .role("dialog")
+        .label("Choose a model")
+        .w(width)
+        .min_h(0.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .on_press(|_: &mut State| {})
+        .child(body);
+    if let Some(error) = &t.error {
+        card = card.child(rule(p)).child(
+            label(error, SMALL, p.danger)
+                .wrap_anywhere()
+                .px(12.0)
+                .py(8.0),
+        );
+    }
+    if let Some(open_id) = &s.open_option_menu
+        && let Some(desc) = controls.others.iter().find(|d| d.id() == open_id)
+    {
+        card = card.child(option_choice_menu(desc, p, can_choose, stacked));
+    }
+    composer_popover(card)
+}
+
+/// The model list's height for its tallest provider tab or favorites, from KSG's
+/// `tallestTabUnits`: a one-line row is 32 pt, a two-line row 48 pt, 2 pt apart, plus the
+/// search row and the list's padding. It never drops below the provider rail.
+fn tallest_model_tab_h(s: &State) -> f32 {
+    use crate::model_picker::provider_model_key;
+    const CHROME: f32 = 51.0 + 12.0;
+    let favorites: std::collections::HashSet<String> = s
+        .effective_model_favorites()
+        .iter()
+        .map(|f| provider_model_key(&f.provider, &f.model))
+        .collect();
+    let row = |two_line: bool| if two_line { 48.0 } else { 32.0 };
+    let mut tallest: f32 = 0.0;
+    let mut favorites_h: f32 = 0.0;
+    for (instance, models) in s.picker_models_by_instance() {
+        let mut tab_h: f32 = 0.0;
+        let mut legacy = false;
+        for model in &models {
+            let favorite = favorites.contains(&provider_model_key(&instance, &model.slug));
+            if favorite {
+                favorites_h += row(true) + 2.0;
+            }
+            if model.is_legacy && !favorite {
+                legacy = true;
+            } else {
+                tab_h += row(model.sub_provider.is_some()) + 2.0;
+            }
+        }
+        if legacy {
+            tab_h += row(false) + 2.0;
+        }
+        tallest = tallest.max(tab_h);
+    }
+    let rail = (s.provider_instance_entries().len() + 1) as f32 * 40.0 + 8.0;
+    (CHROME + tallest.max(favorites_h)).max(rail).max(160.0)
+}
+
+/// An option row's choices, beside the row as KSG's `OptionMenuRow` opens them.
+fn option_choice_menu(
+    desc: &crate::descriptors::ProviderOptionDescriptor,
+    p: Palette,
+    can_choose: bool,
+    stacked: bool,
+) -> El {
+    let crate::descriptors::ProviderOptionDescriptor::Select {
+        id,
+        options,
+        current_value,
+        ..
+    } = desc
+    else {
+        return el();
+    };
+    let choices = crate::descriptors::selectable_provider_option_choices(desc);
+    let current_id = current_value
+        .as_deref()
+        .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+        .unwrap_or("");
+    let mut choice_col = col()
+        .key(format!("option-popup-{id}"))
+        .w(220.0)
+        .padding(4.0)
+        .gap(2.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p));
+    for choice in choices {
+        let selected = choice.id == current_id;
+        let oid = id.clone();
+        let cid = choice.id.clone();
+        let mut crow = row()
+            .key(format!("option-choice-{id}-{}", choice.id))
+            .role("menuitemradio")
+            .checked(selected)
+            .focusable(can_choose)
+            .px(8.0)
+            .py(5.0)
+            .gap(6.0)
+            .center_y()
+            .radius(6.0)
+            .fill(if selected {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.selected)
+            .cursor(rune::Cursor::Pointer)
+            .on_press(move |s: &mut State| {
+                s.set_composer_option_sticky(
+                    oid.clone(),
+                    crate::model_selection::OptionValue::Str(cid.clone()),
+                );
+                s.open_option_menu = None;
+            })
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .child(label(&choice.label, SMALL, p.ink).truncate())
+                    .child(if let Some(d) = &choice.description {
+                        label(d, META, p.muted).wrap()
+                    } else {
+                        el()
+                    }),
+            );
+        if choice.is_default {
+            crow = crow.child(meta_text("Default", p.muted));
+        }
+        if selected {
+            crow = crow.child(icon("check", p.ink).size(14.0, 14.0));
+        }
+        choice_col = choice_col.child(crow);
+    }
+    choice_col.anchored_fit(
+        format!("option-menu-{id}"),
+        if stacked {
+            rune::Side::Bottom
+        } else {
+            rune::Side::Right
+        },
+        rune::Align::Start,
+        6.0,
+    )
+}
+
+/// Ported from KSG Code's `ComposerEffortColumn` with `optionsOnly`: the model's options other
+/// than reasoning and speed, one row each, under a header that names the model.
+fn options_column(
     s: &State,
     p: Palette,
     can_choose: bool,
@@ -1815,39 +1925,32 @@ fn effort_column(
     model_label: &str,
     controls: &crate::descriptors::ColumnControls,
 ) -> El {
-    let t = s.current();
-    let header_title = controls
-        .effort
-        .as_ref()
-        .map(|d| d.label().to_owned())
-        .unwrap_or_else(|| {
-            if controls.others.is_empty() {
-                "Effort".into()
-            } else {
-                "Options".into()
-            }
-        });
-
+    // KSG's `bg-muted/40`, a shade off the card.
+    let tint = Color::BLACK.alpha(if s.dark { 0.12 } else { 0.03 });
     let mut column = col()
-        .key("model-picker-effort")
-        .w(if stacked { f32::NAN } else { 196.0 })
-        .w_full()
+        .key("model-picker-options")
+        .h(if stacked { 256.0 } else { MODEL_PICKER_H })
         .shrink()
-        .min_w(0.0);
-    if !stacked {
-        column = column.w(196.0);
-    }
+        .min_h(0.0)
+        .min_w(0.0)
+        .fill(tint);
+    column = if stacked {
+        column.w_full().corners([0.0, 0.0, 11.0, 11.0])
+    } else {
+        column.w(MODEL_OPTIONS_W).corners([0.0, 11.0, 11.0, 0.0])
+    };
+    // The search row's height, so one rule runs across the top of the popup.
     column = column
         .child(
             row()
                 .center_y()
                 .gap(8.0)
+                .h(50.0)
                 .px(12.0)
-                .py(10.0)
-                .child(label(&header_title, SMALL, p.muted))
+                .child(label("Options", META, p.muted))
                 .child(spacer())
                 .child(
-                    label(model_label, SMALL, p.muted)
+                    label(model_label, META, p.muted)
                         .key("effort-model-label")
                         .truncate()
                         .shrink()
@@ -1855,7 +1958,223 @@ fn effort_column(
                 ),
         )
         .child(rule(p));
+    column.child(
+        col()
+            .w_full()
+            .gap(2.0)
+            .px(8.0)
+            .pt(10.0)
+            .pb(6.0)
+            .h(0.0)
+            .grow(1.0)
+            .min_h(0.0)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .children(option_rows(s, p, can_choose, controls)),
+    )
+}
 
+/// KSG's `OptionSwitchRow` and `OptionMenuRow`: an option's name over its current value.
+fn option_rows(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    controls: &crate::descriptors::ColumnControls,
+) -> Vec<El> {
+    let mut rows = Vec::new();
+    for desc in &controls.others {
+        match desc {
+            crate::descriptors::ProviderOptionDescriptor::Boolean {
+                id,
+                label: opt_label,
+                current_value,
+                ..
+            } => {
+                let on = *current_value == Some(true);
+                let oid = id.clone();
+                rows.push(
+                    row()
+                        .key(format!("option-switch-{id}"))
+                        .role("switch")
+                        .checked(on)
+                        .label(format!("{opt_label}: {}", if on { "On" } else { "Off" }))
+                        .focusable(can_choose)
+                        .disabled(!can_choose)
+                        .px(8.0)
+                        .py(4.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(6.0)
+                        .hover(p.selected)
+                        .focus_fill(p.selected)
+                        .cursor(rune::Cursor::Pointer)
+                        .on_press(move |s: &mut State| {
+                            s.set_composer_option_sticky(
+                                oid.clone(),
+                                crate::model_selection::OptionValue::Bool(!on),
+                            );
+                        })
+                        .child(option_row_text(opt_label, if on { "On" } else { "Off" }, p))
+                        .child(switch_track(on, p)),
+                );
+            }
+            crate::descriptors::ProviderOptionDescriptor::Select {
+                id,
+                label: opt_label,
+                options,
+                current_value,
+                ..
+            } => {
+                let choices = crate::descriptors::selectable_provider_option_choices(desc);
+                let current_id = current_value
+                    .as_deref()
+                    .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
+                    .unwrap_or("");
+                let current_label = choices
+                    .iter()
+                    .find(|c| c.id == current_id)
+                    .map(|c| c.label.as_str())
+                    .unwrap_or(current_id);
+                let is_open = s.open_option_menu.as_deref() == Some(id.as_str());
+                let oid = id.clone();
+                rows.push(
+                    row()
+                        .key(format!("option-menu-{id}"))
+                        .role("button")
+                        .label(format!("{opt_label}: {current_label}"))
+                        .focusable(can_choose)
+                        .disabled(!can_choose)
+                        .px(8.0)
+                        .py(4.0)
+                        .gap(6.0)
+                        .center_y()
+                        .radius(6.0)
+                        .fill(if is_open {
+                            p.selected
+                        } else {
+                            Color::TRANSPARENT
+                        })
+                        .hover(p.selected)
+                        .focus_fill(p.selected)
+                        .cursor(rune::Cursor::Pointer)
+                        .on_press(move |s: &mut State| {
+                            if s.open_option_menu.as_deref() == Some(oid.as_str()) {
+                                s.open_option_menu = None;
+                            } else {
+                                s.open_option_menu = Some(oid.clone());
+                            }
+                        })
+                        .child(option_row_text(opt_label, current_label, p))
+                        .child(icon("open", p.muted).size(14.0, 14.0)),
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// KSG's `OptionRowText`: the option's name in meta type over its value.
+fn option_row_text(name: &str, value: &str, p: Palette) -> El {
+    col()
+        .grow(1.0)
+        .min_w(0.0)
+        .child(label(name, META, p.muted).truncate())
+        .child(label(value, TextStyle::new(13.0, 450.0), p.ink).truncate())
+}
+
+/// KSG's small `Switch`: a 28 x 16 track with a 12 pt knob.
+fn switch_track(on: bool, p: Palette) -> El {
+    let mut track = row()
+        .w(28.0)
+        .h(16.0)
+        .radius(8.0)
+        .padding(2.0)
+        .center_y()
+        .shrink()
+        .fill(if on { p.coral } else { p.line });
+    if on {
+        track = track.justify_end();
+    }
+    track.child(el().size(12.0, 12.0).radius(6.0).fill(p.card))
+}
+
+/// Ported from KSG Code's `ComposerReasoningPicker`: its own menu above the effort chip, with
+/// the reasoning levels under a header that names the model and the speed controls below
+/// them. The levels keep Shina's Codex slider, laid out for this narrower menu.
+fn reasoning_picker(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let can_choose = !t.status.busy() && !t.configuring;
+    let descriptors = s.active_model_descriptors();
+    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let title = controls
+        .effort
+        .as_ref()
+        .map(|d| d.label().to_owned())
+        .unwrap_or_else(|| "Reasoning".into());
+    let model_label = picker_model_label(s);
+    let card = col()
+        .key("reasoning-picker")
+        .role("dialog")
+        .label("Reasoning")
+        .w(REASONING_W.min((s.viewport_width - 16.0).max(200.0)))
+        .min_h(0.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .on_press(|_: &mut State| {})
+        .child(
+            row()
+                .key("reasoning-header")
+                .center_y()
+                .gap(8.0)
+                .px(12.0)
+                .pt(10.0)
+                .pb(2.0)
+                .child(label(&title, META, p.muted))
+                .child(spacer())
+                .child(
+                    label(&model_label, META, p.muted)
+                        .key("effort-model-label")
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0),
+                ),
+        );
+    // Below the header everything scrolls, so a window too short for the menu clips nothing.
+    let mut body = col()
+        .key("reasoning-body")
+        .w_full()
+        .shrink()
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(effort_body(s, p, can_choose, &controls));
+    if let Some(speed) = speed_section(s, p, can_choose, &controls) {
+        body = body.child(rule(p)).child(speed);
+    }
+    if let Some(error) = &t.error {
+        body = body.child(rule(p)).child(
+            label(error, SMALL, p.danger)
+                .wrap_anywhere()
+                .px(12.0)
+                .py(8.0),
+        );
+    }
+    composer_popover(card.child(body))
+}
+
+/// The reasoning levels: the slider for a select, KSG's On and Off rows for a boolean, or a
+/// note when the model has none.
+fn effort_body(
+    s: &State,
+    p: Palette,
+    can_choose: bool,
+    controls: &crate::descriptors::ColumnControls,
+) -> El {
+    let t = s.current();
     let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
     let ultrathink_in_body = controls.effort.as_ref().is_some_and(|d| match d {
         crate::descriptors::ProviderOptionDescriptor::Select {
@@ -1865,24 +2184,14 @@ fn effort_column(
         _ => false,
     }) && prompt_ultrathink == crate::descriptors::PromptUltrathink::Body;
 
-    let mut body = col()
-        .w_full()
-        .gap(4.0)
-        .pb(8.0)
-        .max_h(if stacked { 256.0 } else { 300.0 })
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        });
-
-    let mut rendered_effort = false;
+    let mut body = col().key("model-picker-effort").w_full();
     match &controls.effort {
-        Some(crate::descriptors::ProviderOptionDescriptor::Select {
-            id, current_value, ..
-        }) => {
-            let desc_id = id.clone();
-            let choices = crate::descriptors::selectable_provider_option_choices(
-                controls.effort.as_ref().unwrap(),
-            );
+        Some(
+            desc @ crate::descriptors::ProviderOptionDescriptor::Select {
+                id, current_value, ..
+            },
+        ) => {
+            let choices = crate::descriptors::selectable_provider_option_choices(desc);
             let levels: Vec<String> = if choices.is_empty() {
                 t.thinking_levels.clone()
             } else {
@@ -1894,49 +2203,43 @@ fn effort_column(
                 .unwrap_or_else(|| t.thinking.clone());
             if ultrathink_in_body {
                 body = body.child(
-                    label(crate::descriptors::ULTRATHINK_IN_BODY_NOTE, SMALL, p.muted)
+                    label(crate::descriptors::ULTRATHINK_IN_BODY_NOTE, META, p.muted)
                         .key("ultrathink-lock-note")
                         .wrap()
                         .px(12.0)
-                        .pt(8.0),
+                        .pt(6.0),
                 );
             }
-            body = body.child(effort_slider_with_levels(
+            body.child(effort_slider_with_levels(
                 &levels,
                 &current,
                 s.thinking_drag,
                 p,
                 can_choose && !ultrathink_in_body,
-                desc_id,
-            ));
-            rendered_effort = true;
+                id.clone(),
+            ))
         }
         Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
             id, current_value, ..
         }) => {
-            let desc_id = id.clone();
             let on = *current_value == Some(true);
+            let mut group = col().role("radiogroup").gap(2.0).padding(6.0).w_full();
             for (label_text, val) in [("On", true), ("Off", false)] {
                 let checked = on == val;
-                let oid = desc_id.clone();
-                body = body.child(
+                let oid = id.clone();
+                group = group.child(
                     row()
-                        .key(format!("effort-bool-{desc_id}-{val}"))
+                        .key(format!("effort-bool-{id}-{val}"))
                         .role("radio")
                         .checked(checked)
                         .focusable(can_choose)
                         .disabled(!can_choose)
                         .h(30.0)
-                        .mx(6.0)
                         .px(8.0)
                         .center_y()
                         .radius(6.0)
-                        .fill(if checked {
-                            p.selected
-                        } else {
-                            Color::TRANSPARENT
-                        })
                         .hover(p.selected)
+                        .focus_fill(p.selected)
                         .cursor(rune::Cursor::Pointer)
                         .on_press(move |s: &mut State| {
                             s.set_composer_option_sticky(
@@ -1945,10 +2248,14 @@ fn effort_column(
                             );
                         })
                         .child(label(label_text, SMALL, p.ink).grow(1.0))
-                        .child(if checked { icon("check", p.sea) } else { el() }),
+                        .child(if checked {
+                            icon("check", p.ink).size(14.0, 14.0)
+                        } else {
+                            el()
+                        }),
                 );
             }
-            rendered_effort = true;
+            body.child(group)
         }
         None if !t.thinking_levels.is_empty() => {
             let fallback_id = match t.harness.as_str() {
@@ -1956,174 +2263,72 @@ fn effort_column(
                 "codex" => "reasoningEffort",
                 _ => "effort",
             };
-            body = body.child(effort_slider_with_levels(
+            body.child(effort_slider_with_levels(
                 &t.thinking_levels,
                 &t.thinking,
                 s.thinking_drag,
                 p,
                 can_choose,
                 fallback_id.into(),
-            ));
-            rendered_effort = true;
+            ))
         }
-        None => {}
-    }
-
-    if !rendered_effort && controls.others.is_empty() {
-        body = body.child(
+        None => body.child(
             label("No effort levels", SMALL, p.muted)
                 .key("no-effort-levels")
                 .px(12.0)
                 .py(10.0),
-        );
+        ),
     }
-
-    if !controls.others.is_empty() {
-        if rendered_effort {
-            body = body.child(rule(p).mx(8.0));
-        }
-        for desc in &controls.others {
-            match desc {
-                crate::descriptors::ProviderOptionDescriptor::Boolean {
-                    id,
-                    label: opt_label,
-                    current_value,
-                    ..
-                } => {
-                    let on = *current_value == Some(true);
-                    let oid = id.clone();
-                    body = body.child(
-                        row()
-                            .key(format!("option-switch-{id}"))
-                            .role("switch")
-                            .checked(on)
-                            .label(format!("{opt_label}: {}", if on { "On" } else { "Off" }))
-                            .focusable(can_choose)
-                            .disabled(!can_choose)
-                            .mx(6.0)
-                            .px(8.0)
-                            .py(6.0)
-                            .gap(8.0)
-                            .center_y()
-                            .radius(6.0)
-                            .hover(p.selected)
-                            .cursor(rune::Cursor::Pointer)
-                            .on_press(move |s: &mut State| {
-                                s.set_composer_option_sticky(
-                                    oid.clone(),
-                                    crate::model_selection::OptionValue::Bool(!on),
-                                );
-                            })
-                            .child(
-                                col()
-                                    .grow(1.0)
-                                    .min_w(0.0)
-                                    .child(label(opt_label, SMALL, p.muted).truncate())
-                                    .child(label(
-                                        if on { "On" } else { "Off" },
-                                        TextStyle::new(13.0, 450.0),
-                                        p.ink,
-                                    )),
-                            )
-                            .child({
-                                let mut track = row()
-                                    .w(28.0)
-                                    .h(16.0)
-                                    .radius(8.0)
-                                    .padding(2.0)
-                                    .center_y()
-                                    .fill(if on { p.coral } else { p.line });
-                                if on {
-                                    track = track.justify_end();
-                                }
-                                track.child(el().size(12.0, 12.0).radius(12.0).fill(p.card))
-                            }),
-                    );
-                }
-                crate::descriptors::ProviderOptionDescriptor::Select {
-                    id,
-                    label: opt_label,
-                    options,
-                    current_value,
-                    ..
-                } => {
-                    let choices = crate::descriptors::selectable_provider_option_choices(desc);
-                    let current_id = current_value
-                        .as_deref()
-                        .or_else(|| options.iter().find(|o| o.is_default).map(|o| o.id.as_str()))
-                        .unwrap_or("");
-                    let current_label = choices
-                        .iter()
-                        .find(|c| c.id == current_id)
-                        .map(|c| c.label.as_str())
-                        .unwrap_or(current_id);
-                    let is_open = s.open_option_menu.as_deref() == Some(id.as_str());
-                    let oid = id.clone();
-                    body = body.child(
-                        row()
-                            .key(format!("option-menu-{id}"))
-                            .role("button")
-                            .label(format!("{opt_label}: {current_label}"))
-                            .focusable(can_choose)
-                            .disabled(!can_choose)
-                            .mx(6.0)
-                            .px(8.0)
-                            .py(6.0)
-                            .gap(6.0)
-                            .center_y()
-                            .radius(6.0)
-                            .fill(if is_open {
-                                p.selected
-                            } else {
-                                Color::TRANSPARENT
-                            })
-                            .hover(p.selected)
-                            .cursor(rune::Cursor::Pointer)
-                            .on_press(move |s: &mut State| {
-                                if s.open_option_menu.as_deref() == Some(oid.as_str()) {
-                                    s.open_option_menu = None;
-                                } else {
-                                    s.open_option_menu = Some(oid.clone());
-                                }
-                            })
-                            .child(
-                                col()
-                                    .grow(1.0)
-                                    .min_w(0.0)
-                                    .child(label(opt_label, SMALL, p.muted).truncate())
-                                    .child(
-                                        label(current_label, TextStyle::new(13.0, 450.0), p.ink)
-                                            .truncate(),
-                                    ),
-                            )
-                            .child(icon(if is_open { "chevron" } else { "open" }, p.muted)),
-                    );
-                }
-            }
-        }
-    }
-
-    column.child(body)
 }
 
-/// Ported from KSG Code's `ComposerModelEffort.tsx` (`ComposerPickerFooter`, `SpeedControl`, `UltracodeControl`).
-fn composer_picker_footer(
+/// Ported from KSG Code's `SpeedControl` and `UltracodeControl`, which its reasoning menu keeps
+/// below the levels: service tiers, Claude's Fast mode, or Codex's legacy tiers, then Ultracode.
+fn speed_section(
     s: &State,
     p: Palette,
     can_choose: bool,
     controls: &crate::descriptors::ColumnControls,
-) -> El {
+) -> Option<El> {
     let t = s.current();
-    let mut footer = row()
+    let segment = |key: String, text: &str, on: bool| {
+        row()
+            .key(key)
+            .role("radio")
+            .label(text)
+            .checked(on)
+            .focusable(can_choose)
+            .disabled(!can_choose)
+            .h(24.0)
+            .w(0.0)
+            .grow(1.0)
+            .min_w(0.0)
+            .px(8.0)
+            .gap(4.0)
+            .center()
+            .radius(6.0)
+            .fill(if on { p.card } else { Color::TRANSPARENT })
+            .hover(if on { p.card } else { p.selected })
+            .focus_fill(p.selected)
+            .cursor(rune::Cursor::Pointer)
+    };
+    let group = |key: &str, name: &str| {
+        row()
+            .key(key)
+            .role("radiogroup")
+            .label(name)
+            .w_full()
+            .gap(2.0)
+            .padding(2.0)
+            .radius(8.0)
+            .fill(p.selected)
+    };
+    let mut section = col()
         .key("picker-footer")
         .w_full()
-        .center_y()
-        .flex_wrap()
         .gap(8.0)
         .px(12.0)
-        .py(8.0);
-
-    // SpeedControl: serviceTier select descriptor, legacy model.service_tiers, or fastMode boolean
+        .py(10.0);
+    let mut any = false;
     if let Some(crate::descriptors::ProviderOptionDescriptor::Select {
         options,
         current_value,
@@ -2134,87 +2339,39 @@ fn composer_picker_footer(
             .as_str()
             .or_else(|| current_value.as_deref())
             .unwrap_or("default");
-        let mut group = row()
-            .key("service-tier-picker")
-            .role("radiogroup")
-            .label("Service Tier")
-            .gap(2.0)
-            .padding(2.0)
-            .radius(12.0)
-            .fill(p.bg)
-            .border(1.0, p.line);
+        let mut tiers = group("service-tier-picker", "Service Tier");
         for (index, opt) in options.iter().enumerate() {
             let on = selected == opt.id;
             let oid = opt.id.clone();
-            let mut seg = row()
-                .key(format!("service-tier-{index}"))
-                .role("radio")
-                .label(&opt.label)
-                .checked(on)
-                .focusable(can_choose)
-                .disabled(!can_choose)
-                .h(24.0)
-                .px(8.0)
-                .gap(4.0)
-                .center_y()
-                .radius(6.0)
-                .fill(if on { p.selected } else { Color::TRANSPARENT })
-                .hover(p.selected)
-                .cursor(rune::Cursor::Pointer)
-                .on_press(move |s: &mut State| {
+            let mut seg = segment(format!("service-tier-{index}"), &opt.label, on).on_press(
+                move |s: &mut State| {
                     s.set_composer_service_tier_sticky(oid.clone());
-                });
+                },
+            );
             if let Some(desc) = &opt.description {
                 seg = seg.help(desc);
             }
             if opt.label == "Fast" || opt.label == "Ultrafast" {
-                seg = seg.child(icon("bolt", if on { p.brass } else { p.muted }));
+                seg = seg.child(icon("bolt", if on { p.brass } else { p.muted }).size(14.0, 14.0));
             }
-            seg = seg.child(label(&opt.label, SMALL, if on { p.ink } else { p.muted }));
-            group = group.child(seg);
+            tiers = tiers.child(
+                seg.child(label(&opt.label, SMALL, if on { p.ink } else { p.muted }).truncate()),
+            );
         }
-        footer = footer.child(group);
-    } else if !t
-        .models
-        .iter()
-        .find(|m| m.id == t.model_id && m.provider == "codex")
-        .is_none_or(|m| m.service_tiers.is_empty())
-    {
-        footer = footer.child(service_tier_picker(t, p, can_choose));
+        section = section.child(label("Speed", META, p.muted)).child(tiers);
+        any = true;
+    } else if let Some(tiers) = service_tier_picker(t, p, can_choose) {
+        section = section.child(tiers);
+        any = true;
     } else if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
         current_value,
         ..
     }) = &controls.fast_toggle
     {
         let is_fast = *current_value == Some(true);
-        let group = row()
-            .key("fast-mode-picker")
-            .role("radiogroup")
-            .label("Fast Mode")
-            .gap(2.0)
-            .padding(2.0)
-            .radius(12.0)
-            .fill(p.bg)
-            .border(1.0, p.line)
+        let tiers = group("fast-mode-picker", "Fast Mode")
             .child(
-                row()
-                    .key("fast-mode-off")
-                    .role("radio")
-                    .label("Standard")
-                    .checked(!is_fast)
-                    .focusable(can_choose)
-                    .disabled(!can_choose)
-                    .h(24.0)
-                    .px(8.0)
-                    .center_y()
-                    .radius(6.0)
-                    .fill(if !is_fast {
-                        p.selected
-                    } else {
-                        Color::TRANSPARENT
-                    })
-                    .hover(p.selected)
-                    .cursor(rune::Cursor::Pointer)
+                segment("fast-mode-off".into(), "Standard", !is_fast)
                     .on_press(|s: &mut State| {
                         s.set_composer_option_sticky(
                             "fastMode".into(),
@@ -2228,35 +2385,18 @@ fn composer_picker_footer(
                     )),
             )
             .child(
-                row()
-                    .key("fast-mode-on")
-                    .role("radio")
-                    .label("Fast")
-                    .checked(is_fast)
-                    .focusable(can_choose)
-                    .disabled(!can_choose)
-                    .h(24.0)
-                    .px(8.0)
-                    .gap(4.0)
-                    .center_y()
-                    .radius(6.0)
-                    .fill(if is_fast {
-                        p.selected
-                    } else {
-                        Color::TRANSPARENT
-                    })
-                    .hover(p.selected)
-                    .cursor(rune::Cursor::Pointer)
+                segment("fast-mode-on".into(), "Fast", is_fast)
                     .on_press(|s: &mut State| {
                         s.set_composer_option_sticky(
                             "fastMode".into(),
                             crate::model_selection::OptionValue::Bool(true),
                         );
                     })
-                    .child(icon("bolt", if is_fast { p.brass } else { p.muted }))
+                    .child(icon("bolt", if is_fast { p.brass } else { p.muted }).size(14.0, 14.0))
                     .child(label("Fast", SMALL, if is_fast { p.ink } else { p.muted })),
             );
-        footer = footer.child(group);
+        section = section.child(label("Speed", META, p.muted)).child(tiers);
+        any = true;
     }
 
     if let Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
@@ -2268,22 +2408,22 @@ fn composer_picker_footer(
     {
         let on = *current_value == Some(true);
         let oid = id.clone();
-        footer = footer.child(
+        section = section.child(
             row()
                 .key("ultracode-toggle")
-                .role("button")
+                .role("switch")
                 .label(ultra_label)
                 .checked(on)
                 .focusable(can_choose)
                 .disabled(!can_choose)
                 .h(28.0)
-                .px(8.0)
-                .gap(4.0)
+                .mx(-4.0)
+                .px(4.0)
+                .gap(8.0)
                 .center_y()
-                .radius(12.0)
-                .fill(if on { p.selected } else { p.bg })
-                .border(1.0, p.line)
+                .radius(6.0)
                 .hover(p.selected)
+                .focus_fill(p.selected)
                 .cursor(rune::Cursor::Pointer)
                 .on_press(move |s: &mut State| {
                     s.set_composer_option_sticky(
@@ -2291,33 +2431,38 @@ fn composer_picker_footer(
                         crate::model_selection::OptionValue::Bool(!on),
                     );
                 })
-                .child(icon("workflow", if on { p.sea } else { p.muted }))
-                .child(label(ultra_label, SMALL, if on { p.ink } else { p.muted })),
+                .child(icon("workflow", if on { p.sea } else { p.muted }).size(14.0, 14.0))
+                .child(
+                    label(ultra_label, SMALL, p.ink)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(switch_track(on, p)),
         );
+        any = true;
     }
-
-    footer = footer.child(composer_ui::permissions_section(s, p));
-    footer
+    any.then_some(section)
 }
 
-/// Ported from KSG Code's ComposerModelEffort.SpeedControl footer segments.
-fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
-    let Some(model) = t
+/// Codex's legacy service tiers, read from the model, as KSG's `SpeedControl` segments.
+fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> Option<El> {
+    let model = t
         .models
         .iter()
-        .find(|model| model.id == t.model_id && model.provider == "codex")
-    else {
-        return el();
-    };
+        .find(|model| model.id == t.model_id && model.provider == "codex")?;
     if model.service_tiers.is_empty() {
-        return el();
+        return None;
     }
     let mut choices = row()
         .key("service-tier-options")
         .role("radiogroup")
         .label("Service tier")
-        .gap(4.0)
-        .w_full();
+        .w_full()
+        .gap(2.0)
+        .padding(2.0)
+        .radius(8.0)
+        .fill(p.selected);
     let selected = t.harness_state["serviceTier"]
         .as_str()
         .or_else(|| t.harness_state["effectiveServiceTier"].as_str())
@@ -2352,8 +2497,8 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
                 .center_y()
                 .justify_center()
                 .radius(6.0)
-                .fill(if on { p.selected } else { Color::TRANSPARENT })
-                .hover(p.selected)
+                .fill(if on { p.card } else { Color::TRANSPARENT })
+                .hover(if on { p.card } else { p.selected })
                 .focus_fill(p.selected)
                 .cursor(rune::Cursor::Pointer)
                 .child(label(name, SMALL, if on { p.ink } else { p.muted }).truncate())
@@ -2362,13 +2507,13 @@ fn service_tier_picker(t: &Thread, p: Palette, can_choose: bool) -> El {
                 }),
         );
     }
-    col()
-        .key("service-tier-picker")
-        .px(16.0)
-        .pb(12.0)
-        .gap(8.0)
-        .child(meta_text("Service tier", p.muted))
-        .child(choices)
+    Some(
+        col()
+            .key("service-tier-picker")
+            .gap(8.0)
+            .child(label("Service tier", META, p.muted))
+            .child(choices),
+    )
 }
 
 const SLIDER_H: f32 = 28.0;
@@ -2450,12 +2595,13 @@ fn effort_slider_with_levels(
     let title = shown
         .and_then(|index| levels.get(index))
         .map_or_else(|| effort_name(active_level), |level| effort_name(level));
+    // Under the reasoning menu's header, so a little tighter than Codex's standalone slider.
     let mut section = col()
         .key("effort-section")
-        .px(16.0)
-        .pt(14.0)
-        .pb(16.0)
-        .gap(12.0);
+        .px(12.0)
+        .pt(8.0)
+        .pb(14.0)
+        .gap(10.0);
     section = section.child(
         row()
             .center_y()
@@ -2917,13 +3063,14 @@ fn picker_snapshot(s: &State) -> PickerSnapshot {
 }
 
 /// Ported from KSG Code's `ModelPickerContent.tsx`, `ModelPickerSidebar.tsx`, and `ModelListRow.tsx`.
+/// `round_bottom` rounds the rail's lower corner, when the list ends at the popup's bottom.
 fn model_list(
     s: &State,
     p: Palette,
     can_choose: bool,
-    max_h: f32,
     card: El,
     autofocus_search: bool,
+    round_bottom: bool,
 ) -> El {
     use crate::model_picker::{
         ModelPickerTab, describe_unavailable_instance, get_display_model_name,
@@ -2966,7 +3113,7 @@ fn model_list(
         search_field = search_field.autofocus();
     }
 
-    let header = row().center_y().gap(8.0).px(12.0).py(10.0).child(
+    let header = row().center_y().gap(8.0).h(50.0).px(10.0).shrink().child(
         row()
             .center_y()
             .gap(6.0)
@@ -2981,45 +3128,52 @@ fn model_list(
             .child(search_field),
     );
 
+    // KSG's `--model-picker-rail`: a darker strip of square provider buttons, the selected one
+    // filled.
     let mut sidebar = col()
         .key("harness-group")
         .role("toolbar")
         .label("Providers")
         .w(44.0)
-        .shrink()
+        .h_full()
+        .min_h(0.0)
         .padding(4.0)
         .gap(4.0)
-        .border(0.0, Color::TRANSPARENT);
+        // Inside the popup's 1 pt border, so its 12 pt corners less one.
+        .corners([11.0, 0.0, 0.0, if round_bottom { 11.0 } else { 0.0 }])
+        .fill(Color::BLACK.alpha(if s.dark { 0.2 } else { 0.1 }))
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        });
     let fav_selected = snap.selected_tab == ModelPickerTab::Favorites;
-    sidebar = sidebar
-        .child(
-            row()
-                .key("choose-harness-favorites")
-                .role("button")
-                .label("Favorites")
-                .help("Favorites")
-                .cursor(rune::Cursor::Pointer)
-                .w_full()
-                .h(36.0)
-                .center()
-                .radius(6.0)
-                .fill(if fav_selected {
-                    p.selected
-                } else {
-                    Color::TRANSPARENT
-                })
-                .hover(p.selected)
-                .on_press(|s: &mut State| {
-                    s.model_picker_tab = Some(ModelPickerTab::Favorites);
-                })
-                .child(icon("star", if fav_selected { p.brass } else { p.muted }))
-                .child(el().w(2.0).h(18.0).fill(if fav_selected {
-                    p.coral
-                } else {
-                    Color::TRANSPARENT
-                })),
-        )
-        .child(rule(p));
+    sidebar = sidebar.child(
+        row()
+            .key("choose-harness-favorites")
+            .role("button")
+            .label("Favorites")
+            .help("Favorites")
+            .checked(fav_selected)
+            .cursor(rune::Cursor::Pointer)
+            .size(36.0, 36.0)
+            .center()
+            .radius(8.0)
+            .fill(if fav_selected {
+                p.selected
+            } else {
+                Color::TRANSPARENT
+            })
+            .hover(p.selected)
+            .on_press(|s: &mut State| {
+                s.model_picker_tab = Some(ModelPickerTab::Favorites);
+            })
+            .child(
+                icon(
+                    if fav_selected { "star" } else { "star-off" },
+                    if fav_selected { p.ink } else { p.muted },
+                )
+                .size(18.0, 18.0),
+            ),
+    );
 
     let mut seen: Vec<(String, String)> = Vec::new();
     for entry in &snap.sidebar_entries {
@@ -3059,7 +3213,7 @@ fn model_list(
             .items_center()
             .justify_center()
             .gap(1.0)
-            .grow(1.0)
+            .opacity(if is_selected { 1.0 } else { 0.7 })
             .child(harness_icon(s, p, &entry.instance_id, &entry.display_name));
         if entry.is_acp {
             btn_content = btn_content.child(outlined(
@@ -3079,10 +3233,10 @@ fn model_list(
             .checked(is_selected)
             .disabled(is_disabled)
             .opacity(if is_disabled { 0.5 } else { 1.0 })
-            .w_full()
+            .w(36.0)
             .h(if entry.is_acp { 42.0 } else { 36.0 })
-            .center_y()
-            .radius(6.0)
+            .center()
+            .radius(8.0)
             .fill(if is_selected {
                 p.selected
             } else {
@@ -3097,14 +3251,7 @@ fn model_list(
                     s.model_picker_tab = Some(ModelPickerTab::Instance(target_id.clone()));
                 });
         }
-        item = item
-            .child(btn_content)
-            .child(el().w(2.0).h(18.0).fill(if is_selected {
-                p.coral
-            } else {
-                Color::TRANSPARENT
-            }));
-        sidebar = sidebar.child(item);
+        sidebar = sidebar.child(item.child(btn_content));
     }
 
     let mut list = col()
@@ -3113,8 +3260,13 @@ fn model_list(
         .label("Models")
         .focus_group()
         .w_full()
-        .max_h(max_h)
-        .pb(6.0)
+        .h(0.0)
+        .grow(1.0)
+        .min_h(0.0)
+        .pl(6.0)
+        .pr(4.0)
+        .py(6.0)
+        .gap(2.0)
         .scroll(ScrollSpec {
             stick_bottom: false,
         });
@@ -3130,6 +3282,10 @@ fn model_list(
         Vec::new()
     };
 
+    let rows_mix_providers = snap
+        .visible_models
+        .iter()
+        .any(|m| m.instance_id != snap.visible_models[0].instance_id);
     let mut jump_num = 0usize;
     for (index, model) in snap.visible_models.iter().enumerate() {
         let disabled_reason = if !can_choose {
@@ -3161,21 +3317,19 @@ fn model_list(
             false,
         );
 
-        let mut name_row = row().center_y().gap(6.0).grow(1.0).min_w(0.0).child(
-            label(&display_name, TextStyle::new(13.5, 450.0), p.ink)
+        // KSG's `ModelListRow`: the name with a check when selected, then its badges.
+        let mut name_row = row().center_y().gap(6.0).min_w(0.0).child(
+            label(&display_name, TextStyle::new(13.0, 450.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         );
         if selected {
-            name_row = name_row.child(icon("check", p.sea));
-        }
-        if let Some(sub) = &model.sub_provider {
-            name_row = name_row.child(label(sub, SMALL, p.muted).truncate().shrink().min_w(0.0));
+            name_row = name_row.child(icon("check", p.ink).size(14.0, 14.0));
         }
         if model.badge.as_deref() == Some("new") {
             name_row = name_row.child(outlined(
-                meta_text("New", p.coral)
+                meta_text("New", p.muted)
                     .label("New model")
                     .px(4.0)
                     .py(1.0)
@@ -3193,13 +3347,41 @@ fn model_list(
             ));
         }
 
+        let mut name_col = col().gap(4.0).grow(1.0).min_w(0.0).child(name_row);
+        // The provider line, when the rows mix providers or the model names a sub-provider.
+        if rows_mix_providers || model.sub_provider.is_some() {
+            let provider_label = match &model.sub_provider {
+                Some(sub) => format!("{} · {sub}", model.instance_display_name),
+                None => model.instance_display_name.clone(),
+            };
+            name_col = name_col.child(
+                row()
+                    .center_y()
+                    .gap(6.0)
+                    .min_w(0.0)
+                    .child(
+                        provider_icon(
+                            s,
+                            p,
+                            model_vendor(&model.instance_id, &model.instance_display_name),
+                            12.0,
+                        )
+                        .opacity(0.6),
+                    )
+                    .child(
+                        label(&provider_label, META, p.faint)
+                            .truncate()
+                            .shrink()
+                            .min_w(0.0),
+                    ),
+            );
+        }
         // A started thread hands its context to the new provider; the row says so
         // under the name, KSG Code's pending-handoff wording for the pick.
         let handoff_hint = enabled && t.has_started_session() && model.instance_id != t.harness;
-        let mut name_col = col().gap(1.0).grow(1.0).min_w(0.0).child(name_row);
         if handoff_hint {
             name_col = name_col.child(
-                label("Starts a context handoff", SMALL, p.muted)
+                label("Starts a context handoff", META, p.muted)
                     .key(format!("handoff-hint-{index}"))
                     .truncate()
                     .shrink()
@@ -3223,14 +3405,17 @@ fn model_list(
                 "Add to favorites"
             })
             .focusable(false)
-            .size(22.0, 22.0)
+            .size(24.0, 24.0)
             .center()
             .radius(6.0)
             .disabled(!enabled)
-            .child(icon(
-                if is_favorite { "star" } else { "star-off" },
-                if is_favorite { p.brass } else { p.muted },
-            ));
+            .child(
+                icon(
+                    if is_favorite { "star" } else { "star-off" },
+                    if is_favorite { p.brass } else { p.muted },
+                )
+                .size(14.0, 14.0),
+            );
         if enabled {
             star_btn = star_btn
                 .cursor(rune::Cursor::Pointer)
@@ -3245,6 +3430,8 @@ fn model_list(
             trailing = trailing.child(keycap_chip(&jump, p));
         }
 
+        // Clicking a row picks the model; Shift adds it to a multi-model send, as KSG's
+        // combobox does. There is no checkbox.
         let mut item = row()
             .key(format!("choose-model-{index}"))
             .role("option")
@@ -3255,61 +3442,13 @@ fn model_list(
             .opacity(if enabled { 1.0 } else { 0.55 })
             .center_y()
             .gap(8.0)
-            .min_h(34.0)
-            .mx(4.0)
-            .pl(12.0)
-            .pr(8.0)
+            .min_h(32.0)
+            .px(8.0)
+            .py(5.0)
             .radius(6.0)
-            .fill(if selected {
-                p.coral_bg
-            } else {
-                Color::TRANSPARENT
-            })
-            .hover(if selected { p.coral_bg } else { p.selected })
+            .hover(p.selected)
             .focus_fill(p.selected)
-            .focus_selected(selected);
-        if multi_enabled {
-            let toggle_instance = model.instance_id.clone();
-            let toggle_slug = model.slug.clone();
-            let mut checkbox = el()
-                .key(format!(
-                    "model-multi-toggle-{}-{}",
-                    model.instance_id, model.slug
-                ))
-                .role("checkbox")
-                .label(format!("Select {display_name} for multi-model send"))
-                .checked(selected)
-                .focusable(false)
-                .disabled(!enabled)
-                .size(14.0, 14.0)
-                .radius(0.0)
-                .border(1.0, p.ink)
-                .center()
-                .shrink()
-                .fill(if selected {
-                    p.coral
-                } else {
-                    Color::TRANSPARENT
-                });
-            if selected {
-                checkbox = checkbox.child(icon("check", p.on_coral).size(10.0, 10.0));
-            }
-            if enabled {
-                checkbox = checkbox
-                    .cursor(rune::Cursor::Pointer)
-                    .on_press(move |s: &mut State| {
-                        s.toggle_model_in_multi_selection(&toggle_instance, &toggle_slug);
-                    });
-            }
-            item = item.child(checkbox);
-        }
-        item = item
-            .child(provider_icon(
-                s,
-                p,
-                model_vendor(&model.slug, &model.name),
-                16.0,
-            ))
+            .focus_selected(selected)
             .child(name_col)
             .child(trailing);
         if let Some(reason) = &disabled_reason {
@@ -3325,7 +3464,7 @@ fn model_list(
                         s.toggle_model_in_multi_selection(&instance_id, &id);
                     } else {
                         s.select_model_from_picker(&instance_id, &id);
-                        s.settings_picker = Some(SettingsPicker::Thinking);
+                        finish_model_pick(s);
                     }
                 });
         }
@@ -3451,8 +3590,11 @@ fn model_list(
     }
 
     let mut right_col = col()
+        .w(0.0)
         .grow(1.0)
         .min_w(0.0)
+        .h_full()
+        .min_h(0.0)
         .child(header)
         .child(rule(p))
         .child(list);
@@ -3533,9 +3675,9 @@ fn model_list(
         );
     }
 
-    let mut body = row().w_full().min_w(0.0);
+    let mut body = row().w_full().h_full().min_w(0.0).min_h(0.0);
     if show_sidebar {
-        body = body.child(sidebar).child(el().w(1.0).h_full().fill(p.line));
+        body = body.child(sidebar);
     }
     body = body.child(right_col);
     card.child(body)
@@ -16712,7 +16854,7 @@ pub(crate) fn jump_model_picker_index(state: &mut State, index: usize) -> bool {
         return false;
     };
     state.select_model_from_picker(&chosen.instance_id, &chosen.slug);
-    state.settings_picker = Some(SettingsPicker::Thinking);
+    finish_model_pick(state);
     true
 }
 
@@ -25373,7 +25515,7 @@ pub(crate) mod tests {
             rt.state.settings_picker = Some(SettingsPicker::Thinking);
             rt.invalidate();
             rt.frame(0.5);
-            let (picker, _) = rt.presented("pi-settings-picker").unwrap();
+            let (picker, _) = rt.presented("reasoning-picker").unwrap();
             let (control, _) = rt.presented("service-tier-picker").unwrap();
             assert!(
                 control[0] >= picker[0] && control[0] + control[2] <= picker[0] + picker[2] + 0.5
@@ -29253,12 +29395,15 @@ pub(crate) mod tests {
         press(&mut rt, "choose-model-0");
         assert!(rt.state.current().pi.is_none());
         assert_eq!(
-            rt.state.settings_picker,
-            Some(SettingsPicker::Thinking),
-            "picking a model returns to the slider"
+            rt.state.settings_picker, None,
+            "picking a model with no options closes the picker"
         );
         assert_eq!(rt.state.current().model_id, "model-a");
         rt.frame(0.0);
+        assert!(rt.find("composer-effort").is_some());
+        press(&mut rt, "composer-effort");
+        rt.frame(1.0 / 60.0);
+        assert!(rt.presented("reasoning-picker").is_some());
         press(&mut rt, "choose-thinking-1");
         assert_eq!(rt.state.current().thinking, "high");
         assert!(rt.state.current().pi.is_none());
@@ -29297,8 +29442,9 @@ pub(crate) mod tests {
         );
         assert_eq!(commands.try_recv().unwrap()["type"], "get_session_stats");
         rt.frame(0.0);
-        // Pi's replies arrive outside a frame here, so redraw the open popover with them.
-        rt.invalidate();
+        // The pick closed the model picker; the levels are in the reasoning menu.
+        assert_eq!(rt.state.settings_picker, None);
+        open_picker(&mut rt, SettingsPicker::Thinking);
         press(&mut rt, "choose-thinking-1");
         let thinking = commands.try_recv().unwrap();
         assert_eq!(thinking["type"], "set_thinking_level");
@@ -29307,6 +29453,12 @@ pub(crate) mod tests {
             .current_mut()
             .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
         assert_eq!(rt.state.current().thinking, "high");
+    }
+    /// Opens the model picker or the reasoning menu and draws it.
+    fn open_picker(rt: &mut Runtime<State>, picker: SettingsPicker) {
+        rt.state.open_model_picker(picker);
+        rt.invalidate();
+        rt.frame(0.0);
     }
     fn with_levels(rt: &mut Runtime<State>) {
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
@@ -29320,6 +29472,56 @@ pub(crate) mod tests {
         t.thinking_levels = vec!["off".into(), "low".into(), "medium".into(), "high".into()];
         t.thinking = "medium".into();
         rt.invalidate();
+    }
+
+    /// Short windows used to leave the combined picker taller than the room above the
+    /// composer, so its rows ran out of the card over the input. Each popover now stays inside
+    /// the window and its rows inside the card.
+    #[test]
+    fn model_and_reasoning_popovers_fit_short_windows_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            for height in [480.0, 640.0, 900.0] {
+                let mut rt = runtime(width);
+                rt.set_viewport((width, height), 1.0);
+                with_levels(&mut rt);
+                rt.frame(0.0);
+                for picker in [SettingsPicker::Model, SettingsPicker::Thinking] {
+                    open_picker(&mut rt, picker);
+                    rt.frame(1.0);
+                    let card_key = match picker {
+                        SettingsPicker::Model => "pi-settings-picker",
+                        SettingsPicker::Thinking => "reasoning-picker",
+                    };
+                    let (card, _) = rt
+                        .presented(card_key)
+                        .unwrap_or_else(|| panic!("{width}x{height}: {card_key}"));
+                    assert!(
+                        card[0] >= 0.0
+                            && card[1] >= 0.0
+                            && card[0] + card[2] <= width + 0.5
+                            && card[1] + card[3] <= height + 0.5,
+                        "{width}x{height}: {card_key} leaves the window: {card:?}"
+                    );
+                    let inner = match picker {
+                        SettingsPicker::Model => ["model-list", "harness-group"],
+                        SettingsPicker::Thinking => ["reasoning-body", "reasoning-header"],
+                    };
+                    for key in inner {
+                        let (rect, _) = rt
+                            .presented(key)
+                            .unwrap_or_else(|| panic!("{width}x{height}: {key}"));
+                        assert!(
+                            rect[1] >= card[1] - 0.5
+                                && rect[1] + rect[3] <= card[1] + card[3] + 0.5,
+                            "{width}x{height}: {key} runs out of {card_key}: {rect:?} {card:?}"
+                        );
+                    }
+                    rt.state.settings_picker = None;
+                    rt.invalidate();
+                    rt.frame(1.5);
+                }
+            }
+        }
     }
 
     #[test]
@@ -29563,25 +29765,21 @@ pub(crate) mod tests {
 
             // Pick gpt-6-astra and set effort=high + serviceTier=fast
             press(&mut rt, "choose-model-0");
-            rt.invalidate();
-            rt.frame(0.1);
+            open_picker(&mut rt, SettingsPicker::Thinking);
             press(&mut rt, "choose-thinking-2");
             press(&mut rt, "service-tier-1");
             assert_eq!(rt.state.current().thinking, "high");
             assert_eq!(rt.state.current().harness_state["serviceTier"], "fast");
 
             // Switch to gpt-5.6-sol and set effort=low
-            rt.invalidate();
-            rt.frame(0.2);
+            open_picker(&mut rt, SettingsPicker::Model);
             press(&mut rt, "choose-model-1");
-            rt.invalidate();
-            rt.frame(0.3);
+            open_picker(&mut rt, SettingsPicker::Thinking);
             press(&mut rt, "choose-thinking-0");
             assert_eq!(rt.state.current().thinking, "low");
 
             // Switch back to gpt-6-astra: remembered sticky options (high + fast) restore!
-            rt.invalidate();
-            rt.frame(0.4);
+            open_picker(&mut rt, SettingsPicker::Model);
             press(&mut rt, "choose-model-0");
             rt.invalidate();
             rt.frame(0.5);
@@ -29664,6 +29862,7 @@ pub(crate) mod tests {
             rt.state.catalog.error = Some("CPA gateway unreachable.".into());
             rt.invalidate();
             rt.frame(0.1);
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
             let (retry, _) = rt
                 .presented("retry-catalog")
                 .expect("retry-catalog shown on error");
@@ -29730,31 +29929,41 @@ pub(crate) mod tests {
             rt.invalidate();
             rt.frame(0.05);
 
+            // Opus has only reasoning and speed, so the model picker is the list alone and
+            // carries no reasoning, speed or permission controls.
             let (card, _) = rt.presented("pi-settings-picker").unwrap();
-            let (list, _) = rt.presented("model-list").unwrap();
-            let (effort_col, _) = rt.presented("model-picker-effort").unwrap();
-            let (footer, _) = rt.presented("picker-footer").unwrap();
             assert!(
                 card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
                 "{width}: {card:?}"
             );
-            if width > 640.0 {
+            for key in [
+                "model-picker-options",
+                "effort-slider",
+                "picker-footer",
+                "fast-mode-picker",
+                "overflow-access-full",
+            ] {
                 assert!(
-                    effort_col[0] >= list[0] + list[2] - 1.0,
-                    "{width}: effort column sits beside list: {list:?} {effort_col:?}"
-                );
-            } else {
-                assert!(
-                    effort_col[1] >= list[1] + list[3] - 1.0,
-                    "{width}: effort column stacks below list: {list:?} {effort_col:?}"
+                    rt.presented(key).is_none(),
+                    "{width}: {key} in model picker"
                 );
             }
-            assert!(
-                footer[1] >= effort_col[1] + effort_col[3] - 1.0,
-                "{width}: footer sits at bottom: {effort_col:?} {footer:?}"
-            );
 
-            // Fast/Standard and Ultracode controls exist in footer and toggle
+            // Fast/Standard and Ultracode sit under the levels in the reasoning menu.
+            rt.state.open_model_picker(SettingsPicker::Thinking);
+            rt.invalidate();
+            rt.frame(0.08);
+            let (menu, _) = rt.presented("reasoning-picker").unwrap();
+            let (slider, _) = rt.presented("effort-slider").unwrap();
+            let (speed, _) = rt.presented("picker-footer").unwrap();
+            assert!(
+                menu[0] >= 0.0 && menu[0] + menu[2] <= width + 0.5 && menu[1] >= 0.0,
+                "{width}: {menu:?}"
+            );
+            assert!(
+                speed[1] >= slider[1] + slider[3],
+                "{width}: speed sits under the levels: {slider:?} {speed:?}"
+            );
             assert!(rt.presented("fast-mode-picker").is_some(), "{width}");
             assert!(rt.presented("ultracode-toggle").is_some(), "{width}");
             press(&mut rt, "fast-mode-on");
@@ -29795,7 +30004,8 @@ pub(crate) mod tests {
                 "{width}"
             );
 
-            // ACP model shows select and boolean option rows in effort column
+            // ACP model shows select and boolean option rows in the model picker's options
+            // column, beside the list or, below 640 px, under it.
             rt.state.current_mut().draft.replace_text("");
             rt.state.harnesses.agents = vec![crate::harness::Agent {
                 id: "devin".into(),
@@ -29817,8 +30027,33 @@ pub(crate) mod tests {
             rt.state
                 .current_mut()
                 .set_model("devin".into(), "fusion".into());
+            // Set directly: opening refreshes the catalogs, which drops this fixture agent.
+            rt.state.settings_picker = Some(SettingsPicker::Model);
             rt.invalidate();
             rt.frame(0.3);
+            let (card, _) = rt.presented("pi-settings-picker").unwrap();
+            let (list, _) = rt.presented("model-list").unwrap();
+            let (options, _) = rt.presented("model-picker-options").unwrap();
+            assert!(
+                card[0] >= 0.0 && card[0] + card[2] <= width + 0.5 && card[1] >= 0.0,
+                "{width}: {card:?}"
+            );
+            assert!(
+                options[0] + options[2] <= card[0] + card[2] + 0.5
+                    && options[1] + options[3] <= card[1] + card[3] + 0.5,
+                "{width}: options column inside the card: {options:?} {card:?}"
+            );
+            if width > 640.0 {
+                assert!(
+                    options[0] >= list[0] + list[2] - 1.0,
+                    "{width}: options column sits beside list: {list:?} {options:?}"
+                );
+            } else {
+                assert!(
+                    options[1] >= list[1] + list[3] - 1.0,
+                    "{width}: options column stacks below list: {list:?} {options:?}"
+                );
+            }
             assert!(
                 rt.presented("option-menu-_t3/session-mode").is_some(),
                 "{width}"
@@ -29862,7 +30097,7 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         with_levels(&mut rt);
         rt.frame(0.0);
-        press(&mut rt, "model-effort");
+        press(&mut rt, "composer-effort");
         rt.frame(1.0);
         let focused = |rt: &Runtime<State>| {
             rt.elements()
@@ -29921,7 +30156,7 @@ pub(crate) mod tests {
         rt.state.current_mut().thinking = "high".into();
         rt.invalidate();
         rt.frame(0.0);
-        press(&mut rt, "model-effort");
+        press(&mut rt, "composer-effort");
         rt.frame(5.0);
         let (track, _) = rt.presented("effort-slider").unwrap();
         let (thumb, _) = rt.presented("effort-thumb").unwrap();
@@ -30957,7 +31192,10 @@ pub(crate) mod tests {
         });
         rt.frame(0.0);
         assert_eq!(rt.state.current().model_id, "model-beta");
-        assert_eq!(rt.state.settings_picker, Some(SettingsPicker::Thinking));
+        // Without an options column, a pick closes the picker as KSG's does.
+        assert_eq!(rt.state.settings_picker, None);
+        rt.state.open_model_picker(SettingsPicker::Thinking);
+        rt.frame(0.0);
 
         // Mod+Shift+E closes effort when already open, and opens it when closed.
         rt.key(rune::KeyEvent {
@@ -33758,6 +33996,29 @@ pub(crate) mod tests {
         rt
     }
 
+    /// Presses `key` with Shift held, as a Shift+click.
+    fn shift_press(rt: &mut Runtime<State>, key: &str) {
+        let shift = rune::Mods {
+            shift: true,
+            ..Default::default()
+        };
+        rt.physical_input(rune::PhysicalInput::Modifiers(shift));
+        press(rt, key);
+        rt.physical_input(rune::PhysicalInput::Modifiers(Default::default()));
+        rt.frame(0.0);
+    }
+
+    /// With multi-model send off, Shift+click picks one model instead of adding it.
+    fn assert_multi_send_off(rt: &mut Runtime<State>) {
+        if rt.find("choose-model-2").is_none() {
+            rt.state.open_model_picker(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+        }
+        shift_press(rt, "choose-model-2");
+        assert_eq!(rt.state.multi_model_selections().len(), 1);
+    }
+
     #[test]
     fn multi_model_selection_toggles_persists_across_switch_and_reload_and_respects_availability() {
         let mut rt = setup_multi_model_git_runtime(1280.0);
@@ -33772,13 +34033,20 @@ pub(crate) mod tests {
         rt.state.current_mut().draft.focused = true;
         rt.frame(0.0);
 
-        // Open model picker and toggle 3 additional models on via checkboxes (4 total).
+        // Open model picker and Shift+click 3 additional models on (4 total), as KSG Code's
+        // combobox adds to a multi-model send. Rows have no checkboxes.
         press(&mut rt, "model-effort");
         assert!(rt.presented("model-list").is_some());
-        press(&mut rt, "model-multi-toggle-pi-cpa/gpt-5");
-        press(&mut rt, "model-multi-toggle-pi-cpa/gemini-2-5-pro");
-        press(&mut rt, "model-multi-toggle-pi-cpa/deepseek-r1");
+        assert!(rt.find("model-multi-toggle-pi-cpa/gpt-5").is_none());
+        shift_press(&mut rt, "choose-model-1");
+        shift_press(&mut rt, "choose-model-2");
+        shift_press(&mut rt, "choose-model-3");
         assert_eq!(rt.state.multi_model_selections().len(), 4);
+        assert_eq!(
+            rt.state.settings_picker,
+            Some(SettingsPicker::Model),
+            "Shift+click keeps the picker open"
+        );
         assert_eq!(
             rt.state.multi_model_selections()[0].options,
             vec![crate::model_selection::ProviderOptionSelection {
@@ -33788,8 +34056,8 @@ pub(crate) mod tests {
         );
         assert!(rt.state.multi_model_selections()[1].options.is_empty());
 
-        // Toggle one off via checkbox.
-        press(&mut rt, "model-multi-toggle-pi-cpa/deepseek-r1");
+        // Shift+click a selected row to take it off.
+        shift_press(&mut rt, "choose-model-3");
         assert_eq!(rt.state.multi_model_selections().len(), 3);
 
         // Switch to a new thread and back; selection persists on the draft.
@@ -33832,6 +34100,9 @@ pub(crate) mod tests {
         );
 
         // Clicking the model row itself resets to single primary model.
+        if rt.find("choose-model-1").is_none() {
+            press(&mut rt, "model-effort");
+        }
         press(&mut rt, "choose-model-1");
         assert_eq!(rt.state.multi_model_selections().len(), 1);
         assert_eq!(rt.state.current().model_id, "cpa/gpt-5");
@@ -33848,7 +34119,7 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         rt.frame(1.0);
-        assert!(rt.presented("model-multi-toggle-pi-cpa/gpt-5").is_none());
+        assert_multi_send_off(&mut rt);
 
         // Unavailable on a non-git project.
         rt.state.current_mut().messages.clear();
@@ -33873,7 +34144,7 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         rt.frame(1.0);
-        assert!(rt.presented("model-multi-toggle-pi-cpa/gpt-5").is_none());
+        assert_multi_send_off(&mut rt);
 
         // Unavailable on a linked machine without vcs-worktrees-v1 capability.
         let project_path = rt
@@ -33900,13 +34171,13 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         rt.frame(1.0);
-        assert!(rt.presented("model-multi-toggle-pi-cpa/gpt-5").is_none());
+        assert_multi_send_off(&mut rt);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn multi_model_picker_checkboxes_and_trigger_count_fit_at_all_widths() {
+    fn multi_model_picker_rows_and_trigger_count_fit_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = setup_multi_model_git_runtime(width);
             rt.state.compact_sidebar = width < 760.0;
@@ -33921,7 +34192,7 @@ pub(crate) mod tests {
                 "{width}: trigger missing model-multi-count"
             );
 
-            // Open picker and verify checkboxes fit inside their rows without overflowing.
+            // Open picker: selected rows carry a check, no checkbox, and fit the list.
             press(&mut rt, "model-effort");
             assert!(
                 rt.presented("model-multi-count").is_some(),
@@ -33942,15 +34213,21 @@ pub(crate) mod tests {
                 let (row_rect, _) = rt
                     .presented(&format!("choose-model-{idx}"))
                     .unwrap_or_else(|| panic!("{width}: choose-model-{idx}"));
-                let (cb_rect, _) = rt
-                    .presented(&format!("model-multi-toggle-pi-{slug}"))
-                    .unwrap_or_else(|| panic!("{width}: model-multi-toggle-pi-{slug}"));
                 assert!(
-                    cb_rect[0] >= row_rect[0] - 0.5
-                        && cb_rect[0] + cb_rect[2] <= row_rect[0] + row_rect[2] + 0.5
-                        && row_rect[0] + row_rect[2] <= list_rect[0] + list_rect[2] + 0.5,
-                    "{width}: checkbox overflowed row or list: cb={cb_rect:?} row={row_rect:?} list={list_rect:?}"
+                    rt.find(&format!("model-multi-toggle-pi-{slug}")).is_none(),
+                    "{width}: no checkbox on {slug}"
                 );
+                assert!(
+                    row_rect[0] >= list_rect[0] - 0.5
+                        && row_rect[0] + row_rect[2] <= list_rect[0] + list_rect[2] + 0.5,
+                    "{width}: row overflowed list: row={row_rect:?} list={list_rect:?}"
+                );
+                let selected = rt
+                    .state
+                    .multi_model_selections()
+                    .iter()
+                    .any(|sel| sel.model == slug);
+                assert_eq!(selected, idx < 3, "{width}: {slug} selection");
             }
         }
     }
