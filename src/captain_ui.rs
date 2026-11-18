@@ -2467,14 +2467,12 @@ mod tests {
             prev = y;
         }
     }
-    /// Scroll `key` into the Brief's scroll viewport and wait until its centre is
-    /// really inside the clip, so a later press or bounds check sees it.
+    /// Scroll `key` until its whole box is in the Brief's viewport. A visible
+    /// centre alone does not rule out clipping at the edge.
     fn reveal_in_brief(rt: &mut Runtime<State>, key: &str) {
         for _ in 0..24 {
-            if let Some((x, y)) = rt.find(key) {
-                if rt.contains(key, x, y) {
-                    return;
-                }
+            if fully_visible(rt, key) {
+                return;
             }
             rt.update(|_, tx| tx.scroll_into_view_in("captain-brief", key.to_string()));
             rt.frame(0.5);
