@@ -56,6 +56,7 @@ mod mobile_pairing;
 mod mobile_push;
 mod mobile_share;
 mod model;
+mod model_catalog;
 mod model_picker;
 mod model_selection;
 mod outbox;
