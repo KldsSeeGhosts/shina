@@ -987,7 +987,10 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         captain_crew_control = minor >= u64::from(protocol::CAPTAIN_CREW_CONTROL_MINOR);
                         if captain_crew_control { capabilities.push(protocol::CAPTAIN_CREW_CONTROL); }
                         captain_events = minor >= u64::from(protocol::CAPTAIN_EVENTS_MINOR);
-                        if captain_events { capabilities.push(protocol::CAPTAIN_EVENTS); }
+                        if captain_events {
+                            capabilities.push(protocol::CAPTAIN_EVENTS);
+                            capabilities.push(protocol::CAPTAIN_INBOX);
+                        }
                         provider_updates = minor >= u64::from(protocol::PROVIDER_UPDATES_MINOR);
                         if provider_updates { capabilities.push(protocol::PROVIDER_UPDATES); }
                         if minor >= u64::from(protocol::CAPTAIN_PEER_DOCUMENTS_MINOR) {
@@ -1044,6 +1047,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err(protocol::PROVIDER_UPDATES_UPDATE_REQUIRED.into())
                 } else if method == "captain.reportPolicy" && !captain_events {
                     Err(protocol::CAPTAIN_EVENTS_UPDATE_REQUIRED.into())
+                } else if (method == "captain.recoveryMode" || method.starts_with("captain.inbox.")) && !captain_events {
+                    Err(protocol::CAPTAIN_INBOX_UPDATE_REQUIRED.into())
                 } else if matches!(method, "captain.reports.list" | "captain.report.answer") && !captain_reports {
                     Err(protocol::CAPTAIN_REPORTS_UPDATE_REQUIRED.into())
                 } else if matches!(method, "captain.lifecycle.preview" | "captain.archive" | "captain.unarchive") && !captain_archive {

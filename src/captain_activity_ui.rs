@@ -13,8 +13,8 @@ use super::captain_ui::{SHEET_BELOW, close_brief, icon_action, quiet_note};
 use super::crew_questions_ui::{delivery_words, outcome_status, outcome_word, policy_badge};
 use super::crew_ui::{active_wash, hover_wash, motion};
 use super::*;
-use crate::model::ReportPolicy;
 use crate::model::crew_reports::QuestionRecipient;
+use crate::model::{RecoveryMode, ReportPolicy};
 use serde_json::Value;
 
 /// KSG's `text-[13px] font-medium` detail rows, matching `captain_ui::ROW_TEXT`.
@@ -775,6 +775,80 @@ pub(super) fn policy_block(s: &State, p: Palette, captain: usize) -> El {
     block
 }
 
+/// Recovery has no KSG counterpart; use its ThreadDetailsSection and
+/// ThreadDetailsControl pattern already used by the Brief's Crew section.
+pub(super) fn recovery_block(s: &State, p: Palette, captain: usize) -> El {
+    let server = s.machines.selected.clone();
+    let current = s.captain_recovery_mode(captain);
+    let (mode, description, action, next) = match current {
+        RecoveryMode::Attended => (
+            "Attended",
+            "After restart, held events wait for your next message or an explicit resume.",
+            "Allow unattended recovery",
+            RecoveryMode::Unattended,
+        ),
+        RecoveryMode::Unattended => (
+            "Unattended",
+            "After restart, eligible events can resume once workers are reconciled. Approvals and uncertain work still wait.",
+            "Wait for me after restart",
+            RecoveryMode::Attended,
+        ),
+    };
+    let mut block = col()
+        .key("brief-captain-recovery")
+        .role("group")
+        .label("Restart recovery")
+        .px(10.0)
+        .pt(8.0)
+        .gap(4.0)
+        .child(
+            row()
+                .center_y()
+                .child(pixel_label("Restart recovery", p.muted))
+                .child(spacer())
+                .child(label(mode, META, p.ink).key("captain-recovery-mode")),
+        )
+        .child(quiet_note(description, p));
+    let reason = s.captain_recovery_unavailable(&server, captain);
+    let error = s.captain_recovery_errors.get(&(server.clone(), captain));
+    if let Some(error) = error {
+        block = block.child(label(error, META, p.danger).wrap().role("alert"));
+    }
+    if let Some(reason) = reason {
+        block = block.child(quiet_note(reason, p).key("captain-recovery-unavailable"));
+    } else {
+        block = block.child(row().child(super::crew_ui::ghost_button(
+            s,
+            "captain-recovery-change".into(),
+            action,
+            p,
+            move |s| {
+                if s.machines.selected == server
+                    && let Err(error) = s.change_captain_recovery(&server, captain, current, next)
+                {
+                    s.captain_recovery_errors
+                        .insert((server.clone(), captain), error);
+                }
+            },
+        )));
+    }
+    let mut waits = s.active_captain_wait_reasons(captain);
+    for (index, reason) in waits.by_ref().take(3).enumerate() {
+        block = block.child(
+            row()
+                .key(format!("captain-recovery-wait-{index}"))
+                .gap(6.0)
+                .child(pixel_label("Waiting", p.brass))
+                .child(label(reason, META, p.ink).wrap().grow(1.0).min_w(0.0)),
+        );
+    }
+    let remaining = waits.count();
+    if remaining > 0 {
+        block = block.child(quiet_note(format!("{remaining} more active waits"), p));
+    }
+    block
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,6 +1280,62 @@ mod tests {
         rt.frame(0.0);
         rt.frame(1.0);
         assert!(rt.presented("captain-report-policy-error").is_some());
+    }
+
+    #[test]
+    fn the_brief_shows_recovery_waits_and_sends_explicit_opt_in() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            brief(&mut rt);
+            let captain = rt.state.current().captain.unwrap();
+            let db = crate::database::Database::open(&rt.state.data_dir).unwrap();
+            db.begin().unwrap();
+            rt.state
+                .execute_command(&crate::protocol::Command {
+                    command_id: uuid::Uuid::new_v4(),
+                    method: "captain.inbox.await".into(),
+                    params: json!({"captain":captain,"correlationId":"ci","reason":"Waiting for CI."}),
+                })
+                .unwrap();
+            let (client, mut commands) =
+                crate::client::Client::test_connected(rt.state.data_dir.clone());
+            *client.info.lock().unwrap() = json!({"capabilities":[
+                crate::protocol::CAPTAIN_STATE,
+                crate::protocol::CAPTAIN_EVENTS,
+                crate::protocol::CAPTAIN_INBOX,
+            ]});
+            rt.state.client = Some(client);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            press_in_brief(&mut rt, "captain-recovery-change");
+            let command = commands.try_recv().expect("recovery command");
+            assert_eq!(command.method, "captain.recoveryMode");
+            assert_eq!(command.params["captain"], captain);
+            assert_eq!(command.params["mode"], "unattended");
+            assert_eq!(command.params["expectedMode"], "attended");
+            assert_eq!(
+                rt.state.captain_recovery_mode(captain),
+                RecoveryMode::Attended
+            );
+            assert!(
+                rt.state
+                    .captain_recovery_unavailable("local", captain)
+                    .is_some()
+            );
+            rt.update(|_, tx| tx.scroll_into_view("captain-recovery-wait-0"));
+            rt.frame(0.0);
+            assert!(rt.presented("captain-recovery-wait-0").is_some(), "{width}");
+            assert!(rt.state.captain_recovery_receipt(
+                "local",
+                &command,
+                &json!({"result":{"status":"rejected","result":{"error":"Recovery mode changed."}}}),
+            ));
+            assert_eq!(
+                rt.state.captain_recovery_errors.values().next().unwrap(),
+                "Recovery mode changed."
+            );
+        }
     }
 
     #[test]

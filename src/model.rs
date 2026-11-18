@@ -159,6 +159,9 @@ pub use run_control::StopPhase;
 pub use run_control::{StopControl, TurnCapabilities};
 #[path = "captain_event_policy.rs"]
 mod captain_event_policy;
+#[path = "captain_inbox.rs"]
+mod captain_inbox;
+pub use captain_inbox::RecoveryMode;
 #[path = "captain_state.rs"]
 mod captain_state;
 pub use captain_event_policy::ReportPolicy;
@@ -4744,6 +4747,7 @@ struct DeletedRecords {
     projects: Vec<(ProjectId, usize)>,
     reports: Vec<crew_reports::CrewReport>,
     answers: Vec<crew_questions::CrewAnswer>,
+    events: Vec<captain_inbox::InboxEvent>,
 }
 
 struct RequestedTabRestore {
@@ -5005,6 +5009,9 @@ pub struct State {
     captain_report_policies: std::collections::BTreeMap<usize, ReportPolicy>,
     captain_reports: Vec<crew_reports::CrewReport>,
     captain_question_answers: Vec<crew_questions::CrewAnswer>,
+    captain_recovery_modes: std::collections::BTreeMap<usize, captain_inbox::RecoveryMode>,
+    captain_inbox: Vec<captain_inbox::InboxEvent>,
+    captain_waits: Vec<captain_inbox::InboxWait>,
     /// In-memory Captain document drafts, keyed by server, captain and document name. Never
     /// persisted: an unsaved draft quits with the app (separate follow-up).
     pub captain_drafts: std::collections::BTreeMap<DocumentDraftKey, DocumentDraft>,
@@ -5017,6 +5024,8 @@ pub struct State {
     pub captain_policy_pending:
         std::collections::BTreeMap<(String, uuid::Uuid), CaptainPolicyChange>,
     pub captain_policy_errors: std::collections::BTreeMap<(String, usize), String>,
+    captain_recovery_pending: std::collections::BTreeMap<(String, uuid::Uuid), usize>,
+    pub captain_recovery_errors: std::collections::BTreeMap<(String, usize), String>,
     pub crew_question_drafts: std::collections::BTreeMap<(String, String), CrewQuestionDraft>,
     pub crew_questions_captain_open: bool,
     /// A dirty-draft close parked behind the discard confirmation.
@@ -6073,12 +6082,17 @@ impl State {
             captain_report_policies: Default::default(),
             captain_reports: Vec::new(),
             captain_question_answers: Vec::new(),
+            captain_recovery_modes: Default::default(),
+            captain_inbox: Vec::new(),
+            captain_waits: Vec::new(),
             captain_drafts: Default::default(),
             crew_pending: Default::default(),
             lifecycle_pending: Default::default(),
             promotion_pending: Default::default(),
             captain_policy_pending: Default::default(),
             captain_policy_errors: Default::default(),
+            captain_recovery_pending: Default::default(),
+            captain_recovery_errors: Default::default(),
             crew_question_drafts: Default::default(),
             crew_questions_captain_open: false,
             doc_discard: None,
@@ -7833,6 +7847,12 @@ impl State {
                 .filter(|answer| ids.contains(&answer.thread_id))
                 .cloned()
                 .collect(),
+            events: self
+                .captain_inbox
+                .iter()
+                .filter(|event| event.thread_id.is_some_and(|t| ids.contains(&t)))
+                .cloned()
+                .collect(),
             homes: self
                 .captain_homes
                 .iter()
@@ -7955,10 +7975,19 @@ impl State {
             .collect();
         self.captain_question_answers
             .retain(|answer| !ids.contains(&answer.thread_id));
+        let removed_events: std::collections::HashSet<String> = self
+            .captain_inbox
+            .iter()
+            .filter(|event| event.thread_id.is_some_and(|t| ids.contains(&t)))
+            .map(|event| event.id.clone())
+            .collect();
+        self.captain_inbox
+            .retain(|event| !event.thread_id.is_some_and(|t| ids.contains(&t)));
         let removed_deliveries: std::collections::HashSet<&str> = removed_reports
             .iter()
             .map(String::as_str)
             .chain(removed_answers.iter().map(String::as_str))
+            .chain(removed_events.iter().map(String::as_str))
             .collect();
         for thread in &mut self.threads {
             thread.pending_injections.retain(|injection| {
@@ -8445,6 +8474,15 @@ impl State {
                             .any(|a| a.id == answer.id)
                     {
                         self.captain_question_answers.push(answer);
+                    }
+                }
+                for event in records.events {
+                    if event
+                        .thread_id
+                        .is_none_or(|id| self.threads.iter().any(|t| t.id == id))
+                        && !self.captain_inbox.iter().any(|e| e.id == event.id)
+                    {
+                        self.captain_inbox.push(event);
                     }
                 }
                 for (captain, home) in records.homes {
@@ -14514,7 +14552,7 @@ impl State {
             self.current_mut().submission_error = Some(error);
             return false;
         }
-        self.release_task_results(self.current().id);
+        self.release_task_results(self.current().id, captain_inbox::ReleaseActor::User);
         if let Some(sent) = self.try_worktree_bootstrap_send(fresh_context, fresh_arm) {
             if sent && self.thread_admission_managed(self.active) {
                 let peer_worker = self.current().peer_origin.is_some();
@@ -15751,6 +15789,9 @@ impl State {
             // A different machine's records must not consult the old lifecycle map.
             self.captain_lifecycles.clear();
             self.captain_report_policies.clear();
+            self.captain_recovery_modes.clear();
+            self.captain_inbox.clear();
+            self.captain_waits.clear();
             self.projects.entries = projects;
             self.restore_repository_records(index)?;
             self.restore_captain_records(index, &project_remap)?;
@@ -15759,6 +15800,8 @@ impl State {
             self.restore_crew_answers(index)?;
             self.restore_captain_lifecycles(index)?;
             self.restore_captain_report_policies(index)?;
+            self.restore_captain_recovery_modes(index)?;
+            self.restore_captain_inbox(index)?;
             self.projects.next_id = next_project;
             self.next_id = next_thread;
             if restore_session {
@@ -16476,6 +16519,9 @@ impl State {
             "captainReportPolicies":self.captain_report_policies,
             "captainReports":self.captain_reports,
             "captainQuestionAnswers":self.captain_question_answers,
+            "captainRecoveryModes":self.captain_recovery_modes,
+            "captainInbox":self.captain_inbox,
+            "captainWaits":self.captain_waits,
             "threads":self.threads.iter().filter(|thread| {
                 // A blank draft is saved only while it is open or has a tab.
                 self.headless || self.persist_transcripts || !thread.blank_draft() || thread.crew_captain.is_some() || thread.id == self.current().id || self.tabs.contains(&thread.id)

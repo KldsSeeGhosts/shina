@@ -162,6 +162,80 @@ impl State {
         }
         true
     }
+
+    pub fn captain_recovery_unavailable(&self, server: &str, captain: usize) -> Option<String> {
+        if server != self.machines.selected {
+            return Some("Open the primary Captain conversation to change recovery.".into());
+        }
+        let Some(client) = &self.client else {
+            return Some("Changing recovery requires a connected Shina server.".into());
+        };
+        if !self.machine_connected(server) {
+            return Some(format!("{} is unreachable.", self.machine_label(server)));
+        }
+        if !client.supports_capability(server, crate::protocol::CAPTAIN_INBOX) {
+            return Some(crate::protocol::CAPTAIN_INBOX_UPDATE_REQUIRED.into());
+        }
+        if self.captain_access(captain) != CaptainAccess::Full {
+            return Some("Open the primary Captain conversation to change recovery.".into());
+        }
+        if self
+            .captain_recovery_pending
+            .iter()
+            .any(|((host, _), &owner)| host == server && owner == captain)
+        {
+            return Some("Waiting for the server to save the recovery setting.".into());
+        }
+        None
+    }
+
+    pub fn change_captain_recovery(
+        &mut self,
+        server: &str,
+        captain: usize,
+        expected: RecoveryMode,
+        mode: RecoveryMode,
+    ) -> Result<(), String> {
+        if let Some(reason) = self.captain_recovery_unavailable(server, captain) {
+            return Err(reason);
+        }
+        let id = self.policy_send(
+            server,
+            "captain.recoveryMode",
+            json!({"captain":captain,"mode":mode,"expectedMode":expected}),
+        )?;
+        self.captain_recovery_pending
+            .insert((server.to_owned(), id), captain);
+        self.captain_recovery_errors
+            .remove(&(server.to_owned(), captain));
+        Ok(())
+    }
+
+    pub(crate) fn captain_recovery_receipt(
+        &mut self,
+        server: &str,
+        command: &crate::protocol::Command,
+        value: &Value,
+    ) -> bool {
+        if command.method != "captain.recoveryMode" {
+            return false;
+        }
+        let Some(captain) = self
+            .captain_recovery_pending
+            .remove(&(server.to_owned(), command.command_id))
+        else {
+            return false;
+        };
+        if value["result"]["status"] != "accepted" {
+            let error = value["error"]["message"]
+                .as_str()
+                .or(value["result"]["result"]["error"].as_str())
+                .unwrap_or("The recovery setting did not change.");
+            self.captain_recovery_errors
+                .insert((server.to_owned(), captain), error.to_owned());
+        }
+        true
+    }
 }
 
 #[cfg(test)]

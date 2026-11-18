@@ -214,6 +214,160 @@ fn tool_names_as(url: &str, token: &str) -> Vec<String> {
 }
 
 #[test]
+fn captain_inbox_commits_headless_watch_events_and_replays_without_another_wake() {
+    let mut profile = Profile::new();
+    let release = profile.root.join("release-inbox");
+    fs::write(
+        profile.root.join("extra-env.json"),
+        json!({"SHINA_TEST_HOLD_INJECTION_FLUSH":release}).to_string(),
+    )
+    .unwrap();
+    profile.launch(&["serve"]);
+    let device = uuid::Uuid::new_v4();
+    let mut client = profile.client(device);
+    hello(&mut client, "inbox-headless");
+    let captain = captain_open(&mut client, "Inbox Captain");
+    let command = |client: &mut Client, method: &str, args: Value| {
+        let receipt = client.command(method, args, uuid::Uuid::new_v4());
+        assert_eq!(receipt["result"]["status"], "accepted", "{receipt}");
+        receipt["result"]["result"].clone()
+    };
+    command(
+        &mut client,
+        "captain.recoveryMode",
+        json!({"captain":0,"mode":"unattended","expectedMode":"attended"}),
+    );
+    let wait = command(
+        &mut client,
+        "captain.inbox.await",
+        json!({"captain":0,"correlationId":"build-28","reason":"Wait for build evidence."}),
+    )["waitId"]
+        .clone();
+    let event = |key: &str, summary: &str, failed| {
+        json!({"captain":0,"kind":"watch","source":"test-ci",
+            "eventKey":key,"correlationId":"build-28","summary":summary,"failed":failed})
+    };
+    let progress = command(
+        &mut client,
+        "captain.inbox.capture",
+        event("running-1", "Build progress to supersede", false),
+    )["event"]["id"]
+        .clone();
+    let failure = command(
+        &mut client,
+        "captain.inbox.capture",
+        event("failed-1", "Build failure to retain", true),
+    )["event"]["id"]
+        .clone();
+    let final_event = event("passed-1", "Verified build result", false);
+    let success =
+        command(&mut client, "captain.inbox.capture", final_event.clone())["event"]["id"].clone();
+    command(
+        &mut client,
+        "captain.reportPolicy",
+        json!({"captain":0,"policy":"ignore","expectedPolicy":"react"}),
+    );
+    let ignored_event = event("ignored-1", "A captured Ignore update", false);
+    let ignored = command(&mut client, "captain.inbox.capture", ignored_event)["event"].clone();
+    assert_eq!(ignored["policy"], "ignore");
+    command(
+        &mut client,
+        "captain.reportPolicy",
+        json!({"captain":0,"policy":"react","expectedPolicy":"ignore"}),
+    );
+    let mut cancelled_event = event("cancelled-1", "Cancelled external update", false);
+    cancelled_event["kind"] = json!("external");
+    let cancelled =
+        command(&mut client, "captain.inbox.capture", cancelled_event)["event"]["id"].clone();
+    command(
+        &mut client,
+        "captain.inbox.cancel",
+        json!({"captain":0,"eventId":cancelled}),
+    );
+    let mut expired_event = event("expired-1", "Expired update", false);
+    expired_event["expiresAt"] = json!(1);
+    let expiry = command(&mut client, "captain.inbox.capture", expired_event)["event"].clone();
+    assert_eq!(expiry["state"], "expired");
+    let changed = client.command(
+        "captain.inbox.capture",
+        event("passed-1", "Different content under the same key", false),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(changed["result"]["status"], "rejected", "{changed}");
+    let list = |client: &mut Client| command(client, "captain.inbox.list", json!({"captain":0}));
+    let status = |inbox: &Value, id: &Value| {
+        inbox["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["id"] == *id)
+            .unwrap()["state"]
+            .clone()
+    };
+    let before = list(&mut client);
+    assert_eq!(status(&before, &progress), "superseded");
+    assert_eq!(status(&before, &failure), "pending");
+    assert_eq!(status(&before, &success), "pending");
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    // No desktop, provider tool call or explicit user prompt releases this.
+    fs::write(&release, "").unwrap();
+    let mut client = profile.client(device);
+    hello(&mut client, "inbox-headless-restarted");
+    client.until(|state| {
+        state["index"]["captainInbox"]
+            .as_array()
+            .is_some_and(|events| {
+                [&failure, &success].iter().all(|id| {
+                    events
+                        .iter()
+                        .any(|event| event["id"] == **id && event["state"] == "accepted")
+                })
+            })
+    });
+    let after = list(&mut client);
+    assert_eq!(status(&after, &progress), "superseded");
+    assert_eq!(status(&after, &ignored["id"]), "pending");
+    assert_eq!(status(&after, &cancelled), "cancelled");
+    assert!(
+        after["waits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["id"] == wait && entry["state"] == "satisfied" })
+    );
+    let directory = directory_of(&mut client, &profile, captain);
+    let prompts_path = directory.join("fixture-prompts.jsonl");
+    let prompts = jsonl(&prompts_path);
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(
+        prompts[0]
+            .as_str()
+            .unwrap()
+            .contains("Build failure to retain")
+    );
+    assert!(
+        prompts[1]
+            .as_str()
+            .unwrap()
+            .contains("Verified build result")
+    );
+
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(device);
+    hello(&mut client, "inbox-accepted-restarted");
+    let replay = command(&mut client, "captain.inbox.capture", final_event);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["event"]["id"], success);
+    assert_eq!(replay["event"]["state"], "accepted");
+    assert_eq!(jsonl(&prompts_path), prompts);
+    profile.stop();
+}
+
+#[test]
 fn task_plan_pins_a_real_stacked_worktree_and_replays_its_launch_after_restart() {
     let mut profile = Profile::new();
     let workspace = profile.root.join("workspace");

@@ -2002,6 +2002,7 @@ impl State {
                 && (self.fleet_receipt(&server, command, value)
                     || self.captain_lifecycle_receipt(&server, command, value)
                     || self.captain_policy_receipt(&server, command, value)
+                    || self.captain_recovery_receipt(&server, command, value)
                     || self.captain_promotion_receipt(&server, command, value)
                     || self.crew_question_receipt(&server, command, value)
                     || self.crew_draft_receipt(&server, command, value)
@@ -5463,6 +5464,13 @@ impl State {
                     .map_err(|_| "expectedPolicy must be react, context or ignore.")?;
                 return self.set_captain_report_policy(number("captain")?, policy, expected);
             }
+            "captain.recoveryMode" => {
+                let mode = serde_json::from_value(args["mode"].clone())
+                    .map_err(|_| "mode must be attended or unattended.")?;
+                let expected = serde_json::from_value(args["expectedMode"].clone())
+                    .map_err(|_| "expectedMode must be attended or unattended.")?;
+                return self.set_captain_recovery_mode(number("captain")?, mode, expected);
+            }
             "captain.lifecycle.preview" => {
                 return self.captain_lifecycle_preview(number("captain")?, &text("action")?);
             }
@@ -5545,6 +5553,14 @@ impl State {
             }
             "captain.reports.list" => {
                 return self.captain_reports_value(number("captain")?, &args);
+            }
+            "captain.inbox.list" => {
+                return self.captain_inbox_value(number("captain")?, &args);
+            }
+            "captain.inbox.capture" => return self.record_captain_event(args),
+            "captain.inbox.await" => return self.await_captain_event(args),
+            "captain.inbox.cancel" => {
+                return self.cancel_captain_inbox_entry(number("captain")?, args);
             }
             "captain.report.answer" => {
                 return self.captain_report_answer(

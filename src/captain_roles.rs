@@ -370,6 +370,7 @@ impl State {
             }
         }
         self.captain_homes.remove(&captain);
+        self.close_captain_inbox(captain);
         self.captain_lifecycles.insert(
             captain,
             captain_lifecycle::CaptainLifecycle {

@@ -237,6 +237,7 @@ impl State {
         if self.reconcile_crew_report_acceptances() {
             changed = true;
         }
+        changed |= self.poll_captain_inbox();
         changed |= self.scrub_crew_report_injections();
         // Durable records commit before any process is woken with them. Global
         // report changes leave a scoped poll's partial snapshot, so the batch
@@ -372,6 +373,7 @@ impl State {
             }
         }
         self.prepare_crew_answer_recovery();
+        self.prepare_inbox_recovery();
         self.scrub_held_crew_report_injections();
     }
 
@@ -1276,10 +1278,10 @@ mod tests {
         restored.poll_tasks(Instant::now());
         assert!(restored.threads[home].pending_injections.is_empty());
         // A reset alone does not release the hold.
-        restored.release_task_results(usize::MAX);
+        restored.release_task_results(usize::MAX, captain_inbox::ReleaseActor::User);
         assert!(restored.captain_reports[0].hold_delivery);
         let home_id = restored.captain_home(0).unwrap();
-        restored.release_task_results(home_id);
+        restored.release_task_results(home_id, captain_inbox::ReleaseActor::User);
         assert!(!restored.captain_reports[0].hold_delivery);
         restored.threads[home].status = Status::Failed;
         restored.poll_tasks(Instant::now());

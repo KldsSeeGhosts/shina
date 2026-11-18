@@ -488,6 +488,22 @@ impl Task {
         }
     }
 
+    /// Whether any result notification is still held for review.
+    pub(super) fn has_held_notifications(&self) -> bool {
+        self.hold_delivery || self.prior_deliveries.iter().any(|delivery| delivery.hold)
+    }
+
+    /// Clears every delivery hold. Reports whether anything was released.
+    pub(super) fn release_result_notifications(&mut self) -> bool {
+        let mut released = self.hold_delivery;
+        self.hold_delivery = false;
+        for delivery in &mut self.prior_deliveries {
+            released |= delivery.hold;
+            delivery.hold = false;
+        }
+        released
+    }
+
     pub(super) fn finish(&mut self, state: TaskState, reply: &str, error: &str) {
         self.state = state;
         self.result_excerpt = report_excerpt(reply);
@@ -972,13 +988,23 @@ impl State {
         {
             return Err("The parent thread is unavailable.".into());
         }
-        self.release_task_results(parent_thread_id);
+        self.release_task_results(parent_thread_id, captain_inbox::ReleaseActor::User);
         self.poll_tasks(Instant::now());
         self.checkpoint();
         Ok(())
     }
 
-    pub(super) fn release_task_results(&mut self, parent_thread_id: usize) {
+    /// Releases restart-held deliveries for one home. A `User` turn also
+    /// releases the Captain's held inbox events (Context-policy records
+    /// included, since an explicit turn is their release contract) and
+    /// records itself as a `user_message` event. `System` is reserved for
+    /// unattended recovery, which uses `release_recovery_holds` instead so
+    /// Context holds survive.
+    pub(super) fn release_task_results(
+        &mut self,
+        parent_thread_id: usize,
+        actor: captain_inbox::ReleaseActor,
+    ) {
         let parents: Vec<_> = self
             .threads
             .iter()
@@ -1006,6 +1032,27 @@ impl State {
             }
         }
         self.release_crew_reports(parent_thread_id);
+        if actor == captain_inbox::ReleaseActor::User
+            && let Some(captain) = self
+                .captain_homes
+                .iter()
+                .find(|(_, home)| **home == parent_thread_id)
+                .map(|(captain, _)| *captain)
+        {
+            let now = lifecycle::now();
+            let mut released = Vec::new();
+            for event in &mut self.captain_inbox {
+                if event.captain == captain
+                    && event.state == captain_inbox::InboxState::Held
+                    && event.dispatched_at.is_none()
+                {
+                    event.state = captain_inbox::InboxState::Pending;
+                    event.updated_at = now;
+                    released.push(event.id.clone());
+                }
+            }
+            self.record_release_turn(captain, parent_thread_id, released);
+        }
     }
 
     /// Pre-creation admission checks: the coordinator's unfinished cap and
@@ -1734,9 +1781,16 @@ impl State {
         let dispatches: Vec<_> = self
             .threads
             .iter_mut()
-            .flat_map(|thread| thread.injection_dispatches.drain(..))
+            .flat_map(|thread| {
+                let id = thread.id;
+                thread
+                    .injection_dispatches
+                    .drain(..)
+                    .map(move |(delivery, realized)| (id, delivery, realized))
+            })
             .collect();
-        for (delivery, realized) in dispatches {
+        for (thread, delivery, realized) in dispatches {
+            changed |= self.note_inbox_dispatch(thread, &delivery);
             let Some(index) = self.operation_index_for_delivery(&delivery) else {
                 continue;
             };

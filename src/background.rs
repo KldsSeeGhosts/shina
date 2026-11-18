@@ -561,10 +561,11 @@ impl State {
                     }
                     _ => None,
                 }?;
-                Some((r.id, state))
+                Some((r.id, delivery.clone(), state))
             })
             .collect();
-        for (id, status) in finished {
+        for (id, delivery, status) in finished {
+            self.note_routine_outcome(&delivery, status);
             if let Err(error) = self.background.routines.finish(id, status) {
                 self.background.status.error = Some(error);
                 self.background.routine_retry = Some(now + Duration::from_secs(30));
@@ -635,6 +636,7 @@ impl State {
                 }) {
                 Ok(messages) => {
                     for (home, message) in messages {
+                        self.note_routine_delivery(home, &message);
                         if let Some(index) = self.threads.iter().position(|t| t.id == home) {
                             self.threads[index].pending_injections.push_back(Injection {
                                 text: message,

@@ -1113,16 +1113,16 @@ mod tests {
                 .all(|i| tasks::delivery_id(&i.text) != Some(answer_id.as_str()))
         );
         // Reset alone releases nothing; an explicit turn at the source does.
-        restored.release_task_results(usize::MAX);
+        restored.release_task_results(usize::MAX, captain_inbox::ReleaseActor::User);
         assert!(restored.captain_question_answers[0].hold_delivery);
-        restored.release_task_results(worker);
+        restored.release_task_results(worker, captain_inbox::ReleaseActor::User);
         assert!(!restored.captain_question_answers[0].hold_delivery);
         // Membership still waits on the report's own delivery; a turn at the
         // Captain's home releases it and its acceptance clears both guards.
         restored.poll_tasks(Instant::now());
         assert!(restored.crew_idle(index(&restored, worker)).is_err());
         let home_id = restored.captain_home(0).unwrap();
-        restored.release_task_results(home_id);
+        restored.release_task_results(home_id, captain_inbox::ReleaseActor::User);
         restored.poll_tasks(Instant::now());
         let home = index(&restored, home_id);
         restored.threads[home]
