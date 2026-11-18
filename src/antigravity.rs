@@ -345,7 +345,6 @@ pub fn read_text_file(request: &Value, roots: &[&Path]) -> Result<Value, (i64, S
         let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         real == root || real.starts_with(&root)
     });
-    let _ = &resolved;
     if !inside {
         return Err(outside());
     }
