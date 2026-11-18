@@ -91,6 +91,8 @@ mod markdown_ui;
 mod pi_ui;
 #[path = "pixel_icons.rs"]
 mod pixel_icons;
+#[path = "plan_ui.rs"]
+mod plan_ui;
 #[path = "settings_ui.rs"]
 pub(crate) mod settings_ui;
 #[path = "sidebar_ui.rs"]
@@ -15007,6 +15009,7 @@ fn composer(
         crew_ui::crew_bar(s, p, lane),
         crew_ui::needs_you(s, p),
         crew_ui::crew_tray(s, p, lane),
+        plan_ui::plan_panel(s, p, lane),
     ]
     .into_iter()
     .flatten()
@@ -26713,6 +26716,298 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         rt
+    }
+
+    /// Type into the open plan editor and save it through the panel's Save button.
+    fn plan_draft(rt: &mut Runtime<State>, key: Option<&str>, title: &str, brief: &str) {
+        let editor = rt.state.plan_panel.editor.as_mut().expect("editor open");
+        if let Some(key) = key {
+            editor.key.replace_text(key);
+        }
+        editor.title.replace_text(title);
+        editor.brief.replace_text(brief);
+        rt.invalidate();
+        press(rt, "plan-edit-save");
+        rt.frame(1.0);
+    }
+
+    fn plan_node(rt: &Runtime<State>, key: &str) -> serde_json::Value {
+        rt.state.shown_plan().expect("a plan")["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["key"] == key)
+            .cloned()
+            .unwrap_or_else(|| panic!("node {key}"))
+    }
+
+    #[test]
+    fn the_plan_panel_drafts_revises_and_starts_only_the_selected_ready_nodes() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state.lift_coordinator_limit_for_test();
+            let home = rt.state.current().id;
+            assert_eq!(rt.state.plan_home(), Some(home));
+            assert_inside(&mut rt, width, &["crew-tray", "crew-tray-plan"]);
+            press(&mut rt, "crew-tray-plan");
+            rt.frame(1.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &["plan-panel", "plan-empty", "plan-new-draft", "plan-start"],
+            );
+            // Three drafts allocate nothing: no task, thread or provider.
+            let (threads, tasks) = (rt.state.threads.len(), rt.state.tasks_for(home).len());
+            press(&mut rt, "plan-new-draft");
+            assert_inside(
+                &mut rt,
+                width,
+                &["plan-editor", "plan-edit-key", "plan-edit-brief"],
+            );
+            plan_draft(
+                &mut rt,
+                Some("a"),
+                "Map the reconnect path",
+                "Read the reconnect code.",
+            );
+            press(&mut rt, "plan-new-draft");
+            rt.state
+                .plan_panel
+                .editor
+                .as_mut()
+                .unwrap()
+                .key
+                .replace_text("b");
+            rt.invalidate();
+            press(&mut rt, "plan-edit-dep-a");
+            press(&mut rt, "plan-edit-stack-a");
+            plan_draft(&mut rt, None, "Fix the reconnect", "Fix what a found.");
+            press(&mut rt, "plan-new-draft");
+            plan_draft(&mut rt, Some("c"), "Sidebar notes", "Write sidebar notes.");
+            assert_eq!(rt.state.threads.len(), threads, "{width}");
+            assert_eq!(rt.state.tasks_for(home).len(), tasks, "{width}");
+            assert!(
+                rt.state.plan_panel.error.is_none(),
+                "{width}: {:?}",
+                rt.state.plan_panel.error
+            );
+            assert_eq!(plan_node(&rt, "b")["stacked_on"], "a");
+            assert_eq!(plan_node(&rt, "b")["status"], "draft");
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "plan-node-a",
+                    "plan-node-b",
+                    "plan-node-c",
+                    "plan-deps-b",
+                    "plan-reason-b",
+                ],
+            );
+            // Revise c, then lose a race on a: the stale save is refused and names it.
+            press(&mut rt, "plan-edit-c");
+            plan_draft(
+                &mut rt,
+                None,
+                "Sidebar review notes",
+                "Write sidebar review notes.",
+            );
+            assert_eq!(plan_node(&rt, "c")["revision"], 2);
+            assert_eq!(
+                element_text(&rt, "plan-revision-c").as_deref(),
+                Some("c r2")
+            );
+            press(&mut rt, "plan-edit-a");
+            let plan_id = rt.state.shown_plan().unwrap()["id"].clone();
+            rt.state
+                .mcp_call(
+                    home,
+                    "task_update",
+                    &json!({"plan": plan_id, "node": "a", "expected_revision": 1,
+                        "title": "Changed elsewhere"}),
+                )
+                .unwrap();
+            plan_draft(
+                &mut rt,
+                None,
+                "Map the reconnect path",
+                "Read the reconnect code first.",
+            );
+            assert!(
+                rt.state.plan_panel.editor.as_ref().unwrap().conflict,
+                "{width}"
+            );
+            assert_inside(
+                &mut rt,
+                width,
+                &["plan-edit-conflict", "plan-edit-rebase", "plan-error"],
+            );
+            assert_eq!(plan_node(&rt, "a")["title"], "Changed elsewhere");
+            press(&mut rt, "plan-edit-rebase");
+            press(&mut rt, "plan-edit-save");
+            rt.frame(1.0);
+            assert_eq!(plan_node(&rt, "a")["revision"], 3);
+            assert_eq!(
+                plan_node(&rt, "a")["brief"],
+                "Read the reconnect code first."
+            );
+            // Select only the ready nodes a and c; b waits on a and stays a draft.
+            press(&mut rt, "plan-select-a");
+            press(&mut rt, "plan-select-c");
+            assert_eq!(
+                element_text(&rt, "plan-start").as_deref(),
+                Some("Start 2 selected")
+            );
+            press(&mut rt, "plan-start");
+            rt.frame(1.0);
+            assert!(
+                rt.state.plan_panel.error.is_none(),
+                "{width}: {:?}",
+                rt.state.plan_panel.error
+            );
+            assert_eq!(rt.state.tasks_for(home).len(), tasks + 2, "{width}");
+            for key in ["a", "c"] {
+                let node = plan_node(&rt, key);
+                assert_eq!(node["status"], "launched");
+                let launch = element_text(&rt, &format!("plan-launch-{key}")).unwrap();
+                assert!(
+                    launch.contains(&format!("thread #{}", node["launch"]["thread_id"])),
+                    "{width}: {launch}"
+                );
+                assert!(launch.contains("Request desktop-start-"), "{launch}");
+            }
+            assert_eq!(plan_node(&rt, "b")["status"], "draft");
+            assert!(rt.presented("plan-select-a").is_none());
+            assert_inside(
+                &mut rt,
+                width,
+                &["plan-launch-a", "plan-open-a", "plan-select-b"],
+            );
+            // The panel shows exactly what the MCP tool returns to the same Captain home.
+            let mcp = rt.state.mcp_call(home, "task_plan", &json!({})).unwrap();
+            assert_eq!(rt.state.plan_view().unwrap(), mcp, "{width}");
+            // A failed upstream blocks b with the reason, and starting it needs an
+            // explicit, recorded override.
+            let a_task = plan_node(&rt, "a")["launch"]["task_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            rt.state
+                .finish_task_for_test(&a_task, crate::model::TaskState::Failed, "tests broke");
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_eq!(plan_node(&rt, "b")["status"], "blocked");
+            assert!(
+                element_text(&rt, "plan-reason-b")
+                    .unwrap()
+                    .contains("failed")
+            );
+            // Stacking still needs a completed upstream, so drop the base before the override.
+            press(&mut rt, "plan-edit-b");
+            press(&mut rt, "plan-edit-stack-a");
+            press(&mut rt, "plan-edit-save");
+            rt.frame(1.0);
+            press(&mut rt, "plan-select-b");
+            press(&mut rt, "plan-start");
+            rt.frame(1.0);
+            assert_eq!(
+                rt.state.tasks_for(home).len(),
+                tasks + 2,
+                "nothing starts unconfirmed"
+            );
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "plan-override",
+                    "plan-override-node-b",
+                    "plan-override-reason",
+                    "plan-override-confirm",
+                ],
+            );
+            press(&mut rt, "plan-override-confirm");
+            assert_eq!(
+                rt.state.tasks_for(home).len(),
+                tasks + 2,
+                "an empty reason starts nothing"
+            );
+            rt.state
+                .plan_panel
+                .override_reason
+                .replace_text("The failure was in an unrelated test.");
+            rt.invalidate();
+            press(&mut rt, "plan-override-confirm");
+            rt.frame(1.0);
+            assert!(
+                rt.state.plan_panel.error.is_none(),
+                "{width}: {:?}",
+                rt.state.plan_panel.error
+            );
+            assert_eq!(rt.state.tasks_for(home).len(), tasks + 3, "{width}");
+            let plan = rt.state.shown_plan().unwrap();
+            assert_eq!(plan["overrides"][0]["node"], "b");
+            assert_eq!(
+                plan["overrides"][0]["reason"],
+                "The failure was in an unrelated test."
+            );
+            assert_eq!(plan["overrides"][0]["unsatisfied"][0]["state"], "failed");
+            assert!(
+                element_text(&rt, "plan-launch-b")
+                    .unwrap()
+                    .contains("Overrode a")
+            );
+            assert_inside(&mut rt, width, &["plan-panel", "composer"]);
+            // The panel shares the lane without squeezing the conversation away.
+            assert!(
+                rt.presented("conversation-7").unwrap().0[3] > 0.0,
+                "{width}"
+            );
+            press(&mut rt, "plan-close");
+            rt.frame(1.0);
+            assert!(rt.presented("plan-panel").is_none());
+        }
+    }
+
+    #[test]
+    fn plan_commands_act_as_the_named_captain_home_and_refuse_workers() {
+        let mut rt = crew_runtime(1280.0);
+        let home = rt.state.current().id;
+        let prepare = |thread: usize| {
+            crate::protocol::Command::new(
+                "task.plan.prepare",
+                json!({"threadId": thread, "args": {"plan": "p", "node": "a", "prompt": "Do a."}}),
+            )
+        };
+        // A worker in this captain's crew cannot manage plans.
+        let worker = rt.state.tasks_for(home)[0].child_id;
+        let refused = rt.state.execute_command(&prepare(worker)).unwrap_err();
+        assert!(
+            refused.contains("Delegated threads cannot manage task plans"),
+            "{refused}"
+        );
+        assert!(rt.state.task_plans.is_empty());
+        // The home's command writes the same plan the MCP tool reads.
+        rt.state.execute_command(&prepare(home)).unwrap();
+        let read = rt
+            .state
+            .execute_command(&crate::protocol::Command::new(
+                "task.plan",
+                json!({"threadId": home, "args": {}}),
+            ))
+            .unwrap();
+        assert_eq!(
+            read,
+            rt.state.mcp_call(home, "task_plan", &json!({})).unwrap()
+        );
+        assert_eq!(read["plans"][0]["nodes"][0]["key"], "a");
+        let missing = rt
+            .state
+            .execute_command(&crate::protocol::Command::new(
+                "task.plan",
+                json!({"args": {}}),
+            ))
+            .unwrap_err();
+        assert!(missing.contains("threadId"), "{missing}");
     }
 
     #[test]

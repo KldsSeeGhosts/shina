@@ -51,6 +51,9 @@ pub(super) struct Task {
     /// The caller-scoped application retry contract for a keyed delegation.
     #[serde(default)]
     pub request_key: Option<RequestKey>,
+    /// The plan node this task was launched from, when a task plan started it.
+    #[serde(default)]
+    pub plan_node: Option<PlanTaskRef>,
     pub id: String,
     pub parent_thread_id: usize,
     pub child_thread_id: usize,
@@ -95,6 +98,28 @@ pub(super) struct Task {
 pub struct RequestKey {
     pub key: String,
     pub intent_hash: String,
+}
+
+/// The task plan node a launched task came from, recorded on the task so its
+/// status and the index projection carry the same launch linkage the plan
+/// records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanTaskRef {
+    pub plan: String,
+    pub node: String,
+}
+
+/// The validated, caller-facing delegation choices a local launch will use,
+/// computed before any thread or task exists.
+pub(super) struct LocalDelegateSpec {
+    pub prompt: String,
+    pub harness: String,
+    pub target: Option<DelegationTarget>,
+    pub selection: Option<Selection>,
+    pub project: Option<ProjectId>,
+    pub captain: Option<usize>,
+    pub models: Vec<AgentModel>,
 }
 
 /// One keyed task-control operation, separate from its immutable saved receipt.
@@ -274,7 +299,7 @@ fn task_control_command_id(key: &str) -> uuid::Uuid {
     keyed_command_id("shina.task-control.request-key", key)
 }
 
-fn keyed_command_id(namespace: &str, key: &str) -> uuid::Uuid {
+pub(super) fn keyed_command_id(namespace: &str, key: &str) -> uuid::Uuid {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("{namespace}:{key}"));
     let mut bytes = [0u8; 16];
@@ -344,7 +369,7 @@ pub struct AttentionItem {
     pub short_title: String,
 }
 
-fn unique_id() -> String {
+pub(super) fn unique_id() -> String {
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
         "{}-{}-{}",
@@ -407,6 +432,7 @@ impl Task {
         Self {
             remote: None,
             request_key: None,
+            plan_node: None,
             attempt_id: format!("{id}-brief"),
             attempt_message: delivery_text(
                 &format!("{id}-brief"),
@@ -1064,12 +1090,249 @@ impl State {
         })
     }
 
+    /// The durable audit namespace for plan tools: the same caller identity
+    /// delegate receipts are scoped under.
+    pub(super) fn delegate_scope_device(&self, caller_index: usize) -> String {
+        self.delegate_scope(caller_index).device()
+    }
+
+    /// The coordinator home thread behind the caller's delegate scope.
+    pub(super) fn caller_delegate_home(&self, caller_index: usize) -> usize {
+        self.delegate_scope_home(self.delegate_scope(caller_index))
+    }
+
     fn delegate_scope(&self, caller_index: usize) -> DelegateScope {
         let thread = &self.threads[caller_index];
         match thread.captain.filter(|_| thread.captain_home) {
             Some(captain) => DelegateScope::Captain(captain),
             None => DelegateScope::Thread(thread.id),
         }
+    }
+
+    /// The local delegation spec: every caller-facing validation
+    /// `delegate_task` runs before it allocates, with no mutation of state.
+    /// `task_start` runs the same check on drafted nodes before any launch.
+    pub(super) fn local_delegate_spec(
+        &self,
+        caller_index: usize,
+        args: &Value,
+    ) -> Result<LocalDelegateSpec, String> {
+        let prompt = args["prompt"].as_str().map(str::trim).unwrap_or("");
+        if prompt.is_empty() {
+            return Err("prompt must describe the task.".into());
+        }
+        if self.threads[caller_index].machine != "local" {
+            return Err(format!(
+                "Shina delegates only on the local machine. The caller's machine {} is unavailable.",
+                self.threads[caller_index].machine
+            ));
+        }
+        if remote_tasks::target_machine(args)?.is_some_and(|machine| machine != "local") {
+            return Err("This launch path only supports local execution.".into());
+        }
+        let target = parse_delegation_target(args)?;
+        let harness = target
+            .as_ref()
+            .and_then(|t| t.harness.clone())
+            .unwrap_or_else(|| self.threads[caller_index].harness.clone());
+        self.validate_harness(&harness)?;
+        self.require_harness_executable(&harness)?;
+        let provider = if harness == "pi" { "cpa" } else { &harness };
+        if target
+            .as_ref()
+            .and_then(|t| t.provider.as_deref())
+            .is_some_and(|p| p != provider)
+        {
+            return Err(format!(
+                "target.provider must be {provider} for harness {harness}."
+            ));
+        }
+        let models = if harness == self.threads[caller_index].harness {
+            self.delegation_models(&self.threads[caller_index]).0
+        } else {
+            self.harness_models(&harness)
+        };
+        let inherited = if harness == self.threads[caller_index].harness {
+            self.inherited_selection(caller_index)
+        } else if harness == "pi" {
+            self.default_selection()
+        } else {
+            None
+        };
+        let selection = match &target {
+            Some(target) => target
+                .model
+                .clone()
+                .or_else(|| inherited.as_ref().map(|s| s.model.clone()))
+                .map(|model| Selection {
+                    provider: provider.into(),
+                    model,
+                    reasoning: target
+                        .reasoning
+                        .clone()
+                        .or_else(|| inherited.and_then(|choice| choice.reasoning)),
+                }),
+            None => inherited,
+        };
+        if selection.is_none() && target.as_ref().is_some_and(|t| t.reasoning.is_some()) {
+            return Err(
+                "A reasoning target requires an advertised model so Shina can validate the level."
+                    .into(),
+            );
+        }
+        if let Some(selection) = &selection {
+            self.validate_delegation_selection(&models, selection, target.is_some())?;
+        }
+        let project = self.delegation_workspace(caller_index, args)?;
+        if let Some(project) = self.project(project)
+            && project.machine != "local"
+        {
+            return Err("Shina delegates only into local workspaces.".into());
+        }
+        let assigned = self.threads[caller_index]
+            .captain
+            .filter(|_| self.threads[caller_index].captain_home);
+        let captain = match args["captain"]
+            .as_str()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            Some(name) => {
+                if !assigned.is_some_and(|id| self.captains[id].name.eq_ignore_ascii_case(name)) {
+                    return Err("Crew inherits the calling captain. Open that captain's home to delegate with its profile.".into());
+                }
+                assigned
+            }
+            None => assigned,
+        };
+        Ok(LocalDelegateSpec {
+            prompt: prompt.to_owned(),
+            harness,
+            target,
+            selection,
+            project,
+            captain,
+            models,
+        })
+    }
+
+    /// The local `delegate_task` path: capacity, validated spec, thread and
+    /// task allocation, placement, admission reservation, keyed receipt and
+    /// the first scheduling pass. Plan launches run through this same path so
+    /// a drafted node is indistinguishable from a direct delegation.
+    pub(super) fn delegate_local(
+        &mut self,
+        caller_index: usize,
+        args: &Value,
+        request_key: Option<&str>,
+    ) -> Result<Value, String> {
+        let caller = self.threads[caller_index].id;
+        self.check_task_capacity(caller)?;
+        let prepared =
+            self.prepare_local_delegation(caller_index, args, request_key, self.next_id)?;
+        let status = self.stage_local_delegation(caller_index, args, request_key, prepared)?;
+        self.checkpoint();
+        self.start_queued_tasks();
+        Ok(status)
+    }
+
+    /// Resolve placement before publishing a thread or reserving admission.
+    /// A plan can validate every selected node before it stages any of them.
+    pub(super) fn prepare_local_delegation(
+        &self,
+        caller_index: usize,
+        args: &Value,
+        request_key: Option<&str>,
+        id: usize,
+    ) -> Result<(Thread, Task), String> {
+        let caller = self.threads[caller_index].id;
+        let spec = self.local_delegate_spec(caller_index, args)?;
+        let mut thread = Thread::new(id);
+        thread.harness = spec.harness;
+        thread.project = spec.project;
+        thread.machine = self.threads[caller_index].machine.clone();
+        thread.title = args["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or(&spec.prompt)
+            .chars()
+            .take(45)
+            .collect();
+        thread.captain = spec.captain;
+        thread.crew_captain = spec.captain;
+        thread.delegated = true;
+        thread.native.access = match self.threads[caller_index].native.access {
+            AccessMode::ReadOnly => AccessMode::default(),
+            access => access,
+        };
+        thread.parent = Some(caller);
+        thread.models = spec.models;
+        if let Some(selection) = &spec.selection {
+            thread.set_model(selection.provider.clone(), selection.model.clone());
+            if let Some(reasoning) = &selection.reasoning {
+                thread.set_thinking(reasoning.clone());
+            }
+        }
+        thread.arm_task();
+        thread.life.mark_unread();
+        let mut task = Task::new(
+            &thread,
+            &spec.prompt,
+            spec.selection.as_ref().map(Selection::to_value),
+        );
+        task.request_key = request_key.map(|key| RequestKey {
+            key: key.into(),
+            intent_hash: delegate_intent_hash(args),
+        });
+        #[cfg(test)]
+        let git_ctx = self.test_git_context.clone().unwrap_or_default();
+        #[cfg(not(test))]
+        let git_ctx = crate::vcs::GitContext::default();
+        let placement = self.plan_thread_placement(
+            &thread,
+            placement::spec_from_args(args)?.as_ref(),
+            &format!("delegate:{}/{}", task.id, id),
+            "local",
+            &git_ctx,
+        )?;
+        if placement.read_only() {
+            // A shared reader keeps the parent's dirty checkout visible
+            // and never gains write access to it.
+            thread.native.access = AccessMode::ReadOnly;
+        }
+        if placement.uses_worktree() {
+            thread.worktree_path = placement.checkout.clone();
+            thread.branch = placement.branch.clone();
+            thread.env_mode = Some(ThreadEnvMode::Worktree);
+        }
+        thread.placement = Some(placement);
+        Ok((thread, task))
+    }
+
+    pub(super) fn stage_local_delegation(
+        &mut self,
+        caller_index: usize,
+        args: &Value,
+        request_key: Option<&str>,
+        (thread, task): (Thread, Task),
+    ) -> Result<Value, String> {
+        let caller = self.threads[caller_index].id;
+        let id = thread.id;
+        debug_assert_eq!(id, self.next_id);
+        self.next_id += 1;
+        self.threads.push(thread);
+        self.tasks.push(task);
+        self.sync_memory_links();
+        // The attempt reserves admission before the pump can start it.
+        self.admit_task_index(self.tasks.len() - 1);
+        let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
+        if let Some(key) = request_key
+            && let Err(error) = self.record_delegate_receipt(caller_index, key, args, &status)
+        {
+            return Err(self.fail_delegate_receipt(error));
+        }
+        Ok(status)
     }
 
     /// Tasks route to a Captain's current home, so the scope home also covers
@@ -1824,7 +2087,7 @@ impl State {
 
     /// A legacy file profile has one committed snapshot for the task change and
     /// its receipt. Wait for that write before the caller can dispatch work.
-    fn persist_receipt_snapshot(&mut self) -> Result<(), String> {
+    pub(super) fn persist_receipt_snapshot(&mut self) -> Result<(), String> {
         if self.store.is_some() {
             return self
                 .checkpoint_and_flush()

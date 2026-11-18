@@ -2006,7 +2006,8 @@ impl State {
                     || self.crew_question_receipt(&server, command, value)
                     || self.crew_draft_receipt(&server, command, value)
                     || self.captain_document_receipt(&server, command, value)
-                    || self.captain_crew_receipt(&server, command, value))
+                    || self.captain_crew_receipt(&server, command, value)
+                    || self.task_plan_receipt(&server, command, value))
             {
                 continue;
             }
@@ -2505,6 +2506,7 @@ impl State {
         }
         changed |= self.poll_approval_sends();
         changed |= self.poll_question_answers();
+        changed |= self.poll_plan_panel();
         if self.approval_sends_pending() {
             tx.wake_after(Duration::from_millis(16));
         }
@@ -4629,6 +4631,13 @@ impl State {
 
     pub fn execute_command(&mut self, command: &Command) -> Result<Value, String> {
         let args = &command.params;
+        if command.method == "task.plan" {
+            let home = args["threadId"]
+                .as_u64()
+                .and_then(|id| usize::try_from(id).ok())
+                .ok_or("threadId must name the Captain home that owns the plan.")?;
+            return self.mcp_call(home, "task_plan", &args["args"]);
+        }
         if let Some(id) = args.get("threadId") {
             self.active = self
                 .threads
@@ -5643,6 +5652,19 @@ impl State {
                     "task.send" => "task_send",
                     _ => "task_cancel",
                 };
+                return self.mcp_call(self.current().id, tool, &args["args"]);
+            }
+            // The desktop's plan panel drives the same reducer and reads the same
+            // plan view as the MCP plan tools, as the Captain home it names.
+            "task.plan.prepare" | "task.plan.update" | "task.plan.start" => {
+                let tool = match command.method.as_str() {
+                    "task.plan.prepare" => "task_prepare",
+                    "task.plan.update" => "task_update",
+                    _ => "task_start",
+                };
+                if args.get("threadId").is_none() {
+                    return Err("threadId must name the Captain home that owns the plan.".into());
+                }
                 return self.mcp_call(self.current().id, tool, &args["args"]);
             }
             _ => return Err(format!("Unsupported slice 1 method {}.", command.method)),

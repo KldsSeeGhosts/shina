@@ -368,6 +368,175 @@ fn captain_inbox_commits_headless_watch_events_and_replays_without_another_wake(
 }
 
 #[test]
+fn task_plan_pins_a_real_stacked_worktree_and_replays_its_launch_after_restart() {
+    let mut profile = Profile::new();
+    let workspace = profile.root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let git = |cwd: &std::path::Path, args: &[&str]| {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    git(&workspace, &["init", "-b", "main", "--quiet"]);
+    fs::write(workspace.join("base.txt"), "main base\n").unwrap();
+    git(&workspace, &["add", "base.txt"]);
+    git(&workspace, &["commit", "-qm", "main base"]);
+    let main_commit = git(&workspace, &["rev-parse", "HEAD"]);
+    profile.launch(&["serve"]);
+    let device = uuid::Uuid::new_v4();
+    let mut client = profile.client(device);
+    hello(&mut client, "task-plan-start");
+    let project = client.command(
+        "project.put",
+        json!({"path":workspace}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(project["result"]["status"], "accepted", "{project}");
+    let captain = captain_open(&mut client, "Plan Captain");
+    let scope = client.command(
+        "captain.scope",
+        json!({"captain":0,"projects":[1]}),
+        uuid::Uuid::new_v4(),
+    );
+    assert_eq!(scope["result"]["status"], "accepted", "{scope}");
+    let connect_captain = |client: &mut Client, message: &str| {
+        let send = client.command(
+            "thread.send",
+            json!({"threadId":captain,"text":message,"attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(send["result"]["status"], "accepted", "{send}");
+        client.until_sequence(send["result"]["seq"].as_u64().unwrap(), |state| {
+            state["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|thread| thread["id"] == captain && thread["status"] == "Completed")
+        });
+    };
+    connect_captain(&mut client, "Prepare test plan");
+    let home = directory_of(&mut client, &profile, captain);
+    for node in [
+        json!({"plan":"stack","node":"up","prompt":"Write the upstream result.",
+            "placement":{"mode":"isolated","baseBranch":"main"}}),
+        json!({"plan":"stack","node":"down","prompt":"Use the upstream result.",
+            "depends_on":["up"],"stacked_on":"up"}),
+        json!({"plan":"stack","node":"spare","prompt":"Leave this as a draft."}),
+    ] {
+        assert_eq!(fixture_call(&home, "task_prepare", node)["revision"], 1);
+    }
+    let revised = fixture_call(
+        &home,
+        "task_update",
+        json!({"plan":"stack","node":"down","expected_revision":1,
+            "expected_outputs":"Return the stacked check."}),
+    );
+    assert_eq!(revised["revision"], 2);
+    let downstream = json!({"plan":"stack","node":"down","client_request_id":"start-down"});
+    let blocked = fixture_refusal(&home, "task_start", downstream.clone());
+    assert!(blocked.contains("has not launched"), "{blocked}");
+    client.rpc("workspace.subscribe", json!({}), json!("drafts-only"));
+    assert!(
+        client.snapshot["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let settled = |state: &Value, task: &Value| {
+        state["index"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == *task && entry["state"] == "completed")
+    };
+    let upstream = fixture_call(
+        &home,
+        "task_start",
+        json!({"plan":"stack","node":"up","client_request_id":"start-up"}),
+    );
+    let up = &upstream["started"][0];
+    client.until(|state| settled(state, &up["task_id"]));
+    let up_checkout = directory_of(&mut client, &profile, up["thread_id"].as_u64().unwrap());
+    assert_ne!(up_checkout, workspace);
+    fs::write(
+        up_checkout.join("stack-output.txt"),
+        "committed upstream output\n",
+    )
+    .unwrap();
+    git(&up_checkout, &["add", "stack-output.txt"]);
+    git(&up_checkout, &["commit", "-qm", "verified upstream result"]);
+    let upstream_commit = git(&up_checkout, &["rev-parse", "HEAD"]);
+    assert_ne!(upstream_commit, main_commit);
+
+    let launched = fixture_call(&home, "task_start", downstream.clone());
+    let down = &launched["started"][0];
+    assert_eq!(
+        launched["plan"]["nodes"][1]["launch"]["resolved_base"]["commit"],
+        upstream_commit
+    );
+    assert_eq!(launched["plan"]["nodes"][2]["status"], "ready");
+    assert!(launched["plan"]["nodes"][2]["launch"].is_null());
+    client.until(|state| settled(state, &down["task_id"]));
+    let downstream_checkout =
+        directory_of(&mut client, &profile, down["thread_id"].as_u64().unwrap());
+    assert_ne!(downstream_checkout, up_checkout);
+    assert_eq!(
+        git(&downstream_checkout, &["rev-parse", "HEAD"]),
+        upstream_commit
+    );
+    assert_eq!(
+        fs::read_to_string(downstream_checkout.join("stack-output.txt")).unwrap(),
+        "committed upstream output\n"
+    );
+    let prompt_log = downstream_checkout.join("fixture-prompts.jsonl");
+    let prompts = jsonl(&prompt_log);
+    assert_eq!(prompts.len(), 1);
+    assert!(
+        prompts[0]
+            .as_str()
+            .unwrap()
+            .contains("Return the stacked check.")
+    );
+
+    drop(client);
+    profile.stop();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(device);
+    hello(&mut client, "task-plan-restart");
+    connect_captain(&mut client, "Read the saved plan");
+    let replay = fixture_call(&home, "task_start", downstream);
+    assert_eq!(replay["replayed"], true, "{replay}");
+    assert_eq!(replay["started"], launched["started"]);
+    assert_eq!(replay["plan"]["nodes"][1]["revision"], 2);
+    assert!(replay["plan"]["nodes"][2]["launch"].is_null());
+    assert_eq!(
+        client.snapshot["index"]["tasks"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(jsonl(&prompt_log), prompts);
+    profile.stop();
+}
+
+#[test]
 fn captain_continues_on_a_linked_executor_without_creating_a_second_home() {
     let mut home = Profile::new();
     let mut target = Profile::new();

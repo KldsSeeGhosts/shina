@@ -71,7 +71,8 @@
       "execution-leases-v1",
       "captain-continue-on-v1",
       "logical-repositories-v1",
-      "admission-scheduler-v1"
+      "admission-scheduler-v1",
+      "task-plans-v1"
     ],
     "controllerId": "<uuid>",
     "deviceId": "<uuid>",
@@ -109,7 +110,7 @@
     "ownerId": "<uuid>",
     "projectionSchema": 1,
     "protocolMajor": 1,
-    "protocolMinor": 48,
+    "protocolMinor": 49,
     "serverId": "<serverId>",
     "serverTime": "<time>",
     "workspaceId": "<uuid>"

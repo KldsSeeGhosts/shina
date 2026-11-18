@@ -8246,3 +8246,56 @@ mod update_recovery;
 
 #[path = "support/capability_parity.rs"]
 mod capability_parity;
+
+#[test]
+fn task_plans_are_negotiated_and_drive_the_mcp_plan_reducer() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let prepare = json!({"threadId":1,"args":{"plan":"p","node":"a","prompt":"Map the code."}});
+    for minor in [protocol::TASK_PLANS_MINOR - 1, protocol::MINOR] {
+        let hello = client.rpc(
+            "hello",
+            json!({"protocolMajor":1,"protocolMinor":minor,"projectionSchema":1}),
+            json!(format!("task-plans-{minor}")),
+        );
+        let negotiated = hello["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|cap| cap == protocol::TASK_PLANS);
+        assert_eq!(negotiated, minor >= protocol::TASK_PLANS_MINOR);
+        let result = client.command("task.plan.prepare", prepare.clone(), uuid::Uuid::new_v4());
+        if !negotiated {
+            assert_eq!(
+                result["error"]["message"],
+                protocol::TASK_PLANS_UPDATE_REQUIRED,
+                "{result}"
+            );
+            continue;
+        }
+        assert_eq!(result["result"]["status"], "accepted", "{result}");
+        assert_eq!(result["result"]["result"]["revision"], 1);
+        // The read returns the same plan value the prepare reply carried.
+        let read = client.command(
+            "task.plan",
+            json!({"threadId":1,"args":{"plan":"p"}}),
+            uuid::Uuid::new_v4(),
+        );
+        assert_eq!(read["result"]["status"], "accepted", "{read}");
+        assert_eq!(
+            read["result"]["result"]["plan"]["nodes"][0],
+            result["result"]["result"]["plan"]["nodes"][0]
+        );
+        let stale = client.command(
+            "task.plan.update",
+            json!({"threadId":1,"args":{"plan":"p","node":"a","expected_revision":9,"title":"x"}}),
+            uuid::Uuid::new_v4(),
+        );
+        assert!(
+            stale.to_string().contains("changed since revision 9"),
+            "{stale}"
+        );
+    }
+    profile.stop();
+}

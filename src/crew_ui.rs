@@ -86,7 +86,7 @@ pub(super) fn solid_button(
     )
 }
 
-fn open_thread(s: &mut State, id: usize) {
+pub(super) fn open_thread(s: &mut State, id: usize) {
     if let Some(remote) = s.remote_task(id).cloned()
         && let Some(thread) = remote.thread_id
         && s.client
@@ -929,7 +929,9 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                 )
         })
         .collect();
-    if tasks.is_empty() {
+    // A primary Captain home keeps the tray's header for its Plan control, crew or not.
+    let plan = super::plan_ui::plan_toggle(s, p);
+    if tasks.is_empty() && plan.is_none() {
         return None;
     }
     // One definition of working, shared with the chat header: running now. A worker waiting on
@@ -1071,6 +1073,10 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
         // An odd chip takes the left column; an empty cell keeps it half width.
         chips = chips.child(row().gap(8.0).child(last).child(el().w(0.0).grow(1.0)));
     }
+    // An open plan lists its launched nodes, so the tray keeps only its counts meanwhile.
+    if s.plan_panel_open() {
+        chips = col();
+    }
     Some(
         col()
             .key("crew-tray")
@@ -1085,7 +1091,9 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     .center_y()
                     .child(pixel_label("Crew", p.muted))
                     // One item per count, 8 px apart, never joined with a dot.
-                    .child(summary),
+                    .child(summary)
+                    .child(spacer())
+                    .child(plan.unwrap_or_else(el)),
             )
             .child(chips),
     )
@@ -1268,7 +1276,8 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
             .key("needs-you")
             .role("region")
             .label("Needs you")
-            .max_h(320.0)
+            // An open task plan shares the lane, so the stack gives it most of its height.
+            .max_h(if s.plan_panel_open() { 120.0 } else { 320.0 })
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
