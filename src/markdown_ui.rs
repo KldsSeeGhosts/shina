@@ -168,8 +168,8 @@ pub(super) fn render_with_find(
         .quote(p.frame, 2.0, 12.0, p.muted)
         .selection(p.coral_bg)
         .highlight_bg(p.brass.alpha(0.32))
-        .highlight_current_bg(p.coral.alpha(0.42))
-        .highlight_current_ring(Some((p.coral, 1.5)))
+        .highlight_current_bg(p.sea.alpha(0.32))
+        .highlight_current_ring(Some((p.ring, 1.5)))
         // The header frame owns the visible border. Rune's inner card has none.
         .code_block(p.code_bg, Color::TRANSPARENT)
         .diff(added, removed)

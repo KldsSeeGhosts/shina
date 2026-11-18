@@ -38,10 +38,10 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
     let mut options = col().gap(2.0).w_full();
     for (i, option) in question.options.iter().enumerate() {
         let selected = !custom && answer.selected.contains(&option.value);
-        // A square mark: a filled coral square for a chosen checkbox, a coral square inside the
-        // frame for a chosen radio.
+        // KSG checkbox (rounded-kbd, 4 px) and radio (circle) indicators.
         let indicator = el()
             .size(14.0, 14.0)
+            .radius(if question.multi { 4.0 } else { 7.0 })
             .center()
             .border(1.0, if selected { p.coral } else { p.field_line })
             .fill(if selected && question.multi {
@@ -49,8 +49,10 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
             } else {
                 Color::TRANSPARENT
             })
-            .child(if selected && !question.multi {
-                el().size(6.0, 6.0).fill(p.coral)
+            .child(if selected && question.multi {
+                icon("check", p.on_coral).size(10.0, 10.0)
+            } else if selected {
+                el().size(6.0, 6.0).radius(3.0).fill(p.coral)
             } else {
                 el()
             })

@@ -629,7 +629,7 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
                 let mut highlight = rune::TextHighlight::new(
                     range,
                     if active {
-                        p.coral.alpha(0.42)
+                        p.sea.alpha(0.32)
                     } else {
                         p.brass.alpha(0.32)
                     },

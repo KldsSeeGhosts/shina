@@ -5374,7 +5374,7 @@ fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
         return el().size(size, size).child(portrait).child(
             el().absolute(offset, offset)
                 .size(backing, backing)
-                .radius(4.0)
+                .radius(backing / 2.0)
                 .fill(p.panel)
                 .border(1.0, p.frame)
                 .center()
@@ -5635,7 +5635,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
 
     // The mark only shows what deserves a glance: work in progress, something that needs the
     // user, a failure, an unread result, a draft or a pin. Quiet rows leave it out.
-    let dot = |ink: Color| el().size(6.0, 6.0).fill(ink);
+    let dot = |ink: Color| el().size(6.0, 6.0).radius(3.0).fill(ink);
     let mark = if approval || thread.request.is_some() || row_status == Status::Waiting {
         Some(dot(p.brass))
     } else if row_status == Status::Running || row_status == Status::Failed {
@@ -11783,7 +11783,7 @@ fn build_user_or_system_row(
                 lbl = lbl.text_highlights(ranges.into_iter().enumerate().map(|(i, range)| {
                     let is_active = Some(i) == active_occ;
                     let bg = if is_active {
-                        p.coral.alpha(0.42)
+                        p.sea.alpha(0.32)
                     } else {
                         p.brass.alpha(0.32)
                     };
@@ -13953,7 +13953,7 @@ fn usage_progress_bar(key: String, fill_key: Option<String>, percent: f64, p: Pa
         .w_frac(fraction)
         .h_full()
         .radius(4.0)
-        .fill(if percent >= 90.0 { p.coral } else { p.faint });
+        .fill(if percent >= 90.0 { p.danger } else { p.faint });
     if let Some(fill_key) = fill_key {
         fill = fill.key(fill_key);
     }
@@ -24645,7 +24645,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .fill
             };
-            assert_eq!(fill(&rt, "usage-fill-0"), palette(rt.state.dark).coral);
+            assert_eq!(fill(&rt, "usage-fill-0"), palette(rt.state.dark).danger);
             assert_eq!(fill(&rt, "usage-fill-1"), palette(rt.state.dark).faint);
             rt.state.current_mut().context = Default::default();
             rt.state.current_mut().context_window = None;
