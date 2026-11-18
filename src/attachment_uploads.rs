@@ -225,21 +225,11 @@ fn connection(state: &State, machine: &str) -> (Capability, bool, Option<Link>) 
     };
     let info = client.info.lock().expect("connection info");
     let capability = Capability::from_caps(info["capabilities"].as_array().map(Vec::as_slice));
-    let link = client.remote.clone().or_else(|| {
-        let discovery = crate::server_auth::Discovery::read(&state.data_dir).ok()?;
-        let saved = crate::store::load(&state.data_dir.join("client-credential.json")).ok()??;
-        if saved["serverId"] != discovery.server_id {
-            return None;
-        }
-        Some(Link {
-            enabled: true,
-            server_id: discovery.server_id,
-            host: format!("127.0.0.1:{}", discovery.port),
-            device_id: saved["deviceId"].as_str()?.into(),
-            token: saved["token"].as_str()?.into(),
-        })
-    });
-    (capability, client.commands.connected(), link)
+    (
+        capability,
+        client.commands.connected(),
+        client.upload_link(),
+    )
 }
 
 impl Queue {
@@ -900,6 +890,12 @@ impl Queue {
                         };
                         changed = true;
                     }
+                } else {
+                    // KSG's `resolve-url` failure: with no credential to upload over, say so
+                    // instead of holding the draft as "still uploading". A failed upload does
+                    // not block Send, and reconnecting queues it again.
+                    entry.phase = Phase::Failed("Not connected".into());
+                    changed = true;
                 }
             }
             keep.push(entry);
@@ -1832,9 +1828,77 @@ mod tests {
         assert!(queue.block_reason("local", 1).is_none());
         *state.client.as_ref().unwrap().info.lock().unwrap() =
             json!({"capabilities":[protocol::STAGED_ATTACHMENTS]});
+        local_credential(&mut state);
         queue.poll(&mut state);
-        assert!(matches!(queue.entries[0].phase, Phase::Queued));
+        assert!(matches!(queue.entries[0].phase, Phase::Uploading { .. }));
         assert!(queue.block_reason("local", 1).is_some());
+        queue.remove("local", 1, "capability.png");
+    }
+
+    /// The local server's discovery file in the data directory and this device's credential in
+    /// its client slot, where `Client::start` keeps it.
+    fn local_credential(state: &mut State) {
+        let server_id = uuid::Uuid::new_v4().to_string();
+        crate::server_auth::Discovery {
+            server_id: server_id.clone(),
+            instance_id: "instance".into(),
+            epoch: "epoch".into(),
+            pid: 1,
+            started_at: 0,
+            port: 1,
+            protocol_major: protocol::MAJOR,
+            protocol_minor: 0,
+            binary_version: "test".into(),
+            bootstrap_token: "bootstrap".into(),
+        }
+        .publish(&state.data_dir)
+        .unwrap();
+        let slot = state.data_dir.join("clients").join("0");
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(
+            slot.join("client-credential.json"),
+            json!({"serverId": server_id, "deviceId": "device", "token": "fixture"}).to_string(),
+        )
+        .unwrap();
+        state.client.as_mut().unwrap().set_device_directory(slot);
+    }
+
+    #[test]
+    fn a_local_image_uploads_with_the_client_slot_credential_or_fails_without_one() {
+        let mut state = State::new(".".into(), false);
+        let (client, _commands) = crate::client::Client::test_connected(state.data_dir.clone());
+        *client.info.lock().unwrap() = json!({"capabilities":[protocol::STAGED_ATTACHMENTS]});
+        state.client = Some(client);
+        let image = Attachment {
+            id: "slot.png".into(),
+            name: "slot.png".into(),
+            mime: "image/png".into(),
+            width: 1,
+            height: 1,
+            bytes: 1,
+            path: None,
+            asset_id: None,
+            uploaded: None,
+            source: None,
+        };
+        state.current_mut().draft_images.push(image.clone());
+        // No credential: KSG's "Not connected", which does not hold the draft.
+        let mut queue = Queue::default();
+        queue
+            .entries
+            .push(Entry::fixture("local", 1, &image, Phase::Queued));
+        queue.poll(&mut state);
+        assert!(
+            matches!(&queue.entries[0].phase, Phase::Failed(reason) if reason == "Not connected")
+        );
+        assert!(queue.block_reason("local", 1).is_none());
+        // The credential in the client slot, not the data directory, starts the upload.
+        local_credential(&mut state);
+        assert!(!state.data_dir.join("client-credential.json").exists());
+        queue.retry("local", 1, "slot.png");
+        queue.poll(&mut state);
+        assert!(matches!(queue.entries[0].phase, Phase::Uploading { .. }));
+        queue.remove("local", 1, "slot.png");
     }
 
     #[test]

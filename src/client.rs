@@ -325,6 +325,13 @@ impl Client {
     pub fn set_device_directory(&mut self, directory: PathBuf) {
         self.device_directory = directory;
     }
+    /// The link attachments upload over: a linked machine's own, or this device's
+    /// credential for the local server, which lives in its client slot directory.
+    pub fn upload_link(&self) -> Option<crate::peer::Link> {
+        self.remote
+            .clone()
+            .or_else(|| local_upload_link(&self.directory, &self.device_directory))
+    }
     pub fn start(&mut self, wake: rune::Waker) {
         if !self.enabled() {
             return;
