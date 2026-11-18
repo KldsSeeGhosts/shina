@@ -244,6 +244,25 @@ struct Client {
     turn_serial: u64,
     usage_limits_raw: Value,
     usage_account: Value,
+    /// Claude Code's reported model list from `initialize`, for catalog routing.
+    reported: Vec<crate::claude_catalog::ClaudeReportedModel>,
+    /// Manifest catalog routed through this CLI's reported model ids.
+    catalog: crate::claude_catalog::ClaudeModelCatalog,
+    /// `claude --version` output parsed to semver, as KSG's provider probe reads it.
+    version: Option<String>,
+    /// `maxEffortLevel` caps from Claude Code `get_settings`, per settings source.
+    effort_cap_sources: Vec<crate::claude_catalog::ClaudeEffortCapSource>,
+    /// Options applied so far; the api model id resolves against the full selection.
+    model_options: Vec<crate::model_selection::ProviderOptionSelection>,
+    /// Discovery probes emit catalog fields sessions do not need.
+    probe: bool,
+    /// `system`/`init` arrived: it carries `claude_code_version`, like KSG's probe
+    /// awaiting the initialization result.
+    init_seen: bool,
+    /// `get_settings` resolved or was ruled out; model rows wait on it plus init.
+    settings_done: bool,
+    /// Grace for `system`/`init`; CLIs that never emit it still finish at this point.
+    init_deadline: Option<Instant>,
 }
 
 impl Client {
@@ -295,6 +314,15 @@ impl Client {
             turn_serial: 0,
             usage_limits_raw: Value::Null,
             usage_account: Value::Null,
+            reported: vec![],
+            catalog: Default::default(),
+            version: None,
+            effort_cap_sources: vec![],
+            model_options: vec![],
+            probe: false,
+            init_seen: false,
+            settings_done: false,
+            init_deadline: None,
         }
     }
 
@@ -430,6 +458,9 @@ impl Client {
             } else {
                 Duration::from_secs(5)
             }
+        } else if request["subtype"] == "get_settings" {
+            // CLIs that predate the request may never answer; models still list.
+            Duration::from_secs(5)
         } else {
             Duration::from_secs(30)
         };
@@ -490,130 +521,131 @@ impl Client {
             .unwrap_or_else(|| json!([]))
     }
 
+    /// Track option selections so routed api ids reflect the full model selection,
+    /// as `compileClaudeModelSelection` compiles them in KSG.
+    fn upsert_option(&mut self, id: &str, value: &Value) {
+        let parsed = if let Some(s) = value.as_str() {
+            crate::model_selection::OptionValue::Str(s.to_owned())
+        } else if let Some(b) = value.as_bool() {
+            crate::model_selection::OptionValue::Bool(b)
+        } else {
+            return;
+        };
+        self.model_options.retain(|o| o.id != id);
+        self.model_options
+            .push(crate::model_selection::ProviderOptionSelection {
+                id: id.into(),
+                value: parsed,
+            });
+    }
+
+    /// KSG `resolveClaudeCatalogApiModelId` for a manifest slug under the options
+    /// applied so far.
+    fn api_model_id(&self, slug: &str) -> String {
+        crate::claude_catalog::resolve_claude_catalog_api_model_id(
+            &self.catalog,
+            &crate::model_selection::ModelSelection {
+                instance_id: "claude".into(),
+                model: slug.to_owned(),
+                options: self.model_options.clone(),
+            },
+        )
+    }
+
     fn initialized(&mut self, data: &Value) -> Result<(), String> {
         // A failed blocking hook must never degrade to execution under user allow rules.
         if data["hook_on_failure_supported"] != true || data["hooks_applied"] == false {
             return Err("Claude cannot enforce Shina's blocking tool policy. Update Claude Code outside Shina.".into());
         }
         self.planning = data["current_permission_mode"] == "plan";
-        self.models =
-            data["models"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|model| {
-                    let id = model["value"].as_str()?;
-                    let manifest = crate::descriptors::claude_manifest_model_entry(id);
-                    let raw_levels: Vec<String> = model
-                        .get("supportedEffortLevels")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect();
-                    let capabilities =
-                        manifest
-                            .as_ref()
-                            .map(|m| m.capabilities.clone())
-                            .unwrap_or_else(|| {
-                                if raw_levels.is_empty() {
-                                    Default::default()
-                                } else {
-                                    crate::descriptors::ModelCapabilities {
-                                        option_descriptors: vec![
-                            crate::descriptors::ProviderOptionDescriptor::Select {
-                                id: "effort".into(),
-                                label: "Reasoning".into(),
-                                description: None,
-                                options: std::iter::once(crate::descriptors::ProviderOptionChoice {
-                                    id: "default".into(),
-                                    label: "Default".into(),
-                                    description: None,
-                                    is_default: true,
-                                })
-                                .chain(raw_levels.iter().map(|lvl| {
-                                    crate::descriptors::ProviderOptionChoice {
-                                        id: lvl.clone(),
-                                        label: lvl.clone(),
-                                        description: None,
-                                        is_default: false,
-                                    }
-                                }))
-                                .collect(),
-                                current_value: None,
-                                prompt_injected_values: vec![],
-                                role: Some(crate::descriptors::ProviderOptionRole::Reasoning),
-                            },
-                        ],
-                                    }
-                                }
-                            });
-                    let thinking_levels: Vec<String> = capabilities
-                        .option_descriptors
-                        .iter()
-                        .find(|d| d.id() == "effort")
-                        .map(|d| {
-                            crate::descriptors::selectable_provider_option_choices(d)
-                                .into_iter()
-                                .map(|c| c.id)
-                                .filter(|id| id != "default")
-                                .collect()
-                        })
-                        .unwrap_or(raw_levels);
-                    Some(json!({"provider":"claude","id":id,
-                "name":model["displayName"].as_str().unwrap_or(id),
-                "shortName":manifest.as_ref().and_then(|m| m.short_name.clone()),
-                "aliases":manifest.as_ref().map(|m| m.aliases.clone()).unwrap_or_default(),
-                "isLegacy":manifest.as_ref().is_some_and(|m| m.is_legacy),
-                "thinkingLevels":thinking_levels,
-                "capabilities":capabilities,
-                "input":["text","image"]}))
-                })
-                .collect();
-        // Documented CLI aliases supplement the live catalog, without invented effort levels.
-        for alias in [
-            "default",
-            "opus",
-            "sonnet",
-            "haiku",
-            "fable",
-            "opusplan",
-            "sonnet[1m]",
-        ] {
-            if !self.models.iter().any(|m| m["id"] == alias) {
-                let manifest = crate::descriptors::claude_manifest_model_entry(alias);
-                let capabilities = manifest
-                    .as_ref()
-                    .map(|m| m.capabilities.clone())
-                    .unwrap_or_default();
-                let thinking_levels: Vec<String> = capabilities
-                    .option_descriptors
-                    .iter()
-                    .find(|d| d.id() == "effort")
-                    .map(|d| {
-                        crate::descriptors::selectable_provider_option_choices(d)
-                            .into_iter()
-                            .map(|c| c.id)
-                            .filter(|id| id != "default")
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.models
-                    .push(json!({"provider":"claude","id":alias,"name":alias,
-                    "shortName":manifest.as_ref().and_then(|m| m.short_name.clone()),
-                    "isLegacy":manifest.as_ref().is_some_and(|m| m.is_legacy),
-                    "thinkingLevels":thinking_levels,
-                    "capabilities":capabilities,
-                    "input":["text","image"]}));
-            }
+        // KSG `withClaudeCodeModelRoutes`: report the CLI's own model ids so catalog
+        // slugs route to whatever a Bedrock/Vertex-style backend accepts.
+        self.reported = crate::claude_catalog::parse_claude_reported_models(&data["models"]);
+        self.catalog = crate::claude_catalog::with_claude_code_model_routes(
+            &crate::claude_catalog::bundled_claude_model_catalog(crate::lifecycle::now()),
+            &self.reported,
+        );
+        self.set_commands(&data["commands"]);
+        if data["account"].is_object() {
+            let mut acct = data["account"].clone();
+            crate::usage_limits::conceal_account_json(&mut acct);
+            self.usage_account = acct;
+            self.update("usageAccount", self.usage_account.clone());
         }
+        // Effort caps come from Claude Code's own settings. Older CLIs reject this
+        // request; the error and timeout paths finish initialization without them.
+        // KSG's probe awaits `init` the same way for `claude_code_version`.
+        self.init_deadline = Some(Instant::now() + Duration::from_secs(5));
+        self.request(
+            json!({"subtype":"get_settings"}),
+            json!({"type":"init_settings"}),
+        );
+        Ok(())
+    }
+
+    /// `finish_initialized` runs once `get_settings` has settled and `system`/`init`
+    /// (or its grace deadline) has arrived, mirroring KSG awaiting both probes.
+    fn try_finish_initialized(&mut self) {
+        if self.settings_done
+            && (self.init_seen
+                || self
+                    .init_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline))
+        {
+            self.finish_initialized();
+        }
+    }
+
+    /// Model rows and the deferred `initialize` replies, once `get_settings` has
+    /// resolved or been ruled out.
+    fn finish_initialized(&mut self) {
+        if self.ready {
+            return;
+        }
+        let mut rows = crate::claude_catalog::resolve_claude_models_for_version(
+            &self.catalog,
+            self.version.as_deref(),
+        );
+        rows = crate::claude_catalog::cap_claude_catalog_effort(
+            &self.catalog,
+            rows,
+            &self.effort_cap_sources,
+        );
+        rows.extend(crate::claude_catalog::claude_reported_models(
+            &self.catalog,
+            &self.reported,
+        ));
+        self.models = rows
+            .iter()
+            .map(|row| claude_row_model_value(&self.catalog, row))
+            .collect();
         self.model = self
             .models
             .iter()
-            .find(|m| m["id"] == "default")
+            .find(|m| m["isDefault"] == true)
+            .or_else(|| self.models.first())
             .cloned()
             .unwrap_or(Value::Null);
-        self.set_commands(&data["commands"]);
+        if self.probe {
+            if let Some(version) = &self.version {
+                self.update("version", json!(version));
+            }
+            self.update(
+                "updateRequiredModels",
+                json!(
+                    crate::claude_catalog::resolve_claude_update_required_models(
+                        &self.catalog,
+                        self.version.as_deref()
+                    )
+                ),
+            );
+            if let Some(message) = crate::claude_catalog::format_claude_version_upgrade_message(
+                &self.catalog,
+                self.version.as_deref(),
+            ) {
+                self.update("providerMessage", json!(message));
+            }
+        }
         self.ready = true;
         self.reply(
             &json!({"type":"get_available_models","id":"models"}),
@@ -633,12 +665,6 @@ impl Client {
             json!({"commands":self.commands}),
         );
         self.update("awareness", json!(true));
-        if data["account"].is_object() {
-            let mut acct = data["account"].clone();
-            crate::usage_limits::conceal_account_json(&mut acct);
-            self.usage_account = acct;
-            self.update("usageAccount", self.usage_account.clone());
-        }
         self.request(
             json!({"subtype":"get_usage","skipBehaviors":true}),
             json!({"type":"get_usage"}),
@@ -652,7 +678,6 @@ impl Client {
                 json!({"type":"mcp_status_check"}),
             );
         }
-        Ok(())
     }
 
     fn set_commands(&mut self, commands: &Value) {
@@ -735,6 +760,12 @@ impl Client {
                         self.finish_binding(false);
                         return Ok(());
                     }
+                    // CLIs that predate `get_settings` reject it; uncapped models still list.
+                    if pending.request["subtype"] == "get_settings" {
+                        self.settings_done = true;
+                        self.try_finish_initialized();
+                        return Ok(());
+                    }
                     if matches!(
                         pending.request["subtype"].as_str(),
                         Some("get_context_usage" | "get_usage")
@@ -751,6 +782,12 @@ impl Client {
                 }
                 match pending.request["subtype"].as_str().unwrap_or("") {
                     "initialize" => self.initialized(data)?,
+                    "get_settings" => {
+                        self.effort_cap_sources =
+                            crate::claude_catalog::parse_claude_effort_cap_sources(data);
+                        self.settings_done = true;
+                        self.try_finish_initialized();
+                    }
                     "get_usage" => {
                         if data.get("rate_limits_available").is_some() {
                             self.usage_limits_raw = json!({
@@ -761,12 +798,23 @@ impl Client {
                         }
                     }
                     "set_model" => {
-                        self.model = self
-                            .models
-                            .iter()
-                            .find(|m| m["id"] == pending.request["model"])
-                            .cloned()
-                            .unwrap();
+                        // `pending.request.model` is the routed api id; the row is the
+                        // slug the client asked for (`optionId` switches keep their row).
+                        let slug = pending.original["modelId"]
+                            .as_str()
+                            .map(|id| {
+                                crate::claude_catalog::resolve_claude_reported_model_slug(
+                                    &self.catalog,
+                                    id,
+                                )
+                            })
+                            .or_else(|| self.model["id"].as_str().map(str::to_owned));
+                        if let Some(model) = slug
+                            .as_ref()
+                            .and_then(|slug| self.models.iter().find(|m| m["id"] == *slug))
+                        {
+                            self.model = model.clone();
+                        }
                         self.usage = Value::Null;
                         self.reply(&pending.original, self.model.clone());
                     }
@@ -975,6 +1023,15 @@ impl Client {
             }
             "system" => match record["subtype"].as_str().unwrap_or("") {
                 "init" => {
+                    // KSG reads `claude_code_version` from the init event; it gates
+                    // which manifest models this CLI can run.
+                    if self.version.is_none()
+                        && let Some(version) = record["claude_code_version"].as_str()
+                    {
+                        self.version = Some(version.to_owned());
+                    }
+                    self.init_seen = true;
+                    self.try_finish_initialized();
                     if record["mcp_servers"]
                         .as_array()
                         .into_iter()
@@ -998,7 +1055,19 @@ impl Client {
                         );
                     }
                     if let Some(id) = record["model"].as_str() {
-                        if let Some(model) = self.models.iter().find(|m| m["id"] == id) {
+                        // KSG `resolveClaudeReportedModelSlug`: Claude reports aliases
+                        // and dated ids; the session tracks the manifest row.
+                        let slug = if id == "default" {
+                            None
+                        } else {
+                            Some(crate::claude_catalog::resolve_claude_reported_model_slug(
+                                &self.catalog,
+                                id,
+                            ))
+                        };
+                        if let Some(model) =
+                            slug.and_then(|slug| self.models.iter().find(|m| m["id"] == slug))
+                        {
                             self.model = model.clone();
                         }
                     }
@@ -1426,13 +1495,30 @@ impl Client {
             "get_session_stats" => self.reply(&record, json!({"contextUsage":self.usage})),
             "set_session_name" => self.reply(&record, json!({})),
             "set_model" => {
-                if self.running || !self.models.iter().any(|m| m["id"] == record["modelId"]) {
+                // Saved and reported ids resolve to manifest slugs before lookup.
+                let reported = record["modelId"].as_str().unwrap_or("");
+                // `resolveClaudeModelSlug` resolves aliases; `resolveClaudeReportedModelSlug`
+                // additionally strips the `-\d{8}` date suffix Claude reports on ids.
+                let mut slug =
+                    crate::claude_catalog::resolve_claude_model_slug(&self.catalog, reported);
+                slug =
+                    crate::claude_catalog::resolve_claude_reported_model_slug(&self.catalog, &slug);
+                if slug == "default"
+                    && let Some(default) = self
+                        .models
+                        .iter()
+                        .find(|m| m["isDefault"] == true)
+                        .and_then(|m| m["id"].as_str())
+                {
+                    slug = default.to_owned();
+                }
+                if self.running || !self.models.iter().any(|m| m["id"] == slug) {
                     self.reject(&record, "Choose an advertised Claude model while idle.");
                 } else {
-                    self.request(
-                        json!({"subtype":"set_model","model":record["modelId"]}),
-                        record,
-                    );
+                    // KSG `resolveClaudeCatalogApiModelId`: apiModel, else slug, never
+                    // the display name, with manifest modelSuffixes applied.
+                    let api_id = self.api_model_id(&slug);
+                    self.request(json!({"subtype":"set_model","model":api_id}), record);
                 }
             }
             "set_thinking_level" => {
@@ -1444,7 +1530,20 @@ impl Client {
                 {
                     self.reject(&record, "Choose an advertised Claude effort while idle.");
                 } else {
-                    self.request(json!({"subtype":"apply_flag_settings","settings":{"effortLevel":record["level"]}}), record);
+                    let model = self.model["id"].as_str().unwrap_or("");
+                    let level = record["level"].as_str().unwrap_or("");
+                    // KSG `normalizeClaudeCatalogEffort`: effortMap may remap the wire
+                    // value; a mapped `null` clears it (prompt-injected effort).
+                    let mapped = crate::claude_catalog::normalize_claude_catalog_effort(
+                        &self.catalog,
+                        Some(level),
+                        model,
+                    )
+                    .unwrap_or_default();
+                    self.request(
+                        json!({"subtype":"apply_flag_settings","settings":{"effortLevel":mapped}}),
+                        record,
+                    );
                 }
             }
             "set_option" => {
@@ -1457,12 +1556,21 @@ impl Client {
                     let val = &record["value"];
                     match option_id {
                         "effort" => {
-                            let effort = val.as_str().unwrap_or("");
-                            let mapped = match effort {
-                                "ultracode" => "xhigh",
-                                "ultrathink" => "",
-                                other => other,
-                            };
+                            let model = self.model["id"].as_str().unwrap_or("");
+                            // KSG `compileClaudeModelSelection`: resolve against the
+                            // model's effort descriptor, then apply the effortMap.
+                            let resolved = crate::claude_catalog::resolve_claude_catalog_effort(
+                                &self.catalog,
+                                model,
+                                val.as_str(),
+                            );
+                            let mapped = crate::claude_catalog::normalize_claude_catalog_effort(
+                                &self.catalog,
+                                resolved.as_deref(),
+                                model,
+                            )
+                            .unwrap_or_default();
+                            self.upsert_option(option_id, val);
                             self.request(
                                 json!({"subtype":"apply_flag_settings","settings":{"effortLevel":mapped}}),
                                 record,
@@ -1487,13 +1595,10 @@ impl Client {
                             );
                         }
                         "contextWindow" => {
-                            if let Some(base_id) = self.model["id"].as_str() {
-                                let base = base_id.strip_suffix("[1m]").unwrap_or(base_id);
-                                let api_id = if val.as_str() == Some("1m") {
-                                    format!("{base}[1m]")
-                                } else {
-                                    base.to_owned()
-                                };
+                            self.upsert_option(option_id, val);
+                            if let Some(slug) = self.model["id"].as_str().map(str::to_owned) {
+                                // Manifest modelSuffixes decide the routed id ([1m]).
+                                let api_id = self.api_model_id(&slug);
                                 self.request(json!({"subtype":"set_model","model":api_id}), record);
                             } else {
                                 self.reply(&record, json!({}));
@@ -1898,6 +2003,34 @@ impl Client {
             }
         }
     }
+}
+
+/// The `get_available_models` value a catalog row becomes. Shared with UI tests
+/// so the picker sees exactly what a session advertises.
+pub(crate) fn claude_row_model_value(
+    catalog: &crate::claude_catalog::ClaudeModelCatalog,
+    row: &crate::claude_catalog::ClaudeModelRow,
+) -> Value {
+    let mut value = json!({"provider":"claude","id":row.slug,
+        "name":row.name,"shortName":row.short_name,
+        "subProvider":row.sub_provider,"aliases":row.aliases,
+        "badge":row.badge,"isDefault":row.is_default,"isCustom":row.is_custom,
+        "isLegacy":row.is_legacy,
+        "thinkingLevels":crate::claude_catalog::claude_thinking_levels(&row.capabilities),
+        "capabilities":row.capabilities,
+        "input":["text","image"]});
+    let selection = crate::model_selection::ModelSelection {
+        instance_id: "claude".into(),
+        model: row.slug.clone(),
+        options: vec![],
+    };
+    if let Some(tokens) = crate::claude_catalog::resolve_claude_catalog_context_window_tokens(
+        catalog,
+        Some(&selection),
+    ) {
+        value["contextWindow"] = json!(tokens);
+    }
+    value
 }
 
 fn auth_error(message: &str) -> bool {
@@ -2470,6 +2603,21 @@ fn run(
     run_mode(command, start, input, events, wake, stopped, owner, false)
 }
 
+/// KSG's provider probe (`claude --version` + `parseCliVersionResult`): the first
+/// semver token in the CLI's version output gates which manifest models it runs.
+fn claude_cli_version() -> Option<String> {
+    static VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?").unwrap()
+    });
+    let output = process().ok()?.arg("--version").output().ok()?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    VERSION.find(&text).map(|m| m.as_str().to_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mode(
     mut command: Command,
@@ -2496,6 +2644,12 @@ fn run_mode(
         client.config = client.start.workspace.join(&client.config);
     }
     load_history(&mut client)?;
+    client.probe = probe;
+    // KSG probes `claude --version` once per provider probe; sessions learn the
+    // version from the `system`/`init` frame instead of paying a second spawn.
+    if probe {
+        client.version = claude_cli_version();
+    }
     client.launch(&mut command);
     command
         .current_dir(&client.start.workspace)
@@ -2566,16 +2720,24 @@ fn run_mode(
             }
             let now = Instant::now();
             let mut status_expired = false;
+            let mut settings_expired = false;
             client.pending.retain(|_, p| {
                 let droppable = matches!(
                     p.request["subtype"].as_str(),
-                    Some("get_context_usage" | "get_usage" | "mcp_status")
+                    Some("get_context_usage" | "get_usage" | "mcp_status" | "get_settings")
                 ) && now >= p.deadline;
                 status_expired |= droppable && p.request["subtype"] == "mcp_status";
+                settings_expired |= droppable && p.request["subtype"] == "get_settings";
                 !droppable
             });
             if status_expired {
                 client.finish_binding(false);
+            }
+            if settings_expired {
+                client.settings_done = true;
+            }
+            if !client.ready {
+                client.try_finish_initialized();
             }
             if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Claude did not acknowledge an operation within 30 seconds.".into());
