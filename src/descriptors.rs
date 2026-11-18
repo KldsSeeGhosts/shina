@@ -24,8 +24,13 @@ pub const ACP_SESSION_MODE_OPTION_ID: &str = "_t3/session-mode";
 pub const ACP_EMPTY_OPTION_VALUE: &str = "_t3/empty";
 
 const MODEL_MANIFEST_JSON: &str = include_str!("../assets/model-manifest.json");
-const REASONING_EFFORT_OPTION_IDS: &[&str] =
-    &["reasoningEffort", "effort", "reasoning", "thought_level"];
+const REASONING_EFFORT_OPTION_IDS: &[&str] = &[
+    "reasoningEffort",
+    "effort",
+    "reasoning",
+    "thought_level",
+    "thinking_level",
+];
 const PI_THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const PI_STANDARD_SERVICE_TIER: &str = "default";
 const DEFAULT_SERVICE_TIER_ID: &str = "default";
