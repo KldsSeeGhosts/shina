@@ -126,6 +126,10 @@ mod question_attachment_tests;
 #[cfg(test)]
 #[path = "question_flow_tests.rs"]
 mod question_flow_tests;
+#[path = "task_plan.rs"]
+mod task_plan;
+#[path = "task_plan_client.rs"]
+pub(crate) mod task_plan_client;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -5022,6 +5026,8 @@ pub struct State {
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
+    /// A Captain home's task plan panel, bound to its machine and home.
+    pub plan_panel: task_plan_client::PlanPanel,
     pub settings_picker: Option<SettingsPicker>,
     pub open_option_menu: Option<String>,
     pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
@@ -5053,6 +5059,9 @@ pub struct State {
     pub restart_notice: Option<String>,
     task_waiters: Vec<TaskWaiter>,
     tasks: Vec<Task>,
+    /// Editable task plans: draft nodes, revisions, dependency edges, audited
+    /// overrides and one-time launch records. Persisted with the index.
+    pub(crate) task_plans: Vec<task_plan::TaskPlan>,
     pub(crate) identity: crate::identity::Catalog,
     pub(crate) execution: crate::execution::Book,
     /// Keyed control evidence, separate from the immutable saved receipts.
@@ -6077,6 +6086,7 @@ impl State {
             memory: Arc::default(),
             captain_editor: None,
             brief: BriefUi::default(),
+            plan_panel: Default::default(),
             settings_picker: None,
             open_option_menu: None,
             model_picker_tab: None,
@@ -6118,6 +6128,7 @@ impl State {
             ownership_denied: false,
             runtime_stop_requested: false,
             tasks: Vec::new(),
+            task_plans: Vec::new(),
             identity: crate::identity::Catalog::local(
                 &crate::store::directory().unwrap_or_default(),
             ),
@@ -9275,6 +9286,7 @@ impl State {
                 "unfinished_tasks_per_coordinator": self.scheduler.limits.coordinator_unfinished,
                 "direct_providers": false,
                 "remote_hosts": true,
+                "task_plans": true,
                 "model_ids": "exact ids only",
                 "reasoning_levels": "exact levels only, never clamped",
             },
@@ -9558,6 +9570,7 @@ impl State {
                 | "captain_reports_list"
                 | "captain_crew_report"
                 | "captain_question_answer"
+                | "task_plan"
         ) {
             self.require_active_thread_owner(caller)?;
         }
@@ -9648,6 +9661,10 @@ impl State {
                     json!({ "captains": captains, "peers":self.peers.iter().map(crate::peer::Peer::summary).collect::<Vec<_>>() }),
                 )
             }
+            "task_prepare" => self.task_plan_prepare(caller_index, args),
+            "task_update" => self.task_plan_update(caller_index, args),
+            "task_start" => self.task_plan_start(caller_index, args),
+            "task_plan" => self.task_plan_read(caller_index, args),
             "delegate_task" => {
                 if self.threads[caller_index].delegated {
                     return Err(
@@ -9679,165 +9696,7 @@ impl State {
                 if request_key.is_some() {
                     self.delegate_receipt_ready()?;
                 }
-                self.check_task_capacity(caller)?;
-                let prompt = args["prompt"].as_str().map(str::trim).unwrap_or("");
-                if prompt.is_empty() {
-                    return Err("prompt must describe the task.".into());
-                }
-                if self.threads[caller_index].machine != "local" {
-                    return Err(format!(
-                        "Shina delegates only on the local machine. The caller's machine {} is unavailable.",
-                        self.threads[caller_index].machine
-                    ));
-                }
-                let target = parse_delegation_target(args)?;
-                let harness = target
-                    .as_ref()
-                    .and_then(|t| t.harness.clone())
-                    .unwrap_or_else(|| self.threads[caller_index].harness.clone());
-                self.validate_harness(&harness)?;
-                self.require_harness_executable(&harness)?;
-                let provider = if harness == "pi" { "cpa" } else { &harness };
-                if target
-                    .as_ref()
-                    .and_then(|t| t.provider.as_deref())
-                    .is_some_and(|p| p != provider)
-                {
-                    return Err(format!(
-                        "target.provider must be {provider} for harness {harness}."
-                    ));
-                }
-                let models = if harness == self.threads[caller_index].harness {
-                    self.delegation_models(&self.threads[caller_index]).0
-                } else {
-                    self.harness_models(&harness)
-                };
-                let inherited = if harness == self.threads[caller_index].harness {
-                    self.inherited_selection(caller_index)
-                } else if harness == "pi" {
-                    self.default_selection()
-                } else {
-                    None
-                };
-                let selection = match &target {
-                    Some(target) => target
-                        .model
-                        .clone()
-                        .or_else(|| inherited.as_ref().map(|s| s.model.clone()))
-                        .map(|model| Selection {
-                            provider: provider.into(),
-                            model,
-                            reasoning: target
-                                .reasoning
-                                .clone()
-                                .or_else(|| inherited.and_then(|choice| choice.reasoning)),
-                        }),
-                    None => inherited,
-                };
-                if selection.is_none() && target.as_ref().is_some_and(|t| t.reasoning.is_some()) {
-                    return Err("A reasoning target requires an advertised model so Shina can validate the level.".into());
-                }
-                if let Some(selection) = &selection {
-                    self.validate_delegation_selection(&models, selection, target.is_some())?;
-                }
-                let project = self.delegation_workspace(caller_index, args)?;
-                if let Some(project) = self.project(project)
-                    && project.machine != "local"
-                {
-                    return Err("Shina delegates only into local workspaces.".into());
-                }
-                let assigned = self.threads[caller_index]
-                    .captain
-                    .filter(|_| self.threads[caller_index].captain_home);
-                let captain = match args["captain"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|n| !n.is_empty())
-                {
-                    Some(name) => {
-                        if !assigned
-                            .is_some_and(|id| self.captains[id].name.eq_ignore_ascii_case(name))
-                        {
-                            return Err("Crew inherits the calling captain. Open that captain's home to delegate with its profile.".into());
-                        }
-                        assigned
-                    }
-                    None => assigned,
-                };
-                let mut thread = Thread::new(self.next_id);
-                thread.harness = harness;
-                thread.project = project;
-                thread.machine = self.threads[caller_index].machine.clone();
-                self.next_id += 1;
-                thread.title = args["title"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or(prompt)
-                    .chars()
-                    .take(45)
-                    .collect();
-                thread.captain = captain;
-                thread.crew_captain = captain;
-                thread.delegated = true;
-                thread.native.access = match self.threads[caller_index].native.access {
-                    AccessMode::ReadOnly => AccessMode::default(),
-                    access => access,
-                };
-                thread.parent = Some(caller);
-                thread.models = models;
-                if let Some(selection) = &selection {
-                    thread.set_model(selection.provider.clone(), selection.model.clone());
-                    if let Some(reasoning) = &selection.reasoning {
-                        thread.set_thinking(reasoning.clone());
-                    }
-                }
-                thread.arm_task();
-                thread.life.mark_unread();
-                let mut task =
-                    Task::new(&thread, prompt, selection.as_ref().map(Selection::to_value));
-                task.request_key = request_key.map(|key| tasks::RequestKey {
-                    key: key.into(),
-                    intent_hash: tasks::delegate_intent_hash(args),
-                });
-                let id = thread.id;
-                #[cfg(test)]
-                let git_ctx = self.test_git_context.clone().unwrap_or_default();
-                #[cfg(not(test))]
-                let git_ctx = crate::vcs::GitContext::default();
-                let placement = self.plan_thread_placement(
-                    &thread,
-                    placement::spec_from_args(args)?.as_ref(),
-                    &format!("delegate:{}/{}", task.id, id),
-                    "local",
-                    &git_ctx,
-                )?;
-                if placement.read_only() {
-                    // A shared reader keeps the parent's dirty checkout visible
-                    // and never gains write access to it.
-                    thread.native.access = AccessMode::ReadOnly;
-                }
-                if placement.uses_worktree() {
-                    thread.worktree_path = placement.checkout.clone();
-                    thread.branch = placement.branch.clone();
-                    thread.env_mode = Some(ThreadEnvMode::Worktree);
-                }
-                thread.placement = Some(placement);
-                self.threads.push(thread);
-                self.tasks.push(task);
-                self.sync_memory_links();
-                // The attempt reserves admission before the pump can start it.
-                self.admit_task_index(self.tasks.len() - 1);
-                let status = self.mcp_call(caller, "task_status", &json!({"thread_id":id}))?;
-                if let Some(key) = request_key
-                    && let Err(error) =
-                        self.record_delegate_receipt(caller_index, key, args, &status)
-                {
-                    return Err(self.fail_delegate_receipt(error));
-                }
-                self.checkpoint();
-                self.start_queued_tasks();
-                Ok(status)
+                self.delegate_local(caller_index, args, request_key)
             }
             "task_status" => {
                 let thread_index = find(self)?;
@@ -9913,6 +9772,10 @@ impl State {
                             "generation": thread.request_generation,
                             "kind": request["method"],
                         }))),
+                    "plan": task
+                        .and_then(|task| task.plan_node.as_ref())
+                        .map(|plan| json!({"id": plan.plan, "node": plan.node}))
+                        .unwrap_or(Value::Null),
                     "queue_position": task.and_then(|task| self.task_queue_position(task)),
                     "admission": task.map(|task| self.admission_value_for_task(task)).unwrap_or(Value::Null),
                     "selection": selection_value(thread),
@@ -15964,6 +15827,7 @@ impl State {
                 .map_err(|error| format!("Invalid saved scheduler: {error}."))?;
             self.scheduler.validate()?;
         }
+        self.restore_task_plans(index)?;
         self.requeue_undelivered_managed_inputs();
         self.validate_captain_archives()?;
         self.sync_memory_links();
@@ -16618,6 +16482,7 @@ impl State {
             }).map(Thread::stored_metadata).collect::<Vec<_>>()
         });
         index["scheduler"] = json!(self.scheduler);
+        index["taskPlans"] = json!(self.task_plans);
         index["commandReceipts"] = json!(self.command_receipts);
         index["commandIntents"] = json!(self.command_intents);
         // Bounded projection only. The durable table keeps every operation;

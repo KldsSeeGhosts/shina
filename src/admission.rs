@@ -432,13 +432,18 @@ impl Scheduler {
     /// Pre-creation backpressure: the durable queue is bounded so retries
     /// cannot accumulate unbounded pending work.
     pub(super) fn check_pending(&self) -> Result<(), String> {
+        self.check_pending_additional(1)
+    }
+
+    pub(super) fn check_pending_additional(&self, additional: usize) -> Result<(), String> {
         if let Some(limit) = self.limits.account_pending
             && self
                 .reservations
                 .iter()
                 .filter(|r| r.state == ReservationState::Queued)
                 .count()
-                >= limit
+                .saturating_add(additional)
+                > limit
         {
             return Err(format!(
                 "The admission queue is full ({limit} pending reservations). Finish or dismiss work before starting more."

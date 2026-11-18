@@ -834,6 +834,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
     let mut captain_events = false;
     let mut provider_updates = false;
     let mut scheduling = false;
+    let mut task_plans = false;
     let mut review_diff = false;
     let mut history_leases = crate::history::Fragments::default();
     let mut active_thread = None;
@@ -1007,6 +1008,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         }
                         scheduling = minor >= u64::from(protocol::SCHEDULING_MINOR);
                         if scheduling { capabilities.push(protocol::SCHEDULING); }
+                        task_plans = minor >= u64::from(protocol::TASK_PLANS_MINOR);
+                        if task_plans { capabilities.push(protocol::TASK_PLANS); }
                         match identity_for_read(&shared) {
                             Err(error) => Err(error),
                             Ok(identity) => {
@@ -1056,6 +1059,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     Err(protocol::CAPTAIN_CREW_CONTROL_UPDATE_REQUIRED.into())
                 } else if matches!(method, "scheduling.status" | "scheduling.configure") && !scheduling {
                     Err(protocol::SCHEDULING_UPDATE_REQUIRED.into())
+                } else if matches!(method, "task.plan" | "task.plan.prepare" | "task.plan.update" | "task.plan.start") && !task_plans {
+                    Err(protocol::TASK_PLANS_UPDATE_REQUIRED.into())
                 } else if matches!(method, "notifications.get" | "notifications.push.status") {
                     if !mobile_push {
                         Err(protocol::MOBILE_PUSH_UPDATE_REQUIRED.into())

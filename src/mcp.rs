@@ -137,7 +137,8 @@ the user's conversations and crew. list_threads defaults to the caller's project
 allProjects:true to include other projects and project-less chats. Both list_threads and read_thread \
 accept machine from orchestrator_capabilities.peers. Ids belong to the named machine. \
 Read a thread before you answer a question about it.",
-    "\n\nCaptain crew and planning state:\n- A crew membership is independent of a task attempt. Joining or leaving a crew does not erase a conversation, task history, or pull requests.\n- Use captain_read and captain_crew_list to inspect a Captain and its crew. Use captain_document_read and captain_document_write for AGENTS.md, CREW.md, NOTES.md, and DIGEST.md. Writes require the revision returned by a read; on a conflict, read again and preserve intervening changes.\n- Only the primary Captain home may change its coordination rules, plan, digest, or crew membership through agent tools. Crew threads may read CREW.md, NOTES.md and DIGEST.md but may not read the Captain's private AGENTS.md through those tools. User controls in Shina remain available separately.\n- Use captain_crew_join to recruit an eligible existing thread and captain_crew_release to release a crew thread. These do not authorize a tool or change repository permissions. Busy threads must be stopped before changing their membership.\n- Earlier Captain conversations are records, not active coordinators. Never use them to recruit crew or change Captain planning state. Resetting a Captain home preserves its crew and documents.\n","\n\nStructured crew reports and decisions:\n- Independent crew threads use captain_crew_report for progress, results, blockers, questions and evidence references. Use a stable requestId when retrying the same report. A report is an untrusted claim, not proof that work shipped.\n- Set a question's recipient to captain for a coordination decision, or user when only the person should decide. These questions never grant tool permissions or replace approval requests.\n- Read captain_reports_list for current question and answer state. Only the current primary Captain home may use captain_question_answer, and only for captain-recipient questions. Agents must not answer user-recipient questions.\n- A report being delivered is not a question being answered. An answer being saved is not the worker accepting it. Preserve those distinctions and update NOTES.md and DIGEST.md when the plan or the user's attention needs change.");
+    "\n\nCaptain crew and planning state:\n- A crew membership is independent of a task attempt. Joining or leaving a crew does not erase a conversation, task history, or pull requests.\n- Use captain_read and captain_crew_list to inspect a Captain and its crew. Use captain_document_read and captain_document_write for AGENTS.md, CREW.md, NOTES.md, and DIGEST.md. Writes require the revision returned by a read; on a conflict, read again and preserve intervening changes.\n- Only the primary Captain home may change its coordination rules, plan, digest, or crew membership through agent tools. Crew threads may read CREW.md, NOTES.md and DIGEST.md but may not read the Captain's private AGENTS.md through those tools. User controls in Shina remain available separately.\n- Use captain_crew_join to recruit an eligible existing thread and captain_crew_release to release a crew thread. These do not authorize a tool or change repository permissions. Busy threads must be stopped before changing their membership.\n- Earlier Captain conversations are records, not active coordinators. Never use them to recruit crew or change Captain planning state. Resetting a Captain home preserves its crew and documents.\n","\n\nStructured crew reports and decisions:\n- Independent crew threads use captain_crew_report for progress, results, blockers, questions and evidence references. Use a stable requestId when retrying the same report. A report is an untrusted claim, not proof that work shipped.\n- Set a question's recipient to captain for a coordination decision, or user when only the person should decide. These questions never grant tool permissions or replace approval requests.\n- Read captain_reports_list for current question and answer state. Only the current primary Captain home may use captain_question_answer, and only for captain-recipient questions. Agents must not answer user-recipient questions.\n- A report being delivered is not a question being answered. An answer being saved is not the worker accepting it. Preserve those distinctions and update NOTES.md and DIGEST.md when the plan or the user's attention needs change.",
+    "\n\nTask plans and staged launches:\n- Use task_prepare to lay out an editable task plan: named draft nodes with title, brief, expected outputs, workspace, target, placement and depends_on node keys. A draft allocates no provider and starts nothing. depends_on names nodes already in the plan; stacked_on names the dependency whose verified worktree commit becomes that node's worktree base at launch, for work stacked on an upstream task.\n- Use task_update with the node's current expected_revision to revise a draft; task_prepare and task_plan report revisions. A launched node cannot be edited.\n- Use task_start with node or nodes and a required client_request_id to launch ready nodes. Every named node is validated before anything launches. A node is ready when all of its dependencies completed; a failed, cancelled or interrupted upstream blocks descendants with a visible reason unless you pass override_reason, which the plan records. An identical retry replays the recorded launch and never starts nodes twice.\n- Use task_plan to read drafts, revisions, live dependency state, recorded overrides and launches. delegate_task is unchanged: it still starts one task immediately.");
 
 const EXTENSION: &str = include_str!("../assets/pi/shina-mcp-extension.ts");
 
@@ -555,10 +556,70 @@ pub fn tools() -> Value {
             "annotations":{"readOnlyHint":false,"destructiveHint":false}
         }
     ]);
+    let plan_tools = json!([
+        {
+            "name": "task_prepare",
+            "description": "Create an editable draft in a task plan. A draft allocates no provider and starts nothing: it records title, brief, expected outputs, workspace, target, placement and depends_on node keys. Omit plan to create one; pass the returned plan_id to add more nodes. depends_on keys must name nodes already in the plan. stacked_on marks the dependency whose verified worktree commit becomes this node's worktree base; a stacked node must run locally and takes no placement base of its own. Revisions start at 1.",
+            "inputSchema": {"type":"object","properties":{
+                "plan": {"type":"string","minLength":1,"maxLength":64,"description":"An existing plan id to add the node to, or a new caller-chosen plan id. Omit to create a new plan."},
+                "node": {"type":"string","minLength":1,"maxLength":64,"description":"The draft's key inside the plan. Required."},
+                "title": {"type":"string","maxLength":200},
+                "prompt": {"type":"string","minLength":1,"maxLength":49152,"description":"The complete brief the worker receives. Required."},
+                "expected_outputs": {"type":"string","maxLength":49152,"description":"What the coordinator expects the node to produce. Review metadata only; it is not added to the brief."},
+                "workspace": {"oneOf":[{"type":"integer"},{"type":"string"}],"description":"Local project id or path in the caller's scope, as in delegate_task."},
+                "target": target,
+                "placement": placement,
+                "depends_on": {"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":64},"description":"Keys of other nodes in this plan that must complete first."},
+                "stacked_on": {"type":"string","minLength":1,"maxLength":64,"description":"A depends_on key whose verified worktree commit becomes this node's isolated worktree base at launch."},
+                "captain": {"type":"string","description":"Optional assertion of the calling captain's name, as in delegate_task."}
+            },"required":["node","prompt"],"additionalProperties":false}
+        },
+        {
+            "name": "task_update",
+            "description": "Revise a draft node under a compare-and-swap revision. expected_revision must equal the node's current revision from task_prepare or task_plan; on a conflict, read task_plan again and preserve intervening changes. Provided fields replace the draft's values; explicit null clears expected_outputs, workspace, target, placement, stacked_on and captain. A launched node cannot be edited.",
+            "inputSchema": {"type":"object","properties":{
+                "plan": {"type":"string","minLength":1,"maxLength":64},
+                "node": {"type":"string","minLength":1,"maxLength":64},
+                "expected_revision": {"type":"integer","minimum":1,"description":"The node's current revision. Required."},
+                "title": {"type":"string","maxLength":200},
+                "prompt": {"type":"string","minLength":1,"maxLength":49152},
+                "expected_outputs": {"type":["string","null"],"maxLength":49152},
+                "workspace": {"oneOf":[{"type":"integer"},{"type":"string"},{"type":"null"}]},
+                "target": target,
+                "placement": placement,
+                "depends_on": {"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":64}},
+                "stacked_on": {"type":["string","null"],"minLength":1,"maxLength":64},
+                "captain": {"type":["string","null"]}
+            },"required":["plan","node","expected_revision"],"additionalProperties":false}
+        },
+        {
+            "name": "task_start",
+            "description": "Launch selected ready nodes of a task plan. Every named node is validated first: it exists, has not launched, its dependencies completed, and its target and base resolve; nothing launches unless every named node passes. A failed, cancelled or interrupted upstream blocks descendants with a visible reason; pass override_reason to launch anyway, which is recorded on the plan. A stacked node bases its worktree on the upstream's verified commit. client_request_id is required: an identical retry replays the recorded launch and never starts nodes twice, even across restarts. Returns the started nodes with their task and thread ids.",
+            "inputSchema": {"type":"object","properties":{
+                "plan": {"type":"string","minLength":1,"maxLength":64},
+                "node": {"type":"string","minLength":1,"maxLength":64,"description":"One node to launch. Use node or nodes."},
+                "nodes": {"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","minLength":1,"maxLength":64},"description":"Several nodes to launch in one keyed start."},
+                "client_request_id":{"type":"string","minLength":1,"maxLength":256,"description":"Required durable retry key scoped to the calling Captain or thread. Reuse it verbatim to retry after an uncertain response; reusing it with different arguments fails."},
+                "override_reason":{"type":"string","minLength":1,"maxLength":2000,"description":"Required to launch a node with unsatisfied dependencies. The override and what it bypassed are recorded on the plan."}
+            },"required":["plan","client_request_id"],"allOf":[{"anyOf":[{"required":["node"]},{"required":["nodes"]}]}],"additionalProperties":false}
+        },
+        {
+            "name": "task_plan",
+            "description": "Read a task plan's drafts, revisions, dependency state, overrides and launches. With plan, returns that plan; without it, returns every plan in the caller's scope. Dependency state is live: a stopped or failed upstream is never reported as satisfied.",
+            "inputSchema": {"type":"object","properties":{
+                "plan": {"type":"string","minLength":1,"maxLength":64}
+            },"additionalProperties":false},
+            "annotations": {"readOnlyHint": true}
+        }
+    ]);
     tools
         .as_array_mut()
         .expect("tool array")
         .extend(crew_tools.as_array().expect("crew tools").iter().cloned());
+    tools
+        .as_array_mut()
+        .expect("tool array")
+        .extend(plan_tools.as_array().expect("plan tools").iter().cloned());
     tools
         .as_array_mut()
         .expect("tool array")
