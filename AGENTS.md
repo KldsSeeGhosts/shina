@@ -36,7 +36,9 @@ Already ported:
 | `new_thread_click` (`src/model.rs`) | `components/Sidebar.logic.ts` (`shouldCreateNewThreadInCurrentProject`), `lib/chatThreadActions.ts` (`startNewThreadFromContext`) |
 | `composer` card and footer | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx` |
 | `attachment_chip` | `chat/ComposerAttachmentStrip.tsx` |
-| `model_effort_trigger`, `settings_picker`, `model_list` | `chat/ComposerModelEffort.tsx`, `chat/ModelPickerContent.tsx`, `chat/ModelListRow.tsx` |
+| `model_effort_trigger`, `model_picker`, `model_list`, `tallest_model_tab_h` | `chat/ProviderModelPicker.tsx`, `chat/ModelPickerContent.tsx` (`tallestTabUnits`), `chat/ModelPickerSidebar.tsx`, `chat/ModelListRow.tsx` |
+| `options_column`, `option_rows`, `option_choice_menu` | `chat/ComposerModelEffort.tsx` (`ComposerEffortColumn` with `optionsOnly`, `OptionMenuRow`, `OptionSwitchRow`) |
+| `reasoning_picker`, `speed_section` | `chat/ComposerModelEffort.tsx` (`ComposerReasoningPicker`), `chat/TraitsPicker.tsx` (`TraitsMenuContent` with `reasoningOnly`) |
 | `context_ring`, `context_popover` | `chat/ContextWindowMeter.tsx`, `chat/ContextWindowMeter.logic.ts`, `ui/popover.tsx` |
 | `measure`, `lane_gutter`, `conversation`, `composer` lane | `index.css` (`.chat-content-lane`, `.chat-composer-lane`), `chat/MessagesTimeline.tsx`, `chat/TimelineUserMessageRow.tsx` |
 | `composer_shell`, `composer-prompt-body`, `composer_ui::controls` strip, `effort_trigger` | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx`, `chat/ComposerControlsBar.tsx`, `chat/ComposerModelEffort.tsx`, `index.css` (`.composer-prompt-body`) |
@@ -51,6 +53,8 @@ Already ported:
 | `captain_hero` | `chat/DraftHeroHeadline.tsx` |
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
+
+The model picker and the reasoning menu are separate popovers, as in KSG Code. Model rows have no checkboxes: a click picks the model and Shift+click adds it to a multi-model send. The reasoning menu keeps the effort slider below instead of KSG's list of levels, at the user's request.
 
 The effort slider (`effort_slider`, `slider_curve`, `sparkles`) is ported from the Codex desktop app instead. Its source ships uncompressed in `C:\Program Files\WindowsApps\OpenAI.Codex_*\app\resources\app.asar`. Search it as text for `data-reasoning-slider`, `model-picker-power-slider` and the CSS classes it names. Read it there, never run it. Its values: a 24 px track in a 28 px row, a 28 px white thumb with a hairline edge, motion of 0.3 s on `cubic-bezier(.23, 1, .32, 1)` (0.15 s while dragging), a thumb that follows the pointer with no detents, and a closed-hand cursor only while the slider is pressed or dragged (hover keeps the arrow). winit shows `Cursor::Grabbing` as the four-way move arrow on Windows, so the hand is an image cursor, `assets/cursors/grabbing.png`, drawn by `tools/cursors.py`. Rune lands drag commits at once, so each drag phase sets `tx.motion_curve(...)`.
 

@@ -554,6 +554,91 @@ fn live_thread(agent: Agent, source: SessionSource) -> Thread {
     thread
 }
 
+/// KSG AntigravityAcpSupport: initialize, eager authenticate, session/new with
+/// model+thinking_level config options, combined `family-level` selection.
+#[test]
+fn antigravity_fake_agent_authenticate_config_options_and_combined_model() {
+    let (mut agent, log) = fixture(&["--antigravity"]);
+    agent.id = "antigravity".into();
+    let dir = crate::store::directory().unwrap();
+    std::fs::write(
+        dir.join("harnesses.json"),
+        json!([{"id":agent.id,"name":agent.name,"command":agent.command,
+            "args":agent.args,"env":agent.env}])
+        .to_string(),
+    )
+    .unwrap();
+    let mut thread = Thread::new(32);
+    thread.harness = "antigravity".into();
+    thread.host = spec(SessionSource::New).link;
+    thread.native.access = crate::model::AccessMode::Supervised;
+    thread.connect_with_instructions(
+        dir.clone(),
+        Arc::new(|| {}),
+        Some("Captain fixture instructions".into()),
+    );
+    pump(&mut thread, |t| {
+        t.native.commands_loaded && !t.harness_state["modes"].is_null()
+    });
+    let wire = records(&log);
+    let methods: Vec<&str> = wire.iter().filter_map(|r| r["method"].as_str()).collect();
+    let position = |m: &str| methods.iter().position(|x| *x == m).unwrap();
+    assert!(position("initialize") < position("authenticate"));
+    assert!(position("authenticate") < position("session/new"));
+    let session_new = wire.iter().find(|r| r["method"] == "session/new").unwrap();
+    assert!(session_new["params"]["_meta"]["antigravity"]["systemPrompt"]["append"].is_string());
+    // The session builds the combined 1.3-style ids T3 selects.
+    let ids: Vec<&str> = thread.models.iter().map(|m| m.id.as_str()).collect();
+    for id in [
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-4-carbon",
+    ] {
+        assert!(ids.contains(&id), "{id} not in {ids:?}");
+    }
+    // `gemini-3.8-flash-high` is the session's current model; picking a different
+    // level still sends family then level, like KSG's applyAntigravityAcpModelSelection.
+    crate::harness::send(
+        thread.pi.as_ref().unwrap(),
+        json!({"type":"set_model","id":"pick","modelId":"gemini-3.8-flash-medium"}),
+    )
+    .unwrap();
+    pump(&mut thread, |t| t.model_id == "gemini-3.8-flash-medium");
+    let sets: Vec<Value> = records(&log)
+        .into_iter()
+        .filter(|r| r["method"] == "session/set_config_option")
+        .collect();
+    assert_eq!(sets.len(), 2);
+    assert_eq!(
+        sets[0]["params"],
+        json!({"sessionId":"fixture-session","configId":"model","value":"gemini-3.8-flash"})
+    );
+    assert_eq!(
+        sets[1]["params"],
+        json!({"sessionId":"fixture-session","configId":"thinking_level","value":"medium"})
+    );
+
+    // Cross-family combined pick: family config first, thinking level second.
+    crate::harness::send(
+        thread.pi.as_ref().unwrap(),
+        json!({"type":"set_model","id":"pick2","modelId":"gemini-4-carbon-high"}),
+    )
+    .unwrap();
+    pump(&mut thread, |t| t.model_id == "gemini-4-carbon-high");
+    let sets: Vec<Value> = records(&log)
+        .into_iter()
+        .filter(|r| r["method"] == "session/set_config_option")
+        .collect();
+    assert_eq!(sets.len(), 4);
+    assert_eq!(
+        sets[2]["params"],
+        json!({"sessionId":"fixture-session","configId":"model","value":"gemini-4-carbon"})
+    );
+    assert_eq!(sets[3]["params"]["configId"], "thinking_level");
+    assert_eq!(sets[3]["params"]["value"], "high");
+}
+
 #[test]
 fn fake_agent_initialize_mcp_stream_permission_cancel_and_load_round_trip() {
     let (agent, log) = fixture(&[]);

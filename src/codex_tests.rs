@@ -1834,3 +1834,121 @@ fn codex_prompt_suggestion_samples_after_turn_and_discards_late_answer() {
     }
     assert_eq!(thread.prompt_suggestion, None);
 }
+
+/// KSG `applyCodexModelCatalog` over a real `model/list`: manifest rows take
+/// manifest names and the legacy split, unknown rows keep their wire data, and
+/// models newer than the CLI become update-required entries.
+#[test]
+fn probe_applies_the_manifest_catalog_to_model_list() {
+    let dir = crate::store::directory().unwrap();
+    let log = dir.join("probe-manifest.jsonl");
+    let script = dir.join("probe.py");
+    std::fs::write(&script, include_str!("../assets/tests/fake_codex.py")).unwrap();
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command.arg("-u").arg(script).arg("--log").arg(&log).args([
+        "--manifest-models",
+        "--cli-version",
+        "0.150.0",
+    ]);
+    let start = Start::discovery("codex", dir);
+    let owner = start.owner.clone();
+    let pi = Pi::worker(
+        Arc::new(|| {}),
+        owner,
+        None,
+        move |input, events, wake, stopped, owner| {
+            run_mode(
+                command,
+                start,
+                input,
+                events,
+                wake,
+                stopped,
+                owner,
+                Some(true),
+            )
+        },
+    );
+    let mut output = vec![];
+    loop {
+        match pi
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("probe deadline")
+        {
+            Event::Record(record) => output.push(record),
+            Event::Error(error) => panic!("Codex manifest probe failed: {error}"),
+            Event::Exited => break,
+            Event::Diagnostic(_) => {}
+        }
+    }
+    let updates: Vec<&Value> = output
+        .iter()
+        .filter(|r| r["type"] == "harness_update")
+        .collect();
+    let version = updates.iter().find(|r| r["field"] == "version").unwrap();
+    assert_eq!(version["value"], json!("0.150.0"));
+    // Manifest models the CLI predates, in manifest order.
+    let required = updates
+        .iter()
+        .find(|r| r["field"] == "updateRequiredModels")
+        .unwrap()["value"]
+        .clone();
+    assert_eq!(
+        required,
+        json!([
+            {"slug":"gpt-6.1-sol","name":"GPT-6.1 Sol","minVersion":"0.153.0"},
+            {"slug":"gpt-6-luna","name":"GPT-6 Luna","minVersion":"0.155.0"},
+        ])
+    );
+    let models = output
+        .iter()
+        .find(|r| r["command"] == "get_available_models")
+        .unwrap()["data"]["models"]
+        .clone();
+    let models = models.as_array().unwrap();
+    // Discovery order and wire ids are preserved; the unknown slug survives.
+    let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        ["gpt-6-astra", "zzz-fixture", "openai.gpt-6-sol", "gpt-5.5"]
+    );
+    // Manifest names and the legacy split; the unknown row keeps its wire data.
+    let names: Vec<&str> = models.iter().filter_map(|m| m["name"].as_str()).collect();
+    assert_eq!(
+        names,
+        ["GPT-6 Astra", "Fixture Unknown", "GPT-6 Sol", "GPT-5.5"]
+    );
+    assert!(models.iter().all(|m| m.get("badge").is_none()));
+    assert!(models[0].get("isLegacy").is_none());
+    assert!(models[1].get("isLegacy").is_none());
+    assert_eq!(models[2]["isLegacy"], true);
+    assert_eq!(models[3]["isLegacy"], true);
+    assert_eq!(models[0]["isDefault"], true);
+    // Merged capabilities: the manifest row keeps KSG's effort levels and speed
+    // options; the unknown row keeps its wire data.
+    assert_eq!(
+        models[0]["thinkingLevels"],
+        json!(["low", "medium", "high"])
+    );
+    let descriptors = models[0]["capabilities"]["optionDescriptors"]
+        .as_array()
+        .unwrap();
+    let effort = descriptors
+        .iter()
+        .find(|d| d["id"] == "reasoningEffort")
+        .expect("reasoning descriptor");
+    assert_eq!(effort["currentValue"], json!("medium"));
+    assert_eq!(
+        effort["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["id"].as_str())
+            .collect::<Vec<_>>(),
+        ["low", "medium", "high"]
+    );
+    assert!(descriptors.iter().any(|d| d["id"] == "serviceTier"));
+    assert_eq!(models[1]["thinkingLevels"], json!(["xhigh"]));
+    assert_eq!(models[1]["contextWindow"], json!(32000));
+}

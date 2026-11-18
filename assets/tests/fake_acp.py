@@ -12,6 +12,7 @@ args.add_argument("--stdio", action="store_true")
 args.add_argument("--no-load", action="store_true")
 args.add_argument("--resume", action="store_true")
 args.add_argument("--auth-denied", action="store_true")
+args.add_argument("--antigravity", action="store_true")
 args.add_argument("--delay-seconds", type=float, default=0)
 args.add_argument("--no-history", action="store_true")
 args.add_argument("--no-mcp", action="store_true")
@@ -21,6 +22,20 @@ pending = None
 permission_prompt = None
 mcp_http = None
 session_cwd = None
+agy_config = None
+agy_mode = None
+
+
+def agy_options(model="gemini-3.8-flash", level="high"):
+    return [{"id": "model", "name": "Model", "category": "model", "type": "select",
+             "currentValue": model,
+             "options": [{"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"},
+                         {"value": "gemini-4-carbon", "name": "Gemini 4 Carbon"}]},
+            {"id": "thinking_level", "name": "Thinking", "category": "thought_level",
+             "type": "select", "currentValue": level,
+             "options": [{"value": "low", "name": "Low"},
+                         {"value": "medium", "name": "Medium"},
+                         {"value": "high", "name": "High"}]}]
 
 
 def send(value):
@@ -52,14 +67,21 @@ for line in sys.stdin:
     params = record.get("params", {})
     if method == "initialize":
         assert params["protocolVersion"] == 1
-        assert params["clientCapabilities"]["fs"]["readTextFile"] is False
+        assert params["clientCapabilities"]["fs"]["readTextFile"] == opts.antigravity
+        assert params["clientCapabilities"]["fs"]["writeTextFile"] is False
         assert params["clientCapabilities"]["terminal"] is False
-        result(req_id, {"protocolVersion": 1, "agentCapabilities": {
-            "loadSession": not opts.no_load and not opts.resume,
+        capabilities = {"loadSession": not opts.no_load and not opts.resume,
             "sessionCapabilities": {"resume": {}} if opts.resume else {},
             "promptCapabilities": {"image": True},
             "mcpCapabilities": {"http": not opts.stdio and not opts.no_mcp,
-                                "stdio": not opts.no_mcp}}})
+                                "stdio": not opts.no_mcp}}
+        if opts.antigravity:
+            assert params["clientInfo"]["name"] == "zed"
+            capabilities["_meta"] = {"antigravity": {"systemPrompt": {"append": True}}}
+        result(req_id, {"protocolVersion": 1, "agentCapabilities": capabilities})
+    elif method == "authenticate":
+        assert opts.antigravity and params["methodId"] == "oauth-personal"
+        result(req_id, {})
     elif method in ("session/new", "session/load", "session/resume"):
         if opts.auth_denied:
             send({"id": req_id, "error": {"code": -32000, "message": "Authentication required"}})
@@ -93,10 +115,34 @@ for line in sys.stdin:
         update("available_commands_update", availableCommands=[{
             "name": "fixture", "description": "A fake command"}])
         update("plan", entries=[{"content": "Read fixture", "priority": "high", "status": "pending"}])
-        result(req_id, {"sessionId": session, "models": {
-            "currentModelId": "fixture-model",
-            "availableModels": [{"modelId": "fixture-model", "name": "Fixture model"}]},
-            "modes": {"currentModeId": "code", "availableModes": [{"id": "code", "name": "Code"}]}})
+        if opts.antigravity:
+            assert params["_meta"]["antigravity"]["systemPrompt"]["append"]
+            agy_config = agy_options()
+            result(req_id, {"sessionId": session, "configOptions": agy_config,
+                "models": {"currentModelId": "gemini-3.8-flash",
+                    "availableModels": [
+                        {"modelId": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"},
+                        {"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)"},
+                        {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"},
+                        {"modelId": "gemini-4-carbon", "name": "Gemini 4 Carbon"}]},
+                "modes": {"currentModeId": "code", "availableModes": [{"id": "code", "name": "Code"}]}})
+        else:
+            result(req_id, {"sessionId": session, "models": {
+                "currentModelId": "fixture-model",
+                "availableModels": [{"modelId": "fixture-model", "name": "Fixture model"}]},
+                "modes": {"currentModeId": "code", "availableModes": [{"id": "code", "name": "Code"}]}})
+    elif method == "session/set_config_option":
+        assert opts.antigravity and agy_config
+        config_id = params["configId"]
+        assert config_id in ("model", "thinking_level")
+        for option in agy_config:
+            if option["id"] == config_id:
+                option["currentValue"] = params["value"]
+        result(req_id, {"configOptions": agy_config})
+    elif method == "session/set_mode":
+        assert opts.antigravity
+        agy_mode = params["modeId"]
+        result(req_id, {})
     elif method == "session/prompt":
         assert params["sessionId"] == session
         blocks = params["prompt"]

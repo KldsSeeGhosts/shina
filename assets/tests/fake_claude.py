@@ -144,6 +144,10 @@ with open(log_path, "a", encoding="utf8") as log:
                 data = dict(mcpServers=mcp_servers())
             emit(dict(type="control_response", response=dict(subtype="success",
                       request_id=record["request_id"], response=data)))
+            if subtype == "initialize":
+                emit(dict(type="system", subtype="init", model="default",
+                          claude_code_version="9.9.9",
+                          capabilities=["interrupt_receipt_v1", "interrupt_cancel_queued_v1"]))
             if subtype == "interrupt":
                 finish()
         elif record["type"] == "control_response":

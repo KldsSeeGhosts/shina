@@ -111,6 +111,25 @@ impl Thread {
                 id: id.clone(),
                 value: value.clone(),
             });
+        // KSG `resolveClaudeCatalogContextWindowTokens`: a Claude model's window is
+        // the selected contextWindow option's tokens, not a fixed catalog value.
+        if self.harness == "claude" && id == "contextWindow" {
+            let catalog =
+                crate::claude_catalog::bundled_claude_model_catalog(crate::lifecycle::now());
+            let selection = crate::model_selection::ModelSelection {
+                instance_id: self.harness.clone(),
+                model: self.model_id.clone(),
+                options: self.model_options.clone(),
+            };
+            if let Some(tokens) =
+                crate::claude_catalog::resolve_claude_catalog_context_window_tokens(
+                    &catalog,
+                    Some(&selection),
+                )
+            {
+                self.context_window = Some(tokens);
+            }
+        }
         if matches!(
             id.as_str(),
             "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
@@ -383,6 +402,15 @@ impl State {
     /// Harness ids a thread can use: built-ins, then registered ACP agents.
     pub(crate) fn harness_ids(&self) -> Vec<String> {
         let mut ids = vec!["pi".to_string(), "codex".to_string(), "claude".to_string()];
+        if crate::antigravity::cli_available()
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "antigravity")
+        {
+            ids.push("antigravity".to_string());
+        }
         ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
         ids
     }
@@ -516,69 +544,77 @@ impl State {
         // Codex & Claude
         for (id, name) in [("codex", "Codex"), ("claude", "Claude")] {
             seen.push((id.into(), name.into()));
-            let (installed, error, auth_status, update_required_models, has_models) =
-                if self.client.is_some() {
-                    let snap = &self.client_views["nativeCatalogs"][id];
-                    let models_empty = snap["models"].as_array().is_none_or(Vec::is_empty);
-                    let err = snap["error"].as_str().map(str::to_owned);
-                    let installed = snap["installed"].as_bool().unwrap_or(!models_empty);
-                    let auth = snap["authStatus"]
-                        .as_str()
-                        .map(ProviderAuthStatus::parse)
-                        .unwrap_or_else(|| {
-                            if err
-                                .as_deref()
-                                .is_some_and(crate::usage_limits::authentication_error)
-                            {
-                                ProviderAuthStatus::Unauthenticated
-                            } else if !models_empty {
-                                ProviderAuthStatus::Authenticated
-                            } else {
-                                ProviderAuthStatus::Unknown
-                            }
-                        });
-                    let updates: Vec<crate::model_picker::UpdateRequiredModel> =
-                        serde_json::from_value(snap["updateRequiredModels"].clone())
-                            .unwrap_or_default();
-                    (installed, err, auth, updates, !models_empty)
-                } else {
-                    let catalog = if id == "codex" {
-                        &self.codex_catalog
-                    } else {
-                        &self.claude_catalog
-                    };
-                    let installed = if id == "claude" {
-                        catalog.installed || crate::claude::process().is_ok()
-                    } else {
-                        true
-                    };
-                    let err = catalog.error.clone().or_else(|| {
-                        (id == "claude" && !installed).then(|| crate::claude::MISSING.into())
+            let (
+                installed,
+                error,
+                auth_status,
+                update_required_models,
+                has_models,
+                provider_message,
+            ) = if self.client.is_some() {
+                let snap = &self.client_views["nativeCatalogs"][id];
+                let models_empty = snap["models"].as_array().is_none_or(Vec::is_empty);
+                let err = snap["error"].as_str().map(str::to_owned);
+                let installed = snap["installed"].as_bool().unwrap_or(!models_empty);
+                let auth = snap["authStatus"]
+                    .as_str()
+                    .map(ProviderAuthStatus::parse)
+                    .unwrap_or_else(|| {
+                        if err
+                            .as_deref()
+                            .is_some_and(crate::usage_limits::authentication_error)
+                        {
+                            ProviderAuthStatus::Unauthenticated
+                        } else if !models_empty {
+                            ProviderAuthStatus::Authenticated
+                        } else {
+                            ProviderAuthStatus::Unknown
+                        }
                     });
-                    let auth = catalog
-                        .auth_status
-                        .as_deref()
-                        .map(ProviderAuthStatus::parse)
-                        .unwrap_or_else(|| {
-                            if err
-                                .as_deref()
-                                .is_some_and(crate::usage_limits::authentication_error)
-                            {
-                                ProviderAuthStatus::Unauthenticated
-                            } else if !catalog.models.is_empty() {
-                                ProviderAuthStatus::Authenticated
-                            } else {
-                                ProviderAuthStatus::Unknown
-                            }
-                        });
-                    (
-                        installed,
-                        err,
-                        auth,
-                        catalog.update_required_models.clone(),
-                        !catalog.models.is_empty(),
-                    )
+                let updates: Vec<crate::model_picker::UpdateRequiredModel> =
+                    serde_json::from_value(snap["updateRequiredModels"].clone())
+                        .unwrap_or_default();
+                let message = snap["providerMessage"].as_str().map(str::to_owned);
+                (installed, err, auth, updates, !models_empty, message)
+            } else {
+                let catalog = if id == "codex" {
+                    &self.codex_catalog
+                } else {
+                    &self.claude_catalog
                 };
+                let installed = if id == "claude" {
+                    catalog.installed || crate::claude::process().is_ok()
+                } else {
+                    true
+                };
+                let err = catalog.error.clone().or_else(|| {
+                    (id == "claude" && !installed).then(|| crate::claude::MISSING.into())
+                });
+                let auth = catalog
+                    .auth_status
+                    .as_deref()
+                    .map(ProviderAuthStatus::parse)
+                    .unwrap_or_else(|| {
+                        if err
+                            .as_deref()
+                            .is_some_and(crate::usage_limits::authentication_error)
+                        {
+                            ProviderAuthStatus::Unauthenticated
+                        } else if !catalog.models.is_empty() {
+                            ProviderAuthStatus::Authenticated
+                        } else {
+                            ProviderAuthStatus::Unknown
+                        }
+                    });
+                (
+                    installed,
+                    err,
+                    auth,
+                    catalog.update_required_models.clone(),
+                    !catalog.models.is_empty(),
+                    catalog.provider_message.clone(),
+                )
+            };
             let is_available = id != "claude" || installed;
             let status = if let Some(explicit) = (self.client.is_some())
                 .then(|| self.client_views["nativeCatalogs"][id]["status"].as_str())
@@ -612,9 +648,35 @@ impl State {
                 can_setup: false,
                 is_available,
                 is_acp: false,
-                message: error,
+                message: error.or(provider_message),
                 compatibility_broken_message: None,
                 update_required_models,
+            });
+        }
+
+        // Built-in Antigravity (KSG provider instance): `agy` on PATH, no ACP tag.
+        if crate::antigravity::cli_available()
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "antigravity")
+        {
+            entries.push(ProviderInstanceEntry {
+                instance_id: "antigravity".into(),
+                driver_kind: "antigravity".into(),
+                display_name: "Antigravity".into(),
+                continuation_group_key: None,
+                enabled: true,
+                installed: true,
+                status: ProviderStatusKind::Ready,
+                auth_status: ProviderAuthStatus::Unknown,
+                can_setup: true,
+                is_available: true,
+                is_acp: false,
+                message: None,
+                compatibility_broken_message: None,
+                update_required_models: vec![],
             });
         }
 
@@ -668,10 +730,16 @@ impl State {
                     ..Default::default()
                 });
             }
-            // Retain active thread's model if unavailable / uncatalogued
+            // Retain active thread's model if unavailable / uncatalogued. Aliases
+            // count as catalogued: a saved `opus` selects Claude Opus 5.5's row.
             if entry.instance_id == t.harness
                 && !t.model_id.is_empty()
-                && !models.iter().any(|m| m.id == t.model_id)
+                && !models.iter().any(|m| {
+                    m.id == t.model_id
+                        || m.aliases
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&t.model_id))
+                })
             {
                 models.push(AgentModel {
                     provider: if t.harness == "pi" {

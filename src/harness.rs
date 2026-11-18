@@ -291,6 +291,14 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
         if start.id == "claude" {
             return crate::claude::start(start, wake);
         }
+        // Antigravity is built in when `agy` is on PATH unless harnesses.json overrides it.
+        if start.id == "antigravity" {
+            let registry = Registry::read();
+            if registry.agents.iter().any(|a| a.id == "antigravity") {
+                return crate::acp::start(registry.find("antigravity")?, start, wake);
+            }
+            return crate::antigravity::start(start, wake);
+        }
         let agent = Registry::read().find(&start.id)?;
         crate::acp::start(agent, start, wake)
     }

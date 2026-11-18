@@ -109,13 +109,24 @@ fn probe_uncached(agent: &Agent) -> Result<Value, String> {
 }
 
 pub fn start(agent: Agent, start: Start, wake: Waker) -> Result<Pi, String> {
+    let command = agent.process()?;
+    start_command(agent, start, wake, command)
+}
+
+/// The Antigravity layer supplies its own isolated command; every other agent
+/// builds one from its registry entry.
+pub(crate) fn start_command(
+    agent: Agent,
+    start: Start,
+    wake: Waker,
+    command: std::process::Command,
+) -> Result<Pi, String> {
     if matches!(start.source, SessionSource::Fork(_)) {
         return Err("ACP conversation forks are not supported. Start a new thread instead.".into());
     }
     if start.link.is_none() {
         return Err("ACP requires Shina's MCP bridge. Retry after the bridge is available.".into());
     }
-    let command = agent.process()?;
     let claude = crate::composer_skills::is_claude(&agent);
     let skill_args = agent.args.clone();
     let inherit_config = agent.env.iter().any(|name| name == "CLAUDE_CONFIG_DIR");
@@ -224,6 +235,20 @@ struct Client {
     queued: VecDeque<Value>,
     wire: Vec<Value>,
     events: Vec<Value>,
+    /// Built-in Antigravity runtime hooks (KSG makeAntigravityAcpRuntime).
+    antigravity: bool,
+    antigravity_version: Option<String>,
+    initialize_result: Value,
+    config_options: Vec<Value>,
+    thinking_levels: HashMap<String, Option<Value>>,
+    /// A combined `family-level` pick awaiting its level after the family switch.
+    pending_thinking: Option<(Value, String, String)>,
+    /// The real `agy` CLI wraps setMode with antigravityCliSessionMode; a
+    /// harnesses.json override is an arbitrary executable and does not.
+    antigravity_cli: bool,
+    /// The session's ACP `modes` block, for KSG's setMode modeState.
+    modes: Value,
+    file_reads: bool,
 }
 
 impl Client {
@@ -257,6 +282,15 @@ impl Client {
             queued: VecDeque::new(),
             wire: vec![],
             events: vec![],
+            antigravity: false,
+            antigravity_version: None,
+            initialize_result: Value::Null,
+            config_options: vec![],
+            thinking_levels: HashMap::new(),
+            pending_thinking: None,
+            antigravity_cli: false,
+            modes: Value::Null,
+            file_reads: false,
         }
     }
 
@@ -286,10 +320,22 @@ impl Client {
     }
 
     fn initialize(&mut self) {
+        // KSG antigravityClientInfo + client-file-reads rule: serve reads except on the
+        // qualified 1.4.5 release; writes stay off so the agent keeps its diff edits.
+        let (client_info, read_files) = if self.antigravity {
+            let version = self.antigravity_version.as_deref();
+            self.file_reads = !crate::antigravity::is_qualified_release(version);
+            (crate::antigravity::client_info(version), self.file_reads)
+        } else {
+            (
+                json!({"name":"Shina","version":env!("CARGO_PKG_VERSION")}),
+                false,
+            )
+        };
         self.request("initialize", json!({
             "protocolVersion":1,
-            "clientInfo":{"name":"Shina","version":env!("CARGO_PKG_VERSION")},
-            "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false}
+            "clientInfo":client_info,
+            "clientCapabilities":{"fs":{"readTextFile":read_files,"writeTextFile":false},"terminal":false}
         }), json!({"type":"initialize"}));
     }
 
@@ -369,6 +415,20 @@ impl Client {
             } else if method == "session/request_permission" && record.get("id").is_some() {
                 self.permission(&record)?;
             } else if record.get("id").is_some() {
+                // KSG readAntigravityClientTextFile, advertised per the qualified-release rule.
+                if method == "fs/read_text_file" && self.antigravity && self.file_reads {
+                    let workspace = self.start.workspace.clone();
+                    let response = match crate::antigravity::read_text_file(
+                        &record["params"],
+                        &[workspace.as_path()],
+                    ) {
+                        Ok(result) => json!({"jsonrpc":"2.0","id":record["id"],"result":result}),
+                        Err((code, message)) => json!({"jsonrpc":"2.0","id":record["id"],
+                            "error":{"code":code,"message":message}}),
+                    };
+                    self.wire.push(response);
+                    return Ok(());
+                }
                 self.wire.push(json!({"jsonrpc":"2.0","id":record["id"],"error":{"code":-32601,"message":format!("Shina does not support ACP client capability {method}. Filesystem and terminal capabilities were not advertised.")}}));
                 self.reject(
                     &json!({"type":"capability"}),
@@ -435,9 +495,21 @@ impl Client {
                 message.to_owned()
             };
             // Never authenticate or retry after an auth denial.
-            let message = format!(
-                "ACP {kind} failed: {message}. If authentication is required, configure or sign in to the agent outside Shina, then retry."
-            );
+            let message = if self.antigravity
+                && kind == "authenticate"
+                && crate::antigravity::is_sign_in_required_error(
+                    error["code"].as_i64().unwrap_or(0),
+                    &message,
+                ) {
+                crate::antigravity::SIGN_IN_REQUIRED.to_owned()
+            } else {
+                format!(
+                    "ACP {kind} failed: {message}. If authentication is required, configure or sign in to the agent outside Shina, then retry."
+                )
+            };
+            if kind == "authenticate" {
+                return Err(message);
+            }
             if matches!(kind, "initialize" | "start") {
                 return Err(message);
             }
@@ -456,36 +528,23 @@ impl Client {
                     return Err("This ACP agent did not negotiate protocol version 1. ACP v2 is not supported.".into());
                 }
                 self.capabilities = result["agentCapabilities"].clone();
+                self.initialize_result = result.clone();
                 self.active_steering = supports_active_steering(&result["_meta"]);
                 self.events
                     .push(json!({"type":"harness_update","field":"turnCapabilities",
                     "value":self.turn_capabilities()}));
-                let mut params =
-                    json!({"cwd":self.start.workspace,"mcpServers":self.mcp_servers()?});
-                let method = match &self.start.source {
-                    SessionSource::New => "session/new",
-                    SessionSource::Resume(session) => {
-                        params["sessionId"] = json!(session);
-                        self.session = Some(session.clone());
-                        if self.capabilities["loadSession"] == true {
-                            "session/load"
-                        } else if self.capabilities["sessionCapabilities"]
-                            .get("resume")
-                            .is_some_and(|v| !v.is_null())
-                        {
-                            "session/resume"
-                        } else {
-                            return Err("This ACP agent does not advertise session/load or session/resume. Start a new thread instead.".into());
-                        }
-                    }
-                    SessionSource::Fork(_) => return Err("ACP forks are unsupported.".into()),
-                };
-                self.request(
-                    method,
-                    params.clone(),
-                    json!({"type":"start","method":method,"params":params}),
-                );
+                // KSG authenticateEagerly with authMethodId oauth-personal.
+                if self.antigravity {
+                    self.request(
+                        "authenticate",
+                        json!({"methodId":"oauth-personal"}),
+                        json!({"type":"authenticate"}),
+                    );
+                    return Ok(());
+                }
+                self.start_session()?;
             }
+            "authenticate" => self.start_session()?,
             "start" => {
                 if let Some(session) = result["sessionId"].as_str() {
                     self.session = Some(session.into());
@@ -496,7 +555,22 @@ impl Client {
                 // The persisted per-session marker avoids repeating context after resume.
                 self.finish_replay();
                 self.configure_models(result);
+                if let Some(modes) = result.get("modes") {
+                    self.modes = modes.clone();
+                }
                 self.ready = true;
+                // KSG sessionModeForPolicy: the thread's runtime policy becomes the
+                // session mode at setup; the agy CLI maps yolo/auto_edit to default.
+                if self.antigravity {
+                    let access = self
+                        .start
+                        .link
+                        .as_ref()
+                        .map(|h| h.access_mode.as_str())
+                        .unwrap_or("");
+                    let policy = crate::antigravity::permission_mode(access).to_owned();
+                    self.antigravity_set_mode(&policy, json!({"type":"antigravity_mode"}));
+                }
                 self.reply(
                     &json!({"id":"models","type":"get_available_models"}),
                     json!({"models":self.models}),
@@ -541,7 +615,65 @@ impl Client {
                             self.model_value(request["modelId"].as_str().unwrap_or("default"), None)
                         });
                 }
+                // KSG applyAntigravityAcpModelSelection: thinking levels vary by family, so
+                // read them after the family switch and apply the level second.
+                if self.antigravity
+                    && let Some((original, combined, level)) = self.pending_thinking.take()
+                {
+                    let levels = crate::antigravity::thinking_config(&self.config_options);
+                    let offered = levels
+                        .map(|c| {
+                            crate::antigravity::select_values(c)
+                                .into_iter()
+                                .any(|e| e["value"] == level)
+                        })
+                        .unwrap_or(false);
+                    if let (Some(levels), true) = (levels, offered) {
+                        let config_id = levels["id"].as_str().unwrap_or("").to_owned();
+                        self.request(
+                            "session/set_config_option",
+                            json!({"sessionId":self.session,"configId":config_id,"value":level}),
+                            json!({"type":"antigravity_level","original":original,"combined":combined}),
+                        );
+                        return Ok(());
+                    }
+                    self.reject(
+                        &original,
+                        format!("Antigravity model '{combined}' is unavailable. Select an available model."),
+                    );
+                    return Ok(());
+                }
                 self.reply(&request, self.model.clone());
+            }
+            "antigravity_mode" => {
+                if result["configOptions"].is_array() {
+                    self.configure_models(result);
+                }
+                self.note_modes(result);
+                if self.modes.is_object() {
+                    self.events
+                        .push(json!({"type":"harness_update","field":"modes","value":self.modes}));
+                }
+            }
+            "antigravity_level" => {
+                let original = request["original"].clone();
+                if result["configOptions"].is_array() {
+                    self.configure_models(result);
+                }
+                self.pending_thinking = None;
+                let combined = request["combined"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| crate::antigravity::current_model(&self.config_options));
+                self.model = self
+                    .models
+                    .iter()
+                    .find(|m| m["id"].as_str() == combined.as_deref())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        self.model_value(combined.as_deref().unwrap_or("default"), None)
+                    });
+                self.reply(&original, self.model.clone());
             }
             "set_option" | "set_thinking_level" => {
                 if result["configOptions"].is_array() {
@@ -552,6 +684,123 @@ impl Client {
             _ => self.reply(&request, result.clone()),
         }
         Ok(())
+    }
+
+    /// Session creation, extracted so Antigravity can authenticate first. KSG
+    /// `antigravitySessionMeta` rides along as `_meta`; Antigravity prefers session/resume.
+    fn start_session(&mut self) -> Result<(), String> {
+        let mut params = json!({"cwd":self.start.workspace,"mcpServers":self.mcp_servers()?});
+        let method = match &self.start.source {
+            SessionSource::New => "session/new",
+            SessionSource::Resume(session) => {
+                params["sessionId"] = json!(session);
+                self.session = Some(session.clone());
+                if self.antigravity
+                    && self.capabilities["sessionCapabilities"]
+                        .get("resume")
+                        .is_some_and(|v| !v.is_null())
+                {
+                    "session/resume"
+                } else if self.capabilities["loadSession"] == true {
+                    "session/load"
+                } else if self.capabilities["sessionCapabilities"]
+                    .get("resume")
+                    .is_some_and(|v| !v.is_null())
+                {
+                    "session/resume"
+                } else {
+                    return Err("This ACP agent does not advertise session/load or session/resume. Start a new thread instead.".into());
+                }
+            }
+            SessionSource::Fork(_) => return Err("ACP forks are unsupported.".into()),
+        };
+        if self.antigravity
+            && let Some(meta) = crate::antigravity::session_meta(
+                &self.initialize_result,
+                Some(crate::mcp::INSTRUCTIONS),
+            )
+        {
+            params["_meta"] = meta;
+        }
+        self.request(
+            method,
+            params.clone(),
+            json!({"type":"start","method":method,"params":params}),
+        );
+        Ok(())
+    }
+
+    /// KSG `AcpSessionRuntime.setMode`: a mode pick goes through the session's
+    /// `category: "mode"` config option when one exists, else `session/set_mode`
+    /// when the agent negotiated `modes`. The real `agy` CLI wraps the pick in
+    /// `antigravityCliSessionMode`; short-circuits when the mode already matches.
+    fn antigravity_set_mode(&mut self, mode_id: &str, request: Value) {
+        let mode_id = if self.antigravity_cli {
+            crate::antigravity::cli_session_mode(mode_id)
+        } else {
+            mode_id
+        };
+        if self.modes["currentModeId"].as_str() == Some(mode_id) {
+            self.reply(&request, json!({"currentModeId":mode_id}));
+            return;
+        }
+        if let Some(config_id) = crate::antigravity::mode_config(&self.config_options)
+            .and_then(|o| o["id"].as_str().map(str::to_owned))
+        {
+            self.request(
+                "session/set_config_option",
+                json!({"sessionId":self.session,"configId":config_id,"value":mode_id}),
+                request,
+            );
+        } else if self.modes.is_object() {
+            self.request(
+                "session/set_mode",
+                json!({"sessionId":self.session,"modeId":mode_id}),
+                request,
+            );
+        } else {
+            self.reject(&request, "This ACP agent did not negotiate session modes.");
+        }
+    }
+
+    /// KSG `withinCeiling` + `antigravityRuntimeModeForSessionMode`: under a managed
+    /// policy ceiling, a mode pick applies only when its granted runtime mode is
+    /// known and stays at or under the ceiling.
+    fn antigravity_mode_denial(&self, value: &str) -> Option<String> {
+        let policy = crate::model::pi_session::read_managed_policy()?;
+        let ceiling = policy.max_access?;
+        match crate::antigravity::runtime_mode_for_session_mode(value)
+            .and_then(crate::model::AccessMode::parse)
+        {
+            Some(mode) => crate::model::pi_session::managed_access_mode_denial(Some(&policy), mode),
+            None => Some(format!(
+                "{} limits threads to {}.",
+                policy.organization,
+                ceiling.label()
+            )),
+        }
+    }
+
+    /// KSG `updateCurrentModeId` + `parseSessionModeState`: track the current mode
+    /// from a mode reply or the mode-category config option's currentValue.
+    fn note_modes(&mut self, result: &Value) {
+        if let Some(modes) = result.get("modes") {
+            self.modes = modes.clone();
+        }
+        let current = result["currentModeId"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                crate::antigravity::mode_config(&self.config_options)
+                    .and_then(|o| o["currentValue"].as_str().map(str::to_owned))
+            });
+        if let Some(current) = current {
+            if self.modes.is_object() {
+                self.modes["currentModeId"] = json!(current);
+            } else {
+                self.modes = json!({"currentModeId":current,"availableModes":[]});
+            }
+        }
     }
 
     fn model_value(&self, id: &str, name: Option<&str>) -> Value {
@@ -586,6 +835,33 @@ impl Client {
             result["configOptions"].as_array().map(Vec::as_slice),
             result.get("modes"),
         );
+        self.config_options = result["configOptions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        // KSG observeThinkingLevels + buildAntigravityModelsFromSession.
+        if self.antigravity {
+            crate::antigravity::observe_thinking_levels(
+                &self.config_options,
+                &mut self.thinking_levels,
+            );
+            let (mut rows, current) =
+                crate::antigravity::session_models(result, &self.thinking_levels);
+            crate::antigravity::apply_manifest(&mut rows);
+            self.model_option = crate::antigravity::model_config(&self.config_options)
+                .and_then(|c| c["id"].as_str().map(str::to_owned));
+            self.models = rows
+                .iter()
+                .map(|row| self.antigravity_model_value(row))
+                .collect();
+            self.model = self
+                .models
+                .iter()
+                .find(|m| m["id"].as_str() == current.as_deref())
+                .cloned()
+                .unwrap_or_else(|| self.model_value(current.as_deref().unwrap_or("default"), None));
+            return;
+        }
         if let Some(options) = result["configOptions"].as_array()
             && let Some(option) = options
                 .iter()
@@ -624,6 +900,33 @@ impl Client {
                 None,
             );
         }
+    }
+
+    /// KSG `thinkingCapabilities`: per-model reasoning descriptor, current value
+    /// stripped unless this model was observed with it.
+    fn antigravity_model_value(&self, row: &Value) -> Value {
+        let mut value = self.model_value(
+            row["slug"].as_str().unwrap_or("default"),
+            row["name"].as_str(),
+        );
+        value["isDefault"] = row["isDefault"].clone();
+        value["aliases"] = row["aliases"].clone();
+        value["isLegacy"] = row["isLegacy"].clone();
+        if row["thinking"].is_object() {
+            let descriptors = crate::descriptors::acp_provider_option_descriptors(
+                Some(std::slice::from_ref(&row["thinking"])),
+                None,
+            );
+            if let Some(descriptor) = descriptors.into_iter().next() {
+                let levels = crate::descriptors::selectable_provider_option_choices(&descriptor)
+                    .into_iter()
+                    .map(|c| c.id)
+                    .collect::<Vec<_>>();
+                value["thinkingLevels"] = json!(levels);
+                value["capabilities"] = json!({"optionDescriptors":[descriptor]});
+            }
+        }
+        value
     }
 
     fn command(&mut self, record: Value) -> Result<(), String> {
@@ -740,6 +1043,47 @@ impl Client {
             "set_model" => {
                 if self.running {
                     self.reject(&record, "Wait for the ACP run to finish before changing its model.");
+                } else if self.antigravity {
+                    // KSG applyAntigravityAcpModelSelection (no gateway branch in Shina).
+                    let requested = record["modelId"].as_str().unwrap_or("");
+                    let resolved = crate::antigravity::resolve_model(
+                        &self.config_options,
+                        Some(requested),
+                        None,
+                    );
+                    let current = crate::antigravity::current_model(&self.config_options);
+                    let Some(resolved) = resolved else {
+                        self.reject(&record, format!("Antigravity model '{requested}' is unavailable. Select an available model."));
+                        return Ok(());
+                    };
+                    if requested.is_empty() && current.as_deref() == Some(resolved.as_str()) {
+                        self.reply(&record, self.model.clone());
+                    } else if let Some(option) = &self.model_option {
+                        let split = crate::antigravity::split_model(&self.config_options, &resolved);
+                        match split {
+                            Some((family, None)) | Some((family, Some(_)))
+                                if family == resolved =>
+                            {
+                                self.request("session/set_config_option", json!({"sessionId":self.session,"configId":option,"value":family}), record);
+                            }
+                            Some((family, Some(level))) => {
+                                self.pending_thinking =
+                                    Some((record.clone(), resolved.clone(), level));
+                                self.request("session/set_config_option", json!({"sessionId":self.session,"configId":option,"value":family}), record);
+                            }
+                            _ if crate::antigravity::legacy_family(&self.config_options, &resolved)
+                                .is_some()
+                                && crate::antigravity::thinking_config(&self.config_options)
+                                    .is_none() =>
+                            {
+                                // Legacy 1.3 combined id the agent still accepts.
+                                self.request("session/set_config_option", json!({"sessionId":self.session,"configId":option,"value":resolved}), record);
+                            }
+                            _ => self.reject(&record, format!("Antigravity model '{resolved}' is unavailable. Select an available model.")),
+                        }
+                    } else {
+                        self.request("session/set_model", json!({"sessionId":self.session,"modelId":resolved}), record);
+                    }
                 } else if !self.models.iter().any(|model| model["id"] == record["modelId"]) {
                     self.reject(&record, "This ACP agent did not advertise that model. Refresh the session or choose one of its advertised models.");
                 } else if let Some(option) = &self.model_option {
@@ -776,16 +1120,27 @@ impl Client {
                 if self.running {
                     self.reject(&record, "Wait for the ACP run to finish before changing options.");
                 } else if let Some(option_id) = record["optionId"].as_str() {
-                    if option_id == crate::descriptors::ACP_SESSION_MODE_OPTION_ID {
+                    if self.antigravity
+                        && crate::antigravity::is_mode_choice(&self.config_options, option_id)
+                        && let Some(denial) = self
+                            .antigravity_mode_denial(record["value"].as_str().unwrap_or(""))
+                    {
+                        self.reject(&record, denial);
+                    } else if option_id == crate::descriptors::ACP_SESSION_MODE_OPTION_ID {
                         let mode_id = record["value"]
                             .as_str()
                             .map(|v| if v == crate::descriptors::ACP_EMPTY_OPTION_VALUE { "" } else { v })
-                            .unwrap_or("");
-                        self.request(
-                            "session/set_mode",
-                            json!({"sessionId":self.session,"modeId":mode_id}),
-                            record,
-                        );
+                            .unwrap_or("")
+                            .to_owned();
+                        if self.antigravity {
+                            self.antigravity_set_mode(&mode_id, record);
+                        } else {
+                            self.request(
+                                "session/set_mode",
+                                json!({"sessionId":self.session,"modeId":mode_id}),
+                                record,
+                            );
+                        }
                     } else {
                         let value = match record["value"].as_str() {
                             Some(v) if v == crate::descriptors::ACP_EMPTY_OPTION_VALUE => json!(""),
@@ -1105,6 +1460,16 @@ impl Client {
     }
 
     fn update(&mut self, update: &Value) {
+        // KSG normalizeAntigravitySessionUpdate bounds tool payload size.
+        let normalized;
+        let update = if self.antigravity {
+            normalized = crate::antigravity::normalize_session_update(
+                &json!({"sessionId":self.session,"update":update}),
+            );
+            &normalized["update"]
+        } else {
+            update
+        };
         let emit = self.ready;
         match update["sessionUpdate"].as_str().unwrap_or("") {
             "agent_message_chunk" | "agent_thought_chunk" | "user_message_chunk" => {
@@ -1226,6 +1591,16 @@ impl Client {
                     update["configOptions"].as_array().map(Vec::as_slice),
                     None,
                 );
+                self.config_options = update["configOptions"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if self.antigravity {
+                    crate::antigravity::observe_thinking_levels(
+                        &self.config_options,
+                        &mut self.thinking_levels,
+                    );
+                }
                 self.events.push(json!({
                     "type": "harness_update",
                     "field": "optionDescriptors",
@@ -1480,12 +1855,24 @@ fn run(
     let mut stdin = process.stdin.take().unwrap();
     let stdout = process.stdout.take().unwrap();
     let stderr = process.stderr.take().unwrap();
+    let is_antigravity = start.id == "antigravity";
     let (received, records) = mpsc::sync_channel(256);
     let reader = thread::spawn(move || {
         let mut stdout = BufReader::new(stdout);
         loop {
-            let record =
-                backend::read_record(&mut stdout).map_err(|error| error.replace("Pi", "ACP"));
+            // KSG makeAntigravityStdoutTransform: the OAuth URL line is not JSON-RPC.
+            let record = if is_antigravity {
+                match crate::antigravity::read_agent_record(&mut stdout) {
+                    Ok(crate::antigravity::AgentLine::AuthUrl(url)) => {
+                        Ok(Some(json!({"shina/antigravity-auth-url":url})))
+                    }
+                    Ok(crate::antigravity::AgentLine::Record(record)) => Ok(Some(record)),
+                    Ok(crate::antigravity::AgentLine::Eof) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            } else {
+                backend::read_record(&mut stdout).map_err(|error| error.replace("Pi", "ACP"))
+            };
             let done = !matches!(record, Ok(Some(_)));
             if received.send(record).is_err() || done {
                 break;
@@ -1509,17 +1896,32 @@ fn run(
                 .read_until(b'\n', &mut bytes)
             {
                 Ok(0) | Err(_) => break,
-                _ if sent < 12 => {
-                    sent += 1;
-                    // Agent stderr can include provider secrets. Keep it out of persisted diagnostics.
+                _ => {
                     let text = String::from_utf8_lossy(&bytes).replace(&bridge_token, "[redacted]");
-                    let message = crate::update::redact(&crate::projects::redact(&text));
-                    if !backend::publish(&diagnostics, &diagnostic_wake, Event::Diagnostic(message))
+                    // KSG makeAntigravityStderrHandler: the BROWSER helper marks the OAuth URL.
+                    if is_antigravity && let Some(url) = crate::antigravity::stderr_auth_url(&text)
                     {
-                        break;
+                        let _ = backend::publish(
+                            &diagnostics,
+                            &diagnostic_wake,
+                            Event::Record(json!({"type":"harness_update",
+                                "field":"signInUrl","value":url})),
+                        );
+                        continue;
+                    }
+                    if sent < 12 {
+                        sent += 1;
+                        // Agent stderr can include provider secrets. Keep it out of persisted diagnostics.
+                        let message = crate::update::redact(&crate::projects::redact(&text));
+                        if !backend::publish(
+                            &diagnostics,
+                            &diagnostic_wake,
+                            Event::Diagnostic(message),
+                        ) {
+                            break;
+                        }
                     }
                 }
-                _ => {}
             }
         }
     });
@@ -1549,6 +1951,22 @@ fn run(
         client.restart_steering = false;
     }
     client.claude_skills = claude_skills;
+    if is_antigravity {
+        client.antigravity = true;
+        // Version gating only applies to the real `agy` CLI, never a registry override.
+        let program = std::path::Path::new(&*executable)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(
+            program.as_str(),
+            "agy" | "agy.exe" | "antigravity" | "antigravity.exe"
+        ) {
+            client.antigravity_cli = true;
+            client.antigravity_version = crate::antigravity::cli_version();
+        }
+    }
     client.initialize();
     let result = (|| {
         let mut started = Instant::now();
@@ -1599,7 +2017,14 @@ fn run(
             }
             for _ in 0..64 {
                 match records.try_recv() {
-                    Ok(Ok(Some(record))) => client.incoming(record)?,
+                    Ok(Ok(Some(record))) => {
+                        if let Some(url) = record["shina/antigravity-auth-url"].as_str() {
+                            client.events.push(json!({"type":"harness_update",
+                                "field":"signInUrl","value":url}));
+                            continue;
+                        }
+                        client.incoming(record)?;
+                    }
                     Ok(Ok(None)) => {
                         return Err(
                             "ACP agent closed its output. Retry to resume the saved session."
