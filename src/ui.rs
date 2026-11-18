@@ -10652,10 +10652,12 @@ fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) ->
     if let Some(key) = key {
         words = words.key(key);
     }
+    // A full-width row bounds the label, so it truncates at the lane instead of overflowing.
     row()
         .min_h(26.0)
         .center_y()
         .gap(5.0)
+        .w_full()
         .min_w(0.0)
         .child(el().size(24.0, 24.0).center().child(tool_icon(glyph, ink)))
         .child(words)
@@ -27227,6 +27229,30 @@ pub(crate) mod tests {
             .iter()
             .filter_map(|e| e.text.clone())
             .collect()
+    }
+
+    #[test]
+    fn a_long_live_step_truncates_inside_the_lane() {
+        let command = format!(
+            "\"C:\\\\WINDOWS\\\\System32\\\\powershell.exe\" -Command 'tailscale ping {}'",
+            "kidsseemac ".repeat(40)
+        );
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = streak_runtime(width);
+            rt.state.current_mut().tools[3].detail = command.clone();
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.frame(2.0);
+            let lane = rt.presented("chat-lane").unwrap().0;
+            for key in ["live-work-1", "live-work-text-1"] {
+                let rect = rt.presented(key).unwrap().0;
+                eprintln!("{width}: lane {lane:?} {key} {rect:?}");
+                assert!(
+                    rect[0] + rect[2] <= lane[0] + lane[2] + 0.5,
+                    "{width}: {key} {rect:?} overflows {lane:?}"
+                );
+            }
+        }
     }
 
     #[test]
