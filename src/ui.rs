@@ -12897,6 +12897,19 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
     framed(bar, p).pin(None, Some(12.0), Some(12.0), None)
 }
 
+/// A running turn's height motion. Streaming prose reveals at the stream's pace. While the
+/// turn ends in work, its live row replaces itself as steps start and end and its thought
+/// preview comes and goes, so the row snaps to each new height instead of easing toward it
+/// behind the feathered edge, which flickered and cut the newest step in half.
+fn live_turn_motion(t: &Thread, turn: El, start: usize, end: usize) -> El {
+    let parts = turn_parts(t, start, end);
+    if parts.is_empty() || live_tail(t, &parts).is_some() {
+        turn.fold_glide(rune::Spring::NONE).fold_feather(0.0)
+    } else {
+        turn.streaming(true)
+    }
+}
+
 /// Ported from KSG Code's `MessagesTimeline` (`LegendList` virtualisation, `estimatedItemSize={90}`,
 /// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
@@ -13002,15 +13015,18 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     TimelineRow::AssistantTurn { start, end, .. } => {
                         let turn = assistant_turn(s, p, wide, *start, *end);
                         if *end == s.current().messages.len() && s.current().status.busy() {
-                            turn.streaming(true)
+                            live_turn_motion(s.current(), turn, *start, *end)
                         } else {
                             turn.fold_glide(rune::Spring::new(0.20, 0.0))
                                 .fold_feather(14.0)
                         }
                     }
-                    TimelineRow::LiveTurn { start, .. } => {
-                        assistant_turn(s, p, wide, *start, *start).streaming(true)
-                    }
+                    TimelineRow::LiveTurn { start, .. } => live_turn_motion(
+                        s.current(),
+                        assistant_turn(s, p, wide, *start, *start),
+                        *start,
+                        *start,
+                    ),
                     TimelineRow::TurnPiece {
                         start, end, piece, ..
                     } => assistant_turn_piece(s, p, wide, *start, *end, Some(*piece)),
@@ -27252,6 +27268,38 @@ pub(crate) mod tests {
                     "{width}: {key} {rect:?} overflows {lane:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_live_work_row_snaps_to_its_new_height() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = streak_runtime(width);
+            let run = |rt: &mut Runtime<State>, frames: usize| {
+                for _ in 0..frames {
+                    rt.frame(1.0 / 60.0);
+                }
+            };
+            run(&mut rt, 180);
+            // The virtual list keys the turn's row; its drawn height is the growth height.
+            let row = disclosed_timeline_structure(rt.state.current())
+                .rows
+                .last()
+                .unwrap()
+                .key()
+                .to_owned();
+            let bottom = |rt: &Runtime<State>| rt.presented(&row).unwrap().0[3];
+            let before = bottom(&rt);
+            // A long thought heading over the running step makes the live row taller.
+            rt.state.current_mut().thoughts[2].text =
+                format!("**{}**", "Checking the tests again ".repeat(12));
+            rt.invalidate();
+            run(&mut rt, 1);
+            let next = bottom(&rt);
+            run(&mut rt, 180);
+            let settled = bottom(&rt);
+            assert!(settled > before + 10.0, "{width}: {before} {settled}");
+            assert_eq!(next, settled, "{width}: the live row eased from {before}");
         }
     }
 
