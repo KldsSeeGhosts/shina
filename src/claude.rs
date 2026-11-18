@@ -2009,7 +2009,7 @@ impl Client {
 /// so the picker sees exactly what a session advertises.
 pub(crate) fn claude_row_model_value(
     catalog: &crate::claude_catalog::ClaudeModelCatalog,
-    row: &crate::claude_catalog::ClaudeModelRow,
+    row: &crate::model_catalog::CatalogModelRow,
 ) -> Value {
     let mut value = json!({"provider":"claude","id":row.slug,
         "name":row.name,"shortName":row.short_name,
