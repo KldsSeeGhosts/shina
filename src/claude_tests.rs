@@ -183,12 +183,14 @@ fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
             Event::Diagnostic(_) => {}
         }
     }
+    // Manifest rows list under their slugs, with the manifest's display names;
+    // `default` is Claude Code's pointer, not a catalog row.
     assert!(
         models
             .as_array()
             .unwrap()
             .iter()
-            .any(|model| model["id"] == "default")
+            .any(|model| model["id"] == "claude-opus-4-5" && model["name"] == "Claude Opus 4.5")
     );
     let wire = records(&log);
     assert!(wire.iter().all(|record| record["type"] != "user"));
@@ -305,7 +307,29 @@ fn initialized_client(access: &str) -> Client {
         "commands":[],"models":[{"value":"default","supportedEffortLevels":["low","high"]}]}),
         )
         .unwrap();
+    settings_response(&mut client, json!({"effective":{},"sources":[]}));
     client
+}
+
+/// Answers the session's `get_settings` request, as the CLI's own settings files
+/// would report them; finishes deferred initialization. `system`/`init` goes first,
+/// the order the real CLI emits it.
+fn settings_response(client: &mut Client, response: Value) {
+    client
+        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"9.9.9"}))
+        .unwrap();
+    let id = client
+        .pending
+        .iter()
+        .find(|(_, pending)| pending.request["subtype"] == "get_settings")
+        .map(|(id, _)| id.clone())
+        .expect("get_settings request");
+    client
+        .incoming(
+            json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":id,"response":response}}),
+        )
+        .unwrap();
 }
 
 /// Answers the session's `mcp_status` request with `servers`, as the CLI would report its
@@ -351,7 +375,16 @@ fn handshake_stream_tools_nested_usage_and_process_only_mcp() {
     let (mut thread, log) = fixture("approval-required", &[]);
     pump(&mut thread, |t| t.native.commands_loaded);
     assert!(thread.session.is_some());
-    assert_eq!(thread.models[0].thinking_levels, ["low", "high"]);
+    // Manifest rows list the catalog's effort levels under their manifest slugs.
+    let opus = thread
+        .models
+        .iter()
+        .find(|m| m.id == "claude-opus-5-5")
+        .expect("Claude Opus 5.5 row");
+    assert_eq!(
+        opus.thinking_levels,
+        ["low", "medium", "high", "xhigh", "max"]
+    );
     assert!(thread.native.commands.iter().any(|c| c.name == "review"));
     thread.draft.replace_text("hello");
     thread.send();
@@ -538,6 +571,7 @@ fn read_only_admits_only_exact_shina_tools_on_an_authenticated_endpoint() {
         "commands":[],"models":[]}),
         )
         .unwrap();
+    settings_response(&mut offline, json!({"effective":{},"sources":[]}));
     offline
         .server_request(
             &json!({"request_id":"p","request":{"subtype":"can_use_tool",
@@ -1627,6 +1661,7 @@ fn claude_reports_manifest_descriptors_and_applies_options_and_1m_suffix() {
             ]
         }))
         .unwrap();
+    settings_response(&mut client, json!({"effective":{},"sources":[]}));
     let opus55 = client
         .models
         .iter()
@@ -1671,6 +1706,7 @@ fn auto_mode_maps_to_claude_auto_permission_mode() {
             "models": []
         }))
         .unwrap();
+    settings_response(&mut client, json!({"effective":{},"sources":[]}));
     client.wire.clear();
     client
         .command(json!({"type":"set_access_mode","accessMode":"auto"}))
@@ -1814,6 +1850,7 @@ fn claude_prompt_suggestion_stores_for_settled_run_and_discards_late_answer() {
             }
         }))
         .unwrap();
+    settings_response(&mut client, json!({"effective":{},"sources":[]}));
 
     let mut thread = Thread::new(33);
     thread.harness = "claude".into();

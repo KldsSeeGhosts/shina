@@ -901,7 +901,11 @@ pub fn normalize_claude_catalog_effort(
     model: &str,
 ) -> Option<String> {
     let effort = effort?;
-    let effort_map = &resolve_claude_catalog_model(catalog, model)?.runtime.effort_map;
+    let Some(effort_map) =
+        resolve_claude_catalog_model(catalog, model).map(|entry| &entry.runtime.effort_map)
+    else {
+        return Some(effort.to_owned());
+    };
     if !effort_map.contains_key(effort) {
         return Some(effort.to_owned());
     }
@@ -1177,7 +1181,10 @@ const MODEL_SETTINGS_ENV_PREFIXES: [&str; 5] = [
 ];
 
 /// Ported from `ClaudeCodeModelRoutes.ts` (`claudeModelSettingsKey`): equal keys
-/// mean Claude Code resolves model ids the same way under both settings.
+/// mean Claude Code resolves model ids the same way under both settings. Shina
+/// sessions each read their own settings, so no probe-vs-session key comparison
+/// exists for it to feed; it stays for parity and tests.
+#[allow(dead_code)]
 pub fn claude_model_settings_key(settings: &Value) -> String {
     let sorted_entries = |record: &Value| -> Vec<(String, String)> {
         let mut entries: Vec<(String, String)> = record
@@ -1210,6 +1217,7 @@ pub fn claude_model_settings_key(settings: &Value) -> String {
 }
 
 /// `claudeModelSettingsKey({})`: the key when no settings carry model context.
+#[allow(dead_code)]
 pub fn no_model_settings_key() -> String {
     claude_model_settings_key(&json!({}))
 }

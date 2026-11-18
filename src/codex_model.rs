@@ -111,6 +111,22 @@ impl Thread {
                 id: id.clone(),
                 value: value.clone(),
             });
+        // KSG `resolveClaudeCatalogContextWindowTokens`: a Claude model's window is
+        // the selected contextWindow option's tokens, not a fixed catalog value.
+        if self.harness == "claude" && id == "contextWindow" {
+            let catalog = crate::claude_catalog::bundled_claude_model_catalog(crate::lifecycle::now());
+            let selection = crate::model_selection::ModelSelection {
+                instance_id: self.harness.clone(),
+                model: self.model_id.clone(),
+                options: self.model_options.clone(),
+            };
+            if let Some(tokens) = crate::claude_catalog::resolve_claude_catalog_context_window_tokens(
+                &catalog,
+                Some(&selection),
+            ) {
+                self.context_window = Some(tokens);
+            }
+        }
         if matches!(
             id.as_str(),
             "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
@@ -516,7 +532,7 @@ impl State {
         // Codex & Claude
         for (id, name) in [("codex", "Codex"), ("claude", "Claude")] {
             seen.push((id.into(), name.into()));
-            let (installed, error, auth_status, update_required_models, has_models) =
+            let (installed, error, auth_status, update_required_models, has_models, provider_message) =
                 if self.client.is_some() {
                     let snap = &self.client_views["nativeCatalogs"][id];
                     let models_empty = snap["models"].as_array().is_none_or(Vec::is_empty);
@@ -540,7 +556,8 @@ impl State {
                     let updates: Vec<crate::model_picker::UpdateRequiredModel> =
                         serde_json::from_value(snap["updateRequiredModels"].clone())
                             .unwrap_or_default();
-                    (installed, err, auth, updates, !models_empty)
+                    let message = snap["providerMessage"].as_str().map(str::to_owned);
+                    (installed, err, auth, updates, !models_empty, message)
                 } else {
                     let catalog = if id == "codex" {
                         &self.codex_catalog
@@ -577,6 +594,7 @@ impl State {
                         auth,
                         catalog.update_required_models.clone(),
                         !catalog.models.is_empty(),
+                        catalog.provider_message.clone(),
                     )
                 };
             let is_available = id != "claude" || installed;
@@ -612,7 +630,7 @@ impl State {
                 can_setup: false,
                 is_available,
                 is_acp: false,
-                message: error,
+                message: error.or(provider_message),
                 compatibility_broken_message: None,
                 update_required_models,
             });
@@ -668,10 +686,16 @@ impl State {
                     ..Default::default()
                 });
             }
-            // Retain active thread's model if unavailable / uncatalogued
+            // Retain active thread's model if unavailable / uncatalogued. Aliases
+            // count as catalogued: a saved `opus` selects Claude Opus 5.5's row.
             if entry.instance_id == t.harness
                 && !t.model_id.is_empty()
-                && !models.iter().any(|m| m.id == t.model_id)
+                && !models.iter().any(|m| {
+                    m.id == t.model_id
+                        || m.aliases
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&t.model_id))
+                })
             {
                 models.push(AgentModel {
                     provider: if t.harness == "pi" {

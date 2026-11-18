@@ -247,6 +247,9 @@ pub struct NativeCatalog {
     pub version: Option<String>,
     pub auth_status: Option<String>,
     pub update_required_models: Vec<crate::model_picker::UpdateRequiredModel>,
+    /// KSG's `probe.message`: advisory text (e.g. a version-upgrade notice) that is
+    /// not an error.
+    pub provider_message: Option<String>,
     pub usage_limits: Value,
     pub usage_limits_raw: Value,
     pub usage_account: Value,
@@ -275,7 +278,7 @@ impl NativeCatalog {
         serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
             "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading(),
             "installed":self.installed,"version":self.version,"authStatus":self.auth_status,
-            "updateRequiredModels":self.update_required_models,
+            "updateRequiredModels":self.update_required_models,"providerMessage":self.provider_message,
             "usageLimits":self.usage_limits,"usageLimitsRaw":self.usage_limits_raw,
             "usageAccount":self.usage_account})
     }
@@ -355,6 +358,19 @@ impl NativeCatalog {
                         }
                         Some("usageAccount") => {
                             self.usage_account = record["value"].clone();
+                        }
+                        Some("updateRequiredModels") => {
+                            self.update_required_models = serde_json::from_value(
+                                record["value"].clone(),
+                            )
+                            .unwrap_or_default();
+                        }
+                        Some("providerMessage") => {
+                            self.provider_message =
+                                record["value"].as_str().map(str::to_owned);
+                        }
+                        Some("version") => {
+                            self.version = record["value"].as_str().map(str::to_owned);
                         }
                         _ => {}
                     }
