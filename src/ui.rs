@@ -4417,11 +4417,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             );
         }
     }
-    if let Some(notice) = &s.machines.auto_notice
-        && s.machines.notice.as_ref() == Some(notice)
-    {
-        side = side.child(machine_notice(notice, p));
-    }
     if let Some(error) = &s.lifecycle_error {
         side = side.child(label(error, SMALL, p.danger).wrap().padding(8.0));
     }
@@ -4723,27 +4718,6 @@ fn clone_dialog(s: &State, p: Palette) -> El {
             }
         })
         .child(card)
-}
-
-/// The one notice for linked machines this desktop cannot reach: a framed card with a brass
-/// mark and a pixel-type label. It goes away when the connections are ready again.
-fn machine_notice(text: &str, p: Palette) -> El {
-    outlined(
-        row()
-            .key("machine-unreachable")
-            .role("status")
-            .label(text)
-            .mx(8.0)
-            .mb(8.0)
-            .px(8.0)
-            .py(7.0)
-            .gap(8.0)
-            .radius(6.0)
-            .fill(p.card)
-            .child(el().size(8.0, 8.0).mt(3.0).fill(p.brass).a11y_hidden())
-            .child(meta_text(text, p.ink).wrap().grow(1.0).min_w(0.0)),
-        p,
-    )
 }
 
 /// Shown only while an update is on its way or waits for a restart. Downloading is passive;
@@ -6165,7 +6139,7 @@ fn workspace_named_by_filter(s: &State, server: &str, project: Option<usize>) ->
         }
 }
 /// A machine's name for labels and tooltips. Whether this desktop can reach it is not part of
-/// a row; it shows as one notice and in the open thread (`State::unreachable_machines`).
+/// a row; the open thread says so in the composer notice stack.
 fn machine_caption(s: &State, server: &str) -> String {
     s.machine_label(server)
 }
@@ -19465,57 +19439,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unreachable_machines_raise_one_notice_and_the_open_thread_says_so() {
-        let mut rt = runtime(1280.0);
-        crate::fleet_demo(&mut rt.state);
-        // Real machines, not demo data: their fixture clients are not connected.
-        rt.state.demo = false;
-        let poll = |rt: &mut Runtime<State>| {
-            rt.update(|state, tx| {
-                crate::model::poll(state, 0.0, tx);
-            });
-            rt.invalidate();
-            rt.frame(1.0);
-        };
-        poll(&mut rt);
-        let notice = rt.state.machines.notice.clone().expect("a notice");
-        assert!(
-            notice.contains("Studio")
-                && notice.contains("Laptop")
-                && notice.ends_with("unreachable. Reconnecting."),
-            "{notice}"
-        );
-        assert!(notice.contains(" and "), "one notice lists both: {notice}");
-        assert_eq!(
-            rt.state.machines.auto_notice.as_deref(),
-            Some(notice.as_str())
-        );
-        assert!(rt.presented("machine-unreachable").is_some());
-        // Rows still say nothing about the connection.
-        let tree = rt.accessibility_json();
-        let sidebar = find(&tree, "sidebar").expect("sidebar");
-        assert!(!sidebar.to_string().contains("offline"));
-        // The open thread on an unreachable machine says so in the composer notice stack.
-        rt.state.open_machine_thread("example-studio", 3);
-        poll(&mut rt);
-        assert_eq!(rt.state.machines.selected, "example-studio");
-        let tree = rt.accessibility_json();
-        let notice = find(
-            &tree,
-            "composer-notice-environment-unavailable:example-studio",
-        )
-        .expect("the composer notice says so");
-        assert_eq!(notice["name"], "Studio is offline: This device is offline");
-        // Another message is never replaced or cleared by it.
-        rt.state.machines.notice = Some("Something else".into());
-        poll(&mut rt);
-        assert_eq!(rt.state.machines.notice.as_deref(), Some("Something else"));
-        // The notice clears itself once the machines are ready: none are linked any more.
-        rt.state.machines.notice = rt.state.machines.auto_notice.clone();
-        rt.state.client.as_mut().unwrap().linked.clear();
-        poll(&mut rt);
-        assert!(rt.state.machines.notice.is_none());
-        assert!(rt.presented("machine-unreachable").is_none());
+    fn unreachable_machines_show_only_above_the_composer_for_the_open_thread() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            // Real machines, not demo data: their fixture clients are not connected.
+            rt.state.demo = false;
+            rt.state.compact_sidebar = width < 760.0;
+            let poll = |rt: &mut Runtime<State>| {
+                rt.update(|state, tx| {
+                    crate::model::poll(state, 0.0, tx);
+                });
+                rt.invalidate();
+                rt.frame(1.0);
+            };
+            poll(&mut rt);
+            // No stuck sidebar notice for machines the user is not using.
+            assert!(rt.state.machines.notice.is_none(), "{width}");
+            assert!(rt.presented("machine-unreachable").is_none(), "{width}");
+            let sidebar = find(&rt.accessibility_json(), "sidebar")
+                .expect("sidebar")
+                .to_string();
+            assert!(!sidebar.contains("unreachable"), "{width}: {sidebar}");
+            // The composer banner names only the machine the open thread targets.
+            assert!(
+                rt.presented("composer-notice-environment-unavailable:example-studio")
+                    .is_none(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-notice-environment-unavailable:example-laptop")
+                    .is_none(),
+                "{width}"
+            );
+            rt.state.open_machine_thread("example-studio", 3);
+            poll(&mut rt);
+            assert_eq!(rt.state.machines.selected, "example-studio");
+            let tree = rt.accessibility_json();
+            let notice = find(
+                &tree,
+                "composer-notice-environment-unavailable:example-studio",
+            )
+            .expect("the composer notice says so");
+            assert_eq!(notice["name"], "Studio is offline: This device is offline");
+            assert!(rt.presented("machine-unreachable").is_none(), "{width}");
+            let sidebar = find(&rt.accessibility_json(), "sidebar")
+                .expect("sidebar")
+                .to_string();
+            assert!(!sidebar.contains("unreachable"), "{width}: {sidebar}");
+        }
     }
 
     #[test]

@@ -1940,7 +1940,6 @@ impl State {
     pub(super) fn poll_client(&mut self, tx: &mut Tx) -> bool {
         let changed = self.poll_client_background(tx)
             | self.updater.poll(Instant::now(), self.wake.clone())
-            | self.refresh_machine_notice()
             | self.tick_mobile_pairing(crate::lifecycle::now(), tx)
             | self.tick_composer_notices_at(Instant::now(), Some(tx));
         if self.background.quitting {
@@ -2198,8 +2197,6 @@ impl State {
                 continue;
             }
             if server != "local" && matches!(event, crate::client::Event::Maintenance(..)) {
-                // A restarting machine is not ready, so the unreachable notice covers it.
-                self.refresh_machine_notice();
                 continue;
             }
             match event {
@@ -3002,56 +2999,12 @@ impl State {
                 .and_then(|client| client.linked.get(server))
                 .is_none_or(crate::client::Client::enabled)
     }
-    /// The names of the linked machines whose connection is not ready.
-    pub fn unreachable_machines(&self) -> Vec<String> {
-        let Some(client) = &self.client else {
-            return Vec::new();
-        };
-        client
-            .linked
-            .keys()
-            .filter(|server| self.machine_enabled(server) && !self.machine_connected(server))
-            .map(|server| self.machine_label(server))
-            .collect()
-    }
     /// The open thread's machine, by name, while this desktop cannot reach it.
     pub fn unreachable_selected(&self) -> Option<String> {
         (self.client.is_some()
             && (!self.machine_connected(&self.machines.selected)
                 || !self.machines.views.contains_key(&self.machines.selected)))
         .then(|| self.machine_label(&self.machines.selected))
-    }
-    /// Raises one notice naming every linked machine that is down ("Studio and Laptop are
-    /// unreachable. Reconnecting.") and clears it when all of them are ready again. It never
-    /// replaces or clears another notice. Returns whether the notice changed.
-    pub(super) fn refresh_machine_notice(&mut self) -> bool {
-        let down = self.unreachable_machines();
-        let ours =
-            self.machines.notice.is_some() && self.machines.notice == self.machines.auto_notice;
-        if down.is_empty() {
-            if ours {
-                self.machines.notice = None;
-                self.machines.auto_notice = None;
-                return true;
-            }
-            self.machines.auto_notice = None;
-            return false;
-        }
-        if self.machines.notice.is_some() && !ours {
-            return false;
-        }
-        let names = match down.as_slice() {
-            [one] => format!("{one} is"),
-            [first @ .., last] => format!("{} and {last} are", first.join(", ")),
-            [] => unreachable!("checked above"),
-        };
-        let text = format!("{names} unreachable. Reconnecting.");
-        if self.machines.notice.as_deref() == Some(text.as_str()) {
-            return false;
-        }
-        self.machines.notice = Some(text.clone());
-        self.machines.auto_notice = Some(text);
-        true
     }
     pub(crate) fn tick_composer_notices_at(&mut self, now: Instant, tx: Option<&mut Tx>) -> bool {
         let active = if self.demo || self.client.is_none() {
@@ -3123,7 +3076,6 @@ impl State {
             self.machines.views.remove(server);
             self.machines.threads.remove(server);
             self.machines.recover.remove(server);
-            self.refresh_machine_notice();
             if self.machines.selected == server {
                 self.select_machine("local");
                 self.new_client_draft(None);
