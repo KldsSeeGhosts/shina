@@ -2618,9 +2618,15 @@ impl State {
             self.threads.push(thread);
         }
         // Keep device drafts and open tabs, even after another device deletes a server record.
+        // On the first projection, do not retain the synthetic startup placeholder thread (id 1)
+        // when it was not in saved device tabs.
+        let keep_tabs = !first
+            || self.client_views["localUi"]["tabs"]
+                .as_array()
+                .is_some_and(|saved| !saved.is_empty());
         self.threads.extend(
             old.into_iter()
-                .filter(|t| t.client_draft || tabs.contains(&t.id)),
+                .filter(|t| t.client_draft || (keep_tabs && tabs.contains(&t.id))),
         );
         self.refresh_captain_contexts();
         // Document surfaces are client-local, so a remote reset must carry them to the
@@ -3118,6 +3124,14 @@ impl State {
     }
     /// Server/thread ids remain a pair. Only one server's records enter the State facade.
     pub fn select_machine(&mut self, server: &str) {
+        self.select_machine_inner(server, true);
+    }
+
+    pub fn select_machine_without_draft(&mut self, server: &str) {
+        self.select_machine_inner(server, false);
+    }
+
+    fn select_machine_inner(&mut self, server: &str, open_fallback_draft: bool) {
         self.machines.picker = false;
         if server == self.machines.selected {
             return;
@@ -3236,7 +3250,9 @@ impl State {
             .collect();
         if restored_tabs.is_empty() {
             self.tabs.clear();
-            self.new_client_draft(None);
+            if open_fallback_draft {
+                self.new_client_draft(None);
+            }
         } else {
             self.tabs = restored_tabs;
             let active = self.machines.ui[server]["active"]
@@ -3293,7 +3309,15 @@ impl State {
     /// the draft moves to the matching logical project on the target machine, or
     /// to its scratch project when nothing matches.
     pub fn retarget_draft(&mut self, server: &str) {
-        if !self.can_retarget_draft() || !self.machine_connected(server) {
+        if !self.can_retarget_draft() {
+            return;
+        }
+        let known_offline_target = !self.machine_connected(server)
+            && matches!(
+                self.draft_route_target(server, self.current().project),
+                RouteTarget::Project(_)
+            );
+        if !self.machine_connected(server) && !known_offline_target {
             return;
         }
         self.machines.picker = false;
@@ -3790,10 +3814,7 @@ impl State {
     }
 
     pub fn choose_draft_project(&mut self, project: Option<usize>) {
-        if (self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
-            || self.current().crew_draft.is_some())
-            && self.current().client_draft
-        {
+        if self.current().client_draft {
             if self.current().project != project {
                 self.current_mut().base_branch = None;
             }

@@ -2240,6 +2240,14 @@ impl crate::model::State {
     pub fn dismiss_result_notice(&mut self) {
         self.fleet.result_notice = None;
         self.fleet.notice_shown = None;
+        if self.fleet.running
+            && !self.fleet.rows.is_empty()
+            && self.fleet.rows.iter().all(|row| row.result.is_some())
+        {
+            self.fleet.running = false;
+            self.fleet.phase = RunPhase::Idle;
+            self.fleet.rows.clear();
+        }
     }
     /// The pill's dismiss button ("Dismiss provider update notice"), keyed until the
     /// status changes.

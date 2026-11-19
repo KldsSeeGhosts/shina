@@ -8842,7 +8842,7 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
             } else if mode == ProjectPicker::Scope {
                 s.set_machine_scope(server, Some(id), shift);
             } else if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
-                s.select_machine(&server);
+                s.select_machine_without_draft(&server);
                 if s.machines.selected == server {
                     s.choose_draft_project(Some(id));
                 }
@@ -8853,7 +8853,7 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
         }
         PickerChoice::MachineNoProject(server) => {
             if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
-                s.select_machine(&server);
+                s.select_machine_without_draft(&server);
                 if s.machines.selected == server {
                     s.choose_draft_project(None);
                 }
@@ -8880,18 +8880,23 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
     }
 }
 
-/// A machine pick in the New captain modal retargets the editor's "Lives on" machine first,
-/// the same way the modal's own machine row does, then records the workspace.
+/// A machine pick in the New captain modal records the target machine and workspace on the
+/// editor without switching the active machine or draft behind the modal until Save.
 fn captain_workspace_pick(s: &mut State, server: &str, project: Option<usize>) {
     if !s.machine_connected(server) {
         return;
     }
-    s.retarget_captain(server);
-    if s.machines.selected == server {
-        s.captain_project = Some(project);
-        s.project_picker = None;
-        s.checkpoint();
+    if let Some(editor) = s.captain_editor.as_mut() {
+        if editor.editing.is_some() || editor.promotion.is_some() {
+            return;
+        }
+        editor.server = server.into();
+        editor.machine_picker = false;
     }
+    s.captain_project = Some(project);
+    s.projects.captain_target = None;
+    s.project_picker = None;
+    s.checkpoint();
 }
 
 /// Ported from KSG Code's CommandPalette and CommandPaletteLookups project/environment
@@ -18913,7 +18918,7 @@ pub(crate) mod tests {
             PickerChoice::MachineProject("studio".into(), project),
             false,
         );
-        assert_eq!(rt.state.machines.selected, "studio");
+        assert_eq!(rt.state.machines.selected, "local");
         assert_eq!(rt.state.project_picker, None);
         let editor = rt.state.captain_editor.as_ref().unwrap();
         assert_eq!(editor.server, "studio");

@@ -9080,6 +9080,24 @@ impl State {
             return;
         }
         if self.client.is_some() {
+            let target_server = self
+                .captain_editor
+                .as_ref()
+                .map(|editor| editor.server.clone());
+            if let Some(server) = target_server
+                && server != self.machines.selected
+            {
+                if !self.machine_connected(&server) {
+                    return;
+                }
+                let editor = self.captain_editor.take();
+                let captain_project = self.captain_project;
+                let captain_target = self.projects.captain_target;
+                self.select_machine_without_draft(&server);
+                self.captain_editor = editor;
+                self.captain_project = captain_project;
+                self.projects.captain_target = captain_target;
+            }
             if let Some(editor) = &self.captain_editor {
                 if editor.server != self.machines.selected {
                     return;
