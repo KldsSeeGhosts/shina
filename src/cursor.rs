@@ -89,17 +89,44 @@ pub fn process() -> Result<Command, String> {
 }
 
 fn resolve_process(candidates: Vec<PathBuf>) -> Result<Command, String> {
+    const ALLOWED_ENV: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "LANG",
+        "LC_ALL",
+        "CURSOR_API_KEY",
+        "CURSOR_BACKEND_URL",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+    ];
     for path in candidates {
         if let Ok((executable, script)) = crate::harness::executable(&path.to_string_lossy()) {
             let mut command = Command::new(executable);
             if let Some(script) = script {
                 command.arg(script);
             }
-            command
-                .env_remove(crate::mcp::URL_ENV)
-                .env_remove(crate::mcp::TOKEN_ENV)
-                .env_remove("SHINA_RUNTIME_MODE")
-                .env_remove("SHINA_PI_BRIDGE_PATH");
+            command.env_clear();
+            for name in ALLOWED_ENV {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
             return Ok(command);
         }
     }

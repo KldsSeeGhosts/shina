@@ -1462,6 +1462,7 @@ impl Client {
             }
             return Ok(());
         }
+        self.models_done = false;
         let request = self
             .models_request
             .take()

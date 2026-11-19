@@ -368,12 +368,16 @@ impl TerminalShared {
 /// `command` rather than an executable plus args.
 fn terminal_command(command: &str, args: &[String]) -> Command {
     if args.is_empty() {
-        if cfg!(windows) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
             let mut shell =
                 Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
-            shell.args(["/d", "/s", "/c", command]);
+            shell.args(["/d", "/s", "/c"]).raw_arg(format!("\"{command}\""));
             shell
-        } else {
+        }
+        #[cfg(not(windows))]
+        {
             let mut shell = Command::new("sh");
             shell.args(["-c", command]);
             shell
@@ -385,11 +389,32 @@ fn terminal_command(command: &str, args: &[String]) -> Command {
     }
 }
 
-/// KSG `mergeEnvironments`: inherited environment, then the request's `env` entries;
+/// KSG `mergeEnvironments`: allowlisted base environment, then the request's `env` entries;
 /// on Windows a request `Path` replaces the inherited `PATH`.
 fn terminal_environment(request_env: &[Value]) -> Vec<(OsString, OsString)> {
-    let inherited =
-        std::env::vars_os().filter(|(name, _)| !name.to_string_lossy().starts_with("SHINA_"));
+    const ALLOWED_BASE_ENV: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "DEVIN_TOKEN",
+        "DEVIN_API_KEY",
+    ];
+    let inherited = ALLOWED_BASE_ENV.iter().filter_map(|name| {
+        std::env::var_os(name).map(|value| (OsString::from(*name), value))
+    });
     let requested = request_env.iter().filter_map(|entry| {
         Some((
             OsString::from(entry["name"].as_str()?),
