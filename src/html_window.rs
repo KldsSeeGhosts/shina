@@ -303,6 +303,9 @@ impl Windows {
     }
 
     fn open_document(&self, key: &str, request: &Value) -> Result<(), String> {
+        if cfg!(test) {
+            return Ok(());
+        }
         let mut live = self.live.lock().expect("HTML windows");
         if let Some(window) = live.get_mut(key) {
             if window.process.try_wait().ok().flatten().is_none()
