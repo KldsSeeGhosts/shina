@@ -6754,7 +6754,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                                 .as_ref()
                                 .is_some_and(|e| e.editing.is_none() && e.promotion.is_none())
                             {
-                                s.open_picker(ProjectPicker::NewThread);
+                                s.open_picker(ProjectPicker::CaptainWorkspace);
                             }
                         })
                         .child(project_tile(s, p, s.project(captain_project), 16.0))
@@ -8720,9 +8720,15 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
         .client
         .as_ref()
         .is_some_and(|client| !client.linked.is_empty());
+    // The New captain editor shares the new-thread picker's machine grouping, but its
+    // choice lands on the editor's `captain_project`, never on a draft thread.
+    let draft_pick = matches!(
+        mode,
+        ProjectPicker::NewThread | ProjectPicker::CaptainWorkspace
+    );
     let across = matches!(mode, ProjectPicker::Scope | ProjectPicker::CaptainScope)
-        || mode == ProjectPicker::NewThread && multiple;
-    if mode != ProjectPicker::CaptainScope && !(mode == ProjectPicker::NewThread && multiple) {
+        || draft_pick && multiple;
+    if mode != ProjectPicker::CaptainScope && !(draft_pick && multiple) {
         choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
     for id in s.sorted_projects() {
@@ -8762,12 +8768,13 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             if server == &s.machines.selected {
                 continue;
             }
-            if mode == ProjectPicker::NewThread
+            if draft_pick
                 && (!s.machine_connected(server)
-                    || s.machines
-                        .draft_picker
-                        .as_ref()
-                        .is_some_and(|target| target != server))
+                    || mode == ProjectPicker::NewThread
+                        && s.machines
+                            .draft_picker
+                            .as_ref()
+                            .is_some_and(|target| target != server))
             {
                 continue;
             }
@@ -8791,23 +8798,25 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             _ => (false, String::new()),
         });
     }
-    if mode == ProjectPicker::NewThread && multiple {
+    if draft_pick && multiple {
         choices.retain(|(choice, _, _)| match choice {
             PickerChoice::Project(_) => {
                 s.machine_connected(&s.machines.selected)
-                    && s.machines
-                        .draft_picker
-                        .as_ref()
-                        .is_none_or(|target| target == &s.machines.selected)
+                    && (mode == ProjectPicker::CaptainWorkspace
+                        || s.machines
+                            .draft_picker
+                            .as_ref()
+                            .is_none_or(|target| target == &s.machines.selected))
             }
             _ => true,
         });
         for server in machine_options(s) {
             if !s.machine_connected(&server)
-                || s.machines
-                    .draft_picker
-                    .as_ref()
-                    .is_some_and(|target| target != &server)
+                || mode == ProjectPicker::NewThread
+                    && s.machines
+                        .draft_picker
+                        .as_ref()
+                        .is_some_and(|target| target != &server)
             {
                 continue;
             }
@@ -8862,6 +8871,8 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 if s.machines.selected == server {
                     s.choose_draft_project(Some(id));
                 }
+            } else if mode == ProjectPicker::CaptainWorkspace {
+                captain_workspace_pick(s, &server, Some(id));
             }
             return;
         }
@@ -8871,6 +8882,8 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 if s.machines.selected == server {
                     s.choose_draft_project(None);
                 }
+            } else if mode == ProjectPicker::CaptainWorkspace {
+                captain_workspace_pick(s, &server, None);
             }
             return;
         }
@@ -8884,6 +8897,25 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 captain_ui::toggle_scope(s, project);
             }
         }
+        ProjectPicker::CaptainWorkspace => {
+            s.captain_project = Some(project);
+            s.project_picker = None;
+            s.checkpoint();
+        }
+    }
+}
+
+/// A machine pick in the New captain modal retargets the editor's "Lives on" machine first,
+/// the same way the modal's own machine row does, then records the workspace.
+fn captain_workspace_pick(s: &mut State, server: &str, project: Option<usize>) {
+    if !s.machine_connected(server) {
+        return;
+    }
+    s.retarget_captain(server);
+    if s.machines.selected == server {
+        s.captain_project = Some(project);
+        s.project_picker = None;
+        s.checkpoint();
     }
 }
 
@@ -8899,6 +8931,7 @@ fn project_picker(s: &State, p: Palette) -> El {
     let placeholder = match mode {
         ProjectPicker::Scope => "Filter by workspace...",
         ProjectPicker::NewThread => "New thread in...",
+        ProjectPicker::CaptainWorkspace => "Workspace...",
         ProjectPicker::AddProject => "Add workspace",
         ProjectPicker::CaptainScope => "Add to this captain's scope...",
     };
@@ -8988,8 +9021,12 @@ fn project_picker(s: &State, p: Palette) -> El {
     });
     let mut last_machine = None;
     for (index, (choice, name, machine)) in choices.iter().enumerate() {
-        if matches!(mode, ProjectPicker::NewThread | ProjectPicker::CaptainScope)
-            && machine != &last_machine
+        if matches!(
+            mode,
+            ProjectPicker::NewThread
+                | ProjectPicker::CaptainScope
+                | ProjectPicker::CaptainWorkspace
+        ) && machine != &last_machine
         {
             if let Some(machine) = machine {
                 list = list.child(
@@ -9056,6 +9093,16 @@ fn project_picker(s: &State, p: Palette) -> El {
             }
             (ProjectPicker::Scope, PickerChoice::MachineProject(server, id)) => {
                 s.project_scope != ProjectScope::All && s.scope_includes_on(server, Some(*id))
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::Project(id)) => {
+                s.captain_project.unwrap_or(s.current().project) == Some(*id)
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::NoProject) => {
+                s.captain_project.unwrap_or(s.current().project).is_none()
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::MachineNoProject(server)) => {
+                *server == s.machines.selected
+                    && s.captain_project.unwrap_or(s.current().project).is_none()
             }
             _ => false,
         };
@@ -18823,6 +18870,80 @@ pub(crate) mod tests {
             assert!(!rt.state.captain_editor.as_ref().unwrap().machine_picker);
             assert_eq!(rt.state.captain_editor.as_ref().unwrap().server, "studio");
         }
+    }
+
+    #[test]
+    fn new_captain_workspace_picker_updates_the_editor_not_the_draft() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let root = std::env::temp_dir().join(format!("shina-captain-ws-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("one")).unwrap();
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        let one = rt.state.add_project(root.join("one")).unwrap().unwrap();
+        let two = rt.state.add_project(root.join("two")).unwrap().unwrap();
+        rt.state.begin_new_captain();
+        rt.invalidate();
+        rt.frame(0.5);
+        let draft_project = rt.state.current().project;
+        let threads = rt.state.threads.len();
+        press(&mut rt, "captain-project-choice");
+        assert_eq!(
+            rt.state.project_picker,
+            Some(ProjectPicker::CaptainWorkspace)
+        );
+        press(&mut rt, &format!("choose-project-{two}"));
+        assert_eq!(rt.state.project_picker, None);
+        assert!(rt.state.captain_editor.is_some());
+        assert_eq!(rt.state.captain_project, Some(Some(two)));
+        // The pick belongs to the modal: the draft thread behind it does not move.
+        assert_eq!(rt.state.current().project, draft_project);
+        assert_eq!(rt.state.threads.len(), threads);
+        rt.invalidate();
+        rt.frame(0.5);
+        assert!(rt.presented("captain-project-choice").is_some());
+        press(&mut rt, "captain-project-choice");
+        press(&mut rt, "choose-no-project");
+        assert_eq!(rt.state.captain_project, Some(None));
+        assert_eq!(rt.state.current().project, draft_project);
+        assert_eq!(rt.state.threads.len(), threads);
+        press(&mut rt, "captain-project-choice");
+        press(&mut rt, &format!("choose-project-{one}"));
+        assert_eq!(rt.state.captain_project, Some(Some(one)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_captain_workspace_picker_retargets_the_captain_machine() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let root =
+            std::env::temp_dir().join(format!("shina-captain-machine-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let project = rt.state.add_project(root.clone()).unwrap().unwrap();
+        connected_machines(&mut rt);
+        rt.state.begin_new_captain();
+        rt.state.open_picker(ProjectPicker::CaptainWorkspace);
+        let choices = picker_choices(&rt.state, ProjectPicker::CaptainWorkspace);
+        assert!(choices.iter().any(|(choice, _, _)| matches!(
+            choice,
+            PickerChoice::MachineProject(server, id) if server == "studio" && *id == project
+        )));
+        assert!(choices.iter().any(|(choice, _, _)| matches!(
+            choice,
+            PickerChoice::MachineNoProject(server) if server == "studio"
+        )));
+        choose_picker(
+            &mut rt.state,
+            ProjectPicker::CaptainWorkspace,
+            PickerChoice::MachineProject("studio".into(), project),
+            false,
+        );
+        assert_eq!(rt.state.machines.selected, "studio");
+        assert_eq!(rt.state.project_picker, None);
+        let editor = rt.state.captain_editor.as_ref().unwrap();
+        assert_eq!(editor.server, "studio");
+        assert_eq!(rt.state.captain_project, Some(Some(project)));
+        std::fs::remove_dir_all(root).unwrap();
     }
     /// Tab once and return the focused element.
     fn tab(rt: &mut Runtime<State>) -> rune::ElementInfo {

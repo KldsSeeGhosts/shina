@@ -603,6 +603,8 @@ pub enum ProjectPicker {
     AddProject,
     /// Add or remove a workspace in the open captain's scope, from its Brief panel.
     CaptainScope,
+    /// Pick the workspace for the New captain editor; the choice stays on the modal.
+    CaptainWorkspace,
 }
 
 /// UI-only state for the captain Brief panel and the profile editor in `captain_ui.rs`.
