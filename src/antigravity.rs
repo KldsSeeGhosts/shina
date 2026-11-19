@@ -743,6 +743,43 @@ pub fn apply_manifest(models: &mut Vec<Value>) {
         model["aliases"] = json!([DEFAULT_MODEL]);
     }
 }
+/// Fallback Antigravity catalog from `assets/model-manifest.json` before a live session reports models.
+pub fn manifest_models() -> Vec<crate::session::AgentModel> {
+    let manifest = manifest();
+    let default_slug = manifest["defaults"]["chat"].as_str();
+    let Some(entries) = manifest["models"].as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let slug = entry["slug"].as_str()?.trim();
+            if slug.is_empty() {
+                return None;
+            }
+            let name = entry["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(slug)
+                .to_owned();
+            let is_default = default_slug == Some(slug);
+            Some(crate::session::AgentModel {
+                provider: "antigravity".into(),
+                id: slug.to_owned(),
+                name,
+                aliases: if is_default {
+                    vec![DEFAULT_MODEL.to_owned()]
+                } else {
+                    vec![]
+                },
+                is_default,
+                is_legacy: entry["status"] == "legacy",
+                ..Default::default()
+            })
+        })
+        .collect()
+}
 /// Open the captured sign-in URL on user click only (platform opener, detached).
 pub fn open_browser(url: &str) -> Result<(), String> {
     parse_authorization_url(url)?;

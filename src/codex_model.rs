@@ -346,6 +346,9 @@ impl State {
                 }
             }
         }
+        if harness == "antigravity" && models.is_empty() {
+            models.extend(crate::antigravity::manifest_models());
+        }
         models
     }
 

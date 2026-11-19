@@ -229,3 +229,23 @@ fn session_update_normalization_sanitizes_tool_payloads() {
     let other = json!({"sessionId":"s","update":{"sessionUpdate":"plan"}});
     assert_eq!(normalize_session_update(&other), other);
 }
+
+#[test]
+fn manifest_models_populate_catalog_before_live_session() {
+    let models = manifest_models();
+    assert!(!models.is_empty());
+    let default = models
+        .iter()
+        .find(|m| m.id == "gemini-3.8-flash-high")
+        .expect("default antigravity model from manifest");
+    assert_eq!(default.provider, "antigravity");
+    assert_eq!(default.name, "Gemini 3.8 Flash (High)");
+    assert!(default.is_default);
+    assert!(!default.is_legacy);
+    assert!(default.aliases.iter().any(|a| a == DEFAULT_MODEL));
+    let legacy = models
+        .iter()
+        .find(|m| m.id == "gemini-3.7-flash-high")
+        .expect("legacy antigravity model from manifest");
+    assert!(legacy.is_legacy);
+}
