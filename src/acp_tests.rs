@@ -639,6 +639,126 @@ fn antigravity_fake_agent_authenticate_config_options_and_combined_model() {
     assert_eq!(sets[3]["params"]["value"], "high");
 }
 
+/// KSG applyAntigravityAcpModelSelection, gateway branch: family-level picks send
+/// the family's default effort route through the model config option, the
+/// adapter-owned reasoningEffort pick re-routes the current family, and a
+/// `family-medium` the agent does not list retries as the family itself.
+#[test]
+fn antigravity_gateway_family_selection_sends_effort_routes() {
+    let options = json!([
+        {"value":"gemini-4-hydrogen","name":"Gemini 4 Hydrogen"},
+        {"value":"gemini-4-hydrogen-high","name":"Gemini 4 Hydrogen"},
+        {"value":"gemini-4-hydrogen-low","name":"Gemini 4 Hydrogen"},
+        {"value":"claude-opus-5-5","name":"Claude Opus 5.5"},
+        {"value":"claude-opus-5-5-high","name":"Claude Opus 5.5 (High)"}]);
+    let model_option = |current: &str| {
+        json!({"id":"model","name":"Model","category":"model","type":"select",
+            "currentValue":current,"options":options})
+    };
+    let mut client = Client::new(spec(SessionSource::New));
+    client.antigravity = true;
+    client.antigravity_gateway = true;
+    client.gateway_models = "gemini-4-hydrogen-low, gemini-4-hydrogen-medium, gemini-4-hydrogen-high, claude-opus-5-5-high".into();
+    client.ready = true;
+    client.session = Some("fixture-session".into());
+    client.configure_models(&json!({
+        "configOptions":[model_option("gemini-4-hydrogen-high")],
+        "models":{"currentModelId":"gemini-4-hydrogen-high",
+            "availableModels":[{"modelId":"gemini-4-hydrogen-high","name":"Gemini 4 Hydrogen"}]}
+    }));
+    // Rows nest under the family slug; the current route marks its row default.
+    let ids: Vec<&str> = client
+        .models
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["gemini-4-hydrogen", "claude-opus-5-5-high"]);
+    assert_eq!(client.model["id"], "gemini-4-hydrogen");
+    // A family-level pick sends the default (medium) effort route.
+    client
+        .command(json!({"type":"set_model","id":"pick","modelId":"gemini-4-hydrogen"}))
+        .unwrap();
+    let request = client.wire.last().unwrap().clone();
+    assert_eq!(request["method"], "session/set_config_option");
+    assert_eq!(
+        request["params"],
+        json!({"sessionId":"fixture-session","configId":"model","value":"gemini-4-hydrogen-medium"})
+    );
+    // KSG -32602 retry: the agent folds its medium tier into the family option.
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":request["id"],
+            "error":{"code":-32602,"message":"Unknown model ID: gemini-4-hydrogen-medium"}}))
+        .unwrap();
+    let retry = client.wire.last().unwrap().clone();
+    assert_eq!(retry["method"], "session/set_config_option");
+    assert_eq!(retry["params"]["value"], "gemini-4-hydrogen");
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":retry["id"],
+            "result":{"configOptions":[model_option("gemini-4-hydrogen")]}}))
+        .unwrap();
+    let reply = client.events.last().unwrap();
+    assert_eq!(reply["id"], "pick");
+    assert_eq!(reply["success"], true);
+    assert_eq!(reply["data"]["id"], "gemini-4-hydrogen");
+    // The adapter-owned effort pick sends its exact route through the model config.
+    client
+        .command(
+            json!({"type":"set_option","id":"effort","optionId":"reasoningEffort","value":"high"}),
+        )
+        .unwrap();
+    let request = client.wire.last().unwrap().clone();
+    assert_eq!(
+        request["params"],
+        json!({"sessionId":"fixture-session","configId":"model","value":"gemini-4-hydrogen-high"})
+    );
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":request["id"],
+            "result":{"configOptions":[model_option("gemini-4-hydrogen-high")]}}))
+        .unwrap();
+    assert_eq!(client.events.last().unwrap()["id"], "effort");
+    assert_eq!(client.events.last().unwrap()["success"], true);
+    // The effort pick persists for the next selection on the same row...
+    client
+        .command(json!({"type":"set_model","id":"again","modelId":"gemini-4-hydrogen"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["value"],
+        "gemini-4-hydrogen-high"
+    );
+    client
+        .incoming(
+            json!({"jsonrpc":"2.0","id":client.wire.last().unwrap()["id"],
+            "result":{"configOptions":[model_option("gemini-4-hydrogen-high")]}}),
+        )
+        .unwrap();
+    // ...but a different row starts from its own default.
+    client
+        .command(json!({"type":"set_model","id":"opus","modelId":"claude-opus-5-5-high"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["value"],
+        "claude-opus-5-5-high"
+    );
+    // An unconfigured model is rejected.
+    client
+        .command(json!({"type":"set_model","id":"nope","modelId":"gpt-6.2-sol"}))
+        .unwrap();
+    assert_eq!(client.events.last().unwrap()["success"], false);
+    // The gateway auth method drives the eager authenticate call.
+    let mut client = Client::new(spec(SessionSource::New));
+    client.antigravity = true;
+    client.antigravity_gateway = true;
+    client.initialize();
+    let init = client.wire.pop().unwrap();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":init["id"],
+            "result":{"protocolVersion":1,"agentCapabilities":{}}}))
+        .unwrap();
+    let auth = client.wire.pop().unwrap();
+    assert_eq!(auth["method"], "authenticate");
+    assert_eq!(auth["params"]["methodId"], "gateway");
+}
+
 #[test]
 fn fake_agent_initialize_mcp_stream_permission_cancel_and_load_round_trip() {
     let (agent, log) = fixture(&[]);
