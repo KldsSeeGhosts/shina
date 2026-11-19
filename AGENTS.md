@@ -87,3 +87,8 @@ Removed at the user's request. Do not add them back:
 - `cargo build`, `cargo test`, and `cargo fmt` must pass. Remove helpers your change leaves unused.
 - To look at a dev build, run `target\debug\shina.exe` with `LOCALAPPDATA` set to a temporary folder. That keeps it away from the user's real threads in `%LOCALAPPDATA%\Shina`.
 - Tests find elements by `.key(...)`. Keep existing keys when restyling, or update every test that uses them.
+
+## Shipping
+
+- Prefer releases over local builds so Windows and macOS stay in sync without drift.
+- After checks pass, commit and push your changes rather than leaving them only as local working-tree edits or local builds.
