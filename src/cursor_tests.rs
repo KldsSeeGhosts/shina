@@ -64,25 +64,20 @@ fn executable_resolution_prefers_overrides_then_path_names_then_install_dirs() {
 }
 
 #[test]
-fn resolved_process_keeps_provider_env_and_strips_only_shina_bridge_vars() {
+fn resolved_process_uses_explicit_env_allowlist() {
     let cli = fake_cli();
     let command = resolve_process(vec![cli.clone()]).unwrap();
     assert_eq!(command.get_program(), cli.as_os_str());
-    // Everything not listed here is inherited: CURSOR_API_KEY, OPENAI_BASE_URL
-    // and the CPA routing variables pass through unchanged.
     let envs: std::collections::BTreeMap<_, _> = command
         .get_envs()
         .map(|(name, value)| (name.to_string_lossy().into_owned(), value.is_some()))
         .collect();
-    assert_eq!(
-        envs,
-        std::collections::BTreeMap::from([
-            ("SHINA_MCP_URL".to_owned(), false),
-            ("SHINA_MCP_TOKEN".to_owned(), false),
-            ("SHINA_RUNTIME_MODE".to_owned(), false),
-            ("SHINA_PI_BRIDGE_PATH".to_owned(), false),
-        ])
-    );
+    assert_eq!(envs.get("PATH"), Some(&true));
+    assert!(!envs.contains_key("SHINA_MCP_URL"));
+    assert!(!envs.contains_key("SHINA_MCP_TOKEN"));
+    assert!(!envs.contains_key("SHINA_RUNTIME_MODE"));
+    assert!(!envs.contains_key("SHINA_PI_BRIDGE_PATH"));
+    assert!(!envs.contains_key("SHINA_HONCHO_TOKEN"));
 }
 
 #[test]
