@@ -330,6 +330,7 @@ impl NativeCatalog {
             "codex" => crate::codex::discover(workspace, wake, models),
             "claude" => crate::claude::discover(workspace, wake),
             "antigravity" => crate::antigravity::discover(workspace, wake),
+            "cursor" => crate::cursor::discover(workspace, wake),
             _ => unreachable!(),
         };
         match result {
