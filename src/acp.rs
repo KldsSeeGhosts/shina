@@ -7,7 +7,7 @@ use crate::{
 use rune::Waker;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::PathBuf,
@@ -61,12 +61,18 @@ fn probe_uncached(agent: &Agent) -> Result<Value, String> {
         .stdout
         .take()
         .ok_or("ACP probe could not open stdout.")?;
+    // KSG agentProfile: Devin's initialize advertises client terminals and the
+    // cognition.ai capability meta in probes too.
+    let mut client_capabilities =
+        json!({"fs":{"readTextFile":false,"writeTextFile":false},"terminal":agent.id == "devin"});
+    if agent.id == "devin" {
+        client_capabilities["_meta"] = crate::devin::client_capabilities_meta();
+    }
     let request = json!({
         "jsonrpc":"2.0","id":"shina-probe","method":"initialize",
         "params":{"protocolVersion":1,
             "clientInfo":{"name":"Shina","version":env!("CARGO_PKG_VERSION")},
-            "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},
-                "terminal":false}}
+            "clientCapabilities":client_capabilities}
     });
     stdin
         .write_all(format!("{request}\n").as_bytes())
@@ -199,6 +205,12 @@ struct Permission {
     question: Option<Value>,
 }
 
+/// A `terminal/wait_for_exit` request answered once the child actually exits.
+struct TerminalWaiter {
+    id: Value,
+    terminal: String,
+}
+
 /// KSG Code's opt-in ACP extension. Standard ACP v1 does not admit active steering.
 fn supports_active_steering(meta: &Value) -> bool {
     let advertisement = &meta["t3code/steering"];
@@ -257,12 +269,20 @@ struct Client {
     /// The session's ACP `modes` block, for KSG's setMode modeState.
     modes: Value,
     file_reads: bool,
+    /// KSG `registryAgentId === "devin"`: normalization, subagent routing and
+    /// `shellCommands` client terminals.
+    devin: bool,
+    /// Child session ids Devin has introduced, via reroute metadata or subagent tools.
+    devin_children: HashSet<String>,
+    terminals: crate::devin::Terminals,
+    terminal_waiters: Vec<TerminalWaiter>,
 }
 
 impl Client {
     fn new(start: Start) -> Self {
         let awareness_sent = start.context_sent;
         let restart_steering = !matches!(start.id.as_str(), "github-copilot-cli" | "copilot");
+        let devin = start.id == "devin";
         Self {
             start,
             capabilities: Value::Null,
@@ -303,6 +323,10 @@ impl Client {
             legacy_models: Value::Null,
             modes: Value::Null,
             file_reads: false,
+            devin,
+            devin_children: HashSet::new(),
+            terminals: crate::devin::Terminals::default(),
+            terminal_waiters: vec![],
         }
     }
 
@@ -344,11 +368,22 @@ impl Client {
                 false,
             )
         };
-        self.request("initialize", json!({
-            "protocolVersion":1,
-            "clientInfo":client_info,
-            "clientCapabilities":{"fs":{"readTextFile":read_files,"writeTextFile":false},"terminal":false}
-        }), json!({"type":"initialize"}));
+        // KSG agentProfile: Devin gets client terminals plus the cognition.ai
+        // capability hints that switch on subagent context and message grouping.
+        let mut client_capabilities =
+            json!({"fs":{"readTextFile":read_files,"writeTextFile":false},"terminal":self.devin});
+        if self.devin {
+            client_capabilities["_meta"] = crate::devin::client_capabilities_meta();
+        }
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion":1,
+                "clientInfo":client_info,
+                "clientCapabilities":client_capabilities
+            }),
+            json!({"type":"initialize"}),
+        );
     }
 
     fn reply(&mut self, request: &Value, data: Value) {
@@ -415,7 +450,9 @@ impl Client {
                 let id = record["params"]["sessionId"]
                     .as_str()
                     .ok_or("ACP update has no sessionId.")?;
-                if self.session.as_deref().is_some_and(|session| session != id) {
+                if self.session.as_deref().is_some_and(|session| session != id)
+                    && !(self.devin && self.devin_children.contains(id))
+                {
                     return Err("ACP agent sent an update for another session.".into());
                 }
                 if let SessionSource::Resume(expected) = &self.start.source
@@ -424,7 +461,41 @@ impl Client {
                 {
                     return Err("ACP agent replayed another session.".into());
                 }
-                self.update(&record["params"]["update"]);
+                if self.devin {
+                    // KSG's adapter order: resolve embedded terminal content on the raw
+                    // notification, then normalizeDevinSessionUpdate reroutes children.
+                    let mut resolved = record["params"].clone();
+                    if let Some(content) = resolved["update"]["content"].as_array_mut() {
+                        for part in content.iter_mut() {
+                            if part["type"] == "terminal" {
+                                let terminal = part["terminalId"].as_str().unwrap_or("");
+                                let text = self
+                                    .terminals
+                                    .output_snapshot(id, terminal)
+                                    .unwrap_or_else(|| format!("[terminal {terminal}]"));
+                                *part = json!({"type":"content",
+                                    "content":{"type":"text","text":text}});
+                            }
+                        }
+                    }
+                    let mut normalized = crate::devin::normalize_session_update(&resolved);
+                    if let Some(child) = normalized["sessionId"].as_str().map(str::to_owned) {
+                        if child != id {
+                            self.devin_children.insert(child.clone());
+                        }
+                        // KSG projectSubagentTool keys child work `{child}:tool:{id}`.
+                        if Some(child.as_str()) != self.session.as_deref()
+                            && self.devin_children.contains(&child)
+                            && let Some(tool_id) = normalized["update"]["toolCallId"].as_str()
+                        {
+                            normalized["update"]["toolCallId"] =
+                                json!(format!("{child}:{tool_id}"));
+                        }
+                    }
+                    self.update(&normalized["update"]);
+                } else {
+                    self.update(&record["params"]["update"]);
+                }
             } else if method == "session/request_permission" && record.get("id").is_some() {
                 self.permission(&record)?;
             } else if record.get("id").is_some() {
@@ -440,6 +511,11 @@ impl Client {
                             "error":{"code":code,"message":message}}),
                     };
                     self.wire.push(response);
+                    return Ok(());
+                }
+                // KSG makeAcpClientTerminals: Devin advertised `terminal` at initialize.
+                if self.devin && method.starts_with("terminal/") {
+                    self.terminal_request(method, &record);
                     return Ok(());
                 }
                 self.wire.push(json!({"jsonrpc":"2.0","id":record["id"],"error":{"code":-32601,"message":format!("Shina does not support ACP client capability {method}. Filesystem and terminal capabilities were not advertised.")}}));
@@ -1584,18 +1660,92 @@ impl Client {
             .push(json!({"type":"queue_update","steering":[],"followUp":texts}));
     }
 
+    /// KSG makeAcpClientTerminals dispatch. `wait_for_exit` defers until the watcher
+    /// thread records an exit status; the loop flushes waiters on every pass.
+    fn terminal_request(&mut self, method: &str, record: &Value) {
+        let id = record["id"].clone();
+        let params = record["params"].clone();
+        let (result, deferred) = match method {
+            "terminal/create" => (
+                self.terminals
+                    .create(&params, &self.start.workspace)
+                    .map(|terminal| json!({"terminalId":terminal})),
+                false,
+            ),
+            "terminal/output" => (self.terminals.output(&params), false),
+            "terminal/kill" => (self.terminals.kill(&params).map(|()| json!({})), false),
+            "terminal/release" => (self.terminals.release(&params).map(|()| json!({})), false),
+            "terminal/wait_for_exit" => match self.terminals.exit_status(&params) {
+                Ok(Some(status)) => (Ok(status), false),
+                Ok(None) => (Ok(Value::Null), params["terminalId"].is_string()),
+                Err(error) => (Err(error), false),
+            },
+            _ => (
+                Err(format!(
+                    "Shina does not support ACP client capability {method}."
+                )),
+                false,
+            ),
+        };
+        if deferred {
+            self.terminal_waiters.push(TerminalWaiter {
+                id,
+                terminal: params["terminalId"].as_str().unwrap().to_owned(),
+            });
+            return;
+        }
+        match result {
+            Ok(result) => self
+                .wire
+                .push(json!({"jsonrpc":"2.0","id":id,"result":result})),
+            Err(message) => self
+                .wire
+                .push(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":message}})),
+        }
+    }
+
+    /// Answer every `terminal/wait_for_exit` whose child has recorded an exit status.
+    fn flush_terminal_waiters(&mut self) {
+        let mut index = 0;
+        while index < self.terminal_waiters.len() {
+            let Some(status) = self
+                .terminals
+                .exit_status_of(&self.terminal_waiters[index].terminal)
+            else {
+                index += 1;
+                continue;
+            };
+            let waiter = self.terminal_waiters.remove(index);
+            self.wire
+                .push(json!({"jsonrpc":"2.0","id":waiter.id,"result":status}));
+        }
+    }
+
     fn permission(&mut self, record: &Value) -> Result<(), String> {
         let params = &record["params"];
         if self
             .session
             .as_deref()
             .is_some_and(|session| params["sessionId"] != session)
+            && !(self.devin
+                && params["sessionId"]
+                    .as_str()
+                    .is_some_and(|session| self.devin_children.contains(session)))
         {
             return Err("ACP permission request belongs to another session.".into());
         }
         let options = params["options"]
             .as_array()
             .ok_or("ACP permission request has no options.")?;
+        // KSG devinAnswerablePermissionOptions: `plan_bypass` is filtered before any
+        // automatic or supervised selection can send its id back to Devin.
+        let filtered;
+        let options: &[Value] = if self.devin {
+            filtered = crate::devin::answerable_permission_options(params);
+            &filtered
+        } else {
+            options
+        };
         let interaction = self.start.id.contains("antigravity")
             && params["toolCall"]["toolCallId"]
                 .as_str()
@@ -1784,23 +1934,82 @@ impl Client {
                     );
                 }
             }
-            "tool_call" | "tool_call_update" => {
+            "tool_call" | "tool_call_update" | "tool_call_content_chunk" => {
                 let Some(id) = update["toolCallId"].as_str() else {
                     return;
                 };
                 let new = !self.tools.contains_key(id);
+                let chunk = update["sessionUpdate"] == "tool_call_content_chunk";
                 let tool = self.tools.entry(id.into()).or_insert_with(|| json!({}));
                 for (key, value) in update.as_object().into_iter().flatten() {
-                    if !value.is_null() {
+                    if value.is_null() || (chunk && key == "content") {
+                        continue;
+                    }
+                    // Devin's _meta carries subagent lifecycle keys; a completion-only
+                    // update must not erase the started keys the card still reads.
+                    if self.devin
+                        && key == "_meta"
+                        && tool["_meta"].is_object()
+                        && value.is_object()
+                    {
+                        for (meta_key, meta_value) in value.as_object().unwrap() {
+                            tool["_meta"][meta_key] = meta_value.clone();
+                        }
+                    } else {
                         tool[key] = value.clone();
                     }
                 }
+                if chunk {
+                    // KSG's reducer streams chunk text into the tool's content parts.
+                    if !tool["content"].is_array() {
+                        tool["content"] = json!([]);
+                    }
+                    let content = tool["content"].as_array_mut().unwrap();
+                    let part = &update["content"];
+                    if part["type"] == "content"
+                        && part["content"]["type"] == "text"
+                        && let Some(last) = content.last_mut().filter(|last| {
+                            last["type"] == "content" && last["content"]["type"] == "text"
+                        })
+                    {
+                        let merged = format!(
+                            "{}{}",
+                            last["content"]["text"].as_str().unwrap_or(""),
+                            part["content"]["text"].as_str().unwrap_or("")
+                        );
+                        last["content"]["text"] = json!(merged);
+                    } else {
+                        content.push(part.clone());
+                    }
+                }
                 let tool = tool.clone();
-                let name = tool["title"]
-                    .as_str()
-                    .or_else(|| tool["kind"].as_str())
-                    .unwrap_or("ACP tool");
-                let metadata = tool_metadata(&tool);
+                // KSG normalizeDevinToolCall then extractDevinSubagentUpdate, both on
+                // the merged state.
+                let tool = if self.devin {
+                    crate::devin::normalize_tool_call(&tool)
+                } else {
+                    tool
+                };
+                let subagent = if self.devin {
+                    let subagent = crate::devin::extract_subagent_update(&tool);
+                    if let Some(subagent) = &subagent {
+                        self.devin_children
+                            .insert(subagent.child_session_id.clone());
+                    }
+                    subagent
+                } else {
+                    None
+                };
+                let name = subagent
+                    .as_ref()
+                    .and_then(|subagent| subagent.title.clone())
+                    .or_else(|| tool["title"].as_str().map(str::to_owned))
+                    .or_else(|| tool["kind"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "ACP tool".to_owned());
+                let mut metadata = tool_metadata(&tool);
+                if subagent.is_some() {
+                    metadata["toolKind"] = json!("subagent");
+                }
                 if new {
                     self.history_chunk(
                         "assistant",
@@ -1810,13 +2019,23 @@ impl Client {
                         self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":tool["rawInput"],"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
-                let done = matches!(tool["status"].as_str(), Some("completed" | "failed"));
-                let result = tool_result(&tool);
+                // The extracted subagent lifecycle settles a tool even when the agent
+                // leaves the call's own status running.
+                let failed = tool["status"] == "failed"
+                    || subagent.as_ref().is_some_and(|s| s.status == "failed");
+                let done = matches!(tool["status"].as_str(), Some("completed" | "failed"))
+                    || subagent.as_ref().is_some_and(|s| s.status != "running");
+                let mut result = tool_result(&tool);
+                if let Some(summary) = subagent.as_ref().and_then(|s| s.result.as_ref())
+                    && let Some(content) = result["content"].as_array_mut()
+                {
+                    content.push(json!({"type":"text","text":summary}));
+                }
                 if done {
                     let mut saved = result.clone();
                     saved["role"] = json!("toolResult");
                     saved["toolCallId"] = json!(id);
-                    saved["isError"] = json!(tool["status"] == "failed");
+                    saved["isError"] = json!(failed);
                     if let Some(previous) = self
                         .history
                         .iter_mut()
@@ -1829,7 +2048,7 @@ impl Client {
                 }
                 if emit {
                     let mut event = json!({"type":if done {"tool_execution_end"} else {"tool_execution_update"},
-                        "toolCallId":id,"isError":tool["status"]=="failed"});
+                        "toolCallId":id,"isError":failed});
                     event[if done { "result" } else { "partialResult" }] = result;
                     self.events.push(event);
                 }
@@ -2313,6 +2532,8 @@ fn run(
                     }
                 }
             }
+            // terminal/wait_for_exit answers once the child records an exit status.
+            client.flush_terminal_waiters();
             // Publish responses before the UI can dispatch its next operation.
             if !client.wire.is_empty() || !client.events.is_empty() {
                 continue;

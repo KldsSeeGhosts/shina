@@ -163,6 +163,13 @@ impl Registry {
                 });
             }
         }
+        // KSG's Devin ACP Registry entry: `devin acp` from PATH or the T3-managed
+        // install cache, with its credential environment passed through by name.
+        if !registry.agents.iter().any(|a| a.id == "devin")
+            && let Some(command) = crate::devin::discover_command()
+        {
+            registry.agents.push(crate::devin::agent(command));
+        }
         registry
     }
 
@@ -427,5 +434,18 @@ mod tests {
         std::fs::write(dir.join("harnesses.json"), r#"[{"id":"fixture","name":"Fixture","command":"node","args":["agent.js"],"env":["FIXTURE_TOKEN"]}]"#).unwrap();
         let agent = Registry::read_in(&dir).find("fixture").unwrap();
         assert_eq!(agent.env, ["FIXTURE_TOKEN"]);
+    }
+
+    #[test]
+    fn a_devin_registry_entry_is_honored_with_credential_names() {
+        let dir = crate::store::directory().unwrap();
+        std::fs::write(
+            dir.join("harnesses.json"),
+            r#"[{"id":"devin","name":"Devin","command":"devin","args":["acp"],"env":["DEVIN_TOKEN","DEVIN_API_KEY"]}]"#,
+        )
+        .unwrap();
+        let agent = Registry::read_in(&dir).find("devin").unwrap();
+        assert_eq!(agent.args, ["acp"]);
+        assert_eq!(agent.env, ["DEVIN_TOKEN", "DEVIN_API_KEY"]);
     }
 }
