@@ -393,6 +393,7 @@ impl Client {
                     retry_notify,
                     connection,
                     wake,
+                    spawn,
                 ))
             };
             #[cfg(test)]
@@ -830,6 +831,7 @@ async fn supervise(
     retry_notify: Arc<tokio::sync::Notify>,
     connection: Arc<Mutex<ConnectionState>>,
     wake: rune::Waker,
+    mut launch: impl FnMut() -> Result<Child, String>,
 ) {
     let (directory, device_directory, history_thread, history_requests, rpc_requests, remote) =
         profile;
@@ -1083,8 +1085,12 @@ async fn supervise(
                         break;
                     }
                     Err(error) => {
-                        next_spawn = Instant::now() + restart_delay(attempt);
-                        attempt = attempt.saturating_add(1);
+                        // Only remote reconnects back off here. A stale local endpoint
+                        // must not postpone launching a server when the profile is free.
+                        if remote.is_some() {
+                            next_spawn = Instant::now() + restart_delay(attempt);
+                            attempt = attempt.saturating_add(1);
+                        }
                         let mut state = connection.lock().expect("connection state");
                         state.phase = ConnectionPhase::Reconnecting;
                         state.attempt = attempt;
@@ -1109,7 +1115,7 @@ async fn supervise(
                 match crate::server_lock::Owner::acquire(&directory) {
                     Ok(probe) => {
                         drop(probe);
-                        match spawn() {
+                        match launch() {
                             Ok(process) => child = Some(process),
                             Err(error) => {
                                 report(error);
@@ -2887,6 +2893,69 @@ mod tests {
             [500, 1000, 2000, 4000, 8000, 10000, 10000]
         );
     }
+
+    #[test]
+    fn stale_local_discovery_does_not_prevent_launch() {
+        let directory = crate::store::directory().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let discovery = Discovery {
+            server_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            epoch: uuid::Uuid::new_v4().to_string(),
+            pid: std::process::id(),
+            started_at: 0,
+            port: listener.local_addr().unwrap().port(),
+            protocol_major: protocol::MAJOR,
+            protocol_minor: protocol::MINOR,
+            binary_version: env!("CARGO_PKG_VERSION").into(),
+            bootstrap_token: crate::server_auth::secret(),
+        };
+        discovery.publish(&directory).unwrap();
+        drop(listener);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (_commands, input) = tokio::sync::mpsc::channel(1);
+        let (output, events) = mpsc::sync_channel(8);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(8),
+                    supervise(
+                        (
+                            directory.clone(),
+                            directory.join("desktop"),
+                            Arc::default(),
+                            Arc::default(),
+                            Arc::default(),
+                            None,
+                        ),
+                        Arc::default(),
+                        input,
+                        output,
+                        Arc::default(),
+                        stop.clone(),
+                        Arc::default(),
+                        Arc::default(),
+                        Arc::default(),
+                        Arc::default(),
+                        Arc::new(|| {}),
+                        || {
+                            stop.store(true, Ordering::Release);
+                            Err("launch attempted".into())
+                        },
+                    ),
+                )
+                .await
+                .expect("stale discovery prevented the local launch");
+            });
+        assert!(
+            matches!(events.try_recv(), Ok(Event::Error(error)) if error == "launch attempted")
+        );
+    }
+
     #[test]
     fn offline_commands_including_approvals_are_not_queued() {
         let client = Client::new(crate::store::directory().unwrap());
