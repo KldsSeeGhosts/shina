@@ -69,6 +69,7 @@ mod process;
 mod projection_store;
 mod projects;
 mod protocol;
+mod provider_config;
 mod provider_update;
 mod question_document;
 mod review;

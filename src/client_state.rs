@@ -2657,7 +2657,7 @@ impl State {
                 let mut thread = Thread::new(id);
                 thread.client_draft = true;
                 thread.project = draft["project"].as_u64().map(|id| id as usize);
-                thread.harness = draft["harness"].as_str().unwrap_or("pi").into();
+                thread.harness = draft["harness"].as_str().unwrap_or("codex").into();
                 thread.selected_model =
                     serde_json::from_value(draft["model"].clone()).unwrap_or_default();
                 thread.selected_thinking = draft["thinking"].as_str().map(str::to_owned);
@@ -6909,6 +6909,7 @@ mod tests {
     #[test]
     fn native_catalog_projection_populates_a_device_draft_before_any_native_session() {
         let (mut state, mut server, mut commands) = tab_client();
+        server.default_harness = "pi".into();
         server.codex_catalog.models = vec![AgentModel::from_harness_value(&json!({
             "provider":"codex","id":"catalog-only","name":"Catalog only","thinkingLevels":["low","high"],
             "serviceTiers":[{"id":"default","name":"Standard"},{"id":"fast","name":"Fast"}]

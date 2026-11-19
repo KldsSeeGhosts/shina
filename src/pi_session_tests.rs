@@ -200,6 +200,7 @@ fn files_send_and_steer_without_vision_and_recover_from_persisted_queue_referenc
 
 fn thread(status: Status) -> (Thread, mpsc::Receiver<Value>) {
     let mut thread = Thread::new(1);
+    thread.harness = "pi".into();
     let (pi, commands, _) = Pi::test_connection();
     thread.pi = Some(pi);
     thread.status = status;
@@ -299,6 +300,7 @@ fn expanded_steers_are_owned_even_when_user_events_precede_the_ack() {
 fn fork_metadata_preserves_the_source_and_the_permission_policy() {
     let mut s = State::new(".".into(), false);
     let source = s.current().id;
+    s.current_mut().harness = "pi".into();
     s.current_mut().session = Some("original.jsonl".into());
     s.current_mut().native.access = AccessMode::Supervised;
     // A missing workspace fails before process startup. This test never starts an installed Pi.

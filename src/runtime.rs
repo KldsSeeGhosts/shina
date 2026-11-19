@@ -1898,6 +1898,7 @@ mod tests {
             .state
             .thread_directory(runtime.state.active)
             .unwrap();
+        runtime.state.current_mut().harness = "pi".into();
         runtime.state.current_mut().session = Some("relative-session.jsonl".into());
         runtime.state.current_mut().native.access = crate::model::AccessMode::Full;
         let profile = crate::captains::Captain::presets().remove(0);

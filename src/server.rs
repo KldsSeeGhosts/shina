@@ -3602,6 +3602,13 @@ mod tests {
                 .await;
             assert_eq!(opened["status"], "accepted", "{opened}");
             let home_thread = opened["result"]["threadId"].as_u64().unwrap() as usize;
+            let harness = home
+                .local_command(
+                    "thread.configure",
+                    json!({"threadId":home_thread,"harness":"pi"}),
+                )
+                .await;
+            assert_eq!(harness["status"], "accepted", "{harness}");
             // Ordinary one-way pairing: only home holds a credential to the
             // target. The target has no link back at all.
             let code = target

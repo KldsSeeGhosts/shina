@@ -1033,6 +1033,9 @@ mod tests {
         .unwrap();
         let mut state = State::headless(directory);
         state.demo = true;
+        // These fixtures exercise Pi delegation: the peer below advertises
+        // only the pi harness and cpa models.
+        state.threads[0].harness = "pi".into();
         let workspace = state.data_dir.join("workspace");
         assert!(
             std::process::Command::new("git")
@@ -3705,6 +3708,8 @@ mod tests {
                 .send_command
                 .is_some()
         );
+        // Windows refuses to delete a directory under an open sqlite handle.
+        drop(database);
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 

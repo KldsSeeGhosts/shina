@@ -18990,6 +18990,7 @@ pub(crate) mod tests {
             walk_menu(&mut rt, "captain-list", true, &at("captain picker"));
 
             let mut rt = fresh();
+            rt.state.current_mut().harness = "pi".into();
             rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
                 {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true},
                 {"provider":"cpa","id":"model-b","name":"Model B","reasoning":true},
@@ -22458,6 +22459,7 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             let (pi, commands, _) = crate::backend::Pi::test_connection();
             let t = rt.state.current_mut();
+            t.harness = "pi".into();
             t.pi = Some(pi);
             t.session = Some("fixture.jsonl".into());
             t.draft.focused = true;
@@ -25235,6 +25237,7 @@ pub(crate) mod tests {
     fn unknown_after_compaction_stays_inside_a_narrow_composer() {
         let mut rt = runtime(620.0);
         let thread = rt.state.current_mut();
+        thread.harness = "pi".into();
         thread.model = "Vision".into();
         thread.context_window = Some(200_000);
         thread.context.usage = ContextUsage {
@@ -27307,6 +27310,11 @@ pub(crate) mod tests {
     fn thought_and_tool_streaks_fold_before_prose_and_into_one_live_row() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = streak_runtime(width);
+            rt.state.current_mut().harness = "pi".into();
+            rt.state.current_mut().started =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+            rt.invalidate();
+            rt.frame(1.0);
             let t = rt.state.current();
             let parts = turn_parts(t, 0, 1);
             use WorkEntry::{Thought, Tool};
@@ -27437,7 +27445,10 @@ pub(crate) mod tests {
     #[test]
     fn the_working_bar_words_stopping_pauses_and_compaction() {
         let mut rt = streak_runtime(1280.0);
+        rt.state.current_mut().harness = "pi".into();
         rt.state.current_mut().request = Some(json!({"id":"q","method":"confirm"}));
+        rt.state.current_mut().started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
         rt.invalidate();
         rt.frame(1.0);
         assert!(texts(&rt).iter().any(|text| text == "Paused at "));
@@ -29472,6 +29483,7 @@ pub(crate) mod tests {
     #[test]
     fn composer_has_no_connection_controls_and_pickers_work_without_a_process() {
         let mut rt = runtime(1280.0);
+        rt.state.current_mut().harness = "pi".into();
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
             {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true,
              "thinkingLevelMap":{"minimal":null,"low":null,"medium":null}}
@@ -29506,6 +29518,7 @@ pub(crate) mod tests {
     fn native_model_and_reasoning_pickers_send_real_rpc_commands() {
         let mut rt = runtime(1280.0);
         let (pi, commands, _events) = crate::backend::Pi::test_connection();
+        rt.state.current_mut().harness = "pi".into();
         rt.state.current_mut().pi = Some(pi);
         rt.state.current_mut().status = Status::Ready;
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
@@ -30047,6 +30060,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             ];
+            rt.state.current_mut().harness = "pi".into();
             rt.state.choose_harness("codex");
             rt.state.open_model_picker(SettingsPicker::Model);
             rt.invalidate();
@@ -30119,6 +30133,7 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.set_viewport((width, 900.0), 1.0);
+            rt.state.current_mut().harness = "pi".into();
             // Loading state while cached models exist shows refreshing indicator inside card
             rt.state.catalog.models = vec![crate::session::AgentModel {
                 provider: "cpa".into(),
@@ -31369,6 +31384,7 @@ pub(crate) mod tests {
         rt.on_key = Some(crate::key);
         {
             let t = rt.state.current_mut();
+            t.harness = "pi".into();
             t.models = vec![
                 crate::session::AgentModel {
                     provider: "cpa".into(),
