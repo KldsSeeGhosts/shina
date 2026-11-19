@@ -320,6 +320,14 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
             }
             return crate::antigravity::start(start, wake);
         }
+        // Cursor is built in when `cursor-agent`/`agent` resolves, with the same override.
+        if start.id == "cursor" {
+            let registry = Registry::read();
+            if registry.agents.iter().any(|a| a.id == "cursor") {
+                return crate::acp::start(registry.find("cursor")?, start, wake);
+            }
+            return crate::cursor::start(start, wake);
+        }
         let agent = Registry::read().find(&start.id)?;
         crate::acp::start(agent, start, wake)
     }

@@ -33,6 +33,7 @@ mod composer_tokens;
 mod context;
 mod context_breakdown;
 mod crisp;
+mod cursor;
 mod database;
 mod descriptors;
 mod devin;

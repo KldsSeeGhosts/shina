@@ -186,6 +186,7 @@ impl State {
         let catalog = match harness {
             "codex" => &self.codex_catalog,
             "claude" => &self.claude_catalog,
+            "cursor" => &self.cursor_catalog,
             _ => return (false, None),
         };
         (catalog.loading(), catalog.error.as_deref())
@@ -207,14 +208,18 @@ impl State {
             && !self.provider_update_drivers.contains("antigravity")
         {
             self.antigravity_catalog
-                .refresh("antigravity", cwd, self.wake.clone(), force);
+                .refresh("antigravity", cwd.clone(), self.wake.clone(), force);
+        }
+        if crate::cursor::cli_available() && !self.provider_update_drivers.contains("cursor") {
+            self.cursor_catalog
+                .refresh("cursor", cwd, self.wake.clone(), force);
         }
         self.apply_native_catalogs();
     }
 
     pub(super) fn apply_native_catalogs(&mut self) {
         if self.client.is_some() {
-            for harness in ["codex", "claude", "antigravity"] {
+            for harness in ["codex", "claude", "antigravity", "cursor"] {
                 let catalog = &self.client_views["nativeCatalogs"][harness];
                 let models = self.harness_models(harness);
                 let projects = &self.projects.entries;
@@ -267,6 +272,7 @@ impl State {
                 "codex" => &self.codex_catalog,
                 "claude" => &self.claude_catalog,
                 "antigravity" => &self.antigravity_catalog,
+                "cursor" => &self.cursor_catalog,
                 _ => continue,
             };
             if thread.pi.is_some() {
@@ -315,6 +321,17 @@ impl State {
     pub(super) fn validate_harness(&self, id: &str) -> Result<(), String> {
         if matches!(id, "pi" | "codex" | "claude") {
             Ok(())
+        } else if matches!(id, "antigravity" | "cursor")
+            && !self.harnesses.agents.iter().any(|agent| agent.id == id)
+        {
+            // Built-in ACP providers validate against their CLI, not the registry.
+            if id == "cursor" {
+                crate::cursor::process().map(drop)
+            } else {
+                crate::antigravity::cli_available()
+                    .then_some(())
+                    .ok_or_else(|| "Antigravity is unavailable. Put `agy` on PATH.".into())
+            }
         } else {
             self.harnesses.find(id).map(drop)
         }
@@ -323,7 +340,8 @@ impl State {
     pub(super) fn harness_models(&self, harness: &str) -> Vec<AgentModel> {
         let mut models = vec![];
         let provider = if harness == "pi" { "cpa" } else { harness };
-        if self.client.is_some() && matches!(harness, "codex" | "claude" | "antigravity") {
+        if self.client.is_some() && matches!(harness, "codex" | "claude" | "antigravity" | "cursor")
+        {
             models.extend(
                 serde_json::from_value::<Vec<AgentModel>>(
                     self.client_views["nativeCatalogs"][harness]["models"].clone(),
@@ -345,6 +363,8 @@ impl State {
             models.extend(self.claude_catalog.models.iter().cloned());
         } else if harness == "antigravity" {
             models.extend(self.antigravity_catalog.models.iter().cloned());
+        } else if harness == "cursor" {
+            models.extend(self.cursor_catalog.models.iter().cloned());
         }
         for thread in self.threads.iter().filter(|t| t.harness == harness) {
             for model in &thread.models {
@@ -370,8 +390,13 @@ impl State {
         capabilities["harnesses"] = json!(harnesses);
         let codex_models = self.harness_models("codex");
         let claude_models = self.harness_models("claude");
+        let cursor_models = self.harness_models("cursor");
         let values = capabilities["models"].as_array_mut().expect("models array");
-        for model in codex_models.into_iter().chain(claude_models) {
+        for model in codex_models
+            .into_iter()
+            .chain(claude_models)
+            .chain(cursor_models)
+        {
             if !values
                 .iter()
                 .any(|m| m["provider"] == model.provider && m["id"] == model.id)
@@ -392,7 +417,7 @@ impl State {
             }
         }
         capabilities["ready"] = json!(!values.is_empty());
-        capabilities["runtime"]["providers"] = json!(["cpa", "codex", "claude"]);
+        capabilities["runtime"]["providers"] = json!(["cpa", "codex", "claude", "cursor"]);
     }
 
     /// One default for new lone threads and captain homes. Workers inherit their parent.
@@ -422,6 +447,15 @@ impl State {
                 .any(|agent| agent.id == "antigravity")
         {
             ids.push("antigravity".to_string());
+        }
+        if crate::cursor::cli_available()
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "cursor")
+        {
+            ids.push("cursor".to_string());
         }
         ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
         ids
@@ -687,6 +721,37 @@ impl State {
                 is_available: true,
                 is_acp: false,
                 message: None,
+                compatibility_broken_message: None,
+                update_required_models: vec![],
+            });
+        }
+
+        // Built-in Cursor (`agent acp`): `cursor-agent`/`agent` resolved from env or PATH.
+        if crate::cursor::cli_available()
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "cursor")
+        {
+            let error = self.cursor_catalog.error.clone();
+            entries.push(ProviderInstanceEntry {
+                instance_id: "cursor".into(),
+                driver_kind: "cursor".into(),
+                display_name: "Cursor".into(),
+                continuation_group_key: None,
+                enabled: true,
+                installed: true,
+                status: if error.is_some() {
+                    ProviderStatusKind::Warning
+                } else {
+                    ProviderStatusKind::Ready
+                },
+                auth_status: ProviderAuthStatus::Unknown,
+                can_setup: false,
+                is_available: true,
+                is_acp: false,
+                message: error,
                 compatibility_broken_message: None,
                 update_required_models: vec![],
             });

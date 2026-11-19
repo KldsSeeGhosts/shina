@@ -507,6 +507,7 @@ impl State {
                     ("Pi", crate::backend::discovery_command()),
                     ("Codex", crate::codex::process()),
                     ("Claude", crate::claude::process()),
+                    ("Cursor", crate::cursor::process()),
                 ] {
                     let Ok(process) = process else { continue };
                     let mut command = version_command(&process);
@@ -2459,6 +2460,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 ("Pi", crate::backend::discovery_command()),
                 ("Codex", crate::codex::process()),
                 ("Claude", crate::claude::process()),
+                ("Cursor", crate::cursor::process()),
             ];
             for (name, process) in processes {
                 if !matches(s, name) {

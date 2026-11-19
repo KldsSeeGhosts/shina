@@ -703,6 +703,16 @@ impl State {
         match harness {
             "pi" => Ok(()),
             "codex" | "claude" => self.native_harness_executable(harness),
+            // Built-in ACP providers validate against their CLI, not the registry.
+            "antigravity" | "cursor"
+                if !self
+                    .harnesses
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == harness) =>
+            {
+                self.native_harness_executable(harness)
+            }
             _ => {
                 let agent = self.harnesses.find(harness)?;
                 let capabilities = crate::acp::probe_live(&agent)?;
@@ -726,6 +736,12 @@ impl State {
         match harness {
             "codex" => crate::codex::process().map(drop),
             "claude" => crate::claude::process().map(drop),
+            "antigravity" => crate::antigravity::cli_available()
+                .then_some(())
+                .ok_or_else(|| "Antigravity is unavailable. Put `agy` on PATH.".into()),
+            "cursor" => crate::cursor::cli_available()
+                .then_some(())
+                .ok_or_else(|| crate::cursor::MISSING.into()),
             _ => unreachable!("native harness checked by caller"),
         }
     }
@@ -807,6 +823,24 @@ impl State {
             "pi" => ("Pi".to_owned(), "cpa", "pi.rpc"),
             "codex" => ("Codex".to_owned(), "codex", "codex.app-server"),
             "claude" => ("Claude".to_owned(), "claude", "claude.stream-json"),
+            "antigravity"
+                if !self
+                    .harnesses
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == harness) =>
+            {
+                ("Antigravity".to_owned(), "antigravity", "acp")
+            }
+            "cursor"
+                if !self
+                    .harnesses
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == harness) =>
+            {
+                ("Cursor".to_owned(), "cursor", "acp")
+            }
             _ => {
                 let agent = self.harnesses.find(harness).ok();
                 (
@@ -833,6 +867,18 @@ impl State {
                 Ok(_) => (true, None),
                 Err(error) => (false, Some(error)),
             },
+            "antigravity" | "cursor"
+                if !self
+                    .harnesses
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == harness) =>
+            {
+                match self.native_harness_executable(harness) {
+                    Ok(_) => (true, None),
+                    Err(error) => (false, Some(error)),
+                }
+            }
             _ => match self.harnesses.find(harness).and_then(|agent| {
                 crate::acp::probe(&agent).map(|capabilities| (agent, capabilities))
             }) {
