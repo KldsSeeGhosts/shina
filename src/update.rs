@@ -3036,6 +3036,12 @@ impl Updater {
             .is_some_and(|until| Instant::now() < until)
     }
 
+    /// This build updates itself, so the sidebar offers a manual "Check for
+    /// updates". Development runs and demos report Disabled and show nothing.
+    pub fn self_update_enabled(&self) -> bool {
+        self.installed && !matches!(self.status, Status::Disabled)
+    }
+
     pub fn prepared_update(&self) -> Option<&PreparedUpdate> {
         match &self.status {
             Status::Ready { update } => Some(update),
@@ -3160,6 +3166,25 @@ impl Updater {
     #[cfg(test)]
     pub fn test_idle() -> Self {
         Self::default()
+    }
+
+    /// An installed updater mid-check, for UI tests.
+    #[cfg(test)]
+    pub fn test_checking() -> Self {
+        Self {
+            status: Status::Checking,
+            installed: true,
+            ..Self::default()
+        }
+    }
+
+    /// An installed updater at rest, for UI tests of the check-for-updates row.
+    #[cfg(test)]
+    pub fn test_checkable() -> Self {
+        Self {
+            installed: true,
+            ..Self::default()
+        }
     }
 
     #[cfg(test)]

@@ -453,6 +453,9 @@ const PROVIDER_LOOKUP_INTERVAL: Duration = Duration::from_secs(10);
 const REFRESH_DEADLINE: Duration = Duration::from_secs(60);
 const PROVIDER_CONFIRM_TIMEOUT: &str =
     "Timed out waiting for provider confirmation. Check versions before retrying.";
+/// A success result notice behaves like KSG's toast: it clears itself. Failures
+/// stay until Retry or Dismiss, like the capsule's settled rows.
+const RESULT_NOTICE_DISMISS: Duration = Duration::from_secs(12);
 
 /// KSG `updateEverything.logic`'s run phases. Provider installs on every machine run
 /// first, servers follow once they settle, and this app installs last behind a countdown.
@@ -603,6 +606,8 @@ pub struct Fleet {
     wake_deadline: Option<Instant>,
     /// The result notice under the capsule (KSG `showUpdateEverythingResult`).
     pub result_notice: Option<ResultNotice>,
+    /// When the notice appeared; a success notice is a toast and clears itself.
+    notice_shown: Option<Instant>,
     /// The capsule's anchored popover is open.
     pub popover: bool,
     /// The dialog's "N skipped" disclosure is open.
@@ -1122,6 +1127,48 @@ impl crate::model::State {
             );
         }
     }
+    /// An unreceipted `server.updateStatus` refresh for one machine. The answer is
+    /// consumed by `fleet_rpc`; the refreshed status reaches the UI on the next
+    /// projection either way.
+    fn refresh_update_status(&self, server: &str) {
+        let Some(client) = &self.client else {
+            return;
+        };
+        let target = if server == "local" {
+            Some(client)
+        } else {
+            client.linked.get(server)
+        };
+        if let Some(target) = target {
+            target.call_rpc(
+                format!("fleet:update-status:{server}"),
+                "server.updateStatus",
+                json!({"refresh": true}),
+            );
+        }
+    }
+    /// KSG `SidebarUpdatePill`'s idle press: one button checks the app release,
+    /// this profile's release catalog and every connected machine's providers and
+    /// server update status. Everything is quiet; results surface through the
+    /// usual pill, button and dialog rows.
+    pub fn check_for_updates(&mut self) {
+        if self.demo {
+            return;
+        }
+        self.updater.retry();
+        self.fleet.release.refresh(true);
+        let mut servers = vec!["local".to_owned()];
+        if let Some(client) = &self.client {
+            servers.extend(client.linked.keys().cloned());
+        }
+        for server in servers {
+            if !self.machine_enabled(&server) || !self.machine_connected(&server) {
+                continue;
+            }
+            self.refresh_providers(&server);
+            self.refresh_update_status(&server);
+        }
+    }
     /// A receipted `providers.update` for one driver on one machine. The receipt lands
     /// on `fleet_receipt` matched by `command_id`; a lost receipt is never resent, the
     /// run adopts the record the projection reports instead.
@@ -1252,12 +1299,17 @@ impl crate::model::State {
         let Some(kind) = tag.strip_prefix("fleet:") else {
             return false;
         };
-        if kind.strip_prefix("refresh:").is_some() {
+        if kind.starts_with("refresh:") {
             self.fleet.refresh_pending.remove(server);
             self.fleet.refreshing = self.fleet.refresh_pending.len();
             if let Ok(value) = result {
                 self.record_providers(server, &value["providers"]);
             }
+            return true;
+        }
+        // `fleet:update-status:<server>` answers a manual "Check for updates" probe;
+        // the refreshed status arrives on the next projection instead.
+        if kind.starts_with("update-status:") {
             return true;
         }
         // `fleet:receipt:<uuid>` answers a read-only `command.get` for a send whose
@@ -1402,6 +1454,7 @@ impl crate::model::State {
         };
         self.fleet.restart_at = None;
         self.fleet.result_notice = None;
+        self.fleet.notice_shown = None;
         // Phase Providers: every eligible (machine, driver) in parallel.
         let started_ms = crate::lifecycle::now() as i64;
         let candidates: Vec<Vec<(String, String, String)>> = self
@@ -1676,7 +1729,7 @@ impl crate::model::State {
             notice.lines.push(failure);
             notice.success = false;
         } else {
-            self.fleet.result_notice = Some(ResultNotice {
+            self.show_result_notice(ResultNotice {
                 success: false,
                 title: "Update failed".into(),
                 lines: vec![failure],
@@ -1817,7 +1870,7 @@ impl crate::model::State {
                     if restarting.len() == 1 { "is" } else { "are" }
                 ));
             }
-            self.fleet.result_notice = Some(notice);
+            self.show_result_notice(notice);
         }
         if handed_off.is_empty() {
             return;
@@ -2173,9 +2226,20 @@ impl crate::model::State {
         }
         self.fleet.pill = None;
     }
+    /// Shows the run's one result notice (KSG `showUpdateEverythingResult`) and
+    /// arms the success toast's self-dismissal.
+    fn show_result_notice(&mut self, notice: ResultNotice) {
+        let success = notice.success;
+        self.fleet.result_notice = Some(notice);
+        self.fleet.notice_shown = Some(Instant::now());
+        if success {
+            self.schedule_fleet_wake(Instant::now() + RESULT_NOTICE_DISMISS);
+        }
+    }
     /// The `update-result` notice's dismiss; the notice does not come back.
     pub fn dismiss_result_notice(&mut self) {
         self.fleet.result_notice = None;
+        self.fleet.notice_shown = None;
     }
     /// The pill's dismiss button ("Dismiss provider update notice"), keyed until the
     /// status changes.
@@ -2770,7 +2834,7 @@ impl crate::model::State {
                 .flat_map(|row| &row.provider_runs)
                 .filter(|run| run.outcome.as_deref() == Some("succeeded"))
                 .count();
-            self.fleet.result_notice = Some(result_notice(
+            self.show_result_notice(result_notice(
                 false,
                 updated_servers,
                 updated_providers,
@@ -2803,12 +2867,24 @@ impl crate::model::State {
                 .flat_map(|row| &row.provider_runs)
                 .filter(|run| run.outcome.as_deref() == Some("succeeded"))
                 .count();
-            self.fleet.result_notice = Some(result_notice(
+            self.show_result_notice(result_notice(
                 false,
                 updated_servers,
                 updated_providers,
                 self.run_failures(),
             ));
+            changed = true;
+        }
+        // A success notice is a toast: it clears itself. Failures stay for
+        // Retry or Dismiss, like KSG's run capsule.
+        if self.fleet.result_notice.as_ref().is_some_and(|n| n.success)
+            && self
+                .fleet
+                .notice_shown
+                .is_some_and(|at| at.elapsed() >= RESULT_NOTICE_DISMISS)
+        {
+            self.fleet.result_notice = None;
+            self.fleet.notice_shown = None;
             changed = true;
         }
         self.poll_provider_pill();
@@ -5054,5 +5130,39 @@ mod tests {
             .expect("inline error");
         assert!(error.contains("disconnected"), "{error}");
         assert!(!state.provider_send_pending("local", "codex"));
+    }
+    /// KSG's result is a toast: a success notice clears itself, a failure waits
+    /// for Retry or Dismiss like the capsule's settled rows.
+    #[test]
+    fn a_success_result_notice_clears_itself_but_a_failure_stays() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.show_result_notice(ResultNotice {
+            success: true,
+            title: "Updated 1 provider".into(),
+            lines: Vec::new(),
+        });
+        state.fleet.notice_shown = Some(Instant::now() - RESULT_NOTICE_DISMISS);
+        state.poll_fleet();
+        assert!(state.fleet.result_notice.is_none());
+        state.show_result_notice(ResultNotice {
+            success: false,
+            title: "Update failed".into(),
+            lines: vec!["studio: refused".into()],
+        });
+        state.fleet.notice_shown = Some(Instant::now() - RESULT_NOTICE_DISMISS * 2);
+        state.poll_fleet();
+        assert!(state.fleet.result_notice.is_some());
+        state.dismiss_result_notice();
+        assert!(state.fleet.result_notice.is_none());
+    }
+    /// The idle "Check for updates" press is quiet: with no client it only arms
+    /// the app's own release check and sends nothing.
+    #[test]
+    fn check_for_updates_without_a_client_only_arms_the_app_check() {
+        let mut state = crate::model::State::new(PathBuf::new(), false);
+        state.updater = crate::update::Updater::test_checkable();
+        state.check_for_updates();
+        assert!(state.fleet.result_notice.is_none());
+        assert!(state.fleet.rows.is_empty());
     }
 }

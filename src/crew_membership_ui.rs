@@ -267,7 +267,7 @@ pub(super) fn move_picker(s: &State, p: Palette) -> Option<El> {
         .w(280.0)
         .child(label(heading, META_LABEL, p.muted).px(8.0).pt(4.0).pb(2.0));
     let mut any = false;
-    for target in 0..s.captains.len() {
+    for target in s.picker_captains() {
         if let MoveMode::Move { from } = picker.mode
             && target == from
         {

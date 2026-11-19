@@ -603,6 +603,8 @@ pub enum ProjectPicker {
     AddProject,
     /// Add or remove a workspace in the open captain's scope, from its Brief panel.
     CaptainScope,
+    /// Pick the workspace for the New captain editor; the choice stays on the modal.
+    CaptainWorkspace,
 }
 
 /// UI-only state for the captain Brief panel and the profile editor in `captain_ui.rs`.
@@ -9011,12 +9013,13 @@ impl State {
         }
         self.captain_picker = false;
         let used_names: std::collections::HashSet<String> = self
-            .captains
-            .iter()
-            .map(|c| c.name.to_lowercase())
+            .picker_captains()
+            .map(|captain| self.captains[captain].name.to_lowercase())
             .collect();
-        let used_portraits: std::collections::HashSet<usize> =
-            self.captains.iter().map(|c| c.portrait).collect();
+        let used_portraits: std::collections::HashSet<usize> = self
+            .picker_captains()
+            .map(|captain| self.captains[captain].portrait)
+            .collect();
         let (portrait, suggested_name) = (0..crate::visuals::PORTRAITS)
             .find(|i| {
                 !used_portraits.contains(i)

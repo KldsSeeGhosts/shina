@@ -1940,7 +1940,6 @@ impl State {
     pub(super) fn poll_client(&mut self, tx: &mut Tx) -> bool {
         let changed = self.poll_client_background(tx)
             | self.updater.poll(Instant::now(), self.wake.clone())
-            | self.refresh_machine_notice()
             | self.tick_mobile_pairing(crate::lifecycle::now(), tx)
             | self.tick_composer_notices_at(Instant::now(), Some(tx));
         if self.background.quitting {
@@ -2198,8 +2197,6 @@ impl State {
                 continue;
             }
             if server != "local" && matches!(event, crate::client::Event::Maintenance(..)) {
-                // A restarting machine is not ready, so the unreachable notice covers it.
-                self.refresh_machine_notice();
                 continue;
             }
             match event {
@@ -3002,56 +2999,12 @@ impl State {
                 .and_then(|client| client.linked.get(server))
                 .is_none_or(crate::client::Client::enabled)
     }
-    /// The names of the linked machines whose connection is not ready.
-    pub fn unreachable_machines(&self) -> Vec<String> {
-        let Some(client) = &self.client else {
-            return Vec::new();
-        };
-        client
-            .linked
-            .keys()
-            .filter(|server| self.machine_enabled(server) && !self.machine_connected(server))
-            .map(|server| self.machine_label(server))
-            .collect()
-    }
     /// The open thread's machine, by name, while this desktop cannot reach it.
     pub fn unreachable_selected(&self) -> Option<String> {
         (self.client.is_some()
             && (!self.machine_connected(&self.machines.selected)
                 || !self.machines.views.contains_key(&self.machines.selected)))
         .then(|| self.machine_label(&self.machines.selected))
-    }
-    /// Raises one notice naming every linked machine that is down ("Studio and Laptop are
-    /// unreachable. Reconnecting.") and clears it when all of them are ready again. It never
-    /// replaces or clears another notice. Returns whether the notice changed.
-    pub(super) fn refresh_machine_notice(&mut self) -> bool {
-        let down = self.unreachable_machines();
-        let ours =
-            self.machines.notice.is_some() && self.machines.notice == self.machines.auto_notice;
-        if down.is_empty() {
-            if ours {
-                self.machines.notice = None;
-                self.machines.auto_notice = None;
-                return true;
-            }
-            self.machines.auto_notice = None;
-            return false;
-        }
-        if self.machines.notice.is_some() && !ours {
-            return false;
-        }
-        let names = match down.as_slice() {
-            [one] => format!("{one} is"),
-            [first @ .., last] => format!("{} and {last} are", first.join(", ")),
-            [] => unreachable!("checked above"),
-        };
-        let text = format!("{names} unreachable. Reconnecting.");
-        if self.machines.notice.as_deref() == Some(text.as_str()) {
-            return false;
-        }
-        self.machines.notice = Some(text.clone());
-        self.machines.auto_notice = Some(text);
-        true
     }
     pub(crate) fn tick_composer_notices_at(&mut self, now: Instant, tx: Option<&mut Tx>) -> bool {
         let active = if self.demo || self.client.is_none() {
@@ -3123,10 +3076,11 @@ impl State {
             self.machines.views.remove(server);
             self.machines.threads.remove(server);
             self.machines.recover.remove(server);
-            self.refresh_machine_notice();
             if self.machines.selected == server {
+                // select_machine restores the local workspace's saved tabs, or
+                // opens a device draft when nothing is restorable. Forcing a
+                // projectless draft here would add a "No workspace" tab on top.
                 self.select_machine("local");
-                self.new_client_draft(None);
             }
         }
         self.tick_composer_notices_at(Instant::now(), None);
@@ -7211,6 +7165,84 @@ mod tests {
             "deleted saved tabs need a draft too"
         );
         assert_eq!(state.tabs, [state.current().id]);
+    }
+
+    #[test]
+    fn disconnecting_the_selected_machine_restores_local_tabs_without_a_new_draft() {
+        let dir =
+            std::env::temp_dir().join(format!("shina-disconnect-tabs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = uuid::Uuid::new_v4().to_string();
+        let link = crate::peer::Link {
+            server_id: server_id.clone(),
+            host: "127.0.0.1:9".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            token: "test-token".into(),
+            enabled: true,
+        };
+        link.save(&dir).unwrap();
+
+        let mut state = State::headless(dir.clone());
+        let (mut client, _) = crate::client::Client::test_connected(dir.clone());
+        let mut remote = crate::client::Client::new(dir.clone());
+        remote.remote = Some(link);
+        client.linked.insert(server_id.clone(), remote);
+        state.client = Some(client);
+
+        // Local has one server thread open in a tab.
+        let mut local = State::headless(dir.clone());
+        local.threads = (1..=2)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Thread {id}");
+                thread.renamed = true;
+                thread
+            })
+            .collect();
+        local.next_id = 3;
+        let local_projection = local.projection();
+        state
+            .machines
+            .views
+            .insert("local".into(), local_projection.clone().into());
+        state.apply_projection(local_projection).unwrap();
+        state.checkpoint_client();
+        let saved_tabs = state.machines.ui["local"]["tabs"].clone();
+        let saved_active = state.current().id;
+
+        // Visit the linked machine, then disconnect it while it is selected.
+        let mut remote_proj = State::headless(dir.clone());
+        remote_proj.threads[0].title = "Remote thread".into();
+        state
+            .machines
+            .views
+            .insert(server_id.clone(), remote_proj.projection().into());
+        state.select_machine(&server_id);
+        state.disconnect_server(&server_id);
+
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.machines.ui["local"]["tabs"], saved_tabs);
+        assert_eq!(
+            state.tabs,
+            saved_tabs
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|id| id as usize)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(state.current().id, saved_active);
+        assert!(
+            !state.current().client_draft,
+            "disconnect must not open a 'No workspace' draft over the restored tab"
+        );
+        assert!(
+            !state.threads.iter().any(|t| t.client_draft),
+            "disconnect must not leave a device draft behind on local"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

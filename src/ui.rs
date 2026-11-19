@@ -4354,73 +4354,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         side = side.child(update_everything_button(&summary, p));
     } else if let Some(row) = update_row(s, p) {
         side = side.child(row);
+    } else if let Some(row) = check_updates_row(s, p) {
+        side = side.child(row);
     }
     if let Some(notice) = &s.fleet.result_notice {
         side = side.child(update_result_notice(notice, p));
-    }
-    for (server, view) in &s.machines.views {
-        let outcome = &view["updateNotice"];
-        if let Some(id) = outcome["updateId"].as_str()
-            && !s
-                .preferences
-                .dismissed_updates
-                .iter()
-                .any(|dismissed| dismissed == id)
-        {
-            let title = if outcome["success"] == true {
-                format!(
-                    "{} updated to {}",
-                    s.machine_label(server),
-                    outcome["tag"].as_str().unwrap_or("")
-                )
-            } else {
-                format!(
-                    "{} update failed: {}",
-                    s.machine_label(server),
-                    outcome["reason"].as_str().unwrap_or("Unknown failure")
-                )
-            };
-            let id = id.to_owned();
-            side = side.child(
-                row()
-                    .key(format!("update-outcome-{id}"))
-                    .gap(4.0)
-                    .px(8.0)
-                    .py(4.0)
-                    .child(
-                        label(
-                            title,
-                            SMALL,
-                            if outcome["success"] == true {
-                                p.sea
-                            } else {
-                                p.danger
-                            },
-                        )
-                        .wrap()
-                        .grow(1.0)
-                        .min_w(0.0),
-                    )
-                    .child(icon_button(
-                        &format!("dismiss-update-{id}"),
-                        "Dismiss update notice",
-                        "close",
-                        p,
-                        move |s| {
-                            s.preferences.dismissed_updates.push(id.clone());
-                            if s.preferences.dismissed_updates.len() > 64 {
-                                s.preferences.dismissed_updates.remove(0);
-                            }
-                            s.checkpoint();
-                        },
-                    )),
-            );
-        }
-    }
-    if let Some(notice) = &s.machines.auto_notice
-        && s.machines.notice.as_ref() == Some(notice)
-    {
-        side = side.child(machine_notice(notice, p));
     }
     if let Some(error) = &s.lifecycle_error {
         side = side.child(label(error, SMALL, p.danger).wrap().padding(8.0));
@@ -4725,27 +4663,6 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// The one notice for linked machines this desktop cannot reach: a framed card with a brass
-/// mark and a pixel-type label. It goes away when the connections are ready again.
-fn machine_notice(text: &str, p: Palette) -> El {
-    outlined(
-        row()
-            .key("machine-unreachable")
-            .role("status")
-            .label(text)
-            .mx(8.0)
-            .mb(8.0)
-            .px(8.0)
-            .py(7.0)
-            .gap(8.0)
-            .radius(6.0)
-            .fill(p.card)
-            .child(el().size(8.0, 8.0).mt(3.0).fill(p.brass).a11y_hidden())
-            .child(meta_text(text, p.ink).wrap().grow(1.0).min_w(0.0)),
-        p,
-    )
-}
-
 /// Shown only while an update is on its way or waits for a restart. Downloading is passive;
 /// the only action is one restart, disabled while any thread still has work.
 /// Ported from KSG Code's sidebar/SidebarUpdatePill.tsx.
@@ -4829,6 +4746,63 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
             Some(button)
         }
     }
+}
+
+/// KSG `SidebarUpdatePill`'s idle state: the one-button "Check for updates"
+/// that probes the app release and every machine's providers and server. It
+/// only exists on builds that update themselves; dev runs and demos show
+/// nothing. A running check reads "Checking for updates" and takes no press.
+fn check_updates_row(s: &State, p: Palette) -> Option<El> {
+    use crate::update::Status;
+    if !s.updater.self_update_enabled() {
+        return None;
+    }
+    if matches!(s.updater.status(), Status::Checking) {
+        return Some(
+            row()
+                .key("check-updates")
+                .role("status")
+                .label("Checking for updates".to_owned())
+                .h(30.0)
+                .mx(8.0)
+                .mb(8.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .radius(12.0)
+                .fill(p.card)
+                .child(icon("reload", p.muted))
+                .child(label(
+                    "Checking for updates",
+                    TextStyle::new(12.5, 520.0),
+                    p.muted,
+                )),
+        );
+    }
+    Some(
+        row()
+            .key("check-updates")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label("Check for updates".to_owned())
+            .h(30.0)
+            .mx(8.0)
+            .mb(8.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(12.0)
+            .fill(p.sea_bg)
+            .focusable(true)
+            .hover(p.selected)
+            .on_press(|s: &mut State| s.check_for_updates())
+            .child(icon("reload", p.sea))
+            .child(label(
+                "Check for updates",
+                TextStyle::new(12.5, 520.0),
+                p.sea,
+            )),
+    )
 }
 
 /// The single footer control while any server or provider can update, KSG
@@ -6165,7 +6139,7 @@ fn workspace_named_by_filter(s: &State, server: &str, project: Option<usize>) ->
         }
 }
 /// A machine's name for labels and tooltips. Whether this desktop can reach it is not part of
-/// a row; it shows as one notice and in the open thread (`State::unreachable_machines`).
+/// a row; the open thread says so in the composer notice stack.
 fn machine_caption(s: &State, server: &str) -> String {
     s.machine_label(server)
 }
@@ -6360,7 +6334,8 @@ fn captain_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let selected_captain = t.captain;
     let query = s.captain_picker_query.text.trim().to_lowercase();
-    let filtered: Vec<usize> = (0..s.captains.len())
+    let filtered: Vec<usize> = s
+        .picker_captains()
         .filter(|&id| {
             if query.is_empty() {
                 return true;
@@ -6754,7 +6729,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                                 .as_ref()
                                 .is_some_and(|e| e.editing.is_none() && e.promotion.is_none())
                             {
-                                s.open_picker(ProjectPicker::NewThread);
+                                s.open_picker(ProjectPicker::CaptainWorkspace);
                             }
                         })
                         .child(project_tile(s, p, s.project(captain_project), 16.0))
@@ -8720,9 +8695,15 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
         .client
         .as_ref()
         .is_some_and(|client| !client.linked.is_empty());
+    // The New captain editor shares the new-thread picker's machine grouping, but its
+    // choice lands on the editor's `captain_project`, never on a draft thread.
+    let draft_pick = matches!(
+        mode,
+        ProjectPicker::NewThread | ProjectPicker::CaptainWorkspace
+    );
     let across = matches!(mode, ProjectPicker::Scope | ProjectPicker::CaptainScope)
-        || mode == ProjectPicker::NewThread && multiple;
-    if mode != ProjectPicker::CaptainScope && !(mode == ProjectPicker::NewThread && multiple) {
+        || draft_pick && multiple;
+    if mode != ProjectPicker::CaptainScope && !(draft_pick && multiple) {
         choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
     for id in s.sorted_projects() {
@@ -8762,12 +8743,13 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             if server == &s.machines.selected {
                 continue;
             }
-            if mode == ProjectPicker::NewThread
+            if draft_pick
                 && (!s.machine_connected(server)
-                    || s.machines
-                        .draft_picker
-                        .as_ref()
-                        .is_some_and(|target| target != server))
+                    || mode == ProjectPicker::NewThread
+                        && s.machines
+                            .draft_picker
+                            .as_ref()
+                            .is_some_and(|target| target != server))
             {
                 continue;
             }
@@ -8791,23 +8773,25 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             _ => (false, String::new()),
         });
     }
-    if mode == ProjectPicker::NewThread && multiple {
+    if draft_pick && multiple {
         choices.retain(|(choice, _, _)| match choice {
             PickerChoice::Project(_) => {
                 s.machine_connected(&s.machines.selected)
-                    && s.machines
-                        .draft_picker
-                        .as_ref()
-                        .is_none_or(|target| target == &s.machines.selected)
+                    && (mode == ProjectPicker::CaptainWorkspace
+                        || s.machines
+                            .draft_picker
+                            .as_ref()
+                            .is_none_or(|target| target == &s.machines.selected))
             }
             _ => true,
         });
         for server in machine_options(s) {
             if !s.machine_connected(&server)
-                || s.machines
-                    .draft_picker
-                    .as_ref()
-                    .is_some_and(|target| target != &server)
+                || mode == ProjectPicker::NewThread
+                    && s.machines
+                        .draft_picker
+                        .as_ref()
+                        .is_some_and(|target| target != &server)
             {
                 continue;
             }
@@ -8862,6 +8846,8 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 if s.machines.selected == server {
                     s.choose_draft_project(Some(id));
                 }
+            } else if mode == ProjectPicker::CaptainWorkspace {
+                captain_workspace_pick(s, &server, Some(id));
             }
             return;
         }
@@ -8871,6 +8857,8 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 if s.machines.selected == server {
                     s.choose_draft_project(None);
                 }
+            } else if mode == ProjectPicker::CaptainWorkspace {
+                captain_workspace_pick(s, &server, None);
             }
             return;
         }
@@ -8884,6 +8872,25 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 captain_ui::toggle_scope(s, project);
             }
         }
+        ProjectPicker::CaptainWorkspace => {
+            s.captain_project = Some(project);
+            s.project_picker = None;
+            s.checkpoint();
+        }
+    }
+}
+
+/// A machine pick in the New captain modal retargets the editor's "Lives on" machine first,
+/// the same way the modal's own machine row does, then records the workspace.
+fn captain_workspace_pick(s: &mut State, server: &str, project: Option<usize>) {
+    if !s.machine_connected(server) {
+        return;
+    }
+    s.retarget_captain(server);
+    if s.machines.selected == server {
+        s.captain_project = Some(project);
+        s.project_picker = None;
+        s.checkpoint();
     }
 }
 
@@ -8899,6 +8906,7 @@ fn project_picker(s: &State, p: Palette) -> El {
     let placeholder = match mode {
         ProjectPicker::Scope => "Filter by workspace...",
         ProjectPicker::NewThread => "New thread in...",
+        ProjectPicker::CaptainWorkspace => "Workspace...",
         ProjectPicker::AddProject => "Add workspace",
         ProjectPicker::CaptainScope => "Add to this captain's scope...",
     };
@@ -8988,8 +8996,12 @@ fn project_picker(s: &State, p: Palette) -> El {
     });
     let mut last_machine = None;
     for (index, (choice, name, machine)) in choices.iter().enumerate() {
-        if matches!(mode, ProjectPicker::NewThread | ProjectPicker::CaptainScope)
-            && machine != &last_machine
+        if matches!(
+            mode,
+            ProjectPicker::NewThread
+                | ProjectPicker::CaptainScope
+                | ProjectPicker::CaptainWorkspace
+        ) && machine != &last_machine
         {
             if let Some(machine) = machine {
                 list = list.child(
@@ -9056,6 +9068,16 @@ fn project_picker(s: &State, p: Palette) -> El {
             }
             (ProjectPicker::Scope, PickerChoice::MachineProject(server, id)) => {
                 s.project_scope != ProjectScope::All && s.scope_includes_on(server, Some(*id))
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::Project(id)) => {
+                s.captain_project.unwrap_or(s.current().project) == Some(*id)
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::NoProject) => {
+                s.captain_project.unwrap_or(s.current().project).is_none()
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::MachineNoProject(server)) => {
+                *server == s.machines.selected
+                    && s.captain_project.unwrap_or(s.current().project).is_none()
             }
             _ => false,
         };
@@ -18824,6 +18846,80 @@ pub(crate) mod tests {
             assert_eq!(rt.state.captain_editor.as_ref().unwrap().server, "studio");
         }
     }
+
+    #[test]
+    fn new_captain_workspace_picker_updates_the_editor_not_the_draft() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let root = std::env::temp_dir().join(format!("shina-captain-ws-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("one")).unwrap();
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        let one = rt.state.add_project(root.join("one")).unwrap().unwrap();
+        let two = rt.state.add_project(root.join("two")).unwrap().unwrap();
+        rt.state.begin_new_captain();
+        rt.invalidate();
+        rt.frame(0.5);
+        let draft_project = rt.state.current().project;
+        let threads = rt.state.threads.len();
+        press(&mut rt, "captain-project-choice");
+        assert_eq!(
+            rt.state.project_picker,
+            Some(ProjectPicker::CaptainWorkspace)
+        );
+        press(&mut rt, &format!("choose-project-{two}"));
+        assert_eq!(rt.state.project_picker, None);
+        assert!(rt.state.captain_editor.is_some());
+        assert_eq!(rt.state.captain_project, Some(Some(two)));
+        // The pick belongs to the modal: the draft thread behind it does not move.
+        assert_eq!(rt.state.current().project, draft_project);
+        assert_eq!(rt.state.threads.len(), threads);
+        rt.invalidate();
+        rt.frame(0.5);
+        assert!(rt.presented("captain-project-choice").is_some());
+        press(&mut rt, "captain-project-choice");
+        press(&mut rt, "choose-no-project");
+        assert_eq!(rt.state.captain_project, Some(None));
+        assert_eq!(rt.state.current().project, draft_project);
+        assert_eq!(rt.state.threads.len(), threads);
+        press(&mut rt, "captain-project-choice");
+        press(&mut rt, &format!("choose-project-{one}"));
+        assert_eq!(rt.state.captain_project, Some(Some(one)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_captain_workspace_picker_retargets_the_captain_machine() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let root =
+            std::env::temp_dir().join(format!("shina-captain-machine-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let project = rt.state.add_project(root.clone()).unwrap().unwrap();
+        connected_machines(&mut rt);
+        rt.state.begin_new_captain();
+        rt.state.open_picker(ProjectPicker::CaptainWorkspace);
+        let choices = picker_choices(&rt.state, ProjectPicker::CaptainWorkspace);
+        assert!(choices.iter().any(|(choice, _, _)| matches!(
+            choice,
+            PickerChoice::MachineProject(server, id) if server == "studio" && *id == project
+        )));
+        assert!(choices.iter().any(|(choice, _, _)| matches!(
+            choice,
+            PickerChoice::MachineNoProject(server) if server == "studio"
+        )));
+        choose_picker(
+            &mut rt.state,
+            ProjectPicker::CaptainWorkspace,
+            PickerChoice::MachineProject("studio".into(), project),
+            false,
+        );
+        assert_eq!(rt.state.machines.selected, "studio");
+        assert_eq!(rt.state.project_picker, None);
+        let editor = rt.state.captain_editor.as_ref().unwrap();
+        assert_eq!(editor.server, "studio");
+        assert_eq!(rt.state.captain_project, Some(Some(project)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     /// Tab once and return the focused element.
     fn tab(rt: &mut Runtime<State>) -> rune::ElementInfo {
         rt.key(rune::KeyEvent {
@@ -19465,57 +19561,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unreachable_machines_raise_one_notice_and_the_open_thread_says_so() {
-        let mut rt = runtime(1280.0);
-        crate::fleet_demo(&mut rt.state);
-        // Real machines, not demo data: their fixture clients are not connected.
-        rt.state.demo = false;
-        let poll = |rt: &mut Runtime<State>| {
-            rt.update(|state, tx| {
-                crate::model::poll(state, 0.0, tx);
-            });
-            rt.invalidate();
-            rt.frame(1.0);
-        };
-        poll(&mut rt);
-        let notice = rt.state.machines.notice.clone().expect("a notice");
-        assert!(
-            notice.contains("Studio")
-                && notice.contains("Laptop")
-                && notice.ends_with("unreachable. Reconnecting."),
-            "{notice}"
-        );
-        assert!(notice.contains(" and "), "one notice lists both: {notice}");
-        assert_eq!(
-            rt.state.machines.auto_notice.as_deref(),
-            Some(notice.as_str())
-        );
-        assert!(rt.presented("machine-unreachable").is_some());
-        // Rows still say nothing about the connection.
-        let tree = rt.accessibility_json();
-        let sidebar = find(&tree, "sidebar").expect("sidebar");
-        assert!(!sidebar.to_string().contains("offline"));
-        // The open thread on an unreachable machine says so in the composer notice stack.
-        rt.state.open_machine_thread("example-studio", 3);
-        poll(&mut rt);
-        assert_eq!(rt.state.machines.selected, "example-studio");
-        let tree = rt.accessibility_json();
-        let notice = find(
-            &tree,
-            "composer-notice-environment-unavailable:example-studio",
-        )
-        .expect("the composer notice says so");
-        assert_eq!(notice["name"], "Studio is offline: This device is offline");
-        // Another message is never replaced or cleared by it.
-        rt.state.machines.notice = Some("Something else".into());
-        poll(&mut rt);
-        assert_eq!(rt.state.machines.notice.as_deref(), Some("Something else"));
-        // The notice clears itself once the machines are ready: none are linked any more.
-        rt.state.machines.notice = rt.state.machines.auto_notice.clone();
-        rt.state.client.as_mut().unwrap().linked.clear();
-        poll(&mut rt);
-        assert!(rt.state.machines.notice.is_none());
-        assert!(rt.presented("machine-unreachable").is_none());
+    fn unreachable_machines_show_only_above_the_composer_for_the_open_thread() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            // Real machines, not demo data: their fixture clients are not connected.
+            rt.state.demo = false;
+            rt.state.compact_sidebar = width < 760.0;
+            let poll = |rt: &mut Runtime<State>| {
+                rt.update(|state, tx| {
+                    crate::model::poll(state, 0.0, tx);
+                });
+                rt.invalidate();
+                rt.frame(1.0);
+            };
+            poll(&mut rt);
+            // No stuck sidebar notice for machines the user is not using.
+            assert!(rt.state.machines.notice.is_none(), "{width}");
+            assert!(rt.presented("machine-unreachable").is_none(), "{width}");
+            let sidebar = find(&rt.accessibility_json(), "sidebar")
+                .expect("sidebar")
+                .to_string();
+            assert!(!sidebar.contains("unreachable"), "{width}: {sidebar}");
+            // The composer banner names only the machine the open thread targets.
+            assert!(
+                rt.presented("composer-notice-environment-unavailable:example-studio")
+                    .is_none(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-notice-environment-unavailable:example-laptop")
+                    .is_none(),
+                "{width}"
+            );
+            rt.state.open_machine_thread("example-studio", 3);
+            poll(&mut rt);
+            assert_eq!(rt.state.machines.selected, "example-studio");
+            let tree = rt.accessibility_json();
+            let notice = find(
+                &tree,
+                "composer-notice-environment-unavailable:example-studio",
+            )
+            .expect("the composer notice says so");
+            assert_eq!(notice["name"], "Studio is offline: This device is offline");
+            assert!(rt.presented("machine-unreachable").is_none(), "{width}");
+            let sidebar = find(&rt.accessibility_json(), "sidebar")
+                .expect("sidebar")
+                .to_string();
+            assert!(!sidebar.contains("unreachable"), "{width}: {sidebar}");
+        }
     }
 
     #[test]
@@ -23170,6 +23264,32 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         assert!(find(&rt.accessibility_json(), "update-restart").is_none());
+    }
+
+    #[test]
+    fn the_check_for_updates_row_is_one_button_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            // A development build shows nothing.
+            assert!(rt.find("check-updates").is_none(), "{width}");
+            rt.state.updater = crate::update::Updater::test_checkable();
+            rt.invalidate();
+            rt.frame(0.0);
+            let tree = rt.accessibility_json();
+            let button = find(&tree, "check-updates")
+                .unwrap_or_else(|| panic!("{width}: check-updates missing"));
+            assert_eq!(button["role"], "button", "{width}");
+            press(&mut rt, "check-updates");
+            rt.frame(0.0);
+        }
+        // A running check reads as a status, not a second button.
+        let mut rt = runtime(1280.0);
+        rt.state.updater = crate::update::Updater::test_checking();
+        rt.frame(0.0);
+        let tree = rt.accessibility_json();
+        let status = find(&tree, "check-updates").expect("checking row");
+        assert_eq!(status["role"], "status");
     }
 
     #[test]
@@ -31026,6 +31146,35 @@ pub(crate) mod tests {
             assert!(rt.find("choose-captain-0").is_none());
             assert!(rt.find("choose-captain-3").is_some());
             assert!(rt.find("picker-new-captain").is_some());
+        }
+    }
+
+    #[test]
+    fn captain_picker_never_offers_deleted_captains() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.delete_captain_for_test(1);
+            rt.state.delete_captain_for_test(3);
+            rt.state.open_captain_selector();
+            rt.frame(0.1);
+            for captain in [0usize, 2] {
+                assert!(
+                    rt.find(&format!("choose-captain-{captain}")).is_some(),
+                    "{width}: live captain {captain}"
+                );
+            }
+            for captain in [1usize, 3] {
+                assert!(
+                    rt.find(&format!("choose-captain-{captain}")).is_none(),
+                    "{width}: deleted captain {captain}"
+                );
+            }
+            rt.state.captain_picker_query.replace_text("Deleted");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(rt.find("choose-captain-0").is_none());
+            assert!(rt.find("choose-captain-2").is_none());
         }
     }
 
