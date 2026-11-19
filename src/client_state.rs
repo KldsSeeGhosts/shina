@@ -3125,8 +3125,10 @@ impl State {
             self.machines.recover.remove(server);
             self.refresh_machine_notice();
             if self.machines.selected == server {
+                // select_machine restores the local workspace's saved tabs, or
+                // opens a device draft when nothing is restorable. Forcing a
+                // projectless draft here would add a "No workspace" tab on top.
                 self.select_machine("local");
-                self.new_client_draft(None);
             }
         }
         self.tick_composer_notices_at(Instant::now(), None);
@@ -7211,6 +7213,84 @@ mod tests {
             "deleted saved tabs need a draft too"
         );
         assert_eq!(state.tabs, [state.current().id]);
+    }
+
+    #[test]
+    fn disconnecting_the_selected_machine_restores_local_tabs_without_a_new_draft() {
+        let dir =
+            std::env::temp_dir().join(format!("shina-disconnect-tabs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = uuid::Uuid::new_v4().to_string();
+        let link = crate::peer::Link {
+            server_id: server_id.clone(),
+            host: "127.0.0.1:9".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            token: "test-token".into(),
+            enabled: true,
+        };
+        link.save(&dir).unwrap();
+
+        let mut state = State::headless(dir.clone());
+        let (mut client, _) = crate::client::Client::test_connected(dir.clone());
+        let mut remote = crate::client::Client::new(dir.clone());
+        remote.remote = Some(link);
+        client.linked.insert(server_id.clone(), remote);
+        state.client = Some(client);
+
+        // Local has one server thread open in a tab.
+        let mut local = State::headless(dir.clone());
+        local.threads = (1..=2)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Thread {id}");
+                thread.renamed = true;
+                thread
+            })
+            .collect();
+        local.next_id = 3;
+        let local_projection = local.projection();
+        state
+            .machines
+            .views
+            .insert("local".into(), local_projection.clone().into());
+        state.apply_projection(local_projection).unwrap();
+        state.checkpoint_client();
+        let saved_tabs = state.machines.ui["local"]["tabs"].clone();
+        let saved_active = state.current().id;
+
+        // Visit the linked machine, then disconnect it while it is selected.
+        let mut remote_proj = State::headless(dir.clone());
+        remote_proj.threads[0].title = "Remote thread".into();
+        state
+            .machines
+            .views
+            .insert(server_id.clone(), remote_proj.projection().into());
+        state.select_machine(&server_id);
+        state.disconnect_server(&server_id);
+
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.machines.ui["local"]["tabs"], saved_tabs);
+        assert_eq!(
+            state.tabs,
+            saved_tabs
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|id| id as usize)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(state.current().id, saved_active);
+        assert!(
+            !state.current().client_draft,
+            "disconnect must not open a 'No workspace' draft over the restored tab"
+        );
+        assert!(
+            !state.threads.iter().any(|t| t.client_draft),
+            "disconnect must not leave a device draft behind on local"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
