@@ -1786,7 +1786,7 @@ impl State {
             "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error,
                 "models":self.catalog.models,"defaultModel":self.catalog.default_model,
                 "defaultThinking":self.catalog.default_thinking},
-            "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
+            "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot(),"antigravity":self.antigravity_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
             "undo":self.undo,

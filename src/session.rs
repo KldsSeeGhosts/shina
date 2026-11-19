@@ -329,6 +329,7 @@ impl NativeCatalog {
         let result = match harness {
             "codex" => crate::codex::discover(workspace, wake, models),
             "claude" => crate::claude::discover(workspace, wake),
+            "antigravity" => crate::antigravity::discover(workspace, wake),
             _ => unreachable!(),
         };
         match result {

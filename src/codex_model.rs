@@ -201,14 +201,20 @@ impl State {
         }
         if !self.provider_update_drivers.contains("claude") {
             self.claude_catalog
-                .refresh("claude", cwd, self.wake.clone(), force);
+                .refresh("claude", cwd.clone(), self.wake.clone(), force);
+        }
+        if crate::antigravity::cli_available()
+            && !self.provider_update_drivers.contains("antigravity")
+        {
+            self.antigravity_catalog
+                .refresh("antigravity", cwd, self.wake.clone(), force);
         }
         self.apply_native_catalogs();
     }
 
     pub(super) fn apply_native_catalogs(&mut self) {
         if self.client.is_some() {
-            for harness in ["codex", "claude"] {
+            for harness in ["codex", "claude", "antigravity"] {
                 let catalog = &self.client_views["nativeCatalogs"][harness];
                 let models = self.harness_models(harness);
                 let projects = &self.projects.entries;
@@ -260,6 +266,7 @@ impl State {
             let catalog = match thread.harness.as_str() {
                 "codex" => &self.codex_catalog,
                 "claude" => &self.claude_catalog,
+                "antigravity" => &self.antigravity_catalog,
                 _ => continue,
             };
             if thread.pi.is_some() {
@@ -316,7 +323,7 @@ impl State {
     pub(super) fn harness_models(&self, harness: &str) -> Vec<AgentModel> {
         let mut models = vec![];
         let provider = if harness == "pi" { "cpa" } else { harness };
-        if self.client.is_some() && matches!(harness, "codex" | "claude") {
+        if self.client.is_some() && matches!(harness, "codex" | "claude" | "antigravity") {
             models.extend(
                 serde_json::from_value::<Vec<AgentModel>>(
                     self.client_views["nativeCatalogs"][harness]["models"].clone(),
@@ -336,6 +343,8 @@ impl State {
             models.extend(self.codex_catalog.models.iter().cloned());
         } else if harness == "claude" {
             models.extend(self.claude_catalog.models.iter().cloned());
+        } else if harness == "antigravity" {
+            models.extend(self.antigravity_catalog.models.iter().cloned());
         }
         for thread in self.threads.iter().filter(|t| t.harness == harness) {
             for model in &thread.models {

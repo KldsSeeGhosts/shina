@@ -5087,6 +5087,7 @@ pub struct State {
     pub catalog: Catalog,
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
+    pub antigravity_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
     pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
@@ -6132,6 +6133,7 @@ impl State {
             catalog: Catalog::default(),
             codex_catalog: Default::default(),
             claude_catalog: Default::default(),
+            antigravity_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
             managed_policy: if cfg!(test) {
                 None
@@ -16949,11 +16951,17 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(remaining);
     }
     state.refresh_native_catalogs(false);
-    if state.codex_catalog.poll("codex") | state.claude_catalog.poll("claude") {
+    if state.codex_catalog.poll("codex")
+        | state.claude_catalog.poll("claude")
+        | state.antigravity_catalog.poll("antigravity")
+    {
         state.apply_native_catalogs();
         changed = true;
     }
-    if state.codex_catalog.loading() || state.claude_catalog.loading() {
+    if state.codex_catalog.loading()
+        || state.claude_catalog.loading()
+        || state.antigravity_catalog.loading()
+    {
         tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();

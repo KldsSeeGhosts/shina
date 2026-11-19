@@ -623,6 +623,19 @@ pub fn start(
     let command = command(&start.workspace)?;
     crate::acp::start_command(agent, start, wake, command)
 }
+/// Live catalog probe via `agy acp`, matching KSG's `AntigravityProvider` session discovery.
+pub fn discover(
+    workspace: std::path::PathBuf,
+    wake: rune::Waker,
+) -> Result<crate::backend::Pi, String> {
+    let pi = start(
+        crate::harness::Start::discovery("antigravity", workspace),
+        wake,
+    )?;
+    let _ = pi.send(json!({"type":"get_available_models"}));
+    let _ = pi.send(json!({"type":"get_commands"}));
+    Ok(pi)
+}
 /// KSG `buildAntigravityModelsFromSession` without the gateway branch (Shina has no
 /// gateway-models input). Model list ids stay combined `family-level`.
 pub fn session_models(

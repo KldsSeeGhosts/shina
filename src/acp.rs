@@ -372,11 +372,12 @@ impl Client {
     }
 
     fn mcp_servers(&self) -> Result<Value, String> {
-        let host = self
-            .start
-            .link
-            .as_ref()
-            .ok_or("Shina MCP is unavailable.")?;
+        let Some(host) = self.start.link.as_ref() else {
+            if self.antigravity {
+                return Ok(json!([]));
+            }
+            return Err("Shina MCP is unavailable.".into());
+        };
         let capabilities = &self.capabilities["mcpCapabilities"];
         if capabilities["http"] == true && !self.stdio_fallback {
             return Ok(json!([{"type":"http","name":"shina","url":host.url,
