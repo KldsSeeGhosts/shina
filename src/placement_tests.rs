@@ -97,6 +97,8 @@ impl Fixture {
         std::fs::write(dir.join("server-id"), uuid::Uuid::new_v4().to_string()).unwrap();
         let mut state = State::headless(dir);
         state.demo = true;
+        // The peer below advertises only the pi harness and cpa models.
+        state.threads[0].harness = "pi".into();
         state
             .projects
             .entries
@@ -1486,7 +1488,11 @@ fn a_peer_launch_reservation_commits_before_any_provisioning_starts() {
         crate::vcs::real_location(Path::new(placement.checkout.as_ref().unwrap())),
         crate::vcs::real_location(Path::new(record["placement"]["checkout"].as_str().unwrap()))
     );
-    std::fs::remove_dir_all(runtime.state.data_dir).unwrap();
+    // Windows refuses to delete a directory under an open sqlite handle.
+    let data_dir = runtime.state.data_dir.clone();
+    drop(runtime);
+    drop(database);
+    std::fs::remove_dir_all(data_dir).unwrap();
 }
 
 #[test]

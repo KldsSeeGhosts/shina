@@ -324,7 +324,7 @@ impl Default for Dialog {
             model: Default::default(),
             provider: Default::default(),
             effort: Default::default(),
-            model_harness: "pi".into(),
+            model_harness: "codex".into(),
             notice: None,
             archive: None,
             archive_targets: vec![],
@@ -2258,7 +2258,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 "Used when there is no thread to inherit from.",
                 settings_button(
                     "default-harness",
-                    index["defaultHarness"].as_str().unwrap_or("pi"),
+                    index["defaultHarness"].as_str().unwrap_or("codex"),
                     p,
                     |s| {
                         if s.client.is_none() {
@@ -2268,7 +2268,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                         let ids = s.settings_harness_ids();
                         let current = s.settings_index()["defaultHarness"]
                             .as_str()
-                            .unwrap_or("pi")
+                            .unwrap_or("codex")
                             .to_owned();
                         let pos = ids.iter().position(|id| id == &current).unwrap_or(0);
                         if !ids.is_empty() {

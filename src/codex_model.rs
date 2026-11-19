@@ -1420,6 +1420,7 @@ mod tests {
     #[test]
     fn draft_pickers_and_capabilities_share_prompt_free_native_models() {
         let mut state = State::new(PathBuf::new(), false);
+        state.current_mut().harness = "pi".into();
         for harness in ["codex", "claude"] {
             let model = AgentModel::from_harness_value(&json!({
                 "provider":harness,"id":"fixture","name":"Fixture","thinkingLevels":["low","high"]
@@ -1622,22 +1623,22 @@ mod tests {
     #[test]
     fn default_harness_persists_and_applies_to_new_threads_and_homes() {
         let mut state = State::new(PathBuf::new(), false);
-        assert_eq!(state.default_harness, "pi");
-        state.cycle_default_harness();
         assert_eq!(state.default_harness, "codex");
+        state.cycle_default_harness();
+        assert_eq!(state.default_harness, "claude");
         state
             .current_mut()
             .draft
             .replace_text("Preserve an existing draft");
         state.new_thread_in(None);
-        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().harness, "claude");
         state.captains = Captain::presets();
         state.open_captain(0);
-        assert_eq!(state.current().harness, "codex");
+        assert_eq!(state.current().harness, "claude");
         assert_eq!(state.current().native.access, AccessMode::ReadOnly);
         let snapshot = state.snapshot();
         state.restore_global(&snapshot).unwrap();
-        assert_eq!(state.default_harness, "codex");
+        assert_eq!(state.default_harness, "claude");
     }
 
     #[test]

@@ -603,6 +603,7 @@ mod tests {
     fn legacy_homes_merge_scope_and_keep_every_conversation_and_session() {
         let mut source = fixture();
         let first = source.current().id;
+        source.current_mut().harness = "pi".into();
         source.current_mut().updated = 100;
         source.current_mut().session = Some("first-session.jsonl".into());
         source
@@ -615,6 +616,7 @@ mod tests {
         let worker = source.threads.last().unwrap().id;
         let second_project = source.add_project(std::env::temp_dir()).unwrap().unwrap();
         let mut second = Thread::new(source.next_id);
+        second.harness = "pi".into();
         second.project = Some(second_project);
         second.captain = Some(0);
         second.captain_home = true;
@@ -625,6 +627,7 @@ mod tests {
         source.next_id += 1;
         source.threads.push(second);
         let mut scratch = Thread::new(source.next_id);
+        scratch.harness = "pi".into();
         source.next_id += 1;
         scratch.captain = Some(0);
         scratch.captain_home = true;

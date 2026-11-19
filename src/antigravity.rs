@@ -852,6 +852,21 @@ fn environment_in(
         ("PYTHONUNBUFFERED".into(), "1".into()),
         ("TMPDIR".into(), tmp.to_string_lossy().into_owned()),
     ]);
+    // KSG `authMethod: "gateway"`: providers.json or SHINA_ANTIGRAVITY_* can
+    // point `agy` at a CLIPROXYAPI-style gateway. REMOVED_ENV already kept the
+    // AGY_* names out of the inherited list, so these only ever append.
+    let providers = crate::provider_config::Registry::read();
+    if let Some(error) = providers.error {
+        return Err(error);
+    }
+    if let Some(gateway) = providers.gateway("antigravity") {
+        env.extend(
+            gateway
+                .antigravity_environment()
+                .into_iter()
+                .map(|(name, value)| (name, value.to_string_lossy().into_owned())),
+        );
+    }
     Ok(env)
 }
 /// KSG `buildAntigravityAcpSpawnInput` for the agy CLI (harnessPath null): `agy acp`

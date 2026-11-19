@@ -1657,7 +1657,7 @@ impl Thread {
             recovery_command: None,
             projected_harness_choice: false,
             id,
-            harness: "pi".into(),
+            harness: "codex".into(),
             harness_context_sent: false,
             harness_state: json!({}),
             project: None,
@@ -5994,7 +5994,7 @@ impl State {
             stash_pulse: 0,
             lifecycle_error: None,
             auto_settle_days: 3,
-            default_harness: "pi".into(),
+            default_harness: "codex".into(),
             drag_thread: None,
             drag_target: None,
             drop_rects: Default::default(),
@@ -15291,7 +15291,7 @@ impl State {
             }
         };
         self.default_harness = match index.get("defaultHarness") {
-            None => "pi".into(),
+            None => "codex".into(),
             Some(value) => value
                 .as_str()
                 .filter(|id| crate::harness::valid_id(id))
@@ -15392,6 +15392,10 @@ impl State {
                             return None;
                         }
                         thread.harness = harness.into();
+                    } else {
+                        // Indexes saved before per-thread harnesses have no
+                        // harness field; those threads are all Pi sessions.
+                        thread.harness = "pi".into();
                     }
                     if let Some(sent) = record.get("harnessContextSent") {
                         thread.harness_context_sent = sent.as_bool()?;
@@ -18574,6 +18578,8 @@ mod tests {
     #[test]
     fn new_threads_keep_default_effort_when_the_inherited_effort_is_invalid() {
         let mut state = tab_fixture();
+        state.default_harness = "pi".into();
+        state.current_mut().harness = "pi".into();
         let model = AgentModel::from_value(
             &json!({"provider":"cpa","id":"chosen","name":"Chosen","reasoning":true}),
         )
@@ -19658,6 +19664,7 @@ mod tests {
     fn explicit_delegation_selection_applies_before_the_first_prompt_and_is_reported() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.current_mut().harness = "pi".into();
         let fast = model_with_levels("fast", &["off", "low"]);
         let deep = model_with_levels(
             "deep",
@@ -19830,6 +19837,7 @@ mod tests {
     fn invalid_delegation_targets_are_rejected_without_creating_children() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.threads[0].harness = "pi".into();
         let fast = model_with_levels("fast", &["off", "low"]);
         let deep = model_with_levels(
             "deep",
@@ -19921,6 +19929,7 @@ mod tests {
     fn delegation_inherits_pinned_selection_and_overrides_only_given_fields() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.threads[0].harness = "pi".into();
         state.threads[0].model_provider = "cpa".into();
         state.threads[0].model_id = "fast".into();
         state.threads[0].thinking = "low".into();
@@ -19988,6 +19997,7 @@ mod tests {
     fn delegation_uses_the_catalog_default_when_the_caller_has_no_selection() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.threads[0].harness = "pi".into();
         let fast = model_with_levels("fast", &["off", "low"]);
         let deep = model_with_levels(
             "deep",
@@ -20017,6 +20027,7 @@ mod tests {
         state.catalog.models = vec![fast.clone(), deep.clone()];
         state.catalog.default_model = Some(fast);
         state.catalog.default_thinking = "low".into();
+        state.threads[0].harness = "pi".into();
         state.threads[0].selected_model = Some(("cpa".into(), "deep".into()));
         state.threads[0].selected_thinking = Some("max".into());
         let capabilities = state
@@ -20180,6 +20191,7 @@ mod tests {
     #[test]
     fn capabilities_report_discovery_not_ready_without_inventing_models() {
         let mut state = State::new(".".into(), false);
+        state.threads[0].harness = "pi".into();
         state.catalog.error = Some("Model discovery timed out.".into());
         let capabilities = state
             .mcp_call(1, "orchestrator_capabilities", &json!({}))
@@ -20210,6 +20222,7 @@ mod tests {
     #[test]
     fn capabilities_use_caller_metadata_when_catalog_discovery_is_unavailable() {
         let mut state = State::new(".".into(), false);
+        state.threads[0].harness = "pi".into();
         let deep = model_with_levels(
             "deep",
             &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -21224,6 +21237,7 @@ mod tests {
     fn direct_provider_models_are_hidden_and_cannot_receive_prompts() {
         let (pi, commands, _events) = Pi::test_connection();
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.pi = Some(pi);
         thread.status = Status::Ready;
         thread.apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
@@ -21273,6 +21287,7 @@ mod tests {
     #[test]
     fn offline_picker_choices_are_applied_before_the_first_prompt() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.set_model("cpa".into(), "chosen".into());
         thread.set_thinking("high".into());
         assert_eq!(thread.model_id, "chosen");
@@ -21348,6 +21363,7 @@ mod tests {
     #[test]
     fn context_stats_refresh_on_startup_turns_and_model_changes() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         let (pi, commands, _events) = Pi::test_connection();
         thread.pi = Some(pi);
         thread.initializing = true;
@@ -21530,6 +21546,7 @@ mod tests {
     #[test]
     fn catalog_image_metadata_and_rejected_model_changes_preserve_actual_support() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "pi".into();
         state.current_mut().model_id = "vision".into();
         state.catalog.models = vec![
             AgentModel::from_value(&json!({
@@ -21681,6 +21698,7 @@ mod tests {
     #[test]
     fn failed_startup_settings_restore_the_message_instead_of_sending_with_defaults() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.set_model("cpa".into(), "missing".into());
         thread.draft.replace_text("Keep my model choice");
         thread.send();
@@ -21737,6 +21755,8 @@ mod tests {
     #[test]
     fn catalog_defaults_do_not_overwrite_a_saved_thinking_choice() {
         let mut state = State::new(".".into(), false);
+        state.default_harness = "pi".into();
+        state.current_mut().harness = "pi".into();
         state.current_mut().set_thinking("high".into());
         let model = AgentModel::from_value(
             &json!({"provider":"cpa","id":"default","name":"Default CPA","reasoning":true}),
@@ -22154,7 +22174,13 @@ mod tests {
         duplicate["path"] = verbatim.to_string_lossy().as_ref().into();
         index["projects"].as_array_mut().unwrap().push(duplicate);
         index["threads"][0]["project"] = 2.into();
+        index["threads"][0]["harness"] = "pi".into();
         index["projectScope"] = 2.into();
+        let uid = index["identity"]["projectCheckoutIds"]["1"].clone();
+        index["identity"]["projectCheckoutIds"]
+            .as_object_mut()
+            .unwrap()
+            .insert("2".into(), uid);
         let mut restored = State::new(PathBuf::new(), false);
         restored.restore_global(&index).unwrap();
         assert_eq!(restored.projects.entries.len(), 1);
@@ -22672,6 +22698,7 @@ mod tests {
     #[test]
     fn image_only_prompts_send_typed_pi_images_with_ksg_path_context() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.model_provider = "cpa".into();
         thread.supports_images = Some(true);
         let (pi, commands, _events) = Pi::test_connection();
@@ -23093,6 +23120,7 @@ mod tests {
     #[test]
     fn retry_after_a_crash_resends_the_snapshotted_image_message() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "pi".into();
         state.current_mut().model_provider = "cpa".into();
         state.current_mut().supports_images = Some(true);
         state.current_mut().session = Some("saved.jsonl".into());
@@ -24085,6 +24113,7 @@ mod tests {
     #[test]
     fn usage_limits_command_raises_notice_without_sending_and_requires_capability() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "pi".into();
         // Pi has no report, so `/usage-limits` is not offered and sends as ordinary text.
         state.current_mut().draft.focused = true;
         state.current_mut().draft.replace_text("/");
@@ -24865,6 +24894,7 @@ mod tests {
         );
         state.catalog.models = models.clone();
         state.catalog.default_model = models.first().cloned();
+        state.default_harness = "pi".into();
         state.current_mut().harness = "pi".into();
         state.current_mut().models = models;
         if let Some(first) = state.catalog.models.first().cloned() {
