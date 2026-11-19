@@ -401,8 +401,11 @@ impl Registry {
             if !crate::harness::valid_id(key) || providers.contains_key(id) {
                 return Err("Use unique lowercase provider ids, with Pi filed under cpa.".into());
             }
-            let file: FileProvider = serde_json::from_value(section.clone())
-                .map_err(|error| format!("Invalid {key} section: {error}"))?;
+            let file: FileProvider = serde_json::from_value(section.clone()).map_err(|_| {
+                format!(
+                    "Invalid {key} section in providers.json. Check field names and value types."
+                )
+            })?;
             let provider = Self::section(key, file)?;
             providers.insert(id.to_owned(), provider);
         }
