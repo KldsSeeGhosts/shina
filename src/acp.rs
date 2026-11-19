@@ -246,6 +246,14 @@ struct Client {
     /// The real `agy` CLI wraps setMode with antigravityCliSessionMode; a
     /// harnesses.json override is an arbitrary executable and does not.
     antigravity_cli: bool,
+    /// A gateway URL was configured for this session (KSG authMethod "gateway").
+    antigravity_gateway: bool,
+    /// The configured gateway model list; non-empty enables KSG's gateway branch.
+    gateway_models: String,
+    /// The adapter-owned `reasoningEffort` pick, re-applied to each route select.
+    gateway_effort: Option<String>,
+    /// `setup.models` from session start: legacy combined ids for gateway row lookup.
+    legacy_models: Value,
     /// The session's ACP `modes` block, for KSG's setMode modeState.
     modes: Value,
     file_reads: bool,
@@ -289,6 +297,10 @@ impl Client {
             thinking_levels: HashMap::new(),
             pending_thinking: None,
             antigravity_cli: false,
+            antigravity_gateway: false,
+            gateway_models: String::new(),
+            gateway_effort: None,
+            legacy_models: Value::Null,
             modes: Value::Null,
             file_reads: false,
         }
@@ -489,6 +501,34 @@ impl Client {
                 self.request(request["method"].as_str().unwrap(), params, retry);
                 return Ok(());
             }
+            if kind == "antigravity_gateway" {
+                // KSG: some gateway families advertise their default tier without the
+                // "-medium" suffix; select the family the agent does advertise.
+                let route = request["route"].as_str().unwrap_or("");
+                let row = request["row"].as_str().unwrap_or("");
+                let values: Vec<&str> = crate::antigravity::model_options(&self.config_options)
+                    .into_iter()
+                    .filter_map(|o| o["value"].as_str())
+                    .collect();
+                if error["code"] == -32602
+                    && error["message"].as_str()
+                        == Some(format!("Unknown model ID: {route}").as_str())
+                    && route == format!("{row}-medium")
+                    && !values.contains(&route)
+                    && values.contains(&row)
+                    && let Some(config) = crate::antigravity::model_config(&self.config_options)
+                {
+                    let config_id = config["id"].as_str().unwrap_or("").to_owned();
+                    let mut retry = request.clone();
+                    retry["route"] = json!(row);
+                    self.request(
+                        "session/set_config_option",
+                        json!({"sessionId":self.session,"configId":config_id,"value":row}),
+                        retry,
+                    );
+                    return Ok(());
+                }
+            }
             let message = error["message"].as_str().unwrap_or("Unknown ACP error");
             let message = if let Some(host) = &self.start.link {
                 message.replace(&host.token, "[redacted]")
@@ -517,6 +557,8 @@ impl Client {
             if kind == "prompt" {
                 // The request may already have run tools. Do not restore/replay accepted input.
                 return Err(message);
+            } else if kind == "antigravity_gateway" {
+                self.reject(&request["original"], message);
             } else {
                 self.reject(&request, message);
             }
@@ -534,11 +576,16 @@ impl Client {
                 self.events
                     .push(json!({"type":"harness_update","field":"turnCapabilities",
                     "value":self.turn_capabilities()}));
-                // KSG authenticateEagerly with authMethodId oauth-personal.
+                // KSG authenticateEagerly with the resolved authMethodId.
                 if self.antigravity {
+                    let method = if self.antigravity_gateway {
+                        "gateway"
+                    } else {
+                        "oauth-personal"
+                    };
                     self.request(
                         "authenticate",
-                        json!({"methodId":"oauth-personal"}),
+                        json!({"methodId":method}),
                         json!({"type":"authenticate"}),
                     );
                     return Ok(());
@@ -645,6 +692,36 @@ impl Client {
                     return Ok(());
                 }
                 self.reply(&request, self.model.clone());
+            }
+            // KSG applyAntigravityAcpModelSelection gateway select: the resolved route
+            // lands in the model config option; the caller's pick replies on success.
+            "antigravity_gateway" => {
+                if result["configOptions"].is_array() {
+                    self.configure_models(result);
+                } else {
+                    // A bare set_model reply carries no configOptions; mark the row
+                    // containing the resolved route current.
+                    let route = request["route"].as_str().unwrap_or("");
+                    let selections =
+                        crate::antigravity::gateway_model_selections(&self.gateway_models);
+                    let rows = crate::antigravity::gateway_model_rows(
+                        &selections,
+                        &self.gateway_entries(),
+                    );
+                    if let Some(row) = rows
+                        .iter()
+                        .find(|row| row.slug == route || row.routes.iter().any(|(v, _)| v == route))
+                        && let Some(model) = self.models.iter().find(|m| m["id"] == row.slug)
+                    {
+                        self.model = model.clone();
+                    }
+                }
+                let original = request["original"].clone();
+                if original["type"] == "set_option" {
+                    self.reply(&original, result.clone());
+                } else {
+                    self.reply(&original, self.model.clone());
+                }
             }
             "antigravity_mode" => {
                 if result["configOptions"].is_array() {
@@ -846,8 +923,14 @@ impl Client {
                 &self.config_options,
                 &mut self.thinking_levels,
             );
-            let (mut rows, current) =
-                crate::antigravity::session_models(result, &self.thinking_levels);
+            if result["models"].is_object() {
+                self.legacy_models = result["models"].clone();
+            }
+            let (mut rows, current) = crate::antigravity::session_models(
+                result,
+                &self.thinking_levels,
+                &self.gateway_models,
+            );
             crate::antigravity::apply_manifest(&mut rows);
             self.model_option = crate::antigravity::model_config(&self.config_options)
                 .and_then(|c| c["id"].as_str().map(str::to_owned));
@@ -913,7 +996,38 @@ impl Client {
         value["isDefault"] = row["isDefault"].clone();
         value["aliases"] = row["aliases"].clone();
         value["isLegacy"] = row["isLegacy"].clone();
-        if row["thinking"].is_object() {
+        if let Some(efforts) = row["efforts"].as_array() {
+            // KSG buildSelectOptionDescriptor(ANTIGRAVITY_GATEWAY_EFFORT_OPTION_ID):
+            // the adapter owns the pick and routes it through the model config option.
+            let descriptor = crate::descriptors::ProviderOptionDescriptor::Select {
+                id: crate::antigravity::GATEWAY_EFFORT_OPTION_ID.into(),
+                label: "Reasoning".into(),
+                description: None,
+                options: efforts
+                    .iter()
+                    .map(|e| crate::descriptors::ProviderOptionChoice {
+                        id: e["id"].as_str().unwrap_or_default().to_owned(),
+                        label: e["label"].as_str().unwrap_or_default().to_owned(),
+                        description: None,
+                        is_default: e["isDefault"] == true,
+                    })
+                    .collect(),
+                current_value: efforts
+                    .iter()
+                    .find(|e| e["isDefault"] == true)
+                    .and_then(|e| e["id"].as_str())
+                    .map(str::to_owned),
+                prompt_injected_values: vec![],
+                role: None,
+            };
+            value["thinkingLevels"] = json!(
+                efforts
+                    .iter()
+                    .filter_map(|e| e["id"].as_str())
+                    .collect::<Vec<_>>()
+            );
+            value["capabilities"] = json!({"optionDescriptors":[descriptor]});
+        } else if row["thinking"].is_object() {
             let descriptors = crate::descriptors::acp_provider_option_descriptors(
                 Some(std::slice::from_ref(&row["thinking"])),
                 None,
@@ -928,6 +1042,127 @@ impl Client {
             }
         }
         value
+    }
+
+    /// KSG `[...antigravityModelOptions, ...legacyModels?.availableModels]`, the entry
+    /// list `applyAntigravityAcpModelSelection` groups gateway rows over.
+    fn gateway_entries(&self) -> Vec<(String, String)> {
+        crate::antigravity::model_options(&self.config_options)
+            .into_iter()
+            .filter_map(|e| {
+                Some((
+                    e["value"].as_str()?.to_owned(),
+                    e["name"].as_str().unwrap_or("").to_owned(),
+                ))
+            })
+            .chain(
+                self.legacy_models["availableModels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| {
+                        Some((
+                            m["modelId"].as_str()?.to_owned(),
+                            m["name"].as_str().unwrap_or("").to_owned(),
+                        ))
+                    }),
+            )
+            .collect()
+    }
+
+    /// KSG applyAntigravityAcpModelSelection, gateway branch: resolve a pick (or the
+    /// stored effort pick) to a route and select it through the model config option.
+    /// Returns true when the record was handled.
+    fn antigravity_gateway_select(&mut self, requested: Option<&str>, record: &Value) -> bool {
+        let selections = crate::antigravity::gateway_model_selections(&self.gateway_models);
+        if selections.is_empty() {
+            return false;
+        }
+        let rows = crate::antigravity::gateway_model_rows(&selections, &self.gateway_entries());
+        let current = crate::antigravity::current_model(&self.config_options).or_else(|| {
+            self.legacy_models["currentModelId"]
+                .as_str()
+                .map(str::to_owned)
+        });
+        let row = match requested {
+            Some(id) => rows
+                .iter()
+                .find(|row| row.slug == id || row.routes.iter().any(|(v, _)| v == id)),
+            None => current
+                .as_deref()
+                .and_then(|current| {
+                    rows.iter().find(|row| {
+                        row.slug == current || row.routes.iter().any(|(v, _)| v == current)
+                    })
+                })
+                .or_else(|| rows.first()),
+        };
+        let Some(row) = row else {
+            return if requested.is_none()
+                || self.gateway_effort.is_some()
+                || requested.is_some_and(|id| {
+                    crate::antigravity::has_configured_gateway_model(&selections, id)
+                }) {
+                self.reject(
+                    record,
+                    format!(
+                        "Antigravity model '{}' is unavailable. Select an available model.",
+                        requested.unwrap_or(crate::antigravity::DEFAULT_MODEL)
+                    ),
+                );
+                true
+            } else {
+                false
+            };
+        };
+        let effort = self.gateway_effort.as_deref();
+        let exact = requested.filter(|id| *id != row.slug).and_then(|id| {
+            row.routes
+                .iter()
+                .find(|(v, _)| v == id)
+                .map(|(v, _)| v.clone())
+        });
+        let route = match effort {
+            Some(effort) => row
+                .efforts
+                .iter()
+                .find(|e| e.value == effort)
+                .map(|e| e.route.clone()),
+            None => Some(exact.unwrap_or_else(|| row.default_route.clone())),
+        };
+        let Some(route) = route else {
+            self.reject(
+                record,
+                format!(
+                    "Antigravity model '{} ({})' is unavailable. Select an available model.",
+                    row.slug,
+                    effort.unwrap_or("")
+                ),
+            );
+            return true;
+        };
+        let pending =
+            json!({"type":"antigravity_gateway","original":record,"route":route,"row":row.slug});
+        if let Some(config_id) = crate::antigravity::model_config(&self.config_options)
+            .and_then(|c| c["id"].as_str().map(str::to_owned))
+        {
+            // KSG allowUnlistedValue: a gateway route need not be an advertised value.
+            self.request(
+                "session/set_config_option",
+                json!({"sessionId":self.session,"configId":config_id,"value":route}),
+                pending,
+            );
+        } else if Some(route.as_str()) != current.as_deref() {
+            self.request(
+                "session/set_model",
+                json!({"sessionId":self.session,"modelId":route}),
+                pending,
+            );
+        } else {
+            // KSG returns without sending when the resolved route is already current.
+            self.reply(record, self.model.clone());
+        }
+        true
     }
 
     fn command(&mut self, record: Value) -> Result<(), String> {
@@ -1045,19 +1280,29 @@ impl Client {
                 if self.running {
                     self.reject(&record, "Wait for the ACP run to finish before changing its model.");
                 } else if self.antigravity {
-                    // KSG applyAntigravityAcpModelSelection (no gateway branch in Shina).
-                    let requested = record["modelId"].as_str().unwrap_or("");
+                    // KSG applyAntigravityAcpModelSelection.
+                    let raw = record["modelId"].as_str().unwrap_or("");
+                    let requested = (!raw.is_empty() && raw != crate::antigravity::DEFAULT_MODEL)
+                        .then_some(raw);
+                    // A new row's selection starts from its descriptor defaults, like
+                    // KSG's freshly-built modelSelection options.
+                    if requested != self.model["id"].as_str() {
+                        self.gateway_effort = None;
+                    }
+                    if self.antigravity_gateway_select(requested, &record) {
+                        return Ok(());
+                    }
                     let resolved = crate::antigravity::resolve_model(
                         &self.config_options,
-                        Some(requested),
+                        requested,
                         None,
                     );
                     let current = crate::antigravity::current_model(&self.config_options);
                     let Some(resolved) = resolved else {
-                        self.reject(&record, format!("Antigravity model '{requested}' is unavailable. Select an available model."));
+                        self.reject(&record, format!("Antigravity model '{raw}' is unavailable. Select an available model."));
                         return Ok(());
                     };
-                    if requested.is_empty() && current.as_deref() == Some(resolved.as_str()) {
+                    if requested.is_none() && current.as_deref() == Some(resolved.as_str()) {
                         self.reply(&record, self.model.clone());
                     } else if let Some(option) = &self.model_option {
                         let split = crate::antigravity::split_model(&self.config_options, &resolved);
@@ -1122,6 +1367,30 @@ impl Client {
                     self.reject(&record, "Wait for the ACP run to finish before changing options.");
                 } else if let Some(option_id) = record["optionId"].as_str() {
                     if self.antigravity
+                        && option_id == crate::antigravity::GATEWAY_EFFORT_OPTION_ID
+                        && !crate::antigravity::gateway_model_selections(&self.gateway_models)
+                            .is_empty()
+                    {
+                        // KSG ownedModelOptionIds: the effort pick lives in the model
+                        // selection and re-routes the current family through the
+                        // model config option instead of a reasoningEffort config.
+                        self.gateway_effort = record["value"]
+                            .as_str()
+                            .filter(|v| {
+                                !v.is_empty() && *v != crate::descriptors::ACP_EMPTY_OPTION_VALUE
+                            })
+                            .map(str::to_owned);
+                        let current_slug = self.model["id"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        if !self.antigravity_gateway_select(current_slug.as_deref(), &record) {
+                            self.reject(
+                                &record,
+                                "Antigravity model is unavailable. Select an available model.",
+                            );
+                        }
+                    } else if self.antigravity
                         && crate::antigravity::is_mode_choice(&self.config_options, option_id)
                         && let Some(denial) = self
                             .antigravity_mode_denial(record["value"].as_str().unwrap_or(""))
@@ -1954,6 +2223,11 @@ fn run(
     client.claude_skills = claude_skills;
     if is_antigravity {
         client.antigravity = true;
+        // A configured gateway switches authenticate to the "gateway" method and
+        // narrows the model catalog to the configured gateway families.
+        let gateway = crate::antigravity::gateway()?;
+        client.antigravity_gateway = gateway.is_some();
+        client.gateway_models = gateway.map(|gateway| gateway.models).unwrap_or_default();
         // Version gating only applies to the real `agy` CLI, never a registry override.
         let program = std::path::Path::new(&*executable)
             .file_name()

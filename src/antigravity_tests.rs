@@ -141,7 +141,7 @@ fn session_models_combined_ids_and_manifest() {
     let mut thinking_levels = std::collections::HashMap::new();
     observe_thinking_levels(&options, &mut thinking_levels);
     assert!(thinking_levels["gemini-3.8-flash"].is_some());
-    let (mut models, current) = session_models(&setup, &thinking_levels);
+    let (mut models, current) = session_models(&setup, &thinking_levels, "");
     apply_manifest(&mut models);
     assert_eq!(current.as_deref(), Some("gemini-3.8-flash-high"));
     let default = models.iter().find(|m| m["isDefault"] == true).unwrap();
@@ -151,6 +151,263 @@ fn session_models_combined_ids_and_manifest() {
     // Manifest renames to the shared catalog names and marks legacy rows.
     assert_eq!(models[0]["name"], "Gemini 3.8 Flash (High)");
     assert_eq!(models[2]["name"], "Gemini 4 Carbon");
+}
+
+#[test]
+fn gateway_model_selections_parse_list_and_effort_aliases() {
+    assert_eq!(
+        gateway_model_selections(
+            "gemini-4-argon, gemini-4-carbon(low), claude-opus-5-5(high), gemini-4-argon, ,"
+        ),
+        [
+            "gemini-4-argon",
+            "gemini-4-carbon-low",
+            "claude-opus-5-5-high"
+        ]
+    );
+    assert!(gateway_model_selections("").is_empty());
+    assert!(gateway_model_selections(" , ,").is_empty());
+    // KSG keeps the configured id when its tail is not a known effort.
+    assert_eq!(
+        gateway_model_selections("claude-opus-5-5(bonus)"),
+        ["claude-opus-5-5(bonus)"]
+    );
+    assert!(has_configured_gateway_model(
+        &["gemini-4-argon".into()],
+        "gemini-4-argon-medium"
+    ));
+    assert!(has_configured_gateway_model(
+        &["claude-opus-5-5-high".into()],
+        "claude-opus-5-5"
+    ));
+    assert!(!has_configured_gateway_model(
+        &["gemini-4-argon".into()],
+        "gemini-9-x"
+    ));
+}
+
+#[test]
+fn gateway_model_rows_group_family_routes_and_default_medium() {
+    // The shape agy 1.5.10 reported in gateway mode on 2026-11-17 (KSG test).
+    let advertised: Vec<(String, String)> = [
+        ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen"),
+        ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen"),
+        ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+        ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen"),
+        ("gemini-4-carbon", "Gemini 4 Carbon"),
+        ("devin/gemini-4-carbon", "Gemini 4 Carbon"),
+        ("gemini-4-argon", "Gemini 4 Argon"),
+        ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+        ("claude-opus-5-5", "Claude Opus 5.5"),
+        ("gpt-6.2-sol", "GPT 6.2 Sol"),
+    ]
+    .iter()
+    .map(|(v, n)| (v.to_string(), n.to_string()))
+    .collect();
+    let selections = gateway_model_selections(
+        "gemini-4-argon-low, gemini-4-argon-medium, gemini-4-argon-high, \
+         gemini-4-hydrogen-low, gemini-4-hydrogen-medium, gemini-4-hydrogen-high, \
+         gemini-4-hydrogen-xhigh, \
+         gemini-4-carbon-low, gemini-4-carbon-medium, gemini-4-carbon-high, \
+         claude-opus-5-5-low, claude-opus-5-5-medium, claude-opus-5-5-high, \
+         claude-sonnet-5-5-low, claude-sonnet-5-5-medium, claude-sonnet-5-5-high, \
+         gemini-9-unknown-high",
+    );
+    let rows = gateway_model_rows(&selections, &advertised);
+    let summary: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|row| (row.slug.as_str(), row.name.as_str()))
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            ("gemini-4-argon", "Gemini 4 Argon"),
+            ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+            ("gemini-4-carbon", "Gemini 4 Carbon"),
+            ("claude-opus-5-5", "Claude Opus 5.5"),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+        ]
+    );
+    let efforts = |slug: &str| {
+        rows.iter()
+            .find(|row| row.slug == slug)
+            .unwrap()
+            .efforts
+            .iter()
+            .map(|e| e.value.as_str())
+            .collect::<Vec<_>>()
+    };
+    let route = |slug: &str| {
+        rows.iter()
+            .find(|row| row.slug == slug)
+            .unwrap()
+            .default_route
+            .as_str()
+    };
+    assert_eq!(efforts("gemini-4-argon"), ["low", "medium", "high"]);
+    assert_eq!(
+        efforts("gemini-4-hydrogen"),
+        ["low", "medium", "high", "xhigh"]
+    );
+    // The agent folds carbon into one family option; the configured tiers stay.
+    assert_eq!(efforts("gemini-4-carbon"), ["low", "medium", "high"]);
+    assert_eq!(route("gemini-4-carbon"), "gemini-4-carbon-medium");
+    assert_eq!(route("gemini-4-hydrogen"), "gemini-4-hydrogen-medium");
+    // A single-tier selection keeps its route as the slug.
+    let single = gateway_model_rows(&["claude-opus-5-5-high".into()], &advertised);
+    assert_eq!(single[0].slug, "claude-opus-5-5-high");
+    assert_eq!(single[0].name, "Claude Opus 5.5");
+}
+
+#[test]
+fn session_models_gateway_rows_expose_family_ids_and_efforts() {
+    // KSG AntigravityProvider gateway test: flat config list, no thinking config.
+    let setup = json!({"configOptions":[
+        {"id":"model","name":"Model","category":"model","type":"select",
+            "currentValue":"gpt-6.0-luna",
+            "options":[{"value":"gpt-6.0-luna","name":"GPT 6.0 Luna"},
+                {"value":"gemini-4-argon-high","name":"Gemini 4 Argon"},
+                {"value":"gemini-4-argon-medium","name":"Gemini 4 Argon"},
+                {"value":"gemini-4-hydrogen-high","name":"Gemini 4 Hydrogen"},
+                {"value":"gemini-4-hydrogen-low","name":"Gemini 4 Hydrogen"},
+                {"value":"gemini-4-carbon-high","name":"Gemini 4 Carbon"},
+                {"value":"claude-opus-5-5","name":"Claude Opus 5.5"},
+                {"value":"devin/claude-opus-5-5","name":"Claude Opus 5.5"},
+                {"value":"claude-opus-5-5-high","name":"Claude Opus 5.5 (High)"},
+                {"value":"claude-sonnet-5-5-high","name":"Claude Sonnet 5.5 (High)"}]}]});
+    let (models, current) = session_models(
+        &setup,
+        &std::collections::HashMap::new(),
+        "gemini-4-argon, gemini-4-hydrogen, gemini-4-carbon-high, claude-opus-5-5-high, claude-sonnet-5-5-high",
+    );
+    let slugs: Vec<&str> = models.iter().filter_map(|m| m["slug"].as_str()).collect();
+    assert_eq!(
+        slugs,
+        [
+            "gemini-4-argon",
+            "gemini-4-hydrogen",
+            "gemini-4-carbon-high",
+            "claude-opus-5-5-high",
+            "claude-sonnet-5-5-high"
+        ]
+    );
+    // An unconfigured current model leaves the first configured row the default.
+    assert_eq!(current.as_deref(), Some("gemini-4-argon"));
+    assert_eq!(models[0]["isDefault"], true);
+    assert_eq!(models[0]["aliases"], json!([DEFAULT_MODEL]));
+    assert_eq!(
+        models[0]["efforts"],
+        json!([
+            {"id":"medium","label":"Medium","isDefault":true},
+            {"id":"high","label":"High","isDefault":false}
+        ])
+    );
+    assert_eq!(
+        models[2]["efforts"],
+        json!([{"id":"high","label":"High","isDefault":true}])
+    );
+    // The ` (effort)` label suffix drops; devin/-prefixed aliases are not grouped.
+    assert_eq!(models[3]["name"], "Claude Opus 5.5");
+    assert_eq!(models[4]["name"], "Claude Sonnet 5.5");
+}
+
+#[test]
+fn gateway_environment_forwards_gateway_vars_but_not_credentials() {
+    let gemini_home = Path::new("/profile");
+    let tmp = Path::new("/tmp");
+    let to_env = |pairs: &[(&str, &str)]| {
+        environment_in(
+            gemini_home,
+            tmp,
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    };
+    fn value<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        env.iter()
+            .rfind(|(key, _)| key == name)
+            .map(|(_, v)| v.as_str())
+    }
+    // SHINA_* names map onto the AGY_* names agy reads; gateway vars survive.
+    let env = to_env(&[
+        (
+            "SHINA_ANTIGRAVITY_GATEWAY_URL",
+            "http://127.0.0.1:8317/antigravity-gateway",
+        ),
+        ("SHINA_ANTIGRAVITY_API_KEY", "gateway-secret"),
+        (
+            "SHINA_ANTIGRAVITY_GATEWAY_MODELS",
+            "gemini-4-argon, claude-opus-5-5-high",
+        ),
+        ("SHINA_MCP_TOKEN", "bridge-secret"),
+        ("GEMINI_API_KEY", "ambient"),
+        ("AGY_LLM_GATEWAY_HEADERS", "x-cpa: 1"),
+    ])
+    .unwrap();
+    assert_eq!(value(&env, "AGY_ACP_ENABLE_GATEWAY_AUTH"), Some("1"));
+    assert_eq!(
+        value(&env, "AGY_LLM_GATEWAY_URL"),
+        Some("http://127.0.0.1:8317/antigravity-gateway")
+    );
+    assert_eq!(
+        value(&env, "AGY_LLM_GATEWAY_API_KEY"),
+        Some("gateway-secret")
+    );
+    assert_eq!(
+        value(&env, "AGY_LLM_GATEWAY_MODELS"),
+        Some("gemini-4-argon, claude-opus-5-5-high")
+    );
+    assert_eq!(value(&env, "AGY_LLM_GATEWAY_HEADERS"), Some("x-cpa: 1"));
+    assert!(env.iter().all(|(key, _)| !key.starts_with("SHINA_")));
+    assert_eq!(value(&env, "GEMINI_API_KEY"), None);
+    // AGY_* fallbacks resolve into the canonical LLM gateway names.
+    let env = to_env(&[
+        ("AGY_GATEWAY_URL", "http://gateway.internal:9000"),
+        ("AGY_GATEWAY_API_KEY", "key"),
+        ("AGY_LLM_GATEWAY_MODELS", "gemini-4-neon-high"),
+    ])
+    .unwrap();
+    assert_eq!(
+        value(&env, "AGY_GATEWAY_URL"),
+        Some("http://gateway.internal:9000")
+    );
+    assert_eq!(
+        value(&env, "AGY_LLM_GATEWAY_URL"),
+        Some("http://gateway.internal:9000")
+    );
+    assert_eq!(value(&env, "AGY_LLM_GATEWAY_API_KEY"), Some("key"));
+    assert_eq!(
+        value(&env, "AGY_LLM_GATEWAY_MODELS"),
+        Some("gemini-4-neon-high")
+    );
+    // Profile isolation still applies.
+    assert_eq!(value(&env, "GEMINI_HOME"), Some("/profile"));
+    assert_eq!(value(&env, "TMPDIR"), Some("/tmp"));
+    assert_eq!(value(&env, "AGY_ACP_FORCE_FILE_STORAGE"), Some("1"));
+    // Without a gateway URL nothing gateway-related leaks, and keys stay stripped.
+    let env = to_env(&[
+        ("AGY_LLM_GATEWAY_HEADERS", "x-cpa: 1"),
+        ("AGY_ACP_ENABLE_GATEWAY_AUTH", "1"),
+        ("GEMINI_API_KEY", "ambient"),
+    ])
+    .unwrap();
+    assert_eq!(value(&env, "AGY_LLM_GATEWAY_HEADERS"), None);
+    assert_eq!(value(&env, "AGY_ACP_ENABLE_GATEWAY_AUTH"), None);
+    assert_eq!(value(&env, "GEMINI_API_KEY"), None);
+    // A gateway URL that is not http(s) fails before the agent launches.
+    assert!(to_env(&[("SHINA_ANTIGRAVITY_GATEWAY_URL", "ftp://gateway.internal")]).is_err());
+    assert!(to_env(&[("SHINA_ANTIGRAVITY_GATEWAY_URL", "antigravity-gateway")]).is_err());
+    // The profile settings name the resolved auth method.
+    assert_eq!(
+        profile_settings("gateway"),
+        "{\"auth\":{\"type\":\"gateway\"}}\n"
+    );
+    assert_eq!(
+        profile_settings("oauth-personal"),
+        "{\"auth\":{\"type\":\"oauth-personal\"}}\n"
+    );
 }
 
 #[test]

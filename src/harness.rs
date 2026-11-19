@@ -123,21 +123,35 @@ impl Registry {
             }
         }
         // Like KSG's ACP registry, discovery never installs or authenticates an agent.
-        for (id, name, command, args) in [
+        for (id, name, command, args, env) in [
             (
                 "claude-code-acp",
                 "Claude Code ACP",
                 "claude-code-acp",
                 vec![],
+                vec![],
             ),
-            ("codex-acp", "Codex ACP", "codex-acp", vec![]),
+            ("codex-acp", "Codex ACP", "codex-acp", vec![], vec![]),
             (
                 "gemini",
                 "Gemini ACP",
                 "gemini",
                 vec!["--experimental-acp".into()],
+                // Gemini CLI reads its key and base-url overrides from the
+                // environment; pass them through by name only.
+                vec![
+                    "GEMINI_API_KEY".into(),
+                    "GOOGLE_API_KEY".into(),
+                    "GOOGLE_GEMINI_BASE_URL".into(),
+                ],
             ),
-            ("opencode", "OpenCode ACP", "opencode", vec!["acp".into()]),
+            (
+                "opencode",
+                "OpenCode ACP",
+                "opencode",
+                vec!["acp".into()],
+                vec![],
+            ),
         ] {
             if !registry.agents.iter().any(|a| a.id == id) && executable(command).is_ok() {
                 registry.agents.push(Agent {
@@ -145,7 +159,7 @@ impl Registry {
                     name: name.into(),
                     command: command.into(),
                     args,
-                    env: vec![],
+                    env,
                 });
             }
         }
