@@ -9011,12 +9011,13 @@ impl State {
         }
         self.captain_picker = false;
         let used_names: std::collections::HashSet<String> = self
-            .captains
-            .iter()
-            .map(|c| c.name.to_lowercase())
+            .picker_captains()
+            .map(|captain| self.captains[captain].name.to_lowercase())
             .collect();
-        let used_portraits: std::collections::HashSet<usize> =
-            self.captains.iter().map(|c| c.portrait).collect();
+        let used_portraits: std::collections::HashSet<usize> = self
+            .picker_captains()
+            .map(|captain| self.captains[captain].portrait)
+            .collect();
         let (portrait, suggested_name) = (0..crate::visuals::PORTRAITS)
             .find(|i| {
                 !used_portraits.contains(i)

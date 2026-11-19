@@ -6360,7 +6360,8 @@ fn captain_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let selected_captain = t.captain;
     let query = s.captain_picker_query.text.trim().to_lowercase();
-    let filtered: Vec<usize> = (0..s.captains.len())
+    let filtered: Vec<usize> = s
+        .picker_captains()
         .filter(|&id| {
             if query.is_empty() {
                 return true;
@@ -31026,6 +31027,35 @@ pub(crate) mod tests {
             assert!(rt.find("choose-captain-0").is_none());
             assert!(rt.find("choose-captain-3").is_some());
             assert!(rt.find("picker-new-captain").is_some());
+        }
+    }
+
+    #[test]
+    fn captain_picker_never_offers_deleted_captains() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.delete_captain_for_test(1);
+            rt.state.delete_captain_for_test(3);
+            rt.state.open_captain_selector();
+            rt.frame(0.1);
+            for captain in [0usize, 2] {
+                assert!(
+                    rt.find(&format!("choose-captain-{captain}")).is_some(),
+                    "{width}: live captain {captain}"
+                );
+            }
+            for captain in [1usize, 3] {
+                assert!(
+                    rt.find(&format!("choose-captain-{captain}")).is_none(),
+                    "{width}: deleted captain {captain}"
+                );
+            }
+            rt.state.captain_picker_query.replace_text("Deleted");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(rt.find("choose-captain-0").is_none());
+            assert!(rt.find("choose-captain-2").is_none());
         }
     }
 

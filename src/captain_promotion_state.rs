@@ -113,12 +113,13 @@ impl State {
     /// "Captain {n}" on a cycling portrait. Same rule `begin_new_captain` uses.
     fn fresh_captain_suggestion(&self) -> (String, usize) {
         let used_names: std::collections::HashSet<String> = self
-            .captains
-            .iter()
-            .map(|c| c.name.to_lowercase())
+            .picker_captains()
+            .map(|captain| self.captains[captain].name.to_lowercase())
             .collect();
-        let used_portraits: std::collections::HashSet<usize> =
-            self.captains.iter().map(|c| c.portrait).collect();
+        let used_portraits: std::collections::HashSet<usize> = self
+            .picker_captains()
+            .map(|captain| self.captains[captain].portrait)
+            .collect();
         (0..crate::visuals::PORTRAITS)
             .find(|i| {
                 !used_portraits.contains(i)

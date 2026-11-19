@@ -370,10 +370,9 @@ fn migrate_legacy(
     }
     let mut projects = Vec::new();
     let mut threads = Vec::new();
-    let mut captains: Vec<Value> = crate::captains::Captain::presets()
-        .iter()
-        .map(crate::captains::Captain::to_value)
-        .collect();
+    // The roster starts empty: presets are only imported when a legacy index
+    // actually declares them (version 1 indexes imply the original four).
+    let mut captains: Vec<Value> = Vec::new();
     let mut used = std::collections::HashSet::new();
     let mut preferences = serde_json::json!({});
     for (path, aliases) in unique {
@@ -926,6 +925,8 @@ mod tests {
         assert_eq!(global["projects"].as_array().unwrap().len(), 2);
         assert_eq!(global["threads"][0]["session"], "keep.jsonl");
         assert_eq!(global["threads"][0]["captain"], 2);
+        // Version 1 indexes imply the original preset roster.
+        assert_eq!(global["captains"].as_array().unwrap().len(), 4);
         fs::write(directory.join("index.json"), global.to_string()).unwrap();
         fs::write(&legacy, "{bad later").unwrap();
         let migrated = load_global(&directory, None).unwrap().unwrap();
@@ -934,6 +935,48 @@ mod tests {
         assert_eq!(migrated["threads"][0]["captain"], 2);
         assert_eq!(migrated["projects"].as_array().unwrap().len(), 2);
         assert!(migrated["identity"]["workspaceId"].is_string());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_imports_only_the_captains_legacy_indexes_declare() {
+        let directory = std::env::temp_dir().join(format!(
+            "shina-legacy-captains-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let custom = directory.join("custom");
+        let plain = directory.join("plain");
+        fs::create_dir(&custom).unwrap();
+        fs::create_dir(&plain).unwrap();
+        fs::write(
+            directory.join("projects.json"),
+            serde_json::json!({"projects":[{"path":custom},{"path":plain}]}).to_string(),
+        )
+        .unwrap();
+        let captain = crate::captains::Captain {
+            name: "Custom".into(),
+            role: "Role".into(),
+            instructions: "Rules".into(),
+            portrait: 2,
+        };
+        fs::write(
+            legacy_path(&directory, &custom),
+            serde_json::json!({"version":2,"captains":[captain.to_value()],"threads":[
+                {"id":1,"title":"Owned","captain":0,"captainHome":true}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let imported = load_global(&directory, None).unwrap().unwrap();
+        let captains = imported["captains"].as_array().unwrap();
+        assert_eq!(captains.len(), 1, "{captains:?}");
+        assert_eq!(captains[0]["name"], "Custom");
+        assert_eq!(imported["threads"][0]["captain"], 0);
         fs::remove_dir_all(directory).unwrap();
     }
     #[test]

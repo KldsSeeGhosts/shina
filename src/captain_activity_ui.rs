@@ -1058,6 +1058,22 @@ mod tests {
         assert!(label.ends_with(", source not on this machine"), "{label}");
     }
 
+    /// Persist just the captain roster so a durable open can validate the
+    /// memory.json the demo wrote. A full checkpoint would save demo threads
+    /// that do not survive index validation.
+    fn save_captain_index(rt: &rune::Runtime<State>) {
+        let index = json!({
+            "version":4,
+            "captains":rt.state.captains.iter().map(crate::captains::Captain::to_value).collect::<Vec<_>>(),
+            "projects":[],
+            "threads":[],
+            "tasks":[],
+            "nextId":1,
+            "nextProjectId":1,
+        });
+        std::fs::write(rt.state.data_dir.join("index.json"), index.to_string()).unwrap();
+    }
+
     /// A durable batch so `set_captain_report_policy` can write, exactly as
     /// `captain_event_policy`'s fixtures do.
     fn durable(rt: &rune::Runtime<State>) -> crate::database::Database {
@@ -1097,6 +1113,7 @@ mod tests {
     fn delivery_words_and_tags_follow_the_captured_policy() {
         let mut rt = runtime(1280.0);
         brief(&mut rt);
+        save_captain_index(&rt);
         let _database = durable(&rt);
         let captain = rt.state.current().captain.unwrap();
         let name = rt.state.captains[captain].name.clone();
@@ -1287,6 +1304,7 @@ mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             brief(&mut rt);
+            save_captain_index(&rt);
             let captain = rt.state.current().captain.unwrap();
             let db = crate::database::Database::open(&rt.state.data_dir).unwrap();
             db.begin().unwrap();
