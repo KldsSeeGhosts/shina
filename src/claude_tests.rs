@@ -239,6 +239,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         owner: Arc::default(),
         context_sent: false,
         prompt_suggestions: false,
+        metadata_only: false,
     }
 }
 
@@ -1811,6 +1812,7 @@ fn claude_context_breakdown_uses_get_context_usage_categories_on_completed_turn(
 fn claude_fresh_session_passes_session_id_and_not_resume() {
     let client = Client::new(Start {
         prompt_suggestions: false,
+        metadata_only: false,
         id: "claude".into(),
         workspace: PathBuf::from("."),
         source: SessionSource::New,

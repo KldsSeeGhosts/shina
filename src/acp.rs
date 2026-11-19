@@ -130,7 +130,7 @@ pub(crate) fn start_command(
     if matches!(start.source, SessionSource::Fork(_)) {
         return Err("ACP conversation forks are not supported. Start a new thread instead.".into());
     }
-    if start.link.is_none() {
+    if !start.metadata_only && start.link.is_none() {
         return Err("ACP requires Shina's MCP bridge. Retry after the bridge is available.".into());
     }
     let claude = crate::composer_skills::is_claude(&agent);
@@ -282,7 +282,7 @@ impl Client {
     fn new(start: Start) -> Self {
         let awareness_sent = start.context_sent;
         let restart_steering = !matches!(start.id.as_str(), "github-copilot-cli" | "copilot");
-        let devin = start.id == "devin";
+        let devin = start.id == "devin" && !start.metadata_only;
         Self {
             start,
             capabilities: Value::Null,
@@ -360,7 +360,8 @@ impl Client {
         // qualified 1.4.5 release; writes stay off so the agent keeps its diff edits.
         let (client_info, read_files) = if self.antigravity {
             let version = self.antigravity_version.as_deref();
-            self.file_reads = !crate::antigravity::is_qualified_release(version);
+            self.file_reads =
+                !self.start.metadata_only && !crate::antigravity::is_qualified_release(version);
             (crate::antigravity::client_info(version), self.file_reads)
         } else {
             (
@@ -419,12 +420,14 @@ impl Client {
     }
 
     fn mcp_servers(&self) -> Result<Value, String> {
-        let Some(host) = self.start.link.as_ref() else {
-            if self.antigravity {
-                return Ok(json!([]));
-            }
-            return Err("Shina MCP is unavailable.".into());
-        };
+        if self.start.metadata_only {
+            return Ok(json!([]));
+        }
+        let host = self
+            .start
+            .link
+            .as_ref()
+            .ok_or("Shina MCP is unavailable.")?;
         let capabilities = &self.capabilities["mcpCapabilities"];
         if capabilities["http"] == true && !self.stdio_fallback {
             return Ok(json!([{"type":"http","name":"shina","url":host.url,
@@ -562,6 +565,7 @@ impl Client {
         if !record["error"].is_null() {
             let error = &record["error"];
             if kind == "start"
+                && !self.start.metadata_only
                 && error["code"] == -32602
                 && self.capabilities["mcpCapabilities"]["http"] == true
                 && self.capabilities["mcpCapabilities"]["stdio"] != false
@@ -685,7 +689,7 @@ impl Client {
                 self.ready = true;
                 // KSG sessionModeForPolicy: the thread's runtime policy becomes the
                 // session mode at setup; the agy CLI maps yolo/auto_edit to default.
-                if self.antigravity {
+                if self.antigravity && !self.start.metadata_only {
                     let access = self
                         .start
                         .link
@@ -869,6 +873,7 @@ impl Client {
             SessionSource::Fork(_) => return Err("ACP forks are unsupported.".into()),
         };
         if self.antigravity
+            && !self.start.metadata_only
             && let Some(meta) = crate::antigravity::session_meta(
                 &self.initialize_result,
                 Some(crate::mcp::INSTRUCTIONS),
@@ -1243,6 +1248,13 @@ impl Client {
 
     fn command(&mut self, record: Value) -> Result<(), String> {
         let kind = record["type"].as_str().unwrap_or("");
+        if self.start.metadata_only && !matches!(kind, "get_available_models" | "get_commands") {
+            self.reject(
+                &record,
+                "ACP catalog discovery only supports metadata requests.",
+            );
+            return Ok(());
+        }
         if kind == "extension_ui_response" {
             let key = record["id"].as_str().unwrap_or("");
             if let Some(permission) = self.permissions.remove(key) {
@@ -1722,6 +1734,11 @@ impl Client {
     }
 
     fn permission(&mut self, record: &Value) -> Result<(), String> {
+        if self.start.metadata_only {
+            self.wire
+                .push(permission_response(record["id"].clone(), None));
+            return Ok(());
+        }
         let params = &record["params"];
         if self
             .session
@@ -2370,11 +2387,7 @@ fn run(
     });
     let diagnostics = output.clone();
     let diagnostic_wake = wake.clone();
-    let bridge_token = start
-        .link
-        .as_ref()
-        .map(|host| host.token.clone())
-        .unwrap_or_default();
+    let bridge_token = start.link.as_ref().map(|host| host.token.clone());
     let errors = thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut sent = 0;
@@ -2386,7 +2399,11 @@ fn run(
             {
                 Ok(0) | Err(_) => break,
                 _ => {
-                    let text = String::from_utf8_lossy(&bytes).replace(&bridge_token, "[redacted]");
+                    let text = String::from_utf8_lossy(&bytes);
+                    let text = match bridge_token.as_deref() {
+                        Some(token) => std::borrow::Cow::Owned(text.replace(token, "[redacted]")),
+                        None => text,
+                    };
                     // KSG makeAntigravityStderrHandler: the BROWSER helper marks the OAuth URL.
                     if is_antigravity && let Some(url) = crate::antigravity::stderr_auth_url(&text)
                     {

@@ -728,6 +728,7 @@ fn spec(source: SessionSource) -> Start {
         owner: Arc::default(),
         context_sent: false,
         prompt_suggestions: false,
+        metadata_only: false,
     }
 }
 
@@ -812,6 +813,67 @@ fn live_thread(agent: Agent, source: SessionSource) -> Thread {
         t.native.commands_loaded && !t.harness_state["modes"].is_null()
     });
     thread
+}
+
+#[test]
+fn antigravity_linkless_discovery_returns_models_and_commands() {
+    let (mut agent, log) = fixture(&["--antigravity", "--discovery", "--no-mcp"]);
+    agent.id = "antigravity".into();
+    let start = Start::discovery(&agent.id, crate::store::directory().unwrap());
+    let pi = super::start(agent, start, Arc::new(|| {})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut models, mut commands) = (false, false);
+    let mut diagnostics = vec![];
+    while !models || !commands {
+        match pi
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Event::Record(record)) if record["command"] == "get_available_models" => {
+                assert_eq!(record["success"], true, "{record}");
+                assert!(
+                    record["data"]["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|model| model["id"] == "gemini-3.8-flash-high"),
+                    "{record}"
+                );
+                models = true;
+            }
+            Ok(Event::Record(record)) if record["command"] == "get_commands" => {
+                assert_eq!(record["success"], true, "{record}");
+                assert_eq!(record["data"]["commands"][0]["name"], "fixture");
+                commands = true;
+            }
+            Ok(Event::Record(_)) => {}
+            Ok(Event::Diagnostic(message)) => diagnostics.push(message),
+            Ok(Event::Error(error)) => panic!("ACP discovery failed: {error}\n{diagnostics:?}"),
+            Ok(Event::Exited) => panic!("ACP discovery exited before returning its catalog"),
+            Err(error) => {
+                panic!("ACP discovery did not return its catalog: {error}\n{diagnostics:?}")
+            }
+        }
+    }
+    let wire = records(&log);
+    assert_eq!(
+        wire.iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect::<Vec<_>>(),
+        ["initialize", "authenticate", "session/new"]
+    );
+    assert_eq!(wire[2]["params"]["mcpServers"], json!([]));
+}
+
+#[test]
+fn interactive_acp_requires_an_mcp_bridge() {
+    let (agent, _log) = fixture(&["--antigravity"]);
+    let mut start = spec(SessionSource::New);
+    start.link = None;
+    let Err(error) = super::start(agent, start, Arc::new(|| {})) else {
+        panic!("Interactive ACP must not start without an MCP bridge");
+    };
+    assert!(error.contains("ACP requires Shina's MCP bridge"), "{error}");
 }
 
 /// KSG AntigravityAcpSupport: initialize, eager authenticate, session/new with

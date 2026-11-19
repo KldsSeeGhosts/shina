@@ -1864,6 +1864,7 @@ impl Thread {
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
                 prompt_suggestions: self.prompt_suggestions_enabled && !self.delegated,
+                metadata_only: false,
             },
             wake,
         ) {
@@ -16415,13 +16416,12 @@ impl State {
         }) {
             return Some("A delegated task is running or queued. Restart when it finishes.");
         }
-        if self.threads.iter().any(|t| {
-            t.status.busy()
-                || t.configuring
-                || t.session_started.is_some()
-                || t.queued()
-                || t.request.is_some()
-        }) {
+        // A provider can be starting or applying model settings before any work is sent.
+        if self
+            .threads
+            .iter()
+            .any(|t| t.status.busy() || t.queued() || t.request.is_some())
+        {
             return Some("A thread is still working. Restart when it finishes.");
         }
         if self.projects.cloning() {
@@ -18829,12 +18829,6 @@ mod tests {
             );
         }
         state.threads[0].status = Status::Ready;
-        state.threads[0].configuring = true;
-        assert!(state.update_restart_blocker().is_some());
-        state.threads[0].configuring = false;
-        state.threads[0].session_started = Some(Instant::now());
-        assert!(state.update_restart_blocker().is_some());
-        state.threads[0].session_started = None;
         state.threads[0].queued_prompt = Some((
             Prompt {
                 text: "queued".into(),
@@ -18867,6 +18861,36 @@ mod tests {
         // A composer draft is saved, so it never blocks.
         state.threads[0].draft.replace_text("unsent");
         assert_eq!(state.update_restart_blocker(), None);
+    }
+
+    #[test]
+    fn update_restart_blocker_ignores_idle_prewarm_but_not_pending_input() {
+        let mut state = ready_state();
+        let (pi, input, _events) = crate::backend::Pi::test_connection();
+        let thread = &mut state.threads[0];
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.session_started = Some(Instant::now());
+        assert_eq!(state.update_restart_blocker(), None);
+        state.threads[0].configuring = true;
+        assert_eq!(state.update_restart_blocker(), None);
+
+        state.threads[0].pending_prompt =
+            Some(("1-1".into(), Prompt::new("Send".into(), vec![]), 0));
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].pending_prompt = None;
+        state.threads[0].status = Status::Running;
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].status = Status::Ready;
+        assert_eq!(state.update_restart_blocker(), None);
+
+        state.begin_runtime_shutdown();
+        state.stop_runtime();
+        assert!(state.threads[0].pi.is_none());
+        assert!(matches!(
+            input.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]

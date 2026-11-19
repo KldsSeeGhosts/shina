@@ -817,6 +817,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         owner: Arc::default(),
         context_sent: false,
         prompt_suggestions: false,
+        metadata_only: false,
     }
 }
 
@@ -1728,6 +1729,7 @@ fn codex_token_usage_notification_produces_estimated_and_inferred_breakdown() {
 fn codex_fresh_session_issues_thread_start_and_not_resume() {
     let mut client = Client::new(Start {
         prompt_suggestions: false,
+        metadata_only: false,
         id: "codex".into(),
         workspace: PathBuf::from("."),
         source: SessionSource::New,

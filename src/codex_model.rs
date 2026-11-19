@@ -1676,6 +1676,7 @@ mod tests {
                 owner: Arc::default(),
                 context_sent: true,
                 prompt_suggestions: false,
+                metadata_only: false,
             };
             let context = crate::codex::developer_instructions(&start);
             assert!(context.contains(crate::mcp::INSTRUCTIONS));

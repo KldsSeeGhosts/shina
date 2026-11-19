@@ -33,7 +33,8 @@ pub fn supports_prompt_suggestions(id: &str) -> bool {
 }
 
 impl Start {
-    /// Metadata discovery never registers MCP, starts a conversation or sends a prompt.
+    /// Discovery can open a temporary session for catalog data, but never registers MCP
+    /// or sends a prompt.
     pub(crate) fn discovery(id: &str, workspace: PathBuf) -> Self {
         Self {
             id: id.into(),
@@ -45,6 +46,7 @@ impl Start {
             owner: Arc::default(),
             context_sent: false,
             prompt_suggestions: false,
+            metadata_only: true,
         }
     }
 }
@@ -291,6 +293,7 @@ pub struct Start {
     pub owner: Arc<SessionOwner>,
     pub context_sent: bool,
     pub prompt_suggestions: bool,
+    pub(crate) metadata_only: bool,
 }
 
 pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, String> {
@@ -415,6 +418,7 @@ mod tests {
                 owner: Arc::default(),
                 context_sent: false,
                 prompt_suggestions: false,
+                metadata_only: false,
             });
             let instructions = start.instructions.as_deref().unwrap();
             assert!(instructions.contains(crate::mcp::INSTRUCTIONS), "{path}");

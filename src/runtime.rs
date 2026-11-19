@@ -2868,9 +2868,9 @@ mod tests {
         assert!(!rt.state.runtime_stop_requested);
     }
     #[test]
-    fn prepare_refuses_active_configuring_approval_and_queue_without_aborting() {
+    fn prepare_restart_allows_idle_configuration_but_refuses_active_work() {
         let mut rt = runtime();
-        for kind in ["active", "configuring", "approval", "queue"] {
+        for kind in ["active", "approval", "queue"] {
             {
                 let t = rt.state.current_mut();
                 t.status = crate::model::Status::Ready;
@@ -2879,7 +2879,6 @@ mod tests {
                 t.native.projected_queued = false;
                 match kind {
                     "active" => t.status = crate::model::Status::Running,
-                    "configuring" => t.configuring = true,
                     "approval" => t.request = Some(json!({"id":"pending"})),
                     "queue" => t.native.projected_queued = true,
                     _ => unreachable!(),
@@ -2896,5 +2895,15 @@ mod tests {
             assert!(!rt.maintenance.fenced());
             assert!(!rt.state.runtime_stop_requested);
         }
+        let t = rt.state.current_mut();
+        t.native.projected_queued = false;
+        t.configuring = true;
+        rt.command(
+            "maintainer",
+            Command::new("server.prepareRestart", json!({})),
+        )
+        .unwrap();
+        assert!(rt.maintenance.fenced());
+        assert!(!rt.state.runtime_stop_requested);
     }
 }

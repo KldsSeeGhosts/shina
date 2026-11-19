@@ -939,13 +939,11 @@ pub fn discover(
     workspace: std::path::PathBuf,
     wake: rune::Waker,
 ) -> Result<crate::backend::Pi, String> {
-    let pi = start(
+    // ACP publishes models and commands once the temporary session is ready.
+    start(
         crate::harness::Start::discovery("antigravity", workspace),
         wake,
-    )?;
-    let _ = pi.send(json!({"type":"get_available_models"}));
-    let _ = pi.send(json!({"type":"get_commands"}));
-    Ok(pi)
+    )
 }
 /// KSG `buildAntigravityModelsFromSession`. With a configured gateway model list it
 /// exposes only the configured families, each effort riding one `reasoningEffort`
