@@ -24,7 +24,6 @@ pub struct Preferences {
     pub confirm_delete: bool,
     pub send_shortcut: crate::composer::SendShortcut,
     pub keybindings: Vec<crate::keybindings::KeybindingRule>,
-    pub dismissed_updates: Vec<String>,
     pub model_favorites: Vec<crate::model_picker::ModelFavorite>,
     pub sticky_composer: crate::model_selection::StickyComposerState,
 }
@@ -36,7 +35,6 @@ impl Default for Preferences {
             confirm_delete: true,
             send_shortcut: Default::default(),
             keybindings: Vec::new(),
-            dismissed_updates: vec![],
             model_favorites: vec![],
             sticky_composer: Default::default(),
         }

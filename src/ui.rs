@@ -4354,68 +4354,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         side = side.child(update_everything_button(&summary, p));
     } else if let Some(row) = update_row(s, p) {
         side = side.child(row);
+    } else if let Some(row) = check_updates_row(s, p) {
+        side = side.child(row);
     }
     if let Some(notice) = &s.fleet.result_notice {
         side = side.child(update_result_notice(notice, p));
-    }
-    for (server, view) in &s.machines.views {
-        let outcome = &view["updateNotice"];
-        if let Some(id) = outcome["updateId"].as_str()
-            && !s
-                .preferences
-                .dismissed_updates
-                .iter()
-                .any(|dismissed| dismissed == id)
-        {
-            let title = if outcome["success"] == true {
-                format!(
-                    "{} updated to {}",
-                    s.machine_label(server),
-                    outcome["tag"].as_str().unwrap_or("")
-                )
-            } else {
-                format!(
-                    "{} update failed: {}",
-                    s.machine_label(server),
-                    outcome["reason"].as_str().unwrap_or("Unknown failure")
-                )
-            };
-            let id = id.to_owned();
-            side = side.child(
-                row()
-                    .key(format!("update-outcome-{id}"))
-                    .gap(4.0)
-                    .px(8.0)
-                    .py(4.0)
-                    .child(
-                        label(
-                            title,
-                            SMALL,
-                            if outcome["success"] == true {
-                                p.sea
-                            } else {
-                                p.danger
-                            },
-                        )
-                        .wrap()
-                        .grow(1.0)
-                        .min_w(0.0),
-                    )
-                    .child(icon_button(
-                        &format!("dismiss-update-{id}"),
-                        "Dismiss update notice",
-                        "close",
-                        p,
-                        move |s| {
-                            s.preferences.dismissed_updates.push(id.clone());
-                            if s.preferences.dismissed_updates.len() > 64 {
-                                s.preferences.dismissed_updates.remove(0);
-                            }
-                            s.checkpoint();
-                        },
-                    )),
-            );
-        }
     }
     if let Some(notice) = &s.machines.auto_notice
         && s.machines.notice.as_ref() == Some(notice)
@@ -4829,6 +4772,63 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
             Some(button)
         }
     }
+}
+
+/// KSG `SidebarUpdatePill`'s idle state: the one-button "Check for updates"
+/// that probes the app release and every machine's providers and server. It
+/// only exists on builds that update themselves; dev runs and demos show
+/// nothing. A running check reads "Checking for updates" and takes no press.
+fn check_updates_row(s: &State, p: Palette) -> Option<El> {
+    use crate::update::Status;
+    if !s.updater.self_update_enabled() {
+        return None;
+    }
+    if matches!(s.updater.status(), Status::Checking) {
+        return Some(
+            row()
+                .key("check-updates")
+                .role("status")
+                .label("Checking for updates".to_owned())
+                .h(30.0)
+                .mx(8.0)
+                .mb(8.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .radius(12.0)
+                .fill(p.card)
+                .child(icon("reload", p.muted))
+                .child(label(
+                    "Checking for updates",
+                    TextStyle::new(12.5, 520.0),
+                    p.muted,
+                )),
+        );
+    }
+    Some(
+        row()
+            .key("check-updates")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label("Check for updates".to_owned())
+            .h(30.0)
+            .mx(8.0)
+            .mb(8.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(12.0)
+            .fill(p.sea_bg)
+            .focusable(true)
+            .hover(p.selected)
+            .on_press(|s: &mut State| s.check_for_updates())
+            .child(icon("reload", p.sea))
+            .child(label(
+                "Check for updates",
+                TextStyle::new(12.5, 520.0),
+                p.sea,
+            )),
+    )
 }
 
 /// The single footer control while any server or provider can update, KSG
@@ -23170,6 +23170,32 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         assert!(find(&rt.accessibility_json(), "update-restart").is_none());
+    }
+
+    #[test]
+    fn the_check_for_updates_row_is_one_button_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            // A development build shows nothing.
+            assert!(rt.find("check-updates").is_none(), "{width}");
+            rt.state.updater = crate::update::Updater::test_checkable();
+            rt.invalidate();
+            rt.frame(0.0);
+            let tree = rt.accessibility_json();
+            let button = find(&tree, "check-updates")
+                .unwrap_or_else(|| panic!("{width}: check-updates missing"));
+            assert_eq!(button["role"], "button", "{width}");
+            press(&mut rt, "check-updates");
+            rt.frame(0.0);
+        }
+        // A running check reads as a status, not a second button.
+        let mut rt = runtime(1280.0);
+        rt.state.updater = crate::update::Updater::test_checking();
+        rt.frame(0.0);
+        let tree = rt.accessibility_json();
+        let status = find(&tree, "check-updates").expect("checking row");
+        assert_eq!(status["role"], "status");
     }
 
     #[test]
