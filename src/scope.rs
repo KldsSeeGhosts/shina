@@ -594,6 +594,7 @@ mod tests {
     fn fixture() -> State {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.use_pi_for_test();
         state.captains = Captain::presets();
         state.open_captain(0);
         state

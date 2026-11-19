@@ -1975,12 +1975,14 @@ fn windows_program_paths_cover_the_installed_codex_binary() {
     );
     assert_eq!(paths.len(), 2);
     assert_eq!(
-        paths[0],
-        r"C:\Users\Fixture\AppData\Local\Programs/OpenAI/Codex/bin/codex.exe"
+        PathBuf::from(&paths[0]),
+        PathBuf::from(r"C:\Users\Fixture\AppData\Local")
+            .join("Programs/OpenAI/Codex/bin/codex.exe")
     );
     assert_eq!(
-        paths[1],
-        r"C:\Users\Fixture\AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"
+        PathBuf::from(&paths[1]),
+        PathBuf::from(r"C:\Users\Fixture")
+            .join("AppData/Local/Programs/OpenAI/Codex/bin/codex.exe")
     );
     assert!(codex_windows_program_paths(None, None).is_empty());
 }

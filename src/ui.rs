@@ -28103,6 +28103,7 @@ pub(crate) mod tests {
     fn crew_runtime(width: f32) -> Runtime<State> {
         let mut rt = runtime(width);
         crate::captain_workspace_demo(&mut rt.state);
+        rt.state.use_pi_for_test();
         rt.invalidate();
         rt.frame(0.0);
         rt

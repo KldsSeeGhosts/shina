@@ -6179,6 +6179,12 @@ impl State {
     pub fn current_mut(&mut self) -> &mut Thread {
         &mut self.threads[self.active]
     }
+    #[cfg(test)]
+    pub(crate) fn use_pi_for_test(&mut self) {
+        // Keep synthetic tests independent of the configured default and native CLIs.
+        self.default_harness = "pi".into();
+        self.current_mut().harness = "pi".into();
+    }
     /// The key the current thread's right-panel state lives under: machine plus thread id, so
     /// the same numeric id on two hosts stays separate.
     pub fn panel_key(&self) -> String {
@@ -18533,6 +18539,7 @@ mod tests {
     #[test]
     fn background_settle_and_crew_creation_do_not_open_tabs_or_move_focus() {
         let mut state = tab_fixture();
+        state.use_pi_for_test();
         let before = (state.tabs.clone(), state.current().id);
         state.sweep_lifecycle(lifecycle::now() + 100 * 86_400_000);
         state.demo = true;
@@ -19633,6 +19640,7 @@ mod tests {
         let mut state = State::new(".".into(), false);
         // Prevent a real subprocess in this unit test; connect_thread is tested live below.
         state.demo = true;
+        state.use_pi_for_test();
         let (reply, answer) = mpsc::channel();
         state.mcp_request(crate::mcp::Request {
             thread: 1,
@@ -20058,7 +20066,7 @@ mod tests {
         assert_eq!(capabilities["runtime"]["harness"], "pi");
         assert_eq!(
             capabilities["runtime"]["providers"],
-            json!(["cpa", "codex", "claude"])
+            json!(["cpa", "codex", "claude", "cursor"])
         );
         assert_eq!(capabilities["runtime"]["hosts"], json!(["local"]));
         assert_eq!(capabilities["runtime"]["machine"], "local");
@@ -22056,6 +22064,7 @@ mod tests {
     #[test]
     fn mcp_lists_the_callers_project_without_changing_captain_ownership() {
         let mut state = State::new(".".into(), false);
+        state.use_pi_for_test();
         // Rosters start empty; these tests exercise the earlier named presets.
         state.captains = crate::captains::Captain::presets();
         state.open_captain(0);

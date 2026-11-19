@@ -24,7 +24,7 @@ use std::{
     net::{TcpListener, TcpStream},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio_tungstenite::tungstenite::{self, Message, WebSocket, client::IntoClientRequest};
 
@@ -1449,6 +1449,28 @@ impl Profile {
         fs::write(root.join("Shina/harnesses.json"), json!([{"id":"fixture-acp","name":"Fixture ACP",
             "command":if cfg!(windows) { "python" } else { "python3" },
             "args":["-u",root.join("fake_acp.py"),"--log",root.join("acp-log.jsonl"),"--delay-seconds","0.6","--resume","--no-history"]}]).to_string()).unwrap();
+        // Pin both the initial draft and newly allocated threads to the fake Pi backend.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        fs::write(
+            root.join("Shina/index.json"),
+            json!({
+                "version": 4,
+                "defaultHarness": "pi",
+                "captains": [],
+                "projects": [],
+                "threads": [{
+                    "id": 1,
+                    "title": "New thread",
+                    "machine": "local",
+                    "harness": "pi",
+                    "neverSent": true,
+                    "updated": now.as_secs(),
+                    "lifecycle": {"createdAt": now.as_millis() as u64, "updatedAt": now.as_millis() as u64},
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
         Self {
             root,
             children: Vec::new(),

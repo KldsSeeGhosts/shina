@@ -373,7 +373,9 @@ fn terminal_command(command: &str, args: &[String]) -> Command {
             use std::os::windows::process::CommandExt;
             let mut shell =
                 Command::new(std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into()));
-            shell.args(["/d", "/s", "/c"]).raw_arg(format!("\"{command}\""));
+            shell
+                .args(["/d", "/s", "/c"])
+                .raw_arg(format!("\"{command}\""));
             shell
         }
         #[cfg(not(windows))]
@@ -412,9 +414,9 @@ fn terminal_environment(request_env: &[Value]) -> Vec<(OsString, OsString)> {
         "DEVIN_TOKEN",
         "DEVIN_API_KEY",
     ];
-    let inherited = ALLOWED_BASE_ENV.iter().filter_map(|name| {
-        std::env::var_os(name).map(|value| (OsString::from(*name), value))
-    });
+    let inherited = ALLOWED_BASE_ENV
+        .iter()
+        .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(*name), value)));
     let requested = request_env.iter().filter_map(|entry| {
         Some((
             OsString::from(entry["name"].as_str()?),
