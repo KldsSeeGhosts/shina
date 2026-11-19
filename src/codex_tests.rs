@@ -1644,18 +1644,21 @@ fn real_codex_pong_smoke() {
 
 #[test]
 fn codex_model_value_includes_descriptor_capabilities() {
-    let model = model_value(&json!({
-        "model": "gpt-6-astra",
-        "displayName": "gpt-6-astra",
-        "isDefault": false,
-        "defaultReasoningEffort": "high",
-        "supportedReasoningEfforts": [
-            {"reasoningEffort": "low"},
-            {"reasoningEffort": "medium"},
-            {"reasoningEffort": "high"}
-        ],
-        "serviceTiers": [{"id": "priority", "name": "Fast"}]
-    }))
+    let model = model_value(
+        &json!({
+            "model": "gpt-6-astra",
+            "displayName": "gpt-6-astra",
+            "isDefault": false,
+            "defaultReasoningEffort": "high",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": "low"},
+                {"reasoningEffort": "medium"},
+                {"reasoningEffort": "high"}
+            ],
+            "serviceTiers": [{"id": "priority", "name": "Fast"}]
+        }),
+        None,
+    )
     .unwrap();
     let descriptors = model["capabilities"]["optionDescriptors"]
         .as_array()
@@ -1752,6 +1755,15 @@ fn codex_fresh_session_issues_thread_start_and_not_resume() {
         .clone();
     client
         .incoming(json!({"id": models_id, "result": {"data": []}}))
+        .unwrap();
+    let config_id = client
+        .wire
+        .iter()
+        .find(|msg| msg["method"] == "config/read")
+        .unwrap()["id"]
+        .clone();
+    client
+        .incoming(json!({"id": config_id, "result": {"config": {}}}))
         .unwrap();
     let methods: Vec<&str> = client
         .wire
@@ -1951,4 +1963,387 @@ fn probe_applies_the_manifest_catalog_to_model_list() {
     assert!(descriptors.iter().any(|d| d["id"] == "serviceTier"));
     assert_eq!(models[1]["thinkingLevels"], json!(["xhigh"]));
     assert_eq!(models[1]["contextWindow"], json!(32000));
+}
+
+/// KSG's local Codex discovery covers the packaged Windows app path when PATH
+/// has no Codex.
+#[test]
+fn windows_program_paths_cover_the_installed_codex_binary() {
+    let paths = codex_windows_program_paths(
+        Some(std::ffi::OsString::from(r"C:\Users\Fixture\AppData\Local")),
+        Some(std::ffi::OsString::from(r"C:\Users\Fixture")),
+    );
+    assert_eq!(paths.len(), 2);
+    assert_eq!(
+        paths[0],
+        r"C:\Users\Fixture\AppData\Local\Programs/OpenAI/Codex/bin/codex.exe"
+    );
+    assert_eq!(
+        paths[1],
+        r"C:\Users\Fixture\AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"
+    );
+    assert!(codex_windows_program_paths(None, None).is_empty());
+}
+
+/// CPA wiring: provider env vars inherit untouched, Shina internals are
+/// removed, and the originator matches KSG's `CODEX_INTERNAL_ORIGINATOR_OVERRIDE`.
+#[test]
+fn process_preserves_cpa_environment_and_marks_the_shina_originator() {
+    struct Saved(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Saved {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+    let saved = Saved(
+        [
+            "SHINA_CODEX_CLI",
+            "CODEX_HOME",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_KEY",
+            crate::mcp::URL_ENV,
+            crate::mcp::TOKEN_ENV,
+        ]
+        .into_iter()
+        .map(|key| (key, std::env::var_os(key)))
+        .collect(),
+    );
+    let dir = crate::store::directory().unwrap();
+    let cli = dir.join("codex-entry.js");
+    std::fs::write(&cli, "// fixture").unwrap();
+    unsafe {
+        std::env::set_var("SHINA_CODEX_CLI", &cli);
+        std::env::set_var("CODEX_HOME", dir.join("codex-home"));
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:8317/v1");
+        std::env::set_var("OPENAI_API_KEY", "fixture-cpa-key");
+        std::env::set_var(crate::mcp::URL_ENV, "http://127.0.0.1:9/mcp");
+        std::env::set_var(crate::mcp::TOKEN_ENV, "other-thread-token");
+    }
+    let command = process().unwrap();
+    // CPA/provider variables are inherited, never removed.
+    for key in [
+        "CODEX_HOME",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY",
+        "CPA_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_MODEL",
+    ] {
+        assert!(
+            command.get_envs().all(|(name, _)| name != key),
+            "{key} was removed"
+        );
+    }
+    // Thread-scoped Shina variables never reach Codex.
+    for removed in [
+        crate::mcp::URL_ENV,
+        crate::mcp::TOKEN_ENV,
+        "SHINA_RUNTIME_MODE",
+        "SHINA_PI_BRIDGE_PATH",
+    ] {
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == removed && value.is_none()),
+            "{removed} is still set"
+        );
+    }
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+            .and_then(|(_, value)| value),
+        Some(std::ffi::OsStr::new("shina"))
+    );
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(args.iter().any(|arg| arg == "app-server"));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["-c", "thread_unload_delay_secs=0"]),
+        "KSG's app-server unload override is missing: {args:?}"
+    );
+    drop(saved);
+}
+
+/// Custom CPA slugs keep their wire ids and stay selectable even when
+/// `model/list` never advertised them.
+#[test]
+fn cpa_and_custom_model_slugs_stay_selectable() {
+    let row = model_value(
+        &json!({"model":"opencode-go/glm-5.3","displayName":"GLM 5.3"}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(row["id"], "opencode-go/glm-5.3");
+    assert_eq!(row["name"], "GLM 5.3");
+    for slug in [
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
+        "gpt-6.1-terra",
+        "cursor-grok-4.6",
+        "opencode-go/deepseek-v4.1-flash",
+        "opencode-go/glm-5.3",
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "full-access"));
+        client.ready = true;
+        client
+            .command(json!({"type":"set_model","id":"pick","modelId":slug}))
+            .unwrap();
+        assert_eq!(client.model["id"], slug, "{slug} was rejected");
+        let reply = client
+            .events
+            .iter()
+            .find(|event| event["command"] == "set_model")
+            .expect("set_model reply");
+        assert_eq!(reply["success"], true);
+        assert_eq!(reply["data"]["id"], slug);
+    }
+}
+
+/// KSG `codexRoutesSpendNativeQuota`: a CPA route has no OpenAI quota to read
+/// and its origin is the endpoint; the native route still probes.
+#[test]
+fn config_routing_gates_the_usage_probe_and_surfaces_the_endpoint() {
+    fn answer(client: &mut Client, method: &str, kind: &str, result: Value) {
+        client.request(method, json!({}), json!({"type":kind}));
+        let id = client.wire.last().unwrap()["id"].clone();
+        client.incoming(json!({"id":id,"result":result})).unwrap();
+    }
+    let account = json!({"requiresOpenaiAuth":true,"account":{"type":"chatgpt"}});
+    for config in [
+        json!({"config":{}}),
+        json!({"config":{"openai_base_url":"https://api.openai.com/v1"}}),
+        json!({"config":{"openai_base_url":"https://chatgpt.com/backend-api/codex"}}),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "full-access"));
+        client.probe = None;
+        answer(&mut client, "account/read", "account", account.clone());
+        answer(&mut client, "config/read", "config", config);
+        assert!(
+            client
+                .wire
+                .iter()
+                .any(|record| record["method"] == "account/rateLimits/read"),
+            "native config skipped the usage probe"
+        );
+        assert!(
+            !client
+                .events
+                .iter()
+                .any(|event| event["field"] == "endpoint")
+        );
+    }
+    for (account, config) in [
+        // The user's CPA route: no OpenAI quota, endpoint is the proxy origin.
+        (
+            account.clone(),
+            json!({"config":{"model_provider":"cpa",
+                "model_providers":{"cpa":{"base_url":"http://127.0.0.1:8317/v1"}},
+                "service_tier":"fast"}}),
+        ),
+        // An API-key login spends no ChatGPT quota even on a native route.
+        (
+            json!({"requiresOpenaiAuth":true,"account":{"type":"apiKey"}}),
+            json!({"config":{}}),
+        ),
+        // A custom provider id the config cannot resolve leaves the route unread.
+        (
+            account.clone(),
+            json!({"config":{"model_provider":"missing"}}),
+        ),
+    ] {
+        let mut client = Client::new(spec(SessionSource::New, "full-access"));
+        client.probe = None;
+        answer(&mut client, "account/read", "account", account);
+        answer(&mut client, "config/read", "config", config);
+        assert!(
+            !client
+                .wire
+                .iter()
+                .any(|record| record["method"] == "account/rateLimits/read")
+        );
+    }
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client.probe = None;
+    answer(&mut client, "account/read", "account", account);
+    answer(
+        &mut client,
+        "config/read",
+        "config",
+        json!({"config":{"model_provider":"cpa",
+            "model_providers":{"cpa":{"base_url":"http://127.0.0.1:8317/v1"}},
+            "service_tier":"fast"}}),
+    );
+    let endpoint = client
+        .events
+        .iter()
+        .find(|event| event["field"] == "endpoint")
+        .expect("endpoint field");
+    assert_eq!(endpoint["value"], "http://127.0.0.1:8317");
+    assert_eq!(client.config_service_tier.as_deref(), Some("fast"));
+}
+
+/// The configured `service_tier` becomes the descriptor default, like KSG's
+/// `applyConfiguredCodexServiceTier` (`fast` resolves to `priority`).
+#[test]
+fn configured_service_tier_becomes_the_descriptor_default() {
+    let wire = json!({"model":"fixture","displayName":"Fixture",
+        "serviceTiers":[{"id":"priority","name":"Fast"}]});
+    let model = model_value(&wire, Some("fast")).unwrap();
+    let descriptor = model["capabilities"]["optionDescriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == "serviceTier")
+        .unwrap();
+    assert_eq!(descriptor["currentValue"], "priority");
+    assert_eq!(
+        descriptor["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["isDefault"] == true)
+            .map(|o| o["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["priority"]
+    );
+    let model = model_value(&wire, Some("default")).unwrap();
+    let descriptor = model["capabilities"]["optionDescriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == "serviceTier")
+        .unwrap();
+    assert_eq!(descriptor["currentValue"], "default");
+}
+
+/// KSG `requestCodexChatGptModels`: a chatgpt probe waits for the originator's
+/// models_cache.json refresh, then relists; a non-chatgpt account lists once.
+#[test]
+fn chatgpt_probe_waits_for_the_originators_catalog_refresh() {
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client.probe = Some(true);
+    client.codex_home = Some(crate::store::directory().unwrap());
+    client.raw_models = vec![json!({"model":"cached","displayName":"Cached"})];
+    client.models_done = true;
+    client.config_done = true;
+    client.models_request = Some(json!({"type":"models"}));
+    // Model rows wait for the account type, like KSG's snapshot ordering.
+    client.finish_models().unwrap();
+    assert!(client.models.is_empty());
+    client.account = json!({"requiresOpenaiAuth":true,"account":{"type":"chatgpt"}});
+    client.account_done = true;
+    client.finish_models().unwrap();
+    assert!(client.catalog_deadline.is_some());
+    assert!(client.models.is_empty());
+    // A cache stamp newer than spawn sends the fresh model/list.
+    client.spawned_at_ms = 0;
+    std::fs::write(
+        client.codex_home.clone().unwrap().join("models_cache.json"),
+        json!({"fetched_at":"2026-01-01T00:00:00Z"}).to_string(),
+    )
+    .unwrap();
+    client.poll_catalog_refresh();
+    assert!(client.catalog_relisting);
+    let id = client
+        .wire
+        .iter()
+        .find(|record| record["method"] == "model/list")
+        .expect("relist request")["id"]
+        .clone();
+    client
+        .incoming(json!({"id":id,"result":{"data":[
+            {"model":"fresh-model","displayName":"Fresh Model"}],"nextCursor":null}}))
+        .unwrap();
+    assert_eq!(client.models[0]["id"], "fresh-model");
+    assert_eq!(client.models.len(), 1, "the fresh list replaced the cache");
+    // A non-chatgpt account finishes without the wait.
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client.probe = Some(true);
+    client.raw_models = vec![json!({"model":"cached","displayName":"Cached"})];
+    client.models_done = true;
+    client.config_done = true;
+    client.account_done = true;
+    client.account = json!({"requiresOpenaiAuth":false,"account":{"type":"apiKey"}});
+    client.models_request = Some(json!({"type":"models"}));
+    client.finish_models().unwrap();
+    assert!(client.catalog_deadline.is_none());
+    assert_eq!(client.models[0]["id"], "cached");
+}
+
+/// The probe reports the CPA endpoint and skips the OpenAI usage probe.
+#[test]
+fn cpa_probe_surfaces_endpoint_and_skips_rate_limits() {
+    let dir = crate::store::directory().unwrap();
+    let log = dir.join("probe-cpa.jsonl");
+    let script = dir.join("probe.py");
+    std::fs::write(&script, include_str!("../assets/tests/fake_codex.py")).unwrap();
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command
+        .arg("-u")
+        .arg(script)
+        .arg("--log")
+        .arg(&log)
+        .arg("--cpa-provider");
+    let start = Start::discovery("codex", dir);
+    let owner = start.owner.clone();
+    let pi = Pi::worker(
+        Arc::new(|| {}),
+        owner,
+        None,
+        move |input, events, wake, stopped, owner| {
+            run_mode(
+                command,
+                start,
+                input,
+                events,
+                wake,
+                stopped,
+                owner,
+                Some(true),
+            )
+        },
+    );
+    let mut output = vec![];
+    loop {
+        match pi
+            .events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("probe deadline")
+        {
+            Event::Record(record) => output.push(record),
+            Event::Error(error) => panic!("CPA probe failed: {error}"),
+            Event::Exited => break,
+            Event::Diagnostic(_) => {}
+        }
+    }
+    let wire = records(&log);
+    assert!(
+        wire.iter().any(|record| record["method"] == "config/read"),
+        "config/read was not issued"
+    );
+    assert!(
+        !wire
+            .iter()
+            .any(|record| record["method"] == "account/rateLimits/read"),
+        "CPA route still probed OpenAI usage"
+    );
+    let endpoint = output
+        .iter()
+        .find(|record| record["field"] == "endpoint")
+        .expect("endpoint field");
+    assert_eq!(endpoint["value"], "http://127.0.0.1:8317");
+    assert!(
+        output
+            .iter()
+            .any(|record| record["command"] == "get_available_models")
+    );
 }

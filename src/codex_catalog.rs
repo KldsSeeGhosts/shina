@@ -171,6 +171,80 @@ pub fn apply_preferred_codex_default_model(models: &mut [Value]) {
     }
 }
 
+/// Ported from `CodexProvider.ts` (`codexRouteBaseUrl`): the base URL Codex's
+/// merged config routes model traffic to. `Ok(None)` is Codex's auth-dependent
+/// OpenAI default; `Err` is a route that cannot be read.
+fn codex_route_base_url(config: &Value) -> Result<Option<String>, ()> {
+    if !config.is_object() {
+        return Err(());
+    }
+    let provider = config["model_provider"].as_str().unwrap_or("openai");
+    if provider == "openai" {
+        return Ok(config["openai_base_url"].as_str().map(str::to_owned));
+    }
+    let Some(entry) = config["model_providers"].get(provider) else {
+        return Err(());
+    };
+    Ok(entry["base_url"].as_str().map(str::to_owned))
+}
+
+/// `(origin, host, scheme)` for an `http(s)` URL, or `None` when the string is
+/// not one. The origin keeps the port but drops credentials and the path.
+fn url_origin(base: &str) -> Option<(String, String, String)> {
+    let (scheme, rest) = base.split_once("://")?;
+    if !matches!(scheme, "http" | "https") {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let origin = match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    };
+    Some((origin, host.to_owned(), scheme.to_owned()))
+}
+
+/// Ported from `CodexProvider.ts` (`routesToNativeOpenai`): only a default
+/// route or an `https` URL on OpenAI's own hosts spends native quota.
+fn routes_to_native_openai(config: &Value) -> bool {
+    match codex_route_base_url(config) {
+        Err(()) => false,
+        Ok(None) => true,
+        Ok(Some(base)) => url_origin(&base).is_some_and(|(_, host, scheme)| {
+            scheme == "https" && (host == "api.openai.com" || host == "chatgpt.com")
+        }),
+    }
+}
+
+/// Ported from `CodexProvider.ts` (`codexCustomEndpoint`): the origin of the
+/// custom endpoint Codex sends model requests to, if it uses one.
+pub(crate) fn codex_custom_endpoint(config: &Value) -> Option<String> {
+    let base = codex_route_base_url(config).ok().flatten()?;
+    if routes_to_native_openai(config) {
+        return None;
+    }
+    url_origin(&base).map(|(origin, ..)| origin)
+}
+
+/// Ported from `CodexProvider.ts` (`codexRoutesSpendNativeQuota`): a stored
+/// login does not mean this provider's traffic spends that login's quota.
+pub(crate) fn codex_routes_spend_native_quota(account: &Value, config: &Value) -> bool {
+    account["requiresOpenaiAuth"] == true
+        && account["account"]["type"].as_str() != Some("apiKey")
+        && routes_to_native_openai(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

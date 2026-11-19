@@ -19,6 +19,7 @@ parser.add_argument("--manifest-models", action="store_true")
 parser.add_argument("--cli-version", default=None)
 parser.add_argument("--model-failure", action="store_true")
 parser.add_argument("--skills-unsupported", action="store_true")
+parser.add_argument("--cpa-provider", action="store_true")
 args = parser.parse_args()
 initialized = False
 thread_id = "codex-fixture-thread"
@@ -184,6 +185,17 @@ for line in sys.stdin:
             "inputModalities": ["text", "image"],
             "serviceTiers": [{"id": "fast", "name": "Fast", "description": "Faster responses"}]
         }], "nextCursor": "second-page" if args.paginated_models else None}})
+    elif method == "account/read":
+        send({"id": request_id, "result": {"requiresOpenaiAuth": True,
+            "account": {"type": "chatgpt", "email": "fixture@codex.test"}}})
+    elif method == "config/read":
+        if args.cpa_provider:
+            send({"id": request_id, "result": {"config": {
+                "model": "gpt-6.1-sol", "model_provider": "cpa",
+                "model_providers": {"cpa": {"base_url": "http://127.0.0.1:8317/v1"}},
+                "service_tier": "fast"}}})
+        else:
+            send({"id": request_id, "result": {"config": {}}})
     elif method == "account/rateLimits/read":
         send({"id": request_id, "result": {"rateLimits": {
             "limitId": "codex", "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 2100000000}}}})
