@@ -339,8 +339,12 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         .min_w(0.0)
         .radius(6.0)
         .hover(p.selected)
-        .on_press(move |s: &mut State| {
-            if has_hit {
+        .pointer_buttons([rune::PointerButton::Middle])
+        .on_press_tx(move |s: &mut State, tx| {
+            // KSG: a middle click opens the thread as a kept tab.
+            if tx.button() == rune::PointerButton::Middle {
+                s.open_machine_thread_kept(&press_server, id);
+            } else if has_hit {
                 s.open_thread_at_search_match(&press_server, id);
             } else {
                 s.open_machine_thread(&press_server, id);

@@ -6305,7 +6305,11 @@ impl State {
             }
             self.ghost_tab = Some(id);
             self.ghost_anchor = anchor.unwrap_or(None);
-        } else if let Some(anchor) = anchor {
+        } else if let Some(anchor) = anchor
+            && self.ghost_tab == Some(id)
+        {
+            // Only the ghost tab takes an anchor; a kept worker re-focusing
+            // leaves another ghost's anchor alone.
             self.ghost_anchor = anchor;
         }
         self.tab_epoch += 1;
@@ -6339,6 +6343,12 @@ impl State {
             .get(index)
             .and_then(|t| t.crew_captain)
             .and_then(|captain| self.captain_home(captain));
+        // When the captain itself is the ghost (opened from the sidebar but
+        // never kept), the worker's ghost slot would replace it and closing
+        // could never return to it. Keep the captain's tab first.
+        if let Some(captain_id) = anchor {
+            self.keep_tab(captain_id);
+        }
         self.show_thread_inner(index, Some(anchor));
         // Only a fresh ghost moves next to its captain; a worker that already
         // holds a kept tab keeps its place in the strip.
@@ -16005,8 +16015,16 @@ impl State {
                 // KSG Code's migration did when the strip learned ghosts.
                 if index["tabs"].is_array() && index.get("ghostTab").is_none() {
                     let active_id = index["active"].as_u64().map(|id| id as usize);
+                    // `runtimeInputs` restore after the index, so a held
+                    // composer queue counts as work from the record itself.
+                    let held_inputs = |id: usize| {
+                        index["runtimeInputs"][id.to_string()]
+                            .as_array()
+                            .is_some_and(|inputs| !inputs.is_empty())
+                    };
                     self.tabs.retain(|id| {
                         Some(*id) == active_id
+                            || held_inputs(*id)
                             || self.threads.iter().any(|t| {
                                 // Runtime status is not persisted; a run the
                                 // session can resume, a queued prompt or a
@@ -18718,6 +18736,68 @@ mod tests {
         assert_eq!(restored.tabs, [1, 3, 4]);
         assert_eq!(restored.ghost_tab, None);
         assert_eq!(restored.current().id, 1);
+    }
+
+    #[test]
+    fn an_index_migration_keeps_tabs_with_held_messages() {
+        let mut state = tab_fixture();
+        // A real session writes `runtimeInputs` once transcripts persist.
+        state.persist_transcripts = true;
+        // Thread 3 holds a queued composer message: its tab survives the
+        // migration even though nothing is running and it is not active.
+        state.threads[2].native.queue_held = true;
+        state.threads[2]
+            .native
+            .queue
+            .push_back(pi_session::QueuedMessage {
+                id: 1,
+                prompt: Prompt::new("held reply".into(), vec![]),
+            });
+        state.tabs = vec![1, 2, 3, 4];
+        state.active = 0;
+        let mut index = state.snapshot();
+        index.as_object_mut().unwrap().remove("ghostTab");
+        index.as_object_mut().unwrap().remove("ghostAnchor");
+        let mut restored = State::new(".".into(), true);
+        restored.restore_global(&index).unwrap();
+        assert_eq!(restored.tabs, [1, 3]);
+        assert_eq!(restored.ghost_tab, None);
+        assert_eq!(restored.current().id, 1);
+    }
+
+    #[test]
+    fn opening_a_worker_over_a_ghost_captain_keeps_the_captains_tab() {
+        let mut state = tab_fixture();
+        // Thread 1 is a captain home; threads 2 and 3 are its crew workers.
+        state.threads[0].captain_home = true;
+        state.threads[0].captain = Some(0);
+        state.threads[1].crew_captain = Some(0);
+        state.threads[2].crew_captain = Some(0);
+        // The captain is the ghost tab: a sidebar preview that was never kept.
+        state.tabs = vec![1];
+        state.ghost_tab = Some(1);
+        state.active = 0;
+        // Opening a worker promotes the captain to kept first, so the
+        // worker's ghost slot can never evict the tab it must return to.
+        state.show_worker_ghost(1);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.ghost_tab, Some(2));
+        assert_eq!(state.ghost_anchor, Some(1));
+        assert_eq!(state.tabs, [1, 2]);
+        state.close_tab(2);
+        assert_eq!(state.current().id, 1);
+        // Worker 2 opens kept this time, then worker 3 becomes the ghost:
+        // focusing the kept worker through `show_worker_ghost` must not move
+        // worker 3's anchor to it or overwrite the anchor worker 3 carries.
+        state.show_worker_ghost(1);
+        state.keep_tab(2);
+        state.show_worker_ghost(2);
+        assert_eq!(state.ghost_tab, Some(3));
+        assert_eq!(state.ghost_anchor, Some(1));
+        state.show_worker_ghost(1);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.ghost_tab, Some(3));
+        assert_eq!(state.ghost_anchor, Some(1));
     }
 
     #[test]
