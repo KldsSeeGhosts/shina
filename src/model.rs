@@ -1116,6 +1116,10 @@ pub struct Thread {
     pub captain_home: bool,
     pub crew_captain: Option<usize>,
     pub captain_context: String,
+    /// The hashed inputs `captain_context` was last built from. `None` forces
+    /// a rebuild on the next refresh; a matching hash skips it so unchanged
+    /// threads keep their block and their pending-instruction state.
+    pub(super) captain_context_inputs: Option<u64>,
     /// The role whose Shina awareness this session received or will receive.
     pub(crate) instruction_role: Option<&'static str>,
     pub(crate) shina: &'static str,
@@ -1740,6 +1744,7 @@ impl Thread {
             captain_home: false,
             crew_captain: None,
             captain_context: String::new(),
+            captain_context_inputs: None,
             instruction_role: None,
             shina: crate::model::capabilities::THREAD_INSTRUCTIONS,
             instruction_context_pending: false,

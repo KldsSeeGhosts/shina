@@ -238,9 +238,25 @@ impl State {
                 .map(|thread| (thread.id, thread.life.archived_at))
                 .collect();
             // Hold exact notification records before disconnecting any process.
-            for report in &mut self.captain_reports {
-                if report.captain == captain && !report.delivered {
-                    report.hold_delivery = true;
+            // Report holds are event transitions; outbox copies still on their
+            // source thread hold the report mirror until the durable list
+            // captures them.
+            let report_holds: Vec<String> = self
+                .captain_reports
+                .iter()
+                .filter(|report| report.captain == captain && report.needs_delivery())
+                .map(|report| report.id.clone())
+                .collect();
+            for id in report_holds {
+                match self.report_event_state(&id) {
+                    None => {
+                        if let Some(report) = self.captain_reports.iter_mut().find(|r| r.id == id) {
+                            report.hold_delivery = true;
+                        }
+                    }
+                    _ => {
+                        self.transition_report_event(&id, captain_inbox::InboxState::Held);
+                    }
                 }
             }
             for answer in &mut self.captain_question_answers {

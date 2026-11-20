@@ -87,6 +87,7 @@ pub(super) fn document_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+#[cfg(test)]
 fn bounded(text: &str, max: usize) -> String {
     bounded_with(text, max, CONTEXT_TRUNCATION)
 }
@@ -299,30 +300,71 @@ impl State {
             .join("\n")
     }
 
+    /// One bounded document excerpt: the embedded text, the coverage figure the
+    /// index reports and the truncation marker that applies. `documents` drives
+    /// the shared body builder so the Captain and crew formats stay aligned.
+    fn context_excerpt(
+        &self,
+        captain: usize,
+        name: &str,
+        max: usize,
+        marker: &str,
+    ) -> (String, usize) {
+        let text = self.captain_document(captain, name).text;
+        let covered = covered_bytes(&text, max, marker);
+        let excerpt = bounded_with(&text, max, marker);
+        (excerpt, covered)
+    }
+
+    /// Shared body for every audience's turn context: labelled excerpts, then
+    /// the document index. Callers supply the header, the labelled documents
+    /// and the index arguments so private documents and read capability stay a
+    /// property of the audience, not a copy of the layout.
+    fn turn_context(
+        &self,
+        captain: usize,
+        header: &str,
+        sections: &[(&str, String)],
+        covered: &[(&str, usize)],
+        private: &[&str],
+        index_label: &str,
+        reads: Option<bool>,
+    ) -> String {
+        let mut body = format!("{CAPTAIN_CONTEXT_PREFIX}{header}");
+        for (label, excerpt) in sections {
+            body.push_str(&format!(
+                "\n\n{label}\n{}",
+                serde_json::to_string(excerpt).expect("captain context serialization")
+            ));
+        }
+        body.push_str(&format!(
+            "\n\n{index_label}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
+            self.document_index(captain, covered, private, reads)
+        ));
+        body
+    }
+
     pub(super) fn captain_turn_context(&self, captain: usize) -> String {
-        let rules = self.captain_document(captain, "AGENTS.md").text;
-        let notes = self.captain_document(captain, "NOTES.md").text;
-        format!(
-            "{CAPTAIN_CONTEXT_PREFIX}{CAPTAIN_CONTEXT_HEADER}\n\n{CAPTAIN_RULES_LABEL}\n{}\n\n{CAPTAIN_NOTES_LABEL}\n{}\n\n{DOCUMENT_INDEX_LABEL}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
-            serde_json::to_string(&bounded(&rules, RULES_CONTEXT_MAX_BYTES))
-                .expect("captain context serialization"),
-            serde_json::to_string(&bounded(&notes, NOTES_CONTEXT_MAX_BYTES))
-                .expect("captain context serialization"),
-            self.document_index(
-                captain,
-                &[
-                    (
-                        "AGENTS.md",
-                        covered_bytes(&rules, RULES_CONTEXT_MAX_BYTES, CONTEXT_TRUNCATION),
-                    ),
-                    (
-                        "NOTES.md",
-                        covered_bytes(&notes, NOTES_CONTEXT_MAX_BYTES, CONTEXT_TRUNCATION),
-                    ),
-                ],
-                &[],
-                None
-            )
+        let (rules, rules_covered) = self.context_excerpt(
+            captain,
+            "AGENTS.md",
+            RULES_CONTEXT_MAX_BYTES,
+            CONTEXT_TRUNCATION,
+        );
+        let (notes, notes_covered) = self.context_excerpt(
+            captain,
+            "NOTES.md",
+            NOTES_CONTEXT_MAX_BYTES,
+            CONTEXT_TRUNCATION,
+        );
+        self.turn_context(
+            captain,
+            CAPTAIN_CONTEXT_HEADER,
+            &[(CAPTAIN_RULES_LABEL, rules), (CAPTAIN_NOTES_LABEL, notes)],
+            &[("AGENTS.md", rules_covered), ("NOTES.md", notes_covered)],
+            &[],
+            DOCUMENT_INDEX_LABEL,
+            None,
         )
     }
 
@@ -332,47 +374,140 @@ impl State {
         } else {
             CONTEXT_TRUNCATION_NO_READ
         };
-        let crew = self.captain_document(captain, "CREW.md").text;
-        format!(
-            "{CAPTAIN_CONTEXT_PREFIX}{CREW_CONTEXT_HEADER}\n\n{CREW_RULES_LABEL}\n{}\n\n{}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
-            serde_json::to_string(&bounded_with(&crew, CREW_CONTEXT_MAX_BYTES, marker))
-                .expect("captain context serialization"),
+        let (crew, crew_covered) =
+            self.context_excerpt(captain, "CREW.md", CREW_CONTEXT_MAX_BYTES, marker);
+        self.turn_context(
+            captain,
+            CREW_CONTEXT_HEADER,
+            &[(CREW_RULES_LABEL, crew)],
+            &[("CREW.md", crew_covered)],
+            &["AGENTS.md"],
             if document_reads {
                 DOCUMENT_INDEX_LABEL
             } else {
                 DOCUMENT_INDEX_LABEL_NO_READ
             },
-            self.document_index(
-                captain,
-                &[(
-                    "CREW.md",
-                    covered_bytes(&crew, CREW_CONTEXT_MAX_BYTES, marker)
-                )],
-                &["AGENTS.md"],
-                Some(document_reads)
-            )
+            Some(document_reads),
         )
     }
 
+    /// The context string a thread carries into its next prompt: a Captain's
+    /// own home reads the private context, a crew member reads the shared crew
+    /// context, and every other thread carries none.
+    fn turn_context_for(&self, thread: &Thread) -> String {
+        if thread.captain_home
+            && !thread.delegated
+            && thread
+                .captain
+                .is_some_and(|captain| self.captain_home(captain) == Some(thread.id))
+        {
+            self.captain_turn_context(thread.captain.unwrap())
+        } else if let Some(captain) = thread.crew_captain {
+            self.crew_turn_context(captain, true)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Every input `refresh_captain_contexts` reads for one thread, hashed:
+    /// the thread's audience (primary home, crew member or neither), its
+    /// Captain's document fingerprint, the wake policy members capture reports
+    /// under, and the role its membership and lifecycle phase decide. Two
+    /// Captains share the hash only through the audience id inside it; an
+    /// accidental collision only ever skips a rebuild, never writes wrong
+    /// context.
+    fn captain_context_inputs(
+        &self,
+        thread: &Thread,
+        role: &'static str,
+        book_fingerprints: &std::collections::HashMap<usize, u64>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let primary_home = thread.captain_home
+            && !thread.delegated
+            && thread
+                .captain
+                .is_some_and(|captain| self.captain_home(captain) == Some(thread.id));
+        primary_home.hash(&mut hash);
+        let audience = if primary_home {
+            thread.captain
+        } else {
+            thread.crew_captain
+        };
+        audience.hash(&mut hash);
+        if let Some(captain) = audience {
+            book_fingerprints.get(&captain).hash(&mut hash);
+        }
+        thread
+            .crew_captain
+            .map(|captain| self.captain_report_policy(captain))
+            .unwrap_or_default()
+            .id()
+            .hash(&mut hash);
+        role.hash(&mut hash);
+        hash.finish()
+    }
+
+    /// Keeps every thread's turn context, captured report policy and Shina role
+    /// current with the records they derive from. The work is incremental: a
+    /// thread whose inputs hash the same as last refresh keeps its existing
+    /// `captain_context` and `instruction_role`, so a memory write or document
+    /// save on one Captain never rebuilds another crew's block or needlessly
+    /// flips `instruction_context_pending`.
     pub(super) fn refresh_captain_contexts(&mut self) {
-        let contexts: Vec<String> = self
-            .threads
-            .iter()
-            .map(|thread| {
-                if thread.captain_home
-                    && !thread.delegated
-                    && thread
-                        .captain
-                        .is_some_and(|captain| self.captain_home(captain) == Some(thread.id))
-                {
-                    self.captain_turn_context(thread.captain.unwrap())
-                } else if let Some(captain) = thread.crew_captain {
-                    self.crew_turn_context(captain, true)
-                } else {
-                    String::new()
-                }
+        // Roles first: the role is both an input to the skip hash and a field
+        // the refresh maintains, so one pass computes it and the hash folds
+        // the result in with the rest of the context inputs.
+        let roles: Vec<(&'static str, &'static str)> = (0..self.threads.len())
+            .map(|index| {
+                let role = self.mcp_role(index);
+                (role, State::instructions_for_role(role))
             })
             .collect();
+        // One fingerprint per Captain's document book, hashed once and folded
+        // into every audience thread's input, so a crew of any size never
+        // re-hashes the same documents.
+        let book_fingerprints: std::collections::HashMap<usize, u64> = self
+            .threads
+            .iter()
+            .filter_map(|thread| thread.captain.or(thread.crew_captain))
+            .map(|captain| {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                let book = self.captain_book(captain);
+                for name in DOCUMENT_NAMES {
+                    let document = book.documents.get(name);
+                    let revision = document.map_or(0, |document| document.revision);
+                    let digest = document.map_or_else(
+                        || document_hash(""),
+                        |document| document_hash(&document.text),
+                    );
+                    (name, revision, digest).hash(&mut hash);
+                }
+                (captain, hash.finish())
+            })
+            .collect();
+        let inputs: Vec<u64> = self
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| {
+                self.captain_context_inputs(thread, roles[index].0, &book_fingerprints)
+            })
+            .collect();
+        let changed: Vec<bool> = self
+            .threads
+            .iter()
+            .zip(&inputs)
+            .map(|(thread, input)| thread.captain_context_inputs != Some(*input))
+            .collect();
+        let mut contexts: Vec<Option<String>> = vec![None; self.threads.len()];
+        for index in 0..self.threads.len() {
+            if changed[index] {
+                contexts[index] = Some(self.turn_context_for(&self.threads[index]));
+            }
+        }
         // Members capture reports under their owner's current policy; released
         // threads return to the react default.
         let policies: Vec<ReportPolicy> = self
@@ -385,20 +520,18 @@ impl State {
                     .unwrap_or_default()
             })
             .collect();
-        let roles: Vec<(&'static str, &'static str)> = (0..self.threads.len())
-            .map(|index| {
-                let role = self.mcp_role(index);
-                (role, State::instructions_for_role(role))
-            })
-            .collect();
-        for (((thread, context), policy), (role, instructions)) in self
+        for ((((thread, context), input), policy), (role, instructions)) in self
             .threads
             .iter_mut()
             .zip(contexts)
+            .zip(inputs)
             .zip(policies)
             .zip(roles)
         {
-            thread.captain_context = context;
+            if let Some(context) = context {
+                thread.captain_context = context;
+            }
+            thread.captain_context_inputs = Some(input);
             thread.crew_report_policy = policy;
             if thread.instruction_role != Some(role) {
                 let known = thread.instruction_role.is_some();
@@ -1670,6 +1803,63 @@ mod tests {
         assert!(!member_context.contains("PRIVATE-INSTRUCTIONS"));
         assert!(member_context.starts_with("<shina_captain_context>"));
         assert!(member_context.contains("</shina_captain_context>"));
+    }
+
+    #[test]
+    fn refresh_skips_threads_whose_context_inputs_did_not_change() {
+        let mut state = fixture();
+        state.open_captain(1);
+        let member = push_thread(&mut state);
+        state.captain_crew_join(0, member).unwrap();
+        let other_member = push_thread(&mut state);
+        state.captain_crew_join(1, other_member).unwrap();
+        // First refresh records every thread's input fingerprint.
+        state.refresh_captain_contexts();
+        assert!(thread(&state, member).captain_context_inputs.is_some());
+        let member_context = thread(&state, member).captain_context.clone();
+        let member_inputs = thread(&state, member).captain_context_inputs;
+        let other_inputs = thread(&state, other_member).captain_context_inputs;
+        // A document write on captain 1 rebuilds only that captain's audience.
+        state
+            .captain_document_write(1, "CREW.md", "OTHER-RULES".into(), 0)
+            .unwrap();
+        assert_eq!(
+            thread(&state, member).captain_context,
+            member_context,
+            "an unrelated captain's document never rebuilds this context"
+        );
+        assert_eq!(
+            thread(&state, member).captain_context_inputs,
+            member_inputs,
+            "an unchanged thread keeps its input fingerprint"
+        );
+        assert_ne!(
+            thread(&state, other_member).captain_context_inputs,
+            other_inputs,
+            "the changed audience rebuilds its fingerprint"
+        );
+        assert!(
+            thread(&state, other_member)
+                .captain_context
+                .contains("OTHER-RULES")
+        );
+        // A same-captain document write does rebuild the member's context.
+        state
+            .captain_document_write(0, "CREW.md", "UPDATED-RULES".into(), 0)
+            .unwrap();
+        assert_ne!(thread(&state, member).captain_context_inputs, member_inputs);
+        assert!(
+            thread(&state, member)
+                .captain_context
+                .contains("UPDATED-RULES")
+        );
+        // A memory write never rebuilds context: it shares no document input.
+        let before = thread(&state, member).captain_context_inputs;
+        state
+            .add_memory(0, "user prefers dark mode".into(), false)
+            .unwrap();
+        assert_eq!(thread(&state, member).captain_context_inputs, before);
+        std::fs::remove_dir_all(&state.data_dir).ok();
     }
 
     #[test]
