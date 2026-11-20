@@ -946,9 +946,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 ))
         };
         // The thread's right panel sits at the conversation's right edge inside this row
-        // (KSG Code's `ChatRightPanel`). Where it cannot fit beside a 360 px conversation
-        // it covers the conversation column instead, like KSG's `RightPanelSheet`; a
-        // maximized panel covers it at any width.
+        // (KSG Code's `ChatRightPanel`). Below 1050 pt (`narrow`), or whenever the body
+        // cannot fit a 360 pt panel beside a 360 pt conversation, or when maximized, it
+        // covers the conversation column instead (spec §0.1 / §3.3).
         let panel = s.right_panel();
         let panel_open = panel.open;
         let body_width = cx.layout_with("chat-body", |r| r[2]).unwrap_or_else(|| {
@@ -956,7 +956,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
                 .unwrap_or(900.0)
         });
-        let covering = panel_open && (panel.maximized || crate::right_panel::covers(body_width));
+        let covering =
+            panel_open && (panel.maximized || narrow || crate::right_panel::covers(body_width));
         let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
         if covering {
             main_wrap = main_wrap.child(inspector_ui::view(s, p, zoom, None).pin(
@@ -7436,8 +7437,7 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
             p,
         ));
     }
-    let diff_open =
-        s.right_panels.active_view(&panel_key) == Some(crate::right_panel::PanelView::Diff);
+    let diff_open = s.right_panel_active_view() == Some(crate::right_panel::PanelView::Diff);
     let mut diff = toggle_button(
         "header-diff",
         "Toggle diff",
@@ -20273,9 +20273,8 @@ pub(crate) mod tests {
                 inside(main),
                 "conversation stays in the window at {width}: {main:?}"
             );
-            // `chat-body` is the window less the workspace's 8 px gutters on each side;
-            // `covers` flips below 720 px of it.
-            let covering = crate::right_panel::covers(width - 16.0);
+            // Spec §0.1 / §3.3: Inspector covers below 1050 pt (620, 960) and docks at 1280+.
+            let covering = width < 1050.0 || crate::right_panel::covers(width - 16.0);
             if covering {
                 // KSG's sheet mode: the panel covers the conversation column outright.
                 assert!(

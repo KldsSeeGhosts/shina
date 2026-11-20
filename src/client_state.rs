@@ -4653,6 +4653,10 @@ impl State {
             TabIntent::Delete(ids) => {
                 let active = self.current().id;
                 self.tabs.retain(|id| *id == active || !ids.contains(id));
+                for id in &ids {
+                    self.right_panels
+                        .forget(&crate::right_panel::key(server, *id));
+                }
                 if self.ghost_tab.is_some_and(|ghost| ids.contains(&ghost)) {
                     self.ghost_tab = None;
                     self.ghost_anchor = None;

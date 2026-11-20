@@ -6222,6 +6222,38 @@ impl State {
     pub fn right_panel(&self) -> crate::right_panel::ThreadPanel {
         self.right_panels.get(&self.panel_key())
     }
+    /// Whether the current thread offers the Crew tab in the Inspector (spec §3.3):
+    /// captain homes and crew/delegated/peer workers do; plain threads do not.
+    pub fn inspector_has_crew_tab(&self) -> bool {
+        let t = self.current();
+        self.is_captain_home(t)
+            || t.crew_captain.is_some()
+            || t.delegated
+            || t.peer_origin.is_some()
+    }
+    /// The Inspector tab actually shown for the current thread (resolving an unoffered
+    /// stored view such as Crew on a released/plain thread to Overview).
+    pub fn right_panel_resolved_view(&self) -> crate::right_panel::PanelView {
+        let view = self.right_panel().view;
+        if view == crate::right_panel::PanelView::Crew && !self.inspector_has_crew_tab() {
+            crate::right_panel::PanelView::Overview
+        } else {
+            view
+        }
+    }
+    /// The visible Inspector tab while open, with unoffered views resolved to Overview.
+    pub fn right_panel_active_view(&self) -> Option<crate::right_panel::PanelView> {
+        self.right_panel()
+            .open
+            .then(|| self.right_panel_resolved_view())
+    }
+    /// Whether the Inspector covers the conversation column at the current viewport width.
+    pub fn inspector_covers(&self) -> bool {
+        let panel = self.right_panel();
+        panel.maximized
+            || self.viewport_width < 1050.0
+            || crate::right_panel::covers(self.viewport_width - 16.0)
+    }
     /// `rightPanel.toggle`: hide an open panel, show it when it has surfaces, and open the
     /// Inspector on its last tab (or Overview on a fresh panel), as KSG's
     /// `toggleRightPanel`.
@@ -6242,8 +6274,12 @@ impl State {
     /// `threadPanel.toggle`: the Inspector's Overview tab, toggled as a surface.
     pub fn right_panel_toggle_overview(&mut self) {
         let key = self.panel_key();
-        self.right_panels
-            .toggle(&key, crate::right_panel::SingletonKind::Overview);
+        if self.right_panel_active_view() == Some(crate::right_panel::PanelView::Overview) {
+            self.right_panels.close(&key);
+        } else {
+            self.right_panels
+                .open(&key, crate::right_panel::SingletonKind::Overview);
+        }
     }
     /// `rightPanel.toggleMaximized`: KSG gates it on the panel being open.
     pub fn right_panel_toggle_maximized(&mut self) {

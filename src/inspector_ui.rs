@@ -14,8 +14,7 @@ use super::*;
 /// all four; a plain thread has no Crew tab.
 pub(super) fn tabs(s: &State) -> Vec<crate::right_panel::PanelView> {
     use crate::right_panel::PanelView;
-    let t = s.current();
-    if s.is_captain_home(t) || t.crew_captain.is_some() || t.delegated || t.peer_origin.is_some() {
+    if s.inspector_has_crew_tab() {
         return vec![
             PanelView::Overview,
             PanelView::Crew,
@@ -29,13 +28,7 @@ pub(super) fn tabs(s: &State) -> Vec<crate::right_panel::PanelView> {
 /// The tab the shell actually draws: a stored view the thread does not have
 /// falls back to Overview.
 fn resolved_view(s: &State) -> crate::right_panel::PanelView {
-    let panel = s.right_panel();
-    let offered = tabs(s);
-    if offered.contains(&panel.view) {
-        panel.view
-    } else {
-        crate::right_panel::PanelView::Overview
-    }
+    s.right_panel_resolved_view()
 }
 
 /// One segment of the strip's control: a 24 px pressable row with an icon and
@@ -322,8 +315,8 @@ fn session_body(s: &State, p: Palette) -> El {
 /// The Overview tab: the captain's Brief sections on a home or worker thread,
 /// else the session details.
 fn overview_body(s: &State, p: Palette) -> El {
-    if captain_ui::brief_captain(s).is_some() {
-        captain_ui::brief_panel(s, p)
+    if let Some(captain) = captain_ui::home_brief_captain(s) {
+        captain_ui::brief_panel_for(s, p, captain, false)
     } else {
         session_body(s, p)
     }
@@ -370,31 +363,17 @@ fn diff_body(s: &State, p: Palette) -> El {
         )
 }
 
-/// The body a tab draws, under its `right-panel-body-{view}` key. Context keeps
-/// the document-viewer route: an open captain document draws inside the tab
-/// with its own body key.
+/// The body a tab draws, under its `right-panel-body-{view}` key. `context_ui::view`
+/// owns the entire Context tab, including its document-viewer route, so Workstream 4
+/// can evolve both the Context list and the document editor header inside `context_ui.rs`.
 fn body(s: &State, p: Palette) -> (String, El) {
-    let panel = s.right_panel();
-    match (resolved_view(s), &panel.viewer) {
-        (
-            crate::right_panel::PanelView::Context,
-            Some(crate::right_panel::Surface::CaptainDocument { captain, name }),
-        ) => (
-            format!("right-panel-body-captain-doc:{captain}:{name}"),
-            captain_docs_ui::document_panel(s, p, *captain, name),
-        ),
-        (crate::right_panel::PanelView::Overview, _) => {
+    match resolved_view(s) {
+        crate::right_panel::PanelView::Overview => {
             ("right-panel-body-overview".into(), overview_body(s, p))
         }
-        (crate::right_panel::PanelView::Crew, _) => {
-            ("right-panel-body-crew".into(), crew_body(s, p))
-        }
-        (crate::right_panel::PanelView::Context, _) => {
-            ("right-panel-body-context".into(), context_ui::tab(s, p))
-        }
-        (crate::right_panel::PanelView::Diff, _) => {
-            ("right-panel-body-diff".into(), diff_body(s, p))
-        }
+        crate::right_panel::PanelView::Crew => ("right-panel-body-crew".into(), crew_body(s, p)),
+        crate::right_panel::PanelView::Context => context_ui::view(s, p),
+        crate::right_panel::PanelView::Diff => ("right-panel-body-diff".into(), diff_body(s, p)),
     }
 }
 

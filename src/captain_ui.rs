@@ -50,10 +50,8 @@ fn report<T>(s: &mut State, result: Result<T, String>) -> bool {
     }
 }
 
-/// The captain whose Brief is shown: a retired record opened from the Archive, else the
-/// primary home or an earlier conversation of the open thread. A record binds to the
-/// machine it was opened on and draws only while its phase stays Retired.
-pub(super) fn brief_captain(s: &State) -> Option<usize> {
+/// The retired captain record currently open in the archive sheet, if any.
+pub(super) fn retired_record_captain(s: &State) -> Option<usize> {
     if let Some((server, captain)) = &s.brief.record
         && *server == s.machines.selected
         && *captain < s.captains.len()
@@ -61,11 +59,23 @@ pub(super) fn brief_captain(s: &State) -> Option<usize> {
     {
         return Some(*captain);
     }
+    None
+}
+
+/// The captain whose Brief lives in the current thread's Inspector (primary home or an
+/// earlier conversation of that captain; never a retired record sheet).
+pub(super) fn home_brief_captain(s: &State) -> Option<usize> {
     let t = s.current();
     s.is_captain_home(t)
         .then_some(t.captain)
         .flatten()
         .filter(|&captain| captain < s.captains.len())
+}
+
+/// The captain whose Brief is shown: a retired record opened from the Archive, else the
+/// primary home or an earlier conversation of the open thread.
+pub(super) fn brief_captain(s: &State) -> Option<usize> {
+    retired_record_captain(s).or_else(|| home_brief_captain(s))
 }
 
 /// The open thread is a captain's earlier conversation, which opens read-only. Only a real
@@ -191,14 +201,37 @@ pub(super) fn quiet_note(text: impl Into<String>, p: Palette) -> El {
 /// One cell of the Brief header's pennant, in points.
 
 /// The Brief: a captain's standing instructions to Shina, beside its home conversation.
-pub(super) fn brief_panel(s: &State, p: Palette) -> El {
-    let Some(captain) = brief_captain(s) else {
+pub(super) fn brief_error_banner(s: &State, p: Palette) -> Option<El> {
+    let error = s.brief.error.as_ref()?;
+    Some(
+        row()
+            .key("brief-error")
+            .role("alert")
+            .mx(16.0)
+            .mb(8.0)
+            .px(10.0)
+            .py(8.0)
+            .gap(8.0)
+            .radius(CARD_RADIUS)
+            .fill(p.danger.alpha(0.08))
+            .child(icon("alert", p.danger))
+            .child(label(error, META, p.danger).wrap().grow(1.0).min_w(0.0))
+            .child(icon_action(
+                s,
+                "dismiss-brief-error".into(),
+                "Dismiss",
+                icon("close", p.danger),
+                p,
+                |s| s.brief.error = None,
+            )),
+    )
+}
+
+pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: bool) -> El {
+    if captain >= s.captains.len() {
         return el();
-    };
+    }
     let access = s.captain_access(captain);
-    // A retired record opened from the Archive: read-only throughout, with no crew,
-    // workspace or routine controls and no private document edits.
-    let record = s.brief.record.is_some();
     let profile = &s.captains[captain];
     let mut role = profile.role.trim().to_string();
     if role.is_empty() {
@@ -252,29 +285,8 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
                 .child(label(role, META, p.muted).truncate()),
         );
     let mut body = col().key("brief-sections").pb(8.0);
-    if let Some(error) = &s.brief.error {
-        body = body.child(
-            row()
-                .key("brief-error")
-                .role("alert")
-                .mx(16.0)
-                .mb(8.0)
-                .px(10.0)
-                .py(8.0)
-                .gap(8.0)
-                .radius(CARD_RADIUS)
-                .fill(p.danger.alpha(0.08))
-                .child(icon("alert", p.danger))
-                .child(label(error, META, p.danger).wrap().grow(1.0).min_w(0.0))
-                .child(icon_action(
-                    s,
-                    "dismiss-brief-error".into(),
-                    "Dismiss",
-                    icon("close", p.danger),
-                    p,
-                    |s| s.brief.error = None,
-                )),
-        );
+    if !record && let Some(error) = brief_error_banner(s, p) {
+        body = body.child(error);
     }
     // A host without captain records or the protocol cannot know the new sections, so
     // they stay hidden rather than drawing empty state.
@@ -282,28 +294,46 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         access,
         crate::model::CaptainAccess::UpdateRequired | crate::model::CaptainAccess::NoRecords
     );
-    let sections = [
-        knowable.then(|| digest_section(s, p, captain)),
-        (knowable && !record).then(|| crew_section(s, p, captain)),
-        (!record).then(|| {
-            routines_section(s, p, captain).disabled(access != crate::model::CaptainAccess::Full)
-        }),
-        super::captain_lifecycle_ui::section_visible(s, captain)
-            .then(|| super::captain_lifecycle_ui::section(s, p, captain)),
-    ];
+    // A retired record has no Inspector tabs (spec §3.9), so its sheet stacks the read-only
+    // Overview and Context sections together. Active/archived homes keep Context in its own tab.
+    let sections: Vec<Option<El>> = if record {
+        vec![
+            knowable.then(|| digest_section(s, p, captain)),
+            knowable.then(|| documents_section(s, p, captain)),
+            Some(memory_section(s, p, captain)),
+            Some(earlier_section(s, p, captain)),
+            super::captain_lifecycle_ui::section_visible(s, captain)
+                .then(|| super::captain_lifecycle_ui::section(s, p, captain)),
+        ]
+    } else {
+        vec![
+            knowable.then(|| digest_section(s, p, captain)),
+            knowable.then(|| crew_section(s, p, captain)),
+            Some(
+                routines_section(s, p, captain)
+                    .disabled(access != crate::model::CaptainAccess::Full),
+            ),
+            super::captain_lifecycle_ui::section_visible(s, captain)
+                .then(|| super::captain_lifecycle_ui::section(s, p, captain)),
+        ]
+    };
     for section in sections.into_iter().flatten() {
         body = body
             .child(el().h(1.0).mx(16.0).fill(hairline(p)))
             .child(section);
     }
     col()
-        .key("captain-brief")
+        .key(if record {
+            "retired-captain-brief"
+        } else {
+            "captain-brief"
+        })
         .role("complementary")
         .label(format!("{}'s brief", profile.name))
         .min_h(0.0)
         .h_full()
         .w_full()
-        .children(brief_notice(s, p, captain, access))
+        .children(brief_notice(s, p, captain, access, record))
         .child(
             col()
                 .grow(1.0)
@@ -324,9 +354,10 @@ fn brief_notice(
     p: Palette,
     captain: usize,
     access: crate::model::CaptainAccess,
+    record: bool,
 ) -> Vec<El> {
     let server = s.machines.selected.clone();
-    if s.brief.record.is_some() {
+    if record {
         return vec![
             label(
                 "Demoted to a thread. This record is read-only.",
@@ -401,6 +432,9 @@ fn brief_notice(
 /// `brief_panel` draws outside the Inspector. `top` keeps the title strip and its window
 /// buttons clear.
 pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
+    let Some(captain) = retired_record_captain(s) else {
+        return el();
+    };
     let width = (s.viewport_width - 48.0).clamp(280.0, 360.0);
     row()
         .key("brief-sheet")
@@ -415,7 +449,7 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
         // Escape closes it from the keyboard, so the scrim is no Tab stop.
         .focusable(false)
         .child(
-            brief_panel(s, p)
+            brief_panel_for(s, p, captain, true)
                 .w(width)
                 .fill(p.panel)
                 .radius(12.0)
@@ -891,12 +925,19 @@ pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
             .press(active_wash(s, p))
             .hover_motion(motion(), motion())
             .on_press(move |s: &mut State| {
+                // Until Workstream 3 moves the member rows into the Crew tab, opening the
+                // roster focuses the primary home, opens the composer roster, and closes a
+                // covering Inspector so the roster is actually visible.
                 if s.captain_home(captain) != Some(s.current().id) {
                     s.open_captain(captain);
                 }
-                let key = s.panel_key();
-                s.right_panels
-                    .open(&key, crate::right_panel::SingletonKind::Crew);
+                if !s.crew_roster_open(captain) {
+                    s.toggle_crew_roster(captain);
+                }
+                if s.inspector_covers() {
+                    let key = s.panel_key();
+                    s.right_panels.close(&key);
+                }
             })
             .child(label("Manage in the crew roster", META_LABEL, p.sea))
     });
@@ -2880,11 +2921,10 @@ mod tests {
     }
 
     #[test]
-    fn a_document_panel_covers_the_chat_at_620_and_sits_inline_from_960() {
-        // The panel is a sheet over the conversation wherever the chat column cannot
-        // spare 720 px for both. With the Inspector's 360 px floor plus the chat's
-        // 360 px floor, only 620 covers outright; at 960 and above it docks inline.
-        for width in [620.0] {
+    fn a_document_panel_covers_the_chat_below_1050_and_sits_inline_from_1280() {
+        // Spec §0.1 / §3.3: Inspector covers the conversation below 1050 pt (620 and 960)
+        // and docks beside it at 1280 and 1920.
+        for width in [620.0, 960.0] {
             let mut rt = store_runtime(width);
             open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
             press(&mut rt, "brief-document-NOTES.md");
@@ -2900,8 +2940,8 @@ mod tests {
                 "{width}: doc {doc:?} does not cover chat {main:?}"
             );
         }
-        // At 960 and 1920 the column fits an inline panel and keeps its 360 px floor.
-        for width in [960.0, 1280.0, 1920.0] {
+        // At 1280 and 1920 the column docks inline and keeps its 360 px floor.
+        for width in [1280.0, 1920.0] {
             let mut rt = store_runtime(width);
             open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
             press(&mut rt, "brief-document-NOTES.md");

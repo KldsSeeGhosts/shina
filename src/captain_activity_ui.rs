@@ -230,10 +230,7 @@ fn open_activity_source(s: &mut State, tx: &mut Tx, server: String, captain: usi
     }
     close_brief(s);
     // The card opens on the primary home's chat; a covering Inspector would hide it.
-    if s.brief.record.is_some()
-        || crate::right_panel::covers(s.viewport_width - 16.0)
-        || s.right_panel().maximized
-    {
+    if s.brief.record.is_some() || s.inspector_covers() {
         let key = s.panel_key();
         s.right_panels.close(&key);
     }
