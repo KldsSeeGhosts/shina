@@ -2226,7 +2226,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(!sidebar(&state).contains(&member));
-        state.select_thread(state.threads.iter().position(|t| t.id == home).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == home).unwrap());
         assert_eq!(
             state
                 .visible_captain_workers(home)
@@ -2235,7 +2235,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![member]
         );
-        state.select_thread(state.threads.iter().position(|t| t.id == member).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == member).unwrap());
         assert_eq!(state.selected_row(), home);
         state.captain_crew_release(0, member).unwrap();
         assert!(sidebar(&state).contains(&member));
@@ -2244,7 +2244,7 @@ mod tests {
         state.reset_captain_conversation(0).unwrap();
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(new_home, home);
-        state.select_thread(state.threads.iter().position(|t| t.id == new_home).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == new_home).unwrap());
         assert!(state.visible_captain_workers(home).is_empty());
         assert_eq!(
             state
@@ -2287,7 +2287,7 @@ mod tests {
             .map(|index| state.threads[*index].id)
             .collect();
         assert!(sidebar.contains(&worker), "{sidebar:?}");
-        state.select_thread(state.threads.iter().position(|t| t.id == worker).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == worker).unwrap());
         assert_eq!(state.selected_row(), worker);
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
@@ -2751,7 +2751,7 @@ mod tests {
             t.captain = Some(0);
         }
         let index = state.threads.iter().position(|t| t.id == earlier).unwrap();
-        state.select_thread(index);
+        state.open_kept_tab(index);
         let read_only = state.captain_crew_command("local", 0, joinable, CrewKind::Release);
         assert_eq!(
             read_only.unwrap_err(),
@@ -2782,7 +2782,7 @@ mod tests {
         state.threads[state.active].native.access = crate::model::AccessMode::default();
         // An ordinary root cannot open or save a draft for any Captain document.
         let root = push_thread(&mut state);
-        state.select_thread(state.threads.iter().position(|t| t.id == root).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == root).unwrap());
         state.captain_document_begin_edit(0, "NOTES.md");
         assert_eq!(state.captain_drafts[&key].base_revision, 0);
         state.captain_document_save_draft(&key);
@@ -2801,7 +2801,7 @@ mod tests {
             t.captain_home = true;
             t.captain = Some(0);
         }
-        state.select_thread(state.threads.iter().position(|t| t.id == earlier).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == earlier).unwrap());
         state.captain_document_begin_edit(0, "NOTES.md");
         state.captain_document_save_draft(&key);
         assert!(state.captain_document_overwrite_reviewed(&key, 0).is_err());
@@ -2818,7 +2818,7 @@ mod tests {
                 show_theirs: None,
             },
         );
-        state.select_thread(
+        state.open_kept_tab(
             state
                 .threads
                 .iter()

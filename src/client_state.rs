@@ -1906,6 +1906,8 @@ impl State {
         ui["pendingMessages"] = json!({});
         ui["active"] = json!(self.current().id);
         ui["tabs"] = json!(self.tabs);
+        ui["ghostTab"] = json!(self.ghost_tab);
+        ui["ghostAnchor"] = json!(self.ghost_anchor);
         ui["dark"] = json!(self.dark);
         ui["zoom"] = json!(self.zoom);
         self.machines.ui[&self.machines.selected] = ui.clone();
@@ -2779,6 +2781,10 @@ impl State {
             .into_iter()
             .filter(|id| self.threads.iter().any(|t| t.id == *id))
             .collect();
+        self.ghost_tab = self.ghost_tab.filter(|id| self.tabs.contains(id));
+        if self.ghost_tab.is_none() {
+            self.ghost_anchor = None;
+        }
         self.dark = dark;
         self.zoom = zoom;
         self.project_scope = scope;
@@ -2845,6 +2851,17 @@ impl State {
                     .map(|id| id as usize)
                     .filter(|id| self.threads.iter().any(|t| t.id == *id))
                     .collect();
+                self.ghost_tab = local["ghostTab"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                self.ghost_anchor = local["ghostAnchor"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                if self.ghost_tab.is_none() {
+                    self.ghost_anchor = None;
+                }
             }
             if restore_navigation
                 && let Some(index) = self
@@ -3231,6 +3248,8 @@ impl State {
         self.threads = cached.unwrap_or_else(|| vec![Thread::new(1)]);
         self.active = 0;
         self.tabs.clear();
+        self.ghost_tab = None;
+        self.ghost_anchor = None;
         self.client_recover = self.machines.recover.remove(server).unwrap_or_default();
         self.selected_threads.clear();
         self.project_scope = ProjectScope::All;
@@ -3290,6 +3309,17 @@ impl State {
             self.new_client_draft(None);
         } else {
             self.tabs = restored_tabs;
+            self.ghost_tab = self.machines.ui[server]["ghostTab"]
+                .as_u64()
+                .map(|id| id as usize)
+                .filter(|id| self.tabs.contains(id));
+            self.ghost_anchor = self.machines.ui[server]["ghostAnchor"]
+                .as_u64()
+                .map(|id| id as usize)
+                .filter(|id| self.tabs.contains(id));
+            if self.ghost_tab.is_none() {
+                self.ghost_anchor = None;
+            }
             let active = self.machines.ui[server]["active"]
                 .as_u64()
                 .map(|id| id as usize)
@@ -3658,7 +3688,7 @@ impl State {
         // A saved copy on the source machine would resurrect the draft there.
         self.drop_saved_client_draft(&source, draft);
         self.threads.push(thread);
-        self.select_thread(self.threads.len() - 1);
+        self.open_kept_tab(self.threads.len() - 1);
         self.crew_draft_strip_foreign();
         self.apply_retarget_rules();
         self.checkpoint();
@@ -3837,7 +3867,7 @@ impl State {
             self.inherit_composer(index, seed);
         }
         self.apply_native_catalogs();
-        self.select_thread(index);
+        self.open_kept_tab(index);
     }
 
     pub fn choose_draft_project(&mut self, project: Option<usize>) {
@@ -4117,6 +4147,11 @@ impl State {
                     *tab = id;
                 }
             }
+            if self.ghost_tab == Some(draft_id) {
+                // A sent draft is no longer provisional.
+                self.ghost_tab = None;
+                self.ghost_anchor = None;
+            }
             self.threads.remove(draft_index);
             self.active = self
                 .threads
@@ -4312,7 +4347,7 @@ impl State {
         if self.machines.selected == server
             && let Some(index) = self.threads.iter().position(|thread| thread.id == id)
         {
-            self.select_thread(index);
+            self.show_thread(index);
         }
     }
     pub(super) fn tick_mobile_pairing(&mut self, now: u64, tx: &mut Tx) -> bool {
@@ -4579,6 +4614,10 @@ impl State {
             TabIntent::Delete(ids) => {
                 let active = self.current().id;
                 self.tabs.retain(|id| *id == active || !ids.contains(id));
+                if self.ghost_tab.is_some_and(|ghost| ids.contains(&ghost)) {
+                    self.ghost_tab = None;
+                    self.ghost_anchor = None;
+                }
                 if ids.contains(&active) && epoch == self.tab_epoch {
                     self.remove_tab(active, false);
                 }
@@ -4611,7 +4650,7 @@ impl State {
                     self.tabs[position] = id;
                 }
             }
-            self.select_thread(index);
+            self.open_kept_tab(index);
         }
     }
     fn restore_requested_tabs(&mut self) {
@@ -5879,7 +5918,7 @@ mod tests {
         state.client = Some(client);
         state.apply_projection(server.projection()).unwrap();
         state.tabs = vec![1, 2, 3];
-        state.select_thread(1);
+        state.open_kept_tab(1);
         while commands.try_recv().is_ok() {}
         (state, server, commands)
     }
@@ -5892,9 +5931,9 @@ mod tests {
     fn projections_never_open_server_tabs_or_override_a_later_click() {
         let (mut state, mut server, _) = tab_client();
         state.client_views["localUi"] = json!({"active":1,"tabs":[1]});
-        state.select_thread(2);
+        state.open_kept_tab(2);
         let before = (state.tabs.clone(), state.current().id);
-        server.select_thread(3);
+        server.open_kept_tab(3);
         server.new_thread_in(None);
         state.apply_projection(server.projection()).unwrap();
         state.apply_projection(server.projection()).unwrap();
@@ -5927,7 +5966,7 @@ mod tests {
         ui["active"] = json!(1);
         ui["tabs"] = json!([1]);
         state.client_views = json!({"localUi":ui});
-        state.select_thread(2);
+        state.open_kept_tab(2);
         state.apply_projection(server.projection()).unwrap();
         assert_eq!(state.current().id, 3);
         assert_eq!(state.tabs, [1, 2, 3]);
@@ -5968,7 +6007,7 @@ mod tests {
         let command = std::iter::from_fn(|| commands.try_recv().ok())
             .find(|c| c.method == "thread.create")
             .unwrap();
-        state.select_thread(0);
+        state.open_kept_tab(0);
         let before = state.tabs.clone();
         let result = server.execute_command(&command).unwrap();
         state.apply_projection(server.projection()).unwrap();
@@ -6155,7 +6194,7 @@ mod tests {
         server.open_captain(0);
         let old = server.current().id;
         state.apply_projection(server.projection()).unwrap();
-        state.select_thread(state.threads.iter().position(|t| t.id == old).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == old).unwrap());
         let tabs = state.tabs.clone();
         state.reset_captain_conversation(0).unwrap();
         let command = std::iter::from_fn(|| commands.try_recv().ok())
@@ -6351,7 +6390,7 @@ mod tests {
         draft.draft.replace_text(text);
         let id = draft.id;
         state.threads.push(draft);
-        state.select_thread(state.threads.len() - 1);
+        state.open_kept_tab(state.threads.len() - 1);
         id
     }
 
@@ -6502,7 +6541,7 @@ mod tests {
         let mut opening = Thread::new(41);
         opening.draft.replace_text("typed at launch");
         state.threads.push(opening);
-        state.select_thread(state.threads.len() - 1);
+        state.open_kept_tab(state.threads.len() - 1);
         assert!(!state.current().client_draft);
         state.retarget_draft("server-b");
         assert!(state.current().client_draft);
@@ -6706,8 +6745,8 @@ mod tests {
         server.threads[2].parent = Some(1);
         server.threads[2].delegated = true;
         state.apply_projection(server.projection()).unwrap();
-        state.select_thread(3);
-        state.select_thread(1);
+        state.open_kept_tab(3);
+        state.open_kept_tab(1);
         let before = state.tabs.clone();
         state.request_delete(1);
         state.confirm_delete();
@@ -6773,7 +6812,7 @@ mod tests {
             assert_eq!(state.current().id, 3);
             assert_eq!(state.tabs, [1, 3]);
             if abandon {
-                state.select_thread(0);
+                state.open_kept_tab(0);
             }
             state.apply_projection(server.projection()).unwrap();
             state.open_requested_tab();
@@ -6948,7 +6987,7 @@ mod tests {
                 assert_eq!(send.method, "thread.send");
                 assert_eq!(send.params["threadId"], id);
                 if navigate {
-                    state.select_thread(0);
+                    state.open_kept_tab(0);
                 }
                 if receipt_first {
                     // The draft still has its device ID. Match the send by command ID.
@@ -7041,7 +7080,7 @@ mod tests {
                 let command = commands.try_recv().unwrap();
                 assert_eq!(command.method, method);
                 if stale {
-                    state.select_thread(0);
+                    state.open_kept_tab(0);
                 }
                 state.machines.receipts.insert(
                     "local".into(),
@@ -7342,7 +7381,7 @@ mod tests {
         for leaves_queue in [false, true] {
             for ordinary_empty in [false, true] {
                 let (mut state, _, _, mut projection) = paired_client_fixture();
-                state.select_thread(0);
+                state.open_kept_tab(0);
                 let id = state.current().id;
                 let view = projection["threads"]
                     .as_array_mut()
@@ -8665,7 +8704,7 @@ mod tests {
                 context: None,
             });
             state.apply_projection(server.projection()).unwrap();
-            state.select_thread(0);
+            state.open_kept_tab(0);
             while commands.try_recv().is_ok() {}
             let existing_id = state.current().id;
             assert!(!state.current().is_draft());
@@ -8780,7 +8819,7 @@ mod tests {
     #[test]
     fn model_options_gate_on_capability_and_fall_back_for_older_peers() {
         let (mut state, mut server, mut commands) = tab_client();
-        state.select_thread(0);
+        state.open_kept_tab(0);
         while commands.try_recv().is_ok() {}
         server.threads[0].harness = "claude".into();
         server.threads[0].models = vec![crate::session::AgentModel {

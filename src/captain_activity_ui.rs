@@ -210,7 +210,7 @@ fn open_thread_source(s: &mut State, server: String, thread: usize, focus: bool)
         return;
     }
     if let Some(index) = s.threads.iter().position(|t| t.id == thread) {
-        s.select_thread(index);
+        s.show_worker_ghost(index);
         if focus {
             s.current_mut().reply.focused = true;
         }
@@ -245,7 +245,7 @@ fn open_activity_source(s: &mut State, tx: &mut Tx, server: String, captain: usi
             if s.current().id != home
                 && let Some(index) = s.threads.iter().position(|t| t.id == home)
             {
-                s.select_thread(index);
+                s.show_thread(index);
             }
             tx.scroll_into_view(format!("needs-you-report-{rid}"));
             tx.focus(format!("needs-you-report-{rid}-text"), true);

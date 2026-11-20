@@ -430,7 +430,7 @@ mod tests {
             .iter()
             .position(|t| !t.captain_home && t.crew_captain.is_none())
             .expect("an ordinary thread");
-        state.select_thread(ordinary);
+        state.open_kept_tab(ordinary);
         assert_eq!(
             state
                 .submit_crew_question_answer("local", &report)
@@ -444,7 +444,7 @@ mod tests {
             .iter()
             .position(|t| t.id == state.captain_home(0).unwrap())
             .unwrap();
-        state.select_thread(home);
+        state.open_kept_tab(home);
         state.submit_crew_question_answer("local", &report).unwrap();
         assert_eq!(state.crew_answers().len(), 1);
     }

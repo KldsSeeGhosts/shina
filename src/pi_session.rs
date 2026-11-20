@@ -2390,7 +2390,7 @@ impl State {
         self.current_mut().native.conversation = None;
         self.threads.push(thread);
         self.next_id += 1;
-        self.select_thread(self.threads.len() - 1);
+        self.open_kept_tab(self.threads.len() - 1);
         self.connect_thread(self.active);
         self.checkpoint();
     }
