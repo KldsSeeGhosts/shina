@@ -757,60 +757,8 @@ impl State {
         Some(key)
     }
 
-    /// Surface ids a tab-close operation would remove, in tab order.
-    fn close_candidates(
-        &self,
-        panel: &str,
-        surface_id: &str,
-        kind: crate::model::DiscardKind,
-    ) -> Vec<String> {
-        let surfaces = &self.right_panels.get(panel).surfaces;
-        match kind {
-            crate::model::DiscardKind::Others => surfaces
-                .iter()
-                .map(crate::right_panel::Surface::id)
-                .filter(|id| id != surface_id)
-                .collect(),
-            crate::model::DiscardKind::ToRight => surfaces
-                .iter()
-                .skip_while(|surface| surface.id() != surface_id)
-                .skip(1)
-                .map(crate::right_panel::Surface::id)
-                .collect(),
-            _ => surfaces
-                .iter()
-                .map(crate::right_panel::Surface::id)
-                .collect(),
-        }
-    }
-
-    fn request_close_batch(
-        &mut self,
-        panel: &str,
-        surface_id: &str,
-        kind: crate::model::DiscardKind,
-    ) -> bool {
-        for id in self.close_candidates(panel, surface_id, kind) {
-            if let Some(key) = self.dirty_document(panel, &id) {
-                self.doc_discard = Some(crate::model::DocDiscard {
-                    panel: panel.into(),
-                    surface: surface_id.into(),
-                    key,
-                    kind,
-                });
-                return false;
-            }
-        }
-        true
-    }
-
     /// The editor's Cancel: a clean draft closes quietly; a dirty one asks first.
-    pub fn request_close_document(
-        &mut self,
-        key: &crate::model::DocumentDraftKey,
-        panel: &str,
-        surface_id: &str,
-    ) {
+    pub fn request_close_document(&mut self, key: &crate::model::DocumentDraftKey, panel: &str) {
         let Some(draft) = self.captain_drafts.get(key) else {
             return;
         };
@@ -820,7 +768,6 @@ impl State {
         if draft.text.text != draft.base_text {
             self.doc_discard = Some(crate::model::DocDiscard {
                 panel: panel.into(),
-                surface: surface_id.into(),
                 key: key.clone(),
                 kind: crate::model::DiscardKind::Discard,
             });
@@ -829,44 +776,55 @@ impl State {
         }
     }
 
-    /// Close one surface; a dirty document draft parks the close behind a confirmation.
-    pub fn request_close_surface(&mut self, panel: &str, surface_id: &str) {
-        if let Some(key) = self.dirty_document(panel, surface_id) {
+    /// Close the viewer item; a dirty document draft parks the close behind a
+    /// confirmation. The panel stays open on the Diff segment.
+    pub fn request_close_viewer(&mut self, panel: &str) {
+        let surface_id = self
+            .right_panels
+            .get(panel)
+            .viewer
+            .as_ref()
+            .map(crate::right_panel::Surface::id);
+        let Some(surface_id) = surface_id else {
+            return;
+        };
+        if let Some(key) = self.dirty_document(panel, &surface_id) {
             self.doc_discard = Some(crate::model::DocDiscard {
                 panel: panel.into(),
-                surface: surface_id.into(),
                 key,
                 kind: crate::model::DiscardKind::Close,
             });
             return;
         }
-        self.right_panels.close_surface(panel, surface_id);
+        self.right_panels.close_viewer(panel);
     }
 
-    pub fn request_close_others(&mut self, panel: &str, surface_id: &str) {
-        if self.request_close_batch(panel, surface_id, crate::model::DiscardKind::Others) {
-            self.right_panels.close_others(panel, surface_id);
-        }
-    }
-
-    pub fn request_close_to_right(&mut self, panel: &str, surface_id: &str) {
-        if self.request_close_batch(panel, surface_id, crate::model::DiscardKind::ToRight) {
-            self.right_panels.close_to_right(panel, surface_id);
-        }
-    }
-
-    pub fn request_close_all(&mut self, panel: &str) {
-        let any = self
+    /// Open a Captain document in the panel's lone viewer slot. Replacing a dirty
+    /// document draft parks the swap behind the discard confirmation; a clean or
+    /// Saving draft's document swaps straight in.
+    pub fn open_captain_document(&mut self, panel: &str, captain: usize, name: &str) {
+        let current_id = self
             .right_panels
             .get(panel)
-            .surfaces
-            .first()
-            .map(|s| s.id());
-        if let Some(any) = any
-            && self.request_close_batch(panel, &any, crate::model::DiscardKind::All)
+            .viewer
+            .as_ref()
+            .map(crate::right_panel::Surface::id);
+        if let Some(current_id) = current_id
+            && current_id != format!("captain-doc:{captain}:{name}")
+            && let Some(key) = self.dirty_document(panel, &current_id)
         {
-            self.right_panels.close_all(panel);
+            self.doc_discard = Some(crate::model::DocDiscard {
+                panel: panel.into(),
+                key,
+                kind: crate::model::DiscardKind::Replace {
+                    captain,
+                    name: name.into(),
+                },
+            });
+            return;
         }
+        self.right_panels
+            .open_captain_document(panel, captain, name);
     }
 
     /// The discard dialog's confirm: drops the draft and replays the queued close.
@@ -885,16 +843,10 @@ impl State {
         }
         match discard.kind {
             crate::model::DiscardKind::Discard => {}
-            crate::model::DiscardKind::Close => self
+            crate::model::DiscardKind::Close => self.right_panels.close_viewer(&discard.panel),
+            crate::model::DiscardKind::Replace { captain, name } => self
                 .right_panels
-                .close_surface(&discard.panel, &discard.surface),
-            crate::model::DiscardKind::Others => {
-                self.request_close_others(&discard.panel, &discard.surface)
-            }
-            crate::model::DiscardKind::ToRight => {
-                self.request_close_to_right(&discard.panel, &discard.surface)
-            }
-            crate::model::DiscardKind::All => self.request_close_all(&discard.panel),
+                .open_captain_document(&discard.panel, captain, &name),
         }
     }
 
@@ -2647,44 +2599,30 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_carries_document_surfaces_but_not_files() {
+    fn a_reset_carries_the_viewer_but_not_the_diff() {
         let mut state = fixture();
         let home = state.captain_home(0).unwrap();
         let old_key = crate::right_panel::key("local", home);
         state
             .right_panels
             .open_captain_document(&old_key, 0, "NOTES.md");
-        state
-            .right_panels
-            .open(&old_key, crate::right_panel::SingletonKind::Diff);
-        state
-            .right_panels
-            .activate(&old_key, &format!("captain-doc:0:NOTES.md"));
         state.reset_captain_conversation(0).unwrap();
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(home, new_home);
         let new_panel = state
             .right_panels
             .get(&crate::right_panel::key("local", new_home));
-        assert!(new_panel.surfaces.iter().any(|surface| {
-            matches!(
-                surface,
-                crate::right_panel::Surface::CaptainDocument { captain: 0, name }
-                    if name == "NOTES.md"
-            )
-        }));
-        assert_eq!(new_panel.active.as_deref(), Some("captain-doc:0:NOTES.md"));
-        let old_panel = state.right_panels.get(&old_key);
-        assert!(old_panel.surfaces.iter().all(|surface| {
-            !matches!(surface, crate::right_panel::Surface::CaptainDocument { .. })
-        }));
-        assert!(
-            old_panel
-                .surfaces
-                .iter()
-                .any(|surface| matches!(surface, crate::right_panel::Surface::Diff)),
-            "the diff stays on the retired home's panel"
+        assert_eq!(
+            new_panel.viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
         );
+        assert_eq!(new_panel.view, crate::right_panel::PanelView::Viewer);
+        assert!(new_panel.open);
+        let old_panel = state.right_panels.get(&old_key);
+        assert!(old_panel.viewer.is_none());
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 
@@ -2703,37 +2641,21 @@ mod tests {
             name: "NOTES.md".into(),
         };
         state.captain_drafts.get_mut(&draft_key).unwrap().text.text = "unsaved".into();
-        let surface = "captain-doc:0:NOTES.md";
         // A dirty close parks instead of closing; a clean or Saving draft closes freely.
-        state.request_close_surface(&panel, surface);
+        state.request_close_viewer(&panel);
         assert!(state.doc_discard.is_some());
-        assert!(
-            state
-                .right_panels
-                .get(&panel)
-                .surfaces
-                .iter()
-                .any(|surface| surface.id() == "captain-doc:0:NOTES.md")
-        );
+        assert!(state.right_panels.get(&panel).viewer.is_some());
         state.doc_discard = None;
         state.finish_doc_discard();
         assert!(state.captain_drafts.contains_key(&draft_key));
         state.doc_discard = Some(crate::model::DocDiscard {
             panel: panel.clone(),
-            surface: surface.into(),
             key: draft_key.clone(),
             kind: crate::model::DiscardKind::Close,
         });
         state.finish_doc_discard();
         assert!(!state.captain_drafts.contains_key(&draft_key));
-        assert!(
-            state
-                .right_panels
-                .get(&panel)
-                .surfaces
-                .iter()
-                .all(|surface| surface.id() != "captain-doc:0:NOTES.md")
-        );
+        assert!(state.right_panels.get(&panel).viewer.is_none());
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 
@@ -2937,7 +2859,6 @@ mod tests {
         let panel = crate::right_panel::key("local", state.captain_home(0).unwrap());
         state.doc_discard = Some(crate::model::DocDiscard {
             panel,
-            surface: "captain-doc:0:NOTES.md".into(),
             key: key.clone(),
             kind: crate::model::DiscardKind::Discard,
         });
@@ -3153,7 +3074,6 @@ mod tests {
         let panel = crate::right_panel::key("local", state.captain_home(0).unwrap());
         state.doc_discard = Some(crate::model::DocDiscard {
             panel,
-            surface: "captain-doc:0:NOTES.md".into(),
             key: local_key.clone(),
             kind: crate::model::DiscardKind::Close,
         });
@@ -3205,51 +3125,70 @@ mod tests {
     }
 
     #[test]
-    fn closing_other_documents_asks_for_each_dirty_one_and_saving_tabs_just_close() {
+    fn replacing_a_dirty_document_asks_and_a_saving_one_swaps_freely() {
         let mut state = fixture();
         let home = state.captain_home(0).unwrap();
         let panel = crate::right_panel::key("local", home);
-        for name in ["NOTES.md", "AGENTS.md"] {
-            state.right_panels.open_captain_document(&panel, 0, name);
-            state.captain_document_begin_edit(0, name);
-            let key = crate::model::DocumentDraftKey {
-                server: "local".into(),
-                captain: 0,
-                name: name.into(),
-            };
-            state.captain_drafts.get_mut(&key).unwrap().text.text = format!("unsaved {name}");
-        }
+        state.open_captain_document(&panel, 0, "NOTES.md");
+        state.captain_document_begin_edit(0, "NOTES.md");
         let notes = crate::model::DocumentDraftKey {
             server: "local".into(),
             captain: 0,
             name: "NOTES.md".into(),
         };
-        let agents = crate::model::DocumentDraftKey {
-            server: "local".into(),
-            captain: 0,
-            name: "AGENTS.md".into(),
-        };
-        // Closing everything parks on a dirty draft instead of closing anything.
-        state.request_close_all(&panel);
+        state.captain_drafts.get_mut(&notes).unwrap().text.text = "unsaved".into();
+        // Replacing a dirty document parks instead of swapping; the draft survives.
+        state.open_captain_document(&panel, 0, "AGENTS.md");
         assert!(state.doc_discard.is_some());
-        assert_eq!(state.right_panels.get(&panel).surfaces.len(), 2);
-        // "Keep editing" abandons the batch: both tabs and both drafts survive.
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
+        );
+        // "Keep editing" abandons the swap: the document and its draft stay.
         state.doc_discard = None;
         assert!(state.captain_drafts.contains_key(&notes));
-        assert!(state.captain_drafts.contains_key(&agents));
-        // A Saving tab is not a discard candidate: it closes while its draft and
-        // pending command stay in the map for the receipt.
-        state.captain_drafts.get_mut(&notes).unwrap().state = crate::model::DraftState::Saving {
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
+        );
+        // Confirming the discard drops the draft and opens the new document.
+        state.open_captain_document(&panel, 0, "AGENTS.md");
+        state.finish_doc_discard();
+        assert!(!state.captain_drafts.contains_key(&notes));
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "AGENTS.md".into(),
+            })
+        );
+        // A Saving draft is not a discard candidate: the document swaps while its
+        // pending command stays in the map for the receipt.
+        state.open_captain_document(&panel, 0, "NOTES.md");
+        state.captain_document_begin_edit(0, "NOTES.md");
+        let pending = crate::model::DocumentDraftKey {
+            server: "local".into(),
+            captain: 0,
+            name: "NOTES.md".into(),
+        };
+        state.captain_drafts.get_mut(&pending).unwrap().state = crate::model::DraftState::Saving {
             command: uuid::Uuid::new_v4(),
         };
-        state.request_close_all(&panel);
-        let discard = state.doc_discard.clone().expect("dirty draft parked");
-        assert_eq!(discard.key, agents);
-        state.finish_doc_discard();
-        // Confirming replays the batch: the Saving tab closes, its draft stays.
-        assert!(state.captain_drafts.contains_key(&notes));
-        assert!(!state.captain_drafts.contains_key(&agents));
-        assert!(state.right_panels.get(&panel).surfaces.is_empty());
+        state.open_captain_document(&panel, 0, "CREW.md");
+        assert!(state.doc_discard.is_none());
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "CREW.md".into(),
+            })
+        );
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 

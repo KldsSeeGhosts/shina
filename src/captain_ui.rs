@@ -705,9 +705,6 @@ fn digest_section(s: &State, p: Palette, captain: usize) -> El {
 /// Captain the tab opens on this thread's panel so it is actually visible and read only;
 /// the earlier view does not jump to the primary home.
 fn open_captain_document(s: &mut State, captain: usize, name: &str) {
-    if s.viewport_width < SHEET_BELOW {
-        close_brief(s);
-    }
     let earlier = s.captain_access(captain) == crate::model::CaptainAccess::Earlier;
     let key = if earlier {
         s.panel_key()
@@ -717,7 +714,12 @@ fn open_captain_document(s: &mut State, captain: usize, name: &str) {
             None => return,
         }
     };
-    s.right_panels.open_captain_document(&key, captain, name);
+    // Below the sheet fold the Brief and the panel cannot share the window, so the
+    // document takes the region; on wide windows the Brief stays open as its index.
+    if s.viewport_width < SHEET_BELOW {
+        close_brief(s);
+    }
+    s.open_captain_document(&key, captain, name);
 }
 
 /// Planning documents, in the row style of Shina's `earlier_section` entries: a pressable
@@ -1931,6 +1933,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         } else {
             s.show_activity = true;
             s.activity_full = false;
+            s.close_right_panel_for_drawer();
         }
     };
     if on {
@@ -1939,7 +1942,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         return toggle_button(
             "open-brief",
             "Hide the captain's brief",
-            "list",
+            "info",
             true,
             p,
             press,
@@ -1960,7 +1963,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(press)
-        .child(icon("list", p.muted))
+        .child(icon("info", p.muted))
         .child(label("Brief", TextStyle::new(12.5, 500.0), p.muted))
 }
 
@@ -3409,19 +3412,15 @@ mod tests {
             rt.presented("captain-doc-edit").is_none(),
             "an earlier view has no Edit"
         );
-        // The tab lives on the earlier thread's panel, not the primary home's.
+        // The document lives on the earlier thread's panel, not the primary home's.
         let panel = rt.state.panel_key();
-        assert!(
-            rt.state
-                .right_panels
-                .get(&panel)
-                .surfaces
-                .iter()
-                .any(|surface| matches!(
-                    surface,
-                    crate::right_panel::Surface::CaptainDocument { captain: 0, .. }
-                )),
-            "document surface opened on the earlier panel"
+        assert_eq!(
+            rt.state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            }),
+            "document opened on the earlier panel"
         );
         std::fs::remove_dir_all(&rt.state.data_dir).ok();
     }

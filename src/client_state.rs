@@ -5749,7 +5749,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_reset_carries_captain_document_surfaces_to_the_new_home() {
+    fn a_remote_reset_carries_the_captain_document_viewer_to_the_new_home() {
         let dir = std::env::temp_dir().join(format!(
             "shina-client-reset-{}",
             uuid::Uuid::new_v4().simple()
@@ -5765,7 +5765,6 @@ mod tests {
         state
             .right_panels
             .open_captain_document(&old_key, 0, "NOTES.md");
-        state.right_panels.open_file(&old_key, "src/one.rs", None);
         // The remote side resets its captain's conversation: the projection arrives
         // with a new primary home.
         server.reset_captain_conversation(0).unwrap();
@@ -5773,30 +5772,14 @@ mod tests {
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(old_home, new_home);
         let new_key = crate::right_panel::key(&state.machines.selected, new_home);
-        let moved: Vec<String> = state
-            .right_panels
-            .get(&new_key)
-            .surfaces
-            .iter()
-            .map(crate::right_panel::Surface::id)
-            .collect();
-        assert!(
-            moved.contains(&"captain-doc:0:NOTES.md".to_string()),
-            "{moved:?}"
+        assert_eq!(
+            state.right_panels.get(&new_key).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
         );
-        // File surfaces stay on the retired home's panel.
-        let stayed: Vec<String> = state
-            .right_panels
-            .get(&old_key)
-            .surfaces
-            .iter()
-            .map(crate::right_panel::Surface::id)
-            .collect();
-        assert!(
-            stayed.iter().any(|id| id.contains("src/one.rs")),
-            "{stayed:?}"
-        );
-        assert!(!stayed.contains(&"captain-doc:0:NOTES.md".to_string()));
+        assert!(state.right_panels.get(&old_key).viewer.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

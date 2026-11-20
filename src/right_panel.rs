@@ -44,32 +44,17 @@ pub fn covers(container: f32) -> bool {
     container < MIN_WIDTH + SIBLING_MIN
 }
 
+/// The one item the panel's Viewer segment can hold. Opening another replaces
+/// the current one; `State::open_captain_document` asks before dropping a dirty
+/// draft.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Surface {
-    Diff,
-    Files,
-    File {
-        path: String,
-        reveal_line: Option<u32>,
-        reveal_request: u64,
-    },
-    Attachment {
-        id: String,
-        name: String,
-    },
-    CaptainDocument {
-        captain: usize,
-        name: String,
-    },
+    CaptainDocument { captain: usize, name: String },
 }
 
 impl Surface {
     pub fn id(&self) -> String {
         match self {
-            Self::Diff => "diff".to_string(),
-            Self::Files => "files".to_string(),
-            Self::File { path, .. } => format!("file:{path}"),
-            Self::Attachment { id, .. } => format!("attachment:{id}"),
             Self::CaptainDocument { captain, name } => {
                 format!("captain-doc:{captain}:{name}")
             }
@@ -77,35 +62,37 @@ impl Surface {
     }
 }
 
+/// The segment the panel shows: the diff, or the lone viewer item.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelView {
+    #[default]
+    Diff,
+    Viewer,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingletonKind {
     Diff,
-    // The Files explorer's opener lands in a later change; tests construct it now.
-    #[cfg_attr(not(test), allow(dead_code))]
-    Files,
 }
 
 impl SingletonKind {
-    fn into_surface(self) -> Surface {
+    fn into_view(self) -> PanelView {
         match self {
-            Self::Diff => Surface::Diff,
-            Self::Files => Surface::Files,
+            Self::Diff => PanelView::Diff,
         }
     }
 
-    fn matches_surface(self, surface: &Surface) -> bool {
-        matches!(
-            (self, surface),
-            (Self::Diff, Surface::Diff) | (Self::Files, Surface::Files)
-        )
+    fn matches_view(self, view: PanelView) -> bool {
+        matches!((self, view), (Self::Diff, PanelView::Diff))
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThreadPanel {
     pub open: bool,
-    pub active: Option<String>,
-    pub surfaces: Vec<Surface>,
+    pub view: PanelView,
+    /// At most one open viewer item; `None` leaves only the Diff segment.
+    pub viewer: Option<Surface>,
     pub maximized: bool,
 }
 
@@ -120,233 +107,68 @@ impl RightPanels {
         self.threads.get(thread).cloned().unwrap_or_default()
     }
 
+    /// Opens (or shows) a singleton view: the panel's own Diff segment.
     pub fn open(&mut self, thread: &str, kind: SingletonKind) {
         self.update_thread(thread, |current| {
-            upsert_surface(current, kind.into_surface());
-        });
-    }
-
-    // The diff rows and file explorer that open files land in a later change; the tests below
-    // and the panel's layout tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn open_file(&mut self, thread: &str, path: &str, line: Option<u32>) {
-        self.update_thread(thread, |current| {
-            if path == "." {
-                upsert_surface(current, Surface::Files);
-                return;
-            }
-            let relative_path = normalize_file_path(path);
-            current
-                .surfaces
-                .retain(|surface| !matches!(surface, Surface::Files));
-            let surface_id = format!("file:{relative_path}");
-            let existing_request = current.surfaces.iter().find_map(|surface| match surface {
-                Surface::File { reveal_request, .. } if surface.id() == surface_id => {
-                    Some(*reveal_request)
-                }
-                _ => None,
-            });
-            let surface = Surface::File {
-                path: relative_path,
-                reveal_line: normalize_reveal_line(line),
-                reveal_request: existing_request.unwrap_or(0).saturating_add(1),
-            };
             current.open = true;
-            current.active = Some(surface_id.clone());
-            if let Some(slot) = current
-                .surfaces
-                .iter_mut()
-                .find(|entry| matches!(entry, Surface::File { .. }) && entry.id() == surface_id)
-            {
-                *slot = surface;
-            } else {
-                current.surfaces.push(surface);
+            current.view = kind.into_view();
+        });
+    }
+
+    /// Switches the panel to the viewer's segment without opening one; a
+    /// no-op while no viewer exists.
+    pub fn show_viewer(&mut self, thread: &str) {
+        self.update_thread(thread, |current| {
+            if current.viewer.is_some() {
+                current.open = true;
+                current.view = PanelView::Viewer;
             }
         });
     }
 
-    // Attachment surfaces open from a later change; tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn open_attachment(&mut self, thread: &str, id: &str, name: &str) {
-        self.update_thread(thread, |current| {
-            current
-                .surfaces
-                .retain(|surface| !matches!(surface, Surface::Files));
-            upsert_surface(
-                current,
-                Surface::Attachment {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                },
-            );
-        });
-    }
-
-    /// Opens (or activates) a Captain document tab in a thread's panel.
+    /// Replaces the viewer with a Captain document and shows it. The caller
+    /// parks the swap behind the dirty-draft confirmation when the current
+    /// document has unsaved edits (`State::open_captain_document`).
     pub fn open_captain_document(&mut self, thread: &str, captain: usize, name: &str) {
         self.update_thread(thread, |current| {
-            upsert_surface(
-                current,
-                Surface::CaptainDocument {
-                    captain,
-                    name: name.to_string(),
-                },
-            );
+            current.open = true;
+            current.view = PanelView::Viewer;
+            current.viewer = Some(Surface::CaptainDocument {
+                captain,
+                name: name.to_string(),
+            });
         });
     }
 
-    /// Moves every Captain document surface between panel keys, keeping the active one
-    /// active. Called when a Captain's home is reset to a new conversation.
+    /// Moves the viewer item between panel keys, keeping its segment selection.
+    /// Called when a Captain's home is reset to a new conversation.
     pub fn carry_captain_documents(&mut self, from: &str, to: &str) {
         let source = self.threads.get(from).cloned().unwrap_or_default();
-        let documents: Vec<Surface> = source
-            .surfaces
-            .iter()
-            .filter(|surface| matches!(surface, Surface::CaptainDocument { .. }))
-            .cloned()
-            .collect();
-        if documents.is_empty() {
+        let Some(viewer) = source.viewer.clone() else {
             return;
-        }
-        let active_document = source
-            .active
-            .as_ref()
-            .filter(|id| documents.iter().any(|surface| surface.id() == **id))
-            .cloned();
+        };
         self.update_thread(from, |current| {
-            current
-                .surfaces
-                .retain(|surface| !matches!(surface, Surface::CaptainDocument { .. }));
-            if active_document.is_some() {
-                current.active = current.surfaces.first().map(Surface::id);
+            current.viewer = None;
+            if current.view == PanelView::Viewer {
+                current.view = PanelView::Diff;
             }
-            current.open = !current.surfaces.is_empty() && current.open;
         });
         self.update_thread(to, |current| {
-            for surface in documents {
-                if !current
-                    .surfaces
-                    .iter()
-                    .any(|entry| entry.id() == surface.id())
-                {
-                    current.surfaces.push(surface);
-                }
-            }
-            if let Some(active) = active_document {
+            current.viewer = Some(viewer);
+            if source.open && source.view == PanelView::Viewer {
                 current.open = true;
-                current.active = Some(active);
+                current.view = PanelView::Viewer;
             }
         });
     }
 
-    pub fn activate(&mut self, thread: &str, surface_id: &str) {
+    /// Closes the viewer item. The panel stays open on the Diff segment.
+    pub fn close_viewer(&mut self, thread: &str) {
         self.update_thread(thread, |current| {
-            if current
-                .surfaces
-                .iter()
-                .any(|surface| surface.id() == surface_id)
-            {
-                current.open = true;
-                current.active = Some(surface_id.to_string());
+            current.viewer = None;
+            if current.view == PanelView::Viewer {
+                current.view = PanelView::Diff;
             }
-        });
-    }
-
-    pub fn close_surface(&mut self, thread: &str, surface_id: &str) {
-        self.update_thread(thread, |current| {
-            let Some(index) = current
-                .surfaces
-                .iter()
-                .position(|surface| surface.id() == surface_id)
-            else {
-                return;
-            };
-            current.surfaces.remove(index);
-            current.open = !current.surfaces.is_empty() && current.open;
-            if current.active.as_deref() != Some(surface_id) {
-                return;
-            }
-            current.active = if current.surfaces.is_empty() {
-                None
-            } else {
-                let fallback_index = index.min(current.surfaces.len().saturating_sub(1));
-                current.surfaces.get(fallback_index).map(Surface::id)
-            };
-        });
-    }
-
-    pub fn close_others(&mut self, thread: &str, surface_id: &str) {
-        self.update_thread(thread, |current| {
-            let Some(surface) = current
-                .surfaces
-                .iter()
-                .find(|entry| entry.id() == surface_id)
-                .cloned()
-            else {
-                return;
-            };
-            if current.surfaces.len() == 1 {
-                return;
-            }
-            current.open = true;
-            current.active = Some(surface.id());
-            current.surfaces = vec![surface];
-        });
-    }
-
-    pub fn close_to_right(&mut self, thread: &str, surface_id: &str) {
-        self.update_thread(thread, |current| {
-            let Some(index) = current
-                .surfaces
-                .iter()
-                .position(|surface| surface.id() == surface_id)
-            else {
-                return;
-            };
-            if index + 1 >= current.surfaces.len() {
-                return;
-            }
-            current.surfaces.truncate(index + 1);
-            let active_still_exists = current.active.as_deref().is_some_and(|active_id| {
-                current
-                    .surfaces
-                    .iter()
-                    .any(|surface| surface.id() == active_id)
-            });
-            if !active_still_exists {
-                current.active = Some(surface_id.to_string());
-            }
-        });
-    }
-
-    pub fn close_all(&mut self, thread: &str) {
-        self.update_thread(thread, |current| {
-            if current.surfaces.is_empty() {
-                return;
-            }
-            current.open = false;
-            current.surfaces.clear();
-            current.active = None;
-        });
-    }
-
-    // KSG reorders tabs by drag; that gesture lands with a later change. Tests exercise this now.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn move_surface(&mut self, thread: &str, surface_id: &str, to_index: usize) {
-        self.update_thread(thread, |current| {
-            let Some(from_index) = current
-                .surfaces
-                .iter()
-                .position(|surface| surface.id() == surface_id)
-            else {
-                return;
-            };
-            if from_index == to_index {
-                return;
-            }
-            let surface = current.surfaces.remove(from_index);
-            let target_index = to_index.min(current.surfaces.len());
-            current.surfaces.insert(target_index, surface);
         });
     }
 
@@ -372,34 +194,26 @@ impl RightPanels {
         });
     }
 
+    /// KSG's surface toggle: an open panel already showing the segment hides;
+    /// anything else shows it.
     pub fn toggle(&mut self, thread: &str, kind: SingletonKind) {
         self.update_thread(thread, |current| {
-            let active_matches = current.active.as_deref().is_some_and(|active_id| {
-                current
-                    .surfaces
-                    .iter()
-                    .find(|surface| surface.id() == active_id)
-                    .is_some_and(|surface| kind.matches_surface(surface))
-            });
-            if current.open && active_matches {
+            if current.open && kind.matches_view(current.view) {
                 current.open = false;
                 return;
             }
-            upsert_surface(current, kind.into_surface());
+            current.open = true;
+            current.view = kind.into_view();
         });
     }
 
-    pub fn active_surface(&self, thread: &str) -> Option<Surface> {
+    /// The segment on screen, only while the panel is open.
+    pub fn active_view(&self, thread: &str) -> Option<PanelView> {
         let state = self.threads.get(thread)?;
         if !state.open {
             return None;
         }
-        let active_id = state.active.as_deref()?;
-        state
-            .surfaces
-            .iter()
-            .find(|surface| surface.id() == active_id)
-            .cloned()
+        Some(state.view)
     }
 
     pub fn forget(&mut self, thread: &str) {
@@ -409,44 +223,12 @@ impl RightPanels {
     fn update_thread(&mut self, thread: &str, f: impl FnOnce(&mut ThreadPanel)) {
         let mut next = self.threads.get(thread).cloned().unwrap_or_default();
         f(&mut next);
-        if !next.open && next.active.is_none() && next.surfaces.is_empty() {
+        if !next.open && next.viewer.is_none() && !next.maximized {
             self.threads.remove(thread);
         } else if self.threads.get(thread) != Some(&next) {
             self.threads.insert(thread.to_string(), next);
         }
     }
-}
-
-fn upsert_surface(panel: &mut ThreadPanel, surface: Surface) {
-    let id = surface.id();
-    panel.open = true;
-    if !panel.surfaces.iter().any(|entry| entry.id() == id) {
-        panel.surfaces.push(surface);
-    }
-    panel.active = Some(id);
-}
-
-fn normalize_file_path(requested_path: &str) -> String {
-    let is_windows_drive_root = match requested_path.as_bytes() {
-        [drive, b':', rest @ ..] => {
-            drive.is_ascii_alphabetic() && !rest.is_empty() && rest.iter().all(|&b| b == b'/')
-        }
-        _ => false,
-    };
-    if is_windows_drive_root {
-        return requested_path.to_string();
-    }
-    let trimmed = requested_path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        requested_path.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// KSG's `normalizeRevealLine`: a line below 1 reveals line 1.
-fn normalize_reveal_line(line: Option<u32>) -> Option<u32> {
-    line.map(|value| value.max(1))
 }
 
 #[cfg(test)]
@@ -456,148 +238,13 @@ mod tests {
     const THREAD_A: &str = "env-1:thread-A";
     const THREAD_B: &str = "env-1:thread-B";
 
-    // KSG test: "opens workspace-root links as the singleton files explorer"
-    #[test]
-    fn ksg_opens_workspace_root_links_as_singleton_files_explorer() {
-        let mut panels = RightPanels::default();
-        panels.open_file(THREAD_A, "README.md", None);
-        panels.open_file(THREAD_A, ".", None);
-        panels.open_file(THREAD_A, ".", None);
-
-        let state = panels.get(THREAD_A);
-        assert_eq!(state.active.as_deref(), Some("files"));
-        let ids: Vec<String> = state.surfaces.iter().map(Surface::id).collect();
-        assert_eq!(ids, vec!["file:README.md", "files"]);
-
-        panels.close_surface(THREAD_A, "files");
-        assert_eq!(
-            panels.get(THREAD_A).active.as_deref(),
-            Some("file:README.md")
-        );
-
-        panels.open_file(THREAD_A, ".", None);
-        assert_eq!(panels.get(THREAD_A).active.as_deref(), Some("files"));
-    }
-
-    // KSG test: "replaces the standalone explorer with peer file surfaces"
-    #[test]
-    fn ksg_replaces_standalone_explorer_with_peer_file_surfaces() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Files);
-        panels.open_file(THREAD_A, "src/index.ts", None);
-        panels.open_file(THREAD_A, "src/index.ts", None);
-        panels.open_file(THREAD_A, "README.md", None);
-
-        assert_eq!(
-            panels.get(THREAD_A),
-            ThreadPanel {
-                open: true,
-                active: Some("file:README.md".to_string()),
-                surfaces: vec![
-                    Surface::File {
-                        path: "src/index.ts".to_string(),
-                        reveal_line: None,
-                        reveal_request: 2,
-                    },
-                    Surface::File {
-                        path: "README.md".to_string(),
-                        reveal_line: None,
-                        reveal_request: 1,
-                    },
-                ],
-                maximized: false,
-            }
-        );
-    }
-
-    // KSG test: "keeps %j and %j in separate file tabs"
-    #[test]
-    fn ksg_keeps_distinct_paths_in_separate_file_tabs() {
-        for (first_path, second_path) in [
-            ("generated\\", "generated"),
-            ("notes/meeting ", "notes/meeting"),
-            (" notes/meeting", "notes/meeting"),
-        ] {
-            let mut panels = RightPanels::default();
-            panels.open_file(THREAD_A, first_path, None);
-            panels.open_file(THREAD_A, second_path, None);
-
-            assert_eq!(
-                panels.get(THREAD_A).surfaces,
-                vec![
-                    Surface::File {
-                        path: first_path.to_string(),
-                        reveal_line: None,
-                        reveal_request: 1,
-                    },
-                    Surface::File {
-                        path: second_path.to_string(),
-                        reveal_line: None,
-                        reveal_request: 1,
-                    },
-                ]
-            );
+    fn doc(captain: usize, name: &str) -> Surface {
+        Surface::CaptainDocument {
+            captain,
+            name: name.into(),
         }
     }
 
-    // KSG test: "keeps attachment and workspace file ids disjoint"
-    #[test]
-    fn ksg_keeps_attachment_and_workspace_file_ids_disjoint() {
-        let mut panels = RightPanels::default();
-        panels.open_file(THREAD_A, "attachment:shared-id", None);
-        panels.open_attachment(THREAD_A, "shared-id", "report.pdf");
-
-        let ids: Vec<String> = panels
-            .get(THREAD_A)
-            .surfaces
-            .iter()
-            .map(Surface::id)
-            .collect();
-        assert_eq!(
-            ids,
-            vec!["file:attachment:shared-id", "attachment:shared-id"]
-        );
-    }
-
-    // KSG test: "updates line reveal requests when reopening a file surface"
-    #[test]
-    fn ksg_updates_line_reveal_requests_when_reopening_a_file_surface() {
-        let mut panels = RightPanels::default();
-        panels.open_file(THREAD_A, "src/index.ts", Some(42));
-        panels.open_file(THREAD_A, "src/index.ts", Some(87));
-
-        assert_eq!(
-            panels.get(THREAD_A),
-            ThreadPanel {
-                open: true,
-                active: Some("file:src/index.ts".to_string()),
-                surfaces: vec![Surface::File {
-                    path: "src/index.ts".to_string(),
-                    reveal_line: Some(87),
-                    reveal_request: 2,
-                }],
-                maximized: false,
-            }
-        );
-
-        panels.open_file(THREAD_A, "src/index.ts", None);
-
-        assert_eq!(
-            panels.get(THREAD_A),
-            ThreadPanel {
-                open: true,
-                active: Some("file:src/index.ts".to_string()),
-                surfaces: vec![Surface::File {
-                    path: "src/index.ts".to_string(),
-                    reveal_line: None,
-                    reveal_request: 3,
-                }],
-                maximized: false,
-            }
-        );
-    }
-
-    // Required test 1
     #[test]
     fn open_diff_on_empty_thread() {
         let mut panels = RightPanels::default();
@@ -607,215 +254,97 @@ mod tests {
             panels.get(THREAD_A),
             ThreadPanel {
                 open: true,
-                active: Some("diff".to_string()),
-                surfaces: vec![Surface::Diff],
+                view: PanelView::Diff,
+                viewer: None,
                 maximized: false,
             }
         );
-        assert_eq!(panels.active_surface(THREAD_A), Some(Surface::Diff));
+        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Diff));
     }
 
-    // Required test 2
     #[test]
-    fn open_diff_twice_gives_one_surface() {
+    fn open_diff_twice_keeps_one_segment() {
         let mut panels = RightPanels::default();
         panels.open(THREAD_A, SingletonKind::Diff);
         panels.open(THREAD_A, SingletonKind::Diff);
 
         let state = panels.get(THREAD_A);
-        assert_eq!(state.surfaces, vec![Surface::Diff]);
-        assert_eq!(state.active.as_deref(), Some("diff"));
+        assert_eq!(state.view, PanelView::Diff);
+        assert!(state.viewer.is_none());
         assert!(state.open);
     }
 
-    // Required test 3
     #[test]
-    fn open_file_two_paths_then_close_active_surface() {
+    fn a_second_document_replaces_the_viewer_and_close_returns_to_diff() {
         let mut panels = RightPanels::default();
-        panels.open_file(THREAD_A, "src/a.rs", None);
-        panels.open_file(THREAD_A, "src/b.rs", None);
-        assert_eq!(
-            panels.get(THREAD_A).active.as_deref(),
-            Some("file:src/b.rs")
-        );
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
+        panels.open_captain_document(THREAD_A, 0, "AGENTS.md");
 
-        panels.close_surface(THREAD_A, "file:src/b.rs");
+        let state = panels.get(THREAD_A);
+        assert_eq!(state.viewer, Some(doc(0, "AGENTS.md")));
+        assert_eq!(state.view, PanelView::Viewer);
+
+        panels.close_viewer(THREAD_A);
         let state = panels.get(THREAD_A);
         assert!(state.open);
-        assert_eq!(state.active.as_deref(), Some("file:src/a.rs"));
-        assert_eq!(
-            state.surfaces,
-            vec![Surface::File {
-                path: "src/a.rs".to_string(),
-                reveal_line: None,
-                reveal_request: 1,
-            }]
-        );
-
-        // Closing a middle active tab activates the neighbor at the same index (to the right).
-        panels.open_file(THREAD_A, "src/b.rs", None);
-        panels.open_file(THREAD_A, "src/c.rs", None);
-        panels.activate(THREAD_A, "file:src/b.rs");
-        panels.close_surface(THREAD_A, "file:src/b.rs");
-        assert_eq!(
-            panels.get(THREAD_A).active.as_deref(),
-            Some("file:src/c.rs")
-        );
+        assert_eq!(state.view, PanelView::Diff);
+        assert!(state.viewer.is_none());
     }
 
-    // Required test 4
-    #[test]
-    fn close_surface_of_last_surface() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.set_maximized(THREAD_A, true);
-        panels.close_surface(THREAD_A, "diff");
-
-        assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
-        assert_eq!(panels.active_surface(THREAD_A), None);
-    }
-
-    // Required test 5
-    #[test]
-    fn close_others_close_to_right_and_close_all() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.open_file(THREAD_A, "a.rs", None);
-        panels.open_file(THREAD_A, "b.rs", None);
-        panels.open_file(THREAD_A, "c.rs", None);
-
-        // close_to_right when active surface is among the closed tabs activates the target tab.
-        panels.close_to_right(THREAD_A, "file:a.rs");
-        let after_right = panels.get(THREAD_A);
-        assert_eq!(
-            after_right
-                .surfaces
-                .iter()
-                .map(Surface::id)
-                .collect::<Vec<_>>(),
-            vec!["diff", "file:a.rs"]
-        );
-        assert_eq!(after_right.active.as_deref(), Some("file:a.rs"));
-
-        // close_to_right when active surface stays keeps that active surface.
-        panels.open_file(THREAD_A, "b.rs", None);
-        panels.activate(THREAD_A, "diff");
-        panels.close_to_right(THREAD_A, "file:a.rs");
-        assert_eq!(panels.get(THREAD_A).active.as_deref(), Some("diff"));
-
-        // close_others keeps only the chosen surface and activates it.
-        panels.close_others(THREAD_A, "file:a.rs");
-        let after_others = panels.get(THREAD_A);
-        assert!(after_others.open);
-        assert_eq!(after_others.active.as_deref(), Some("file:a.rs"));
-        assert_eq!(
-            after_others
-                .surfaces
-                .iter()
-                .map(Surface::id)
-                .collect::<Vec<_>>(),
-            vec!["file:a.rs"]
-        );
-
-        // close_all empties surfaces, clears active, and closes the panel.
-        panels.close_all(THREAD_A);
-        assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
-    }
-
-    // Required test 6
-    #[test]
-    fn move_surface_edge_cases() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.open_file(THREAD_A, "a.rs", None);
-        panels.open_file(THREAD_A, "b.rs", None);
-
-        let ids = |panels: &RightPanels| -> Vec<String> {
-            panels
-                .get(THREAD_A)
-                .surfaces
-                .iter()
-                .map(Surface::id)
-                .collect()
-        };
-
-        panels.move_surface(THREAD_A, "file:b.rs", 0);
-        assert_eq!(ids(&panels), vec!["file:b.rs", "diff", "file:a.rs"]);
-
-        panels.move_surface(THREAD_A, "file:b.rs", 999);
-        assert_eq!(ids(&panels), vec!["diff", "file:a.rs", "file:b.rs"]);
-
-        panels.move_surface(THREAD_A, "file:missing.rs", 0);
-        assert_eq!(ids(&panels), vec!["diff", "file:a.rs", "file:b.rs"]);
-    }
-
-    // Required test 7
     #[test]
     fn toggle_diff_states() {
         let mut panels = RightPanels::default();
 
-        // When closed (empty): opens diff and activates it.
+        // Closed: opens the Diff segment.
         panels.toggle(THREAD_A, SingletonKind::Diff);
         let state = panels.get(THREAD_A);
         assert!(state.open);
-        assert_eq!(state.active.as_deref(), Some("diff"));
-        assert_eq!(state.surfaces, vec![Surface::Diff]);
+        assert_eq!(state.view, PanelView::Diff);
 
-        // When open on diff: closes panel while keeping diff in surfaces and active.
+        // Open on Diff: hides, keeping the segment selection.
         panels.toggle(THREAD_A, SingletonKind::Diff);
-        let closed_state = panels.get(THREAD_A);
-        assert!(!closed_state.open);
-        assert_eq!(closed_state.active.as_deref(), Some("diff"));
-        assert_eq!(closed_state.surfaces, vec![Surface::Diff]);
+        let closed = panels.get(THREAD_A);
+        assert!(!closed.open);
+        assert_eq!(closed.view, PanelView::Diff);
 
-        // When closed with diff already present: reopens on diff.
+        // Closed again: reopens on Diff.
         panels.toggle(THREAD_A, SingletonKind::Diff);
         assert!(panels.get(THREAD_A).open);
 
-        // When open on a file: switches active to diff and keeps panel open.
-        panels.open_file(THREAD_A, "main.rs", None);
-        assert_eq!(panels.get(THREAD_A).active.as_deref(), Some("file:main.rs"));
+        // Open on the viewer: switches to Diff and stays open.
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
+        assert_eq!(panels.get(THREAD_A).view, PanelView::Viewer);
         panels.toggle(THREAD_A, SingletonKind::Diff);
         let switched = panels.get(THREAD_A);
         assert!(switched.open);
-        assert_eq!(switched.active.as_deref(), Some("diff"));
-        assert_eq!(switched.surfaces.len(), 2);
+        assert_eq!(switched.view, PanelView::Diff);
+        assert_eq!(switched.viewer, Some(doc(0, "NOTES.md")));
     }
 
-    // Required test 8
     #[test]
-    fn toggle_visibility_with_and_without_surfaces() {
+    fn toggle_visibility_hides_and_reshows() {
         let mut panels = RightPanels::default();
 
-        // Without surfaces: toggles open to true, then back to false (and removes empty entry).
+        // Empty: toggling shows a bare panel, and hiding it evicts the entry.
         panels.toggle_visibility(THREAD_A);
-        assert_eq!(
-            panels.get(THREAD_A),
-            ThreadPanel {
-                open: true,
-                active: None,
-                surfaces: vec![],
-                maximized: false,
-            }
-        );
+        assert!(panels.get(THREAD_A).open);
         panels.toggle_visibility(THREAD_A);
         assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
 
-        // With surfaces: hides and re-shows while preserving surfaces and active.
-        panels.open(THREAD_A, SingletonKind::Diff);
+        // With a viewer: hides and re-shows on the same segment.
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
         panels.toggle_visibility(THREAD_A);
         let hidden = panels.get(THREAD_A);
         assert!(!hidden.open);
-        assert_eq!(hidden.active.as_deref(), Some("diff"));
-        assert_eq!(hidden.surfaces, vec![Surface::Diff]);
-        assert_eq!(panels.active_surface(THREAD_A), None);
+        assert_eq!(hidden.view, PanelView::Viewer);
+        assert_eq!(hidden.viewer, Some(doc(0, "NOTES.md")));
+        assert_eq!(panels.active_view(THREAD_A), None);
 
         panels.toggle_visibility(THREAD_A);
         assert!(panels.get(THREAD_A).open);
-        assert_eq!(panels.active_surface(THREAD_A), Some(Surface::Diff));
+        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Viewer));
     }
 
-    // Required test 9
     #[test]
     fn set_maximized_then_close_preserves_maximized() {
         let mut panels = RightPanels::default();
@@ -829,127 +358,73 @@ mod tests {
         assert!(state.maximized);
     }
 
-    // Required test 10
     #[test]
-    fn open_file_same_path_twice_with_different_lines() {
+    fn show_viewer_only_with_a_viewer() {
         let mut panels = RightPanels::default();
-        panels.open_file(THREAD_A, "src/lib.rs", Some(10));
-        panels.open_file(THREAD_A, "src/lib.rs", Some(25));
+        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.show_viewer(THREAD_A);
+        assert_eq!(panels.get(THREAD_A).view, PanelView::Diff);
 
-        let state = panels.get(THREAD_A);
-        assert_eq!(state.surfaces.len(), 1);
-        assert_eq!(
-            state.surfaces,
-            vec![Surface::File {
-                path: "src/lib.rs".to_string(),
-                reveal_line: Some(25),
-                reveal_request: 2,
-            }]
-        );
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
+        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.show_viewer(THREAD_A);
+        assert_eq!(panels.get(THREAD_A).view, PanelView::Viewer);
     }
 
-    // Required test 11
+    #[test]
+    fn carry_moves_the_viewer_and_keeps_the_diff_segment() {
+        let mut panels = RightPanels::default();
+        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
+
+        panels.carry_captain_documents(THREAD_A, THREAD_B);
+        let from = panels.get(THREAD_A);
+        assert!(from.viewer.is_none());
+        assert_eq!(from.view, PanelView::Diff);
+        assert!(from.open, "the diff stays open on the old home");
+
+        let to = panels.get(THREAD_B);
+        assert!(to.open);
+        assert_eq!(to.view, PanelView::Viewer);
+        assert_eq!(to.viewer, Some(doc(0, "NOTES.md")));
+
+        // A hidden or diff-selected source carries the item without opening it.
+        let mut panels = RightPanels::default();
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
+        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.close(THREAD_A);
+        panels.carry_captain_documents(THREAD_A, THREAD_B);
+        let to = panels.get(THREAD_B);
+        assert!(!to.open);
+        assert_eq!(to.viewer, Some(doc(0, "NOTES.md")));
+    }
+
     #[test]
     fn threads_are_isolated_and_forget_removes_one() {
         let mut panels = RightPanels::default();
         panels.open(THREAD_A, SingletonKind::Diff);
         panels.set_maximized(THREAD_A, true);
-        panels.open_file(THREAD_B, "src/main.rs", Some(5));
+        panels.open_captain_document(THREAD_B, 0, "NOTES.md");
 
-        assert_eq!(panels.active_surface(THREAD_A), Some(Surface::Diff));
-        assert_eq!(
-            panels.active_surface(THREAD_B),
-            Some(Surface::File {
-                path: "src/main.rs".to_string(),
-                reveal_line: Some(5),
-                reveal_request: 1,
-            })
-        );
+        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Diff));
+        assert_eq!(panels.get(THREAD_B).viewer, Some(doc(0, "NOTES.md")));
 
         panels.forget(THREAD_A);
         assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
-        assert_eq!(panels.active_surface(THREAD_A), None);
+        assert_eq!(panels.active_view(THREAD_A), None);
         assert!(panels.get(THREAD_B).open);
     }
 
-    // Required test 12
     #[test]
-    fn unknown_surface_ids_change_nothing() {
+    fn empty_closed_entries_are_evicted() {
         let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.open_file(THREAD_A, "a.rs", None);
-        let before = panels.get(THREAD_A);
+        panels.toggle_visibility(THREAD_A);
+        panels.toggle_visibility(THREAD_A);
+        assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
 
-        panels.activate(THREAD_A, "file:missing.rs");
-        assert_eq!(panels.get(THREAD_A), before);
-
-        panels.close_surface(THREAD_A, "file:missing.rs");
-        assert_eq!(panels.get(THREAD_A), before);
-
-        panels.close_others(THREAD_A, "file:missing.rs");
-        assert_eq!(panels.get(THREAD_A), before);
-
-        panels.close_to_right(THREAD_A, "file:missing.rs");
-        assert_eq!(panels.get(THREAD_A), before);
-
-        // Also verify on an absent thread: none of these create an entry.
-        panels.activate(THREAD_B, "diff");
-        panels.close_surface(THREAD_B, "diff");
-        panels.close_others(THREAD_B, "diff");
-        panels.close_to_right(THREAD_B, "diff");
-        assert_eq!(panels.get(THREAD_B), ThreadPanel::default());
-    }
-
-    #[test]
-    fn open_file_normalizes_trailing_slashes_and_line_zero() {
-        let mut panels = RightPanels::default();
-        panels.open_file(THREAD_A, "src/dir/", Some(0));
-        panels.open_file(THREAD_A, "C:/", None);
-        panels.open_file(THREAD_A, "/", None);
-
-        assert_eq!(
-            panels.get(THREAD_A).surfaces,
-            vec![
-                Surface::File {
-                    path: "src/dir".to_string(),
-                    reveal_line: Some(1),
-                    reveal_request: 1,
-                },
-                Surface::File {
-                    path: "C:/".to_string(),
-                    reveal_line: None,
-                    reveal_request: 1,
-                },
-                Surface::File {
-                    path: "/".to_string(),
-                    reveal_line: None,
-                    reveal_request: 1,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn activate_reopens_closed_panel_and_close_others_on_single_closed_surface_noop() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
+        panels.close_viewer(THREAD_A);
         panels.close(THREAD_A);
-        assert!(!panels.get(THREAD_A).open);
-
-        // close_others on a single-surface closed panel is a no-op.
-        panels.close_others(THREAD_A, "diff");
-        assert!(!panels.get(THREAD_A).open);
-
-        // activate opens the panel on the existing surface.
-        panels.activate(THREAD_A, "diff");
-        assert!(panels.get(THREAD_A).open);
-        assert_eq!(panels.active_surface(THREAD_A), Some(Surface::Diff));
-    }
-
-    #[test]
-    fn set_maximized_on_empty_closed_thread_is_evicted() {
-        let mut panels = RightPanels::default();
-        panels.set_maximized(THREAD_A, true);
         assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
     }
 

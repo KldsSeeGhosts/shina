@@ -1291,7 +1291,7 @@ pub(crate) fn tick(state: &mut State, tx: &mut Tx) -> bool {
     }
     let panel_key = state.panel_key();
     let visible =
-        state.right_panels.active_surface(&panel_key) == Some(crate::right_panel::Surface::Diff);
+        state.right_panels.active_view(&panel_key) == Some(crate::right_panel::PanelView::Diff);
     if !visible {
         return changed;
     }
@@ -2678,7 +2678,7 @@ mod tests {
 
         let panel = s.right_panels.get(&key);
         assert!(panel.open);
-        assert_eq!(panel.active.as_deref(), Some("diff"));
+        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
         let diff = &s.diffs[&key];
         // The file unfolds and its header row becomes the scroll target.
         assert!(!diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
@@ -2709,8 +2709,8 @@ mod tests {
         // The press waits on the in-flight request; the tab is already open.
         assert_eq!(s.diffs[&key].pending_reveal.as_deref(), Some("src/b.rs"));
         assert_eq!(
-            s.right_panels.active_surface(&key),
-            Some(crate::right_panel::Surface::Diff)
+            s.right_panels.active_view(&key),
+            Some(crate::right_panel::PanelView::Diff)
         );
         assert!(s.diffs[&key].reveal_row.is_none());
 
@@ -2755,8 +2755,8 @@ mod tests {
         // The tab still opens; nothing in the diff state moved.
         assert!(s.right_panels.get(&key).open);
         assert_eq!(
-            s.right_panels.active_surface(&key),
-            Some(crate::right_panel::Surface::Diff)
+            s.right_panels.active_view(&key),
+            Some(crate::right_panel::PanelView::Diff)
         );
         assert!(diff.reveal_row.is_none());
         assert!(diff.pending_reveal.is_none());

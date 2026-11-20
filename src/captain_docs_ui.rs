@@ -434,14 +434,13 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
     footer = footer.child(spacer());
     let cancel_key = key.clone();
     let panel_key = s.panel_key();
-    let surface_id = format!("captain-doc:{}:{}", key.captain, key.name);
     let mut cancel = ghost_button(
         s,
         "captain-doc-cancel".into(),
         "Cancel",
         p,
         move |s: &mut State| {
-            s.request_close_document(&cancel_key, &panel_key, &surface_id);
+            s.request_close_document(&cancel_key, &panel_key);
         },
     )
     .h(26.0)
@@ -470,7 +469,6 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
         footer = footer.child(replace);
         let discard_key = key.clone();
         let panel = s.panel_key().clone();
-        let surface = format!("captain-doc:{}:{}", key.captain, key.name);
         footer = footer.child(
             ghost_button(
                 s,
@@ -480,7 +478,6 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
                 move |s| {
                     s.doc_discard = Some(DocDiscard {
                         panel: panel.clone(),
-                        surface: surface.clone(),
                         key: discard_key.clone(),
                         kind: DiscardKind::Discard,
                     });

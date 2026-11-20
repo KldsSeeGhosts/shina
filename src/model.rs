@@ -697,21 +697,20 @@ pub enum CrewMutation {
 #[derive(Clone, Debug)]
 pub struct DocDiscard {
     pub panel: String,
-    pub surface: String,
     /// The draft's own identity: confirming always drops this draft, on this server,
     /// whatever machine the user has selected since.
     pub key: DocumentDraftKey,
     pub kind: DiscardKind,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum DiscardKind {
     /// Drop the draft only: the Cancel footer and "Discard mine" leave the tab open.
     Discard,
+    /// Close the viewer item: the panel stays open on the Diff segment.
     Close,
-    Others,
-    ToRight,
-    All,
+    /// Drop the draft and open a different document in its place.
+    Replace { captain: usize, name: String },
 }
 
 /// What a move picker does on selection: move an existing member, or join a root thread.
@@ -4896,10 +4895,6 @@ pub struct State {
     /// Per-thread right-panel state: surfaces, open and maximized. Session only; only the
     /// width is saved.
     pub right_panels: crate::right_panel::RightPanels,
-    /// The right-panel tab context menu: the surface it opened on, and its anchor in window
-    /// points, as `row_menu_at` holds the thread menu's. The panel view uses both.
-    pub right_panel_menu: Option<String>,
-    pub right_panel_menu_at: Option<(f32, f32)>,
     /// The resize handle is mid-drag: the edge line turns coral.
     pub right_panel_resizing: bool,
     /// Per-thread diff panel state, keyed like right_panels. Session only.
@@ -6001,8 +5996,6 @@ impl State {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             right_panel_width: crate::right_panel::DEFAULT_WIDTH,
             right_panels: Default::default(),
-            right_panel_menu: None,
-            right_panel_menu_at: None,
             right_panel_resizing: false,
             diffs: Default::default(),
             diff_hide_tests: false,
@@ -6188,18 +6181,20 @@ impl State {
     /// Diff surface on a thread that has none yet (KSG's `toggleRightPanel`).
     pub fn right_panel_toggle(&mut self) {
         let key = self.panel_key();
-        if self.right_panels.get(&key).surfaces.is_empty() {
+        if self.right_panels.get(&key).open || self.right_panels.get(&key).viewer.is_some() {
+            self.right_panels.toggle_visibility(&key);
+        } else {
             self.right_panels
                 .open(&key, crate::right_panel::SingletonKind::Diff);
-        } else {
-            self.right_panels.toggle_visibility(&key);
         }
+        self.close_side_region();
     }
     /// `diff.toggle`: KSG's `onToggleDiff`, the Diff surface's toggle.
     pub fn right_panel_toggle_diff(&mut self) {
         let key = self.panel_key();
         self.right_panels
             .toggle(&key, crate::right_panel::SingletonKind::Diff);
+        self.close_side_region();
     }
     /// `rightPanel.toggleMaximized`: KSG gates it on the panel being open.
     pub fn right_panel_toggle_maximized(&mut self) {
@@ -6209,15 +6204,45 @@ impl State {
             self.right_panels.set_maximized(&key, !panel.maximized);
         }
     }
-    /// `rightPanel.close`: closes the active surface; returns false when the panel has none,
-    /// so the shortcut can fall through, as KSG's handler does.
+    /// `rightPanel.close`: closes the open viewer first, then the panel. Returns false
+    /// when neither exists so the shortcut can fall through, as KSG's handler does.
     pub fn right_panel_close_active(&mut self) -> bool {
         let key = self.panel_key();
-        let Some(surface) = self.right_panels.active_surface(&key) else {
-            return false;
-        };
-        self.request_close_surface(&key, &surface.id());
-        true
+        let panel = self.right_panels.get(&key);
+        if panel.open
+            && panel.view == crate::right_panel::PanelView::Viewer
+            && panel.viewer.is_some()
+        {
+            self.request_close_viewer(&key);
+            return true;
+        }
+        if panel.open {
+            self.right_panels.close(&key);
+            return true;
+        }
+        if panel.viewer.is_some() {
+            self.request_close_viewer(&key);
+            return true;
+        }
+        false
+    }
+    /// The panel and the Brief or Session drawer share one right-side region: an
+    /// opening panel hides the drawer.
+    pub(crate) fn close_side_region(&mut self) {
+        if self.right_panels.get(&self.panel_key()).open {
+            self.show_activity = false;
+            self.activity_full = false;
+            self.brief.confirm_reset = false;
+            self.brief.record = None;
+        }
+    }
+    /// The drawer equivalent of [`State::close_side_region`]: an opening Brief or
+    /// Session drawer hides the current thread's panel.
+    pub(crate) fn close_right_panel_for_drawer(&mut self) {
+        let key = self.panel_key();
+        if self.right_panels.get(&key).open {
+            self.right_panels.close(&key);
+        }
     }
     pub fn expire_undo(&mut self) -> bool {
         let at = lifecycle::now();
@@ -25172,54 +25197,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // `rightPanel.toggle`: an empty thread opens the Diff surface; an open one hides and
-    // re-shows keeping its surfaces (KSG `toggleRightPanel`).
+    // `rightPanel.toggle`: an empty thread opens the Diff segment; an open one hides and
+    // re-shows keeping its segment (KSG `toggleRightPanel`).
     #[test]
     fn right_panel_toggle_opens_diff_then_hides_and_reshows() {
         let mut state = State::new(".".into(), false);
 
-        // Empty thread: opens the Diff surface.
+        // Empty thread: opens the Diff segment.
         state.right_panel_toggle();
         let panel = state.right_panel();
         assert!(panel.open);
-        assert_eq!(panel.active.as_deref(), Some("diff"));
+        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
 
-        // Open panel on Diff: hides, keeping the surface and the tab selection.
+        // Open panel on Diff: hides, keeping the segment selection.
         state.right_panel_toggle();
         let hidden = state.right_panel();
         assert!(!hidden.open);
-        assert_eq!(hidden.active.as_deref(), Some("diff"));
-        assert_eq!(hidden.surfaces.len(), 1);
+        assert_eq!(hidden.view, crate::right_panel::PanelView::Diff);
 
-        // Hidden with surfaces: re-shows on the same tab.
+        // Hidden: re-shows on the same segment.
         state.right_panel_toggle();
         let shown = state.right_panel();
         assert!(shown.open);
-        assert_eq!(shown.active.as_deref(), Some("diff"));
+        assert_eq!(shown.view, crate::right_panel::PanelView::Diff);
 
-        // Open on a file: hides too.
+        // Open on the viewer: hides too.
         let key = state.panel_key();
-        state.right_panels.open_file(&key, "src/main.rs", Some(7));
+        state
+            .right_panels
+            .open_captain_document(&key, 0, "NOTES.md");
         state.right_panel_toggle();
         let hidden = state.right_panel();
         assert!(!hidden.open);
-        assert_eq!(hidden.active.as_deref(), Some("file:src/main.rs"));
+        assert_eq!(hidden.view, crate::right_panel::PanelView::Viewer);
     }
 
-    // `diff.toggle` on an open file tab activates Diff without hiding; on Diff it hides.
+    // `diff.toggle` on the viewer segment shows Diff without hiding; on Diff it hides.
     #[test]
     fn right_panel_toggle_diff_switches_or_hides() {
         let mut state = State::new(".".into(), false);
 
         state.right_panel_toggle_diff();
-        assert_eq!(state.right_panel().active.as_deref(), Some("diff"));
+        assert_eq!(
+            state.right_panel().view,
+            crate::right_panel::PanelView::Diff
+        );
 
         let key = state.panel_key();
-        state.right_panels.open_file(&key, "src/main.rs", None);
+        state
+            .right_panels
+            .open_captain_document(&key, 0, "NOTES.md");
         state.right_panel_toggle_diff();
         let switched = state.right_panel();
         assert!(switched.open);
-        assert_eq!(switched.active.as_deref(), Some("diff"));
+        assert_eq!(switched.view, crate::right_panel::PanelView::Diff);
 
         state.right_panel_toggle_diff();
         assert!(!state.right_panel().open);
@@ -25245,23 +25276,26 @@ mod tests {
         assert!(!state.right_panel().maximized);
     }
 
-    // `rightPanel.close` closes only the active surface and reports whether it did.
+    // `rightPanel.close` closes the open viewer first, then the panel.
     #[test]
-    fn right_panel_close_active_closes_one_surface() {
+    fn right_panel_close_active_closes_the_viewer_then_the_panel() {
         let mut state = State::new(".".into(), false);
 
-        // No surfaces: reports false so the key can fall through.
+        // Nothing open: reports false so the key can fall through.
         assert!(!state.right_panel_close_active());
 
         state.right_panel_toggle();
         let key = state.panel_key();
-        state.right_panels.open_file(&key, "src/main.rs", None);
+        state
+            .right_panels
+            .open_captain_document(&key, 0, "NOTES.md");
         assert!(state.right_panel_close_active());
         let panel = state.right_panel();
         assert!(panel.open);
-        assert_eq!(panel.active.as_deref(), Some("diff"));
+        assert!(panel.viewer.is_none());
+        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
 
-        // Closing the last surface closes the panel too.
+        // With no viewer left the same shortcut closes the panel.
         assert!(state.right_panel_close_active());
         assert_eq!(
             state.right_panel(),
@@ -25291,14 +25325,16 @@ mod tests {
 
         state.right_panel_toggle();
         let key = state.panel_key();
-        state.right_panels.open_file(&key, "src/lib.rs", None);
+        state
+            .right_panels
+            .open_captain_document(&key, 0, "NOTES.md");
 
-        // Back on the first thread its Diff surface is still open and maximized.
+        // Back on the first thread its Diff view is still open and maximized.
         state.select_thread(0);
         let panel = state.right_panel();
         assert!(panel.open);
         assert!(panel.maximized);
-        assert_eq!(panel.active.as_deref(), Some("diff"));
+        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
 
         // Deleting a thread forgets its panel state.
         let mut ids = std::collections::HashSet::new();

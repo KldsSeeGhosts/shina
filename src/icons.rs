@@ -256,6 +256,14 @@ glyph!(
     GAUGE,
     r#"<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>"#
 );
+glyph!(
+    INFO,
+    r#"<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>"#
+);
+glyph!(
+    BOOK,
+    r#"<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H19a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H6.5a1 1 0 0 1 0-5H20"/>"#
+);
 
 /// Every name `glyph` knows, for tests.
 #[cfg(test)]
@@ -331,6 +339,8 @@ pub(super) const NAMES: &[&str] = &[
     "reply",
     "fork",
     "gauge",
+    "info",
+    "book",
 ];
 
 /// The glyph for an icon name. Unknown names draw a check.
@@ -402,6 +412,8 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "reply" => &REPLY,
         "fork" => &FORK,
         "gauge" => &GAUGE,
+        "info" => &INFO,
+        "book" => &BOOK,
         _ => &CHECK,
     }
 }

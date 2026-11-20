@@ -313,6 +313,8 @@ fn dispatch_global_command(
             state.show_activity = !state.show_activity;
             if !state.show_activity {
                 state.activity_full = false;
+            } else {
+                state.close_right_panel_for_drawer();
             }
             state.checkpoint();
         }
@@ -1064,6 +1066,7 @@ fn captain_brief_demo(state: &mut State) {
         ..Default::default()
     });
     state.show_activity = true;
+    state.close_right_panel_for_drawer();
 }
 
 /// Confirmation examples use only the demo's records and a read-only preview.
@@ -1380,6 +1383,7 @@ fn main() {
                 state.populate_demo();
                 state.dark = true;
                 state.show_activity = true;
+                state.close_right_panel_for_drawer();
             }),
             // A five paragraph draft that wraps past the composer's 200 pt text window.
             ("composer-long-draft", long_draft_demo),
