@@ -213,6 +213,26 @@ fn key_inner(
     dispatch_global_command(state, command, event, key_repeat, tx)
 }
 
+fn modal_dialog_open(state: &State) -> bool {
+    state.settings_menu
+        || state.project_picker.is_some()
+        || state.captain_picker
+        || state.captain_editor.is_some()
+        || state.projects.clone_open
+        || state.machines.dialog
+        || state.fleet.open
+        || state.settings.archive.is_some()
+        || state.rename_thread.is_some()
+        || state.delete_thread.is_some()
+        || state.confirm_remove_attachment.is_some()
+        || state.attachment_preview.is_some()
+        || state.brief.confirm_reset
+        || state.brief.profile_open
+        || state.doc_discard.is_some()
+        || state.plan_save_dialog.is_some()
+        || state.brief.lifecycle.is_some()
+}
+
 fn composer_controls_blocked(state: &State) -> bool {
     let t = state.current();
     state.demo
@@ -337,8 +357,18 @@ fn dispatch_global_command(
                 .right_panels
                 .open(&key, crate::right_panel::SingletonKind::Context);
         }
-        "navigation.back" => state.nav_back(),
-        "navigation.forward" => state.nav_forward(),
+        "navigation.back" => {
+            if state.quick_switcher || modal_dialog_open(state) {
+                return false;
+            }
+            state.nav_back();
+        }
+        "navigation.forward" => {
+            if state.quick_switcher || modal_dialog_open(state) {
+                return false;
+            }
+            state.nav_forward();
+        }
         "rightPanel.toggleMaximized" => {
             // KSG ignores repeats here, and gates the toggle on the panel being open.
             if !key_repeat {
@@ -388,6 +418,8 @@ fn dispatch_global_command(
             }
             if state.quick_switcher {
                 state.quick_switcher = false;
+            } else if modal_dialog_open(state) {
+                return false;
             } else {
                 state.open_quick_switcher();
             }

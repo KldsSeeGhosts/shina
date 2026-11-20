@@ -10,7 +10,15 @@ use super::*;
 #[derive(Clone)]
 enum Row {
     Local(usize),
-    Machine(String, usize, String, Option<crate::model::Status>),
+    Machine {
+        server: String,
+        id: usize,
+        title: String,
+        captain: bool,
+        workspace: String,
+        updated: u64,
+        status: Option<crate::model::Status>,
+    },
 }
 
 /// The list's entries for the current query, in display order. Section labels
@@ -19,6 +27,25 @@ enum Row {
 /// of "Recent" rows they start with (zero while a query is typed).
 fn rows(s: &State) -> Vec<Row> {
     rows_with_recent(s).0
+}
+
+fn row_key(s: &State, row: &Row) -> String {
+    match row {
+        Row::Local(index) => {
+            format!(
+                "quick-switcher-row-{}-{}",
+                s.machines.selected, s.threads[*index].id
+            )
+        }
+        Row::Machine { server, id, .. } => format!("quick-switcher-row-{server}-{id}"),
+    }
+}
+
+fn row_is_captain(s: &State, row: &Row) -> bool {
+    match row {
+        Row::Local(i) => s.is_captain_home(&s.threads[*i]),
+        Row::Machine { captain, .. } => *captain,
+    }
 }
 
 fn rows_with_recent(s: &State) -> (Vec<Row>, usize) {
@@ -34,54 +61,149 @@ fn rows_with_recent(s: &State) -> (Vec<Row>, usize) {
         // Recent first, from the history's newest entries, minus the open one.
         let current = s.current().id;
         let machine = s.machines.selected.clone();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
         for (server, id) in s.nav_history.recent().take(12) {
             if recent >= 6 {
                 break;
             }
             if server == &machine {
-                if *id == current || !seen.insert(*id) {
+                if *id == current || !seen.insert((server.clone(), *id)) {
                     continue;
                 }
                 if let Some(index) = s.threads.iter().position(|t| t.id == *id) {
                     out.push(Row::Local(index));
                     recent += 1;
                 }
-            } else if seen.insert(*id)
-                && let Some(title) = s.machines.views.get(server).and_then(|projection| {
-                    projection["index"]["threads"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|t| t["id"].as_u64() == Some(*id as u64))
-                        .and_then(|t| t["title"].as_str())
-                        .map(str::to_string)
-                })
+            } else if seen.insert((server.clone(), *id))
+                && let Some((title, captain, workspace, updated)) =
+                    s.machines.views.get(server).and_then(|projection| {
+                        let record = projection["index"]["threads"]
+                            .as_array()?
+                            .iter()
+                            .find(|t| t["id"].as_u64() == Some(*id as u64))?;
+                        let title = record["title"].as_str()?.to_string();
+                        let captain = record["captainHome"] == true;
+                        let workspace = projection["index"]["projects"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|p| !record["project"].is_null() && p["id"] == record["project"])
+                            .and_then(|p| p["name"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let updated = record["updated"].as_u64().unwrap_or(0);
+                        Some((title, captain, workspace, updated))
+                    })
             {
-                out.push(Row::Machine(server.clone(), *id, title, None));
+                out.push(Row::Machine {
+                    server: server.clone(),
+                    id: *id,
+                    title,
+                    captain,
+                    workspace,
+                    updated,
+                    status: None,
+                });
                 recent += 1;
             }
         }
     }
-    // Captains, then the rest in the sidebar's order. With a query both
-    // sections filter by the title (and, for a captain, its name).
-    for index in s.sidebar_captains() {
-        let t = &s.threads[index];
-        let name = t
-            .captain
-            .and_then(|c| s.captains.get(c).map(|p| p.name.as_str()))
-            .unwrap_or("");
-        if matches(t, name) {
-            out.push(Row::Local(index));
-        }
-    }
-    for index in s.sidebar_threads() {
-        let t = &s.threads[index];
-        if t.captain_home {
+    // Walk every machine in the sidebar's own order (grouped when Workspace grouping is on).
+    let mut nav_seen: std::collections::HashSet<(String, usize)> = Default::default();
+    for (server, id) in sidebar_navigation(s) {
+        if !nav_seen.insert((server.clone(), id)) {
             continue;
         }
-        if matches(t, "") {
-            out.push(Row::Local(index));
+        if server == s.machines.selected {
+            let Some(index) = s.threads.iter().position(|t| t.id == id) else {
+                continue;
+            };
+            let t = &s.threads[index];
+            let extra = t
+                .captain
+                .and_then(|c| s.captains.get(c).map(|p| p.name.as_str()))
+                .unwrap_or("");
+            if matches(t, extra) {
+                out.push(Row::Local(index));
+            }
+        } else if let Some(projection) = s.machines.views.get(&server)
+            && let Some(record) = projection["index"]["threads"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| t["id"].as_u64() == Some(id as u64))
+        {
+            let title = record["title"].as_str().unwrap_or("Thread").to_string();
+            let captain = record["captainHome"] == true;
+            let cap_name = record["captain"]
+                .as_u64()
+                .and_then(|idx| projection["index"]["captains"].get(idx as usize))
+                .and_then(|c| c["name"].as_str())
+                .unwrap_or("");
+            let workspace = projection["index"]["projects"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|p| !record["project"].is_null() && p["id"] == record["project"])
+                .and_then(|p| p["name"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if query.is_empty()
+                || title.to_lowercase().contains(&query)
+                || cap_name.to_lowercase().contains(&query)
+                || workspace.to_lowercase().contains(&query)
+            {
+                let status = projection
+                    .views
+                    .get(&(id as u64))
+                    .and_then(|v| serde_json::from_value(v.record["status"].clone()).ok());
+                out.push(Row::Machine {
+                    server,
+                    id,
+                    title,
+                    captain,
+                    workspace,
+                    updated: record["updated"].as_u64().unwrap_or(0),
+                    status,
+                });
+            }
+        }
+    }
+    // Also include matching threads from collapsed groups while searching.
+    if !query.is_empty() {
+        for entry in sidebar_ui::entries(s) {
+            if !nav_seen.insert((entry.server.to_owned(), entry.id)) {
+                continue;
+            }
+            if let Some(index) = entry.local {
+                let t = &s.threads[index];
+                let extra = t
+                    .captain
+                    .and_then(|c| s.captains.get(c).map(|p| p.name.as_str()))
+                    .unwrap_or("");
+                if matches(t, extra) {
+                    out.push(Row::Local(index));
+                }
+            } else if let Some(projection) = s.machines.views.get(entry.server)
+                && let Some(record) = projection["index"]["threads"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t["id"].as_u64() == Some(entry.id as u64))
+            {
+                let title = record["title"].as_str().unwrap_or("Thread").to_string();
+                if title.to_lowercase().contains(&query) {
+                    out.push(Row::Machine {
+                        server: entry.server.to_owned(),
+                        id: entry.id,
+                        title,
+                        captain: entry.captain,
+                        workspace: String::new(),
+                        updated: record["updated"].as_u64().unwrap_or(0),
+                        status: None,
+                    });
+                }
+            }
         }
     }
     (out, recent)
@@ -94,44 +216,32 @@ pub(super) fn view(s: &State, p: Palette) -> El {
     let (all, recent_count) = rows_with_recent(s);
     // Classify rows into sections for an empty query; with a query everything
     // lists flat under the two headings.
-    let mut sections: Vec<(&'static str, Vec<Row>)> = Vec::new();
+    let mut sections: Vec<(Option<&'static str>, Vec<Row>)> = Vec::new();
     if query.is_empty() {
         let (recent, rest) = all.split_at(recent_count);
         let captains: Vec<Row> = rest
             .iter()
-            .filter(|row| matches!(row, Row::Local(i) if s.is_captain_home(&s.threads[*i])))
+            .filter(|row| row_is_captain(s, row))
             .cloned()
             .collect();
         let threads: Vec<Row> = rest
             .iter()
-            .filter(|row| !matches!(row, Row::Local(i) if s.is_captain_home(&s.threads[*i])))
+            .filter(|row| !row_is_captain(s, row))
             .cloned()
             .collect();
         if !recent.is_empty() {
-            sections.push(("Recent", recent.to_vec()));
+            sections.push((Some("Recent"), recent.to_vec()));
         }
         if !captains.is_empty() {
-            sections.push(("Captains", captains));
+            sections.push((Some("Captains"), captains));
         }
         if !threads.is_empty() {
-            sections.push(("Threads", threads));
+            sections.push((Some("Threads"), threads));
         }
     } else {
-        let captains: Vec<Row> = all
-            .iter()
-            .filter(|row| matches!(row, Row::Local(i) if s.is_captain_home(&s.threads[*i])))
-            .cloned()
-            .collect();
-        let threads: Vec<Row> = all
-            .iter()
-            .filter(|row| !matches!(row, Row::Local(i) if s.is_captain_home(&s.threads[*i])))
-            .cloned()
-            .collect();
-        if !captains.is_empty() {
-            sections.push(("Captains", captains));
-        }
-        if !threads.is_empty() {
-            sections.push(("Threads", threads));
+        // Filtered query: one flat list without section headings (spec §1.6).
+        if !all.is_empty() {
+            sections.push((None, all.clone()));
         }
     }
     let highlight = s.quick_switcher_highlight.min(all.len().saturating_sub(1));
@@ -147,13 +257,15 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         .gap(1.0);
     let mut index = 0usize;
     for (name, group) in sections {
-        list = list.child(
-            row()
-                .h(28.0)
-                .px(8.0)
-                .center_y()
-                .child(meta_label(name, p.faint)),
-        );
+        if let Some(name) = name {
+            list = list.child(
+                row()
+                    .h(28.0)
+                    .px(8.0)
+                    .center_y()
+                    .child(meta_label(name, p.faint)),
+            );
+        }
         for row in group {
             let lit = index == highlight;
             list = list.child(switcher_row(s, p, &row, index, lit));
@@ -196,20 +308,32 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                         .grow(1.0)
                         .min_w(0.0)
                         .on_edit(|s: &mut State| &mut s.quick_switcher_query)
-                        .on_input_key(|s: &mut State, event, _| {
+                        .on_input_key(|s: &mut State, event, tx| {
                             if edits_text(event) {
                                 s.quick_switcher_highlight = 0;
                             }
-                            let count = rows(s).len();
+                            let all_rows = rows(s);
+                            let count = all_rows.len();
                             let at = s.quick_switcher_highlight.min(count.saturating_sub(1));
                             match event.key {
                                 rune::Key::Down if count > 0 => {
                                     s.quick_switcher_highlight = (at + 1).min(count - 1);
-                                    eprintln!("down -> {}", s.quick_switcher_highlight);
+                                    if let Some(next) = all_rows.get(s.quick_switcher_highlight) {
+                                        tx.scroll_into_view_in(
+                                            "quick-switcher-list",
+                                            row_key(s, next),
+                                        );
+                                    }
                                     true
                                 }
                                 rune::Key::Up => {
                                     s.quick_switcher_highlight = at.saturating_sub(1);
+                                    if let Some(prev) = all_rows.get(s.quick_switcher_highlight) {
+                                        tx.scroll_into_view_in(
+                                            "quick-switcher-list",
+                                            row_key(s, prev),
+                                        );
+                                    }
                                     true
                                 }
                                 rune::Key::Enter => {
@@ -257,11 +381,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
 /// One entry in the list: the thread's `tab_icon`, its title in `TITLE`, the
 /// workspace and age as the detail, and a 7 pt status mark at the end.
 fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> El {
-    let (server, id) = match entry {
-        Row::Local(index) => (s.machines.selected.clone(), s.threads[*index].id),
-        Row::Machine(server, id, _, _) => (server.clone(), *id),
-    };
-    let key = format!("quick-switcher-row-{server}-{id}");
+    let key = row_key(s, entry);
     let mut built = row()
         .key(key)
         .role("menuitem")
@@ -296,10 +416,12 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
             // Detail hides at the 620 pt card, where it would crowd the title.
             if s.viewport_width >= 700.0 {
                 let project = s.project(t.project).map(|p| p.name.as_str()).unwrap_or("");
-                let detail = if project.is_empty() {
-                    s.machine_label(&s.machines.selected)
-                } else {
-                    project.to_string()
+                let age = relative_time(t.updated);
+                let detail = match (project.is_empty(), age) {
+                    (false, Some(age)) => format!("{project} · {age}"),
+                    (false, None) => project.to_string(),
+                    (true, Some(age)) => age,
+                    (true, None) => s.machine_label(&s.machines.selected),
                 };
                 built = built.child(
                     label(detail, SMALL, p.faint)
@@ -310,7 +432,14 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
             }
             built = built.child(status_mark(t.status, p, 7.0));
         }
-        Row::Machine(server, _, title, status) => {
+        Row::Machine {
+            server,
+            title,
+            workspace,
+            updated,
+            status,
+            ..
+        } => {
             built = built
                 .label(title)
                 .child(
@@ -325,8 +454,18 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
                         .min_w(0.0),
                 );
             if s.viewport_width >= 700.0 {
+                let machine = s.machine_label(server);
+                let age = relative_time(*updated);
+                let mut parts = Vec::new();
+                if !workspace.is_empty() {
+                    parts.push(workspace.clone());
+                }
+                parts.push(machine);
+                if let Some(age) = age {
+                    parts.push(age);
+                }
                 built = built.child(
-                    label(s.machine_label(server), SMALL, p.faint)
+                    label(parts.join(" · "), SMALL, p.faint)
                         .truncate()
                         .shrink()
                         .max_w(160.0),
@@ -345,7 +484,7 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
 fn open_row(s: &mut State, row: &Row) {
     match row {
         Row::Local(index) => s.show_thread(*index),
-        Row::Machine(server, id, _, _) => s.open_machine_thread(server, *id),
+        Row::Machine { server, id, .. } => s.open_machine_thread(server, *id),
     }
 }
 
@@ -381,7 +520,7 @@ mod tests {
         // the open thread itself.
         let target = match super::rows(&rt.state)[0] {
             super::Row::Local(index) => rt.state.threads[index].id,
-            super::Row::Machine(_, id, _, _) => id,
+            super::Row::Machine { id, .. } => id,
         };
         crate::ui::tests::tap(&mut rt, rune::Key::Down);
         assert_eq!(rt.state.quick_switcher_highlight, 1);

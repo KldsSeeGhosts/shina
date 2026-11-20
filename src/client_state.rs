@@ -1910,6 +1910,7 @@ impl State {
         ui["ghostAnchor"] = json!(self.ghost_anchor);
         ui["dark"] = json!(self.dark);
         ui["zoom"] = json!(self.zoom);
+        ui["tabsEnabled"] = json!(self.tabs_enabled);
         self.machines.ui[&self.machines.selected] = ui.clone();
         // The top-level legacy format remains the local server's namespace.
         let mut saved = self.machines.ui["local"].clone();
@@ -1924,6 +1925,7 @@ impl State {
             "sidebar",
             "sidebarWidth",
             "shelves",
+            "tabsEnabled",
             "sidebarGrouping",
             "collapsedGroups",
             "background",
@@ -2557,6 +2559,14 @@ impl State {
         } else {
             self.zoom
         };
+        let tabs_enabled = if first {
+            self.client_views["localUi"]["tabsEnabled"]
+                .as_bool()
+                .or_else(|| projection["index"]["tabsEnabled"].as_bool())
+                .unwrap_or(self.tabs_enabled)
+        } else {
+            self.tabs_enabled
+        };
         let scope = self.project_scope;
         let additional = self.scope_additional.clone();
         let old_homes = self.captain_homes.clone();
@@ -2790,6 +2800,15 @@ impl State {
         }
         self.dark = dark;
         self.zoom = zoom;
+        self.tabs_enabled = tabs_enabled;
+        if !self.tabs_enabled
+            && let Some(active_id) = self.threads.get(self.active).map(|t| t.id)
+        {
+            self.tabs.clear();
+            self.tabs.push(active_id);
+            self.ghost_tab = None;
+            self.ghost_anchor = None;
+        }
         self.project_scope = scope;
         self.scope_additional = additional;
         self.recovery_notice = projection["recoveryNotice"].as_str().map(str::to_owned);
@@ -3250,6 +3269,7 @@ impl State {
             self.sidebar,
             self.sidebar_width,
             self.shelves,
+            self.tabs_enabled,
             self.sidebar_grouping,
             self.collapsed_groups.clone(),
             self.background.settings.clone(),
@@ -3346,6 +3366,7 @@ impl State {
             self.sidebar,
             self.sidebar_width,
             self.shelves,
+            self.tabs_enabled,
             self.sidebar_grouping,
             self.collapsed_groups,
             self.background.settings,
@@ -4365,7 +4386,9 @@ impl State {
                 Some("This thread is no longer available on that machine.".into());
             return;
         }
-        self.select_machine(server);
+        // Never spawn a throwaway fallback draft into NavHistory when jumping directly
+        // to a specific thread on another machine.
+        self.select_machine_without_draft(server);
         if self.machines.selected == server
             && let Some(index) = self.threads.iter().position(|thread| thread.id == id)
         {

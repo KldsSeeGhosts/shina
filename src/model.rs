@@ -4873,15 +4873,22 @@ impl NavHistory {
     /// Drop every entry naming a thread that no longer exists, keeping the
     /// cursor on the same entry where it can. Returns whether anything left.
     pub fn retain(&mut self, mut exists: impl FnMut(&str, usize) -> bool) {
-        let current = self.entries.get(self.cursor).cloned();
-        self.entries
-            .retain(|(server, id)| exists(server.as_str(), *id));
+        let old_cursor = self.cursor;
+        let mut next = Vec::with_capacity(self.entries.len());
+        let mut new_cursor = None;
+        for (idx, entry) in self.entries.drain(..).enumerate() {
+            if exists(entry.0.as_str(), entry.1) {
+                if idx <= old_cursor {
+                    new_cursor = Some(next.len());
+                }
+                next.push(entry);
+            }
+        }
+        self.entries = next;
         if self.entries.is_empty() {
             self.cursor = 0;
         } else {
-            self.cursor = current
-                .and_then(|entry| self.entries.iter().position(|e| *e == entry))
-                .unwrap_or_else(|| self.cursor.min(self.entries.len() - 1));
+            self.cursor = new_cursor.unwrap_or(0).min(self.entries.len() - 1);
         }
     }
     /// The most recent entries first, for the quick switcher's "Recent" list.
@@ -6621,7 +6628,7 @@ impl State {
     fn focus_thread(&mut self, index: usize) {
         if !self.tabs_enabled
             && let Some(id) = self.threads.get(index).map(|t| t.id)
-            && !self.tabs.contains(&id)
+            && self.tabs != [id]
         {
             // The strip is off: one slot, the open thread's.
             self.tabs.clear();
@@ -16702,6 +16709,7 @@ impl State {
         if let Some(width) = self.diff_tree_width {
             value["diffTreeWidth"] = json!(width);
         }
+        value["tabsEnabled"] = json!(self.tabs_enabled);
         if self.sidebar_grouping != SidebarGrouping::default() {
             value["sidebarGrouping"] = json!(self.sidebar_grouping);
         }
@@ -16781,6 +16789,9 @@ impl State {
                     crate::ui::diff_tree::MAX_W as f64,
                 ) as f32
             });
+        if let Some(enabled) = ui.get("tabsEnabled").and_then(Value::as_bool) {
+            self.tabs_enabled = enabled;
+        }
         self.sidebar_grouping = ui
             .get("sidebarGrouping")
             .and_then(|v| serde_json::from_value(v.clone()).ok())

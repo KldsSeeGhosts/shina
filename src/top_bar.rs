@@ -76,7 +76,7 @@ pub(super) fn bar(s: &State, p: Palette, narrow: bool, compact: bool, tabs_width
 /// captain) as a quiet first segment, then the title in `TITLE`. Press opens
 /// the quick switcher, double press the rename dialog, secondary press the
 /// thread menu.
-fn thread_title(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
+fn thread_title(s: &State, p: Palette, _narrow: bool, compact: bool) -> El {
     let t = s.current();
     let mut first: Option<El> = None;
     let mut first_label = String::new();
@@ -159,7 +159,9 @@ fn thread_title(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                     ),
             );
         }
-    } else if !narrow && let Some(project) = s.project(t.project) {
+    } else if s.viewport_width >= 960.0
+        && let Some(project) = s.project(t.project)
+    {
         // Below 960 pt of window width the project segment hides.
         first_label = project.name.clone();
         first = Some(
@@ -204,9 +206,14 @@ fn thread_title(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         .on_press(|s: &mut State| {
             s.open_quick_switcher();
         })
-        .on_double_press(|s: &mut State| {
-            let id = s.current().id;
-            s.begin_rename(id);
+        .on_key(|s: &mut State, ev, _| {
+            if ev.key == rune::Key::Function(2) {
+                let id = s.current().id;
+                s.begin_rename(id);
+                true
+            } else {
+                false
+            }
         })
         .on_secondary_press(|s: &mut State, at, _| {
             let id = s.current().id;
@@ -236,14 +243,27 @@ fn thread_title(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
             .min_w(0.0),
     );
     if let Some(machine) = machine {
-        title = title.child(
-            label(machine, SMALL, p.faint)
-                .key("thread-title-machine")
-                .truncate()
-                .max_w(120.0)
-                .shrink(),
-        );
+        let _ = machine;
+        title = title.child(machine_tag(
+            s,
+            p,
+            &s.machines.selected,
+            "thread-title-machine".into(),
+            SMALL,
+            true,
+        ));
     }
+    let rename_id = t.id;
+    title = title.child(
+        icon_button(
+            "thread-title-rename",
+            "Rename thread",
+            "edit",
+            p,
+            move |s: &mut State| s.begin_rename(rename_id),
+        )
+        .group_opacity(0.0, 1.0),
+    );
     title = title.child(
         icon("chevron-down", p.faint)
             .size(12.0, 12.0)
