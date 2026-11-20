@@ -1524,6 +1524,42 @@ fn acp_reports_option_descriptors_and_applies_config_and_mode_options() {
     assert_eq!(client.wire.last().unwrap()["params"]["value"], "high");
 }
 
+/// An unflagged probe spawn pops a console window on Windows for console hosts
+/// like agy or claude. The fixture reports its own console handle and pid so the
+/// test can check both the launch flags and that the probe reaps the agent.
+#[cfg(windows)]
+#[test]
+fn an_initialize_probe_has_no_console_window_and_reaps_the_agent() {
+    let (agent, log) = fixture(&["--record-launch"]);
+    let capabilities = probe(&agent).unwrap();
+    assert_eq!(capabilities["mcpCapabilities"]["stdio"], true);
+    let wire = records(&log);
+    let launch = wire
+        .iter()
+        .find_map(|record| record.get("fixtureLaunch"))
+        .expect("fixture launch record");
+    assert!(
+        launch.get("consoleWindow").is_some_and(Value::is_null),
+        "the probe agent inherited or created a console: {launch}"
+    );
+    assert_eq!(
+        wire.iter()
+            .filter_map(|record| record["method"].as_str())
+            .collect::<Vec<_>>(),
+        ["initialize"],
+        "the probe must send initialize only: {wire:?}"
+    );
+    let pid = launch["pid"].as_u64().expect("fixture pid") as u32;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while crate::process::is_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the probe agent outlived the probe"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn acp_fresh_session_issues_session_new_and_not_resume_or_load() {
     let mut client = Client::new(spec(SessionSource::New));

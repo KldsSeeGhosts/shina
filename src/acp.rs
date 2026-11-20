@@ -46,12 +46,14 @@ pub(crate) fn probe_live(agent: &Agent) -> Result<Value, String> {
 }
 
 fn probe_uncached(agent: &Agent) -> Result<Value, String> {
-    let mut child = agent
-        .process()?
+    let mut command = agent.process()?;
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    // The same owned launch as sessions: no console window on Windows and the
+    // job object reaps agent descendants on every return path.
+    let mut child = crate::process::Process::spawn(&mut command)
         .map_err(|error| format!("Could not start ACP harness {}: {error}", agent.id))?;
     let mut stdin = child
         .stdin
