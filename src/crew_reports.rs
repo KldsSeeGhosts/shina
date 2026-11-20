@@ -765,6 +765,13 @@ mod tests {
             .threads
             .retain(|t| t.crew_captain.is_none() && !t.captain_home);
         state.active = 0;
+        if state.threads.is_empty() {
+            // A leftover checkpoint can hold only captain threads; with tabs
+            // off a blank draft loses its slot and drops out of the index.
+            state.threads.push(Thread::new(state.next_id));
+            state.next_id += 1;
+            state.tabs = vec![state.threads[0].id];
+        }
         state
             .tabs
             .retain(|id| state.threads.iter().any(|t| t.id == *id));

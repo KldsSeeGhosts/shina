@@ -3,7 +3,7 @@ use std::collections::HashMap;
 /// KSG `useResizableWidth`'s minimum panel width.
 pub const MIN_WIDTH: f32 = 360.0;
 /// KSG `useResizableWidth`'s starting width.
-pub const DEFAULT_WIDTH: f32 = 540.0;
+pub const DEFAULT_WIDTH: f32 = 420.0;
 /// KSG's keyboard resize step for the panel's Left and Right keys. The resize
 /// handle's key handler uses it.
 pub const KEYBOARD_STEP: f32 = 16.0;
@@ -62,28 +62,38 @@ impl Surface {
     }
 }
 
-/// The segment the panel shows: the diff, or the lone viewer item.
+/// The Inspector's four fixed tabs. `right_panel_body` degrades a stored view
+/// the open thread does not offer (such as Crew on a plain thread) to
+/// `Overview`, so saved state always lands somewhere real.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PanelView {
     #[default]
+    Overview,
+    Crew,
+    Context,
     Diff,
-    Viewer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingletonKind {
+    Overview,
+    Crew,
+    Context,
     Diff,
 }
 
 impl SingletonKind {
     fn into_view(self) -> PanelView {
         match self {
+            Self::Overview => PanelView::Overview,
+            Self::Crew => PanelView::Crew,
+            Self::Context => PanelView::Context,
             Self::Diff => PanelView::Diff,
         }
     }
 
     fn matches_view(self, view: PanelView) -> bool {
-        matches!((self, view), (Self::Diff, PanelView::Diff))
+        self.into_view() == view
     }
 }
 
@@ -91,7 +101,8 @@ impl SingletonKind {
 pub struct ThreadPanel {
     pub open: bool,
     pub view: PanelView,
-    /// At most one open viewer item; `None` leaves only the Diff segment.
+    /// The one viewer item, routed inside the Context tab: `Context` shows it
+    /// while `Some`, the context list while `None`.
     pub viewer: Option<Surface>,
     pub maximized: bool,
 }
@@ -115,14 +126,10 @@ impl RightPanels {
         });
     }
 
-    /// Switches the panel to the viewer's segment without opening one; a
-    /// no-op while no viewer exists.
-    pub fn show_viewer(&mut self, thread: &str) {
+    /// Shows the panel on its stored view, or the default tab on a fresh entry.
+    pub fn show(&mut self, thread: &str) {
         self.update_thread(thread, |current| {
-            if current.viewer.is_some() {
-                current.open = true;
-                current.view = PanelView::Viewer;
-            }
+            current.open = true;
         });
     }
 
@@ -132,7 +139,7 @@ impl RightPanels {
     pub fn open_captain_document(&mut self, thread: &str, captain: usize, name: &str) {
         self.update_thread(thread, |current| {
             current.open = true;
-            current.view = PanelView::Viewer;
+            current.view = PanelView::Context;
             current.viewer = Some(Surface::CaptainDocument {
                 captain,
                 name: name.to_string(),
@@ -149,26 +156,21 @@ impl RightPanels {
         };
         self.update_thread(from, |current| {
             current.viewer = None;
-            if current.view == PanelView::Viewer {
-                current.view = PanelView::Diff;
-            }
         });
         self.update_thread(to, |current| {
             current.viewer = Some(viewer);
-            if source.open && source.view == PanelView::Viewer {
+            if source.open && source.view == PanelView::Context {
                 current.open = true;
-                current.view = PanelView::Viewer;
+                current.view = PanelView::Context;
             }
         });
     }
 
-    /// Closes the viewer item. The panel stays open on the Diff segment.
+    /// Closes the viewer item. The panel stays on Context, which shows the
+    /// document list again.
     pub fn close_viewer(&mut self, thread: &str) {
         self.update_thread(thread, |current| {
             current.viewer = None;
-            if current.view == PanelView::Viewer {
-                current.view = PanelView::Diff;
-            }
         });
     }
 
@@ -223,7 +225,14 @@ impl RightPanels {
     fn update_thread(&mut self, thread: &str, f: impl FnOnce(&mut ThreadPanel)) {
         let mut next = self.threads.get(thread).cloned().unwrap_or_default();
         f(&mut next);
-        if !next.open && next.viewer.is_none() && !next.maximized {
+        // A closed entry that still carries state (a viewer, the maximized flag,
+        // or a non-default last tab) stays so the panel reopens where it left off;
+        // a default closed entry is dropped.
+        if !next.open
+            && next.viewer.is_none()
+            && !next.maximized
+            && next.view == PanelView::default()
+        {
             self.threads.remove(thread);
         } else if self.threads.get(thread) != Some(&next) {
             self.threads.insert(thread.to_string(), next);
@@ -246,48 +255,48 @@ mod tests {
     }
 
     #[test]
-    fn open_diff_on_empty_thread() {
+    fn open_overview_on_empty_thread() {
         let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.open(THREAD_A, SingletonKind::Overview);
 
         assert_eq!(
             panels.get(THREAD_A),
             ThreadPanel {
                 open: true,
-                view: PanelView::Diff,
+                view: PanelView::Overview,
                 viewer: None,
                 maximized: false,
             }
         );
-        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Diff));
+        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Overview));
     }
 
     #[test]
-    fn open_diff_twice_keeps_one_segment() {
+    fn open_overview_twice_keeps_one_segment() {
         let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.open(THREAD_A, SingletonKind::Overview);
+        panels.open(THREAD_A, SingletonKind::Overview);
 
         let state = panels.get(THREAD_A);
-        assert_eq!(state.view, PanelView::Diff);
+        assert_eq!(state.view, PanelView::Overview);
         assert!(state.viewer.is_none());
         assert!(state.open);
     }
 
     #[test]
-    fn a_second_document_replaces_the_viewer_and_close_returns_to_diff() {
+    fn a_second_document_replaces_the_viewer_and_close_returns_to_the_context_list() {
         let mut panels = RightPanels::default();
         panels.open_captain_document(THREAD_A, 0, "NOTES.md");
         panels.open_captain_document(THREAD_A, 0, "AGENTS.md");
 
         let state = panels.get(THREAD_A);
         assert_eq!(state.viewer, Some(doc(0, "AGENTS.md")));
-        assert_eq!(state.view, PanelView::Viewer);
+        assert_eq!(state.view, PanelView::Context);
 
         panels.close_viewer(THREAD_A);
         let state = panels.get(THREAD_A);
         assert!(state.open);
-        assert_eq!(state.view, PanelView::Diff);
+        assert_eq!(state.view, PanelView::Context);
         assert!(state.viewer.is_none());
     }
 
@@ -305,15 +314,16 @@ mod tests {
         panels.toggle(THREAD_A, SingletonKind::Diff);
         let closed = panels.get(THREAD_A);
         assert!(!closed.open);
+        // Hiding keeps the last tab so a re-open lands where the user left off.
         assert_eq!(closed.view, PanelView::Diff);
 
         // Closed again: reopens on Diff.
         panels.toggle(THREAD_A, SingletonKind::Diff);
         assert!(panels.get(THREAD_A).open);
 
-        // Open on the viewer: switches to Diff and stays open.
+        // Open on a document in Context: switches to Diff and stays open.
         panels.open_captain_document(THREAD_A, 0, "NOTES.md");
-        assert_eq!(panels.get(THREAD_A).view, PanelView::Viewer);
+        assert_eq!(panels.get(THREAD_A).view, PanelView::Context);
         panels.toggle(THREAD_A, SingletonKind::Diff);
         let switched = panels.get(THREAD_A);
         assert!(switched.open);
@@ -325,7 +335,8 @@ mod tests {
     fn toggle_visibility_hides_and_reshows() {
         let mut panels = RightPanels::default();
 
-        // Empty: toggling shows a bare panel, and hiding it evicts the entry.
+        // Empty: toggling shows a bare panel on the default tab, and hiding it
+        // evicts the entry.
         panels.toggle_visibility(THREAD_A);
         assert!(panels.get(THREAD_A).open);
         panels.toggle_visibility(THREAD_A);
@@ -336,13 +347,13 @@ mod tests {
         panels.toggle_visibility(THREAD_A);
         let hidden = panels.get(THREAD_A);
         assert!(!hidden.open);
-        assert_eq!(hidden.view, PanelView::Viewer);
+        assert_eq!(hidden.view, PanelView::Context);
         assert_eq!(hidden.viewer, Some(doc(0, "NOTES.md")));
         assert_eq!(panels.active_view(THREAD_A), None);
 
         panels.toggle_visibility(THREAD_A);
         assert!(panels.get(THREAD_A).open);
-        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Viewer));
+        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Context));
     }
 
     #[test]
@@ -359,33 +370,19 @@ mod tests {
     }
 
     #[test]
-    fn show_viewer_only_with_a_viewer() {
+    fn carry_moves_the_viewer_and_keeps_the_context_tab() {
         let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.show_viewer(THREAD_A);
-        assert_eq!(panels.get(THREAD_A).view, PanelView::Diff);
-
-        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.show_viewer(THREAD_A);
-        assert_eq!(panels.get(THREAD_A).view, PanelView::Viewer);
-    }
-
-    #[test]
-    fn carry_moves_the_viewer_and_keeps_the_diff_segment() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
         panels.open_captain_document(THREAD_A, 0, "NOTES.md");
 
         panels.carry_captain_documents(THREAD_A, THREAD_B);
         let from = panels.get(THREAD_A);
         assert!(from.viewer.is_none());
-        assert_eq!(from.view, PanelView::Diff);
-        assert!(from.open, "the diff stays open on the old home");
+        assert_eq!(from.view, PanelView::Context);
+        assert!(from.open, "the context list stays open on the old home");
 
         let to = panels.get(THREAD_B);
         assert!(to.open);
-        assert_eq!(to.view, PanelView::Viewer);
+        assert_eq!(to.view, PanelView::Context);
         assert_eq!(to.viewer, Some(doc(0, "NOTES.md")));
 
         // A hidden or diff-selected source carries the item without opening it.
@@ -402,11 +399,11 @@ mod tests {
     #[test]
     fn threads_are_isolated_and_forget_removes_one() {
         let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
+        panels.open(THREAD_A, SingletonKind::Overview);
         panels.set_maximized(THREAD_A, true);
         panels.open_captain_document(THREAD_B, 0, "NOTES.md");
 
-        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Diff));
+        assert_eq!(panels.active_view(THREAD_A), Some(PanelView::Overview));
         assert_eq!(panels.get(THREAD_B).viewer, Some(doc(0, "NOTES.md")));
 
         panels.forget(THREAD_A);
@@ -424,6 +421,15 @@ mod tests {
 
         panels.open_captain_document(THREAD_A, 0, "NOTES.md");
         panels.close_viewer(THREAD_A);
+        panels.close(THREAD_A);
+        // The stored Context view stays so the panel reopens on its last tab.
+        let closed = panels.get(THREAD_A);
+        assert!(!closed.open);
+        assert_eq!(closed.view, PanelView::Context);
+        assert!(closed.viewer.is_none());
+
+        panels.toggle_visibility(THREAD_A);
+        panels.open(THREAD_A, SingletonKind::Overview);
         panels.close(THREAD_A);
         assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
     }

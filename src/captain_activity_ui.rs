@@ -228,25 +228,37 @@ fn open_activity_source(s: &mut State, tx: &mut Tx, server: String, captain: usi
     if !source_known(s, &server, thread) {
         return;
     }
-    if s.brief.record.is_some() || s.viewport_width < SHEET_BELOW {
-        close_brief(s);
+    close_brief(s);
+    // The card opens on the primary home's chat; a covering Inspector would hide it.
+    if s.brief.record.is_some() || s.inspector_covers() {
+        let key = s.panel_key();
+        s.right_panels.close(&key);
     }
     let kind = entry["kind"].as_str().unwrap_or("");
     if kind == "crew_question" {
         let rid = entry["reportId"].as_str().unwrap_or("").to_string();
-        let card_drawn = !rid.is_empty()
+        let question_index = (!rid.is_empty()
             && s.captain_phase(captain) == crate::model::CaptainPhase::Active
-            && s.captain_home(captain).is_some()
-            && s.open_crew_questions(captain, QuestionRecipient::User)
+            && s.captain_home(captain).is_some())
+        .then(|| {
+            s.open_crew_questions(captain, QuestionRecipient::User)
                 .iter()
-                .any(|view| view.report_id == rid);
-        if card_drawn {
+                .position(|view| view.report_id == rid)
+        })
+        .flatten();
+        if let Some(q_idx) = question_index {
             let home = s.captain_home(captain).expect("home checked above");
             if s.current().id != home
                 && let Some(index) = s.threads.iter().position(|t| t.id == home)
             {
                 s.show_thread(index);
             }
+            let live_count = s
+                .attention()
+                .into_iter()
+                .filter(|item| super::crew_ui::needs_you_item(s, home, item))
+                .count();
+            s.needs_you_page = live_count + q_idx;
             tx.scroll_into_view(format!("needs-you-report-{rid}"));
             tx.focus(format!("needs-you-report-{rid}-text"), true);
             return;
@@ -492,7 +504,9 @@ fn group(
 /// to a `Value` at the seam so this view depends on the snapshot's fields, not
 /// on the record types. Needs-you, what's-new and in-progress groups render
 /// only while they hold entries.
-pub(super) fn activity(s: &State, p: Palette, captain: usize) -> El {
+/// The Overview's "What's new" (spec §3.4): the digest's "What's new" group on its
+/// own. "Needs you" lives in the request bar and "In progress" in the Crew tab.
+pub(super) fn activity_whats_new(s: &State, p: Palette, captain: usize) -> El {
     let digest = s
         .captain_activity_digest(captain)
         .ok()
@@ -504,34 +518,17 @@ pub(super) fn activity(s: &State, p: Palette, captain: usize) -> El {
         .get(captain)
         .map(|c| c.name.clone())
         .unwrap_or_else(|| "the captain".into());
-    let entries = |name: &str| digest[name].as_array().cloned().unwrap_or_default();
-    let needs_you = entries("needsYou");
-    let whats_new = entries("whatsNew");
-    let in_progress = entries("inProgress");
-    if needs_you.is_empty() && whats_new.is_empty() && in_progress.is_empty() {
-        return quiet_note(
-            format!("No crew activity yet. Reports and questions from {captain_name}'s crew appear here."),
-            p,
-        )
-        .key("brief-activity-empty");
+    let whats_new = digest["whatsNew"].as_array().cloned().unwrap_or_default();
+    if whats_new.is_empty() {
+        return quiet_note(format!("Nothing new from {captain_name}'s crew yet."), p)
+            .key("brief-activity-empty");
     }
     col()
         .key("brief-activity")
         .role("group")
-        .label("Crew activity")
+        .label("What's new")
         .gap(4.0)
         .pb(4.0)
-        .child(group(
-            s,
-            p,
-            "needs-you",
-            "Needs you",
-            &needs_you,
-            digest["truncated"]["needsYou"].as_u64().unwrap_or(0) as usize,
-            &server,
-            captain,
-            &captain_name,
-        ))
         .child(group(
             s,
             p,
@@ -539,17 +536,6 @@ pub(super) fn activity(s: &State, p: Palette, captain: usize) -> El {
             "What's new",
             &whats_new,
             digest["truncated"]["whatsNew"].as_u64().unwrap_or(0) as usize,
-            &server,
-            captain,
-            &captain_name,
-        ))
-        .child(group(
-            s,
-            p,
-            "in-progress",
-            "In progress",
-            &in_progress,
-            digest["truncated"]["inProgress"].as_u64().unwrap_or(0) as usize,
             &server,
             captain,
             &captain_name,
@@ -885,7 +871,10 @@ mod tests {
         asking.title = "Deploy worker".into();
         asking.request = Some(json!({"method":"confirm","title":"Allow deploy?","message":""}));
         rt.state.threads.push(asking);
-        rt.state.show_activity = true;
+        let key = rt.state.panel_key();
+        rt.state
+            .right_panels
+            .open(&key, crate::right_panel::SingletonKind::Overview);
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
@@ -902,6 +891,15 @@ mod tests {
         rt.pointer_down(rect[0] + 8.0, rect[1] + 4.0);
         rt.pointer_up(rect[0] + 8.0, rect[1] + 4.0);
         rt.frame(0.0);
+    }
+
+    /// Open the Inspector on `kind`, as pressing its strip segment does.
+    fn open_tab(rt: &mut rune::Runtime<State>, kind: crate::right_panel::SingletonKind) {
+        let key = rt.state.panel_key();
+        rt.state.right_panels.open(&key, kind);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.5);
     }
 
     /// Every label the panel presented, for wording assertions.
@@ -922,18 +920,20 @@ mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             brief(&mut rt);
-            assert!(rt.presented("brief-activity").is_some(), "{width}");
+            // "What's new" is the only activity group left on the Overview: the
+            // request lives in the needs-you bar and the busy workers in the Crew
+            // tab (spec §3.4). With no reports yet it reads as the quiet note.
             assert!(
-                rt.presented("brief-activity-needs-you").is_some(),
+                rt.presented("brief-activity-empty").is_some()
+                    || rt.presented("brief-activity-whats-new").is_some(),
                 "{width}"
             );
             assert!(
-                rt.presented("brief-activity-in-progress").is_some(),
+                rt.presented("brief-activity-needs-you").is_none(),
                 "{width}"
             );
-            // Four busy workers draw three rows and one Show more button.
             assert!(
-                rt.presented("brief-activity-in-progress-more").is_some(),
+                rt.presented("brief-activity-in-progress").is_none(),
                 "{width}"
             );
             let (policy, _) = rt.presented("captain-report-policy").unwrap();
@@ -952,7 +952,8 @@ mod tests {
             for text in presented_labels(&rt) {
                 assert!(!text.contains(" · "), "{width}: {text}");
             }
-            rt.state.show_activity = false;
+            let key = rt.state.panel_key();
+            rt.state.right_panels.close(&key);
         }
     }
 
@@ -961,37 +962,29 @@ mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             brief(&mut rt);
-            press_in_brief(&mut rt, "brief-activity-in-progress-more");
-            rt.frame(1.0);
-            // The group now draws all four workers and the button reads fewer.
-            let four = rt
+            // The busy workers moved to the Crew tab's Working group (spec §3.5),
+            // which lists them all without a Show more fold.
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
+            let worker_ids: Vec<usize> = rt
+                .state
+                .threads
+                .iter()
+                .filter(|t| t.title.starts_with("Crew worker"))
+                .map(|t| t.id)
+                .collect();
+            let working = rt
                 .elements()
                 .into_iter()
                 .filter(|e| {
-                    e.key
-                        .as_deref()
-                        .is_some_and(|key| key.starts_with("brief-activity-in-progress-crew-"))
+                    worker_ids
+                        .iter()
+                        .any(|id| e.key.as_deref() == Some(format!("crew-chip-{id}").as_str()))
                 })
                 .count();
-            assert_eq!(four, 4, "{width}");
-            assert_eq!(
-                element_text(&rt, "brief-activity-in-progress-more").as_deref(),
-                Some("Show fewer"),
-                "{width}"
-            );
-            press_in_brief(&mut rt, "brief-activity-in-progress-more");
-            rt.frame(1.0);
-            let three = rt
-                .elements()
-                .into_iter()
-                .filter(|e| {
-                    e.key
-                        .as_deref()
-                        .is_some_and(|key| key.starts_with("brief-activity-in-progress-crew-"))
-                })
-                .count();
-            assert_eq!(three, 3, "{width}");
-            rt.state.show_activity = false;
+            assert_eq!(working, 4, "{width}: the four busy crew workers");
+            assert!(rt.presented("crew-group-working").is_some(), "{width}");
+            let key = rt.state.panel_key();
+            rt.state.right_panels.close(&key);
         }
     }
 
@@ -1006,16 +999,21 @@ mod tests {
             .find(|t| t.title == "Deploy worker")
             .unwrap()
             .id;
-        let asking_captain = rt.state.current().captain.unwrap_or(0);
-        let entry = rt
-            .state
-            .captain_activity_digest(asking_captain)
-            .unwrap()
-            .needs_you
-            .into_iter()
-            .find(|entry| entry.thread_id == asking)
-            .expect("the request is a needs-you entry");
-        press_in_brief(&mut rt, &format!("brief-activity-needs-you-{}", entry.id));
+        // The request bar above the composer carries the open-source link now
+        // (spec §3.6): the pressable title replaces the row's own button. The
+        // demo seeds another request, so page until this one is the shown card.
+        while rt
+            .presented(&format!("needs-you-source-{asking}"))
+            .is_none()
+        {
+            let Some((next, _)) = rt.presented("needs-you-next") else {
+                break;
+            };
+            rt.pointer_down(next[0] + 8.0, next[1] + 4.0);
+            rt.pointer_up(next[0] + 8.0, next[1] + 4.0);
+            rt.frame(0.3);
+        }
+        press_in_brief(&mut rt, &format!("needs-you-source-{asking}"));
         assert_eq!(rt.state.current().id, asking);
     }
 
@@ -1201,27 +1199,33 @@ mod tests {
     fn a_crew_question_row_opens_its_question_card() {
         let mut rt = runtime(620.0);
         brief(&mut rt);
+        // At 620 pt the Inspector covers the chat lane; close it to inspect the home's
+        // needs-you bar, then advance the unified pager past the demo's live approval.
+        let key = rt.state.panel_key();
+        rt.state.right_panels.close(&key);
         rt.state.demo = false;
-        let home = rt.state.current().id;
         let w0 = worker(&rt, "Crew worker 0");
         let rid = report(
             &mut rt,
             w0,
             Some(json!({"text":"Which branch?","recipient":"user"})),
         );
+        // `brief()` seeds two live approvals (pages 0 and 1); the report question is page 2.
+        rt.state.needs_you_page = 2;
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
-        press_in_brief(&mut rt, &format!("brief-activity-needs-you-{rid}"));
-        rt.frame(1.0);
-        // The sheet closes, the primary home is selected and the card's answer
-        // field takes focus — an answer typed on the worker is not a record.
-        assert!(!rt.state.show_activity);
-        assert_eq!(rt.state.current().id, home);
-        let focused = rt.elements().into_iter().find(|e| e.focused);
-        assert_eq!(
-            focused.and_then(|e| e.key).as_deref(),
-            Some(format!("needs-you-report-{rid}-text").as_str())
+        // The question card now lives in the needs-you bar on the captain home
+        // itself (spec §3.6); there is no Inspector row to press. The answer
+        // field is focusable right where the request sits.
+        assert!(rt.presented(&format!("needs-you-report-{rid}")).is_some());
+        let field = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(format!("needs-you-report-{rid}-text").as_str()));
+        assert!(
+            field.is_some_and(|e| e.focusable),
+            "the answer field takes focus"
         );
     }
 
@@ -1243,13 +1247,23 @@ mod tests {
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
-        let key = format!("brief-activity-needs-you-{rid}");
-        rt.update(|_, tx| tx.scroll_into_view(key.clone()));
-        rt.frame(0.0);
-        let label = element_text(&rt, &key).expect("the row stays listed");
-        assert!(label.contains("Answer saved"), "{label}");
-        assert!(label.contains("Not yet accepted"), "{label}");
-        // The question card itself leaves once the answer record exists.
+        let captain = rt.state.current().captain.unwrap();
+        assert!(
+            rt.state
+                .open_crew_questions(captain, QuestionRecipient::User)
+                .is_empty(),
+            "a saved answer no longer counts as an open question"
+        );
+        // The digest reads the saved-but-not-accepted state as answer_pending:
+        // the answer is stored, only the captain's acceptance is missing.
+        let entry = rt
+            .state
+            .captain_activity_digest(captain)
+            .unwrap()
+            .needs_you
+            .into_iter()
+            .find(|entry| entry.report_id.as_deref() == Some(rid.as_str()));
+        assert_eq!(entry.map(|e| e.status).as_deref(), Some("answer_pending"));
         assert!(rt.presented(&format!("needs-you-report-{rid}")).is_none());
     }
 
@@ -1267,6 +1281,7 @@ mod tests {
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
         press_in_brief(&mut rt, "captain-report-policy-context");
         let command = commands.try_recv().expect("the CAS command was sent");
         assert_eq!(command.method, "captain.reportPolicy");
@@ -1326,6 +1341,7 @@ mod tests {
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(1.0);
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
             press_in_brief(&mut rt, "captain-recovery-change");
             let command = commands.try_recv().expect("recovery command");
             assert_eq!(command.method, "captain.recoveryMode");
@@ -1379,9 +1395,7 @@ mod tests {
         rt.state.machines.selected = "studio".into();
         // The link reports disconnected only off the demo path.
         rt.state.demo = false;
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
         let reason =
             element_text(&rt, "captain-report-policy-reason").expect("the reason note draws");
         assert!(reason.ends_with("is unreachable."), "{reason}");
@@ -1441,6 +1455,7 @@ mod tests {
         // The headless State has no client, so the send refuses; the reason
         // lands on the block's error row, never a toast.
         rt.state.client = None;
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
         press_in_brief(&mut rt, "captain-report-policy-context");
         assert!(rt.presented("captain-report-policy-error").is_some());
         assert_eq!(rt.state.captain_report_policy(0), ReportPolicy::React);
@@ -1463,9 +1478,7 @@ mod tests {
             .views
             .insert("studio".into(), projection.into());
         rt.state.machines.selected = "studio".into();
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
         assert!(rt.presented("captain-report-policy").is_none());
         let reason =
             element_text(&rt, "captain-report-policy-reason").expect("the reason note draws");

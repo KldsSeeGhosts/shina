@@ -339,9 +339,9 @@ impl State {
                         || self.brief.record.as_ref()
                             == Some(&(server.to_string(), change.captain)));
                 if owns_brief {
-                    self.show_activity = false;
-                    self.activity_full = false;
                     self.brief.confirm_reset = false;
+                    self.brief.record = None;
+                    self.right_panels.close(&self.panel_key());
                 }
             }
             let title = match change.action {
@@ -759,10 +759,12 @@ mod tests {
     #[test]
     fn a_late_receipt_from_another_server_toasts_but_keeps_the_brief() {
         let mut state = fixture();
-        state.show_activity = true;
-        state.activity_full = true;
+        state.right_panels.open(
+            &state.panel_key(),
+            crate::right_panel::SingletonKind::Overview,
+        );
         // A demote queued on "studio" settles while the user has "local" and its
-        // Brief open: the pending record clears, a toast lands, and the Brief
+        // Inspector open: the pending record clears, a toast lands, and the panel
         // stays up because it belongs to the selected machine.
         let id = uuid::Uuid::new_v4();
         state.lifecycle_pending.insert(
@@ -778,12 +780,14 @@ mod tests {
             &accepted(json!({"captainVersion":"2","lifecycle":"retired"}))
         ));
         assert!(state.lifecycle_pending.is_empty());
-        assert!(state.show_activity);
+        assert!(state.right_panel().open);
         assert_eq!(state.toasts.len(), 1);
         // The same receipt on the selected machine closes it.
         let mut state = fixture();
-        state.show_activity = true;
-        state.activity_full = true;
+        state.right_panels.open(
+            &state.panel_key(),
+            crate::right_panel::SingletonKind::Overview,
+        );
         let id = uuid::Uuid::new_v4();
         state.lifecycle_pending.insert(
             ("local".into(), id),
@@ -797,7 +801,7 @@ mod tests {
             &command(id, "captain.demote"),
             &accepted(json!({"captainVersion":"2","lifecycle":"retired"}))
         ));
-        assert!(!state.show_activity);
+        assert!(!state.right_panel().open);
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 

@@ -413,21 +413,10 @@ mod tests {
     use crate::model::crew_questions::{AnswerActor, CrewAnswer};
 
     fn fixture() -> State {
-        let mut state = State::new(
-            std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
-            false,
-        );
-        state.load_global_for_test();
+        // A test can build more than one fixture. Loading the per-test profile
+        // here would let one fixture pick up another's asynchronous checkpoints.
+        let mut state = State::new(std::path::PathBuf::new(), false);
         state.captains = Captain::presets();
-        state.captain_reports.clear();
-        state.captain_homes.clear();
-        state
-            .threads
-            .retain(|t| t.crew_captain.is_none() && !t.captain_home);
-        state.active = 0;
-        state
-            .tabs
-            .retain(|id| state.threads.iter().any(|t| t.id == *id));
         state
     }
 

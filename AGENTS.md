@@ -47,12 +47,16 @@ Already ported:
 | `markdown_ui` style and `code_frame` | `ChatMarkdown.tsx`, `index.css` (`.chat-markdown`), `chat/MarkdownCodeBlock.tsx` |
 | `captain_editor` portrait grid | `settings/ProjectIconPickerDialog.tsx` (emoji grid) |
 | `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
-| `crew_ui::needs_you` | `chat/ChildThreadApprovals.tsx` |
-| `crew_ui::parent_bar`, `crew_ui::task_card` meta line | `chat/ProviderSubagentBar.tsx` |
-| `crew_ui::crew_tray` placement | `chat/QueuedRunsControl.tsx` |
+| `crew_ui::needs_you` | `chat/ChildThreadApprovals.tsx` (one paged request card, spec §3.6) |
+| `crew_ui::task_card` | `chat/ProviderSubagentBar.tsx` restyled as a single 32 pt work row (spec §3.7) |
+| `crew_ui::crew_tray` | `chat/QueuedRunsControl.tsx` — a flat 28 pt strip that toggles the Inspector on the Crew tab; never expands in place (spec §3.6) |
+| `crew_ui::parent_bar`, `crew_ui::crew_bar` | Shina-only 36 pt borderless notice bars (`p.selected`), shown only for actionable recovery/offline/pending-crew states (spec §3.8) |
+| `inspector_ui` tabs: `overview`/`crew` bodies, `worker_overview_body`, `peer_crew_body` | `chat/ChatRightPanel.tsx` + `chat/RightPanelTabs.tsx`; Crew tab is Shina-only (`crew_ui::roster_row` groups + pinned 44 pt footer) (spec §3.4, §3.5) |
 | `captain_hero` | `chat/DraftHeroHeadline.tsx` |
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
+| `inspector_ui::view` (right-panel shell, `right-panel-strip`, four segments) | `chat/ChatRightPanel.tsx`, `chat/RightPanelTabs.tsx` (fixed four-tab strip instead of KSG's scrollable list; Shina-only Overview/Crew/Context/Diff set) |
+| `top_bar::bar`, `quick_switcher::view` | `chat/CommandPalette.tsx`, `chat/CommandPaletteResults.tsx` (row metrics for the switcher; the single 40 pt title bar with nav buttons and the breadcrumb title is a Shina-only design) |
 
 The model picker and the reasoning menu are separate popovers, as in KSG Code. Model rows have no checkboxes: a click picks the model and Shift+click adds it to a multi-model send. The reasoning menu keeps the effort slider below instead of KSG's list of levels, at the user's request.
 

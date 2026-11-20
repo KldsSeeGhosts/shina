@@ -19,6 +19,222 @@ pub(super) struct Entry<'a> {
     pub search_hit: Option<crate::thread_search::ThreadSearchHit>,
 }
 
+/// One workspace group in the sidebar (ported from KSG Code's
+/// `SidebarProjectFolderHeader`). Groups sort by most recent row, pinned first
+/// inside each group, "Chats" (no workspace) last.
+pub(super) struct Group<'a> {
+    pub server: &'a str,
+    pub project: Option<usize>,
+    pub name: String,
+    pub project_data: Option<crate::projects::Project>,
+    pub rows: Vec<&'a Entry<'a>>,
+}
+
+impl<'a> Entry<'a> {
+    pub(super) fn project(&self, s: &State) -> Option<usize> {
+        if let Some(index) = self.local {
+            s.threads[index].project
+        } else {
+            self.record
+                .and_then(|r| r["project"].as_u64())
+                .and_then(|id| usize::try_from(id).ok())
+        }
+    }
+
+    pub(super) fn project_data(&self, s: &State) -> Option<crate::projects::Project> {
+        let project = self.project(s)?;
+        if self.local.is_some() {
+            s.project(Some(project)).cloned()
+        } else {
+            self.projection
+                .and_then(|p| p["index"]["projects"].as_array())
+                .into_iter()
+                .flatten()
+                .find(|p| p["id"].as_u64() == Some(project as u64))
+                .and_then(|p| crate::projects::Project::from_record(p, false))
+        }
+    }
+
+    pub(super) fn project_name(&self, s: &State) -> String {
+        self.project_data(s)
+            .map(|p| p.name)
+            .unwrap_or_else(|| "Chats".to_string())
+    }
+
+    pub(super) fn selected(&self, s: &State) -> bool {
+        self.server == s.machines.selected
+            && (self.id == s.selected_row() || s.selected_threads.contains(&self.id))
+    }
+
+    pub(super) fn needs_you(&self, s: &State) -> bool {
+        if let Some(index) = self.local {
+            let thread = &s.threads[index];
+            let (status, approval) = row_status(s, thread);
+            approval || thread.request.is_some() || status == Status::Waiting
+        } else {
+            !self.view.record["request"].is_null() || status_of_view(self.view) == Status::Waiting
+        }
+    }
+
+    pub(super) fn working(&self, s: &State) -> bool {
+        if let Some(index) = self.local {
+            row_status(s, &s.threads[index]).0 == Status::Running
+        } else {
+            status_of_view(self.view) == Status::Running
+        }
+    }
+
+    fn recent_rank(&self, s: &State) -> u64 {
+        // `updated` is in Unix seconds; lifecycle timestamps are in Unix milliseconds.
+        // Convert `updated` to ms before comparing, and exclude `pinned_at` so pinning
+        // a single row keeps it first inside its group without reordering the whole workspace.
+        let updated_ms = if let Some(index) = self.local {
+            s.threads[index].updated
+        } else {
+            self.record.and_then(|r| r["updated"].as_u64()).unwrap_or(0)
+        }
+        .saturating_mul(1000);
+        let life_ts = self
+            .life
+            .latest_user_message_at
+            .max(self.life.last_completed_at)
+            .unwrap_or(0);
+        updated_ms.max(life_ts)
+    }
+}
+
+/// Group ordinary active/pinned sidebar rows by `(server, project)`.
+pub(super) fn groups<'a>(s: &'a State, rows: &[&'a Entry<'a>]) -> Vec<Group<'a>> {
+    let mut grouped: Vec<Group<'a>> = Vec::new();
+    for &entry in rows {
+        let project = entry.project(s);
+        if let Some(group) = grouped
+            .iter_mut()
+            .find(|g| g.server == entry.server && g.project == project)
+        {
+            group.rows.push(entry);
+        } else {
+            grouped.push(Group {
+                server: entry.server,
+                project,
+                name: entry.project_name(s),
+                project_data: entry.project_data(s),
+                rows: vec![entry],
+            });
+        }
+    }
+    // Sort groups: "Chats" (no workspace) last, otherwise most recent row first.
+    // Rows inside each group already preserve pinned-first, lifecycle order.
+    grouped.sort_by(|a, b| {
+        a.project
+            .is_none()
+            .cmp(&b.project.is_none())
+            .then_with(|| {
+                let ra = a.rows.iter().map(|e| e.recent_rank(s)).max().unwrap_or(0);
+                let rb = b.rows.iter().map(|e| e.recent_rank(s)).max().unwrap_or(0);
+                rb.cmp(&ra)
+            })
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.server.cmp(b.server))
+            .then_with(|| a.project.cmp(&b.project))
+    });
+    grouped
+}
+
+/// Workspace group header, ported from KSG Code's `SidebarProjectFolderHeader`.
+pub(super) fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: bool) -> El {
+    let project_key = group
+        .project
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".into());
+    let key = format!("sidebar-group-{}-{project_key}", group.server);
+    let new_key = format!("new-thread-in-{}-{project_key}", group.server);
+    let server = group.server.to_string();
+    let project = group.project;
+    let new_server = server.clone();
+    let name = group.name.clone();
+    let needs_you = group.rows.iter().any(|e| e.needs_you(s));
+    let working = group.rows.iter().any(|e| e.working(s));
+    let lead = if group.project.is_some() {
+        project_tile(s, p, group.project_data.as_ref(), 16.0)
+    } else {
+        el().size(16.0, 16.0)
+            .center()
+            .a11y_hidden()
+            .child(icon("thread", p.muted).size(14.0, 14.0))
+    };
+    let mut header = rune::row()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(format!(
+            "{}, {} threads, {}",
+            name,
+            group.rows.len(),
+            if collapsed { "collapsed" } else { "expanded" }
+        ))
+        .focusable(true)
+        .h(28.0)
+        .mt(4.0)
+        .pl(ROW_INSET)
+        .pr(4.0)
+        .gap(8.0)
+        .center_y()
+        .radius(6.0)
+        .hover(p.selected)
+        .hover_group()
+        .on_press(move |s: &mut State| s.toggle_sidebar_group(server.clone(), project))
+        .child(lead)
+        .child(label(&name, META, p.muted).truncate().grow(1.0).min_w(0.0));
+    if multiple_machines(s) {
+        header = header.child(machine_tag(
+            s,
+            p,
+            group.server,
+            format!("sidebar-group-machine-{}-{project_key}", group.server),
+            SMALL,
+            sidebar_row_width(s) >= 232.0,
+        ));
+    }
+    if needs_you {
+        header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.brass).a11y_hidden());
+    } else if working {
+        header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
+    }
+    if collapsed {
+        header = header.child(label(
+            group.rows.len().to_string(),
+            META.features(TABULAR),
+            p.faint,
+        ));
+    }
+    let new_label = format!("New thread in {name}");
+    header
+        .child(
+            icon_button(&new_key, &new_label, "plus", p, move |s| {
+                if new_server != s.machines.selected && s.machine_connected(&new_server) {
+                    s.select_machine_without_draft(&new_server);
+                }
+                if new_server == s.machines.selected {
+                    s.new_thread_in(project);
+                }
+            })
+            .group_opacity(0.0, 1.0)
+            .help(new_label),
+        )
+        .child(
+            icon(
+                if collapsed {
+                    "chevron-right"
+                } else {
+                    "chevron-down"
+                },
+                p.faint,
+            )
+            .size(12.0, 12.0),
+        )
+}
+
 pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
     let mut entries = Vec::new();
     let searching = !s.search.text.is_empty();
@@ -78,13 +294,31 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             usize,
             Vec<(&Value, &crate::client_history::ThreadProjection)>,
         > = Default::default();
+        let mut home_by_captain: std::collections::HashMap<usize, usize> = Default::default();
+        if let Some(homes) = projection["index"]["captainHomes"].as_object() {
+            for (cap, home) in homes {
+                if let (Ok(cap), Some(home)) = (cap.parse::<usize>(), home.as_u64()) {
+                    home_by_captain.insert(cap, home as usize);
+                }
+            }
+        }
         for record in projection["index"]["threads"]
             .as_array()
             .into_iter()
             .flatten()
         {
-            if let (Some(parent), Some(id)) = (record["parent"].as_u64(), record["id"].as_u64()) {
-                children.entry(parent as usize).or_default().push((
+            let Some(id) = record["id"].as_u64() else {
+                continue;
+            };
+            let owner_home = record
+                .get("crewCaptain")
+                .and_then(Value::as_u64)
+                .and_then(|cap| home_by_captain.get(&(cap as usize)).copied())
+                .or_else(|| record["parent"].as_u64().map(|p| p as usize));
+            if let Some(home) = owner_home
+                && home != id as usize
+            {
+                children.entry(home).or_default().push((
                     record,
                     match views.get(&(id as usize)) {
                         Some(view) => *view,
@@ -139,8 +373,18 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                         .is_some_and(|parent| parent["captainHome"] == true);
             // Crew members list flat during search and in the archive, like local ones.
             let crew_worker = crew_member && (!query.is_empty() || s.show_archive);
+            // Keep a live remote captain visible in archive view when it has archived workers,
+            // matching the local `sidebar_captains` rule.
+            let captain_has_archived_worker = captain
+                && s.show_archive
+                && children.get(&id).is_some_and(|kids| {
+                    kids.iter().any(|(child, _)| {
+                        lifecycle::Lifecycle::from_record(child)
+                            .is_ok_and(|life| life.archived_at.is_some())
+                    })
+                });
             // Workspace IDs are paired with their server, including filter selections.
-            if life.archived_at.is_some() != s.show_archive
+            if (life.archived_at.is_some() != s.show_archive && !captain_has_archived_worker)
                 || !in_scope
                 || crew_member && !crew_worker
             {
@@ -298,6 +542,13 @@ fn status_of_view(view: &crate::client_history::ThreadProjection) -> Status {
     serde_json::from_value(view.record["status"].clone()).unwrap_or(Status::Ready)
 }
 
+fn view_running_seconds(view: &crate::client_history::ThreadProjection) -> Option<u64> {
+    if let Some(started_ms) = view.record["started_at"].as_u64() {
+        return Some(lifecycle::now().saturating_sub(started_ms) / 1000);
+    }
+    view.record["elapsed"].as_u64()
+}
+
 fn null_view() -> &'static crate::client_history::ThreadProjection {
     static NULL: std::sync::OnceLock<crate::client_history::ThreadProjection> =
         std::sync::OnceLock::new();
@@ -383,164 +634,125 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         let pixels = s
             .artwork
             .face_pixels(portrait, face_for(status), CAPTAIN_FACE);
-        let mut detail = Vec::new();
-        let running = std::iter::once(view)
-            .chain(entry.children.iter().map(|(_, view)| *view))
-            .filter(|view| status_of_view(view) == Status::Running)
+        let crew_count = entry
+            .children
+            .iter()
+            .filter(|(record, _)| {
+                lifecycle::Lifecycle::from_record(record)
+                    .is_ok_and(|life| life.archived_at.is_some() == s.show_archive)
+            })
             .count();
-        let approval = std::iter::once(view)
-            .chain(entry.children.iter().map(|(_, view)| *view))
-            .any(|view| view.record["request"]["method"] == "confirm");
-        match status {
-            Status::Running => detail.push(format!(
-                "{} {}",
-                running.max(1),
-                if running > 1 { "threads" } else { "thread" }
-            )),
-            Status::Waiting if approval => detail.push("approval".into()),
-            Status::Waiting if requests > 0 => detail.push("a question".into()),
-            _ => {
-                if record["renamed"] == true {
-                    detail.push(title.into());
-                }
-                let count = entry
-                    .children
-                    .iter()
-                    .filter(|(record, _)| {
-                        lifecycle::Lifecycle::from_record(record)
-                            .is_ok_and(|life| life.archived_at.is_some() == s.show_archive)
-                    })
-                    .count();
-                if count > 0 {
-                    detail.push(format!("{count} crew"));
-                }
-            }
-        }
-        if !workspace_named_by_filter(
+        let detail_text = if !workspace_named_by_filter(
             s,
             entry.server,
             record["project"].as_u64().map(|id| id as usize),
         ) {
-            detail.push(workspace.into());
-        }
+            workspace.to_string()
+        } else if crew_count > 0 {
+            format!("{crew_count} crew")
+        } else {
+            String::new()
+        };
         let timer = std::iter::once(view)
             .chain(entry.children.iter().map(|(_, view)| *view))
             .filter(|view| status_of_view(view) == Status::Running)
-            .filter_map(|view| view.record["elapsed"].as_u64())
+            .filter_map(view_running_seconds)
             .max();
-        let mut status_line = rune::row()
+        let mut trailing = rune::row()
             .key(format!("machine-status-{}-{id}", entry.server))
-            .h(18.0)
+            .h(20.0)
+            .gap(6.0)
+            .center_y();
+        if requests > 0 || status == Status::Waiting {
+            trailing = trailing.child(count_pill(requests.max(1), CountKind::NeedsYou, p));
+        } else if status == Status::Running {
+            trailing = trailing.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
+            if let Some(seconds) = timer {
+                trailing = trailing.child(label(
+                    elapsed_label(seconds),
+                    META.features(TABULAR),
+                    p.muted,
+                ));
+            }
+        } else if status == Status::Failed {
+            trailing = trailing
+                .child(el().size(6.0, 6.0).radius(3.0).fill(p.danger).a11y_hidden())
+                .child(meta_text("Failed", p.danger));
+        } else if unread > 0 {
+            trailing = trailing.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
+        }
+        let portrait_el = pixel_portrait(s, &pixels, CAPTAIN_FACE, p)
+            .key(format!("machine-portrait-{}-{id}", entry.server))
+            .a11y_hidden();
+        let portrait_el = if requests > 0 || status == Status::Waiting {
+            status_badge(p, portrait_el, CAPTAIN_FACE, Status::Waiting)
+        } else {
+            portrait_el
+        };
+        let show_detail = sidebar_row_width(s) >= 224.0 && !detail_text.is_empty();
+        let show_machine_name = sidebar_row_width(s) >= 232.0
+            && room_for_machine_name(
+                sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+                ICON + 48.0,
+                &detail_text,
+            );
+        let mut description = format!("{name}, {}", status.label());
+        if !detail_text.is_empty() {
+            description.push_str(&format!(", {detail_text}"));
+        }
+        description.push_str(&format!(", {machine_line}"));
+        let mut row_el = rune::row()
+            .h(40.0)
             .w_full()
-            .gap(8.0)
+            .pl(8.0)
+            .pr(8.0)
+            .gap(10.0)
             .center_y()
-            .child(meta_text(status.label(), status_ink(status, p)))
-            // The workspace keeps `WORKSPACE_FLOOR`, so the machine name gives way first, down
-            // to its icon alone.
             .child(
-                label(detail.join(", "), CAPTAIN_STATUS, p.muted)
+                el().size(CAPTAIN_SLOT, CAPTAIN_SLOT)
+                    .center()
+                    .child(portrait_el),
+            )
+            .child(
+                label(name, CAPTAIN_NAME, p.ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            );
+        if show_detail {
+            row_el = row_el.child(
+                label(detail_text, CAPTAIN_STATUS, p.faint)
                     .key(format!("machine-detail-{}-{id}", entry.server))
                     .truncate()
                     .shrink()
-                    .beside_tag(
-                        true,
-                        sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                        status.label().chars().count() as f32 * 6.6
-                            + 24.0
-                            + ICON
-                            + if timer.is_some() { TIMER_SLOT } else { 0.0 },
-                        &detail.join(", "),
-                    )
-                    .min_w(workspace_floor(
-                        sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                        // The status word, three gaps, the machine icon and the timer slot.
-                        status.label().chars().count() as f32 * 6.6
-                            + 24.0
-                            + ICON
-                            + if timer.is_some() { TIMER_SLOT } else { 0.0 },
-                        &detail.join(", "),
-                    )),
-            )
+                    .min_w(0.0),
+            );
+        }
+        row_el = row_el
             .child(machine_tag(
                 s,
                 p,
                 entry.server,
                 format!("machine-tag-{}-{id}", entry.server),
                 CAPTAIN_STATUS,
-                room_for_machine_name(
-                    sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                    status.label().chars().count() as f32 * 6.6
-                        + 24.0
-                        + ICON
-                        + if timer.is_some() { TIMER_SLOT } else { 0.0 },
-                    &detail.join(", "),
-                ),
+                show_machine_name,
             ))
-            // The machine sits 8 px after the workspace; the free space comes after it.
-            .child(spacer());
-        if let Some(seconds) = timer {
-            status_line = status_line.child(
-                label(elapsed_label(seconds), META.features(TABULAR), p.muted)
-                    .w(TIMER_SLOT)
-                    .align(rune::Align::End),
-            );
-        }
-        return item.radius(6.0).child(
-            rune::row()
-                .h(CAPTAIN_SLOT + 12.0)
-                .w_full()
-                .pl(6.0)
-                .pr(8.0)
-                .gap(10.0)
-                .center_y()
-                .child(
-                    el().size(CAPTAIN_SLOT, CAPTAIN_SLOT).center().child(
-                        pixel_portrait(s, &pixels, CAPTAIN_FACE, p)
-                            .key(format!("machine-portrait-{}-{id}", entry.server))
-                            .a11y_hidden(),
-                    ),
-                )
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .gap(1.0)
-                        .child(
-                            rune::row()
-                                .h(20.0)
-                                .gap(6.0)
-                                .center_y()
-                                .child(
-                                    label(name, CAPTAIN_NAME, p.ink)
-                                        .truncate()
-                                        .grow(1.0)
-                                        .min_w(0.0),
-                                )
-                                .child(
-                                    rune::row()
-                                        .w(BADGE_SLOT)
-                                        .h(18.0)
-                                        .center_y()
-                                        .child(spacer())
-                                        .child(if requests > 0 || status == Status::Waiting {
-                                            count_pill(requests.max(1), CountKind::NeedsYou, p)
-                                        } else if unread > 0 {
-                                            count_pill(unread, CountKind::Unread, p)
-                                        } else {
-                                            el()
-                                        }),
-                                ),
-                        )
-                        .child(status_line),
-                ),
-        );
+            .child(spacer())
+            .child(trailing);
+        return item
+            .label(description.clone())
+            .help(description)
+            .radius(6.0)
+            .child(row_el);
     }
     let shelved = matches!(
         lifecycle::section(&entry.life, lifecycle::now()),
         Section::Settled | Section::Snoozed
     );
     let at = lifecycle::now();
-    let state_label = if view.record["request"]["method"] == "confirm" {
+    let grouped = s.sidebar_grouped() && !shelved;
+    let approval = view.record["request"]["method"] == "confirm";
+    let state_label = if approval {
         "Approval"
     } else if requests > 0 {
         "Input"
@@ -558,25 +770,21 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         ""
     };
     let age = if state_label == "Working" {
-        view.record["elapsed"]
-            .as_u64()
-            .map(|secs| format!("Working {}", elapsed_label(secs)))
-            .or_else(|| Some("Working".into()))
-    } else if !state_label.is_empty() {
+        Some(elapsed_label(view_running_seconds(view).unwrap_or(0)))
+    } else if matches!(state_label, "Approval" | "Input" | "Waiting" | "Failed") {
         Some(state_label.into())
+    } else if shelved {
+        if lifecycle::section(&entry.life, at) == Section::Snoozed {
+            Some(lifecycle::wake_label(
+                entry.life.snoozed_until.unwrap_or(0),
+                at,
+            ))
+        } else {
+            relative_time(entry.life.settled_at.unwrap_or(0) / 1000)
+        }
     } else {
         relative_time(record["updated"].as_u64().unwrap_or(0))
     };
-    let mut meta = rune::row().h(18.0).gap(8.0).center_y();
-    if entry.draft || entry.life.pinned_at.is_some() {
-        meta = meta.child(
-            el().size(14.0, 16.0)
-                .center()
-                .child(icon(if entry.draft { "edit" } else { "pin" }, p.muted)),
-        );
-    }
-    // A remote crew member carries its captain's portrait and name where the project
-    // tile sits, whether it was delegated or independently recruited.
     let delegated_to_home = record["delegated"] == true
         && record["parent"]
             .as_u64()
@@ -601,138 +809,105 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                 .and_then(|index| projection["index"]["captains"].get(index as usize))
         })
         .flatten();
-    let (meta_tile, meta_name) = match worker_captain {
-        Some(captain) => {
-            let name = captain["name"].as_str().unwrap_or("Crew").to_string();
-            let portrait = captain["portrait"].as_u64().unwrap_or(0) as usize;
-            let pixels = s.artwork.face_pixels(portrait, face_for(status), 16.0);
-            (
+    let dot = |ink: Color| el().size(6.0, 6.0).radius(3.0).fill(ink).a11y_hidden();
+    let lead_content = if grouped {
+        if approval || requests > 0 || status == Status::Waiting {
+            Some(status_mark(Status::Waiting, p, 7.0).a11y_hidden())
+        } else if status == Status::Running || status == Status::Failed {
+            Some(status_mark(status, p, 7.0).a11y_hidden())
+        } else if entry.life.unread() || entry.life.woke(at) {
+            Some(dot(p.sea))
+        } else if entry.life.pinned_at.is_some() {
+            Some(icon("pin", p.faint).size(12.0, 12.0).a11y_hidden())
+        } else if entry.draft {
+            Some(icon("edit", p.faint).size(12.0, 12.0).a11y_hidden())
+        } else {
+            None
+        }
+    } else {
+        let tile = match worker_captain {
+            Some(captain) => {
+                let portrait = captain["portrait"].as_u64().unwrap_or(0) as usize;
+                let pixels = s.artwork.face_pixels(portrait, face_for(status), 16.0);
                 pixel_portrait(s, &pixels, 16.0, p)
                     .key(format!("machine-captain-portrait-{}-{id}", entry.server))
-                    .a11y_hidden(),
-                name,
-            )
-        }
-        None => (
-            project_tile(s, p, project_tile_data.as_ref(), 16.0),
-            workspace.to_string(),
-        ),
-    };
-    meta = meta.child(meta_tile).child(
-        rune::row()
-            .grow(1.0)
-            .min_w(0.0)
-            .gap(8.0)
-            .center_y()
-            .child(
-                label(meta_name.clone(), CARD_META, p.muted)
-                    .key(format!("machine-workspace-{}-{id}", entry.server))
-                    .truncate()
-                    .shrink()
-                    .beside_tag(
-                        true,
-                        sidebar_row_width(s) - 2.0 * ROW_INSET,
-                        16.0 + ICON + slot_width(age.as_deref()) + 32.0,
-                        &meta_name,
-                    )
-                    .min_w(if worker_captain.is_some() {
-                        0.0
-                    } else {
-                        workspace_floor(
-                            sidebar_row_width(s) - 2.0 * ROW_INSET,
-                            // The project tile, the machine icon, the status or age text and
-                            // the gaps between them.
-                            16.0 + ICON + slot_width(age.as_deref()) + 32.0,
-                            &meta_name,
-                        )
-                    }),
-            )
-            .child(machine_tag(
-                s,
-                p,
-                entry.server,
-                format!("machine-tag-{}-{id}", entry.server),
-                CARD_META,
-                room_for_machine_name(
-                    sidebar_row_width(s) - 2.0 * ROW_INSET,
-                    16.0 + ICON + slot_width(age.as_deref()) + 32.0,
-                    workspace,
-                ),
-            ))
-            // The machine sits 8 px after the workspace; the free space comes after it.
-            .child(spacer()),
-    );
-    if let Some(age) = age {
-        let ink = if status == Status::Waiting {
-            p.brass
-        } else if status == Status::Failed {
-            p.danger
-        } else if !state_label.is_empty() {
-            p.sea
-        } else {
-            p.muted
+                    .a11y_hidden()
+            }
+            None => project_tile(s, p, project_tile_data.as_ref(), 16.0),
         };
-        meta = meta.child(label(age, META.features(TABULAR), ink));
-    }
+        Some(status_badge(p, tile, 16.0, status))
+    };
+    let lead = el()
+        .size(16.0, 16.0)
+        .center()
+        .child(lead_content.unwrap_or_else(el));
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
         .as_str()
         .or_else(|| saved["text"].as_str())
         .unwrap_or("");
-    let title = label(
+    let highlighted = status == Status::Running
+        || status == Status::Waiting
+        || requests > 0
+        || entry.life.woke(at)
+        || entry.life.unread();
+    let (title_style, title_ink) = if shelved {
+        (ROW_QUIET, p.faint)
+    } else if highlighted {
+        (TITLE, p.ink)
+    } else {
+        (ROW_QUIET, p.muted)
+    };
+    let title_el = label(
         if entry.draft && !draft.trim().is_empty() {
             draft.lines().next().unwrap_or(title)
         } else {
             title
         },
-        if shelved {
-            LABEL
-        } else {
-            TextStyle::new(14.0, 500.0)
-        },
-        p.ink,
+        title_style,
+        title_ink,
     )
     .truncate()
+    .grow(1.0)
     .min_w(0.0);
-    if shelved {
-        item.child(
-            rune::row()
-                .h(34.0)
-                .px(ROW_INSET)
-                .gap(8.0)
-                .center_y()
-                .child(project_tile(s, p, project_tile_data.as_ref(), 16.0).help(&machine_line))
-                .child(title.grow(1.0))
-                .child(label(
-                    if lifecycle::section(&entry.life, at) == Section::Snoozed {
-                        lifecycle::wake_label(entry.life.snoozed_until.unwrap_or(0), at)
-                    } else {
-                        relative_time(entry.life.settled_at.unwrap_or(0) / 1000).unwrap_or_default()
-                    },
-                    META,
+    let mut slot = rune::row().h(20.0).gap(4.0).center_y();
+    if let Some(age) = age {
+        let ink = if approval || status == Status::Waiting || requests > 0 {
+            p.brass
+        } else if status == Status::Failed {
+            p.danger
+        } else if state_label == "Working" {
+            p.sea
+        } else {
+            p.faint
+        };
+        slot = slot.child(label(age, META.features(TABULAR), ink));
+    }
+    let main_line = rune::row()
+        .h(32.0)
+        .w_full()
+        .pl(ROW_INSET)
+        .pr(8.0)
+        .gap(8.0)
+        .center_y()
+        .child(lead)
+        .child(title_el)
+        .child(slot);
+    if let Some(hit) = &entry.search_hit {
+        item.help(format!("{workspace}, {machine_line}")).child(
+            col().w_full().min_w(0.0).pb(6.0).child(main_line).child(
+                el().pl(ROW_INSET + 24.0).pr(8.0).child(search_snippet_el(
+                    &server,
+                    id,
+                    &hit.snippet,
+                    &s.search.text,
                     p.muted,
+                    p.brass,
                 )),
+            ),
         )
     } else {
-        let mut body = col()
-            .grow(1.0)
-            .min_w(0.0)
-            .px(ROW_INSET)
-            .pt(9.0)
-            .pb(10.0)
-            .gap(5.0)
-            .child(meta)
-            .child(title);
-        if let Some(hit) = &entry.search_hit {
-            body = body.child(search_snippet_el(
-                &server,
-                id,
-                &hit.snippet,
-                &s.search.text,
-                p.muted,
-                p.brass,
-            ));
-        }
-        item.child(body)
+        item.help(format!("{workspace}, {machine_line}"))
+            .child(main_line)
     }
 }

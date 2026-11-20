@@ -213,6 +213,26 @@ fn key_inner(
     dispatch_global_command(state, command, event, key_repeat, tx)
 }
 
+fn modal_dialog_open(state: &State) -> bool {
+    state.settings_menu
+        || state.project_picker.is_some()
+        || state.captain_picker
+        || state.captain_editor.is_some()
+        || state.projects.clone_open
+        || state.machines.dialog
+        || state.fleet.open
+        || state.settings.archive.is_some()
+        || state.rename_thread.is_some()
+        || state.delete_thread.is_some()
+        || state.confirm_remove_attachment.is_some()
+        || state.attachment_preview.is_some()
+        || state.brief.confirm_reset
+        || state.brief.profile_open
+        || state.doc_discard.is_some()
+        || state.plan_save_dialog.is_some()
+        || state.brief.lifecycle.is_some()
+}
+
 fn composer_controls_blocked(state: &State) -> bool {
     let t = state.current();
     state.demo
@@ -320,16 +340,35 @@ fn dispatch_global_command(
             {
                 return false;
             }
-            state.show_activity = !state.show_activity;
-            if !state.show_activity {
-                state.activity_full = false;
-            } else {
-                state.close_right_panel_for_drawer();
-            }
+            state.right_panel_toggle_overview();
             state.checkpoint();
         }
         "rightPanel.toggle" => state.right_panel_toggle(),
         "diff.toggle" => state.right_panel_toggle_diff(),
+        "inspector.crew" => {
+            let key = state.panel_key();
+            state
+                .right_panels
+                .open(&key, crate::right_panel::SingletonKind::Crew);
+        }
+        "inspector.context" => {
+            let key = state.panel_key();
+            state
+                .right_panels
+                .open(&key, crate::right_panel::SingletonKind::Context);
+        }
+        "navigation.back" => {
+            if state.quick_switcher || modal_dialog_open(state) {
+                return false;
+            }
+            state.nav_back();
+        }
+        "navigation.forward" => {
+            if state.quick_switcher || modal_dialog_open(state) {
+                return false;
+            }
+            state.nav_forward();
+        }
         "rightPanel.toggleMaximized" => {
             // KSG ignores repeats here, and gates the toggle on the panel being open.
             if !key_repeat {
@@ -374,7 +413,16 @@ fn dispatch_global_command(
             }
         }
         "commandPalette.toggle" => {
-            state.search.focused = true;
+            if key_repeat {
+                return true;
+            }
+            if state.quick_switcher {
+                state.quick_switcher = false;
+            } else if modal_dialog_open(state) {
+                return false;
+            } else {
+                state.open_quick_switcher();
+            }
         }
         "view.zoomIn" => state.step_zoom(1),
         "view.zoomOut" => state.step_zoom(-1),
@@ -1075,8 +1123,10 @@ fn captain_brief_demo(state: &mut State) {
         routines_paused_while_away: true,
         ..Default::default()
     });
-    state.show_activity = true;
-    state.close_right_panel_for_drawer();
+    let key = state.panel_key();
+    state
+        .right_panels
+        .open(&key, crate::right_panel::SingletonKind::Overview);
 }
 
 /// Confirmation examples use only the demo's records and a read-only preview.
@@ -1392,8 +1442,10 @@ fn main() {
             ("session-details", |state| {
                 state.populate_demo();
                 state.dark = true;
-                state.show_activity = true;
-                state.close_right_panel_for_drawer();
+                let key = state.panel_key();
+                state
+                    .right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Overview);
             }),
             // A five paragraph draft that wraps past the composer's 200 pt text window.
             ("composer-long-draft", long_draft_demo),
