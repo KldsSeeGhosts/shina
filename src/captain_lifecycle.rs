@@ -238,10 +238,20 @@ impl State {
                 .map(|thread| (thread.id, thread.life.archived_at))
                 .collect();
             // Hold exact notification records before disconnecting any process.
-            for report in &mut self.captain_reports {
-                if report.captain == captain && !report.delivered {
-                    report.hold_delivery = true;
-                }
+            // Report holds are event transitions; outbox copies still on their
+            // source thread hold the report mirror until the durable list
+            // captures them.
+            let report_holds: Vec<String> = self
+                .captain_reports
+                .iter()
+                .filter(|report| report.captain == captain && report.needs_delivery())
+                .map(|report| report.id.clone())
+                .collect();
+            for id in report_holds {
+                // The canonical transition creates the mirror event for a
+                // report captured since the last poll, so a terminal event
+                // can never be re-held by mutating the flag out of band.
+                self.transition_report_event(&id, captain_inbox::InboxState::Held);
             }
             for answer in &mut self.captain_question_answers {
                 if group.contains(&answer.thread_id) && !answer.delivered {

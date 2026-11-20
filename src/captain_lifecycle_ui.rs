@@ -12,9 +12,9 @@ use crate::model::{CaptainLifecycleAction, CaptainLifecycleDialog, CaptainPhase,
 use serde_json::Value;
 
 /// Brief meta text, as captain_ui's `META`.
-const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
+const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 /// Brief row text, as captain_ui's `ROW_TEXT`.
-const ROW_TEXT: TextStyle = TextStyle::new(13.0, 470.0).lh(19.0).tracking(-0.08);
+const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
 /// Row corners, shared with the Brief.
 const ROW_RADIUS: f32 = 4.0;
 /// Card corners, shared with the Brief.
@@ -72,7 +72,7 @@ fn danger_ghost(
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(action)
-        .child(label(title, TextStyle::new(12.5, 500.0), p.danger))
+        .child(label(title, TextStyle::new(13.0, 500.0), p.danger))
 }
 
 /// The filled danger confirm, as KSG's `variant: "destructive"` button.
@@ -854,7 +854,7 @@ fn dialog_body(s: &State, p: Palette, dialog: &CaptainLifecycleDialog) -> El {
             body = body
                 .child(meta_label(&format!("Type \"{name}\" to confirm"), p.muted))
                 .child(
-                    text_input(&dialog.confirm_name, TextStyle::new(14.0, 420.0).lh(20.0))
+                    text_input(&dialog.confirm_name, TextStyle::new(14.0, 400.0).lh(20.0))
                         .key("captain-delete-name")
                         .label("Captain name")
                         .color(p.ink)
@@ -954,7 +954,7 @@ pub(super) fn archived_bar(s: &State, p: Palette, wide: bool, pane_width: f32) -
         .child(
             label(
                 format!("{name} is archived. It doesn't run or receive crew reports."),
-                TextStyle::new(13.0, 470.0),
+                TextStyle::new(13.0, 500.0),
                 p.muted,
             )
             .truncate()

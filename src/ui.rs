@@ -129,13 +129,6 @@ pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
             }
         }
         rows.push((entry.server.to_owned(), entry.id));
-        if entry.captain && entry.local.is_some() {
-            rows.extend(
-                s.visible_captain_workers(entry.id)
-                    .into_iter()
-                    .map(|index| (entry.server.to_owned(), s.threads[index].id)),
-            );
-        }
     }
     rows
 }
@@ -397,19 +390,15 @@ fn lane_width(pane_width: f32, wide: bool) -> f32 {
 /// Live timers and counts use tabular figures, so "12m 05s" never shifts as a digit changes.
 const TABULAR: &str = "'tnum' 1";
 const TIMER: TextStyle = META.features(TABULAR);
-const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
-const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
+const LABEL: TextStyle = TextStyle::new(14.0, 400.0).tracking(-0.10);
+const SMALL: TextStyle = TextStyle::new(12.0, 400.0);
 /// The project line of a sidebar card.
-const CARD_META: TextStyle = TextStyle::new(12.5, 430.0);
+const CARD_META: TextStyle = TextStyle::new(13.0, 400.0);
 /// Sidebar rows sit 8 px in from the sidebar's edge, and their content 12 px inside that, so
 /// icons and text share one left edge with the title strip and footer.
 const ROW_INSET: f32 = 12.0;
 /// Tool, thinking and status lines in the transcript.
-const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
-/// Height of one-line sidebar rows: navigation, workers and shelved threads.
-/// Workers sit a step below their captain: shorter rows on the captain's rail.
-const CREW_ROW: f32 = 30.0;
-
+const ACTIVITY: TextStyle = TextStyle::new(13.0, 400.0).tracking(-0.08);
 /// A text field's focus look, shared by every field: KSG's 1 px `--input` border that turns the
 /// `--ring` blue while the field has focus. Put it on the box that draws the field's edge.
 trait FieldFocus {
@@ -523,7 +512,7 @@ fn meta_text(value: impl Into<String>, ink: Color) -> El {
     label(value, META, ink)
 }
 fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
-    button_in(key, title, TextStyle::new(12.0, 450.0), p, action)
+    button_in(key, title, TextStyle::new(12.0, 500.0), p, action)
 }
 /// A quiet button with a 12 px Inter label, for the rows of state under the composer.
 fn meta_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
@@ -965,7 +954,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // it covers the conversation column instead, like KSG's `RightPanelSheet`; a
         // maximized panel covers it at any width.
         let panel = s.right_panel();
-        let panel_open = panel.open && !panel.surfaces.is_empty();
+        let panel_open = panel.open;
         // A docked drawer (the Brief's 320 px or the activity tray) plus its 1 px divider
         // comes off the same container the panel measures, in the measured path and the
         // fallback alike, so a covering sheet and the inline clamp see the chat's width.
@@ -1115,15 +1104,15 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         root = root.child(row_menu(s, p));
     }
-    if s.right_panel_menu.is_some() {
-        if let Some((x, y)) = s.right_panel_menu_at {
+    if s.tab_menu.is_some() {
+        if let Some((x, y)) = s.tab_menu_at {
             root = root.child(
-                el().key("right-panel-tab-menu-point")
+                el().key("thread-tab-menu-point")
                     .absolute(x / zoom, y / zoom)
                     .size(0.0, 0.0),
             );
         }
-        root = root.child(right_panel_tab_menu(s, p));
+        root = root.child(thread_tab_menu(s, p));
     }
     if s.snooze_menu.is_some() {
         root = root.child(snooze_menu(s, p));
@@ -1169,13 +1158,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
             root = root.child(menu);
         }
-        if s.show_activity
-            && let Some(thread_id) = s.brief.more
-        {
+        // A secondary press on a Crew Roster row opens the member's More menu right there,
+        // anchored to the row.
+        if let Some(thread_id) = s.brief.more {
             root = root.child(
                 crew_membership_ui::more_menu(s, p, captain, thread_id)
                     .anchored_fit(
-                        format!("brief-crew-more-{thread_id}"),
+                        format!("crew-chip-{thread_id}"),
                         rune::Side::Bottom,
                         rune::Align::End,
                         4.0,
@@ -1193,6 +1182,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .anchored_fit("crew-bar-more", rune::Side::Bottom, rune::Align::End, 4.0)
                 .modal(true, |s: &mut State| s.brief.more = None),
         );
+    }
+    if let Some(menu) = crew_ui::siblings_menu(s, p) {
+        root = root.child(menu);
     }
     if let Some(menu) = crew_membership_ui::move_picker(s, p) {
         root = root.child(menu);
@@ -2135,7 +2127,7 @@ fn option_row_text(name: &str, value: &str, p: Palette) -> El {
         .grow(1.0)
         .min_w(0.0)
         .child(label(name, META, p.muted).truncate())
-        .child(label(value, TextStyle::new(13.0, 450.0), p.ink).truncate())
+        .child(label(value, TextStyle::new(13.0, 500.0), p.ink).truncate())
 }
 
 /// KSG's small `Switch`: a 28 x 16 track with a 12 pt knob.
@@ -2848,13 +2840,13 @@ fn effort_slider_with_levels(
         row()
             .child(label(
                 effort_name(&levels[0]),
-                TextStyle::new(11.0, 450.0),
+                TextStyle::new(12.0, 500.0),
                 p.muted,
             ))
             .child(spacer())
             .child(label(
                 effort_name(&levels[count - 1]),
-                TextStyle::new(11.0, 450.0),
+                TextStyle::new(12.0, 500.0),
                 p.muted,
             )),
     )
@@ -3143,7 +3135,7 @@ fn model_list(
     let t = s.current();
     let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
 
-    let search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+    let search_field = text_input(&s.model_search, TextStyle::new(13.0, 400.0))
         .key("model-search")
         .label("Search models")
         .placeholder("Search models...", p.muted)
@@ -3375,7 +3367,7 @@ fn model_list(
 
         // KSG's `ModelListRow`: the name with a check when selected, then its badges.
         let mut name_row = row().center_y().gap(6.0).min_w(0.0).child(
-            label(&display_name, TextStyle::new(13.0, 450.0), p.ink)
+            label(&display_name, TextStyle::new(13.0, 500.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
@@ -3550,7 +3542,7 @@ fn model_list(
                 })
                 .child(label(
                     if *expanded { "Show less" } else { "Show more" },
-                    TextStyle::new(13.0, 450.0),
+                    TextStyle::new(13.0, 500.0),
                     p.muted,
                 )),
         );
@@ -3739,6 +3731,26 @@ fn model_list(
     card.child(body)
 }
 
+/// A harness's display name: "Pi", "Codex", "Claude" for the built-ins, the registry's
+/// configured name for ACP agents (allowing overrides of "antigravity"), built-in
+/// "Antigravity" when unregistered, or a generic "agent" when the id is unknown.
+fn harness_name<'a>(s: &'a State, id: &'a str) -> &'a str {
+    match id {
+        "pi" => "Pi",
+        "codex" => "Codex",
+        "claude" => "Claude",
+        id => s
+            .harnesses
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.name.as_str())
+            .unwrap_or(match id {
+                "antigravity" => "Antigravity",
+                _ => "agent",
+            }),
+    }
+}
 /// A harness row's mark, as KSG Code's `ProviderInstanceIcon` draws an ACP agent: the vendor's
 /// mark when the agent names one, Pi's own glyph, or a generic agent glyph.
 fn harness_icon(s: &State, p: Palette, id: &str, name: &str) -> El {
@@ -3982,7 +3994,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .px(ROW_INSET)
                     .gap(8.0)
                     .center_y()
-                    .radius(6.0)
+                    .radius(8.0)
                     .grow(1.0)
                     .min_w(0.0)
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
@@ -4087,7 +4099,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(icon("archive", p.muted))
-                .child(label("Archive", TextStyle::new(13.0, 560.0), p.ink))
+                .child(label("Archive", TextStyle::new(13.0, 600.0), p.ink))
                 .child(spacer())
                 .child(
                     label("Back", SMALL, p.muted)
@@ -4128,39 +4140,16 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         content = content.child(heading);
         for entry in &captains {
             let home = entry.id;
-            let workers = entry
-                .local
-                .map(|_| s.visible_captain_workers(home))
-                .unwrap_or_default();
-            let mut crew = col()
-                .key(if s.client.is_some() {
-                    format!("crew-{}-{home}", entry.server)
-                } else {
-                    format!("crew-{home}")
-                })
-                .gap(1.0)
-                .child(sidebar_ui::row(s, p, entry));
-            if !workers.is_empty() {
-                // Both content and row highlights are inset beneath their owning captain, and
-                // the rail runs down from the centre of the captain's portrait.
-                let mut children = col()
-                    .key(format!("crew-threads-{home}"))
-                    .ml(6.0 + CAPTAIN_SLOT / 2.0)
-                    .pl(6.0)
+            content = content.child(
+                col()
+                    .key(if s.client.is_some() {
+                        format!("crew-{}-{home}", entry.server)
+                    } else {
+                        format!("crew-{home}")
+                    })
                     .gap(1.0)
-                    .child(
-                        el().key(format!("crew-rail-{home}"))
-                            .pin(Some(0.0), Some(0.0), None, Some(CREW_ROW / 2.0))
-                            .w(1.0)
-                            .fill(p.line)
-                            .a11y_hidden(),
-                    );
-                for index in workers {
-                    children = children.child(thread_row(s, index, p, true));
-                }
-                crew = crew.child(children);
-            }
-            content = content.child(crew);
+                    .child(sidebar_ui::row(s, p, entry)),
+            );
         }
     }
     if s.show_archive {
@@ -4212,6 +4201,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                 s.brief.record = Some((server.clone(), captain));
                                 s.show_activity = true;
                                 s.activity_full = false;
+                                s.close_right_panel_for_drawer();
                             }
                         }),
                 );
@@ -4447,7 +4437,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .press(p.selected)
                 .on_press(|s: &mut State| s.undo_thread_action())
                 .child(
-                    label(title, TextStyle::new(12.0, 450.0), p.ink)
+                    label(title, TextStyle::new(12.0, 500.0), p.ink)
                         .truncate()
                         .grow(1.0)
                         .min_w(0.0),
@@ -4512,6 +4502,13 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
 fn danger_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
     menu_item_in(key, title, glyph, p, p.danger, p.danger)
 }
+/// A menu row that stays greyed out because acting on it would do nothing, like KSG's
+/// `disabled` DropdownMenuItem: faint ink, no press, not a tab stop.
+fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
+    menu_item_in(key, title, glyph, p, p.faint, p.faint)
+        .focusable(false)
+        .cursor(rune::Cursor::Default)
+}
 /// A menu item with a value at its right edge in pixel type, such as "3 days".
 fn menu_value_item(key: &str, title: &str, value: &str, glyph: &str, p: Palette) -> El {
     menu_item(key, title, glyph, p)
@@ -4543,7 +4540,7 @@ fn menu_item_in(
         .autofocus()
         .child(el().size(ICON, ICON).center().child(icon(glyph, icon_ink)))
         .child(
-            label(title, TextStyle::new(13.0, 450.0), ink)
+            label(title, TextStyle::new(13.0, 500.0), ink)
                 .grow(1.0)
                 .min_w(0.0)
                 .truncate(),
@@ -4768,7 +4765,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                     .radius(12.0)
                     .fill(p.sea_bg)
                     .child(icon("send", p.sea))
-                    .child(label(title, TextStyle::new(12.5, 520.0), p.sea)),
+                    .child(label(title, TextStyle::new(13.0, 500.0), p.sea)),
             )
         }
         Status::Ready { update } => {
@@ -4792,7 +4789,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                 .disabled(blocker.is_some())
                 .a11y_value(description.unwrap_or_default())
                 .child(icon("send", p.sea))
-                .child(label(title, TextStyle::new(12.5, 520.0), p.sea));
+                .child(label(title, TextStyle::new(13.0, 500.0), p.sea));
             if blocker.is_none() {
                 button = button
                     .focusable(true)
@@ -4881,7 +4878,7 @@ fn update_everything_button(summary: &str, p: Palette) -> El {
         .hover(p.selected)
         .on_press(|s: &mut State| s.open_fleet())
         .child(icon("send", p.sea))
-        .child(label(summary, TextStyle::new(12.5, 520.0), p.sea))
+        .child(label(summary, TextStyle::new(13.0, 500.0), p.sea))
 }
 
 /// The run capsule that replaces the footer control, KSG `SidebarUpdateCapsule`.
@@ -5241,8 +5238,8 @@ const BADGE_SLOT: f32 = 28.0;
 const CAPTAIN_TEXT_INSET: f32 = 6.0 + CAPTAIN_SLOT + 10.0 + 8.0;
 /// Room for "59m 59s" at the end of the status line.
 const TIMER_SLOT: f32 = 48.0;
-const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 560.0).tracking(-0.15);
-const CAPTAIN_STATUS: TextStyle = TextStyle::new(12.5, 460.0);
+const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 600.0).tracking(-0.15);
+const CAPTAIN_STATUS: TextStyle = TextStyle::new(13.0, 500.0);
 
 /// A sidebar portrait. It plays its status's animation strip through the shared stage in
 /// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
@@ -5693,13 +5690,18 @@ pub(crate) fn tick_portraits(
     s.portraits.tick(now, rows)
 }
 
-fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
+fn thread_row(s: &State, index: usize, p: Palette) -> El {
     let thread = &s.threads[index];
     let id = thread.id;
     let (row_status, approval) = row_status(s, thread);
     let captain_home = s.is_captain_home(thread);
+    // A crew worker drawn in the ordinary thread list: only search and the archive put it
+    // there, and its meta line names its captain instead of a workspace tile.
+    let worker = thread.crew_captain.is_some();
     let target = RowTarget::Thread(id);
-    let selected = id == s.current().id || s.selected_threads.contains(&id);
+    // A captain row stands for its whole crew, so it stays selected while one of its
+    // workers is open; `selected_row` maps the open worker back to its home.
+    let selected = id == s.selected_row() || s.selected_threads.contains(&id);
     let section = s.thread_section(thread, lifecycle::now());
     let hovered = s.hovered_row == Some(target);
     let draft = thread.is_draft();
@@ -5744,9 +5746,9 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             },
             if approval {
                 "needs approval"
-            } else if nested && (thread.request.is_some() || thread.status == Status::Waiting) {
+            } else if worker && (thread.request.is_some() || thread.status == Status::Waiting) {
                 "needs input"
-            } else if nested && thread.unread() && !thread.actionable() {
+            } else if worker && thread.unread() && !thread.actionable() {
                 "unread result"
             } else if state_label.is_empty() {
                 row_status.label()
@@ -5759,6 +5761,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .radius(6.0)
         .fill(Color::TRANSPARENT)
         .hover(p.selected)
+        .pointer_buttons([rune::PointerButton::Middle])
         .on_press_tx({
             let content_match = !s.search.text.is_empty()
                 && !s.thread_title_search_matches(thread)
@@ -5767,7 +5770,12 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     .contains_key(&(s.machines.selected.clone(), id));
             let server = s.machines.selected.clone();
             move |s: &mut State, tx| {
-                if content_match {
+                // KSG: a middle click opens the thread as a kept tab.
+                if tx.button() == rune::PointerButton::Middle {
+                    if let Some(index) = s.threads.iter().position(|t| t.id == id) {
+                        s.open_kept_tab(index);
+                    }
+                } else if content_match {
                     s.open_thread_at_search_match(&server, id);
                 } else {
                     s.click_thread(index, tx.mods());
@@ -5797,10 +5805,10 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 s.hovered_row = None;
             }
         });
-    if !nested && !captain_home && thread.machine == "local" {
+    if !worker && !captain_home && thread.machine == "local" {
         item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
     }
-    if captain_home && !nested {
+    if captain_home && !worker {
         return captain_row(s, p, thread, item, row_status, approval, selected);
     }
     let item = select_bar(item, selected, p);
@@ -5816,18 +5824,18 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         Some(dot(p.sea))
     } else if draft {
         Some(icon("edit", p.muted))
-    } else if thread.pinned() && !nested {
+    } else if thread.pinned() && !worker {
         Some(icon("pin", p.muted))
     } else {
         // Interrupted and queued workers carry their chip's mark, so they never look finished.
-        nested
+        worker
             .then(|| crew_ui::worker_task_mark(s, thread))
             .flatten()
             .map(|status| status_mark(status, p, 7.0).key(format!("worker-task-mark-{id}")))
     }
     .map(|mark| {
         let mark = el().size(14.0, 16.0).center().child(mark.a11y_hidden());
-        if nested && (thread.actionable() || thread.unread()) {
+        if worker && (thread.actionable() || thread.unread()) {
             mark.key(format!("worker-alert-{id}"))
         } else {
             mark
@@ -5841,36 +5849,18 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         } else {
             &thread.title
         },
-        if nested || shelved {
+        if shelved {
             LABEL
         } else {
-            TextStyle::new(14.0, 520.0).tracking(-0.10)
+            TextStyle::new(14.0, 500.0).tracking(-0.10)
         },
-        // Settled, snoozed and quiet worker rows recede.
-        if quiet && (nested || shelved) {
-            p.muted
-        } else {
-            p.ink
-        },
+        // Settled and snoozed rows recede.
+        if quiet && shelved { p.muted } else { p.ink },
     )
     .truncate()
     .grow(1.0)
     .shrink()
     .min_w(0.0);
-
-    if nested {
-        let mut line = row()
-            .h(CREW_ROW)
-            .w_full()
-            .pl(10.0)
-            .pr(8.0)
-            .gap(8.0)
-            .center_y();
-        // Every worker row has the status slot, empty or not, so all titles share one left edge
-        // and none looks nested under the row above.
-        line = line.child(mark.unwrap_or_else(|| el().size(14.0, 16.0)));
-        return item.child(line.child(title));
-    }
 
     // The status slot: hover actions, then what needs attention, then how old the row is.
     // Hover puts Snooze and Settle where the age sat; everything else is in the right-click menu.
@@ -5984,7 +5974,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let project = s.project(thread.project);
     // Pins and drafts lead the line, as T3 Code puts its pin before the project icon.
     let lead = |line: El| match &mark {
-        Some(_) if thread.pinned() || draft => line.child(mark.clone().unwrap()),
+        Some(_) if thread.pinned() || draft || worker => line.child(mark.clone().unwrap()),
         _ => line,
     };
 
@@ -6008,9 +5998,34 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     }
 
     // A thread card, as T3 Code lays it out: the project's icon and name with the status on
-    // the right, then the title.
+    // the right, then the title. A worker carries its captain's portrait and name where the
+    // project tile sits, so the flat row still says whose crew it belongs to.
+    let (tile, meta_name) = if worker {
+        let captain = thread.crew_captain;
+        let name = captain
+            .and_then(|c| s.captains.get(c))
+            .map(|c| c.name.as_str())
+            .unwrap_or("Crew")
+            .to_string();
+        let portrait = captain_portrait(s, captain);
+        let face = face_for(row_status);
+        let pixels = s.artwork.face_pixels(portrait, face, 16.0);
+        (
+            pixel_portrait(s, &pixels, 16.0, p)
+                .key(format!("worker-captain-portrait-{id}"))
+                .a11y_hidden(),
+            name,
+        )
+    } else {
+        (
+            project_tile(s, p, project, 16.0),
+            project
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| "No workspace".into()),
+        )
+    };
     let top = lead(row().h(18.0).gap(8.0).center_y())
-        .child(project_tile(s, p, project, 16.0))
+        .child(tile)
         .child(
             // The workspace and, on a linked machine, the machine: two labels, not one joined.
             row()
@@ -6019,32 +6034,25 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(
-                    label(
-                        project
-                            .map(|project| project.name.clone())
-                            .unwrap_or_else(|| "No workspace".into()),
-                        CARD_META,
-                        p.muted,
-                    )
-                    .key(format!("thread-workspace-{id}"))
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0)
-                    .beside_tag(
-                        multiple_machines(s),
-                        sidebar_row_width(s) - 2.0 * ROW_INSET,
-                        16.0 + ICON
-                            + slot_width(match state_label {
-                                "" => None,
-                                "Working" => Some("Working 59m 59s"),
-                                other => Some(other),
-                            })
-                            + 32.0,
-                        project.map_or("No workspace", |project| project.name.as_str()),
-                    ),
+                    label(meta_name.clone(), CARD_META, p.muted)
+                        .key(format!("thread-workspace-{id}"))
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0)
+                        .beside_tag(
+                            multiple_machines(s),
+                            sidebar_row_width(s) - 2.0 * ROW_INSET,
+                            16.0 + ICON
+                                + slot_width(match state_label {
+                                    "" => None,
+                                    "Working" => Some("Working 59m 59s"),
+                                    other => Some(other),
+                                })
+                                + 32.0,
+                            &meta_name,
+                        ),
                 )
                 .child(if multiple_machines(s) {
-                    let workspace = project.map_or("No workspace", |project| project.name.as_str());
                     // The age or the status word, widest while it counts up.
                     let slot = match state_label {
                         "" => None,
@@ -6060,7 +6068,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                         room_for_machine_name(
                             sidebar_row_width(s) - 2.0 * ROW_INSET,
                             16.0 + ICON + slot_width(slot) + 32.0,
-                            workspace,
+                            &meta_name,
                         ),
                     )
                 } else {
@@ -6164,8 +6172,9 @@ fn project_tile(
         .find(|c| c.is_alphanumeric())
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default();
+    // Keep initial-on-tile contrast >= 4.5:1 on both dark card (#1e1f23) and light card (#ffffff).
     tile.center()
-        .fill(hue.alpha(if s.dark { 0.45 } else { 0.35 }))
+        .fill(hue.alpha(if s.dark { 0.30 } else { 0.28 }))
         .child(label(initial, META, p.ink))
 }
 
@@ -6226,7 +6235,7 @@ fn slot_width(text: Option<&str>) -> f32 {
     text.map_or(14.0, |text| text.chars().count() as f32 * 6.6)
 }
 
-/// About how wide `text` is at the sidebar's 12.5 px.
+/// About how wide `text` is at the sidebar's 13 px.
 pub(super) fn text_width(text: &str) -> f32 {
     text.chars().count() as f32 * 6.2
 }
@@ -6414,7 +6423,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .min_w(0.0)
             .child(icon("search", p.muted))
             .child(
-                text_input(&s.captain_picker_query, TextStyle::new(13.0, 420.0))
+                text_input(&s.captain_picker_query, TextStyle::new(13.0, 400.0))
                     .key("captain-search")
                     .label("Search captains")
                     .placeholder("Search captains", p.muted)
@@ -6485,7 +6494,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         })
         .child(icon("user", p.muted).size(16.0, 16.0))
         .child(
-            label("No captain", TextStyle::new(13.5, 450.0), p.ink)
+            label("No captain", TextStyle::new(14.0, 500.0), p.ink)
                 .truncate()
                 .grow(1.0)
                 .min_w(0.0),
@@ -6537,7 +6546,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     .grow(1.0)
                     .min_w(0.0)
                     .child(
-                        label(&profile.name, TextStyle::new(13.5, 500.0), p.ink)
+                        label(&profile.name, TextStyle::new(14.0, 500.0), p.ink)
                             .truncate()
                             .min_w(0.0),
                     )
@@ -6590,7 +6599,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .focus_fill(p.selected)
         .on_press(|s: &mut State| s.begin_new_captain())
         .child(icon("plus", p.muted))
-        .child(label("New captain", TextStyle::new(13.5, 450.0), p.ink));
+        .child(label("New captain", TextStyle::new(14.0, 500.0), p.ink));
     card = card.child(col().py(4.0).child(new_captain));
 
     card.anchored_fit(
@@ -7045,20 +7054,59 @@ const TAB_GAP: f32 = 4.0;
 /// A tab is 32 pt tall, so in the 40 pt top strip its bottom frame sits 4 pt above the chat
 /// pane's top rule, the same distance as its top edge sits below the window edge.
 const TAB_HEIGHT: f32 = 32.0;
-/// Below this a tab drops its workspace prefix and keeps the title.
+/// Below this a tab drops its leading icon and keeps the title.
 const TAB_PREFIX_WIDTH: f32 = 170.0;
 /// The narrowest a tab gets before the strip scrolls.
 const TAB_MIN_WIDTH: f32 = 120.0;
 /// Tabs are packed from the left and stop growing here, so a few tabs do not sit in wide empty
 /// slots.
 const TAB_MAX_WIDTH: f32 = 260.0;
-/// Inter 13/520, the title in a tab.
-const TAB_TITLE: TextStyle = TextStyle::new(13.0, 520.0);
+/// Inter 13/500, the title in a tab.
+const TAB_TITLE: TextStyle = TextStyle::new(13.0, 500.0);
+/// The 16 px leading icon in a tab, KSG `PaneTabs`' `ProjectFavicon`. Captain homes and
+/// captain workers show the captain's face when the profile exists locally, an explicit
+/// remote-delegation badge for peer workers (or missing captain profiles), and the project
+/// tile otherwise.
+fn tab_icon(s: &State, p: Palette, thread: &Thread) -> El {
+    let captain = if s.is_captain_home(thread) {
+        thread.captain
+    } else {
+        thread.crew_captain
+    };
+    if let Some(captain) = captain {
+        if s.captains.get(captain).is_some() {
+            return avatar(s, p, captain, 16.0, s.captain_status(captain)).a11y_hidden();
+        }
+        return el()
+            .key(format!("tab-icon-crew-{}", thread.id))
+            .size(16.0, 16.0)
+            .radius(4.0)
+            .border(1.0, p.frame)
+            .fill(p.selected)
+            .center()
+            .a11y_hidden()
+            .child(icon("crew", p.muted).size(12.0, 12.0));
+    }
+    if thread.peer_origin.is_some() {
+        return el()
+            .key(format!("tab-icon-peer-{}", thread.id))
+            .size(16.0, 16.0)
+            .radius(4.0)
+            .border(1.0, p.frame)
+            .fill(p.selected)
+            .center()
+            .a11y_hidden()
+            .child(icon("crew", p.muted).size(12.0, 12.0));
+    }
+    project_tile(s, p, s.project(thread.project), 16.0)
+}
 /// A tab's look, as KSG's chat tabs: the active tab is a `card` with a hairline and 8 px
 /// corners. Others have no fill.
 fn tab_frame(tab: El, active: bool, p: Palette) -> El {
     if !active {
-        return tab.hover(p.selected);
+        // The hover block matches the active tab's 8 px corners, so a tab's fill
+        // never shifts shape as it activates.
+        return tab.hover(p.selected).radius(8.0);
     }
     tab.fill(p.card).radius(8.0).border(1.0, p.line)
 }
@@ -7101,17 +7149,19 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
         };
         let thread = &s.threads[index];
         let active = index == s.active;
+        // KSG draws the ghost tab's title in italics once kept tabs sit
+        // beside it; a lone tab never reads as provisional.
+        let ghost = s.is_ghost_tab(id) && s.tabs.len() > 1;
         let project = s
             .project(thread.project)
             .map(|p| p.name.as_str())
             .unwrap_or("No workspace");
         let mut tab = tab_frame(
             row()
-                .key(if active {
-                    "active-tab".into()
-                } else {
-                    format!("tab-{id}")
-                })
+                // The pressable keeps `tab-{id}` whether focused or not: Rune
+                // pairs a double click by element path, so a key that changed
+                // on focus would swallow the second click before `keep_tab`.
+                .key(format!("tab-{id}"))
                 .role("tab")
                 .cursor(rune::Cursor::Pointer)
                 .label(format!("{project} / {}", thread.title))
@@ -7121,24 +7171,61 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                 .pl(8.0)
                 .pr(if s.tabs.len() > 1 { 2.0 } else { 8.0 })
                 .h(TAB_HEIGHT)
-                .radius(6.0)
+                .radius(8.0)
                 .w(tab_width)
                 .min_w(tab_width)
                 .hover_group()
+                .pointer_buttons([rune::PointerButton::Middle])
                 .on_press_tx(move |s: &mut State, tx| {
-                    s.select_thread(index);
+                    // KSG: a middle click closes the tab.
+                    if tx.button() == rune::PointerButton::Middle {
+                        s.close_tab(id);
+                        return;
+                    }
+                    s.show_thread(index);
                     tx.scroll_into_view("active-tab");
+                })
+                .on_double_press(move |s: &mut State| s.keep_tab(id))
+                .on_secondary_press(move |s: &mut State, at, _| {
+                    s.tab_menu = Some(id);
+                    s.tab_menu_at = Some((at.x, at.y));
                 }),
             active,
             p,
         )
         .child(if tab_width >= TAB_PREFIX_WIDTH {
-            meta_text(project, p.muted).max_w(85.0).truncate()
+            // KSG's `PaneTabs` leads with the project favicon; captain homes and
+            // their workers show the captain's face instead.
+            tab_icon(s, p, thread)
         } else {
             // A tab at its minimum gives the width to the title.
             el()
         })
-        .child(label(&thread.title, TAB_TITLE, p.ink).truncate().grow(1.0));
+        .child(
+            // The active marker covers the tab exactly (`absolute` measures
+            // from the same corner the border box does): tests and
+            // `scroll_into_view` find `active-tab` here while the pressable
+            // above keeps a stable `tab-{id}` key so the second click of a
+            // double-click still pairs with the first.
+            el().key(if active {
+                "active-tab".into()
+            } else {
+                format!("tab-marker-{id}")
+            })
+            .a11y_hidden()
+            .absolute(0.0, 0.0)
+            .w(tab_width)
+            .h(TAB_HEIGHT),
+        )
+        .child(
+            label(
+                &thread.title,
+                if ghost { TAB_TITLE.italic() } else { TAB_TITLE },
+                p.ink,
+            )
+            .truncate()
+            .grow(1.0),
+        );
         if s.tabs.len() > 1 {
             // The close button shows on the active tab and on hover.
             let close = el()
@@ -7197,156 +7284,155 @@ fn reveal_active_tab(s: &State, tab_width: f32, tabs_width: f32) -> El {
         })
 }
 
-/// Ported from KSG Code's `surfaceTitle`: the diff view and the file explorer name
-/// themselves; a file or attachment tab shows its base name.
-fn right_panel_title(surface: &crate::right_panel::Surface) -> String {
-    match surface {
-        crate::right_panel::Surface::Diff => "Diff".to_string(),
-        crate::right_panel::Surface::Files => "Files".to_string(),
-        crate::right_panel::Surface::File { path, .. } => base_name(path).to_string(),
-        crate::right_panel::Surface::Attachment { name, .. } => base_name(name).to_string(),
-        crate::right_panel::Surface::CaptainDocument { name, .. } => {
-            captain_docs_ui::document_title(name).to_string()
-        }
-    }
-}
-
-fn base_name(path: &str) -> &str {
-    let after = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
-    &path[after..]
-}
-
-/// Ported from KSG Code's `RightPanelTab`: `h-6 max-w-36 rounded-md gap-0.5 pl-1.5 pr-2`.
-/// The slot at the left shows the surface icon and swaps to the close button on hover or
-/// when the tab is active, like the thread tabs' `attachment_remove` overlay.
-fn right_panel_tab(
-    s: &State,
-    p: Palette,
-    panel: &crate::right_panel::ThreadPanel,
-    surface: &crate::right_panel::Surface,
-) -> El {
-    let id = surface.id();
-    let active = panel.active.as_deref() == Some(id.as_str());
-    let title = right_panel_title(surface);
-    let glyph = match surface {
-        crate::right_panel::Surface::Diff => "list",
-        crate::right_panel::Surface::Files => "folder",
-        crate::right_panel::Surface::File { .. } => "file",
-        crate::right_panel::Surface::Attachment { .. } => "paperclip",
-        crate::right_panel::Surface::CaptainDocument { .. } => "book",
+/// Ported from KSG Code's thread tab context menu on the `row_menu` pattern: a
+/// ghost tab offers "Keep tab" first, then the close group. Items that would do
+/// nothing are disabled, as KSG does.
+fn thread_tab_menu(s: &State, p: Palette) -> El {
+    let id = s.tab_menu.expect("tab menu only mounts with a tab");
+    let index = s.tabs.iter().position(|tab| *tab == id);
+    let last = s.tabs.len().saturating_sub(1);
+    let anchor = if s.tab_menu_at.is_some() {
+        "thread-tab-menu-point".to_string()
+    } else {
+        format!("tab-{id}")
     };
-    // The close button sits in the icon slot only while it can be seen: on hover of the
-    // tab, or on the active tab (KSG's `group-hover:visible / isActive && visible`).
-    let close_face = {
-        let thread_key = s.panel_key();
-        let surface_id = id.clone();
-        el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .key(format!("right-panel-tab-close-{id}"))
-            .role("button")
-            .label("Close tab")
-            .focusable(true)
-            .cursor(rune::Cursor::Pointer)
-            .center()
-            .radius(6.0)
-            .hover(p.selected)
-            .group_opacity(if active { 1.0 } else { 0.0 }, 1.0)
-            .on_press(move |s: &mut State| {
-                s.request_close_surface(&thread_key, &surface_id);
-            })
-            .child(tool_icon("close", p.ink))
-    };
-    let tab_key = format!("right-panel-tab-{id}");
-    let key_for_press = s.panel_key();
-    let id_for_press = id.clone();
-    let id_for_menu = id.clone();
-    tab_frame(
-        row()
-            .key(tab_key.clone())
-            .role("tab")
-            .label(format!("{title} tab"))
-            .focusable(true)
-            .cursor(rune::Cursor::Pointer)
-            .pointer_buttons([rune::PointerButton::Middle])
-            .hover_group()
-            .center_y()
-            .h(24.0)
-            .min_w(0.0)
-            .max_w(144.0)
-            .pl(6.0)
-            .pr(8.0)
-            .gap(2.0)
-            .on_press_tx(move |s: &mut State, tx| {
-                // KSG: a middle click closes the tab; any other press activates it.
-                if tx.button() == rune::PointerButton::Middle {
-                    s.request_close_surface(&key_for_press, &id_for_press);
-                } else {
-                    s.right_panels.activate(&key_for_press, &id_for_press);
-                    tx.scroll_into_view_in("right-panel-tabs", tab_key.clone());
-                }
-            })
-            .on_secondary_press(move |s: &mut State, at, _| {
-                s.right_panel_menu = Some(id_for_menu.clone());
-                s.right_panel_menu_at = Some((at.x, at.y));
-            })
-            .child(
-                el().size(20.0, 20.0)
-                    .radius(6.0)
-                    .center()
-                    .child(icon(glyph, p.ink).size(12.0, 12.0))
-                    .child(close_face),
-            )
-            .child(
-                label(
-                    title,
-                    TextStyle::new(13.0, 450.0),
-                    if active { p.ink } else { p.muted },
-                )
-                .truncate(),
-            ),
-        active,
-        p,
-    )
-}
-
-/// Scrolls the strip so the active panel tab shows whole, each time the selection or the
-/// tab list changes, on the `reveal_active_tab` marker trick.
-fn reveal_right_panel_tab(panel: &crate::right_panel::ThreadPanel) -> El {
-    use std::hash::{Hash, Hasher};
-    let mut signature = std::collections::hash_map::DefaultHasher::new();
-    panel.surfaces.len().hash(&mut signature);
-    for surface in &panel.surfaces {
-        surface.id().hash(&mut signature);
+    enum TabMenu {
+        Keep,
+        Close,
+        Others,
+        ToRight,
+        All,
     }
-    panel.active.hash(&mut signature);
-    let key = panel.active.clone().unwrap_or_default();
-    el().key(format!("right-panel-tab-reveal-{:x}", signature.finish()))
-        .absolute(0.0, 0.0)
-        .size(1.0, 1.0)
-        .a11y_hidden()
-        .on_visible(move |_: &mut State, visible, tx| {
-            if visible && !key.is_empty() {
-                tx.instant();
-                tx.scroll_into_view_in("right-panel-tabs", format!("right-panel-tab-{key}"));
+    let item = |key: &str, title: &str, glyph: &str, action: Option<TabMenu>| {
+        let Some(action) = action else {
+            return disabled_menu_item(key, title, glyph, p);
+        };
+        menu_item(key, title, glyph, p).on_press(move |s: &mut State| {
+            s.tab_menu = None;
+            match action {
+                TabMenu::Keep => s.keep_tab(id),
+                TabMenu::Close => s.close_tab(id),
+                TabMenu::Others => s.close_other_tabs(id),
+                TabMenu::ToRight => s.close_tabs_to_right(id),
+                TabMenu::All => s.close_all_tabs(),
             }
         })
+    };
+    let keep = s.is_ghost_tab(id).then_some(TabMenu::Keep);
+    let close = (s.tabs.len() > 1).then_some(TabMenu::Close);
+    let others = (s.tabs.len() > 1).then_some(TabMenu::Others);
+    let to_right = index.is_some_and(|i| i < last).then_some(TabMenu::ToRight);
+    let all = (s.tabs.len() > 1).then_some(TabMenu::All);
+    col()
+        .key("thread-tab-menu")
+        .role("menu")
+        .focus_group()
+        .label("Tab actions")
+        .autofocus()
+        .w(222.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::Start, 2.0)
+        .modal(true, |s: &mut State| s.tab_menu = None)
+        .child(item("menu-tab-keep", "Keep tab", "pin", keep))
+        .child(item("menu-tab-close", "Close", "close", close))
+        .child(item("menu-tab-others", "Close others", "close", others))
+        .child(item(
+            "menu-tab-right",
+            "Close to the right",
+            "chevron",
+            to_right,
+        ))
+        .child(item("menu-tab-all", "Close all", "close", all))
 }
 
-/// Ported from KSG Code's `RightPanelTabs` strip: `h-(--workspace-topbar-height) pl-2`,
-/// a horizontally scrolling tab list, then the maximize and close controls `gap-0.5`
-/// apart. Shina's strip matches the native titlebar height instead of the web's 52 px.
+/// One segment of the strip's two-choice control: a 24 px pressable row with an icon and
+/// its title, framed like the Keep awake choices (`h-6 px-2 rounded-md` with the chosen
+/// segment's 1 px frame; idle segments keep a clear border so nothing shifts).
+fn right_panel_segment(
+    s: &State,
+    p: Palette,
+    key: &str,
+    glyph: &str,
+    title: &str,
+    on: bool,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    let _ = s;
+    row()
+        .key(key.to_string())
+        .role("tab")
+        .label(title.to_string())
+        .focusable(true)
+        .cursor(rune::Cursor::Pointer)
+        .h(24.0)
+        .px(8.0)
+        .gap(5.0)
+        .center_y()
+        .radius(6.0)
+        .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
+        .fill(if on { p.card } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .press(p.selected)
+        .on_press(action)
+        .child(icon(glyph, if on { p.ink } else { p.muted }).size(12.0, 12.0))
+        .child(
+            label(
+                title.to_string(),
+                TextStyle::new(12.0, 500.0),
+                if on { p.ink } else { p.muted },
+            )
+            .truncate(),
+        )
+}
+
+/// The strip atop the panel: a two-segment control (Diff, then the open viewer item when
+/// there is one), then the maximize and close controls. It replaces KSG's `RightPanelTabs`
+/// scrollable tab list, which a fixed two-segment panel never needs.
 fn right_panel_strip(s: &State, p: Palette, strip_h: f32) -> El {
     let panel = s.right_panel();
-    let mut tabs = row()
+    let viewer = panel.viewer.clone();
+    let mut segments = row()
         .key("right-panel-tabs")
         .grow(1.0)
         .min_w(0.0)
         .center_y()
-        .gap(4.0)
-        .scroll_x()
-        // Tabs hidden past an edge fade out, so a clipped strip reads as scrollable.
-        .scroll_edge_fade(12.0);
-    for surface in &panel.surfaces {
-        tabs = tabs.child(right_panel_tab(s, p, &panel, surface));
+        .gap(2.0)
+        .child(right_panel_segment(
+            s,
+            p,
+            "right-panel-segment-diff",
+            "diff",
+            "Diff",
+            panel.view == crate::right_panel::PanelView::Diff,
+            |s: &mut State| {
+                let key = s.panel_key();
+                s.right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Diff);
+            },
+        ));
+    if let Some(viewer_surface) = &viewer {
+        let title = match viewer_surface {
+            crate::right_panel::Surface::CaptainDocument { name, .. } => {
+                captain_docs_ui::document_title(name).to_string()
+            }
+        };
+        segments = segments.child(right_panel_segment(
+            s,
+            p,
+            "right-panel-segment-viewer",
+            "file",
+            &title,
+            panel.view == crate::right_panel::PanelView::Viewer,
+            |s: &mut State| {
+                let key = s.panel_key();
+                s.right_panels.show_viewer(&key);
+            },
+        ));
     }
     row()
         .key("right-panel-strip")
@@ -7355,8 +7441,7 @@ fn right_panel_strip(s: &State, p: Palette, strip_h: f32) -> El {
         .pr(12.0)
         .center_y()
         .gap(4.0)
-        .child(tabs)
-        .child(reveal_right_panel_tab(&panel))
+        .child(segments)
         .child(
             row()
                 .center_y()
@@ -7382,8 +7467,7 @@ fn right_panel_strip(s: &State, p: Palette, strip_h: f32) -> El {
                     "close",
                     p,
                     move |s: &mut State| {
-                        let key = s.panel_key();
-                        s.right_panels.close(&key);
+                        s.right_panel_close_active();
                     },
                 )),
         )
@@ -7453,41 +7537,15 @@ fn right_panel_resize(s: &State, p: Palette, zoom: f32, max: f32) -> El {
 /// a covering sheet has no resize handle, matching KSG's `PreviewPanel`.
 fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Option<f32>) -> El {
     let panel = s.right_panel();
-    let active = panel
-        .active
-        .as_deref()
-        .and_then(|id| panel.surfaces.iter().find(|surface| surface.id() == id));
-    let (key, body) = match active {
-        Some(crate::right_panel::Surface::Diff) => {
-            ("right-panel-body-diff".to_string(), diff_panel::body(s, p))
-        }
-        Some(crate::right_panel::Surface::Files) => (
-            "right-panel-body-files".to_string(),
-            label("Files will appear here", SMALL, p.muted),
-        ),
-        Some(crate::right_panel::Surface::File { path, .. }) => (
-            format!("right-panel-body-file:{path}"),
-            label(
-                path.clone(),
-                TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
-                p.muted,
-            )
-            .truncate(),
-        ),
-        Some(crate::right_panel::Surface::Attachment { id, name, .. }) => (
-            format!("right-panel-body-attachment:{id}"),
-            label(
-                name.clone(),
-                TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
-                p.muted,
-            )
-            .truncate(),
-        ),
-        Some(crate::right_panel::Surface::CaptainDocument { captain, name }) => (
+    let (key, body) = match (panel.view, &panel.viewer) {
+        (
+            crate::right_panel::PanelView::Viewer,
+            Some(crate::right_panel::Surface::CaptainDocument { captain, name }),
+        ) => (
             format!("right-panel-body-captain-doc:{captain}:{name}"),
             captain_docs_ui::document_panel(s, p, *captain, name),
         ),
-        None => ("right-panel-body-empty".to_string(), el()),
+        _ => ("right-panel-body-diff".to_string(), diff_panel::body(s, p)),
     };
     let panel_el = el()
         .key("right-panel")
@@ -7503,11 +7561,14 @@ fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Optio
                 .min_w(0.0)
                 .min_h(0.0)
                 .child(right_panel_strip(s, p, strip_h))
-                .child(match active {
-                    Some(crate::right_panel::Surface::Diff) => diff_panel::header(s, p),
-                    _ => el().key("right-panel-header").h(28.0).px(8.0),
+                .child(match panel.view {
+                    crate::right_panel::PanelView::Diff => diff_panel::header(s, p),
+                    crate::right_panel::PanelView::Viewer => el(),
                 })
-                .child(el().h(12.0))
+                .child(match panel.view {
+                    crate::right_panel::PanelView::Diff => el().h(12.0),
+                    crate::right_panel::PanelView::Viewer => el(),
+                })
                 .child(
                     el().key(key)
                         .grow(1.0)
@@ -7521,90 +7582,6 @@ fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Optio
         Some(max) => panel_el.child(right_panel_resize(s, p, zoom, max)),
         None => panel_el,
     }
-}
-
-/// A menu row that stays greyed out because acting on it would do nothing, like KSG's
-/// `disabled` DropdownMenuItem: faint ink, no press, not a tab stop.
-fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
-    menu_item_in(key, title, glyph, p, p.faint, p.faint)
-        .focusable(false)
-        .cursor(rune::Cursor::Default)
-}
-
-/// Ported from KSG Code's tab context menu in `RightPanelTabs` (Close, Close others,
-/// Close to the right, Close all) on the `row_menu` pattern. Items that would do nothing
-/// are disabled, as KSG does.
-fn right_panel_tab_menu(s: &State, p: Palette) -> El {
-    let surface_id = s
-        .right_panel_menu
-        .clone()
-        .expect("tab menu only mounts with a surface");
-    let thread_key = s.panel_key();
-    let panel = s.right_panels.get(&thread_key);
-    let index = panel
-        .surfaces
-        .iter()
-        .position(|surface| surface.id() == surface_id);
-    let last = panel.surfaces.len().saturating_sub(1);
-    let anchor = if s.right_panel_menu_at.is_some() {
-        "right-panel-tab-menu-point".to_string()
-    } else {
-        format!("right-panel-tab-{surface_id}")
-    };
-    enum TabMenu {
-        Close,
-        Others,
-        ToRight,
-        All,
-    }
-    let item = |key: &str, title: &str, glyph: &str, action: Option<TabMenu>| {
-        let Some(action) = action else {
-            return disabled_menu_item(key, title, glyph, p);
-        };
-        let thread_key = thread_key.clone();
-        let surface_id = surface_id.clone();
-        menu_item(key, title, glyph, p).on_press(move |s: &mut State| {
-            s.right_panel_menu = None;
-            match action {
-                TabMenu::Close => s.request_close_surface(&thread_key, &surface_id),
-                TabMenu::Others => s.request_close_others(&thread_key, &surface_id),
-                TabMenu::ToRight => s.request_close_to_right(&thread_key, &surface_id),
-                TabMenu::All => s.request_close_all(&thread_key),
-            }
-        })
-    };
-    let others = (panel.surfaces.len() > 1).then_some(TabMenu::Others);
-    let to_right = index.is_some_and(|i| i < last).then_some(TabMenu::ToRight);
-    let all = (!panel.surfaces.is_empty()).then_some(TabMenu::All);
-    col()
-        .key("right-panel-tab-menu")
-        .role("menu")
-        .focus_group()
-        .label("Panel tab actions")
-        .autofocus()
-        .w(222.0)
-        .padding(4.0)
-        .gap(1.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.frame)
-        .box_shadow(soft_shadow(p))
-        .anchored_fit(anchor, rune::Side::Right, rune::Align::Start, 2.0)
-        .modal(true, |s: &mut State| s.right_panel_menu = None)
-        .child(item(
-            "menu-tab-close",
-            "Close",
-            "close",
-            Some(TabMenu::Close),
-        ))
-        .child(item("menu-tab-others", "Close others", "close", others))
-        .child(item(
-            "menu-tab-right",
-            "Close to the right",
-            "chevron",
-            to_right,
-        ))
-        .child(item("menu-tab-all", "Close all", "close", all))
 }
 
 fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
@@ -7635,15 +7612,20 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 ),
         );
     }
-    // Crew threads link back to the thread that started them; nothing else repeats the tab.
-    if let Some(parent) = s
-        .current()
-        .parent
+    // Crew threads link back to the thread that started them, unless the parent or crew bar
+    // above the composer already names it.
+    let t = s.current();
+    let bar_shown = t.peer_origin.is_some()
+        || t.parent.is_some() && t.delegated
+        || !t.delegated && t.crew_captain.is_some();
+    if let Some(parent) = (!bar_shown)
+        .then(|| s.current().parent)
+        .flatten()
         .and_then(|id| s.threads.iter().position(|t| t.id == id))
     {
         header = header.child(label("From", SMALL, p.muted)).child(
             button("breadcrumb-parent", &s.threads[parent].title, p, move |s| {
-                s.select_thread(parent)
+                s.show_thread(parent)
             })
             .max_w(240.0)
             .shrink()
@@ -7708,11 +7690,12 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         header = header.child(icon_button(
             "open-session-panel",
             "Show session details",
-            "panel",
+            "info",
             p,
             |s| {
                 s.show_activity = true;
                 s.activity_full = false;
+                s.close_right_panel_for_drawer();
             },
         ));
     }
@@ -7743,7 +7726,7 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         ));
     }
     let diff_open =
-        s.right_panels.active_surface(&panel_key) == Some(crate::right_panel::Surface::Diff);
+        s.right_panels.active_view(&panel_key) == Some(crate::right_panel::PanelView::Diff);
     let mut diff = toggle_button(
         "header-diff",
         "Toggle diff",
@@ -8995,7 +8978,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                         .child(icon("search", p.muted)),
                 )
                 .child(
-                    rune::text_input(&s.picker_query, TextStyle::new(15.0, 420.0).tracking(-0.15))
+                    rune::text_input(&s.picker_query, TextStyle::new(15.0, 400.0).tracking(-0.15))
                         .key("picker-search")
                         .label(placeholder)
                         .placeholder(placeholder, p.muted)
@@ -9175,7 +9158,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                 _ => project_tile(s, p, project, 16.0),
             })
             .child(
-                label(name.as_str(), TextStyle::new(14.0, 480.0), p.ink)
+                label(name.as_str(), TextStyle::new(14.0, 500.0), p.ink)
                     .truncate()
                     .shrink()
                     .min_w(0.0),
@@ -9444,7 +9427,7 @@ fn palette_row(key: String, glyph: &str, title: &str, detail: &str, lit: bool, p
                 .gap(1.0)
                 .grow(1.0)
                 .min_w(0.0)
-                .child(label(title, TextStyle::new(14.0, 480.0), p.ink).truncate());
+                .child(label(title, TextStyle::new(14.0, 500.0), p.ink).truncate());
             if detail.is_empty() {
                 text
             } else {
@@ -9510,9 +9493,9 @@ fn add_project_palette(s: &State, p: Palette) -> El {
             rune::text_input(
                 &s.picker_query,
                 if browsing {
-                    TextStyle::new(15.0, 420.0).family(rune::Family::SystemMono)
+                    TextStyle::new(15.0, 400.0).family(rune::Family::SystemMono)
                 } else {
-                    TextStyle::new(15.0, 420.0).tracking(-0.15)
+                    TextStyle::new(15.0, 400.0).tracking(-0.15)
                 },
             )
             .key("picker-search")
@@ -9611,7 +9594,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .hover(p.selected)
                 .disabled(s.client.is_some() && !s.machine_connected(&s.machines.selected))
                 .on_press(|s: &mut State| s.add_browsed_project())
-                .child(label(submit, TextStyle::new(12.5, 560.0), p.ink).key(
+                .child(label(submit, TextStyle::new(13.0, 600.0), p.ink).key(
                     if s.machines.selected == "local" {
                         "local-project-add"
                     } else {
@@ -13805,7 +13788,7 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
                     .child(icon("plus", p.on_coral))
                     .child(label(
                         "Add workspace",
-                        TextStyle::new(13.0, 560.0),
+                        TextStyle::new(13.0, 600.0),
                         p.on_coral,
                     )),
                 p,
@@ -14746,7 +14729,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
     }
     let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
     let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
-    let action_style = TextStyle::new(12.0, 450.0);
+    let action_style = TextStyle::new(12.0, 500.0);
     let mut stack = col().key("composer-notices").w_full().gap(0.0);
     for (index, notice) in notices.iter().enumerate() {
         let top = index == 0;
@@ -15521,7 +15504,7 @@ fn context_popover(s: &State, p: Palette) -> El {
         card = card.child(
             label(
                 t.context_harness_text(state),
-                TextStyle::new(11.0, 500.0).lh(16.0),
+                TextStyle::new(12.0, 500.0).lh(16.0),
                 p.muted,
             )
             .key("context-details-state")
@@ -15756,6 +15739,81 @@ fn composer_decorations(
     (spans, strikes)
 }
 
+/// Budget for the above-composer stack under its 40% viewport cap: how much height the
+/// non-roster parts require to remain usable, and how much room (if any) an open crew
+/// roster's member rows may take without squeezing Needs you or the Plan editor.
+struct AboveComposerBudget {
+    /// Minimum height for the stack so no visible controls become unreachable.
+    floor: f32,
+    /// Maximum height the crew roster's rows may take, or `None` to collapse to header-only.
+    roster_rows_max: Option<f32>,
+}
+
+fn above_composer_budget(s: &State, cap: f32) -> AboveComposerBudget {
+    let t = s.current();
+    let mut parts = 0usize;
+    let mut others_floor = 0.0f32;
+    if crew_ui::parent_bar_shows(s) {
+        parts += 1;
+        others_floor += 52.0;
+    }
+    if crew_ui::crew_bar_shows(s) {
+        parts += 1;
+        others_floor += 48.0;
+    }
+    let has_needs_you = crew_ui::needs_you_shows(s);
+    if has_needs_you {
+        parts += 1;
+        // Keep one approval card with its action buttons visible without scrolling; share the
+        // lane more tightly when the Plan panel is also open.
+        others_floor += if s.plan_panel_open() { 120.0 } else { 140.0 };
+    }
+    let roster_open_height = crew_ui::crew_tray_open_extra_height(s);
+    if crew_ui::crew_tray_shows(s) {
+        parts += 1;
+        others_floor += 28.0;
+    }
+    if s.plan_panel_open() {
+        parts += 1;
+        // Header (28) + footer (32) + padding/gaps (24) + scrolling body floor.
+        let min_body = if s.plan_panel.editor.is_some() {
+            144.0
+        } else {
+            120.0
+        };
+        others_floor += 84.0 + min_body;
+    }
+    let queued = t.native.queue.len() + t.native.steering.len() + t.native.follow_ups.len();
+    if queued > 0 {
+        parts += 1;
+        others_floor += 48.0;
+    }
+    if parts > 1 {
+        others_floor += (parts - 1) as f32 * 8.0;
+    }
+    let remaining = (cap - others_floor).max(0.0);
+    let roster_body = roster_open_height.unwrap_or(0.0);
+    // Keep the roster open when it fits within the cap; when other parts leave less than
+    // the full 150 px rows cap, let the roster shrink its rows scroll box down to one row
+    // (or footer only for 0 members) before collapsing to header-only.
+    let min_open_body = crew_ui::crew_tray_min_open_extra_height(s).unwrap_or(0.0);
+    let roster_rows_max = if roster_open_height.is_some() && remaining >= min_open_body {
+        let footer_and_gaps = crew_ui::crew_tray_footer_extra_height(s);
+        Some((remaining - footer_and_gaps).clamp(0.0, 150.0))
+    } else {
+        None
+    };
+    let floor = others_floor
+        + if roster_rows_max.is_some() {
+            roster_body.min(remaining)
+        } else {
+            0.0
+        };
+    AboveComposerBudget {
+        floor,
+        roster_rows_max,
+    }
+}
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
     s: &State,
@@ -16050,20 +16108,37 @@ fn composer(
         || t.native.operating() && t.queued_edit.is_none()
         || t.request.is_some();
     // Delegation context sits above the composer, nearest first: who sent this worker, then
-    // what the crew needs from the user, then what it is doing.
+    // what the crew needs from the user, then what it is doing. The stack caps at 40% of the
+    // viewport, and the crew roster gives room first: when an open roster would push the
+    // stack past the cap it draws collapsed (its header's count still reads), as the
+    // toggle's closed state does.
+    let viewport_cap = (s.viewport_height * 0.4).max(120.0);
+    let budget = above_composer_budget(s, viewport_cap);
+    // The stack caps at 40% of the viewport, yielding only to the minimum floors so controls
+    // stay reachable on short windows.
+    let cap = viewport_cap.max(budget.floor);
+    let needs_you_part = crew_ui::needs_you(s, p);
+    let tray = crew_ui::crew_tray(s, p, lane, budget.roster_rows_max);
+    let mut stack = col()
+        .key("above-composer-stack")
+        .w_full()
+        .gap(8.0)
+        .min_h(0.0)
+        .max_h(cap);
     for part in [
         crew_ui::parent_bar(s, p, lane),
         crew_ui::crew_bar(s, p, lane),
-        crew_ui::needs_you(s, p),
-        crew_ui::crew_tray(s, p, lane),
+        needs_you_part,
+        tray,
         plan_ui::plan_panel(s, p, lane),
     ]
     .into_iter()
     .flatten()
     {
-        area = area.child(part);
+        stack = stack.child(part);
     }
-    area = area.child(pi_ui::queued_messages(s, p));
+    stack = stack.child(pi_ui::queued_messages(s, p));
+    area = area.child(stack);
     // KSG Code's `ComposerSurface.Main`: a 15 px card with a hairline outline. A composer that
     // cannot send drops its shadow and its frame takes the lighter `line` colour.
     // The resting row and the prompt body swap at once, so a press right after expanding
@@ -16131,20 +16206,7 @@ fn composer(
         composer_style,
     )
     .key("composer-input")
-    .label(format!(
-        "Message {}",
-        match t.harness.as_str() {
-            "pi" => "Pi",
-            "codex" => "Codex",
-            "claude" => "Claude",
-            id => s
-                .harnesses
-                .agents
-                .iter()
-                .find(|agent| agent.id == id)
-                .map_or("agent", |agent| agent.name.as_str()),
-        }
-    ))
+    .label(format!("Message {}", harness_name(s, &t.harness)))
     .placeholder(
         if s.demo {
             "Open a real workspace to send messages".to_string()
@@ -17097,7 +17159,7 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         let title = env_mode_title(s, mode);
         let selected = active == mode;
         let disabled = force_worktree && mode == crate::model::ThreadEnvMode::Local;
-        let name = label(title, TextStyle::new(13.0, 450.0), p.ink)
+        let name = label(title, TextStyle::new(13.0, 500.0), p.ink)
             .truncate()
             .min_w(0.0);
         let mut item = row()
@@ -17194,7 +17256,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
             .min_w(0.0)
             .child(icon("search", p.muted))
             .child(
-                text_input(&s.base_branch_query, TextStyle::new(13.0, 420.0))
+                text_input(&s.base_branch_query, TextStyle::new(13.0, 400.0))
                     .key("base-branch-search")
                     .label("Search refs")
                     .placeholder("Search refs...", p.muted)
@@ -17299,7 +17361,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
                         s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
                     })
                     .child(
-                        label(&r.name, TextStyle::new(13.0, 450.0), p.ink)
+                        label(&r.name, TextStyle::new(13.0, 500.0), p.ink)
                             .truncate()
                             .grow(1.0)
                             .min_w(0.0),
@@ -17827,7 +17889,7 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
     let mut details = col()
         .padding(16.0)
         .gap(16.0)
-        .child(label(&t.title, TextStyle::new(14.0, 560.0), p.ink).wrap())
+        .child(label(&t.title, TextStyle::new(14.0, 600.0), p.ink).wrap())
         .child(status(t.status, p))
         .child(rule(p))
         .child(
@@ -17840,15 +17902,18 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
             col()
                 .gap(5.0)
                 .child(meta_label("Conversation", p.muted))
-                .child(label(
-                    if t.session.is_some() {
-                        "Saved locally by Pi"
-                    } else {
-                        "No saved session yet"
-                    },
-                    LABEL,
-                    p.ink,
-                )),
+                .child(
+                    label(
+                        if t.session.is_some() {
+                            format!("Saved locally by {}", harness_name(s, &t.harness))
+                        } else {
+                            "No saved session yet".to_string()
+                        },
+                        LABEL,
+                        p.ink,
+                    )
+                    .wrap(),
+                ),
         );
     if let Some(session) = &t.session {
         details = details.child(
@@ -18345,7 +18410,7 @@ pub(crate) mod tests {
             rt.state.current_mut().draft.replace_text("Existing draft");
             rt.state.new_thread();
             rt.state.current_mut().draft.focused = false;
-            rt.state.select_thread(0);
+            rt.state.open_kept_tab(0);
             rt.frame(0.0);
             rt.frame(1.0);
             assert!(rt.state.current().draft.focused, "{width}");
@@ -19773,8 +19838,25 @@ pub(crate) mod tests {
                     before,
                     "{width}: selecting {server} moved captains"
                 );
-                assert!(rt.find("tab-1").is_none());
-                assert!(rt.find("tab-3").is_none());
+                // Only the selected machine's strip shows: the active tab
+                // keeps its `tab-{id}` key, and no other machine's tabs leak.
+                let others = ["example-studio", "example-laptop", "local"]
+                    .into_iter()
+                    .filter(|other| *other != server)
+                    .map(|other| match other {
+                        "example-studio" => 3,
+                        "example-laptop" => 2,
+                        _ => 1,
+                    });
+                for other in others {
+                    assert!(rt.find(&format!("tab-{other}")).is_none());
+                }
+                let (tab, _) = rt.presented(&format!("tab-{id}")).unwrap();
+                let (marker, _) = rt.presented("active-tab").unwrap();
+                assert_eq!(
+                    marker, tab,
+                    "{width}: {server}'s marker covers its active tab"
+                );
                 assert!(rt.find("sidebar-machine-label").is_none());
             }
         }
@@ -20362,6 +20444,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_crew_members_list_flat_with_the_captains_portrait() {
+        let mut rt = runtime(1280.0);
+        let mut client = crate::client::Client::new(rt.state.data_dir.clone());
+        let mut remote = crate::client::Client::new(rt.state.data_dir.clone());
+        remote.remote = Some(crate::peer::Link {
+            server_id: "fixture-server".into(),
+            host: "studio-mac".into(),
+            device_id: "fixture-device".into(),
+            token: "fixture".into(),
+            enabled: true,
+        });
+        client.linked.insert("fixture-server".into(), remote);
+        rt.state.client = Some(client);
+        // Thread 3 is crew by canonical membership alone: no parent, no delegation,
+        // the way an independently recruited thread arrives from a linked machine.
+        rt.state.machines.views.insert(
+            "fixture-server".into(),
+            json!({"index":{
+                "captains":[{"name":"Boss","portrait":0}],
+                "threads":[
+                    {"id":1,"title":"Remote thread","session":"s1","captainHome":false,"lifecycle":{}},
+                    {"id":2,"title":"Remote captain","captain":0,"captainHome":true,"lifecycle":{}},
+                    {"id":3,"title":"Recruited worker","session":"s3","captain":0,"crewCaptain":0,"captainHome":false,"lifecycle":{}}
+                ]}}).into(),
+        );
+        rt.frame(0.0);
+        // Without a query or the archive the member stays out of the list.
+        assert!(
+            rt.find("machine-thread-fixture-server-3").is_none(),
+            "a crew member must not list as an ordinary row"
+        );
+        // Search lists it flat, carrying the captain's 16 px portrait and name.
+        rt.state.search.replace_text("Recruited");
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("machine-thread-fixture-server-3").is_some());
+        assert!(
+            rt.presented("machine-captain-portrait-fixture-server-3")
+                .is_some(),
+            "crew rows carry the captain portrait"
+        );
+        // The archive lists it the same way without a query.
+        rt.state.search.replace_text("");
+        rt.state.machines.views.insert(
+            "fixture-server".into(),
+            json!({"index":{
+                "captains":[{"name":"Boss","portrait":0}],
+                "threads":[
+                    {"id":3,"title":"Recruited worker","session":"s3","captain":0,"crewCaptain":0,"captainHome":false,"archived":true,"updated":5}
+                ]}}).into(),
+        );
+        rt.state.show_archive = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("machine-thread-fixture-server-3").is_some());
+        assert!(
+            rt.presented("machine-captain-portrait-fixture-server-3")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn the_machine_selector_marks_a_pending_draft_change_and_blocks_sending() {
         for width in [620.0, 1280.0] {
             let mut rt = runtime(width);
@@ -20491,12 +20635,12 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.current_mut().draft.replace_text("A draft");
-            // The diff view plus two opened file tabs, as KSG's panel tests set up.
+            // The Diff segment plus an open document viewer.
             let key = rt.state.panel_key();
             rt.state.right_panels.open(&key, SingletonKind::Diff);
-            rt.state.right_panels.open_file(&key, "src/one.rs", None);
-            rt.state.right_panels.open_file(&key, "src/two.rs", None);
-            rt.state.right_panels.activate(&key, "diff");
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain_document(&key, 0, "NOTES.md");
+            rt.state.right_panels.open(&key, SingletonKind::Diff);
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(0.5);
@@ -20539,31 +20683,35 @@ pub(crate) mod tests {
                 assert!(rt.presented("composer-input").is_some(), "{width}");
             }
 
-            // Pressing a file tab activates it and shows its body.
-            press(&mut rt, "right-panel-tab-file:src/one.rs");
+            // The viewer segment switches to the document body.
+            press(&mut rt, "right-panel-segment-viewer");
             rt.frame(0.5);
             let key = rt.state.panel_key();
             assert_eq!(
-                rt.state.right_panels.get(&key).active.as_deref(),
-                Some("file:src/one.rs"),
+                rt.state.right_panels.get(&key).view,
+                crate::right_panel::PanelView::Viewer,
                 "{width}"
             );
             assert!(
-                rt.presented("right-panel-body-file:src/one.rs").is_some(),
+                rt.presented("right-panel-body-captain-doc:0:NOTES.md")
+                    .is_some(),
                 "{width}"
             );
 
-            // The active tab's close button removes it; the next tab takes over.
-            press(&mut rt, "right-panel-tab-close-file:src/one.rs");
+            // The Diff segment switches back.
+            press(&mut rt, "right-panel-segment-diff");
             rt.frame(0.5);
-            let state = rt.state.right_panels.get(&key);
-            assert!(
-                state.surfaces.iter().all(|s| s.id() != "file:src/one.rs"),
+            assert_eq!(
+                rt.state.right_panels.get(&key).view,
+                crate::right_panel::PanelView::Diff,
                 "{width}"
             );
-            assert_eq!(state.surfaces.len(), 2, "{width}");
 
-            // Hiding the panel restores the conversation's full width.
+            // Close drops the viewer first, then ends the panel and restores the conversation's full width.
+            press(&mut rt, "right-panel-close");
+            rt.frame(0.5);
+            assert!(rt.state.right_panels.get(&key).viewer.is_none(), "{width}");
+            assert!(rt.presented("right-panel").is_some(), "{width}");
             press(&mut rt, "right-panel-close");
             rt.frame(0.5);
             assert!(rt.presented("right-panel").is_none(), "{width}");
@@ -21004,8 +21152,8 @@ pub(crate) mod tests {
             rt.frame(0.5);
             let key = rt.state.panel_key();
             assert_eq!(
-                rt.state.right_panels.active_surface(&key),
-                Some(crate::right_panel::Surface::Diff),
+                rt.state.right_panels.active_view(&key),
+                Some(crate::right_panel::PanelView::Diff),
                 "{width}"
             );
             assert!(rt.presented("right-panel").is_some(), "{width}");
@@ -22174,7 +22322,7 @@ pub(crate) mod tests {
             let second = rt.state.current().id;
             for action in 0..5 {
                 match action {
-                    0 => rt.state.select_thread(0),
+                    0 => rt.state.open_kept_tab(0),
                     1 => rt.state.close_tab(second),
                     2 => rt.state.settle_thread(rt.state.current().id),
                     3 => rt.state.archive_thread(rt.state.current().id),
@@ -22231,7 +22379,7 @@ pub(crate) mod tests {
                 continue;
             };
             if key.starts_with("routine-schedule-") {
-                // "Weekdays at 9:00" is 16 cells of about 6 pt at 11.5 px.
+                // "Weekdays at 9:00" is 16 cells of about 6 pt at 12 px.
                 let text = element.text.clone().unwrap_or_default();
                 assert!(
                     element.rect[2] >= text.chars().count() as f32 * 5.0,
@@ -23673,7 +23821,7 @@ pub(crate) mod tests {
             rt.update(|_, tx| tx.scroll_to_bottom_instant("conversation-1"));
             rt.frame(1.0);
             let other = rt.state.threads.iter().position(|t| t.id != 1).unwrap();
-            rt.update(|s, _| s.select_thread(other));
+            rt.update(|s, _| s.open_kept_tab(other));
             rt.frame(1.0);
             rt.state.threads[original]
                 .messages
@@ -23684,7 +23832,7 @@ pub(crate) mod tests {
                     images: vec![],
                     context: None,
                 });
-            rt.update(|s, _| s.select_thread(original));
+            rt.update(|s, _| s.open_kept_tab(original));
             for _ in 0..120 {
                 rt.frame(1.0 / 60.0);
             }
@@ -24330,7 +24478,7 @@ pub(crate) mod tests {
         press(&mut rt, "shelf-Snoozed");
         assert!(rt.state.shelves[0]);
         assert!(rt.find("thread-4").is_some());
-        rt.state.select_thread(3);
+        rt.state.open_kept_tab(3);
         rt.frame(0.0);
         rt.update(|_, tx| tx.scroll_into_view("shelf-Snoozed"));
         rt.frame(0.5);
@@ -24524,6 +24672,8 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
             rt.state.compact_sidebar = true;
+            // The summary lives in the roster's header; chip clocks need the roster open.
+            rt.state.refresh_crew_roster_attention();
             rt.frame(0.0);
             rt.frame(1.0);
             // Two workers run. The review waits on an approval, and one more waits for a slot.
@@ -24571,6 +24721,8 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
             rt.state.compact_sidebar = true;
+            // Workers list flat only while searching; the marks ride along on those rows.
+            rt.state.search.replace_text("the");
             rt.frame(0.0);
             let fill = |rt: &Runtime<State>, key: &str| {
                 rt.elements()
@@ -25033,7 +25185,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == earlier)
             .unwrap();
-        rt.state.select_thread(index);
+        rt.state.open_kept_tab(index);
         rt.frame(0.0);
         press(&mut rt, "thread-actions");
         assert!(rt.find("menu-archive-thread").is_some());
@@ -25203,7 +25355,7 @@ pub(crate) mod tests {
         rt.state.current_mut().draft.replace_text("A prompt");
         rt.state.new_thread();
         rt.state.current_mut().draft.replace_text("Another prompt");
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         rt.state.pin_thread(1);
         rt.invalidate();
         rt.frame(0.0);
@@ -28129,20 +28281,118 @@ pub(crate) mod tests {
         child.life.pinned_at = Some(1);
         rt.state.threads.push(child);
         rt.frame(0.0);
-        let (parent, _) = rt.presented("thread-1").unwrap();
-        let (child, _) = rt.presented("thread-2").unwrap();
-        assert!(child[0] >= parent[0] + 24.0 && child[1] > parent[1]);
-        assert!(child[0] + child[2] <= parent[0] + parent[2] + 0.5);
+        // The captain is a single row; its worker never nests beneath it.
+        assert!(rt.presented("thread-1").is_some());
+        assert!(rt.presented("thread-2").is_none());
+        assert!(rt.find("crew-threads-1").is_none());
+        assert!(rt.find("crew-rail-1").is_none());
         rt.state.search.replace_text("Delegated");
         rt.frame(0.0);
+        // The matching worker lists flat under its own match, named by its captain.
+        assert!(rt.presented("thread-2").is_some());
+        assert_eq!(
+            element_text(&rt, "thread-workspace-2").as_deref(),
+            Some("Sable")
+        );
+        let (parent, _) = rt.presented("thread-1").unwrap();
+        let (child, _) = rt.presented("thread-2").unwrap();
+        assert!(child[1] > parent[1]);
         assert!(
             rt.presented("thread-1").is_some(),
             "matching workers retain their captain as context during search"
         );
         press(&mut rt, "thread-2");
         assert_eq!(rt.state.current().id, 2);
-        assert!(rt.presented("thread-2").is_some());
-        assert!(rt.state.sidebar_threads().is_empty());
+        rt.state.search.replace_text("");
+        rt.frame(0.0);
+        // The worker's row is gone from the list, and the captain stays selected for it.
+        assert!(rt.presented("thread-2").is_none());
+        assert!(rt.presented("thread-1").is_some());
+        assert_eq!(rt.state.selected_row(), 1);
+    }
+
+    #[test]
+    fn opening_a_captain_or_its_workers_never_moves_a_sidebar_row() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // Rosters start empty; these tests exercise the earlier named presets.
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain(0);
+            let home = rt.state.current().id;
+            for n in 0..12 {
+                let id = rt.state.next_id;
+                rt.state.next_id += 1;
+                let mut worker = crate::model::Thread::new(id);
+                worker.title = format!("Crew worker {n}");
+                worker.parent = Some(home);
+                worker.delegated = true;
+                worker.captain = Some(0);
+                worker.crew_captain = Some(0);
+                worker.project = rt.state.current().project;
+                rt.state.threads.push(worker);
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            // No worker keys, rails or nested rows exist at rest.
+            for key in rt.elements().iter().filter_map(|e| e.key.as_deref()) {
+                assert!(
+                    !key.starts_with("crew-threads-") && !key.starts_with("crew-rail-"),
+                    "{width}: {key}"
+                );
+            }
+            let rows = |rt: &Runtime<State>| -> Vec<(String, f32)> {
+                rt.elements()
+                    .into_iter()
+                    .filter_map(|e| {
+                        e.key
+                            .filter(|k| {
+                                k.starts_with("thread-")
+                                    || k.starts_with("machine-thread-")
+                                    || k.starts_with("shelf-")
+                                    || k.strip_prefix("crew-").is_some_and(|rest| {
+                                        rest.chars().all(|c| c.is_ascii_digit())
+                                    })
+                            })
+                            .and_then(|k| rt.presented(k.as_str()).map(|(r, _)| (k, r[1])))
+                    })
+                    .collect()
+            };
+            // A different thread is open; capture the resting order.
+            rt.state.new_thread_in(None);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let before = rows(&rt);
+            assert!(!before.is_empty(), "{width}: sidebar rows missing");
+            // Opening the captain moves nothing.
+            rt.state.open_captain(0);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(before, rows(&rt), "{width}: captain open moved rows");
+            // Opening any worker moves nothing either.
+            for n in [0, 5, 11] {
+                let index = rt
+                    .state
+                    .threads
+                    .iter()
+                    .position(|t| t.title == format!("Crew worker {n}"))
+                    .unwrap();
+                rt.state.show_worker_ghost(index);
+                rt.invalidate();
+                rt.frame(0.0);
+                rt.frame(1.0);
+                assert_eq!(before, rows(&rt), "{width}: worker {n} moved rows");
+            }
+            // Still no nested keys after every open.
+            for key in rt.elements().iter().filter_map(|e| e.key.as_deref()) {
+                assert!(
+                    !key.starts_with("crew-threads-") && !key.starts_with("crew-rail-"),
+                    "{width}: {key}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -28170,7 +28420,8 @@ pub(crate) mod tests {
         rt.state.threads.push(child);
         rt.frame(0.0);
         let worker_key = format!("thread-{worker_id}");
-        assert!(rt.presented(&worker_key).is_some());
+        // Workers never list beside their captain; the archive shows them flat.
+        assert!(rt.presented(&worker_key).is_none());
         rt.state.threads.last_mut().unwrap().life.archived_at = Some(1);
         rt.state.show_archive = true;
         rt.invalidate();
@@ -28178,7 +28429,8 @@ pub(crate) mod tests {
         rt.frame(1.0);
         let (home, _) = rt.presented(&format!("thread-{parent}")).unwrap();
         let (worker, _) = rt.presented(&worker_key).unwrap();
-        assert!(worker[0] >= home[0] + 24.0 && worker[1] > home[1]);
+        // Archived workers list flat, at the same inset as any row.
+        assert!((worker[0] - home[0]).abs() < 1.0 && worker[1] > home[1]);
         assert!(
             !rt.state
                 .sidebar_threads()
@@ -28198,6 +28450,7 @@ pub(crate) mod tests {
         rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
         let mut child = crate::model::Thread::new(99);
+        child.title = "Alerting worker".into();
         child.parent = Some(rt.state.current().id);
         child.delegated = true;
         child.crew_captain = Some(0);
@@ -28216,9 +28469,23 @@ pub(crate) mod tests {
             child.life.last_visited_at = Some(if state == 2 { 1 } else { 3 });
             rt.invalidate();
             rt.frame(1.0);
-            assert!(rt.presented("worker-alert-99").is_some());
+            // Nothing enters the sidebar: the captain's own badge carries the alert,
+            // and a search for the worker shows the flat row's alert mark.
+            assert!(rt.presented("worker-alert-99").is_none());
+            assert!(rt.find("thread-99").is_none());
+            rt.state.search.replace_text("Alerting worker");
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(
+                rt.presented("worker-alert-99").is_some(),
+                "state {state}: the flat worker row carries its alert mark"
+            );
+            rt.state.search.replace_text("");
+            rt.invalidate();
+            rt.frame(0.0);
         }
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("thread-99").is_none());
@@ -28674,6 +28941,7 @@ pub(crate) mod tests {
             let mut rt = crew_runtime(width);
             rt.state
                 .demo_remote_task(16, "Studio", crate::model::RemoteState::TargetOffline);
+            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(1.0);
             assert_inside(
@@ -28723,6 +28991,10 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
             assert_eq!(rt.state.current().id, 7);
+            // The roster starts collapsed; a member needing the user opens it.
+            rt.state.refresh_crew_roster_attention();
+            rt.invalidate();
+            rt.frame(0.0);
             assert_inside(
                 &mut rt,
                 width,
@@ -28742,10 +29014,10 @@ pub(crate) mod tests {
                 ],
             );
             // Delegations are task cards, not generic tool rows, and finished tasks stay off
-            // the tray.
+            // the task cards. Every crew member has a roster row, finished or not.
             assert!(rt.presented("inline-tool-7-0").is_none());
-            assert!(rt.presented("crew-chip-1").is_none());
-            assert!(rt.presented("crew-chip-18").is_none());
+            assert!(rt.presented("crew-chip-1").is_some());
+            assert!(rt.presented("crew-chip-18").is_some());
             // The approval stack scrolls inside KSG's max-h-80.
             assert!(rt.presented("needs-you").unwrap().0[3] <= 320.5);
             press(&mut rt, "crew-chip-16");
@@ -28817,6 +29089,7 @@ pub(crate) mod tests {
                 json!({"mode":"shared","newWorktree":false,"primaryCheckout":true,
                     "checkout":"/Users/someone/projects/shina","branch":"main"}),
             );
+            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(1.0);
             for child in [16, 17, 18, 19] {
@@ -28903,6 +29176,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_peer_workers_parent_bar_offers_the_crew_menu_for_its_local_siblings() {
+        for width in [960.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            // Two workers the same remote captain delegated onto this machine.
+            let origin = |parent: usize| {
+                serde_json::from_value(json!({
+                    "deviceId":"origin-device","serverId":"origin-server","serverLabel":"Studio",
+                    "parentThreadId":parent,"taskId":uuid::Uuid::new_v4(),"captain":"Boss"
+                }))
+                .unwrap()
+            };
+            for index in [0, 1] {
+                let thread = &mut rt.state.threads[index];
+                thread.delegated = true;
+                thread.peer_origin = Some(origin(7));
+            }
+            rt.state.show_thread(0);
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_inside(&mut rt, width, &["parent-bar", "crew-siblings"]);
+            press(&mut rt, "crew-siblings");
+            rt.frame(0.5);
+            // The menu lists the other worker this machine runs for the same origin.
+            let sibling = format!("crew-sibling-{}", rt.state.threads[1].id);
+            assert_inside(&mut rt, width, &["crew-siblings-menu", &sibling]);
+            let own = format!("crew-sibling-{}", rt.state.threads[0].id);
+            assert!(rt.find(&own).is_none(), "the open worker is not a row");
+            rt.frame(0.5);
+        }
+    }
+
+    #[test]
     fn a_crew_root_bar_shows_its_placement_and_a_failed_setup_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
@@ -28917,7 +29223,7 @@ pub(crate) mod tests {
                 "error":"Setup script exited with code 1."
             })));
             rt.state.threads.push(member);
-            rt.state.select_thread(rt.state.threads.len() - 1);
+            rt.state.open_kept_tab(rt.state.threads.len() - 1);
             rt.invalidate();
             rt.frame(1.0);
             let bar = rt.presented("crew-bar").expect("crew bar").0;
@@ -29006,53 +29312,162 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_crew_tray_is_two_equal_columns_from_560_and_one_column_below() {
-        let chips = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
-            ["crew-chip-16", "crew-chip-17", "crew-chip-19"]
+    fn the_crew_roster_is_one_column_capped_at_five_rows_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            assert!(rt.presented("crew-roster-rows").is_none());
+            assert!(rt.presented("crew-chip-16").is_none());
+            // The header is a 28 px row; clicking it opens the roster.
+            let header = rt.presented("crew-roster-toggle").unwrap().0;
+            assert!((header[3] - 28.0).abs() < 0.5, "{width}: {header:?}");
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
+            let rows = rt.presented("crew-roster-rows").unwrap().0;
+            assert!(rows[3] <= 150.5, "{width}: {rows:?}");
+            let chips: Vec<[f32; 4]> = ["crew-chip-16", "crew-chip-17", "crew-chip-19"]
                 .iter()
                 .map(|key| rt.presented(key).unwrap().0)
-                .collect()
-        };
-        let rt = crew_runtime(1280.0);
-        let wide = chips(&rt);
-        // Three chips fill two rows of two columns, so two of them share a row.
-        let mut rows: Vec<f32> = wide.iter().map(|c| c[1]).collect();
-        rows.sort_by(f32::total_cmp);
-        rows.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-        assert_eq!(rows.len(), 2, "two rows: {wide:?}");
-        let mut columns: Vec<f32> = wide.iter().map(|c| c[0]).collect();
-        columns.sort_by(f32::total_cmp);
-        columns.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-        assert_eq!(columns.len(), 2, "two columns: {wide:?}");
-        for chip in &wide {
+                .collect();
+            // One column of 30 px rows, 2 px apart.
+            let mut ys: Vec<f32> = chips.iter().map(|c| c[1]).collect();
+            ys.sort_by(f32::total_cmp);
             assert!(
-                (chip[2] - wide[0][2]).abs() < 1.0,
-                "equal columns: {wide:?}"
+                (ys[1] - ys[0] - 32.0).abs() < 1.0 && (ys[2] - ys[1] - 32.0).abs() < 1.0,
+                "{width}: one column: {chips:?}"
             );
-        }
-        assert!(
-            (columns[1] - columns[0] - wide[0][2] - 8.0).abs() < 1.0,
-            "8 px between columns"
-        );
-        assert!(
-            (rows[1] - rows[0] - 30.0 - 6.0).abs() < 1.0,
-            "6 px between rows"
-        );
-        // The timer keeps its width beside the longest title.
-        for chip in ["16", "17", "19"] {
-            let clock = rt.presented(&format!("crew-chip-clock-{chip}")).unwrap().0;
-            assert!(clock[2] >= 20.0, "timer {chip}: {clock:?}");
-        }
-        let rt = crew_runtime(560.0);
-        let narrow = chips(&rt);
-        for pair in narrow.windows(2) {
-            assert!(
-                (pair[0][0] - pair[1][0]).abs() < 1.0 && (pair[0][1] - pair[1][1]).abs() > 20.0,
-                "narrow lanes stack in one column: {narrow:?}"
+            for chip in &chips {
+                assert!((chip[2] - chips[0][2]).abs() < 1.0, "{width}: {chips:?}");
+                assert!((chip[3] - 30.0).abs() < 0.5, "{width}: {chip:?}");
+            }
+            for chip in ["16", "17", "19"] {
+                let clock = rt.presented(&format!("crew-chip-clock-{chip}")).unwrap().0;
+                assert!(clock[2] >= 20.0, "timer {chip}: {clock:?}");
+            }
+            // Full-access footer: New crew thread and Recruit.
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "crew-roster-footer",
+                    "crew-roster-new",
+                    "crew-roster-recruit",
+                ],
             );
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
+            assert!(rt.presented("crew-roster-rows").is_none());
+            assert!(rt.presented("crew-chip-16").is_none());
+        }
+    }
+
+    #[test]
+    fn chunk5_review_blockers_stay_fixed_at_all_widths() {
+        // 1. Harness display name includes built-in Antigravity while preserving registry overrides.
+        let mut state = State::new(".".into(), false);
+        assert_eq!(harness_name(&state, "pi"), "Pi");
+        assert_eq!(harness_name(&state, "codex"), "Codex");
+        assert_eq!(harness_name(&state, "claude"), "Claude");
+        assert_eq!(harness_name(&state, "antigravity"), "Antigravity");
+        assert_eq!(harness_name(&state, "unknown"), "agent");
+        state.harnesses.agents.push(crate::harness::Agent {
+            id: "antigravity".into(),
+            name: "Custom AGY".into(),
+            command: "agy".into(),
+            args: vec![],
+            env: vec![],
+        });
+        assert_eq!(harness_name(&state, "antigravity"), "Custom AGY");
+
+        // 2. Project tile initials meet 4.5:1 contrast on both dark and light active tabs.
+        for dark in [false, true] {
+            let p = palette(dark);
+            let alpha = if dark { 0.30 } else { 0.28 };
+            let bg_lum = p.card.luminance();
+            for hex in PROJECT_HUES {
+                let fg_lum = color(hex).luminance();
+                // Rune blends alpha in linear light; luminance is linear in linear-RGB.
+                let tile_lum = fg_lum * alpha + bg_lum * (1.0 - alpha);
+                let ink_lum = p.ink.luminance();
+                let ratio = (ink_lum.max(tile_lum) + 0.05) / (ink_lum.min(tile_lum) + 0.05);
+                assert!(
+                    ratio >= 4.5,
+                    "dark {dark}: project tile {hex} contrast is {ratio:.2}:1"
+                );
+            }
+        }
+
+        // 3. Peer-worker tabs show an explicit crew fallback instead of a project tile,
+        // and missing captain profiles fall back explicitly instead of portrait 0.
+        let mut rt = runtime(1280.0);
+        rt.state.threads[0].peer_origin = Some(
+            serde_json::from_value(json!({
+                "deviceId": uuid::Uuid::new_v4(),
+                "serverId": uuid::Uuid::new_v4(),
+                "serverLabel": "Mac Studio",
+                "parentThreadId": 7,
+                "taskId": "task-1",
+                "captain": "Sable"
+            }))
+            .unwrap(),
+        );
+        let peer_id = rt.state.threads[0].id;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented(&format!("tab-icon-peer-{peer_id}")).is_some());
+        rt.state.threads[0].peer_origin = None;
+        rt.state.threads[0].crew_captain = Some(999);
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented(&format!("tab-icon-crew-{peer_id}")).is_some());
+
+        // 4. At 480 px height, a captain with zero members and no other panels still fits
+        // its open roster footer (New crew thread / Recruit) without disabling Expand.
+        let mut short_empty = Runtime::with_text(
+            State::new(".".into(), false),
+            view,
+            (620.0, 480.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
+        short_empty.state.captains = crate::captains::Captain::presets();
+        short_empty.state.threads[0].captain_home = true;
+        short_empty.state.threads[0].captain = Some(0);
+        short_empty.invalidate();
+        short_empty.frame(0.0);
+        press(&mut short_empty, "crew-roster-toggle");
+        short_empty.frame(1.0);
+        assert_inside(
+            &mut short_empty,
+            620.0,
+            &[
+                "crew-roster-footer",
+                "crew-roster-new",
+                "crew-roster-recruit",
+            ],
+        );
+
+        // 5. At 720 px height with Needs you + 6 crew members, opening the roster never
+        // pushes Needs you approval actions below the scroll fold.
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state.refresh_crew_roster_attention();
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "needs-you",
+                    "approve-2",
+                    "decline-2",
+                    "open-request-2",
+                    "crew-tray",
+                ],
+            );
+            let stack = rt.presented("above-composer-stack").unwrap().0;
             assert!(
-                (pair[0][2] - pair[1][2]).abs() < 1.0,
-                "stacked chips share a width"
+                stack[3] <= 720.0 * 0.4 + 2.0,
+                "{width}: above-composer-stack exceeded 40% cap: {stack:?}"
             );
         }
     }
@@ -29308,12 +29723,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn tab_key(rt: &Runtime<State>, id: usize) -> String {
-        if rt.state.current().id == id {
-            "active-tab".to_string()
-        } else {
-            format!("tab-{id}")
-        }
+    /// The pressable's key is stable whether the tab is active or not, so a
+    /// double click always lands on the same element path.
+    fn tab_key(_rt: &Runtime<State>, id: usize) -> String {
+        format!("tab-{id}")
     }
 
     #[test]
@@ -29332,7 +29745,7 @@ pub(crate) mod tests {
                         Box::new(|rt| {
                             let first = rt.state.tabs[0];
                             let index = rt.state.threads.iter().position(|t| t.id == first);
-                            rt.state.select_thread(index.unwrap());
+                            rt.state.open_kept_tab(index.unwrap());
                         }),
                     ),
                     (
@@ -29340,7 +29753,7 @@ pub(crate) mod tests {
                         Box::new(|rt| {
                             let last = *rt.state.tabs.last().unwrap();
                             let index = rt.state.threads.iter().position(|t| t.id == last);
-                            rt.state.select_thread(index.unwrap());
+                            rt.state.open_kept_tab(index.unwrap());
                         }),
                     ),
                     (
@@ -29348,6 +29761,32 @@ pub(crate) mod tests {
                         Box::new(|rt| {
                             let last = *rt.state.tabs.last().unwrap();
                             rt.state.close_tab(last);
+                        }),
+                    ),
+                    (
+                        "after ten sidebar previews",
+                        Box::new(|rt| {
+                            // Ghost tabs: sidebar clicks replace one slot
+                            // instead of growing the strip.
+                            let base = rt.state.next_id;
+                            for n in 0..10 {
+                                let mut thread = crate::model::Thread::new(base + n);
+                                thread.title = format!("Sidebar preview {n}");
+                                rt.state.threads.push(thread);
+                            }
+                            rt.state.next_id = base + 10;
+                            let before = rt.state.tabs.len();
+                            for index in (rt.state.threads.len() - 10)..rt.state.threads.len() {
+                                rt.state.show_thread(index);
+                                // The first click adds the ghost slot; the
+                                // next nine replace it in place.
+                                let expected = before + 1;
+                                assert_eq!(
+                                    rt.state.tabs.len(),
+                                    expected,
+                                    "sidebar clicks reuse the ghost tab"
+                                );
+                            }
                         }),
                     ),
                 ];
@@ -29402,19 +29841,65 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == middle)
             .unwrap();
-        rt.state.select_thread(index);
+        rt.state.open_kept_tab(index);
         // Tabs are already at their minimum width at these sizes, so only the strip changes.
         for width in [1100.0, 980.0, 860.0, 760.0, 700.0] {
             rt.set_viewport((width, 800.0), 1.0);
             settle_frames(&mut rt);
             let (strip, _) = rt.presented("thread-tabs").unwrap();
-            let (active, _) = rt.presented("active-tab").unwrap();
-            assert_eq!(rt.presented("active-tab").unwrap().0[2], TAB_MIN_WIDTH);
+            let (active, _) = rt.presented(&tab_key(&rt, middle)).unwrap();
+            assert_eq!(active[2], TAB_MIN_WIDTH);
             assert!(
                 active[0] >= strip[0] - 0.5 && active[0] + active[2] <= strip[0] + strip[2] + 0.5,
                 "{width}: the active tab {active:?} is out of view in {strip:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_double_click_on_an_inactive_ghost_tab_keeps_it() {
+        let mut rt = runtime(1280.0);
+        open_distinct_threads(&mut rt, 2);
+        // An untabbed thread, as a sidebar click would preview.
+        let mut thread = crate::model::Thread::new(rt.state.next_id);
+        thread.title = "Preview thread".into();
+        thread.life.latest_user_message_at = Some(lifecycle::now());
+        rt.state.threads.push(thread);
+        let ghost = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| !rt.state.tabs.contains(&t.id))
+            .unwrap();
+        rt.state.show_thread(ghost);
+        // Focus a kept tab so the ghost sits inactive in the strip.
+        let kept = rt
+            .state
+            .tabs
+            .iter()
+            .copied()
+            .find(|id| Some(*id) != rt.state.ghost_tab);
+        let kept = kept.unwrap();
+        let index = rt.state.threads.iter().position(|t| t.id == kept).unwrap();
+        rt.state.open_kept_tab(index);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.1);
+        let id = rt.state.ghost_tab.expect("a ghost tab");
+        let (x, y) = rt
+            .find(&format!("tab-{id}"))
+            .expect("the ghost tab keeps its stable key");
+        // Both presses land while the path holds `tab-{id}`: the first click
+        // activates the tab, the second pairs with it into `keep_tab`.
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        assert_eq!(rt.state.current().id, id);
+        assert_eq!(rt.state.ghost_tab, None);
+        assert!(rt.state.tabs.contains(&id));
     }
 
     #[test]
@@ -31157,7 +31642,7 @@ pub(crate) mod tests {
                 rt.presented("thread-1").is_some(),
                 "{width}: inactive draft stays listed"
             );
-            rt.state.select_thread(0);
+            rt.state.open_kept_tab(0);
             rt.invalidate();
             rt.frame(0.0);
             assert!(
@@ -33768,7 +34253,7 @@ pub(crate) mod tests {
             },
         ];
         rt.state.new_thread();
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         rt.frame(0.0);
         rt.frame(1.0);
 
@@ -33805,9 +34290,9 @@ pub(crate) mod tests {
         // Set again, persist across thread switch and save/reload in temp dir.
         press(&mut rt, "reply-message-msg-a1");
         rt.frame(1.0);
-        rt.state.select_thread(1);
+        rt.state.open_kept_tab(1);
         assert!(rt.state.current().draft_reply_to.is_none());
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         assert_eq!(
             rt.state
                 .current()
@@ -34642,7 +35127,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == draft_id)
             .unwrap();
-        rt.state.select_thread(draft_idx);
+        rt.state.open_kept_tab(draft_idx);
         assert_eq!(rt.state.multi_model_selections().len(), 3);
 
         // Persist and reload from temporary data directory.
@@ -34656,7 +35141,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == draft_id)
             .unwrap();
-        reloaded.select_thread(reloaded_idx);
+        reloaded.open_kept_tab(reloaded_idx);
         reloaded.vcs_branches = rt.state.vcs_branches.clone();
         assert_eq!(reloaded.multi_model_selections().len(), 3);
         assert_eq!(

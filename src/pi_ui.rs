@@ -94,7 +94,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                         .child(
                             if !option.description.is_empty() && option.description != option.label
                             {
-                                label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
+                                label(&option.description, TextStyle::new(12.0, 400.0), p.muted)
                                     .wrap_anywhere()
                             } else {
                                 el()
@@ -660,6 +660,9 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
         .w_full()
         .gap(8.0)
         .max_h(260.0)
+        // The composer's 40% cap can shave the list; it keeps at least one message.
+        .min_h(48.0)
+        .shrink()
         .scroll(ScrollSpec {
             stick_bottom: false,
         });

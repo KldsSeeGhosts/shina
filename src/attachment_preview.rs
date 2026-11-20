@@ -1306,7 +1306,7 @@ fn archive_view(s: &State, p: Palette) -> El {
                             .child(
                                 label(
                                     modified.unwrap_or_default(),
-                                    TextStyle::new(11.0, 400.0),
+                                    TextStyle::new(12.0, 400.0),
                                     p.faint,
                                 )
                                 .truncate()
@@ -2127,7 +2127,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                     }
                                 })
                                 .child(
-                                    label(title, TextStyle::new(13.0, 450.0), p.ink)
+                                    label(title, TextStyle::new(13.0, 500.0), p.ink)
                                         .grow(1.0)
                                         .min_w(0.0)
                                         .truncate(),

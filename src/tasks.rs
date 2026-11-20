@@ -1031,7 +1031,9 @@ impl State {
                 delivery.hold = false;
             }
         }
-        self.release_crew_reports(parent_thread_id);
+        // The report release names its released events so the user-turn
+        // record's audit list covers every event the turn moved.
+        let mut released = self.release_crew_reports(parent_thread_id);
         if actor == captain_inbox::ReleaseActor::User
             && let Some(captain) = self
                 .captain_homes
@@ -1040,10 +1042,10 @@ impl State {
                 .map(|(captain, _)| *captain)
         {
             let now = lifecycle::now();
-            let mut released = Vec::new();
             for event in &mut self.captain_inbox {
                 if event.captain == captain
                     && event.state == captain_inbox::InboxState::Held
+                    && event.kind != captain_inbox::InboxKind::CrewOutcome
                     && event.dispatched_at.is_none()
                 {
                     event.state = captain_inbox::InboxState::Pending;

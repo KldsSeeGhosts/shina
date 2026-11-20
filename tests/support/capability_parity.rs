@@ -204,6 +204,29 @@ fn endpoint(directory: &std::path::Path) -> (String, String) {
     )
 }
 
+/// A freshly opened or reset Captain home starts its provider session in the
+/// background. `thread.send` refuses while that setup is still running, so
+/// retry only that readiness refusal. Every other rejection fails at once.
+fn send_when_ready(client: &mut Client, thread: u64, text: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let receipt = client.command(
+            "thread.send",
+            json!({"threadId":thread,"text":text,"attachments":[],"mode":"prompt"}),
+            uuid::Uuid::new_v4(),
+        );
+        if receipt["result"]["status"] == "accepted" {
+            return receipt;
+        }
+        let error = receipt["result"]["result"]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(error, "The thread cannot accept input now.", "{receipt}");
+        assert!(Instant::now() < deadline, "{receipt}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn tool_names_as(url: &str, token: &str) -> Vec<String> {
     fixture_rpc_as(url, token, "tools/list", json!({}))["result"]["tools"]
         .as_array()
@@ -1087,13 +1110,7 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
             .iter()
             .any(|tool| tool == "delegate_task")
     );
-    let continued = client.command(
-        "thread.send",
-        json!({"threadId":home,"text":"earlier-home-role-update",
-            "attachments":[],"mode":"prompt"}),
-        uuid::Uuid::new_v4(),
-    );
-    assert_eq!(continued["result"]["status"], "accepted", "{continued}");
+    send_when_ready(&mut client, home, "earlier-home-role-update");
     let instruction_deadline = Instant::now() + Duration::from_secs(20);
     let instructions = loop {
         if let Ok(prompts) = fs::read_to_string(home_directory.join("fixture-system-prompt.jsonl"))
@@ -1127,13 +1144,7 @@ fn capability_contract_binds_advertisement_and_dispatch_to_the_calling_role() {
     // Start the new home explicitly: report delivery may all have finished
     // before the reset. Use the bearer captured by this prompt's actual MCP
     // call, since the two homes can overwrite the shared endpoint file.
-    let started = client.command(
-        "thread.send",
-        json!({"threadId":new_home,"text":"shina-dispatch-fixture",
-            "attachments":[],"mode":"prompt"}),
-        uuid::Uuid::new_v4(),
-    );
-    assert_eq!(started["result"]["status"], "accepted", "{started}");
+    send_when_ready(&mut client, new_home, "shina-dispatch-fixture");
     let new_deadline = Instant::now() + Duration::from_secs(20);
     let (new_url, new_token) = loop {
         if let Ok(log) = fs::read_to_string(home_directory.join("pi-mcp-dispatch.jsonl"))

@@ -7,7 +7,7 @@
 //! `cubic-bezier(.23, 1, .32, 1)`. The visual skin follows docs/ui/pixel-voyage.md.
 use super::*;
 use crate::model::placement::{PlacementMode, PlacementPhase, ThreadPlacement};
-use crate::model::{AttentionItem, AttentionKind, TaskState, TaskView};
+use crate::model::{AttentionItem, AttentionKind, PeerOrigin, TaskState, TaskView};
 use rune::Transition;
 
 /// Row corners, shared by cards, chips and popover items.
@@ -16,9 +16,6 @@ const ROW_RADIUS: f32 = 4.0;
 const ELAPSED_SLOT: f32 = 72.0;
 /// Where a card's second and later lines start: past the status mark's 14 px slot and its gap.
 const CARD_INDENT: f32 = 22.0;
-/// Below this lane width the crew tray stacks its chips, as KSG's composer bars drop to a column.
-const TRAY_STACK_WIDTH: f32 = 560.0;
-
 pub(super) fn motion() -> rune::Curve {
     rune::Curve::tween(0.18, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0))
 }
@@ -57,7 +54,7 @@ pub(super) fn ghost_button(
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(action)
-        .child(label(title, TextStyle::new(12.5, 500.0), p.ink))
+        .child(label(title, TextStyle::new(13.0, 500.0), p.ink))
 }
 /// The one filled action in a group: Approve, Resume, Open to answer.
 pub(super) fn solid_button(
@@ -81,7 +78,7 @@ pub(super) fn solid_button(
             // Rune cannot move a button on press, so a pressed key darkens instead.
             .press(p.coral.alpha(0.9))
             .on_press(action)
-            .child(label(title, TextStyle::new(12.5, 600.0), p.on_coral)),
+            .child(label(title, TextStyle::new(13.0, 600.0), p.on_coral)),
         p,
     )
 }
@@ -102,7 +99,7 @@ pub(super) fn open_thread(s: &mut State, id: usize) {
         return;
     }
     if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-        s.select_thread(index);
+        s.show_worker_ghost(index);
     }
 }
 
@@ -457,7 +454,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .child(
             label(
                 &task.title,
-                TextStyle::new(14.0, 560.0).tracking(-0.12),
+                TextStyle::new(14.0, 600.0).tracking(-0.12),
                 p.ink,
             )
             .key(format!("task-title-{child}"))
@@ -886,7 +883,7 @@ pub(super) fn brief_block(
             label(
                 name,
                 TextStyle {
-                    weight: 560.0,
+                    weight: 600.0,
                     ..ACTIVITY
                 },
                 p.ink,
@@ -911,15 +908,25 @@ pub(super) fn brief_block(
     )
 }
 
-/// The crew tray: running and queued tasks as compact chips above a captain's composer, in the
-/// place KSG Code's `QueuedRunsControl` takes. It wraps on a wide lane and stacks on a narrow one.
-pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
-    let t = s.current();
-    if !s.is_captain_home(t) {
-        return None;
-    }
-    let tasks: Vec<_> = s
-        .tasks_for(t.id)
+/// One member of a captain's Crew Roster: the thread, its task when one exists, and the
+/// ordering rank. Needs-you rows lead, then working, then queued, then idle, each by
+/// `updated`. `crew-chip-{id}` keys stay stable across all of them.
+struct RosterMember {
+    thread_id: usize,
+    title: String,
+    status: Status,
+    word: String,
+    clock: String,
+    remote_server: Option<String>,
+    rank: usize,
+    updated: u64,
+    place: Option<String>,
+    queued: bool,
+}
+
+fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
+    let tasks: std::collections::HashMap<usize, TaskView> = s
+        .tasks_for(home)
         .into_iter()
         .filter(|task| {
             task.remote.as_ref().is_some_and(|remote| remote.stop_owed)
@@ -927,26 +934,291 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
                     task.state,
                     TaskState::Queued | TaskState::Starting | TaskState::Running
                 )
+                || s.threads
+                    .iter()
+                    .any(|t| t.id == task.child_id && t.request.is_some())
+        })
+        .map(|task| (task.child_id, task))
+        .collect();
+    let mut seen: std::collections::HashSet<usize> = Default::default();
+    let mut members = Vec::new();
+    let ids: Vec<usize> = s
+        .captain_crew(captain)
+        .into_iter()
+        .chain(tasks.keys().copied())
+        .filter(|id| seen.insert(*id))
+        .collect();
+    for id in ids {
+        let thread = s.threads.iter().find(|t| t.id == id);
+        let task = tasks.get(&id);
+        if thread.is_none() && task.is_none() {
+            continue;
+        }
+        let (status, word) = match task {
+            Some(task) => {
+                let (status, word) = task_status(s, task);
+                (status, word.to_string())
+            }
+            None => {
+                // An untasked member is independent crew: a request in flight is a
+                // needs-you like any task's, the rest follows the thread's own status.
+                let status = if thread.is_some_and(|t| t.request.is_some()) {
+                    Status::Waiting
+                } else {
+                    thread.map(|t| t.status).unwrap_or(Status::Ready)
+                };
+                (status, crate::model::status_word(status).into())
+            }
+        };
+        let waiting = status == Status::Waiting;
+        let clock = match task {
+            Some(task) if waiting || task.remote.is_some() => word.clone(),
+            Some(task) => task_clock(task),
+            None => word.clone(),
+        };
+        let rank = if thread.is_some_and(|t| t.request.is_some()) || status == Status::Waiting {
+            0
+        } else if status.busy()
+            || task
+                .is_some_and(|task| matches!(task.state, TaskState::Starting | TaskState::Running))
+        {
+            1
+        } else if task.is_some_and(|task| task.state == TaskState::Queued) {
+            2
+        } else {
+            3
+        };
+        members.push(RosterMember {
+            thread_id: id,
+            title: task.map(|task| task.title.clone()).unwrap_or_else(|| {
+                let title = thread.map(|t| t.title.as_str()).unwrap_or_default();
+                if title.is_empty() {
+                    "Untitled".into()
+                } else {
+                    title.to_string()
+                }
+            }),
+            status,
+            word,
+            clock,
+            remote_server: task
+                .and_then(|task| task.remote.as_ref().map(|r| r.server_id.clone()))
+                .or_else(|| thread.and_then(|t| (t.machine != "local").then(|| t.machine.clone()))),
+            rank,
+            updated: thread.map(|t| t.updated).unwrap_or(0),
+            queued: task.is_some_and(|task| task.state == TaskState::Queued),
+            place: worker_placement(s, id).map(|placement| {
+                placement_details(&placement, &placement_machine(s, id, &placement))
+            }),
+        });
+    }
+    members.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| b.updated.cmp(&a.updated)));
+    members
+}
+
+/// The other workers this machine runs for one peer delegation: threads sharing the
+/// open worker's origin server and parent task. Same rank and status rules as
+/// `roster_members`' untasked arm.
+fn peer_sibling_members(s: &State, open: usize, origin: &PeerOrigin) -> Vec<RosterMember> {
+    let mut members: Vec<RosterMember> = s
+        .threads
+        .iter()
+        .filter(|thread| {
+            thread.id != open
+                && thread.peer_origin.as_ref().is_some_and(|other| {
+                    other.server_id == origin.server_id
+                        && other.parent_thread_id == origin.parent_thread_id
+                })
+        })
+        .map(|thread| {
+            let status = if thread.request.is_some() {
+                Status::Waiting
+            } else {
+                thread.status
+            };
+            let word = crate::model::status_word(status).to_string();
+            let rank = if thread.request.is_some() || status == Status::Waiting {
+                0
+            } else if status.busy() {
+                1
+            } else {
+                3
+            };
+            RosterMember {
+                thread_id: thread.id,
+                title: if thread.title.is_empty() {
+                    "Untitled".into()
+                } else {
+                    thread.title.clone()
+                },
+                status,
+                clock: word.clone(),
+                word,
+                remote_server: (thread.machine != "local").then(|| thread.machine.clone()),
+                rank,
+                updated: thread.updated,
+                queued: false,
+                place: worker_placement(s, thread.id).map(|placement| {
+                    placement_details(&placement, &placement_machine(s, thread.id, &placement))
+                }),
+            }
         })
         .collect();
-    // A primary Captain home keeps the tray's header for its Plan control, crew or not.
-    let plan = super::plan_ui::plan_toggle(s, p);
-    if tasks.is_empty() && plan.is_none() {
+    members.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| b.updated.cmp(&a.updated)));
+    members
+}
+
+/// A 30 px roster row: status mark, title, machine tag when remote, clock or status word.
+/// Click opens the worker; a secondary press opens the member's More menu. `key` keeps the
+/// roster's `crew-chip-{id}` keys and lets the siblings menu reuse the builder with its own.
+fn roster_row(s: &State, p: Palette, member: &RosterMember, key: String, menu: bool) -> El {
+    let child = member.thread_id;
+    let (_, tertiary) = quiet_inks(p);
+    let waiting = member.status == Status::Waiting;
+    let clock_width = super::text_width(&member.clock) + 4.0;
+    let mut row_ = row()
+        .key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(match &member.place {
+            Some(place) => format!(
+                "{}. {}. {}. Open the worker",
+                member.title,
+                member.word,
+                place.replace('\n', ". ")
+            ),
+            None => format!("{}. {}. Open the worker", member.title, member.word),
+        })
+        .focusable(true)
+        .center_y()
+        .gap(7.0)
+        .h(30.0)
+        .pl(8.0)
+        .pr(10.0)
+        .radius(ROW_RADIUS)
+        .hover(hover_wash(s, p))
+        .press(active_wash(s, p))
+        .hover_motion(motion(), motion())
+        .transition(Transition::offset(0.0, 4.0).combined(Transition::opacity()))
+        .on_press(move |s: &mut State| {
+            s.crew_siblings_menu = false;
+            open_thread(s, child);
+        })
+        .child(mark_slot(member.status, p))
+        .child(
+            label(&member.title, TextStyle::new(13.0, 500.0), p.ink)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        )
+        .child(
+            member
+                .remote_server
+                .as_ref()
+                .map(|server| {
+                    machine_tag(s, p, server, format!("crew-machine-{child}"), SMALL, true)
+                })
+                .unwrap_or_else(el),
+        )
+        // The timer never shrinks: the title gives way first.
+        .child(
+            label(
+                member.clock.clone(),
+                if waiting { super::META } else { TIMER },
+                if waiting { p.brass } else { tertiary },
+            )
+            .min_w(clock_width)
+            .key(format!("crew-chip-clock-{child}")),
+        );
+    if menu {
+        row_ = row_.on_secondary_press(move |s: &mut State, _at, _| {
+            s.brief.more = Some(child);
+        });
+    }
+    if let Some(place) = &member.place {
+        row_ = row_.help(place.clone());
+    }
+    row_
+}
+
+/// `crew_tray_shows` prices the tray in the composer's stack budget before it is built.
+pub(super) fn crew_tray_shows(s: &State) -> bool {
+    s.is_captain_home(s.current()) && s.current().captain.is_some()
+}
+
+/// Extra height (beyond the 28 px header) for the roster's footer + internal gaps.
+pub(super) fn crew_tray_footer_extra_height(s: &State) -> f32 {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return 0.0;
+    }
+    let Some(captain) = t.captain else {
+        return 0.0;
+    };
+    let has_footer = s.captain_access(captain) == crate::model::CaptainAccess::Full;
+    let members = roster_members(s, t.id, captain).len();
+    let mut extra = 0.0;
+    if members > 0 {
+        extra += 4.0;
+    }
+    if has_footer {
+        extra += 34.0;
+    }
+    extra
+}
+
+/// Preferred extra height (beyond the 28 px header) when this captain's crew roster is open.
+pub(super) fn crew_tray_open_extra_height(s: &State) -> Option<f32> {
+    let t = s.current();
+    if !s.is_captain_home(t) {
         return None;
     }
-    // One definition of working, shared with the chat header: running now. A worker waiting on
-    // an approval needs you instead, and a queued one waits for a slot.
-    let count = |want: Status| {
-        tasks
-            .iter()
-            .filter(|task| task_status(s, task).0 == want)
-            .count()
+    let captain = t.captain?;
+    let members = roster_members(s, t.id, captain).len();
+    let rows_h = if members == 0 {
+        0.0
+    } else {
+        ((members as f32) * 32.0 - 2.0).min(150.0)
     };
+    Some(rows_h + crew_tray_footer_extra_height(s))
+}
+
+/// Minimum extra height required to render an open roster meaningfully (at least one row if
+/// members exist, plus the footer if Full access).
+pub(super) fn crew_tray_min_open_extra_height(s: &State) -> Option<f32> {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return None;
+    }
+    let captain = t.captain?;
+    let members = roster_members(s, t.id, captain).len();
+    let min_rows = if members == 0 { 0.0 } else { 30.0 };
+    Some(min_rows + crew_tray_footer_extra_height(s))
+}
+
+/// The Crew Roster above a captain's composer, in the place KSG Code's `QueuedRunsControl`
+/// takes: a 28 px header with a chevron, the member count, the status summary and the Plan
+/// toggle, then — while expanded — one 30 px row per member, capped at five rows, and a
+/// footer with New crew thread and Recruit on a Full-access captain. `rows_max` caps the
+/// member rows scroll area (or collapses the roster when `None`) under the composer's 40%
+/// viewport cap.
+pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, rows_max: Option<f32>) -> Option<El> {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return None;
+    }
+    let captain = t.captain?;
+    let members = roster_members(s, t.id, captain);
+    let plan = super::plan_ui::plan_toggle(s, p);
+    let can_open = rows_max.is_some();
+    let open = s.crew_roster_open(captain) && can_open;
+    // One definition of working, shared with the chat header: running now. A worker waiting
+    // on an approval needs you instead, and a queued one waits for a slot. Independent crew
+    // members count the same way; only an idle member is no task at all.
+    let count = |want: Status| members.iter().filter(|m| m.status == want).count();
     let (working, needs_you) = (count(Status::Running), count(Status::Waiting));
     let offline = count(Status::Paused);
-    let queued = tasks.len() - working - needs_you - offline;
-    let (_, tertiary) = quiet_inks(p);
-    // One label per count, each after its status square, 8 px apart and never joined.
+    let queued = members.iter().filter(|m| m.queued).count();
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
     for (key, n, status, word) in [
         ("crew-tray-working", working, Status::Running, "working"),
@@ -973,132 +1245,149 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32) -> Option<El> {
             );
         }
     }
-    // One column below 560 px. From there on two equal columns, 8 px apart with 6 px between
-    // rows, so a title keeps the room beside it and only the longest ones truncate.
-    let stacked = lane < TRAY_STACK_WIDTH;
-    let mut chips = col().gap(if stacked { 2.0 } else { 6.0 });
-    let mut pair: Vec<El> = Vec::new();
-    for task in &tasks {
-        let (status, word) = task_status(s, task);
-        let child = task.child_id;
-        // A worker waiting on an approval is not running, so its timer gives way to the word.
-        let waiting = status == Status::Waiting;
-        let clock = if waiting || task.remote.is_some() {
-            word.to_string()
-        } else {
-            task_clock(task)
-        };
-        let clock_width = super::text_width(&clock) + 4.0;
-        // The chip has no room for the checkout, so its tooltip and label carry it.
-        let place = worker_placement(s, child).map(|placement| {
-            placement_details(&placement, &placement_machine(s, child, &placement))
-        });
-        let chip = row()
-            .key(format!("crew-chip-{child}"))
-            .role("button")
-            .cursor(rune::Cursor::Pointer)
-            .label(match &place {
-                Some(place) => format!(
-                    "{}. {word}. {}. Open the worker",
-                    task.title,
-                    place.replace('\n', ". ")
-                ),
-                None => format!("{}. {word}. Open the worker", task.title),
-            })
-            .focusable(true)
-            .center_y()
-            .gap(7.0)
-            .h(30.0)
-            .pl(8.0)
-            .pr(10.0)
-            .radius(ROW_RADIUS)
-            .hover(hover_wash(s, p))
-            .press(active_wash(s, p))
-            .hover_motion(motion(), motion())
-            .transition(Transition::offset(0.0, 4.0).combined(Transition::opacity()))
-            .on_press(move |s: &mut State| open_thread(s, child))
-            .child(mark_slot(status, p))
-            .child(
-                label(&task.title, TextStyle::new(13.0, 500.0), p.ink)
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0),
-            )
-            .child(
-                task.remote
-                    .as_ref()
-                    .map(|remote| {
-                        machine_tag(
-                            s,
-                            p,
-                            &remote.server_id,
-                            format!("crew-machine-{child}"),
-                            SMALL,
-                            true,
+    let mut roster = col()
+        .key("crew-tray")
+        .role("group")
+        .label("Crew")
+        .gap(4.0)
+        .child(
+            row()
+                .h(28.0)
+                .px(4.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    row()
+                        .key("crew-roster-toggle")
+                        .role("button")
+                        .cursor(if can_open {
+                            rune::Cursor::Pointer
+                        } else {
+                            rune::Cursor::Default
+                        })
+                        .label(if open {
+                            format!("Crew, {} members. Collapse", members.len())
+                        } else if !can_open {
+                            format!(
+                                "Crew, {} members. Window too short to expand",
+                                members.len()
+                            )
+                        } else {
+                            format!("Crew, {} members. Expand", members.len())
+                        })
+                        .disabled(!can_open)
+                        .focusable(can_open)
+                        .h_full()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(ROW_RADIUS)
+                        .hover(hover_wash(s, p))
+                        .hover_motion(motion(), motion())
+                        .on_press(move |s: &mut State| {
+                            if can_open {
+                                s.toggle_crew_roster(captain);
+                            }
+                        })
+                        .child(icon(if open { "chevron" } else { "open" }, p.muted))
+                        .child(meta_label("Crew", p.muted))
+                        .child(
+                            meta_text(members.len().to_string(), p.muted).key("crew-roster-count"),
                         )
-                    })
-                    .unwrap_or_else(el),
-            )
-            // The timer never shrinks: the title gives way first.
-            .child(
-                label(
-                    clock,
-                    if waiting { super::META } else { TIMER },
-                    if waiting { p.brass } else { tertiary },
+                        .child(summary)
+                        .child(spacer()),
                 )
-                .min_w(clock_width)
-                .key(format!("crew-chip-clock-{child}")),
-            )
-            // A card fill and a 1 px `line` border, so a chip reads as a chip.
-            .fill(p.card)
-            .border(1.0, p.line);
-        let chip = match place {
-            Some(place) => chip.help(place),
-            None => chip,
-        };
-        if stacked {
-            chips = chips.child(chip.w_full());
-        } else {
-            pair.push(chip.w(0.0).grow(1.0).min_w(0.0));
-            if pair.len() == 2 {
-                let mut line = row().gap(8.0);
-                for chip in pair.drain(..) {
-                    line = line.child(chip);
-                }
-                chips = chips.child(line);
+                .child(plan.unwrap_or_else(el)),
+        );
+    if open {
+        if !members.is_empty() {
+            let mut rows = col().gap(2.0);
+            for member in &members {
+                rows = rows.child(roster_row(
+                    s,
+                    p,
+                    member,
+                    format!("crew-chip-{}", member.thread_id),
+                    true,
+                ));
             }
+            roster = roster.child(
+                col()
+                    .key("crew-roster-rows")
+                    .max_h(rows_max.unwrap_or(150.0))
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .child(rows),
+            );
+        }
+        if s.captain_access(captain) == crate::model::CaptainAccess::Full {
+            let server = s.machines.selected.clone();
+            let draft_reason = s.crew_creation_unavailable(&server, captain);
+            let new_server = server.clone();
+            let mut new_thread = ghost_button(
+                s,
+                "crew-roster-new".into(),
+                "New crew thread",
+                p,
+                move |s: &mut State| {
+                    if s.machines.selected != new_server {
+                        return;
+                    }
+                    if let Err(error) = s.begin_crew_draft(&new_server, captain) {
+                        s.brief.error = Some(error);
+                    }
+                },
+            )
+            .disabled(draft_reason.is_some());
+            if let Some(reason) = draft_reason {
+                new_thread = new_thread.help(reason);
+            }
+            let recruit_server = server.clone();
+            roster = roster.child(
+                row()
+                    .key("crew-roster-footer")
+                    .h(30.0)
+                    .px(4.0)
+                    .gap(6.0)
+                    .center_y()
+                    .child(new_thread)
+                    .child(ghost_button(
+                        s,
+                        "crew-roster-recruit".into(),
+                        "Recruit...",
+                        p,
+                        move |s: &mut State| {
+                            if s.machines.selected != recruit_server
+                                || s.captain_access(captain) != crate::model::CaptainAccess::Full
+                            {
+                                return;
+                            }
+                            s.brief.recruit = Some(crate::model::RecruitPicker {
+                                server: recruit_server.clone(),
+                                captain,
+                                query: rune::TextEdit::default(),
+                            });
+                        },
+                    )),
+            );
         }
     }
-    if let Some(last) = pair.pop() {
-        // An odd chip takes the left column; an empty cell keeps it half width.
-        chips = chips.child(row().gap(8.0).child(last).child(el().w(0.0).grow(1.0)));
-    }
-    // An open plan lists its launched nodes, so the tray keeps only its counts meanwhile.
-    if s.plan_panel_open() {
-        chips = col();
-    }
-    Some(
-        col()
-            .key("crew-tray")
-            .role("group")
-            .label("Crew")
-            .gap(4.0)
-            .child(
-                row()
-                    .h(20.0)
-                    .px(4.0)
-                    .gap(8.0)
-                    .center_y()
-                    .child(meta_label("Crew", p.muted))
-                    // One item per count, 8 px apart, never joined with a dot.
-                    .child(summary)
-                    .child(spacer())
-                    .child(plan.unwrap_or_else(el)),
-            )
-            .child(chips),
-    )
+    Some(roster)
 }
 
+/// Whether `needs_you` draws, so the composer's stack budget can price it before building.
+pub(super) fn needs_you_shows(s: &State) -> bool {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return false;
+    }
+    s.attention()
+        .into_iter()
+        .any(|item| needs_you_item(s, t.id, &item))
+        || super::crew_questions_ui::cards_shows(s)
+}
 /// Approvals and questions from this captain's crew, ported from KSG Code's
 /// `ChildThreadApprovals`: bordered `rounded-lg p-3` cards in a `max-h-80` scrolling stack.
 pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
@@ -1246,7 +1535,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                             status_ink(Status::Waiting, p),
                         ))
                         .child(
-                            label(&item.short_title, TextStyle::new(13.0, 560.0), p.ink)
+                            label(&item.short_title, TextStyle::new(13.0, 600.0), p.ink)
                                 .truncate()
                                 .shrink()
                                 .min_w(0.0),
@@ -1278,6 +1567,9 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
             .label("Needs you")
             // An open task plan shares the lane, so the stack gives it most of its height.
             .max_h(if s.plan_panel_open() { 120.0 } else { 320.0 })
+            // Keep approval actions reachable without hiding buttons under the roster.
+            .min_h(120.0)
+            .shrink()
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
@@ -1304,6 +1596,14 @@ pub(crate) fn needs_you_item(s: &State, home: usize, item: &AttentionItem) -> bo
 
 /// "Delegated by <captain>", "Runs on its own" and "Open captain" above a worker's composer, ported
 /// from KSG Code's `ProviderSubagentBar` (`min-h-12 rounded-2xl py-2 ps-5 pe-2 text-sm`).
+/// Whether `parent_bar` draws, so the composer's stack budget can price it before building.
+pub(super) fn parent_bar_shows(s: &State) -> bool {
+    let t = s.current();
+    t.peer_origin.is_some()
+        || t.delegated
+            && t.parent
+                .is_some_and(|id| s.threads.iter().any(|thread| thread.id == id))
+}
 pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     let t = s.current();
     // Ported from KSG Code's ThreadRelationshipsControl DelegatedFromRow.
@@ -1339,12 +1639,14 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                 .label("Delegated work")
                 .min_h(48.0)
                 .py(8.0)
-                .px(20.0)
+                .pl(20.0)
+                .pr(8.0)
                 .gap(8.0)
                 .center_y()
                 .radius(12.0)
                 .border(1.0, hairline(p))
-                .child(who),
+                .child(who)
+                .child(siblings_button(s, p)),
         );
     }
     let parent = t
@@ -1365,14 +1667,14 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     ));
     who = match captain.and_then(|c| s.captains.get(c).map(|profile| (c, profile))) {
         Some((index, profile)) => who.child(avatar(s, p, index, 20.0, Status::Ready)).child(
-            label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+            label(&profile.name, TextStyle::new(14.0, 600.0), p.ink)
                 .key("parent-bar-name")
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         ),
         None => who.child(
-            label(&parent.title, TextStyle::new(14.0, 560.0), p.ink)
+            label(&parent.title, TextStyle::new(14.0, 600.0), p.ink)
                 .key("parent-bar-name")
                 .truncate()
                 .shrink()
@@ -1441,6 +1743,9 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
             p.muted,
         ));
     }
+    if captain.is_some_and(|c| s.captain_home(c).is_some()) {
+        bar = bar.child(siblings_button(s, p));
+    }
     let bar = bar.child(
         row()
             .key("open-captain")
@@ -1497,6 +1802,13 @@ fn with_placement(bar: El, placement: Option<El>, key: &str, name: String, p: Pa
     group
 }
 
+/// Whether `crew_bar` draws, so the composer's stack budget can price it before building.
+pub(super) fn crew_bar_shows(s: &State) -> bool {
+    let t = s.current();
+    !t.delegated
+        && t.peer_origin.is_none()
+        && t.crew_captain.is_some_and(|c| s.captains.get(c).is_some())
+}
 /// The independent crew root's bar: which captain's crew it belongs to, and a button back
 /// to that captain's home. Delegated workers keep `parent_bar` instead.
 pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
@@ -1518,7 +1830,7 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
         .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
         .child(
-            label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+            label(&profile.name, TextStyle::new(14.0, 600.0), p.ink)
                 .key("crew-bar-name")
                 .truncate()
                 .shrink()
@@ -1545,6 +1857,11 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .center_y()
         .child(who)
         .child(spacer())
+        .child(if home.is_some() {
+            siblings_button(s, p)
+        } else {
+            el()
+        })
         .child(
             row()
                 .key("crew-bar-open-captain")
@@ -1613,6 +1930,100 @@ fn attention_word(kind: AttentionKind) -> &'static str {
         AttentionKind::Interrupted => "Interrupted",
         AttentionKind::ReadyForReview => "Results ready",
     }
+}
+
+/// The "Crew" menu button on a worker's parent or crew bar: jumps between the captain's
+/// members without going back to the captain's home. Rows share the roster's row builder.
+pub(super) fn siblings_button(s: &State, p: Palette) -> El {
+    let mut button = row()
+        .key("crew-siblings")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(if s.crew_siblings_menu {
+            "Close the crew menu"
+        } else {
+            "Open the crew menu"
+        })
+        .focusable(true)
+        .center_y()
+        .gap(6.0)
+        .h(32.0)
+        .px(10.0)
+        .radius(ROW_RADIUS)
+        .hover(hover_wash(s, p))
+        .press(active_wash(s, p))
+        .hover_motion(motion(), motion())
+        .on_press(|s: &mut State| s.crew_siblings_menu = !s.crew_siblings_menu)
+        .child(icon("crew", p.muted))
+        .child(label("Crew", TextStyle::new(13.0, 500.0), p.ink));
+    if s.crew_siblings_menu {
+        button = button.fill(hover_wash(s, p));
+    }
+    button
+}
+
+/// The siblings popover: every member of the captain's crew, in the roster's order, minus
+/// the open worker itself. Anchored to `crew-siblings`; a click opens the worker.
+pub(super) fn siblings_menu(s: &State, p: Palette) -> Option<El> {
+    if !s.crew_siblings_menu {
+        return None;
+    }
+    let t = s.current();
+    // A peer-launched worker's crew lives on the origin machine; this menu jumps
+    // between the members the same delegation put on this one.
+    if let Some(origin) = &t.peer_origin {
+        let members = peer_sibling_members(s, t.id, origin);
+        let mut menu = popover("crew-siblings-menu", "Crew", s, p)
+            .role("menu")
+            .focus_group()
+            .w(280.0)
+            .anchored_fit("crew-siblings", rune::Side::Bottom, rune::Align::End, 4.0)
+            .modal(true, |s: &mut State| s.crew_siblings_menu = false);
+        if members.is_empty() {
+            menu = menu.child(
+                label("No other crew members on this machine", SMALL, p.muted)
+                    .key("crew-siblings-empty")
+                    .px(8.0)
+                    .py(6.0),
+            );
+        }
+        for member in members {
+            let id = member.thread_id;
+            menu =
+                menu.child(roster_row(s, p, &member, format!("crew-sibling-{id}"), false).w_full());
+        }
+        return Some(menu);
+    }
+    let captain = t.crew_captain.or_else(|| {
+        t.parent
+            .and_then(|id| s.threads.iter().find(|p| p.id == id))
+            .and_then(|p| p.captain.or(t.captain))
+    })?;
+    let home = s.captain_home(captain)?;
+    let mut menu = popover("crew-siblings-menu", "Crew", s, p)
+        .role("menu")
+        .focus_group()
+        .w(280.0)
+        .anchored_fit("crew-siblings", rune::Side::Bottom, rune::Align::End, 4.0)
+        .modal(true, |s: &mut State| s.crew_siblings_menu = false);
+    let mut any = false;
+    for member in roster_members(s, home, captain)
+        .into_iter()
+        .filter(|m| m.thread_id != t.id)
+    {
+        any = true;
+        let id = member.thread_id;
+        menu = menu.child(roster_row(s, p, &member, format!("crew-sibling-{id}"), false).w_full());
+    }
+    if !any {
+        menu = menu.child(
+            label("No other crew members", SMALL, p.muted)
+                .key("crew-siblings-empty")
+                .px(8.0)
+                .py(6.0),
+        );
+    }
+    Some(menu)
 }
 fn attention_status(kind: AttentionKind) -> Status {
     match kind {
@@ -1727,7 +2138,7 @@ pub(super) fn attention_menu(s: &State, p: Palette, pane: Option<(f32, f32)>) ->
                 })
                 .child(mark_slot(status, p))
                 .child(
-                    label(&item.short_title, TextStyle::new(13.0, 450.0), p.ink)
+                    label(&item.short_title, TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -1880,5 +2291,48 @@ mod tests {
             (4, "Review", "completed", "Line one\nLine two", "none")
         );
         assert!(parse_completion("Shina: task from parent #1\n\nDo it").is_none());
+    }
+
+    #[test]
+    fn untasked_crew_members_classify_from_thread_state() {
+        let mut state = State::headless(
+            std::env::temp_dir().join(format!("shina-roster-test-{}", uuid::Uuid::new_v4())),
+        );
+        state.load_global_for_test();
+        state.demo = true;
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        let home = state.current().id;
+        let mut members = Vec::new();
+        for (title, status, request) in [
+            ("Waiting on approval", Status::Ready, true),
+            ("Working alone", Status::Running, false),
+            ("Idle member", Status::Ready, false),
+        ] {
+            let id = state.next_id;
+            state.next_id += 1;
+            let mut thread = Thread::new(id);
+            thread.title = title.into();
+            thread.crew_captain = Some(0);
+            thread.captain = Some(0);
+            thread.status = status;
+            if request {
+                thread.request = Some(json!({"method":"confirm"}));
+            }
+            members.push(id);
+            state.threads.push(thread);
+        }
+        let roster = roster_members(&state, home, 0);
+        assert_eq!(roster.len(), 3);
+        let by_id = |id: usize| roster.iter().find(|m| m.thread_id == id).unwrap();
+        // A pending request is needs-you even when the thread status lags it,
+        // and it sorts to the front with the other attention rows.
+        assert_eq!(by_id(members[0]).status, Status::Waiting);
+        assert_eq!(by_id(members[0]).rank, 0);
+        assert_eq!(by_id(members[1]).status, Status::Running);
+        assert_eq!(by_id(members[1]).rank, 1);
+        assert_eq!(by_id(members[2]).status, Status::Ready);
+        assert_eq!(by_id(members[2]).rank, 3);
+        assert_eq!(roster[0].thread_id, members[0]);
     }
 }

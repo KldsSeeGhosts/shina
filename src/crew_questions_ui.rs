@@ -17,7 +17,7 @@ use crate::model::crew_reports::{ArtifactKind, CrewOutcome, QuestionRecipient};
 use rune::Transition;
 
 /// Meta text inside a report card, matching `captain_ui`'s quiet lines.
-const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
+const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 /// Second and later lines start past the status mark's 14 px slot and its gap.
 const CARD_INDENT: f32 = 22.0;
 
@@ -96,7 +96,7 @@ fn open_report_thread(s: &mut State, id: usize) {
         return;
     }
     if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-        s.select_thread(index);
+        s.show_worker_ghost(index);
     }
 }
 
@@ -141,7 +141,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         .child(crew_ui::mark_slot(status, p))
         .child(meta_text("Question from", status_ink(status, p)))
         .child(
-            label(&view.title, TextStyle::new(13.0, 560.0), p.ink)
+            label(&view.title, TextStyle::new(13.0, 600.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
@@ -343,6 +343,20 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         .child(body)
 }
 
+/// Whether `cards` draws, so the composer's stack budget can price it before building.
+pub(super) fn cards_shows(s: &State) -> bool {
+    let t = s.current();
+    s.is_captain_home(t)
+        && t.captain.is_some_and(|captain| {
+            s.captains.get(captain).is_some()
+                && (!s
+                    .open_crew_questions(captain, QuestionRecipient::User)
+                    .is_empty()
+                    || !s
+                        .open_crew_questions(captain, QuestionRecipient::Captain)
+                        .is_empty())
+        })
+}
 /// The cards and the collapsed captain-questions line for the current captain
 /// home, mounted inside `crew_ui::needs_you` after its live request cards.
 /// `cards` returns None when nothing is open, and no report question ever counts

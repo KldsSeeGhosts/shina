@@ -719,7 +719,7 @@ mod tests {
             id
         };
         let index = state.threads.iter().position(|t| t.id == earlier).unwrap();
-        state.select_thread(index);
+        state.open_kept_tab(index);
         for action in [Action::Archive, Action::Demote, Action::Delete] {
             assert_eq!(
                 state

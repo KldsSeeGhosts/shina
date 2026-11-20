@@ -185,7 +185,7 @@ pub(super) fn menu(s: &State, p: Palette) -> El {
             .min_w(0.0)
             .child(icon("search", p.muted))
             .child(
-                text_input(&s.code_picker.query, TextStyle::new(13.0, 420.0))
+                text_input(&s.code_picker.query, TextStyle::new(13.0, 400.0))
                     .key("composer-code-language-search")
                     .label("Search languages")
                     .placeholder("Search languages", p.muted)
@@ -241,7 +241,7 @@ pub(super) fn menu(s: &State, p: Palette) -> El {
                 tx.instant();
             })
             .child(
-                label(name, TextStyle::new(13.0, 450.0), p.ink)
+                label(name, TextStyle::new(13.0, 500.0), p.ink)
                     .truncate()
                     .grow(1.0)
                     .min_w(0.0),

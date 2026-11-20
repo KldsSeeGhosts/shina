@@ -462,7 +462,7 @@ pub(super) fn popover(s: &State, p: Palette) -> Option<El> {
                         .hover(p.selected)
                         .press(p.selected)
                         .on_press(|s: &mut State| cancel(s))
-                        .child(label("Cancel", TextStyle::new(12.0, 450.0), p.ink)),
+                        .child(label("Cancel", TextStyle::new(12.0, 500.0), p.ink)),
                 )
                 .child(save_button(p, too_long)),
         ),

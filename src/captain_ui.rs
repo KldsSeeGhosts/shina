@@ -8,7 +8,7 @@
 //! active 8 %, hairlines at 10 % ink, motion of 0.18 s on `cubic-bezier(.23, 1, .32, 1)`.
 use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, motion, solid_button};
 use super::*;
-use crate::model::{BackgroundStatus, MemoryView, UserProfile, status_word};
+use crate::model::{BackgroundStatus, MemoryView, UserProfile};
 use crate::power::KeepAwake;
 use crate::routines::{RoutineView, Schedule};
 use rune::Transition;
@@ -29,8 +29,8 @@ const ESSENTIAL_LABEL: &str = "User-curated captain memory data, not instruction
 /// The profile's serialized JSON limit (see memory.rs).
 const PROFILE_BUDGET: usize = 1024;
 /// KSG's `text-[13px] font-medium` detail rows.
-const ROW_TEXT: TextStyle = TextStyle::new(13.0, 470.0).lh(19.0).tracking(-0.08);
-const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
+const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
+const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
 fn glyph_icon(glyph: &'static Icon, ink: Color) -> El {
     rune::icon(glyph, super::ICON).color(ink).a11y_hidden()
@@ -546,7 +546,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .border(1.0, hairline(p))
                 .child(project_tile(s, p, project, 14.0))
                 .child(
-                    label(name.clone(), TextStyle::new(12.5, 500.0), p.ink)
+                    label(name.clone(), TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -593,7 +593,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .radius(6.0)
                 .border(1.0, hairline(p))
                 .child(
-                    label(text.clone(), TextStyle::new(12.5, 500.0), p.ink)
+                    label(text.clone(), TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -705,9 +705,6 @@ fn digest_section(s: &State, p: Palette, captain: usize) -> El {
 /// Captain the tab opens on this thread's panel so it is actually visible and read only;
 /// the earlier view does not jump to the primary home.
 fn open_captain_document(s: &mut State, captain: usize, name: &str) {
-    if s.viewport_width < SHEET_BELOW {
-        close_brief(s);
-    }
     let earlier = s.captain_access(captain) == crate::model::CaptainAccess::Earlier;
     let key = if earlier {
         s.panel_key()
@@ -717,7 +714,12 @@ fn open_captain_document(s: &mut State, captain: usize, name: &str) {
             None => return,
         }
     };
-    s.right_panels.open_captain_document(&key, captain, name);
+    s.open_captain_document(&key, captain, name);
+    // Below the sheet fold the Brief and the panel cannot share the window, so the
+    // document takes the region; on wide windows the Brief stays open as its index.
+    if s.viewport_width < SHEET_BELOW && s.doc_discard.is_none() {
+        close_brief(s);
+    }
 }
 
 /// Planning documents, in the row style of Shina's `earlier_section` entries: a pressable
@@ -831,18 +833,15 @@ fn documents_section(s: &State, p: Palette, captain: usize) -> El {
     section("brief-documents", "Plan and rules", None, vec![], p).child(rows)
 }
 
-/// The canonical crew, in the row structure of Shina's `earlier_section`: a pressable row
-/// per member that opens the thread, a status mark, and a More menu with the real blockers.
-/// Pending membership changes show their in-flight word; membership itself always comes
-/// from the projection. Crew membership has no KSG equivalent.
+/// The canonical crew, reduced to a count and a pointer: the Crew Roster above the captain's
+/// composer holds the member rows, the More menus and the recruit/new-thread controls. The
+/// Brief keeps the policy and recovery blocks. Crew membership has no KSG equivalent.
 fn crew_section(s: &State, p: Palette, captain: usize) -> El {
     let access = s.captain_access(captain);
-    let full = access == crate::model::CaptainAccess::Full;
     if access == crate::model::CaptainAccess::NoRecords {
         return section("brief-crew", "Crew", None, vec![], p)
             .child(quiet_note(format!("Loading from {}.", machine_label(s)), p));
     }
-    let mut rows = col().gap(2.0);
     let mut members = s.captain_crew(captain);
     // Pending joins on this server appear as crew rows without touching canonical
     // membership; pending moves/releases keep their rows too.
@@ -884,131 +883,59 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         })
     });
     members.dedup();
-    let machines = s.peers.len() > 0;
-    for id in members.clone() {
-        let Some(index) = s.threads.iter().position(|t| t.id == id) else {
+    let mut rows = col().gap(2.0).child(
+        label(
+            if members.is_empty() {
+                "No crew members".into()
+            } else {
+                format!("{} crew members", members.len())
+            },
+            META,
+            p.muted,
+        )
+        .key("brief-crew-count")
+        .px(10.0)
+        .min_h(28.0),
+    );
+    // A pending membership change still shows its in-flight word; membership itself always
+    // comes from the projection.
+    for (thread, kind) in &pending {
+        if !members.contains(thread) {
+            continue;
+        }
+        let word = match kind {
+            crate::model::CrewKind::Join => "Joining",
+            crate::model::CrewKind::Release => "Leaving",
+            crate::model::CrewKind::Move { .. } => "Moving",
+        };
+        if s.threads.iter().any(|t| t.id == *thread) {
+            let title = s
+                .threads
+                .iter()
+                .find(|t| t.id == *thread)
+                .map(|t| t.title.clone())
+                .unwrap_or_default();
+            rows = rows.child(
+                label(format!("{word}: {title}"), META, p.faint)
+                    .key(format!("brief-crew-{thread}"))
+                    .px(10.0)
+                    .min_h(20.0),
+            );
+        } else {
             // The source thread can vanish (remote reset, archive) while its join is
             // still pending; keep the command for its receipt and show a quiet row.
-            if pending.iter().any(|(thread, _)| *thread == id) {
-                rows = rows.child(
-                    label("Joining, but the thread is no longer here.", META, p.faint)
-                        .key(format!("brief-crew-{id}"))
-                        .px(10.0)
-                        .min_h(28.0),
-                );
-            }
-            continue;
-        };
-        let thread = &s.threads[index];
-        let title = if thread.title.is_empty() {
-            "Untitled".to_string()
-        } else {
-            thread.title.clone()
-        };
-        let pending_word = pending
-            .iter()
-            .find(|(thread, _)| *thread == id)
-            .map(|(_, kind)| match kind {
-                crate::model::CrewKind::Join => "Joining",
-                crate::model::CrewKind::Release => "Leaving",
-                crate::model::CrewKind::Move { .. } => "Moving",
-            });
-        let workspace = thread
-            .project
-            .and_then(|project| s.project(Some(project)))
-            .map(|project| project.name.clone())
-            .unwrap_or_default();
-        let mut meta = row().gap(8.0).center_y();
-        if let Some(word) = pending_word {
-            meta = meta.child(label(word, META_LABEL, p.muted));
-        } else {
-            meta = meta.child(label(
-                status_word(thread.status),
-                META_LABEL,
-                status_ink(thread.status, p),
-            ));
-        }
-        meta = meta.child(label(workspace, META, p.muted).truncate().min_w(0.0));
-        if machines && thread.machine != "local" {
-            meta = meta.child(label(thread.machine.clone(), META, p.faint));
-        }
-        let more_key = format!("brief-crew-more-{id}");
-        let open_server = s.machines.selected.clone();
-        let more_server = open_server.clone();
-        let mut row_ = row()
-            .key(format!("brief-crew-{id}"))
-            .role("button")
-            .label(format!("{title}, {}", status_word(thread.status)))
-            .cursor(rune::Cursor::Pointer)
-            .focusable(true)
-            .hover_group()
-            .px(10.0)
-            .min_h(44.0)
-            .center_y()
-            .gap(8.0)
-            .radius(6.0)
-            .hover(hover_wash(s, p))
-            .press(active_wash(s, p))
-            .hover_motion(motion(), motion())
-            .on_press(move |s: &mut State| {
-                if s.machines.selected != open_server {
-                    return;
-                }
-                if s.viewport_width < SHEET_BELOW {
-                    close_brief(s);
-                }
-                if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-                    s.select_thread(index);
-                }
-            })
-            .child(super::crew_ui::mark_slot(thread.status, p))
-            .child(
-                col()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .child(label(title.clone(), ROW_TEXT, p.ink).truncate())
-                    .child(el().px(14.0).child(meta)),
-            );
-        if let Some(_) = pending_word {
-            row_ = row_.child(
-                icon_action(
-                    s,
-                    more_key,
-                    &format!("Waiting for {} to confirm.", machine_label(s)),
-                    icon("more", p.faint),
-                    p,
-                    |_| {},
-                )
-                .disabled(true),
-            );
-        } else if full {
-            row_ = row_.child(
-                icon_action(
-                    s,
-                    more_key,
-                    &format!("Crew actions for {title}"),
-                    icon("more", p.muted),
-                    p,
-                    move |s| {
-                        if s.machines.selected == more_server {
-                            s.brief.more = Some(id);
-                        }
-                    },
-                )
-                .group_opacity(0.0, 1.0),
+            let note = match kind {
+                crate::model::CrewKind::Join => "Joining, but the thread is no longer here.",
+                crate::model::CrewKind::Release => "Leaving, but the thread is no longer here.",
+                crate::model::CrewKind::Move { .. } => "Moving, but the thread is no longer here.",
+            };
+            rows = rows.child(
+                label(note, META, p.faint)
+                    .key(format!("brief-crew-{thread}"))
+                    .px(10.0)
+                    .min_h(28.0),
             );
         }
-        rows = rows.child(row_);
-    }
-    if members.is_empty() {
-        rows = rows.child(quiet_note(
-            if s.captain_scope(captain).is_empty() && s.remote_captain_scope(captain).is_empty() {
-                "No crew yet. Recruit an idle thread that has no workspace."
-            } else {
-                "No crew yet. Recruit an idle thread from this captain's workspaces."
-            },
-            p,
-        ));
     }
     if let Some(error) = s.crew_errors.get(&s.machines.selected) {
         rows = rows.child(
@@ -1017,54 +944,46 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
                 .color(p.danger),
         );
     }
-    let draft_server = s.machines.selected.clone();
-    let draft_reason = s.crew_creation_unavailable(&draft_server, captain);
-    let new_thread = ghost_button(s, "brief-crew-new".into(), "New crew thread", p, move |s| {
-        if s.machines.selected != draft_server {
-            return;
-        }
-        match s.begin_crew_draft(&draft_server, captain) {
-            Ok(()) => {
+    // The roster only renders above an active captain's primary home composer; on an
+    // earlier home the button opens that home first. An archived captain has no roster
+    // anywhere, so the row hides.
+    let roster_available = s.captain_phase(captain) == crate::model::CaptainPhase::Active;
+    let manage = roster_available.then(|| {
+        row()
+            .key("brief-crew-manage")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label("Manage in the crew roster")
+            .focusable(true)
+            .px(10.0)
+            .min_h(28.0)
+            .center_y()
+            .radius(6.0)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+            .on_press(move |s: &mut State| {
                 if s.viewport_width < SHEET_BELOW {
                     close_brief(s);
                 }
-            }
-            Err(error) => s.brief.error = Some(error),
-        }
-    })
-    .disabled(draft_reason.is_some());
-    let new_thread = match draft_reason {
-        Some(reason) => new_thread.help(reason),
-        None => new_thread,
-    };
-    let recruit_server = s.machines.selected.clone();
-    let actions = if full {
-        vec![
-            new_thread,
-            ghost_button(s, "brief-crew-recruit".into(), "Recruit...", p, move |s| {
-                if s.machines.selected != recruit_server
-                    || s.captain_access(captain) != crate::model::CaptainAccess::Full
-                {
-                    return;
+                if s.captain_home(captain) != Some(s.current().id) {
+                    s.open_captain(captain);
                 }
-                s.brief.recruit = Some(crate::model::RecruitPicker {
-                    server: recruit_server.clone(),
-                    captain,
-                    query: rune::TextEdit::default(),
-                });
-            }),
-        ]
-    } else {
-        vec![]
-    };
+                if !s.crew_roster_open(captain) {
+                    s.toggle_crew_roster(captain);
+                }
+            })
+            .child(label("Manage in the crew roster", META_LABEL, p.sea))
+    });
     section(
         "brief-crew",
         "Crew",
         Some(members.len().to_string()),
-        actions,
+        vec![],
         p,
     )
     .child(rows)
+    .child(manage.unwrap_or_else(el))
     .child(super::captain_activity_ui::policy_block(s, p, captain))
     .child(super::captain_activity_ui::recovery_block(s, p, captain))
 }
@@ -1699,7 +1618,7 @@ fn earlier_section(s: &State, p: Palette, captain: usize) -> El {
             .hover_motion(motion(), motion())
             .on_press(move |s: &mut State| {
                 if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-                    s.select_thread(index);
+                    s.show_thread(index);
                 }
                 // A sheet covers the conversation it just opened; step out of the way.
                 if s.viewport_width < SHEET_BELOW {
@@ -1780,7 +1699,7 @@ fn reset_dialog(s: &State, p: Palette) -> Option<El> {
                                 .captain_home(captain)
                                 .and_then(|home| s.threads.iter().position(|t| t.id == home))
                         {
-                            s.select_thread(index);
+                            s.show_thread(index);
                         }
                     },
                 )),
@@ -1823,7 +1742,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .child(
             label(
                 "Earlier conversation. Read-only.",
-                TextStyle::new(13.0, 470.0),
+                TextStyle::new(13.0, 500.0),
                 p.muted,
             )
             .truncate()
@@ -1838,7 +1757,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
                 if let Some(index) =
                     home.and_then(|home| s.threads.iter().position(|t| t.id == home))
                 {
-                    s.select_thread(index);
+                    s.show_thread(index);
                 }
             },
         ));
@@ -1931,6 +1850,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         } else {
             s.show_activity = true;
             s.activity_full = false;
+            s.close_right_panel_for_drawer();
         }
     };
     if on {
@@ -1939,7 +1859,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         return toggle_button(
             "open-brief",
             "Hide the captain's brief",
-            "list",
+            "info",
             true,
             p,
             press,
@@ -1960,8 +1880,8 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(press)
-        .child(icon("list", p.muted))
-        .child(label("Brief", TextStyle::new(12.5, 500.0), p.muted))
+        .child(icon("info", p.muted))
+        .child(label("Brief", TextStyle::new(13.0, 500.0), p.muted))
 }
 
 /// Add or remove a workspace from the picker in its captain-scope mode.
@@ -2247,7 +2167,7 @@ fn profile_field(p: Palette, title: &str, note: &str, field: El) -> El {
                 .center_y()
                 .child(meta_label(title, p.muted))
                 .child(
-                    label(note, TextStyle::new(12.0, 420.0), p.muted)
+                    label(note, TextStyle::new(12.0, 400.0), p.muted)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -2257,7 +2177,7 @@ fn profile_field(p: Palette, title: &str, note: &str, field: El) -> El {
 }
 
 fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title: &str) -> El {
-    text_input(edit, TextStyle::new(14.0, 420.0).lh(20.0))
+    text_input(edit, TextStyle::new(14.0, 400.0).lh(20.0))
         .key(key)
         .label(title)
         .color(p.ink)
@@ -2354,7 +2274,7 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
                         .child(
                             label(
                                 "Every captain reads this with its memory. It is data about you, not instructions.",
-                                TextStyle::new(12.5, 420.0).lh(18.0),
+                                TextStyle::new(13.0, 400.0).lh(18.0),
                                 p.muted,
                             )
                             .wrap(),
@@ -2995,7 +2915,7 @@ mod tests {
                 "brief-digest",
                 "brief-digest-open",
                 "brief-crew",
-                "brief-crew-recruit",
+                "brief-crew-manage",
                 "brief-documents",
                 "brief-document-NOTES.md",
                 "brief-document-AGENTS.md",
@@ -3075,7 +2995,7 @@ mod tests {
         member.project = Some(1);
         member.crew_captain = Some(0);
         rt.state.threads.push(member);
-        rt.state.select_thread(rt.state.threads.len() - 1);
+        rt.state.open_kept_tab(rt.state.threads.len() - 1);
         rt.frame(0.25);
         let (bar, _) = rt.presented("crew-bar").expect("crew bar");
         assert!(rt.presented("crew-bar-open-captain").is_some());
@@ -3118,7 +3038,8 @@ mod tests {
             next + 1
         };
         rt.state.next_id += 2;
-        press(&mut rt, "brief-crew-recruit");
+        press(&mut rt, "crew-roster-toggle");
+        press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         assert!(rt.presented("crew-recruit-palette").is_some());
         assert!(rt.presented("crew-recruit-can").is_some());
@@ -3259,7 +3180,8 @@ mod tests {
             rt.state.threads.push(t);
         }
         rt.state.next_id += 3;
-        press(&mut rt, "brief-crew-recruit");
+        press(&mut rt, "crew-roster-toggle");
+        press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         // Typing "Second" then Return joins only the matching row.
         press(&mut rt, "crew-recruit-search");
@@ -3291,7 +3213,7 @@ mod tests {
         // A query that matches nothing queues nothing. The palette is still open
         // from the successful join's replacement; focus its field and search.
         rt.frame(0.5);
-        press(&mut rt, "brief-crew-recruit");
+        press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         press(&mut rt, "crew-recruit-search");
         rt.state.brief.recruit.as_mut().unwrap().query.text = "zzz".into();
@@ -3310,7 +3232,7 @@ mod tests {
         // closes the still-open palette first.
         tap(&mut rt, rune::Key::Escape);
         rt.frame(0.25);
-        press(&mut rt, "brief-crew-recruit");
+        press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         press(&mut rt, "crew-recruit-search");
         tap(&mut rt, rune::Key::Down);
@@ -3395,7 +3317,7 @@ mod tests {
             .iter()
             .position(|t| t.id == earlier_id)
             .unwrap();
-        rt.state.select_thread(index);
+        rt.state.open_kept_tab(index);
         rt.frame(0.5);
         assert_eq!(
             rt.state.captain_access(0),
@@ -3409,19 +3331,15 @@ mod tests {
             rt.presented("captain-doc-edit").is_none(),
             "an earlier view has no Edit"
         );
-        // The tab lives on the earlier thread's panel, not the primary home's.
+        // The document lives on the earlier thread's panel, not the primary home's.
         let panel = rt.state.panel_key();
-        assert!(
-            rt.state
-                .right_panels
-                .get(&panel)
-                .surfaces
-                .iter()
-                .any(|surface| matches!(
-                    surface,
-                    crate::right_panel::Surface::CaptainDocument { captain: 0, .. }
-                )),
-            "document surface opened on the earlier panel"
+        assert_eq!(
+            rt.state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            }),
+            "document opened on the earlier panel"
         );
         std::fs::remove_dir_all(&rt.state.data_dir).ok();
     }
@@ -3446,7 +3364,9 @@ mod tests {
         rt.state.threads.push(member);
         rt.frame(0.25);
         rt.state.show_activity = true;
-        press(&mut rt, &format!("brief-crew-more-{member_id}"));
+        press(&mut rt, "crew-roster-toggle");
+        rt.state.brief.more = Some(member_id);
+        rt.invalidate();
         rt.frame(0.25);
         press(&mut rt, "crew-menu-move");
         rt.frame(0.25);
@@ -3488,14 +3408,17 @@ mod tests {
         recruit.never_sent = false;
         rt.state.threads.push(recruit);
         let ordinary = rt.state.threads.len() - 1;
-        press(&mut rt, "brief-crew-recruit");
+        press(&mut rt, "crew-roster-toggle");
+        press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         press(&mut rt, &format!("crew-recruit-{thread_id}"));
         rt.frame(0.25);
         assert_eq!(rt.state.threads[ordinary].crew_captain, Some(0));
         assert!(rt.state.captain_crew(0).contains(&thread_id));
-        assert!(rt.presented(&format!("brief-crew-{thread_id}")).is_some());
-        press(&mut rt, &format!("brief-crew-more-{thread_id}"));
+        assert!(rt.presented(&format!("crew-chip-{thread_id}")).is_some());
+        // A secondary press on the roster row opens the member's More menu.
+        rt.state.brief.more = Some(thread_id);
+        rt.invalidate();
         rt.frame(0.25);
         press(&mut rt, "crew-menu-release");
         rt.frame(0.25);

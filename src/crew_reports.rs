@@ -257,6 +257,14 @@ impl State {
             {
                 continue;
             }
+            // The event ledger is authoritative: a cancelled, expired or
+            // otherwise terminal record never queues a delivery even if the
+            // report's serde mirrors drifted out of step.
+            if let Some(state) = self.report_event_state(&self.captain_reports[index].id)
+                && state != captain_inbox::InboxState::Pending
+            {
+                continue;
+            }
             let Some(home) = routes[index] else {
                 continue;
             };
@@ -295,9 +303,12 @@ impl State {
         changed
     }
 
-    /// Exact delivery ids observed in a Captain home's accepted history mark its
-    /// reports delivered. Every home of that Captain counts, including earlier ones;
-    /// another Captain's evidence never acknowledges a report.
+    /// Exact delivery ids observed in a Captain home's accepted history settle
+    /// the report's `crew_outcome` event, which `sync_inbox_events` mirrors
+    /// back onto the report. Every home of that Captain counts, including
+    /// earlier ones; another Captain's evidence never acknowledges a report.
+    /// `sync_inbox_events` applies the same evidence during the poll; this
+    /// pass keeps the direct call ordering the inbox depends on.
     pub(crate) fn reconcile_crew_report_acceptances(&mut self) -> bool {
         let mut changed = false;
         for index in 0..self.captain_reports.len() {
@@ -312,8 +323,7 @@ impl State {
                 .filter(|thread| thread.captain_home && thread.captain == Some(captain))
                 .any(|thread| thread.accepted_deliveries.iter().any(|seen| *seen == id));
             if accepted {
-                self.captain_reports[index].delivered = true;
-                changed = true;
+                changed |= self.transition_report_event(&id, captain_inbox::InboxState::Accepted);
             }
         }
         changed
@@ -321,7 +331,8 @@ impl State {
 
     /// Removes queued report injections that must not flush from each thread: a
     /// report's copy survives only on its Captain's current home while it is
-    /// undelivered and unheld. Unrelated injections are never touched.
+    /// undelivered, unheld and its event is still open. Unrelated injections
+    /// are never touched.
     pub(crate) fn scrub_crew_report_injections(&mut self) -> bool {
         let mut changed = false;
         for index in 0..self.threads.len() {
@@ -333,6 +344,9 @@ impl State {
                     report.delivered
                         || report.hold_delivery
                         || report.policy == ReportPolicy::Ignore
+                        || self.report_event_state(&report.id).is_some_and(|state| {
+                            !report.delivered && state != captain_inbox::InboxState::Pending
+                        })
                         || self.captain_home(report.captain) != Some(thread_id)
                 })
                 .map(|report| report.id.as_str())
@@ -357,20 +371,44 @@ impl State {
         changed
     }
 
-    /// Restart handling: restored outboxes join the durable list, every undelivered
-    /// report holds until the Captain's home sees an explicit user turn or a resume
-    /// action, and queued injections are removed so prewarming cannot replay them.
-    /// A turn never resumes at boot, so nothing re-arms a run here.
+    /// Restart handling: restored outboxes join the durable list, every
+    /// still-open report event holds until the Captain's home sees an explicit
+    /// user turn or a resume action, and queued injections are removed so
+    /// prewarming cannot replay them. The event transition is the canonical
+    /// hold; `prepare_inbox_recovery` then covers the non-report kinds and the
+    /// mirror lands in the next `sync_inbox_events` pass. A turn never resumes
+    /// at boot, so nothing re-arms a run here.
     pub(crate) fn prepare_crew_report_recovery(&mut self) {
         for thread in &mut self.threads {
             if !thread.crew_report_outbox.is_empty() {
                 self.captain_reports.append(&mut thread.crew_report_outbox);
             }
         }
-        for report in &mut self.captain_reports {
-            if report.needs_delivery() {
-                report.hold_delivery = true;
+        // Ensure every restored report has its mirror event before holding, so
+        // the transition lands on the canonical record, not only the mirror.
+        for index in 0..self.captain_reports.len() {
+            let report = &self.captain_reports[index];
+            if !self
+                .captain_inbox
+                .iter()
+                .any(|e| e.id == report.id && e.kind == captain_inbox::InboxKind::CrewOutcome)
+            {
+                self.captain_inbox.push(captain_inbox::report_event(report));
             }
+        }
+        let ids: Vec<String> = self
+            .captain_reports
+            .iter()
+            .filter(|report| {
+                report.needs_delivery()
+                    && self
+                        .report_event_state(&report.id)
+                        .is_none_or(|state| !state.terminal())
+            })
+            .map(|report| report.id.clone())
+            .collect();
+        for id in ids {
+            self.transition_report_event(&id, captain_inbox::InboxState::Held);
         }
         self.prepare_crew_answer_recovery();
         self.prepare_inbox_recovery();
@@ -399,14 +437,33 @@ impl State {
     }
 
     /// Releases held reports only for the Captain whose current home is
-    /// `parent_thread_id`. A reset alone creates a new home without releasing holds.
-    pub(crate) fn release_crew_reports(&mut self, parent_thread_id: usize) {
-        for index in 0..self.captain_reports.len() {
-            if self.captain_home(self.captain_reports[index].captain) == Some(parent_thread_id) {
-                self.captain_reports[index].hold_delivery = false;
+    /// `parent_thread_id`, by moving each held `crew_outcome` event back to
+    /// pending through the canonical transition, which also creates the
+    /// mirror event for a report captured since the last poll. A reset alone
+    /// creates a new home without releasing holds. Returns the released
+    /// report ids so the caller's release-turn record names them.
+    pub(crate) fn release_crew_reports(&mut self, parent_thread_id: usize) -> Vec<String> {
+        let mut released = Vec::new();
+        let ids: Vec<String> = self
+            .captain_reports
+            .iter()
+            .filter(|report| self.captain_home(report.captain) == Some(parent_thread_id))
+            .map(|report| report.id.clone())
+            .collect();
+        for id in ids {
+            if self.report_event_state(&id) == Some(captain_inbox::InboxState::Held)
+                && self
+                    .captain_inbox
+                    .iter()
+                    .find(|e| e.id == id)
+                    .is_some_and(|event| event.dispatched_at.is_none())
+                && self.transition_report_event(&id, captain_inbox::InboxState::Pending)
+            {
+                released.push(id);
             }
         }
         self.release_crew_answers(parent_thread_id);
+        released
     }
 
     pub(crate) fn crew_reports(&self) -> &[CrewReport] {

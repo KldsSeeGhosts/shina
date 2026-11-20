@@ -87,6 +87,7 @@ pub(super) fn document_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+#[cfg(test)]
 fn bounded(text: &str, max: usize) -> String {
     bounded_with(text, max, CONTEXT_TRUNCATION)
 }
@@ -299,30 +300,71 @@ impl State {
             .join("\n")
     }
 
+    /// One bounded document excerpt: the embedded text, the coverage figure the
+    /// index reports and the truncation marker that applies. `documents` drives
+    /// the shared body builder so the Captain and crew formats stay aligned.
+    fn context_excerpt(
+        &self,
+        captain: usize,
+        name: &str,
+        max: usize,
+        marker: &str,
+    ) -> (String, usize) {
+        let text = self.captain_document(captain, name).text;
+        let covered = covered_bytes(&text, max, marker);
+        let excerpt = bounded_with(&text, max, marker);
+        (excerpt, covered)
+    }
+
+    /// Shared body for every audience's turn context: labelled excerpts, then
+    /// the document index. Callers supply the header, the labelled documents
+    /// and the index arguments so private documents and read capability stay a
+    /// property of the audience, not a copy of the layout.
+    fn turn_context(
+        &self,
+        captain: usize,
+        header: &str,
+        sections: &[(&str, String)],
+        covered: &[(&str, usize)],
+        private: &[&str],
+        index_label: &str,
+        reads: Option<bool>,
+    ) -> String {
+        let mut body = format!("{CAPTAIN_CONTEXT_PREFIX}{header}");
+        for (label, excerpt) in sections {
+            body.push_str(&format!(
+                "\n\n{label}\n{}",
+                serde_json::to_string(excerpt).expect("captain context serialization")
+            ));
+        }
+        body.push_str(&format!(
+            "\n\n{index_label}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
+            self.document_index(captain, covered, private, reads)
+        ));
+        body
+    }
+
     pub(super) fn captain_turn_context(&self, captain: usize) -> String {
-        let rules = self.captain_document(captain, "AGENTS.md").text;
-        let notes = self.captain_document(captain, "NOTES.md").text;
-        format!(
-            "{CAPTAIN_CONTEXT_PREFIX}{CAPTAIN_CONTEXT_HEADER}\n\n{CAPTAIN_RULES_LABEL}\n{}\n\n{CAPTAIN_NOTES_LABEL}\n{}\n\n{DOCUMENT_INDEX_LABEL}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
-            serde_json::to_string(&bounded(&rules, RULES_CONTEXT_MAX_BYTES))
-                .expect("captain context serialization"),
-            serde_json::to_string(&bounded(&notes, NOTES_CONTEXT_MAX_BYTES))
-                .expect("captain context serialization"),
-            self.document_index(
-                captain,
-                &[
-                    (
-                        "AGENTS.md",
-                        covered_bytes(&rules, RULES_CONTEXT_MAX_BYTES, CONTEXT_TRUNCATION),
-                    ),
-                    (
-                        "NOTES.md",
-                        covered_bytes(&notes, NOTES_CONTEXT_MAX_BYTES, CONTEXT_TRUNCATION),
-                    ),
-                ],
-                &[],
-                None
-            )
+        let (rules, rules_covered) = self.context_excerpt(
+            captain,
+            "AGENTS.md",
+            RULES_CONTEXT_MAX_BYTES,
+            CONTEXT_TRUNCATION,
+        );
+        let (notes, notes_covered) = self.context_excerpt(
+            captain,
+            "NOTES.md",
+            NOTES_CONTEXT_MAX_BYTES,
+            CONTEXT_TRUNCATION,
+        );
+        self.turn_context(
+            captain,
+            CAPTAIN_CONTEXT_HEADER,
+            &[(CAPTAIN_RULES_LABEL, rules), (CAPTAIN_NOTES_LABEL, notes)],
+            &[("AGENTS.md", rules_covered), ("NOTES.md", notes_covered)],
+            &[],
+            DOCUMENT_INDEX_LABEL,
+            None,
         )
     }
 
@@ -332,47 +374,140 @@ impl State {
         } else {
             CONTEXT_TRUNCATION_NO_READ
         };
-        let crew = self.captain_document(captain, "CREW.md").text;
-        format!(
-            "{CAPTAIN_CONTEXT_PREFIX}{CREW_CONTEXT_HEADER}\n\n{CREW_RULES_LABEL}\n{}\n\n{}\n{}{CAPTAIN_CONTEXT_SUFFIX}",
-            serde_json::to_string(&bounded_with(&crew, CREW_CONTEXT_MAX_BYTES, marker))
-                .expect("captain context serialization"),
+        let (crew, crew_covered) =
+            self.context_excerpt(captain, "CREW.md", CREW_CONTEXT_MAX_BYTES, marker);
+        self.turn_context(
+            captain,
+            CREW_CONTEXT_HEADER,
+            &[(CREW_RULES_LABEL, crew)],
+            &[("CREW.md", crew_covered)],
+            &["AGENTS.md"],
             if document_reads {
                 DOCUMENT_INDEX_LABEL
             } else {
                 DOCUMENT_INDEX_LABEL_NO_READ
             },
-            self.document_index(
-                captain,
-                &[(
-                    "CREW.md",
-                    covered_bytes(&crew, CREW_CONTEXT_MAX_BYTES, marker)
-                )],
-                &["AGENTS.md"],
-                Some(document_reads)
-            )
+            Some(document_reads),
         )
     }
 
+    /// The context string a thread carries into its next prompt: a Captain's
+    /// own home reads the private context, a crew member reads the shared crew
+    /// context, and every other thread carries none.
+    fn turn_context_for(&self, thread: &Thread) -> String {
+        if thread.captain_home
+            && !thread.delegated
+            && thread
+                .captain
+                .is_some_and(|captain| self.captain_home(captain) == Some(thread.id))
+        {
+            self.captain_turn_context(thread.captain.unwrap())
+        } else if let Some(captain) = thread.crew_captain {
+            self.crew_turn_context(captain, true)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Every input `refresh_captain_contexts` reads for one thread, hashed:
+    /// the thread's audience (primary home, crew member or neither), its
+    /// Captain's document fingerprint, the wake policy members capture reports
+    /// under, and the role its membership and lifecycle phase decide. Two
+    /// Captains share the hash only through the audience id inside it; an
+    /// accidental collision only ever skips a rebuild, never writes wrong
+    /// context.
+    fn captain_context_inputs(
+        &self,
+        thread: &Thread,
+        role: &'static str,
+        book_fingerprints: &std::collections::HashMap<usize, u64>,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let primary_home = thread.captain_home
+            && !thread.delegated
+            && thread
+                .captain
+                .is_some_and(|captain| self.captain_home(captain) == Some(thread.id));
+        primary_home.hash(&mut hash);
+        let audience = if primary_home {
+            thread.captain
+        } else {
+            thread.crew_captain
+        };
+        audience.hash(&mut hash);
+        if let Some(captain) = audience {
+            book_fingerprints.get(&captain).hash(&mut hash);
+        }
+        thread
+            .crew_captain
+            .map(|captain| self.captain_report_policy(captain))
+            .unwrap_or_default()
+            .id()
+            .hash(&mut hash);
+        role.hash(&mut hash);
+        hash.finish()
+    }
+
+    /// Keeps every thread's turn context, captured report policy and Shina role
+    /// current with the records they derive from. The work is incremental: a
+    /// thread whose inputs hash the same as last refresh keeps its existing
+    /// `captain_context` and `instruction_role`, so a memory write or document
+    /// save on one Captain never rebuilds another crew's block or needlessly
+    /// flips `instruction_context_pending`.
     pub(super) fn refresh_captain_contexts(&mut self) {
-        let contexts: Vec<String> = self
-            .threads
-            .iter()
-            .map(|thread| {
-                if thread.captain_home
-                    && !thread.delegated
-                    && thread
-                        .captain
-                        .is_some_and(|captain| self.captain_home(captain) == Some(thread.id))
-                {
-                    self.captain_turn_context(thread.captain.unwrap())
-                } else if let Some(captain) = thread.crew_captain {
-                    self.crew_turn_context(captain, true)
-                } else {
-                    String::new()
-                }
+        // Roles first: the role is both an input to the skip hash and a field
+        // the refresh maintains, so one pass computes it and the hash folds
+        // the result in with the rest of the context inputs.
+        let roles: Vec<(&'static str, &'static str)> = (0..self.threads.len())
+            .map(|index| {
+                let role = self.mcp_role(index);
+                (role, State::instructions_for_role(role))
             })
             .collect();
+        // One fingerprint per Captain's document book, hashed once and folded
+        // into every audience thread's input, so a crew of any size never
+        // re-hashes the same documents.
+        let book_fingerprints: std::collections::HashMap<usize, u64> = self
+            .threads
+            .iter()
+            .filter_map(|thread| thread.captain.or(thread.crew_captain))
+            .map(|captain| {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                let book = self.captain_book(captain);
+                for name in DOCUMENT_NAMES {
+                    let document = book.documents.get(name);
+                    let revision = document.map_or(0, |document| document.revision);
+                    let digest = document.map_or_else(
+                        || document_hash(""),
+                        |document| document_hash(&document.text),
+                    );
+                    (name, revision, digest).hash(&mut hash);
+                }
+                (captain, hash.finish())
+            })
+            .collect();
+        let inputs: Vec<u64> = self
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(index, thread)| {
+                self.captain_context_inputs(thread, roles[index].0, &book_fingerprints)
+            })
+            .collect();
+        let changed: Vec<bool> = self
+            .threads
+            .iter()
+            .zip(&inputs)
+            .map(|(thread, input)| thread.captain_context_inputs != Some(*input))
+            .collect();
+        let mut contexts: Vec<Option<String>> = vec![None; self.threads.len()];
+        for index in 0..self.threads.len() {
+            if changed[index] {
+                contexts[index] = Some(self.turn_context_for(&self.threads[index]));
+            }
+        }
         // Members capture reports under their owner's current policy; released
         // threads return to the react default.
         let policies: Vec<ReportPolicy> = self
@@ -385,20 +520,18 @@ impl State {
                     .unwrap_or_default()
             })
             .collect();
-        let roles: Vec<(&'static str, &'static str)> = (0..self.threads.len())
-            .map(|index| {
-                let role = self.mcp_role(index);
-                (role, State::instructions_for_role(role))
-            })
-            .collect();
-        for (((thread, context), policy), (role, instructions)) in self
+        for ((((thread, context), input), policy), (role, instructions)) in self
             .threads
             .iter_mut()
             .zip(contexts)
+            .zip(inputs)
             .zip(policies)
             .zip(roles)
         {
-            thread.captain_context = context;
+            if let Some(context) = context {
+                thread.captain_context = context;
+            }
+            thread.captain_context_inputs = Some(input);
             thread.crew_report_policy = policy;
             if thread.instruction_role != Some(role) {
                 let known = thread.instruction_role.is_some();
@@ -757,60 +890,8 @@ impl State {
         Some(key)
     }
 
-    /// Surface ids a tab-close operation would remove, in tab order.
-    fn close_candidates(
-        &self,
-        panel: &str,
-        surface_id: &str,
-        kind: crate::model::DiscardKind,
-    ) -> Vec<String> {
-        let surfaces = &self.right_panels.get(panel).surfaces;
-        match kind {
-            crate::model::DiscardKind::Others => surfaces
-                .iter()
-                .map(crate::right_panel::Surface::id)
-                .filter(|id| id != surface_id)
-                .collect(),
-            crate::model::DiscardKind::ToRight => surfaces
-                .iter()
-                .skip_while(|surface| surface.id() != surface_id)
-                .skip(1)
-                .map(crate::right_panel::Surface::id)
-                .collect(),
-            _ => surfaces
-                .iter()
-                .map(crate::right_panel::Surface::id)
-                .collect(),
-        }
-    }
-
-    fn request_close_batch(
-        &mut self,
-        panel: &str,
-        surface_id: &str,
-        kind: crate::model::DiscardKind,
-    ) -> bool {
-        for id in self.close_candidates(panel, surface_id, kind) {
-            if let Some(key) = self.dirty_document(panel, &id) {
-                self.doc_discard = Some(crate::model::DocDiscard {
-                    panel: panel.into(),
-                    surface: surface_id.into(),
-                    key,
-                    kind,
-                });
-                return false;
-            }
-        }
-        true
-    }
-
     /// The editor's Cancel: a clean draft closes quietly; a dirty one asks first.
-    pub fn request_close_document(
-        &mut self,
-        key: &crate::model::DocumentDraftKey,
-        panel: &str,
-        surface_id: &str,
-    ) {
+    pub fn request_close_document(&mut self, key: &crate::model::DocumentDraftKey, panel: &str) {
         let Some(draft) = self.captain_drafts.get(key) else {
             return;
         };
@@ -820,7 +901,6 @@ impl State {
         if draft.text.text != draft.base_text {
             self.doc_discard = Some(crate::model::DocDiscard {
                 panel: panel.into(),
-                surface: surface_id.into(),
                 key: key.clone(),
                 kind: crate::model::DiscardKind::Discard,
             });
@@ -829,44 +909,55 @@ impl State {
         }
     }
 
-    /// Close one surface; a dirty document draft parks the close behind a confirmation.
-    pub fn request_close_surface(&mut self, panel: &str, surface_id: &str) {
-        if let Some(key) = self.dirty_document(panel, surface_id) {
+    /// Close the viewer item; a dirty document draft parks the close behind a
+    /// confirmation. The panel stays open on the Diff segment.
+    pub fn request_close_viewer(&mut self, panel: &str) {
+        let surface_id = self
+            .right_panels
+            .get(panel)
+            .viewer
+            .as_ref()
+            .map(crate::right_panel::Surface::id);
+        let Some(surface_id) = surface_id else {
+            return;
+        };
+        if let Some(key) = self.dirty_document(panel, &surface_id) {
             self.doc_discard = Some(crate::model::DocDiscard {
                 panel: panel.into(),
-                surface: surface_id.into(),
                 key,
                 kind: crate::model::DiscardKind::Close,
             });
             return;
         }
-        self.right_panels.close_surface(panel, surface_id);
+        self.right_panels.close_viewer(panel);
     }
 
-    pub fn request_close_others(&mut self, panel: &str, surface_id: &str) {
-        if self.request_close_batch(panel, surface_id, crate::model::DiscardKind::Others) {
-            self.right_panels.close_others(panel, surface_id);
-        }
-    }
-
-    pub fn request_close_to_right(&mut self, panel: &str, surface_id: &str) {
-        if self.request_close_batch(panel, surface_id, crate::model::DiscardKind::ToRight) {
-            self.right_panels.close_to_right(panel, surface_id);
-        }
-    }
-
-    pub fn request_close_all(&mut self, panel: &str) {
-        let any = self
+    /// Open a Captain document in the panel's lone viewer slot. Replacing a dirty
+    /// document draft parks the swap behind the discard confirmation; a clean or
+    /// Saving draft's document swaps straight in.
+    pub fn open_captain_document(&mut self, panel: &str, captain: usize, name: &str) {
+        let current_id = self
             .right_panels
             .get(panel)
-            .surfaces
-            .first()
-            .map(|s| s.id());
-        if let Some(any) = any
-            && self.request_close_batch(panel, &any, crate::model::DiscardKind::All)
+            .viewer
+            .as_ref()
+            .map(crate::right_panel::Surface::id);
+        if let Some(current_id) = current_id
+            && current_id != format!("captain-doc:{captain}:{name}")
+            && let Some(key) = self.dirty_document(panel, &current_id)
         {
-            self.right_panels.close_all(panel);
+            self.doc_discard = Some(crate::model::DocDiscard {
+                panel: panel.into(),
+                key,
+                kind: crate::model::DiscardKind::Replace {
+                    captain,
+                    name: name.into(),
+                },
+            });
+            return;
         }
+        self.right_panels
+            .open_captain_document(panel, captain, name);
     }
 
     /// The discard dialog's confirm: drops the draft and replays the queued close.
@@ -883,18 +974,27 @@ impl State {
         {
             self.captain_drafts.remove(&discard.key);
         }
+        let expected_id = format!("captain-doc:{}:{}", discard.key.captain, discard.key.name);
+        let viewer_matches = self
+            .right_panels
+            .get(&discard.panel)
+            .viewer
+            .as_ref()
+            .is_some_and(|surface| surface.id() == expected_id);
         match discard.kind {
             crate::model::DiscardKind::Discard => {}
-            crate::model::DiscardKind::Close => self
-                .right_panels
-                .close_surface(&discard.panel, &discard.surface),
-            crate::model::DiscardKind::Others => {
-                self.request_close_others(&discard.panel, &discard.surface)
+            crate::model::DiscardKind::Close if viewer_matches => {
+                self.right_panels.close_viewer(&discard.panel);
             }
-            crate::model::DiscardKind::ToRight => {
-                self.request_close_to_right(&discard.panel, &discard.surface)
+            crate::model::DiscardKind::Replace { captain, name } if viewer_matches => {
+                self.right_panels
+                    .open_captain_document(&discard.panel, captain, &name);
+                // Match captain_ui::SHEET_BELOW (1050.0): below the sheet fold, close the Brief.
+                if self.viewport_width < 1050.0 {
+                    self.close_side_region();
+                }
             }
-            crate::model::DiscardKind::All => self.request_close_all(&discard.panel),
+            crate::model::DiscardKind::Close | crate::model::DiscardKind::Replace { .. } => {}
         }
     }
 
@@ -1707,6 +1807,63 @@ mod tests {
     }
 
     #[test]
+    fn refresh_skips_threads_whose_context_inputs_did_not_change() {
+        let mut state = fixture();
+        state.open_captain(1);
+        let member = push_thread(&mut state);
+        state.captain_crew_join(0, member).unwrap();
+        let other_member = push_thread(&mut state);
+        state.captain_crew_join(1, other_member).unwrap();
+        // First refresh records every thread's input fingerprint.
+        state.refresh_captain_contexts();
+        assert!(thread(&state, member).captain_context_inputs.is_some());
+        let member_context = thread(&state, member).captain_context.clone();
+        let member_inputs = thread(&state, member).captain_context_inputs;
+        let other_inputs = thread(&state, other_member).captain_context_inputs;
+        // A document write on captain 1 rebuilds only that captain's audience.
+        state
+            .captain_document_write(1, "CREW.md", "OTHER-RULES".into(), 0)
+            .unwrap();
+        assert_eq!(
+            thread(&state, member).captain_context,
+            member_context,
+            "an unrelated captain's document never rebuilds this context"
+        );
+        assert_eq!(
+            thread(&state, member).captain_context_inputs,
+            member_inputs,
+            "an unchanged thread keeps its input fingerprint"
+        );
+        assert_ne!(
+            thread(&state, other_member).captain_context_inputs,
+            other_inputs,
+            "the changed audience rebuilds its fingerprint"
+        );
+        assert!(
+            thread(&state, other_member)
+                .captain_context
+                .contains("OTHER-RULES")
+        );
+        // A same-captain document write does rebuild the member's context.
+        state
+            .captain_document_write(0, "CREW.md", "UPDATED-RULES".into(), 0)
+            .unwrap();
+        assert_ne!(thread(&state, member).captain_context_inputs, member_inputs);
+        assert!(
+            thread(&state, member)
+                .captain_context
+                .contains("UPDATED-RULES")
+        );
+        // A memory write never rebuilds context: it shares no document input.
+        let before = thread(&state, member).captain_context_inputs;
+        state
+            .add_memory(0, "user prefers dark mode".into(), false)
+            .unwrap();
+        assert_eq!(thread(&state, member).captain_context_inputs, before);
+        std::fs::remove_dir_all(&state.data_dir).ok();
+    }
+
+    #[test]
     fn only_the_primary_home_mutates_documents_and_crew() {
         let mut state = fixture();
         let home = state.captain_home(0).unwrap();
@@ -2251,6 +2408,7 @@ mod tests {
         let home = state.captain_home(0).unwrap();
         let member = push_thread(&mut state);
         thread_mut(&mut state, member).life.latest_user_message_at = Some(1);
+        thread_mut(&mut state, member).title = "Crew member".into();
         state.captain_crew_join(0, member).unwrap();
         let sidebar = |state: &State| {
             state
@@ -2260,16 +2418,22 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(!sidebar(&state).contains(&member));
-        state.select_thread(state.threads.iter().position(|t| t.id == home).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == home).unwrap());
+        // Workers never list in the thread list while a captain is open; a search for the
+        // member's title surfaces it as a flat row.
+        assert!(state.searched_workers().is_empty());
+        let title = thread(&state, member).title.clone();
+        state.search.replace_text(&title);
         assert_eq!(
             state
-                .visible_captain_workers(home)
+                .searched_workers()
                 .iter()
                 .map(|index| state.threads[*index].id)
                 .collect::<Vec<_>>(),
             vec![member]
         );
-        state.select_thread(state.threads.iter().position(|t| t.id == member).unwrap());
+        state.search.replace_text("");
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == member).unwrap());
         assert_eq!(state.selected_row(), home);
         state.captain_crew_release(0, member).unwrap();
         assert!(sidebar(&state).contains(&member));
@@ -2278,16 +2442,20 @@ mod tests {
         state.reset_captain_conversation(0).unwrap();
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(new_home, home);
-        state.select_thread(state.threads.iter().position(|t| t.id == new_home).unwrap());
-        assert!(state.visible_captain_workers(home).is_empty());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == new_home).unwrap());
+        state.search.replace_text(&title);
         assert_eq!(
             state
-                .visible_captain_workers(new_home)
+                .searched_workers()
                 .iter()
                 .map(|index| state.threads[*index].id)
                 .collect::<Vec<_>>(),
             vec![member]
         );
+        // The old home no longer claims the member: search rows follow live membership.
+        let member_index = state.threads.iter().position(|t| t.id == member).unwrap();
+        assert!(!state.captain_worker(&state.threads[member_index], home));
+        assert!(state.captain_worker(&state.threads[member_index], new_home));
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 
@@ -2321,7 +2489,7 @@ mod tests {
             .map(|index| state.threads[*index].id)
             .collect();
         assert!(sidebar.contains(&worker), "{sidebar:?}");
-        state.select_thread(state.threads.iter().position(|t| t.id == worker).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == worker).unwrap());
         assert_eq!(state.selected_row(), worker);
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
@@ -2648,44 +2816,30 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_carries_document_surfaces_but_not_files() {
+    fn a_reset_carries_the_viewer_but_not_the_diff() {
         let mut state = fixture();
         let home = state.captain_home(0).unwrap();
         let old_key = crate::right_panel::key("local", home);
         state
             .right_panels
             .open_captain_document(&old_key, 0, "NOTES.md");
-        state
-            .right_panels
-            .open(&old_key, crate::right_panel::SingletonKind::Diff);
-        state
-            .right_panels
-            .activate(&old_key, &format!("captain-doc:0:NOTES.md"));
         state.reset_captain_conversation(0).unwrap();
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(home, new_home);
         let new_panel = state
             .right_panels
             .get(&crate::right_panel::key("local", new_home));
-        assert!(new_panel.surfaces.iter().any(|surface| {
-            matches!(
-                surface,
-                crate::right_panel::Surface::CaptainDocument { captain: 0, name }
-                    if name == "NOTES.md"
-            )
-        }));
-        assert_eq!(new_panel.active.as_deref(), Some("captain-doc:0:NOTES.md"));
-        let old_panel = state.right_panels.get(&old_key);
-        assert!(old_panel.surfaces.iter().all(|surface| {
-            !matches!(surface, crate::right_panel::Surface::CaptainDocument { .. })
-        }));
-        assert!(
-            old_panel
-                .surfaces
-                .iter()
-                .any(|surface| matches!(surface, crate::right_panel::Surface::Diff)),
-            "the diff stays on the retired home's panel"
+        assert_eq!(
+            new_panel.viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
         );
+        assert_eq!(new_panel.view, crate::right_panel::PanelView::Viewer);
+        assert!(new_panel.open);
+        let old_panel = state.right_panels.get(&old_key);
+        assert!(old_panel.viewer.is_none());
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 
@@ -2704,37 +2858,21 @@ mod tests {
             name: "NOTES.md".into(),
         };
         state.captain_drafts.get_mut(&draft_key).unwrap().text.text = "unsaved".into();
-        let surface = "captain-doc:0:NOTES.md";
         // A dirty close parks instead of closing; a clean or Saving draft closes freely.
-        state.request_close_surface(&panel, surface);
+        state.request_close_viewer(&panel);
         assert!(state.doc_discard.is_some());
-        assert!(
-            state
-                .right_panels
-                .get(&panel)
-                .surfaces
-                .iter()
-                .any(|surface| surface.id() == "captain-doc:0:NOTES.md")
-        );
+        assert!(state.right_panels.get(&panel).viewer.is_some());
         state.doc_discard = None;
         state.finish_doc_discard();
         assert!(state.captain_drafts.contains_key(&draft_key));
         state.doc_discard = Some(crate::model::DocDiscard {
             panel: panel.clone(),
-            surface: surface.into(),
             key: draft_key.clone(),
             kind: crate::model::DiscardKind::Close,
         });
         state.finish_doc_discard();
         assert!(!state.captain_drafts.contains_key(&draft_key));
-        assert!(
-            state
-                .right_panels
-                .get(&panel)
-                .surfaces
-                .iter()
-                .all(|surface| surface.id() != "captain-doc:0:NOTES.md")
-        );
+        assert!(state.right_panels.get(&panel).viewer.is_none());
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 
@@ -2815,7 +2953,7 @@ mod tests {
             t.captain = Some(0);
         }
         let index = state.threads.iter().position(|t| t.id == earlier).unwrap();
-        state.select_thread(index);
+        state.open_kept_tab(index);
         let read_only = state.captain_crew_command("local", 0, joinable, CrewKind::Release);
         assert_eq!(
             read_only.unwrap_err(),
@@ -2846,7 +2984,7 @@ mod tests {
         state.threads[state.active].native.access = crate::model::AccessMode::default();
         // An ordinary root cannot open or save a draft for any Captain document.
         let root = push_thread(&mut state);
-        state.select_thread(state.threads.iter().position(|t| t.id == root).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == root).unwrap());
         state.captain_document_begin_edit(0, "NOTES.md");
         assert_eq!(state.captain_drafts[&key].base_revision, 0);
         state.captain_document_save_draft(&key);
@@ -2865,7 +3003,7 @@ mod tests {
             t.captain_home = true;
             t.captain = Some(0);
         }
-        state.select_thread(state.threads.iter().position(|t| t.id == earlier).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == earlier).unwrap());
         state.captain_document_begin_edit(0, "NOTES.md");
         state.captain_document_save_draft(&key);
         assert!(state.captain_document_overwrite_reviewed(&key, 0).is_err());
@@ -2882,7 +3020,7 @@ mod tests {
                 show_theirs: None,
             },
         );
-        state.select_thread(
+        state.open_kept_tab(
             state
                 .threads
                 .iter()
@@ -2938,7 +3076,6 @@ mod tests {
         let panel = crate::right_panel::key("local", state.captain_home(0).unwrap());
         state.doc_discard = Some(crate::model::DocDiscard {
             panel,
-            surface: "captain-doc:0:NOTES.md".into(),
             key: key.clone(),
             kind: crate::model::DiscardKind::Discard,
         });
@@ -3154,7 +3291,6 @@ mod tests {
         let panel = crate::right_panel::key("local", state.captain_home(0).unwrap());
         state.doc_discard = Some(crate::model::DocDiscard {
             panel,
-            surface: "captain-doc:0:NOTES.md".into(),
             key: local_key.clone(),
             kind: crate::model::DiscardKind::Close,
         });
@@ -3206,51 +3342,70 @@ mod tests {
     }
 
     #[test]
-    fn closing_other_documents_asks_for_each_dirty_one_and_saving_tabs_just_close() {
+    fn replacing_a_dirty_document_asks_and_a_saving_one_swaps_freely() {
         let mut state = fixture();
         let home = state.captain_home(0).unwrap();
         let panel = crate::right_panel::key("local", home);
-        for name in ["NOTES.md", "AGENTS.md"] {
-            state.right_panels.open_captain_document(&panel, 0, name);
-            state.captain_document_begin_edit(0, name);
-            let key = crate::model::DocumentDraftKey {
-                server: "local".into(),
-                captain: 0,
-                name: name.into(),
-            };
-            state.captain_drafts.get_mut(&key).unwrap().text.text = format!("unsaved {name}");
-        }
+        state.open_captain_document(&panel, 0, "NOTES.md");
+        state.captain_document_begin_edit(0, "NOTES.md");
         let notes = crate::model::DocumentDraftKey {
             server: "local".into(),
             captain: 0,
             name: "NOTES.md".into(),
         };
-        let agents = crate::model::DocumentDraftKey {
-            server: "local".into(),
-            captain: 0,
-            name: "AGENTS.md".into(),
-        };
-        // Closing everything parks on a dirty draft instead of closing anything.
-        state.request_close_all(&panel);
+        state.captain_drafts.get_mut(&notes).unwrap().text.text = "unsaved".into();
+        // Replacing a dirty document parks instead of swapping; the draft survives.
+        state.open_captain_document(&panel, 0, "AGENTS.md");
         assert!(state.doc_discard.is_some());
-        assert_eq!(state.right_panels.get(&panel).surfaces.len(), 2);
-        // "Keep editing" abandons the batch: both tabs and both drafts survive.
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
+        );
+        // "Keep editing" abandons the swap: the document and its draft stay.
         state.doc_discard = None;
         assert!(state.captain_drafts.contains_key(&notes));
-        assert!(state.captain_drafts.contains_key(&agents));
-        // A Saving tab is not a discard candidate: it closes while its draft and
-        // pending command stay in the map for the receipt.
-        state.captain_drafts.get_mut(&notes).unwrap().state = crate::model::DraftState::Saving {
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
+        );
+        // Confirming the discard drops the draft and opens the new document.
+        state.open_captain_document(&panel, 0, "AGENTS.md");
+        state.finish_doc_discard();
+        assert!(!state.captain_drafts.contains_key(&notes));
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "AGENTS.md".into(),
+            })
+        );
+        // A Saving draft is not a discard candidate: the document swaps while its
+        // pending command stays in the map for the receipt.
+        state.open_captain_document(&panel, 0, "NOTES.md");
+        state.captain_document_begin_edit(0, "NOTES.md");
+        let pending = crate::model::DocumentDraftKey {
+            server: "local".into(),
+            captain: 0,
+            name: "NOTES.md".into(),
+        };
+        state.captain_drafts.get_mut(&pending).unwrap().state = crate::model::DraftState::Saving {
             command: uuid::Uuid::new_v4(),
         };
-        state.request_close_all(&panel);
-        let discard = state.doc_discard.clone().expect("dirty draft parked");
-        assert_eq!(discard.key, agents);
-        state.finish_doc_discard();
-        // Confirming replays the batch: the Saving tab closes, its draft stays.
-        assert!(state.captain_drafts.contains_key(&notes));
-        assert!(!state.captain_drafts.contains_key(&agents));
-        assert!(state.right_panels.get(&panel).surfaces.is_empty());
+        state.open_captain_document(&panel, 0, "CREW.md");
+        assert!(state.doc_discard.is_none());
+        assert_eq!(
+            state.right_panels.get(&panel).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "CREW.md".into(),
+            })
+        );
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 

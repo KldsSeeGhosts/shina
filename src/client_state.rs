@@ -1906,6 +1906,8 @@ impl State {
         ui["pendingMessages"] = json!({});
         ui["active"] = json!(self.current().id);
         ui["tabs"] = json!(self.tabs);
+        ui["ghostTab"] = json!(self.ghost_tab);
+        ui["ghostAnchor"] = json!(self.ghost_anchor);
         ui["dark"] = json!(self.dark);
         ui["zoom"] = json!(self.zoom);
         self.machines.ui[&self.machines.selected] = ui.clone();
@@ -2640,6 +2642,11 @@ impl State {
             let from = crate::right_panel::key(&self.machines.selected, *old_home);
             let to = crate::right_panel::key(&self.machines.selected, new_home);
             self.right_panels.carry_captain_documents(&from, &to);
+            if let Some(discard) = self.doc_discard.as_mut()
+                && discard.panel == from
+            {
+                discard.panel = to;
+            }
         }
         if first
             && let Some(drafts) = self.client_views["localUi"]["clientDrafts"]
@@ -2777,6 +2784,10 @@ impl State {
             .into_iter()
             .filter(|id| self.threads.iter().any(|t| t.id == *id))
             .collect();
+        self.ghost_tab = self.ghost_tab.filter(|id| self.tabs.contains(id));
+        if self.ghost_tab.is_none() {
+            self.ghost_anchor = None;
+        }
         self.dark = dark;
         self.zoom = zoom;
         self.project_scope = scope;
@@ -2849,6 +2860,17 @@ impl State {
                     .map(|id| id as usize)
                     .filter(|id| self.threads.iter().any(|t| t.id == *id))
                     .collect();
+                self.ghost_tab = local["ghostTab"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                self.ghost_anchor = local["ghostAnchor"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                if self.ghost_tab.is_none() {
+                    self.ghost_anchor = None;
+                }
             }
             if restore_navigation
                 && let Some(index) = self
@@ -2857,6 +2879,14 @@ impl State {
                     .position(|thread| json!(thread.id) == local["active"])
             {
                 self.active = index;
+            }
+            if restore_navigation && local["tabs"].is_array() && local.get("ghostTab").is_none() {
+                // A saved session from before ghost tabs has no "ghostTab":
+                // run the index's migration on this device's tab strip, as
+                // `restore_global` does. The active tab, working tabs and
+                // drafts stay; quiet tabs drop.
+                let active_id = local["active"].as_u64().map(|id| id as usize);
+                self.migrate_tabs_to_ghost(active_id);
             }
         }
         if self.threads.is_empty() {
@@ -3200,6 +3230,8 @@ impl State {
         self.threads = cached.unwrap_or_else(|| vec![Thread::new(1)]);
         self.active = 0;
         self.tabs.clear();
+        self.ghost_tab = None;
+        self.ghost_anchor = None;
         self.client_recover = self.machines.recover.remove(server).unwrap_or_default();
         self.selected_threads.clear();
         self.project_scope = ProjectScope::All;
@@ -3265,17 +3297,46 @@ impl State {
             }
         } else {
             self.tabs = restored_tabs;
-            let active = self.machines.ui[server]["active"]
-                .as_u64()
-                .map(|id| id as usize)
-                .filter(|id| self.tabs.contains(id))
-                .unwrap_or(self.tabs[0]);
-            self.active = self
-                .threads
-                .iter()
-                .position(|t| t.id == active)
-                .expect("restored active tab");
-            self.capture_opened_draft();
+            let needs_ghost_migration = self.machines.ui[server].get("ghostTab").is_none();
+            if needs_ghost_migration {
+                // A machine UI saved before ghost tabs needs the same
+                // one-time migration the index runs: quiet tabs drop so the
+                // next save does not write "ghostTab": null over a stale set.
+                let active_id = self.machines.ui[server]["active"]
+                    .as_u64()
+                    .map(|id| id as usize);
+                self.migrate_tabs_to_ghost(active_id);
+            } else {
+                self.ghost_tab = self.machines.ui[server]["ghostTab"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                self.ghost_anchor = self.machines.ui[server]["ghostAnchor"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                if self.ghost_tab.is_none() {
+                    self.ghost_anchor = None;
+                }
+            }
+            if self.tabs.is_empty() {
+                // The migration can drop every quiet tab when the saved
+                // active id no longer names a live thread.
+                self.tabs.clear();
+                self.new_client_draft(None);
+            } else {
+                let active = self.machines.ui[server]["active"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id))
+                    .unwrap_or(self.tabs[0]);
+                self.active = self
+                    .threads
+                    .iter()
+                    .position(|t| t.id == active)
+                    .expect("restored active tab");
+                self.capture_opened_draft();
+            }
         }
         (
             self.dark,
@@ -3641,7 +3702,7 @@ impl State {
         // A saved copy on the source machine would resurrect the draft there.
         self.drop_saved_client_draft(&source, draft);
         self.threads.push(thread);
-        self.select_thread(self.threads.len() - 1);
+        self.open_kept_tab(self.threads.len() - 1);
         self.crew_draft_strip_foreign();
         self.apply_retarget_rules();
         self.checkpoint();
@@ -3820,7 +3881,7 @@ impl State {
             self.inherit_composer(index, seed);
         }
         self.apply_native_catalogs();
-        self.select_thread(index);
+        self.open_kept_tab(index);
     }
 
     pub fn choose_draft_project(&mut self, project: Option<usize>) {
@@ -4097,6 +4158,11 @@ impl State {
                     *tab = id;
                 }
             }
+            if self.ghost_tab == Some(draft_id) {
+                // A sent draft is no longer provisional.
+                self.ghost_tab = None;
+                self.ghost_anchor = None;
+            }
             self.threads.remove(draft_index);
             self.active = self
                 .threads
@@ -4270,6 +4336,13 @@ impl State {
     }
     /// Opens a thread on any linked machine, as one click in the unified sidebar.
     pub fn open_machine_thread(&mut self, server: &str, id: usize) {
+        self.open_machine_thread_inner(server, id, false);
+    }
+    /// A middle click on a remote sidebar row: the tab is kept, never a ghost.
+    pub fn open_machine_thread_kept(&mut self, server: &str, id: usize) {
+        self.open_machine_thread_inner(server, id, true);
+    }
+    fn open_machine_thread_inner(&mut self, server: &str, id: usize, kept: bool) {
         let exists = if server == self.machines.selected {
             self.threads.iter().any(|thread| thread.id == id)
         } else {
@@ -4292,8 +4365,31 @@ impl State {
         if self.machines.selected == server
             && let Some(index) = self.threads.iter().position(|thread| thread.id == id)
         {
-            self.select_thread(index);
+            if kept {
+                self.open_kept_tab(index);
+            } else {
+                self.show_thread(index);
+            }
         }
+    }
+    /// The one-time ghost-tab migration `restore_global` runs on an index
+    /// without "ghostTab", for a client machine's saved UI: keep the active
+    /// tab, tabs still working or holding queued input, and drafts that
+    /// carry unsent text.
+    fn migrate_tabs_to_ghost(&mut self, active_id: Option<usize>) {
+        self.tabs.retain(|id| {
+            Some(*id) == active_id
+                || self.threads.iter().any(|t| {
+                    t.id == *id
+                        && (t.status.busy()
+                            || t.has_draft_content()
+                            || !t.native.queue.is_empty()
+                            || t.has_pending_sends()
+                            || t.has_recoverable_native_inputs())
+                })
+        });
+        self.ghost_tab = None;
+        self.ghost_anchor = None;
     }
     pub(super) fn tick_mobile_pairing(&mut self, now: u64, tx: &mut Tx) -> bool {
         if !self.machines.dialog && !self.settings_menu {
@@ -4559,6 +4655,10 @@ impl State {
             TabIntent::Delete(ids) => {
                 let active = self.current().id;
                 self.tabs.retain(|id| *id == active || !ids.contains(id));
+                if self.ghost_tab.is_some_and(|ghost| ids.contains(&ghost)) {
+                    self.ghost_tab = None;
+                    self.ghost_anchor = None;
+                }
                 if ids.contains(&active) && epoch == self.tab_epoch {
                     self.remove_tab(active, false);
                 }
@@ -4591,7 +4691,7 @@ impl State {
                     self.tabs[position] = id;
                 }
             }
-            self.select_thread(index);
+            self.open_kept_tab(index);
         }
     }
     fn restore_requested_tabs(&mut self) {
@@ -5734,7 +5834,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_reset_carries_captain_document_surfaces_to_the_new_home() {
+    fn a_remote_reset_carries_the_captain_document_viewer_to_the_new_home() {
         let dir = std::env::temp_dir().join(format!(
             "shina-client-reset-{}",
             uuid::Uuid::new_v4().simple()
@@ -5750,7 +5850,6 @@ mod tests {
         state
             .right_panels
             .open_captain_document(&old_key, 0, "NOTES.md");
-        state.right_panels.open_file(&old_key, "src/one.rs", None);
         // The remote side resets its captain's conversation: the projection arrives
         // with a new primary home.
         server.reset_captain_conversation(0).unwrap();
@@ -5758,30 +5857,14 @@ mod tests {
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(old_home, new_home);
         let new_key = crate::right_panel::key(&state.machines.selected, new_home);
-        let moved: Vec<String> = state
-            .right_panels
-            .get(&new_key)
-            .surfaces
-            .iter()
-            .map(crate::right_panel::Surface::id)
-            .collect();
-        assert!(
-            moved.contains(&"captain-doc:0:NOTES.md".to_string()),
-            "{moved:?}"
+        assert_eq!(
+            state.right_panels.get(&new_key).viewer,
+            Some(crate::right_panel::Surface::CaptainDocument {
+                captain: 0,
+                name: "NOTES.md".into(),
+            })
         );
-        // File surfaces stay on the retired home's panel.
-        let stayed: Vec<String> = state
-            .right_panels
-            .get(&old_key)
-            .surfaces
-            .iter()
-            .map(crate::right_panel::Surface::id)
-            .collect();
-        assert!(
-            stayed.iter().any(|id| id.contains("src/one.rs")),
-            "{stayed:?}"
-        );
-        assert!(!stayed.contains(&"captain-doc:0:NOTES.md".to_string()));
+        assert!(state.right_panels.get(&old_key).viewer.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5876,7 +5959,7 @@ mod tests {
         state.client = Some(client);
         state.apply_projection(server.projection()).unwrap();
         state.tabs = vec![1, 2, 3];
-        state.select_thread(1);
+        state.open_kept_tab(1);
         while commands.try_recv().is_ok() {}
         (state, server, commands)
     }
@@ -5889,9 +5972,9 @@ mod tests {
     fn projections_never_open_server_tabs_or_override_a_later_click() {
         let (mut state, mut server, _) = tab_client();
         state.client_views["localUi"] = json!({"active":1,"tabs":[1]});
-        state.select_thread(2);
+        state.open_kept_tab(2);
         let before = (state.tabs.clone(), state.current().id);
-        server.select_thread(3);
+        server.open_kept_tab(3);
         server.new_thread_in(None);
         state.apply_projection(server.projection()).unwrap();
         state.apply_projection(server.projection()).unwrap();
@@ -5910,6 +5993,9 @@ mod tests {
         let mut ui = state.ui_snapshot();
         ui["active"] = json!(blank);
         ui["tabs"] = json!([2, blank, 1]);
+        // `ghostTab` present (even null) skips the one-time tab pruning, so
+        // this checks the plain session restore rather than the migration.
+        ui["ghostTab"] = Value::Null;
         state.client_views = json!({"localUi":ui});
         state.tab_epoch = 0;
         state.apply_projection(server.projection()).unwrap();
@@ -5924,7 +6010,7 @@ mod tests {
         ui["active"] = json!(1);
         ui["tabs"] = json!([1]);
         state.client_views = json!({"localUi":ui});
-        state.select_thread(2);
+        state.open_kept_tab(2);
         state.apply_projection(server.projection()).unwrap();
         assert_eq!(state.current().id, 3);
         assert_eq!(state.tabs, [1, 2, 3]);
@@ -5965,7 +6051,7 @@ mod tests {
         let command = std::iter::from_fn(|| commands.try_recv().ok())
             .find(|c| c.method == "thread.create")
             .unwrap();
-        state.select_thread(0);
+        state.open_kept_tab(0);
         let before = state.tabs.clone();
         let result = server.execute_command(&command).unwrap();
         state.apply_projection(server.projection()).unwrap();
@@ -6152,7 +6238,7 @@ mod tests {
         server.open_captain(0);
         let old = server.current().id;
         state.apply_projection(server.projection()).unwrap();
-        state.select_thread(state.threads.iter().position(|t| t.id == old).unwrap());
+        state.open_kept_tab(state.threads.iter().position(|t| t.id == old).unwrap());
         let tabs = state.tabs.clone();
         state.reset_captain_conversation(0).unwrap();
         let command = std::iter::from_fn(|| commands.try_recv().ok())
@@ -6348,7 +6434,7 @@ mod tests {
         draft.draft.replace_text(text);
         let id = draft.id;
         state.threads.push(draft);
-        state.select_thread(state.threads.len() - 1);
+        state.open_kept_tab(state.threads.len() - 1);
         id
     }
 
@@ -6499,7 +6585,7 @@ mod tests {
         let mut opening = Thread::new(41);
         opening.draft.replace_text("typed at launch");
         state.threads.push(opening);
-        state.select_thread(state.threads.len() - 1);
+        state.open_kept_tab(state.threads.len() - 1);
         assert!(!state.current().client_draft);
         state.retarget_draft("server-b");
         assert!(state.current().client_draft);
@@ -6703,8 +6789,8 @@ mod tests {
         server.threads[2].parent = Some(1);
         server.threads[2].delegated = true;
         state.apply_projection(server.projection()).unwrap();
-        state.select_thread(3);
-        state.select_thread(1);
+        state.open_kept_tab(3);
+        state.open_kept_tab(1);
         let before = state.tabs.clone();
         state.request_delete(1);
         state.confirm_delete();
@@ -6770,7 +6856,7 @@ mod tests {
             assert_eq!(state.current().id, 3);
             assert_eq!(state.tabs, [1, 3]);
             if abandon {
-                state.select_thread(0);
+                state.open_kept_tab(0);
             }
             state.apply_projection(server.projection()).unwrap();
             state.open_requested_tab();
@@ -6946,7 +7032,7 @@ mod tests {
                 assert_eq!(send.method, "thread.send");
                 assert_eq!(send.params["threadId"], id);
                 if navigate {
-                    state.select_thread(0);
+                    state.open_kept_tab(0);
                 }
                 if receipt_first {
                     // The draft still has its device ID. Match the send by command ID.
@@ -7039,7 +7125,7 @@ mod tests {
                 let command = commands.try_recv().unwrap();
                 assert_eq!(command.method, method);
                 if stale {
-                    state.select_thread(0);
+                    state.open_kept_tab(0);
                 }
                 state.machines.receipts.insert(
                     "local".into(),
@@ -7196,6 +7282,57 @@ mod tests {
             "deleted saved tabs need a draft too"
         );
         assert_eq!(state.tabs, [state.current().id]);
+    }
+
+    #[test]
+    fn a_first_projection_without_ghost_tabs_prunes_quiet_tabs() {
+        let (mut state, server, _) = tab_client();
+        // A saved session from before ghost tabs has no "ghostTab": the same
+        // migration the index runs keeps only the active tab and tabs still
+        // working, so the next save writes ghost state instead of reviving
+        // every quiet tab.
+        let mut ui = state.ui_snapshot();
+        ui["active"] = json!(2);
+        ui["tabs"] = json!([1, 2, 3]);
+        ui.as_object_mut().unwrap().remove("ghostTab");
+        ui.as_object_mut().unwrap().remove("ghostAnchor");
+        state.client_views = json!({"localUi":ui});
+        state.tab_epoch = 0;
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.tabs, [2]);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.ghost_tab, None);
+    }
+
+    #[test]
+    fn switching_to_a_machine_without_ghost_tabs_prunes_quiet_tabs() {
+        let (mut state, _, _, _) = paired_client_fixture();
+        // Give the remote machine a three-thread projection and a saved UI
+        // that predates ghost tabs: quiet tabs drop on switch instead of
+        // being restored whole.
+        let mut remote_server = State::new(PathBuf::new(), false);
+        remote_server.threads = (1..=3)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Remote {id}");
+                thread.renamed = true;
+                thread
+            })
+            .collect();
+        remote_server.next_id = 4;
+        state
+            .machines
+            .views
+            .insert("studio".into(), remote_server.projection().into());
+        let saved = &mut state.machines.ui["studio"];
+        saved["active"] = json!(2);
+        saved["tabs"] = json!([1, 2, 3]);
+        saved.as_object_mut().unwrap().remove("ghostTab");
+        saved.as_object_mut().unwrap().remove("ghostAnchor");
+        state.select_machine("studio");
+        assert_eq!(state.tabs, [2]);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.ghost_tab, None);
     }
 
     #[test]
@@ -7418,7 +7555,7 @@ mod tests {
         for leaves_queue in [false, true] {
             for ordinary_empty in [false, true] {
                 let (mut state, _, _, mut projection) = paired_client_fixture();
-                state.select_thread(0);
+                state.open_kept_tab(0);
                 let id = state.current().id;
                 let view = projection["threads"]
                     .as_array_mut()
@@ -8741,7 +8878,7 @@ mod tests {
                 context: None,
             });
             state.apply_projection(server.projection()).unwrap();
-            state.select_thread(0);
+            state.open_kept_tab(0);
             while commands.try_recv().is_ok() {}
             let existing_id = state.current().id;
             assert!(!state.current().is_draft());
@@ -8856,7 +8993,7 @@ mod tests {
     #[test]
     fn model_options_gate_on_capability_and_fall_back_for_older_peers() {
         let (mut state, mut server, mut commands) = tab_client();
-        state.select_thread(0);
+        state.open_kept_tab(0);
         while commands.try_recv().is_ok() {}
         server.threads[0].harness = "claude".into();
         server.threads[0].models = vec![crate::session::AgentModel {
