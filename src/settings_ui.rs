@@ -301,9 +301,38 @@ pub struct Dialog {
     pub archive: Option<usize>,
     pub archive_targets: Vec<usize>,
     pub licences: bool,
-    pub versions: BTreeMap<String, String>,
-    version_probe: Option<std::sync::mpsc::Receiver<BTreeMap<String, String>>>,
+    harness_info: HarnessInfo,
+    version_probe: Option<std::sync::mpsc::Receiver<HarnessInfo>>,
 }
+
+#[derive(Default)]
+struct HarnessInfo {
+    native: BTreeMap<&'static str, ExecutableInfo>,
+    acp: BTreeMap<String, ExecutableInfo>,
+    agents: Vec<crate::harness::Agent>,
+}
+
+#[derive(Default)]
+struct ExecutableInfo {
+    path: Option<std::path::PathBuf>,
+    version: Option<String>,
+}
+
+impl ExecutableInfo {
+    fn status(&self) -> String {
+        self.version
+            .as_ref()
+            .map(|v| format!("Found, {v}"))
+            .unwrap_or_else(|| {
+                if self.path.is_some() {
+                    "Found".into()
+                } else {
+                    "Not found".into()
+                }
+            })
+    }
+}
+
 impl Default for Dialog {
     fn default() -> Self {
         Self {
@@ -327,7 +356,7 @@ impl Default for Dialog {
             archive: None,
             archive_targets: vec![],
             licences: false,
-            versions: BTreeMap::new(),
+            harness_info: Default::default(),
             version_probe: None,
         }
     }
@@ -500,7 +529,7 @@ impl State {
             self.settings.version_probe = Some(receive);
             let wake = self.wake.clone();
             std::thread::spawn(move || {
-                let mut versions = BTreeMap::new();
+                let mut info = HarnessInfo::default();
                 for (name, process) in [
                     ("Pi", crate::backend::discovery_command()),
                     ("Codex", crate::codex::process()),
@@ -508,6 +537,17 @@ impl State {
                     ("Cursor", crate::cursor::process()),
                 ] {
                     let Ok(process) = process else { continue };
+                    let path = process
+                        .get_args()
+                        .find(|a| a.to_string_lossy().ends_with(".js"))
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| {
+                            crate::harness::executable(&process.get_program().to_string_lossy())
+                                .ok()
+                                .map(|(path, _)| path)
+                        });
+                    let record = info.native.entry(name).or_default();
+                    record.path = path;
                     let mut command = version_command(&process);
                     if let Ok(output) = crate::process::output(
                         &mut command,
@@ -524,11 +564,23 @@ impl State {
                             .take(100)
                             .collect::<String>();
                         if !line.is_empty() {
-                            versions.insert(name.into(), line);
+                            record.version = Some(line);
                         }
                     }
                 }
-                let _ = send.send(versions);
+                info.agents = crate::harness::Registry::read().agents;
+                for agent in &info.agents {
+                    if let Ok((path, script)) = crate::harness::executable(&agent.command) {
+                        info.acp.insert(
+                            agent.id.clone(),
+                            ExecutableInfo {
+                                version: script.as_deref().and_then(package_version),
+                                path: Some(script.unwrap_or(path)),
+                            },
+                        );
+                    }
+                }
+                let _ = send.send(info);
                 wake();
             });
         }
@@ -548,9 +600,9 @@ impl State {
     }
     pub fn poll_settings(&mut self) -> bool {
         if let Some(receiver) = &self.settings.version_probe
-            && let Ok(versions) = receiver.try_recv()
+            && let Ok(info) = receiver.try_recv()
         {
-            self.settings.versions = versions;
+            self.settings.harness_info = info;
             self.settings.version_probe = None;
             return true;
         }
@@ -2454,43 +2506,18 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             );
         }
         2 => {
-            let processes = [
-                ("Pi", crate::backend::discovery_command()),
-                ("Codex", crate::codex::process()),
-                ("Claude", crate::claude::process()),
-                ("Cursor", crate::cursor::process()),
-            ];
-            for (name, process) in processes {
+            let missing = ExecutableInfo::default();
+            for name in ["Pi", "Codex", "Claude", "Cursor"] {
                 if !matches(s, name) {
                     continue;
                 }
-                let path = process.ok().and_then(|cmd| {
-                    let script = cmd
-                        .get_args()
-                        .find(|a| a.to_string_lossy().ends_with(".js"))
-                        .map(std::path::PathBuf::from);
-                    script.or_else(|| {
-                        crate::harness::executable(&cmd.get_program().to_string_lossy())
-                            .ok()
-                            .map(|(path, _)| path)
-                    })
-                });
-                let description = path
+                let executable = s.settings.harness_info.native.get(name).unwrap_or(&missing);
+                let description = executable
+                    .path
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or("Not found".into());
-                let status = s
-                    .settings
-                    .versions
-                    .get(name)
-                    .map(|version| format!("Found, {version}"))
-                    .unwrap_or_else(|| {
-                        if path.is_some() {
-                            "Found".into()
-                        } else {
-                            "Not found".into()
-                        }
-                    });
+                let status = executable.status();
                 pane=pane.child(info(&format!("settings-harness-{name}"),name,&format!("{description}. Uses SHINA_{}_CLI, then the host's existing install and PATH.",name.to_uppercase()),&status,p));
                 if name != "Pi" {
                     let driver = name.to_lowercase();
@@ -2504,32 +2531,29 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 }
             }
             {
-                let registry = crate::harness::Registry::read();
-                for agent in registry.agents {
+                let agents = if s.settings.version_probe.is_some() {
+                    &s.harnesses.agents
+                } else {
+                    &s.settings.harness_info.agents
+                };
+                for agent in agents {
                     if !matches(s, "ACP harnesses") && !matches(s, &agent.name) {
                         continue;
                     }
                     found = true;
-                    let resolved = crate::harness::executable(&agent.command);
-                    let path = resolved
-                        .as_ref()
-                        .ok()
-                        .map(|(exe, script)| script.as_ref().unwrap_or(exe));
-                    let version = resolved
-                        .as_ref()
-                        .ok()
-                        .and_then(|(_, script)| script.as_deref())
-                        .and_then(package_version);
-                    let status = if let Some(version) = version {
-                        format!("Found, {version}")
-                    } else if resolved.is_ok() {
-                        "Found".into()
-                    } else {
-                        "Not found".into()
-                    };
+                    let executable = s
+                        .settings
+                        .harness_info
+                        .acp
+                        .get(&agent.id)
+                        .unwrap_or(&missing);
+                    let status = executable.status();
                     let note = format!(
                         "{}. Configured in harnesses.json; Shina resolves its command on PATH.",
-                        path.map(|path| path.display().to_string())
+                        executable
+                            .path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
                             .unwrap_or_else(|| agent.command.clone())
                     );
                     pane = pane.child(info(

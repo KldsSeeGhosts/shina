@@ -137,34 +137,54 @@ pub fn normalize_model_slug(model: Option<&str>, driver_kind: &str) -> Option<St
     Some(mapped.map(str::to_owned).unwrap_or(trimmed))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ModelOptionRef<'a> {
+    pub slug: &'a str,
+    pub name: &'a str,
+    pub aliases: &'a [String],
+    pub is_default: bool,
+    pub is_custom: bool,
+}
+
+impl<'a> From<&'a PickerModelOption> for ModelOptionRef<'a> {
+    fn from(option: &'a PickerModelOption) -> Self {
+        Self {
+            slug: &option.slug,
+            name: &option.name,
+            aliases: &option.aliases,
+            is_default: option.is_default,
+            is_custom: option.is_custom,
+        }
+    }
+}
+
 /// Ported from `packages/shared/src/model.ts` (`resolveSelectableModel`).
-pub fn resolve_selectable_model(
+fn resolve_selectable_model<'a>(
     driver_kind: &str,
     value: Option<&str>,
-    options: &[PickerModelOption],
+    mut options: impl Iterator<Item = ModelOptionRef<'a>> + Clone,
 ) -> Option<String> {
     let trimmed = value?.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(direct) = options.iter().find(|o| o.slug == trimmed) {
-        return Some(direct.slug.clone());
+    if let Some(direct) = options.clone().find(|o| o.slug == trimmed) {
+        return Some(direct.slug.to_owned());
     }
     let lower = trimmed.to_lowercase();
-    if let Some(by_name) = options.iter().find(|o| o.name.to_lowercase() == lower) {
-        return Some(by_name.slug.clone());
+    if let Some(by_name) = options.clone().find(|o| o.name.to_lowercase() == lower) {
+        return Some(by_name.slug.to_owned());
     }
     if let Some(by_alias) = options
-        .iter()
+        .clone()
         .find(|o| o.aliases.iter().any(|a| a.to_lowercase() == lower))
     {
-        return Some(by_alias.slug.clone());
+        return Some(by_alias.slug.to_owned());
     }
     let normalized = normalize_model_slug(Some(trimmed), driver_kind)?;
     options
-        .iter()
         .find(|o| o.slug == normalized)
-        .map(|o| o.slug.clone())
+        .map(|o| o.slug.to_owned())
 }
 
 /// Ported from `apps/web/src/modelSelection.ts` (`resolveAppModelSelectionForInstance`).
@@ -175,27 +195,45 @@ pub fn resolve_app_model_selection_for_instance(
     selected_model: Option<&str>,
     preserve_unavailable_selection: bool,
 ) -> Option<String> {
-    let entry = entries.iter().find(|c| c.instance_id == instance_id)?;
     let options = models_by_instance
         .get(instance_id)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    if let Some(resolved) = resolve_selectable_model(&entry.driver_kind, selected_model, options) {
+        .into_iter()
+        .flatten()
+        .map(ModelOptionRef::from);
+    resolve_model_options(
+        instance_id,
+        entries,
+        options,
+        selected_model,
+        preserve_unavailable_selection,
+    )
+}
+
+fn resolve_model_options<'a>(
+    instance_id: &str,
+    entries: &[ProviderInstanceEntry],
+    options: impl Iterator<Item = ModelOptionRef<'a>> + Clone,
+    selected_model: Option<&str>,
+    preserve_unavailable_selection: bool,
+) -> Option<String> {
+    let entry = entries.iter().find(|c| c.instance_id == instance_id)?;
+    if let Some(resolved) =
+        resolve_selectable_model(&entry.driver_kind, selected_model, options.clone())
+    {
         return Some(resolved);
     }
     if preserve_unavailable_selection
         && matches!(entry.driver_kind.as_str(), "opencode" | "antigravity")
         && let Some(unavailable) = normalize_custom_model_slug(selected_model)
-        && resolve_selectable_model(&entry.driver_kind, selected_model, options).is_none()
         && (entry.driver_kind != "antigravity" || unavailable != "antigravity-default")
     {
         return Some(unavailable);
     }
     options
-        .iter()
+        .clone()
         .find(|o| o.is_default)
-        .or_else(|| options.first())
-        .map(|o| o.slug.clone())
+        .or_else(|| options.into_iter().next())
+        .map(|o| o.slug.to_owned())
 }
 
 fn is_selectable_provider_instance_entry(entry: &ProviderInstanceEntry) -> bool {
@@ -313,21 +351,16 @@ pub fn resolve_composer_provider_selection(
     }
 }
 
-fn get_default_server_model(
-    models_by_instance: &BTreeMap<String, Vec<PickerModelOption>>,
-    instance_id: Option<&str>,
+fn get_default_server_model<'a>(
+    mut models: impl Iterator<Item = ModelOptionRef<'a>> + Clone,
     driver_kind: &str,
 ) -> String {
-    let models = instance_id
-        .and_then(|id| models_by_instance.get(id))
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
     models
-        .iter()
+        .clone()
         .find(|m| m.is_default && !m.is_custom)
-        .or_else(|| models.iter().find(|m| !m.is_custom))
-        .or_else(|| models.first())
-        .map(|m| m.slug.clone())
+        .or_else(|| models.clone().find(|m| !m.is_custom))
+        .or_else(|| models.next())
+        .map(|m| m.slug.to_owned())
         .unwrap_or_else(|| default_model_by_provider(driver_kind).to_owned())
 }
 
@@ -345,16 +378,12 @@ fn selections_map_to_options(
     result
 }
 
-fn model_identity(
-    models_by_instance: &BTreeMap<String, Vec<PickerModelOption>>,
-    instance_id: &str,
+fn model_identity<'a>(
+    mut options: impl Iterator<Item = ModelOptionRef<'a>>,
     driver_kind: &str,
     model: Option<&str>,
 ) -> Option<String> {
-    let is_custom = models_by_instance.get(instance_id).is_some_and(|opts| {
-        opts.iter()
-            .any(|m| Some(m.slug.as_str()) == model && m.is_custom)
-    });
+    let is_custom = options.any(|m| Some(m.slug) == model && m.is_custom);
     if is_custom {
         model.map(str::to_owned)
     } else {
@@ -363,16 +392,19 @@ fn model_identity(
 }
 
 /// Ported from `apps/web/src/composerDraftStore.ts` (`deriveEffectiveComposerModelState`).
-pub fn derive_effective_composer_model_state(
+pub(crate) fn derive_effective_composer_model_state<'a, I>(
     draft: Option<&DraftModelState>,
     entries: &[ProviderInstanceEntry],
-    models_by_instance: &BTreeMap<String, Vec<PickerModelOption>>,
+    models_for: impl Fn(Option<&str>) -> I,
     selected_provider: &str,
     selected_instance_id: Option<&str>,
     requested_instance_id: Option<&str>,
     thread_model_selection: Option<&ModelSelection>,
     project_model_selection: Option<&ModelSelection>,
-) -> EffectiveComposerModelState {
+) -> EffectiveComposerModelState
+where
+    I: Iterator<Item = ModelOptionRef<'a>> + Clone,
+{
     let base_model_candidate = thread_model_selection
         .map(|s| s.model.as_str())
         .or_else(|| project_model_selection.map(|s| s.model.as_str()));
@@ -381,10 +413,10 @@ pub fn derive_effective_composer_model_state(
 
     let base_model = selected_instance_id
         .and_then(|id| {
-            resolve_app_model_selection_for_instance(
+            resolve_model_options(
                 id,
                 entries,
-                models_by_instance,
+                models_for(Some(id)),
                 base_model_candidate,
                 preserve_thread_model,
             )
@@ -398,17 +430,17 @@ pub fn derive_effective_composer_model_state(
         })
         .or_else(|| normalize_model_slug(base_model_candidate, selected_provider))
         .unwrap_or_else(|| {
-            get_default_server_model(models_by_instance, selected_instance_id, selected_provider)
+            get_default_server_model(models_for(selected_instance_id), selected_provider)
         });
 
     let instance_selection = selected_instance_id
         .and_then(|id| draft.and_then(|d| d.model_selection_by_provider.get(id)));
     let selected_model = if let Some(sel) = instance_selection {
         let sel_instance = selected_instance_id.unwrap_or(selected_provider);
-        resolve_app_model_selection_for_instance(
+        resolve_model_options(
             sel_instance,
             entries,
-            models_by_instance,
+            models_for(Some(sel_instance)),
             Some(&sel.model),
             true,
         )
@@ -452,10 +484,9 @@ pub fn derive_effective_composer_model_state(
             .map(|e| e.driver_kind.as_str());
         let req_model = option_selections_map.get(req_id).map(|s| s.model.as_str());
         let same_model = req_model == Some(selected_model.as_str())
-            || model_identity(models_by_instance, req_id, selected_provider, req_model)
+            || model_identity(models_for(Some(req_id)), selected_provider, req_model)
                 == model_identity(
-                    models_by_instance,
-                    sel_id,
+                    models_for(Some(sel_id)),
                     selected_provider,
                     Some(&selected_model),
                 );
@@ -900,7 +931,7 @@ mod tests {
             entry("codex", "codex", true),
             entry("claude", "claude", true),
         ];
-        let mut models = BTreeMap::new();
+        let mut models = BTreeMap::<String, _>::new();
         models.insert("pi".into(), vec![model_opt("cpa/default", true)]);
         models.insert(
             "codex".into(),
@@ -910,6 +941,12 @@ mod tests {
             ],
         );
         models.insert("claude".into(), vec![model_opt("claude-opus-5-5", true)]);
+        let models_for = |id: Option<&str>| {
+            id.and_then(|id| models.get(id))
+                .into_iter()
+                .flatten()
+                .map(ModelOptionRef::from)
+        };
 
         let project_sel = ModelSelection {
             instance_id: "codex".into(),
@@ -928,7 +965,7 @@ mod tests {
         let eff_default = derive_effective_composer_model_state(
             None,
             &entries,
-            &models,
+            models_for,
             "pi",
             Some("pi"),
             None,
@@ -943,7 +980,7 @@ mod tests {
         let eff_project = derive_effective_composer_model_state(
             None,
             &entries,
-            &models,
+            models_for,
             "codex",
             Some("codex"),
             Some("codex"),
@@ -959,7 +996,7 @@ mod tests {
         let eff_thread = derive_effective_composer_model_state(
             None,
             &entries,
-            &models,
+            models_for,
             "codex",
             Some("codex"),
             Some("codex"),
@@ -994,7 +1031,7 @@ mod tests {
         let eff_draft = derive_effective_composer_model_state(
             Some(&draft),
             &entries,
-            &models,
+            models_for,
             "claude",
             Some("claude"),
             Some("claude"),
@@ -1014,7 +1051,7 @@ mod tests {
             entry("codex_secondary", "codex", false),
             entry("codex", "codex", true),
         ];
-        let mut models = BTreeMap::new();
+        let mut models = BTreeMap::<String, _>::new();
         models.insert("codex".into(), vec![model_opt("gpt-5.4", true)]);
         let mut draft = DraftModelState::default();
         set_model_selection(
@@ -1030,7 +1067,12 @@ mod tests {
         let eff = derive_effective_composer_model_state(
             Some(&draft),
             &entries,
-            &models,
+            |id| {
+                id.and_then(|id| models.get(id))
+                    .into_iter()
+                    .flatten()
+                    .map(ModelOptionRef::from)
+            },
             "codex",
             Some("codex"),
             Some("codex_secondary"),

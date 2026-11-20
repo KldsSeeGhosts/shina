@@ -753,6 +753,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .borrow_mut()
         .open(&s.machines.selected, s.current().id, unloaded);
     let p = palette(s.dark);
+    let composer_model = ComposerModelDisplay::new(s);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
     cx.focus_ring(2.0, 2.0, p.ring);
@@ -941,6 +942,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             };
             main.child(empty_thread(
                 s,
+                &composer_model,
                 p,
                 wide,
                 main_width,
@@ -951,6 +953,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             main.child(conversation(s, p, wide, main_width))
                 .child(composer(
                     s,
+                    &composer_model,
                     p,
                     wide,
                     main_width,
@@ -1087,7 +1090,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
         root = root.child(captain_editor(s, p, height));
     } else if s.settings_picker.is_some() {
-        root = root.child(settings_picker(s, p));
+        root = root.child(settings_picker(s, &composer_model, p));
     } else if s.captain_picker {
         root = root.child(captain_picker(s, p));
     } else if s.projects.clone_open {
@@ -1213,7 +1216,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         });
         root = root.child(crew_ui::attention_menu(s, p, pane));
     }
-    root = root.child(composer_ui::measurement_probes(s, p));
+    root = root.child(composer_ui::measurement_probes(s, &composer_model, p));
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
         _ => root.w_full().h_full(),
@@ -1313,17 +1316,118 @@ fn effort_name(level: &str) -> String {
     }
 }
 
-/// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
-/// provider's mark, the model's name without its route, and descriptor-driven traits.
+/// Shared by the visible footer, its measurement probe and any open picker in this view.
+struct ComposerModelDisplay {
+    descriptors: Vec<crate::descriptors::ProviderOptionDescriptor>,
+    effort: String,
+    both_default: bool,
+    traits: crate::descriptors::TraitsTriggerDisplay,
+    selections: Vec<crate::model_selection::ModelSelection>,
+    label: String,
+    trigger_label: String,
+    unavailable: bool,
+    multi_labels: Vec<(String, String)>,
+}
+
+impl ComposerModelDisplay {
+    fn new(s: &State) -> Self {
+        use crate::model_picker::get_display_model_name;
+        let entries = s.provider_instance_entries();
+        let (instance_id, model, options) = s.resolve_composer_model(&entries);
+        let descriptors = s.model_descriptors(&instance_id, &model, &options);
+        let selected = crate::model_selection::ModelSelection {
+            instance_id,
+            model,
+            options,
+        };
+        let (effort, both_default, traits) = composer_effort(s, &descriptors, &selected);
+        let entry = |id: &str| entries.iter().find(|e| e.instance_id == id);
+        let selected_entry = entry(&selected.instance_id);
+        let option = selected_entry.and_then(|e| s.picker_model_option(e, &selected.model));
+        let display_name = |opt: &crate::model_picker::PickerModelOption, short| {
+            get_display_model_name(
+                &opt.name,
+                opt.short_name.as_deref(),
+                opt.sub_provider.as_deref(),
+                short,
+            )
+        };
+        let fallback = split_model_label(&s.current().model).0;
+        let label = option
+            .as_ref()
+            .map(|opt| display_name(opt, true))
+            .unwrap_or_else(|| fallback.to_owned());
+        let trigger_label = if option.is_some() {
+            label.clone()
+        } else {
+            crate::model_picker::retained_model_while_provider_locked(
+                selected_entry,
+                &[],
+                &selected.model,
+            )
+            .map(|opt| display_name(&opt, true))
+            .unwrap_or_else(|| label.clone())
+        };
+        let unavailable = option.as_ref().is_some_and(|opt| opt.is_unavailable);
+        let selections = s.multi_model_selections_from(selected);
+        let multi_labels = if selections.len() > 1 {
+            selections
+                .iter()
+                .enumerate()
+                .map(|(index, selection)| {
+                    let other;
+                    let opt = if index == 0 {
+                        option.as_ref()
+                    } else {
+                        other = entry(&selection.instance_id)
+                            .and_then(|e| s.picker_model_option(e, &selection.model));
+                        other.as_ref()
+                    };
+                    let suffix = if opt.is_some_and(|m| m.is_unavailable) {
+                        " (Unavailable)"
+                    } else {
+                        ""
+                    };
+                    let short = opt
+                        .map(|m| display_name(m, true))
+                        .unwrap_or_else(|| split_model_label(&selection.model).0.to_owned());
+                    let full = opt
+                        .map(|m| display_name(m, false))
+                        .unwrap_or_else(|| selection.model.clone());
+                    (format!("{short}{suffix}"), format!("{full}{suffix}"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            descriptors,
+            effort,
+            both_default,
+            traits,
+            selections,
+            label,
+            trigger_label,
+            unavailable,
+            multi_labels,
+        }
+    }
+
+    fn show_effort(&self) -> bool {
+        !self.both_default && !self.effort.is_empty() && self.selections.len() == 1
+    }
+}
+
 /// The reasoning effort the composer shows, as KSG's `ComposerModelEffort` trigger reads it,
 /// with the descriptors' trigger display. `None` when both the model and effort are defaults.
-fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTriggerDisplay) {
+fn composer_effort(
+    s: &State,
+    descriptors: &[crate::descriptors::ProviderOptionDescriptor],
+    selection: &crate::model_selection::ModelSelection,
+) -> (String, bool, crate::descriptors::TraitsTriggerDisplay) {
     let t = s.current();
-    let (resolved_instance, resolved_model_id, resolved_opts) =
-        s.resolved_composer_model_selection();
     let (name, _) = split_model_label(&t.model);
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let controls = crate::descriptors::split_column_and_footer_controls(descriptors);
     let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
     let primary_is_prompt_controlled = descriptors
         .iter()
@@ -1341,18 +1445,14 @@ fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTrigge
             _ => false,
         })
         && prompt_ultrathink != crate::descriptors::PromptUltrathink::None;
-    let selection = crate::model_selection::ModelSelection {
-        instance_id: resolved_instance.clone(),
-        model: resolved_model_id.clone(),
-        options: resolved_opts.clone(),
-    };
     let display = crate::descriptors::build_traits_trigger_display(
-        &descriptors,
+        descriptors,
         primary_is_prompt_controlled,
-        Some(&selection),
+        Some(selection),
         None,
     );
-    let fallback_thinking = resolved_opts
+    let fallback_thinking = selection
+        .options
         .iter()
         .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
         .and_then(|o| o.value.as_str())
@@ -1375,16 +1475,27 @@ fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTrigge
     (effort, both_default, display)
 }
 
-fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
-    model_trigger(s, p, narrow, locked, true)
+fn model_effort_trigger(
+    s: &State,
+    model: &ComposerModelDisplay,
+    p: Palette,
+    narrow: bool,
+    locked: bool,
+) -> El {
+    model_trigger(s, model, p, narrow, locked, true)
 }
 
 /// Ported from KSG Code's `ComposerModelEffort` reasoning trigger: a gauge and the effort,
 /// beside the model in the context strip. It opens the same model and effort picker.
 /// `compact` drops the label for a narrow strip, as KSG's controls bar does.
-fn effort_trigger(s: &State, p: Palette, locked: bool, compact: bool) -> Option<El> {
-    let (effort, both_default, _) = composer_effort(s);
-    if both_default || effort.is_empty() || s.multi_model_selections().len() > 1 {
+fn effort_trigger(
+    model: &ComposerModelDisplay,
+    p: Palette,
+    locked: bool,
+    compact: bool,
+) -> Option<El> {
+    let effort = &model.effort;
+    if !model.show_effort() {
         return None;
     }
     let mut trigger = row()
@@ -1419,71 +1530,25 @@ fn effort_trigger(s: &State, p: Palette, locked: bool, compact: bool) -> Option<
 }
 
 /// The model trigger. `with_effort` keeps the effort inside it, as the resting composer does.
-fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort: bool) -> El {
+fn model_trigger(
+    s: &State,
+    model: &ComposerModelDisplay,
+    p: Palette,
+    narrow: bool,
+    locked: bool,
+    with_effort: bool,
+) -> El {
     let t = s.current();
-    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
-    let entries = s.provider_instance_entries();
-    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
-    let active_model_option = s
-        .picker_models_by_instance()
-        .get(&resolved_instance)
-        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
-        .or_else(|| {
-            crate::model_picker::retained_model_while_provider_locked(
-                active_entry,
-                &[],
-                &resolved_model_id,
-            )
-        });
     let (name, _) = split_model_label(&t.model);
-    let (effort, both_default, display) = composer_effort(s);
-    let multi_selections = s.multi_model_selections();
+    let effort = &model.effort;
+    let display = &model.traits;
+    let multi_selections = &model.selections;
     if multi_selections.len() > 1 {
-        let picker_models = s.picker_models_by_instance();
-        let mut short_labels = Vec::with_capacity(multi_selections.len());
-        let mut full_labels = Vec::with_capacity(multi_selections.len());
-        let mut vendors = Vec::with_capacity(multi_selections.len().min(3));
-        for (idx, sel) in multi_selections.iter().enumerate() {
-            let opt = picker_models
-                .get(&sel.instance_id)
-                .and_then(|opts| opts.iter().find(|o| o.slug == sel.model));
-            let unavailable = if opt.is_some_and(|m| m.is_unavailable) {
-                " (Unavailable)"
-            } else {
-                ""
-            };
-            let short = opt
-                .map(|m| {
-                    format!(
-                        "{}{unavailable}",
-                        crate::model_picker::get_display_model_name(
-                            &m.name,
-                            m.short_name.as_deref(),
-                            m.sub_provider.as_deref(),
-                            true,
-                        )
-                    )
-                })
-                .unwrap_or_else(|| format!("{}{unavailable}", split_model_label(&sel.model).0));
-            let full = opt
-                .map(|m| {
-                    format!(
-                        "{}{unavailable}",
-                        crate::model_picker::get_display_model_name(
-                            &m.name,
-                            m.short_name.as_deref(),
-                            m.sub_provider.as_deref(),
-                            false,
-                        )
-                    )
-                })
-                .unwrap_or_else(|| format!("{}{unavailable}", sel.model));
-            if idx < 3 {
-                vendors.push(model_vendor(&sel.model, &full));
-            }
-            short_labels.push(short);
-            full_labels.push(full);
-        }
+        let short_labels = model
+            .multi_labels
+            .iter()
+            .map(|(short, _)| short.as_str())
+            .collect::<Vec<_>>();
         let multiple_label = if short_labels.len() > 2 {
             format!(
                 "{}, {} more",
@@ -1493,10 +1558,15 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
         } else {
             short_labels.join(", ")
         };
-        let all_model_names = full_labels.join(", ");
+        let all_model_names = model
+            .multi_labels
+            .iter()
+            .map(|(_, full)| full.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut icons = row().center_y().gap(2.0).shrink();
-        for vendor in vendors {
-            icons = icons.child(provider_icon(s, p, vendor, 14.0));
+        for (sel, (_, full)) in multi_selections.iter().zip(&model.multi_labels).take(3) {
+            icons = icons.child(provider_icon(s, p, model_vendor(&sel.model, full), 14.0));
         }
         let mut trigger = row()
             .key("model-effort")
@@ -1569,20 +1639,7 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
             s.open_model_picker(SettingsPicker::Model);
         });
     }
-    let trigger_unavailable = active_model_option
-        .as_ref()
-        .is_some_and(|m| m.is_unavailable);
-    let display_name = active_model_option
-        .as_ref()
-        .map(|m| {
-            crate::model_picker::get_display_model_name(
-                &m.name,
-                m.short_name.as_deref(),
-                m.sub_provider.as_deref(),
-                true,
-            )
-        })
-        .unwrap_or_else(|| name.to_owned());
+    let display_name = &model.trigger_label;
     let trigger = trigger.child(provider_icon(
         s,
         p,
@@ -1595,16 +1652,16 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
     }
     let mut trigger = trigger.child(
         if with_effort {
-            label(&display_name, TextStyle::new(13.0, 600.0), p.ink)
+            label(display_name, TextStyle::new(13.0, 600.0), p.ink)
         } else {
             // In the context strip the model reads like KSG's other strip controls.
-            label(&display_name, SMALL, p.muted)
+            label(display_name, SMALL, p.muted)
         }
         .truncate()
         .shrink()
         .min_w(0.0),
     );
-    if with_effort && !both_default {
+    if with_effort && !model.both_default {
         trigger = trigger.child(meta_text(effort, p.muted).truncate().shrink().min_w(0.0));
     }
     if display.speed_label.is_some() {
@@ -1616,7 +1673,7 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
     if let Some(cw) = &display.context_window {
         trigger = trigger.child(meta_text(cw, p.muted).truncate().shrink().min_w(0.0));
     }
-    if trigger_unavailable {
+    if model.unavailable {
         trigger = trigger.child(outlined(
             meta_text("Unavailable", p.muted)
                 .px(4.0)
@@ -1640,29 +1697,12 @@ const REASONING_W: f32 = 272.0;
 
 /// The model picker or the reasoning menu, whichever is open. KSG Code keeps them apart:
 /// `ProviderModelPicker` for the model and `ComposerReasoningPicker` for its levels.
-fn settings_picker(s: &State, p: Palette) -> El {
+fn settings_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     if s.settings_picker == Some(SettingsPicker::Thinking) {
-        reasoning_picker(s, p)
+        reasoning_picker(s, model, p)
     } else {
-        model_picker(s, p)
+        model_picker(s, model, p)
     }
-}
-
-/// The selected model's short name, for the headers of the options column and reasoning menu.
-fn picker_model_label(s: &State) -> String {
-    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
-    s.picker_models_by_instance()
-        .get(&resolved_instance)
-        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id))
-        .map(|m| {
-            crate::model_picker::get_display_model_name(
-                &m.name,
-                m.short_name.as_deref(),
-                m.sub_provider.as_deref(),
-                true,
-            )
-        })
-        .unwrap_or_else(|| split_model_label(&s.current().model).0.to_owned())
 }
 
 /// A popover above the composer, right edges aligned, sized to the window (Floating UI's
@@ -1699,12 +1739,13 @@ fn finish_model_pick(s: &mut State) {
 /// list at one fixed height, and the `ComposerEffortColumn` (`optionsOnly`) beside it when the
 /// model has options besides reasoning. Below 640 px the column stacks under the list, as
 /// KSG's `max-sm` classes do. Reasoning, speed and permissions have their own controls.
-fn model_picker(s: &State, p: Palette) -> El {
+fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     let t = s.current();
     let can_choose = !t.status.busy() && !t.configuring;
     let stacked = s.viewport_width <= 640.0;
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let controls = crate::descriptors::split_column_and_footer_controls(&model.descriptors);
+    let entries = s.provider_instance_entries();
+    let options = s.picker_models_for_entries(&entries);
     let has_options = !controls.others.is_empty();
     let room = (s.viewport_width - 16.0).max(240.0);
     let width = if stacked {
@@ -1723,7 +1764,11 @@ fn model_picker(s: &State, p: Palette) -> El {
     } else if has_options {
         MODEL_PICKER_H
     } else {
-        tallest_model_tab_h(s).min(if stacked { 320.0 } else { MODEL_PICKER_H })
+        tallest_model_tab_h(s, &options, entries.len()).min(if stacked {
+            320.0
+        } else {
+            MODEL_PICKER_H
+        })
     };
     let list_col = col()
         .key("model-picker-list-col")
@@ -1736,7 +1781,16 @@ fn model_picker(s: &State, p: Palette) -> El {
         .shrink()
         .min_w(0.0)
         .min_h(0.0);
-    let list_col = model_list(s, p, can_choose, list_col, true, !(stacked && has_options));
+    let snapshot = picker_snapshot_from(s, entries, &options);
+    let list_col = model_list(
+        s,
+        p,
+        can_choose,
+        list_col,
+        &snapshot,
+        &model.selections,
+        !(stacked && has_options),
+    );
     let mut body = if stacked { col() } else { row() }
         .key("model-picker-body")
         .w_full()
@@ -1745,7 +1799,6 @@ fn model_picker(s: &State, p: Palette) -> El {
         .shrink()
         .child(list_col);
     if has_options {
-        let model_label = picker_model_label(s);
         body = body
             .child(if stacked {
                 rule(p)
@@ -1757,7 +1810,7 @@ fn model_picker(s: &State, p: Palette) -> El {
                 p,
                 can_choose,
                 stacked,
-                &model_label,
+                &model.label,
                 &controls,
             ));
     }
@@ -1792,7 +1845,9 @@ fn model_picker(s: &State, p: Palette) -> El {
 /// The model list's height for its tallest provider tab or favorites, from KSG's
 /// `tallestTabUnits`: a one-line row is 32 pt, a two-line row 48 pt, 2 pt apart, plus the
 /// search row and the list's padding. It never drops below the provider rail.
-fn tallest_model_tab_h(s: &State) -> f32 {
+type PickerModels = std::collections::BTreeMap<String, Vec<crate::model_picker::PickerModelOption>>;
+
+fn tallest_model_tab_h(s: &State, options: &PickerModels, entry_count: usize) -> f32 {
     use crate::model_picker::provider_model_key;
     const CHROME: f32 = 51.0 + 12.0;
     let favorites: std::collections::HashSet<String> = s
@@ -1803,11 +1858,11 @@ fn tallest_model_tab_h(s: &State) -> f32 {
     let row = |two_line: bool| if two_line { 48.0 } else { 32.0 };
     let mut tallest: f32 = 0.0;
     let mut favorites_h: f32 = 0.0;
-    for (instance, models) in s.picker_models_by_instance() {
+    for (instance, models) in options {
         let mut tab_h: f32 = 0.0;
         let mut legacy = false;
-        for model in &models {
-            let favorite = favorites.contains(&provider_model_key(&instance, &model.slug));
+        for model in models {
+            let favorite = favorites.contains(&provider_model_key(instance, &model.slug));
             if favorite {
                 favorites_h += row(true) + 2.0;
             }
@@ -1822,7 +1877,7 @@ fn tallest_model_tab_h(s: &State) -> f32 {
         }
         tallest = tallest.max(tab_h);
     }
-    let rail = (s.provider_instance_entries().len() + 1) as f32 * 40.0 + 8.0;
+    let rail = (entry_count + 1) as f32 * 40.0 + 8.0;
     (CHROME + tallest.max(favorites_h)).max(rail).max(160.0)
 }
 
@@ -2102,17 +2157,16 @@ fn switch_track(on: bool, p: Palette) -> El {
 /// Ported from KSG Code's `ComposerReasoningPicker`: its own menu above the effort chip, with
 /// the reasoning levels under a header that names the model and the speed controls below
 /// them. The levels keep Shina's Codex slider, laid out for this narrower menu.
-fn reasoning_picker(s: &State, p: Palette) -> El {
+fn reasoning_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     let t = s.current();
     let can_choose = !t.status.busy() && !t.configuring;
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let controls = crate::descriptors::split_column_and_footer_controls(&model.descriptors);
     let title = controls
         .effort
         .as_ref()
         .map(|d| d.label().to_owned())
         .unwrap_or_else(|| "Reasoning".into());
-    let model_label = picker_model_label(s);
+    let model_label = &model.label;
     let card = col()
         .key("reasoning-picker")
         .role("dialog")
@@ -2135,7 +2189,7 @@ fn reasoning_picker(s: &State, p: Palette) -> El {
                 .child(label(&title, META, p.muted))
                 .child(spacer())
                 .child(
-                    label(&model_label, META, p.muted)
+                    label(model_label, META, p.muted)
                         .key("effort-model-label")
                         .truncate()
                         .shrink()
@@ -2821,6 +2875,16 @@ struct PickerSnapshot {
 }
 
 fn picker_snapshot(s: &State) -> PickerSnapshot {
+    let entries = s.provider_instance_entries();
+    let options = s.picker_models_for_entries(&entries);
+    picker_snapshot_from(s, entries, &options)
+}
+
+fn picker_snapshot_from(
+    s: &State,
+    entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    options_by_instance: &PickerModels,
+) -> PickerSnapshot {
     use crate::model_picker::{
         ModelPickerItem, ModelPickerSearchableModel, ModelPickerTab,
         is_provider_instance_picker_ready, is_provider_instance_picker_visible,
@@ -2830,8 +2894,6 @@ fn picker_snapshot(s: &State) -> PickerSnapshot {
     };
 
     let t = s.current();
-    let entries = s.provider_instance_entries();
-    let options_by_instance = s.picker_models_by_instance();
     let favorites = s.effective_model_favorites();
     let favorites_set: std::collections::HashSet<String> = favorites
         .iter()
@@ -3069,7 +3131,8 @@ fn model_list(
     p: Palette,
     can_choose: bool,
     card: El,
-    autofocus_search: bool,
+    snap: &PickerSnapshot,
+    selections: &[crate::model_selection::ModelSelection],
     round_bottom: bool,
 ) -> El {
     use crate::model_picker::{
@@ -3078,10 +3141,9 @@ fn model_list(
     };
 
     let t = s.current();
-    let snap = picker_snapshot(s);
     let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
 
-    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+    let search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
         .key("model-search")
         .label("Search models")
         .placeholder("Search models...", p.muted)
@@ -3108,10 +3170,8 @@ fn model_list(
                 return true;
             }
             false
-        });
-    if autofocus_search {
-        search_field = search_field.autofocus();
-    }
+        })
+        .autofocus();
 
     let header = row().center_y().gap(8.0).h(50.0).px(10.0).shrink().child(
         row()
@@ -3276,11 +3336,7 @@ fn model_list(
     }
 
     let multi_enabled = s.multiple_models_enabled();
-    let multi_selections = if multi_enabled {
-        s.multi_model_selections()
-    } else {
-        Vec::new()
-    };
+    let multi_selections = if multi_enabled { selections } else { &[] };
 
     let rows_mix_providers = snap
         .visible_models
@@ -13609,6 +13665,7 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
 /// the headline off it.
 fn empty_thread(
     s: &State,
+    model: &ComposerModelDisplay,
     p: Palette,
     wide: bool,
     pane_width: f32,
@@ -13640,7 +13697,7 @@ fn empty_thread(
         .min_h(0.0)
         .items_center()
         .child(above)
-        .child(composer(s, p, wide, pane_width, caret_edges))
+        .child(composer(s, model, p, wide, pane_width, caret_edges))
         .child(below)
 }
 
@@ -15702,6 +15759,7 @@ fn composer_decorations(
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
     s: &State,
+    model: &ComposerModelDisplay,
     p: Palette,
     wide: bool,
     pane_width: f32,
@@ -16336,7 +16394,7 @@ fn composer(
             preview = preview.child(context_ring(t, p));
         }
         preview = preview.child(action);
-        let controls = composer_ui::controls(s, p, lane - 32.0, true, locked);
+        let controls = composer_ui::controls(s, model, p, lane - 32.0, true, locked);
         let composer_card = composer_ui::frame_card(s, p, card.child(preview).child(controls));
         return col()
             .key("composer-lane")
@@ -16523,7 +16581,7 @@ fn composer(
                     .child(meta_text("Open a real workspace", p.sea)),
             )
     } else {
-        composer_ui::controls(s, p, lane - 16.0, false, locked)
+        composer_ui::controls(s, model, p, lane - 16.0, false, locked)
     };
     area = area.child(composer_shell(
         p,
@@ -18193,6 +18251,53 @@ pub(crate) mod tests {
         rt
     }
 
+    #[test]
+    fn composer_redraws_and_text_commits_do_not_build_picker_maps() {
+        use crate::model::PICKER_MAP_BUILDS;
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.catalog.models = (0..128)
+                .map(|index| crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: format!("cpa/fixture-{index}"),
+                    name: format!("Fixture {index}"),
+                    ..Default::default()
+                })
+                .collect();
+            rt.state.current_mut().model_id = "cpa/fixture-127".into();
+            rt.state.current_mut().model = "Fixture 127".into();
+            PICKER_MAP_BUILDS.with(|count| count.set(0));
+            for _ in 0..3 {
+                rt.invalidate();
+                rt.frame(0.0);
+            }
+            assert!(rt.presented("model-effort").is_some(), "{width}");
+            assert!(rt.presented("measure-model").is_some(), "{width}");
+            press(&mut rt, "composer-input");
+            for text in ["a", "b", "c", "d"] {
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Text(text.into()),
+                    mods: Default::default(),
+                });
+                rt.frame(0.0);
+            }
+            assert_eq!(rt.state.current().draft.text, "abcd");
+            assert_eq!(PICKER_MAP_BUILDS.with(|count| count.get()), 0, "{width}");
+
+            take_timeline_counts();
+            rt.state.settings_picker = Some(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("model-list").is_some(), "{width}");
+            assert_eq!(
+                PICKER_MAP_BUILDS.with(|count| count.get()) as u64,
+                take_timeline_counts().views,
+                "{width}: one picker map per open view"
+            );
+        }
+    }
+
     fn connected_machines(rt: &mut Runtime<State>) {
         let projection = rt.state.projection();
         let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
@@ -18350,16 +18455,18 @@ pub(crate) mod tests {
                     State::new(".".into(), false),
                     |s, cx| {
                         composer_ui::measure(s, cx);
+                        let model = ComposerModelDisplay::new(s);
                         let mut root = col()
                             .w(s.viewport_width + if s.show_archive { 32.0 } else { 20.0 })
                             .child(composer_ui::controls(
                                 s,
+                                &model,
                                 palette(false),
                                 s.viewport_width,
                                 s.show_archive,
                                 false,
                             ))
-                            .child(composer_ui::measurement_probes(s, palette(false)));
+                            .child(composer_ui::measurement_probes(s, &model, palette(false)));
                         if s.composer_ui.overflow.get() {
                             root = root.child(composer_ui::overflow_menu(s, palette(false)));
                         }
@@ -18405,9 +18512,10 @@ pub(crate) mod tests {
                     if resting {
                         return m[0] + blocks_w;
                     }
-                    let mut width = blocks_w + composer_ui::strip_fixed(state, 580.0);
+                    let model = ComposerModelDisplay::new(state);
+                    let mut width = blocks_w + composer_ui::strip_fixed(state, &model, 580.0);
                     for _ in 0..3 {
-                        width = blocks_w + composer_ui::strip_fixed(state, width);
+                        width = blocks_w + composer_ui::strip_fixed(state, &model, width);
                     }
                     width
                 };
@@ -22238,28 +22346,29 @@ pub(crate) mod tests {
             );
             assert!(rt.presented("harness-tag-codex").is_none());
             assert!(rt.presented("harness-tag-claude").is_none());
-            if crate::claude::process().is_ok() {
-                press(&mut rt, "choose-harness-claude");
-                assert_eq!(
-                    rt.state.model_picker_tab,
-                    Some(crate::model_picker::ModelPickerTab::Instance(
-                        "claude".into()
-                    ))
-                );
-            } else {
-                assert!(
-                    find(&rt.accessibility_json(), "choose-harness-claude")
-                        .and_then(|node| node["states"].as_array().cloned())
-                        .is_some_and(|states| states.iter().any(|x| x == "disabled")),
-                    "{width}: claude should be disabled when missing"
-                );
-                rt.state.model_picker_tab = Some(crate::model_picker::ModelPickerTab::Instance(
-                    "claude".into(),
-                ));
-                rt.invalidate();
-                rt.frame(0.0);
-                assert!(rt.presented("claude-unavailable").is_some());
-            }
+            assert!(
+                find(&rt.accessibility_json(), "choose-harness-claude")
+                    .and_then(|node| node["states"].as_array().cloned())
+                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                "{width}: claude should be disabled when missing"
+            );
+            rt.state.model_picker_tab = Some(crate::model_picker::ModelPickerTab::Instance(
+                "claude".into(),
+            ));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("claude-unavailable").is_some());
+            rt.state.claude_catalog.installed = true;
+            rt.state.model_picker_tab = None;
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "choose-harness-claude");
+            assert_eq!(
+                rt.state.model_picker_tab,
+                Some(crate::model_picker::ModelPickerTab::Instance(
+                    "claude".into()
+                ))
+            );
             press(&mut rt, "choose-harness-fixture");
             assert_eq!(
                 rt.state.model_picker_tab,

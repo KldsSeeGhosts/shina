@@ -223,17 +223,20 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
     start_process(process()?, start, wake)
 }
 
-pub fn discover(workspace: PathBuf, wake: Waker) -> Result<Pi, String> {
-    let command = process()?;
+pub fn discover(workspace: PathBuf, wake: Waker) -> Pi {
     let start = Start::discovery("claude", workspace);
-    Ok(Pi::worker(
+    Pi::worker(
         wake,
         start.owner.clone(),
         None,
         move |input, events, wake, stopped, owner| {
+            let command = process()?;
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
             run_mode(command, start, input, events, wake, stopped, owner, true)
         },
-    ))
+    )
 }
 
 fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, String> {

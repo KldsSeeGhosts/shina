@@ -129,6 +129,15 @@ pub(crate) fn start_command(
     wake: Waker,
     command: std::process::Command,
 ) -> Result<Pi, String> {
+    start_with_command(agent, start, wake, |_| Ok(command))
+}
+
+pub(crate) fn start_with_command(
+    agent: Agent,
+    start: Start,
+    wake: Waker,
+    command: impl FnOnce(&std::path::Path) -> Result<std::process::Command, String> + Send + 'static,
+) -> Result<Pi, String> {
     if matches!(start.source, SessionSource::Fork(_)) {
         return Err("ACP conversation forks are not supported. Start a new thread instead.".into());
     }
@@ -155,6 +164,10 @@ pub(crate) fn start_command(
         session_key,
         move |input, events, wake, stopped, owner| {
             let action = || {
+                let command = command(&start.workspace)?;
+                if stopped.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let skills = if claude {
                     crate::composer_skills::claude_config(inherit_config)
                         .map(|config| {

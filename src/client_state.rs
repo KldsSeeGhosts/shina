@@ -2801,8 +2801,14 @@ impl State {
             .get_mut("localUi")
             .map(Value::take)
             .unwrap_or(Value::Null);
+        self.update_projected_native_models(&projection.state);
+        let catalog_changed = ["models", "defaultModel", "defaultThinking"]
+            .into_iter()
+            .any(|key| self.client_views["catalog"][key] != projection["catalog"][key]);
         self.client_views = projection.state;
-        self.apply_projected_catalog();
+        if catalog_changed {
+            self.apply_projected_catalog();
+        }
         self.apply_native_catalogs();
         if first && !local.is_null() {
             // Live cached editors also own pending sends and isolated queue edits. Restoring the
@@ -3215,6 +3221,10 @@ impl State {
             self.background.settings.clone(),
             self.preferences.clone(),
         );
+        self.projected_native_catalogs.clear();
+        self.catalog.models.clear();
+        self.catalog.default_model = None;
+        self.catalog.default_thinking.clear();
         self.client_views =
             json!({"localUi":self.machines.ui[server],"cachedEditors":cached_editors});
         if let Some(mut projection) = projection {

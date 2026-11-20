@@ -165,8 +165,7 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
 
 /// KSG `checkCursorProviderStatus`: a metadata-only catalog probe. No
 /// conversation, MCP registration or prompt, like `Start::discovery` requires.
-pub fn discover(workspace: PathBuf, wake: Waker) -> Result<Pi, String> {
-    let command = process()?;
+pub fn discover(workspace: PathBuf, wake: Waker) -> Pi {
     let start = Start::discovery("cursor", workspace);
     let owner = start.owner.clone();
     let pi = Pi::worker(
@@ -174,6 +173,10 @@ pub fn discover(workspace: PathBuf, wake: Waker) -> Result<Pi, String> {
         owner,
         None,
         move |input, events, _wake, stopped, _owner| {
+            let command = process()?;
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
             if let Some(version) = probe_version(&command) {
                 let _ = events.send(Event::Record(
                     json!({"type":"harness_update","field":"version","value":version}),
@@ -207,7 +210,7 @@ pub fn discover(workspace: PathBuf, wake: Waker) -> Result<Pi, String> {
     );
     let _ = pi.send(json!({"type":"get_available_models"}));
     let _ = pi.send(json!({"type":"get_commands"}));
-    Ok(pi)
+    pi
 }
 
 fn commands() -> Vec<Value> {
