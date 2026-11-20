@@ -7046,6 +7046,14 @@ fn tab_frame(tab: El, active: bool, p: Palette) -> El {
     tab.fill(p.card).radius(8.0).border(1.0, p.line)
 }
 
+/// A menu item that cannot run: the title and icon sit dimmed and presses do nothing, as
+/// KSG's disabled dropdown items.
+fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
+    menu_item_in(key, title, glyph, p, p.faint, p.faint)
+        .cursor(rune::Cursor::Default)
+        .disabled(true)
+}
+
 /// The new-tab plus: a framed 24 px square.
 fn new_tab_button(p: Palette) -> El {
     framed(
@@ -7093,11 +7101,10 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
             .unwrap_or("No workspace");
         let mut tab = tab_frame(
             row()
-                .key(if active {
-                    "active-tab".into()
-                } else {
-                    format!("tab-{id}")
-                })
+                // The pressable keeps `tab-{id}` whether focused or not: Rune
+                // pairs a double click by element path, so a key that changed
+                // on focus would swallow the second click before `keep_tab`.
+                .key(format!("tab-{id}"))
                 .role("tab")
                 .cursor(rune::Cursor::Pointer)
                 .label(format!("{project} / {}", thread.title))
@@ -7135,6 +7142,22 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
             // A tab at its minimum gives the width to the title.
             el()
         })
+        .child(
+            // The active marker covers the tab exactly (`absolute` measures
+            // from the same corner the border box does): tests and
+            // `scroll_into_view` find `active-tab` here while the pressable
+            // above keeps a stable `tab-{id}` key so the second click of a
+            // double-click still pairs with the first.
+            el().key(if active {
+                "active-tab".into()
+            } else {
+                format!("tab-marker-{id}")
+            })
+            .a11y_hidden()
+            .absolute(0.0, 0.0)
+            .w(tab_width)
+            .h(TAB_HEIGHT),
+        )
         .child(
             label(
                 &thread.title,
@@ -19474,8 +19497,25 @@ pub(crate) mod tests {
                     before,
                     "{width}: selecting {server} moved captains"
                 );
-                assert!(rt.find("tab-1").is_none());
-                assert!(rt.find("tab-3").is_none());
+                // Only the selected machine's strip shows: the active tab
+                // keeps its `tab-{id}` key, and no other machine's tabs leak.
+                let others = ["example-studio", "example-laptop", "local"]
+                    .into_iter()
+                    .filter(|other| *other != server)
+                    .map(|other| match other {
+                        "example-studio" => 3,
+                        "example-laptop" => 2,
+                        _ => 1,
+                    });
+                for other in others {
+                    assert!(rt.find(&format!("tab-{other}")).is_none());
+                }
+                let (tab, _) = rt.presented(&format!("tab-{id}")).unwrap();
+                let (marker, _) = rt.presented("active-tab").unwrap();
+                assert_eq!(
+                    marker, tab,
+                    "{width}: {server}'s marker covers its active tab"
+                );
                 assert!(rt.find("sidebar-machine-label").is_none());
             }
         }
@@ -28919,12 +28959,10 @@ pub(crate) mod tests {
         }
     }
 
-    fn tab_key(rt: &Runtime<State>, id: usize) -> String {
-        if rt.state.current().id == id {
-            "active-tab".to_string()
-        } else {
-            format!("tab-{id}")
-        }
+    /// The pressable's key is stable whether the tab is active or not, so a
+    /// double click always lands on the same element path.
+    fn tab_key(_rt: &Runtime<State>, id: usize) -> String {
+        format!("tab-{id}")
     }
 
     #[test]
@@ -29045,13 +29083,59 @@ pub(crate) mod tests {
             rt.set_viewport((width, 800.0), 1.0);
             settle_frames(&mut rt);
             let (strip, _) = rt.presented("thread-tabs").unwrap();
-            let (active, _) = rt.presented("active-tab").unwrap();
-            assert_eq!(rt.presented("active-tab").unwrap().0[2], TAB_MIN_WIDTH);
+            let (active, _) = rt.presented(&tab_key(&rt, middle)).unwrap();
+            assert_eq!(active[2], TAB_MIN_WIDTH);
             assert!(
                 active[0] >= strip[0] - 0.5 && active[0] + active[2] <= strip[0] + strip[2] + 0.5,
                 "{width}: the active tab {active:?} is out of view in {strip:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_double_click_on_an_inactive_ghost_tab_keeps_it() {
+        let mut rt = runtime(1280.0);
+        open_distinct_threads(&mut rt, 2);
+        // An untabbed thread, as a sidebar click would preview.
+        let mut thread = crate::model::Thread::new(rt.state.next_id);
+        thread.title = "Preview thread".into();
+        thread.life.latest_user_message_at = Some(lifecycle::now());
+        rt.state.threads.push(thread);
+        let ghost = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| !rt.state.tabs.contains(&t.id))
+            .unwrap();
+        rt.state.show_thread(ghost);
+        // Focus a kept tab so the ghost sits inactive in the strip.
+        let kept = rt
+            .state
+            .tabs
+            .iter()
+            .copied()
+            .find(|id| Some(*id) != rt.state.ghost_tab);
+        let kept = kept.unwrap();
+        let index = rt.state.threads.iter().position(|t| t.id == kept).unwrap();
+        rt.state.open_kept_tab(index);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.1);
+        let id = rt.state.ghost_tab.expect("a ghost tab");
+        let (x, y) = rt
+            .find(&format!("tab-{id}"))
+            .expect("the ghost tab keeps its stable key");
+        // Both presses land while the path holds `tab-{id}`: the first click
+        // activates the tab, the second pairs with it into `keep_tab`.
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.1);
+        assert_eq!(rt.state.current().id, id);
+        assert_eq!(rt.state.ghost_tab, None);
+        assert!(rt.state.tabs.contains(&id));
     }
 
     #[test]

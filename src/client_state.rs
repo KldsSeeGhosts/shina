@@ -2871,6 +2871,14 @@ impl State {
             {
                 self.active = index;
             }
+            if restore_navigation && local["tabs"].is_array() && local.get("ghostTab").is_none() {
+                // A saved session from before ghost tabs has no "ghostTab":
+                // run the index's migration on this device's tab strip, as
+                // `restore_global` does. The active tab, working tabs and
+                // drafts stay; quiet tabs drop.
+                let active_id = local["active"].as_u64().map(|id| id as usize);
+                self.migrate_tabs_to_ghost(active_id);
+            }
         }
         if self.threads.is_empty() {
             self.new_client_draft(None);
@@ -3309,28 +3317,46 @@ impl State {
             self.new_client_draft(None);
         } else {
             self.tabs = restored_tabs;
-            self.ghost_tab = self.machines.ui[server]["ghostTab"]
-                .as_u64()
-                .map(|id| id as usize)
-                .filter(|id| self.tabs.contains(id));
-            self.ghost_anchor = self.machines.ui[server]["ghostAnchor"]
-                .as_u64()
-                .map(|id| id as usize)
-                .filter(|id| self.tabs.contains(id));
-            if self.ghost_tab.is_none() {
-                self.ghost_anchor = None;
+            let needs_ghost_migration = self.machines.ui[server].get("ghostTab").is_none();
+            if needs_ghost_migration {
+                // A machine UI saved before ghost tabs needs the same
+                // one-time migration the index runs: quiet tabs drop so the
+                // next save does not write "ghostTab": null over a stale set.
+                let active_id = self.machines.ui[server]["active"]
+                    .as_u64()
+                    .map(|id| id as usize);
+                self.migrate_tabs_to_ghost(active_id);
+            } else {
+                self.ghost_tab = self.machines.ui[server]["ghostTab"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                self.ghost_anchor = self.machines.ui[server]["ghostAnchor"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id));
+                if self.ghost_tab.is_none() {
+                    self.ghost_anchor = None;
+                }
             }
-            let active = self.machines.ui[server]["active"]
-                .as_u64()
-                .map(|id| id as usize)
-                .filter(|id| self.tabs.contains(id))
-                .unwrap_or(self.tabs[0]);
-            self.active = self
-                .threads
-                .iter()
-                .position(|t| t.id == active)
-                .expect("restored active tab");
-            self.capture_opened_draft();
+            if self.tabs.is_empty() {
+                // The migration can drop every quiet tab when the saved
+                // active id no longer names a live thread.
+                self.tabs.clear();
+                self.new_client_draft(None);
+            } else {
+                let active = self.machines.ui[server]["active"]
+                    .as_u64()
+                    .map(|id| id as usize)
+                    .filter(|id| self.tabs.contains(id))
+                    .unwrap_or(self.tabs[0]);
+                self.active = self
+                    .threads
+                    .iter()
+                    .position(|t| t.id == active)
+                    .expect("restored active tab");
+                self.capture_opened_draft();
+            }
         }
         (
             self.dark,
@@ -4325,6 +4351,13 @@ impl State {
     }
     /// Opens a thread on any linked machine, as one click in the unified sidebar.
     pub fn open_machine_thread(&mut self, server: &str, id: usize) {
+        self.open_machine_thread_inner(server, id, false);
+    }
+    /// A middle click on a remote sidebar row: the tab is kept, never a ghost.
+    pub fn open_machine_thread_kept(&mut self, server: &str, id: usize) {
+        self.open_machine_thread_inner(server, id, true);
+    }
+    fn open_machine_thread_inner(&mut self, server: &str, id: usize, kept: bool) {
         let exists = if server == self.machines.selected {
             self.threads.iter().any(|thread| thread.id == id)
         } else {
@@ -4347,8 +4380,31 @@ impl State {
         if self.machines.selected == server
             && let Some(index) = self.threads.iter().position(|thread| thread.id == id)
         {
-            self.show_thread(index);
+            if kept {
+                self.open_kept_tab(index);
+            } else {
+                self.show_thread(index);
+            }
         }
+    }
+    /// The one-time ghost-tab migration `restore_global` runs on an index
+    /// without "ghostTab", for a client machine's saved UI: keep the active
+    /// tab, tabs still working or holding queued input, and drafts that
+    /// carry unsent text.
+    fn migrate_tabs_to_ghost(&mut self, active_id: Option<usize>) {
+        self.tabs.retain(|id| {
+            Some(*id) == active_id
+                || self.threads.iter().any(|t| {
+                    t.id == *id
+                        && (t.status.busy()
+                            || t.has_draft_content()
+                            || !t.native.queue.is_empty()
+                            || t.has_pending_sends()
+                            || t.has_recoverable_native_inputs())
+                })
+        });
+        self.ghost_tab = None;
+        self.ghost_anchor = None;
     }
     pub(super) fn tick_mobile_pairing(&mut self, now: u64, tx: &mut Tx) -> bool {
         if !self.machines.dialog && !self.settings_menu {
@@ -5952,6 +6008,9 @@ mod tests {
         let mut ui = state.ui_snapshot();
         ui["active"] = json!(blank);
         ui["tabs"] = json!([2, blank, 1]);
+        // `ghostTab` present (even null) skips the one-time tab pruning, so
+        // this checks the plain session restore rather than the migration.
+        ui["ghostTab"] = Value::Null;
         state.client_views = json!({"localUi":ui});
         state.tab_epoch = 0;
         state.apply_projection(server.projection()).unwrap();
@@ -7237,6 +7296,57 @@ mod tests {
             "deleted saved tabs need a draft too"
         );
         assert_eq!(state.tabs, [state.current().id]);
+    }
+
+    #[test]
+    fn a_first_projection_without_ghost_tabs_prunes_quiet_tabs() {
+        let (mut state, server, _) = tab_client();
+        // A saved session from before ghost tabs has no "ghostTab": the same
+        // migration the index runs keeps only the active tab and tabs still
+        // working, so the next save writes ghost state instead of reviving
+        // every quiet tab.
+        let mut ui = state.ui_snapshot();
+        ui["active"] = json!(2);
+        ui["tabs"] = json!([1, 2, 3]);
+        ui.as_object_mut().unwrap().remove("ghostTab");
+        ui.as_object_mut().unwrap().remove("ghostAnchor");
+        state.client_views = json!({"localUi":ui});
+        state.tab_epoch = 0;
+        state.apply_projection(server.projection()).unwrap();
+        assert_eq!(state.tabs, [2]);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.ghost_tab, None);
+    }
+
+    #[test]
+    fn switching_to_a_machine_without_ghost_tabs_prunes_quiet_tabs() {
+        let (mut state, _, _, _) = paired_client_fixture();
+        // Give the remote machine a three-thread projection and a saved UI
+        // that predates ghost tabs: quiet tabs drop on switch instead of
+        // being restored whole.
+        let mut remote_server = State::new(PathBuf::new(), false);
+        remote_server.threads = (1..=3)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Remote {id}");
+                thread.renamed = true;
+                thread
+            })
+            .collect();
+        remote_server.next_id = 4;
+        state
+            .machines
+            .views
+            .insert("studio".into(), remote_server.projection().into());
+        let saved = &mut state.machines.ui["studio"];
+        saved["active"] = json!(2);
+        saved["tabs"] = json!([1, 2, 3]);
+        saved.as_object_mut().unwrap().remove("ghostTab");
+        saved.as_object_mut().unwrap().remove("ghostAnchor");
+        state.select_machine("studio");
+        assert_eq!(state.tabs, [2]);
+        assert_eq!(state.current().id, 2);
+        assert_eq!(state.ghost_tab, None);
     }
 
     #[test]
