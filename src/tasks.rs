@@ -1045,6 +1045,7 @@ impl State {
             for event in &mut self.captain_inbox {
                 if event.captain == captain
                     && event.state == captain_inbox::InboxState::Held
+                    && event.kind != captain_inbox::InboxKind::CrewOutcome
                     && event.dispatched_at.is_none()
                 {
                     event.state = captain_inbox::InboxState::Pending;

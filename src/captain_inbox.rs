@@ -22,6 +22,10 @@ const SUMMARY_MAX_CHARS: usize = 2000;
 const REASON_MAX_CHARS: usize = 400;
 const DETAIL_MAX_BYTES: usize = 8 * 1024;
 const MESSAGE_DETAIL_MAX_CHARS: usize = 4000;
+/// `user_message` release records list every event the turn released. The
+/// list stays well under the restore-time `detail` bound so a release of
+/// hundreds of ids can never make a snapshot fail validation.
+const RELEASED_DETAIL_MAX_BYTES: usize = 4 * 1024;
 
 /// What sort of logical event the inbox records. `crew_outcome` mirrors a
 /// durable `CrewReport`, `timer` mirrors a routine slot dispatch, `watch` and
@@ -66,7 +70,7 @@ pub enum InboxState {
 }
 
 impl InboxState {
-    fn terminal(self) -> bool {
+    pub(crate) fn terminal(self) -> bool {
         matches!(
             self,
             Self::Accepted | Self::Superseded | Self::Expired | Self::Cancelled
@@ -392,7 +396,10 @@ impl State {
         let Some(event) = self.captain_inbox.iter_mut().find(|event| {
             event.id == delivery
                 && event.captain == captain
-                && matches!(event.kind, InboxKind::Watch | InboxKind::External)
+                && matches!(
+                    event.kind,
+                    InboxKind::Watch | InboxKind::External | InboxKind::CrewOutcome
+                )
                 && event.dispatched_at.is_none()
         }) else {
             return false;
@@ -535,9 +542,10 @@ impl State {
         // Crew-outcome events and their reports reconcile both ways on
         // restore. A report saved as delivered settles its open event; a
         // report captured before the inbox existed gets its mirror now; and
-        // the surviving event's state writes the report's `hold_delivery`
-        // mirror so a held record never reads as releasable before the first
-        // poll. The report keeps its own frozen policy and delivered flag.
+        // the surviving event's state writes both serde mirrors so a held
+        // record never reads as releasable and a terminal record never reads
+        // as deliverable before the first poll. The report keeps its own
+        // frozen policy.
         for index in 0..self.captain_reports.len() {
             let report = &self.captain_reports[index];
             let position = self
@@ -563,7 +571,9 @@ impl State {
                 })
                 .map(|e| e.state);
             if let Some(state) = state {
-                self.captain_reports[index].hold_delivery = state == InboxState::Held;
+                let report = &mut self.captain_reports[index];
+                report.delivered = report.delivered || state == InboxState::Accepted;
+                report.hold_delivery = !report.delivered && state == InboxState::Held;
             }
         }
         for event in &self.captain_inbox {
@@ -653,46 +663,63 @@ impl State {
     /// moves again; report delivery only advances `pending`/`held` records.
     fn sync_inbox_events(&mut self, now: u64) -> bool {
         let mut changed = false;
+        // Ensure every durable report has its canonical event first; the
+        // transition writes the `delivered`/`hold_delivery` mirrors for both
+        // the mirror-event creation and acceptance paths below.
         for index in 0..self.captain_reports.len() {
             let report = &self.captain_reports[index];
             if !self.captain_inbox.iter().any(|e| e.id == report.id) {
                 self.captain_inbox.push(report_event(report));
                 changed = true;
             }
-            let position = self
+        }
+        let report_ids: Vec<String> = self
+            .captain_reports
+            .iter()
+            .map(|report| report.id.clone())
+            .collect();
+        for id in report_ids {
+            let (captain, terminal) = match self
                 .captain_inbox
                 .iter()
-                .position(|e| e.id == report.id && e.kind == InboxKind::CrewOutcome)
-                .expect("crew report event");
-            let report = &self.captain_reports[index];
-            let event = &mut self.captain_inbox[position];
-            if !event.state.terminal() {
-                // Acceptance evidence settles an open event the same way the
-                // report reconciler worked: a delivery id in any of the
-                // Captain's homes' accepted history acknowledges it.
-                let accepted = self
-                    .threads
-                    .iter()
-                    .filter(|thread| thread.captain_home && thread.captain == Some(report.captain))
-                    .any(|thread| {
-                        thread
-                            .accepted_deliveries
-                            .iter()
-                            .any(|seen| *seen == event.id)
-                    });
-                if accepted {
-                    event.state = InboxState::Accepted;
-                    event.updated_at = now;
-                    changed = true;
-                }
+                .find(|e| e.id == id && e.kind == InboxKind::CrewOutcome)
+            {
+                Some(event) => (event.captain, event.state.terminal()),
+                None => continue,
+            };
+            if terminal {
+                continue;
             }
-            // Mirror the canonical event state onto the report's serde fields.
-            // Delivery only ever settles: a cancelled or superseded event on a
-            // deleted Captain never flips a delivered record back, and `held`
-            // simply follows the event's Held state for an undelivered one.
-            let delivered = report.delivered || event.state == InboxState::Accepted;
-            let held = !delivered && event.state == InboxState::Held;
+            // Acceptance evidence settles an open event the same way the
+            // report reconciler worked: a delivery id in any of the
+            // Captain's homes' accepted history acknowledges it.
+            let accepted = self
+                .threads
+                .iter()
+                .filter(|thread| thread.captain_home && thread.captain == Some(captain))
+                .any(|thread| thread.accepted_deliveries.iter().any(|seen| *seen == id));
+            if accepted {
+                changed |= self.transition_report_event(&id, InboxState::Accepted);
+            }
+        }
+        // Mirror the canonical event state onto every report's serde fields,
+        // so a flag that drifted or was restored out of band is repaired on
+        // the next poll: delivery only ever settles, and `held` follows the
+        // event's Held state for an undelivered report.
+        for index in 0..self.captain_reports.len() {
+            let Some(state) = self
+                .captain_inbox
+                .iter()
+                .find(|e| {
+                    e.id == self.captain_reports[index].id && e.kind == InboxKind::CrewOutcome
+                })
+                .map(|e| e.state)
+            else {
+                continue;
+            };
             let report = &mut self.captain_reports[index];
+            let delivered = report.delivered || state == InboxState::Accepted;
+            let held = !delivered && state == InboxState::Held;
             if report.delivered != delivered || report.hold_delivery != held {
                 report.delivered = delivered;
                 report.hold_delivery = held;
@@ -1083,6 +1110,7 @@ impl State {
                     && self.captain_home(event.captain) == Some(parent_thread_id)
                     && event.policy != ReportPolicy::Context
                     && event.state == InboxState::Held
+                    && event.dispatched_at.is_none()
             })
             .map(|event| event.id.clone())
             .collect();
@@ -1103,6 +1131,7 @@ impl State {
         for (index, event) in self.captain_inbox.iter_mut().enumerate() {
             if homes[index] == Some(parent_thread_id)
                 && event.state == InboxState::Held
+                && event.kind != InboxKind::CrewOutcome
                 && event.policy != ReportPolicy::Context
                 && event.dispatched_at.is_none()
             {
@@ -1382,6 +1411,8 @@ impl State {
     /// Records the explicit user turn or resume action that released a
     /// Captain's held work. The released event ids are listed for audit; the
     /// record itself is already at its destination, so it is born accepted.
+    /// The id list is bounded well under `DETAIL_MAX_BYTES` so releasing
+    /// hundreds of held events never produces a record restore rejects.
     pub(crate) fn record_release_turn(
         &mut self,
         captain: usize,
@@ -1391,6 +1422,17 @@ impl State {
         if self.captain_home(captain) != Some(home) || released.is_empty() {
             return;
         }
+        let mut listed: Vec<String> = Vec::new();
+        let mut bytes = "{\"released\":[]}".len();
+        for id in &released {
+            let entry = serde_json::to_string(id).unwrap_or_default().len() + 1;
+            if bytes + entry > RELEASED_DETAIL_MAX_BYTES {
+                break;
+            }
+            bytes += entry;
+            listed.push(id.clone());
+        }
+        let omitted = released.len() - listed.len();
         let now = lifecycle::now();
         self.captain_inbox.push(InboxEvent {
             id: format!("user-{}", uuid::Uuid::new_v4()),
@@ -1407,7 +1449,7 @@ impl State {
             updated_at: now,
             dispatched_at: None,
             expires_at: None,
-            detail: json!({"released":released}),
+            detail: json!({"released":listed,"omitted":omitted}),
         });
     }
 
@@ -2321,5 +2363,135 @@ mod tests {
                 .is_err()
         );
         assert!(state.captain_inbox_value(9, &json!({})).is_err());
+    }
+
+    #[test]
+    fn restore_mirrors_accepted_and_terminal_events_onto_report_flags() {
+        let (mut state, _database) = fixture();
+        let worker = crew_thread(&mut state);
+        complete_turn(&mut state, worker, "run-1");
+        let report_id = state.captain_reports[0].id.clone();
+        // Drift the flags out of band: an undelivered, held record whose
+        // event is already Accepted must restore as delivered and unheld.
+        state
+            .captain_inbox
+            .iter_mut()
+            .find(|e| e.id == report_id && e.kind == InboxKind::CrewOutcome)
+            .unwrap()
+            .state = InboxState::Accepted;
+        state.captain_reports[0].delivered = false;
+        state.captain_reports[0].hold_delivery = true;
+        let mut restored = restart(&state);
+        assert!(restored.captain_reports[0].delivered);
+        assert!(!restored.captain_reports[0].hold_delivery);
+        // A cancelled event on an undelivered report stays cancelled after
+        // restore and releases its hold flag so the sender can never queue it.
+        let worker_b = crew_thread(&mut restored);
+        complete_turn(&mut restored, worker_b, "run-2");
+        let report_b = restored.captain_reports[1].id.clone();
+        restored
+            .captain_inbox
+            .iter_mut()
+            .find(|e| e.id == report_b)
+            .unwrap()
+            .state = InboxState::Cancelled;
+        restored.captain_reports[1].hold_delivery = true;
+        let mut again = restart(&restored);
+        assert_eq!(event(&again, &report_b).state, InboxState::Cancelled);
+        assert!(!again.captain_reports[1].delivered);
+        assert!(!again.captain_reports[1].hold_delivery);
+        // A release turn cannot re-arm a terminal event's report.
+        let home = again.captain_home(0).unwrap();
+        again.release_task_results(home, ReleaseActor::User);
+        assert_eq!(event(&again, &report_b).state, InboxState::Cancelled);
+        again.poll_tasks(Instant::now());
+        let home = home_index(&again);
+        assert_eq!(injections(&again, home, &report_b), 0);
+    }
+
+    #[test]
+    fn sender_never_queues_a_terminal_report_event() {
+        let (mut state, _database) = fixture();
+        let worker = crew_thread(&mut state);
+        complete_turn(&mut state, worker, "run-1");
+        let report_id = state.captain_reports[0].id.clone();
+        // Cancel the event, then drift the report flags to look deliverable.
+        state
+            .captain_inbox
+            .iter_mut()
+            .find(|e| e.id == report_id)
+            .unwrap()
+            .state = InboxState::Cancelled;
+        state.captain_reports[0].hold_delivery = false;
+        state.poll_tasks(Instant::now());
+        let home = home_index(&state);
+        assert_eq!(injections(&state, home, &report_id), 0);
+        assert_eq!(event(&state, &report_id).state, InboxState::Cancelled);
+    }
+
+    #[test]
+    fn dispatched_crew_outcome_survives_a_crash_without_resend() {
+        let (mut state, _database) = fixture();
+        let worker = crew_thread(&mut state);
+        complete_turn(&mut state, worker, "run-1");
+        let report_id = state.captain_reports[0].id.clone();
+        state.poll_captain_inbox();
+        let home = home_index(&state);
+        assert_eq!(injections(&state, home, &report_id), 1);
+        // Provider accepted the input but the process died before acceptance
+        // evidence landed: the dispatch record must survive the restart.
+        let (connection, _input, _events) = Pi::test_connection();
+        state.threads[home].pi = Some(connection);
+        state.threads[home].model_provider = "cpa".into();
+        assert!(state.threads[home].flush_injection());
+        assert!(state.reconcile_task_operations());
+        assert_eq!(event(&state, &report_id).dispatched_at.is_some(), true);
+        let mut restored = restart(&state);
+        restored.poll_tasks(Instant::now());
+        let home = home_index(&restored);
+        assert_eq!(event(&restored, &report_id).state, InboxState::Held);
+        assert_eq!(event(&restored, &report_id).dispatched_at.is_some(), true);
+        // An explicit turn releases restart holds but never resends an
+        // already-dispatched report.
+        let home_id = restored.threads[home].id;
+        restored.release_task_results(home_id, ReleaseActor::User);
+        assert_eq!(event(&restored, &report_id).state, InboxState::Held);
+        restored.poll_tasks(Instant::now());
+        assert_eq!(injections(&restored, home, &report_id), 0);
+        // When acceptance evidence later lands, the record settles accepted.
+        restored.threads[home]
+            .accepted_deliveries
+            .push(report_id.clone());
+        restored.poll_tasks(Instant::now());
+        assert_eq!(event(&restored, &report_id).state, InboxState::Accepted);
+        assert_eq!(injections(&restored, home, &report_id), 0);
+    }
+
+    #[test]
+    fn release_turn_detail_stays_under_the_restore_bound() {
+        let (mut state, _database) = fixture();
+        let home = state.captain_home(0).unwrap();
+        let released: Vec<String> = (0..400)
+            .map(|index| format!("evt-{:0>60}", index))
+            .collect();
+        state.record_release_turn(0, home, released.clone());
+        let release = state
+            .captain_inbox
+            .iter()
+            .find(|e| e.kind == InboxKind::UserMessage)
+            .expect("release turn event");
+        let bytes = release.detail.to_string().len();
+        assert!(bytes <= DETAIL_MAX_BYTES, "detail was {bytes} bytes");
+        let listed = release.detail["released"].as_array().unwrap().len();
+        assert!(listed < released.len());
+        assert_eq!(release.detail["omitted"], json!(released.len() - listed));
+        // The snapshot restores without tripping the 8 KiB detail limit.
+        let restored = restart(&state);
+        assert!(
+            restored
+                .captain_inbox
+                .iter()
+                .any(|e| e.kind == InboxKind::UserMessage)
+        );
     }
 }

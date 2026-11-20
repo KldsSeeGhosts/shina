@@ -4519,6 +4519,13 @@ fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
 fn danger_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
     menu_item_in(key, title, glyph, p, p.danger, p.danger)
 }
+/// A menu row that stays greyed out because acting on it would do nothing, like KSG's
+/// `disabled` DropdownMenuItem: faint ink, no press, not a tab stop.
+fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
+    menu_item_in(key, title, glyph, p, p.faint, p.faint)
+        .focusable(false)
+        .cursor(rune::Cursor::Default)
+}
 /// A menu item with a value at its right edge in pixel type, such as "3 days".
 fn menu_value_item(key: &str, title: &str, value: &str, glyph: &str, p: Palette) -> El {
     menu_item(key, title, glyph, p)

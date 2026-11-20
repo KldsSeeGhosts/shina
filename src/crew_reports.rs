@@ -257,6 +257,14 @@ impl State {
             {
                 continue;
             }
+            // The event ledger is authoritative: a cancelled, expired or
+            // otherwise terminal record never queues a delivery even if the
+            // report's serde mirrors drifted out of step.
+            if let Some(state) = self.report_event_state(&self.captain_reports[index].id)
+                && state != captain_inbox::InboxState::Pending
+            {
+                continue;
+            }
             let Some(home) = routes[index] else {
                 continue;
             };
@@ -323,7 +331,8 @@ impl State {
 
     /// Removes queued report injections that must not flush from each thread: a
     /// report's copy survives only on its Captain's current home while it is
-    /// undelivered and unheld. Unrelated injections are never touched.
+    /// undelivered, unheld and its event is still open. Unrelated injections
+    /// are never touched.
     pub(crate) fn scrub_crew_report_injections(&mut self) -> bool {
         let mut changed = false;
         for index in 0..self.threads.len() {
@@ -335,6 +344,9 @@ impl State {
                     report.delivered
                         || report.hold_delivery
                         || report.policy == ReportPolicy::Ignore
+                        || self.report_event_state(&report.id).is_some_and(|state| {
+                            !report.delivered && state != captain_inbox::InboxState::Pending
+                        })
                         || self.captain_home(report.captain) != Some(thread_id)
                 })
                 .map(|report| report.id.as_str())
@@ -387,7 +399,12 @@ impl State {
         let ids: Vec<String> = self
             .captain_reports
             .iter()
-            .filter(|report| report.needs_delivery())
+            .filter(|report| {
+                report.needs_delivery()
+                    && self
+                        .report_event_state(&report.id)
+                        .is_none_or(|state| !state.terminal())
+            })
             .map(|report| report.id.clone())
             .collect();
         for id in ids {
@@ -421,11 +438,10 @@ impl State {
 
     /// Releases held reports only for the Captain whose current home is
     /// `parent_thread_id`, by moving each held `crew_outcome` event back to
-    /// pending. A report captured since the last poll has no event yet, so its
-    /// mirror is held directly; the event inherits that state on its first
-    /// sync. A reset alone creates a new home without releasing holds.
-    /// Returns the released report ids so the caller's release-turn record
-    /// names them.
+    /// pending through the canonical transition, which also creates the
+    /// mirror event for a report captured since the last poll. A reset alone
+    /// creates a new home without releasing holds. Returns the released
+    /// report ids so the caller's release-turn record names them.
     pub(crate) fn release_crew_reports(&mut self, parent_thread_id: usize) -> Vec<String> {
         let mut released = Vec::new();
         let ids: Vec<String> = self
@@ -435,24 +451,15 @@ impl State {
             .map(|report| report.id.clone())
             .collect();
         for id in ids {
-            match self.report_event_state(&id) {
-                Some(captain_inbox::InboxState::Held) => {
-                    if self.transition_report_event(&id, captain_inbox::InboxState::Pending) {
-                        released.push(id);
-                    }
-                }
-                None => {
-                    if let Some(report) = self
-                        .captain_reports
-                        .iter_mut()
-                        .find(|report| report.id == id)
-                        && report.hold_delivery
-                    {
-                        report.hold_delivery = false;
-                        released.push(id);
-                    }
-                }
-                _ => {}
+            if self.report_event_state(&id) == Some(captain_inbox::InboxState::Held)
+                && self
+                    .captain_inbox
+                    .iter()
+                    .find(|e| e.id == id)
+                    .is_some_and(|event| event.dispatched_at.is_none())
+                && self.transition_report_event(&id, captain_inbox::InboxState::Pending)
+            {
+                released.push(id);
             }
         }
         self.release_crew_answers(parent_thread_id);

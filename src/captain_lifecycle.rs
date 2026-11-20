@@ -248,16 +248,10 @@ impl State {
                 .map(|report| report.id.clone())
                 .collect();
             for id in report_holds {
-                match self.report_event_state(&id) {
-                    None => {
-                        if let Some(report) = self.captain_reports.iter_mut().find(|r| r.id == id) {
-                            report.hold_delivery = true;
-                        }
-                    }
-                    _ => {
-                        self.transition_report_event(&id, captain_inbox::InboxState::Held);
-                    }
-                }
+                // The canonical transition creates the mirror event for a
+                // report captured since the last poll, so a terminal event
+                // can never be re-held by mutating the flag out of band.
+                self.transition_report_event(&id, captain_inbox::InboxState::Held);
             }
             for answer in &mut self.captain_question_answers {
                 if group.contains(&answer.thread_id) && !answer.delivered {
