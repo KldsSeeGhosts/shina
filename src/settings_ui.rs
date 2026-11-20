@@ -3375,7 +3375,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
             app_cell = app_cell.child(
                 label(
                     format!("{} to {}", machine.current, machine.target),
-                    TextStyle::new(11.0, 400.0),
+                    TextStyle::new(12.0, 400.0),
                     p.muted,
                 )
                 .wrap_anywhere(),

@@ -1145,13 +1145,64 @@ fn roster_row(s: &State, p: Palette, member: &RosterMember, key: String, menu: b
 pub(super) fn crew_tray_shows(s: &State) -> bool {
     s.is_captain_home(s.current()) && s.current().captain.is_some()
 }
+
+/// Extra height (beyond the 28 px header) for the roster's footer + internal gaps.
+pub(super) fn crew_tray_footer_extra_height(s: &State) -> f32 {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return 0.0;
+    }
+    let Some(captain) = t.captain else {
+        return 0.0;
+    };
+    let has_footer = s.captain_access(captain) == crate::model::CaptainAccess::Full;
+    let members = roster_members(s, t.id, captain).len();
+    let mut extra = 0.0;
+    if members > 0 {
+        extra += 4.0;
+    }
+    if has_footer {
+        extra += 34.0;
+    }
+    extra
+}
+
+/// Preferred extra height (beyond the 28 px header) when this captain's crew roster is open.
+pub(super) fn crew_tray_open_extra_height(s: &State) -> Option<f32> {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return None;
+    }
+    let captain = t.captain?;
+    let members = roster_members(s, t.id, captain).len();
+    let rows_h = if members == 0 {
+        0.0
+    } else {
+        ((members as f32) * 32.0 - 2.0).min(150.0)
+    };
+    Some(rows_h + crew_tray_footer_extra_height(s))
+}
+
+/// Minimum extra height required to render an open roster meaningfully (at least one row if
+/// members exist, plus the footer if Full access).
+pub(super) fn crew_tray_min_open_extra_height(s: &State) -> Option<f32> {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return None;
+    }
+    let captain = t.captain?;
+    let members = roster_members(s, t.id, captain).len();
+    let min_rows = if members == 0 { 0.0 } else { 30.0 };
+    Some(min_rows + crew_tray_footer_extra_height(s))
+}
+
 /// The Crew Roster above a captain's composer, in the place KSG Code's `QueuedRunsControl`
 /// takes: a 28 px header with a chevron, the member count, the status summary and the Plan
 /// toggle, then — while expanded — one 30 px row per member, capped at five rows, and a
-/// footer with New crew thread and Recruit on a Full-access captain. `fit` collapses the
-/// member rows when the composer's 40% stack cap has no room for them; the header's count
-/// still reads.
-pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, fit: bool) -> Option<El> {
+/// footer with New crew thread and Recruit on a Full-access captain. `rows_max` caps the
+/// member rows scroll area (or collapses the roster when `None`) under the composer's 40%
+/// viewport cap.
+pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, rows_max: Option<f32>) -> Option<El> {
     let t = s.current();
     if !s.is_captain_home(t) {
         return None;
@@ -1159,7 +1210,8 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, fit: bool) -> Option<
     let captain = t.captain?;
     let members = roster_members(s, t.id, captain);
     let plan = super::plan_ui::plan_toggle(s, p);
-    let open = s.crew_roster_open(captain) && fit;
+    let can_open = rows_max.is_some();
+    let open = s.crew_roster_open(captain) && can_open;
     // One definition of working, shared with the chat header: running now. A worker waiting
     // on an approval needs you instead, and a queued one waits for a slot. Independent crew
     // members count the same way; only an idle member is no task at all.
@@ -1208,13 +1260,23 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, fit: bool) -> Option<
                     row()
                         .key("crew-roster-toggle")
                         .role("button")
-                        .cursor(rune::Cursor::Pointer)
+                        .cursor(if can_open {
+                            rune::Cursor::Pointer
+                        } else {
+                            rune::Cursor::Default
+                        })
                         .label(if open {
                             format!("Crew, {} members. Collapse", members.len())
+                        } else if !can_open {
+                            format!(
+                                "Crew, {} members. Window too short to expand",
+                                members.len()
+                            )
                         } else {
                             format!("Crew, {} members. Expand", members.len())
                         })
-                        .focusable(true)
+                        .disabled(!can_open)
+                        .focusable(can_open)
                         .h_full()
                         .grow(1.0)
                         .min_w(0.0)
@@ -1223,7 +1285,11 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, fit: bool) -> Option<
                         .radius(ROW_RADIUS)
                         .hover(hover_wash(s, p))
                         .hover_motion(motion(), motion())
-                        .on_press(move |s: &mut State| s.toggle_crew_roster(captain))
+                        .on_press(move |s: &mut State| {
+                            if can_open {
+                                s.toggle_crew_roster(captain);
+                            }
+                        })
                         .child(icon(if open { "chevron" } else { "open" }, p.muted))
                         .child(meta_label("Crew", p.muted))
                         .child(
@@ -1235,25 +1301,27 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, fit: bool) -> Option<
                 .child(plan.unwrap_or_else(el)),
         );
     if open {
-        let mut rows = col().gap(2.0);
-        for member in &members {
-            rows = rows.child(roster_row(
-                s,
-                p,
-                member,
-                format!("crew-chip-{}", member.thread_id),
-                true,
-            ));
+        if !members.is_empty() {
+            let mut rows = col().gap(2.0);
+            for member in &members {
+                rows = rows.child(roster_row(
+                    s,
+                    p,
+                    member,
+                    format!("crew-chip-{}", member.thread_id),
+                    true,
+                ));
+            }
+            roster = roster.child(
+                col()
+                    .key("crew-roster-rows")
+                    .max_h(rows_max.unwrap_or(150.0))
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .child(rows),
+            );
         }
-        roster = roster.child(
-            col()
-                .key("crew-roster-rows")
-                .max_h(150.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .child(rows),
-        );
         if s.captain_access(captain) == crate::model::CaptainAccess::Full {
             let server = s.machines.selected.clone();
             let draft_reason = s.crew_creation_unavailable(&server, captain);
@@ -1499,9 +1567,8 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
             .label("Needs you")
             // An open task plan shares the lane, so the stack gives it most of its height.
             .max_h(if s.plan_panel_open() { 120.0 } else { 320.0 })
-            // The composer's 40% cap shrinks the cards' scrolling region before the crew
-            // roster's; a card's header stays reachable at the floor.
-            .min_h(40.0)
+            // Keep approval actions reachable without hiding buttons under the roster.
+            .min_h(120.0)
             .shrink()
             .scroll(ScrollSpec {
                 stick_bottom: false,

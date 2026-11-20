@@ -685,10 +685,13 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
         p,
         |s: &mut State| s.toggle_plan_panel(),
     ));
+    let editor_open = s.plan_panel.editor.is_some();
+    let min_body = if editor_open { 144.0 } else { 60.0 };
     let mut panel = col()
         .key("plan-panel")
         .role("region")
         .label("Task plan")
+        .shrink()
         .gap(6.0)
         .padding(6.0)
         .radius(12.0)
@@ -764,15 +767,24 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
     } else {
         LIST_MAX
     };
-    panel = panel.child(
-        col()
-            .key("plan-list")
-            .max_h(body_max)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(body),
-    );
+    // Let the scrolling body shrink inside a short viewport while keeping the panel's
+    // header and footer intact.
+    let mut list_box = col()
+        .key("plan-list")
+        .shrink()
+        .max_h(body_max.max(min_body))
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(body);
+    if editor_open {
+        list_box = list_box.min_h(min_body);
+    } else if !nodes.is_empty() {
+        // Leave enough height for rows (and their edit actions) when the panel shares space
+        // with Needs you, while still shrinking below body_max on very short viewports.
+        list_box = list_box.min_h(60.0);
+    }
+    panel = panel.child(list_box);
     let conflict = s
         .plan_panel
         .editor

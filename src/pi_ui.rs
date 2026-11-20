@@ -94,7 +94,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                         .child(
                             if !option.description.is_empty() && option.description != option.label
                             {
-                                label(&option.description, TextStyle::new(11.0, 400.0), p.muted)
+                                label(&option.description, TextStyle::new(12.0, 400.0), p.muted)
                                     .wrap_anywhere()
                             } else {
                                 el()

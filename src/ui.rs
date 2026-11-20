@@ -3676,7 +3676,8 @@ fn model_list(
 }
 
 /// A harness's display name: "Pi", "Codex", "Claude" for the built-ins, the registry's
-/// configured name for ACP agents, or a generic "agent" when the id is unknown.
+/// configured name for ACP agents (allowing overrides of "antigravity"), built-in
+/// "Antigravity" when unregistered, or a generic "agent" when the id is unknown.
 fn harness_name<'a>(s: &'a State, id: &'a str) -> &'a str {
     match id {
         "pi" => "Pi",
@@ -3687,7 +3688,11 @@ fn harness_name<'a>(s: &'a State, id: &'a str) -> &'a str {
             .agents
             .iter()
             .find(|agent| agent.id == id)
-            .map_or("agent", |agent| agent.name.as_str()),
+            .map(|agent| agent.name.as_str())
+            .unwrap_or(match id {
+                "antigravity" => "Antigravity",
+                _ => "agent",
+            }),
     }
 }
 /// A harness row's mark, as KSG Code's `ProviderInstanceIcon` draws an ACP agent: the vendor's
@@ -6137,8 +6142,9 @@ fn project_tile(
         .find(|c| c.is_alphanumeric())
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_default();
+    // Keep initial-on-tile contrast >= 4.5:1 on both dark card (#1e1f23) and light card (#ffffff).
     tile.center()
-        .fill(hue.alpha(if s.dark { 0.45 } else { 0.35 }))
+        .fill(hue.alpha(if s.dark { 0.30 } else { 0.28 }))
         .child(label(initial, META, p.ink))
 }
 
@@ -7027,8 +7033,9 @@ const TAB_MAX_WIDTH: f32 = 260.0;
 /// Inter 13/500, the title in a tab.
 const TAB_TITLE: TextStyle = TextStyle::new(13.0, 500.0);
 /// The 16 px leading icon in a tab, KSG `PaneTabs`' `ProjectFavicon`. Captain homes and
-/// captain workers show the captain's face instead of the project tile, matching the
-/// portrait the sidebar's captain rows lead with.
+/// captain workers show the captain's face when the profile exists locally, an explicit
+/// remote-delegation badge for peer workers (or missing captain profiles), and the project
+/// tile otherwise.
 fn tab_icon(s: &State, p: Palette, thread: &Thread) -> El {
     let captain = if s.is_captain_home(thread) {
         thread.captain
@@ -7036,7 +7043,29 @@ fn tab_icon(s: &State, p: Palette, thread: &Thread) -> El {
         thread.crew_captain
     };
     if let Some(captain) = captain {
-        return avatar(s, p, captain, 16.0, s.captain_status(captain)).a11y_hidden();
+        if s.captains.get(captain).is_some() {
+            return avatar(s, p, captain, 16.0, s.captain_status(captain)).a11y_hidden();
+        }
+        return el()
+            .key(format!("tab-icon-crew-{}", thread.id))
+            .size(16.0, 16.0)
+            .radius(4.0)
+            .border(1.0, p.frame)
+            .fill(p.selected)
+            .center()
+            .a11y_hidden()
+            .child(icon("crew", p.muted).size(12.0, 12.0));
+    }
+    if thread.peer_origin.is_some() {
+        return el()
+            .key(format!("tab-icon-peer-{}", thread.id))
+            .size(16.0, 16.0)
+            .radius(4.0)
+            .border(1.0, p.frame)
+            .fill(p.selected)
+            .center()
+            .a11y_hidden()
+            .child(icon("crew", p.muted).size(12.0, 12.0));
     }
     project_tile(s, p, s.project(thread.project), 16.0)
 }
@@ -15373,7 +15402,7 @@ fn context_popover(s: &State, p: Palette) -> El {
         card = card.child(
             label(
                 t.context_harness_text(state),
-                TextStyle::new(11.0, 500.0).lh(16.0),
+                TextStyle::new(12.0, 500.0).lh(16.0),
                 p.muted,
             )
             .key("context-details-state")
@@ -15608,44 +15637,80 @@ fn composer_decorations(
     (spans, strikes)
 }
 
-/// What the above-composer stack needs besides the crew roster's member rows: each part's
-/// floor, plus the 8 px gaps. Heights are estimates of what keeps a part usable, matching
-/// the floors the parts themselves declare (the roster's header and footer, one needs-you
-/// card's chrome, the plan panel's header, list cap and footer, one queued message, one
-/// delegation bar).
-fn above_composer_others(s: &State) -> f32 {
+/// Budget for the above-composer stack under its 40% viewport cap: how much height the
+/// non-roster parts require to remain usable, and how much room (if any) an open crew
+/// roster's member rows may take without squeezing Needs you or the Plan editor.
+struct AboveComposerBudget {
+    /// Minimum height for the stack so no visible controls become unreachable.
+    floor: f32,
+    /// Maximum height the crew roster's rows may take, or `None` to collapse to header-only.
+    roster_rows_max: Option<f32>,
+}
+
+fn above_composer_budget(s: &State, cap: f32) -> AboveComposerBudget {
     let t = s.current();
-    let mut others = 0.0;
-    if crew_ui::parent_bar_shows(s) || crew_ui::crew_bar_shows(s) {
-        others += 68.0;
+    let mut parts = 0usize;
+    let mut others_floor = 0.0f32;
+    if crew_ui::parent_bar_shows(s) {
+        parts += 1;
+        others_floor += 52.0;
     }
-    if crew_ui::needs_you_shows(s) {
-        others += 40.0;
+    if crew_ui::crew_bar_shows(s) {
+        parts += 1;
+        others_floor += 48.0;
     }
+    let has_needs_you = crew_ui::needs_you_shows(s);
+    if has_needs_you {
+        parts += 1;
+        // Keep one approval card with its action buttons visible without scrolling; share the
+        // lane more tightly when the Plan panel is also open.
+        others_floor += if s.plan_panel_open() { 120.0 } else { 140.0 };
+    }
+    let roster_open_height = crew_ui::crew_tray_open_extra_height(s);
     if crew_ui::crew_tray_shows(s) {
-        others += 58.0;
+        parts += 1;
+        others_floor += 28.0;
     }
     if s.plan_panel_open() {
-        // The panel's header and footer plus the list's cap.
-        others += 68.0 + (s.viewport_height * 0.2).clamp(120.0, 300.0);
+        parts += 1;
+        // Header (28) + footer (32) + padding/gaps (24) + scrolling body floor.
+        let min_body = if s.plan_panel.editor.is_some() {
+            144.0
+        } else {
+            120.0
+        };
+        others_floor += 84.0 + min_body;
     }
     let queued = t.native.queue.len() + t.native.steering.len() + t.native.follow_ups.len();
     if queued > 0 {
-        others += 48.0;
+        parts += 1;
+        others_floor += 48.0;
     }
-    others + 40.0
-}
-/// Whether the crew roster can stay open under the composer's 40% viewport cap. The roster
-/// is the first part to collapse: it folds when its 150 pt of rows would push the stack
-/// past the cap, and opens again when the room comes back.
-fn roster_budget(s: &State, cap: f32) -> bool {
-    above_composer_others(s) + 150.0 <= cap
-}
-/// The height `above-composer-stack` needs when every part keeps what it cannot lose. The
-/// stack caps at 40% of the viewport, but never below this floor: a plan editor's controls
-/// or the last bar must stay usable no matter how short the window is.
-fn above_composer_floor(s: &State, fit: bool) -> f32 {
-    above_composer_others(s) + if fit { 150.0 } else { 0.0 }
+    if parts > 1 {
+        others_floor += (parts - 1) as f32 * 8.0;
+    }
+    let remaining = (cap - others_floor).max(0.0);
+    let roster_body = roster_open_height.unwrap_or(0.0);
+    // Keep the roster open when it fits within the cap; when other parts leave less than
+    // the full 150 px rows cap, let the roster shrink its rows scroll box down to one row
+    // (or footer only for 0 members) before collapsing to header-only.
+    let min_open_body = crew_ui::crew_tray_min_open_extra_height(s).unwrap_or(0.0);
+    let roster_rows_max = if roster_open_height.is_some() && remaining >= min_open_body {
+        let footer_and_gaps = crew_ui::crew_tray_footer_extra_height(s);
+        Some((remaining - footer_and_gaps).clamp(0.0, 150.0))
+    } else {
+        None
+    };
+    let floor = others_floor
+        + if roster_rows_max.is_some() {
+            roster_body.min(remaining)
+        } else {
+            0.0
+        };
+    AboveComposerBudget {
+        floor,
+        roster_rows_max,
+    }
 }
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
@@ -15944,13 +16009,13 @@ fn composer(
     // viewport, and the crew roster gives room first: when an open roster would push the
     // stack past the cap it draws collapsed (its header's count still reads), as the
     // toggle's closed state does.
-    let cap = (s.viewport_height * 0.4).max(120.0);
-    let fit = roster_budget(s, cap);
-    // The stack never exceeds 40% of the viewport unless its parts' floors cannot meet that;
-    // then the cap yields to the floors rather than hiding controls.
-    let cap = cap.max(above_composer_floor(s, fit));
+    let viewport_cap = (s.viewport_height * 0.4).max(120.0);
+    let budget = above_composer_budget(s, viewport_cap);
+    // The stack caps at 40% of the viewport, yielding only to the minimum floors so controls
+    // stay reachable on short windows.
+    let cap = viewport_cap.max(budget.floor);
     let needs_you_part = crew_ui::needs_you(s, p);
-    let tray = crew_ui::crew_tray(s, p, lane, fit);
+    let tray = crew_ui::crew_tray(s, p, lane, budget.roster_rows_max);
     let mut stack = col()
         .key("above-composer-stack")
         .w_full()
@@ -17734,15 +17799,18 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
             col()
                 .gap(5.0)
                 .child(meta_label("Conversation", p.muted))
-                .child(label(
-                    if t.session.is_some() {
-                        format!("Saved locally by {}", harness_name(s, &t.harness))
-                    } else {
-                        "No saved session yet".to_string()
-                    },
-                    LABEL,
-                    p.ink,
-                )),
+                .child(
+                    label(
+                        if t.session.is_some() {
+                            format!("Saved locally by {}", harness_name(s, &t.harness))
+                        } else {
+                            "No saved session yet".to_string()
+                        },
+                        LABEL,
+                        p.ink,
+                    )
+                    .wrap(),
+                ),
         );
     if let Some(session) = &t.session {
         details = details.child(
@@ -28969,6 +29037,118 @@ pub(crate) mod tests {
             rt.frame(1.0);
             assert!(rt.presented("crew-roster-rows").is_none());
             assert!(rt.presented("crew-chip-16").is_none());
+        }
+    }
+
+    #[test]
+    fn chunk5_review_blockers_stay_fixed_at_all_widths() {
+        // 1. Harness display name includes built-in Antigravity while preserving registry overrides.
+        let mut state = State::new(".".into(), false);
+        assert_eq!(harness_name(&state, "pi"), "Pi");
+        assert_eq!(harness_name(&state, "codex"), "Codex");
+        assert_eq!(harness_name(&state, "claude"), "Claude");
+        assert_eq!(harness_name(&state, "antigravity"), "Antigravity");
+        assert_eq!(harness_name(&state, "unknown"), "agent");
+        state.harnesses.agents.push(crate::harness::Agent {
+            id: "antigravity".into(),
+            name: "Custom AGY".into(),
+            command: "agy".into(),
+            args: vec![],
+            env: vec![],
+        });
+        assert_eq!(harness_name(&state, "antigravity"), "Custom AGY");
+
+        // 2. Project tile initials meet 4.5:1 contrast on both dark and light active tabs.
+        for dark in [false, true] {
+            let p = palette(dark);
+            let alpha = if dark { 0.30 } else { 0.28 };
+            let bg_lum = p.card.luminance();
+            for hex in PROJECT_HUES {
+                let fg_lum = color(hex).luminance();
+                // Rune blends alpha in linear light; luminance is linear in linear-RGB.
+                let tile_lum = fg_lum * alpha + bg_lum * (1.0 - alpha);
+                let ink_lum = p.ink.luminance();
+                let ratio = (ink_lum.max(tile_lum) + 0.05) / (ink_lum.min(tile_lum) + 0.05);
+                assert!(
+                    ratio >= 4.5,
+                    "dark {dark}: project tile {hex} contrast is {ratio:.2}:1"
+                );
+            }
+        }
+
+        // 3. Peer-worker tabs show an explicit crew fallback instead of a project tile,
+        // and missing captain profiles fall back explicitly instead of portrait 0.
+        let mut rt = runtime(1280.0);
+        rt.state.threads[0].peer_origin = Some(
+            serde_json::from_value(json!({
+                "deviceId": uuid::Uuid::new_v4(),
+                "serverId": uuid::Uuid::new_v4(),
+                "serverLabel": "Mac Studio",
+                "parentThreadId": 7,
+                "taskId": "task-1",
+                "captain": "Sable"
+            }))
+            .unwrap(),
+        );
+        let peer_id = rt.state.threads[0].id;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented(&format!("tab-icon-peer-{peer_id}")).is_some());
+        rt.state.threads[0].peer_origin = None;
+        rt.state.threads[0].crew_captain = Some(999);
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented(&format!("tab-icon-crew-{peer_id}")).is_some());
+
+        // 4. At 480 px height, a captain with zero members and no other panels still fits
+        // its open roster footer (New crew thread / Recruit) without disabling Expand.
+        let mut short_empty = Runtime::with_text(
+            State::new(".".into(), false),
+            view,
+            (620.0, 480.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
+        short_empty.state.captains = crate::captains::Captain::presets();
+        short_empty.state.threads[0].captain_home = true;
+        short_empty.state.threads[0].captain = Some(0);
+        short_empty.invalidate();
+        short_empty.frame(0.0);
+        press(&mut short_empty, "crew-roster-toggle");
+        short_empty.frame(1.0);
+        assert_inside(
+            &mut short_empty,
+            620.0,
+            &[
+                "crew-roster-footer",
+                "crew-roster-new",
+                "crew-roster-recruit",
+            ],
+        );
+
+        // 5. At 720 px height with Needs you + 6 crew members, opening the roster never
+        // pushes Needs you approval actions below the scroll fold.
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            rt.state.refresh_crew_roster_attention();
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "needs-you",
+                    "approve-2",
+                    "decline-2",
+                    "open-request-2",
+                    "crew-tray",
+                ],
+            );
+            let stack = rt.presented("above-composer-stack").unwrap().0;
+            assert!(
+                stack[3] <= 720.0 * 0.4 + 2.0,
+                "{width}: above-composer-stack exceeded 40% cap: {stack:?}"
+            );
         }
     }
 

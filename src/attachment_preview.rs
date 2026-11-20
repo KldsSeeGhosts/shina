@@ -1306,7 +1306,7 @@ fn archive_view(s: &State, p: Palette) -> El {
                             .child(
                                 label(
                                     modified.unwrap_or_default(),
-                                    TextStyle::new(11.0, 400.0),
+                                    TextStyle::new(12.0, 400.0),
                                     p.faint,
                                 )
                                 .truncate()
