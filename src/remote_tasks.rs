@@ -10038,7 +10038,7 @@ impl State {
             let wake = self.wake.clone();
             let db = database.clone();
             std::thread::spawn(move || {
-                let Ok(Some(_dispatch)) = db.claim_dispatch() else {
+                let Ok(Some(_dispatch)) = db.claim_dispatch("linked peer status check") else {
                     return;
                 };
                 let runtime = peer_runtime();
@@ -10165,7 +10165,10 @@ impl State {
                     let _dispatch = if command.method == "peer.thread.wait" {
                         None
                     } else {
-                        Some(db.claim_dispatch()?.ok_or("Dispatch is fenced.")?)
+                        Some(
+                            db.claim_dispatch("linked peer task command")?
+                                .ok_or("Dispatch is fenced.")?,
+                        )
                     };
                     #[cfg(debug_assertions)]
                     test_peer_send_barrier(&command);
@@ -10189,7 +10192,7 @@ impl State {
                                         return Err(format!("Update required on {}. The wait contract is incompatible.", link.host));
                                     }
                                     if status["finished"] == true {
-                                        let _dispatch = db.claim_dispatch()?.ok_or("Dispatch is fenced.")?;
+                                        let _dispatch = db.claim_dispatch("linked peer task completion")?.ok_or("Dispatch is fenced.")?;
                                         return peer_completion(&link, &thread_id, &status).await;
                                     }
                                 }

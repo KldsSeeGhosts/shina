@@ -7,6 +7,11 @@ use std::{
 };
 
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub const ACTIVE_EXTERNAL_EFFECT: &str = "An external effect is still dispatching.";
+pub const PENDING_HARNESS_EFFECTS: &str =
+    "Waiting for committed harness effects to settle. Retry preparation.";
+const PREPARE_RETRY_WINDOW: Duration = Duration::from_secs(8);
+const PREPARE_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct Drain {
     id: String,
@@ -124,6 +129,37 @@ pub fn rpc(directory: &Path, method: &str, args: Value) -> Result<Value, String>
         .build()
         .map_err(|e| e.to_string())?
         .block_on(crate::client::local_rpc(directory, method, args))
+}
+
+pub fn prepare_restart(directory: &Path) -> Result<Value, String> {
+    retry_preparation(PREPARE_RETRY_WINDOW, || {
+        rpc(directory, "server.prepareRestart", json!({}))
+    })
+}
+
+fn retry_preparation(
+    window: Duration,
+    mut request: impl FnMut() -> Result<Value, String>,
+) -> Result<Value, String> {
+    let deadline = Instant::now() + window;
+    loop {
+        // These replies confirm that no restart was prepared. Never retry a
+        // lost reply, an authentication error or a refusal due to active work.
+        let error = match request() {
+            Err(error)
+                if error.starts_with(ACTIVE_EXTERNAL_EFFECT)
+                    || error == PENDING_HARNESS_EFFECTS =>
+            {
+                error
+            }
+            result => return result,
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining <= PREPARE_RETRY_INTERVAL {
+            return Err(error);
+        }
+        std::thread::sleep(PREPARE_RETRY_INTERVAL);
+    }
 }
 
 pub fn wait_unowned(directory: &Path, timeout: Duration) -> Result<(), String> {
@@ -250,6 +286,42 @@ pub fn restore_backup(directory: &Path, backup: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preparation_retries_only_confirmed_background_dispatch_refusals() {
+        let mut replies = [
+            Err(format!(
+                "{ACTIVE_EXTERNAL_EFFECT} Drain cancelled; retry after it settles."
+            )),
+            Err(format!(
+                "{ACTIVE_EXTERNAL_EFFECT} Waiting on: linked peer status check."
+            )),
+            Err(PENDING_HARNESS_EFFECTS.into()),
+            Ok(json!({"updateId":"prepared"})),
+        ]
+        .into_iter();
+        assert_eq!(
+            retry_preparation(PREPARE_RETRY_WINDOW, || replies.next().unwrap()).unwrap(),
+            json!({"updateId":"prepared"})
+        );
+        for (window, reason) in [
+            (Duration::ZERO, ACTIVE_EXTERNAL_EFFECT),
+            (PREPARE_RETRY_WINDOW, "A thread is still working."),
+            (PREPARE_RETRY_WINDOW, "Authentication denied."),
+            (PREPARE_RETRY_WINDOW, "Local RPC timed out."),
+        ] {
+            let mut calls = 0;
+            assert_eq!(
+                retry_preparation(window, || {
+                    calls += 1;
+                    Err(reason.into())
+                })
+                .unwrap_err(),
+                reason
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
     #[test]
     fn major_refuses_minor_negotiates() {
         assert!(negotiate(99, 0, 1).unwrap_err().contains("shina update"));
