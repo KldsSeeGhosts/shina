@@ -37,7 +37,7 @@ pub(super) fn more_menu(s: &State, p: Palette, captain: usize, thread_id: usize)
             }
             if let Some(index) = s.threads.iter().position(|t| t.id == thread_id) {
                 s.brief.more = None;
-                s.select_thread(index);
+                s.show_worker_ghost(index);
             }
         },
     ));

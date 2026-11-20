@@ -258,7 +258,7 @@ fn dispatch_global_command(
                     state.open_machine_thread(server, *id);
                 } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id)
                 {
-                    state.select_thread(index);
+                    state.show_thread(index);
                 }
             }
         }
@@ -272,7 +272,7 @@ fn dispatch_global_command(
                 if state.client.is_some() {
                     state.open_machine_thread(server, *id);
                 } else if let Some(pos) = state.threads.iter().position(|thread| thread.id == *id) {
-                    state.select_thread(pos);
+                    state.show_thread(pos);
                 }
             }
         }
@@ -837,7 +837,7 @@ fn captain_workspace_demo(state: &mut State) {
     }
     crew_tasks_demo(state);
     state.tabs = vec![7, 1, 11];
-    state.select_thread(home);
+    state.open_kept_tab(home);
 }
 
 /// Ember's delegations in the captain workspace: task records in each state, the calls that
@@ -1143,7 +1143,7 @@ fn settings_profile_demo(state: &mut State) {
 fn captain_crews_demo(state: &mut State) {
     captain_workspace_demo(state);
     let home = state.threads.iter().position(|t| t.id == 7).unwrap();
-    state.select_thread(home);
+    state.open_kept_tab(home);
 }
 
 fn main() {
@@ -1403,7 +1403,7 @@ fn main() {
             ("captain-worker", |state| {
                 captain_workspace_demo(state);
                 let worker = state.threads.iter().position(|t| t.id == 16).unwrap();
-                state.select_thread(worker);
+                state.open_kept_tab(worker);
                 let t = state.current_mut();
                 t.status = model::Status::Running;
                 t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(65));

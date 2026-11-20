@@ -421,7 +421,7 @@ impl State {
                     }
                 }
                 if let Some(index) = self.threads.iter().position(|thread| thread.id == id) {
-                    self.select_thread(index);
+                    self.open_kept_tab(index);
                 }
                 self.checkpoint();
                 true

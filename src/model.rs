@@ -4825,6 +4825,11 @@ pub struct State {
     pub threads: Vec<Thread>,
     pub active: usize,
     pub tabs: Vec<usize>,
+    /// The provisional tab: sidebar clicks replace it in place instead of
+    /// piling up, like KSG Code's ghost tab. At most one tab is a ghost, and
+    /// `ghost_anchor` names the captain tab a worker ghost returns to on close.
+    pub ghost_tab: Option<usize>,
+    pub ghost_anchor: Option<usize>,
     pub next_id: usize,
     pub dark: bool,
     /// Whole-window zoom, changed with Ctrl+= / Ctrl+- and reset with Ctrl+0.
@@ -4833,6 +4838,9 @@ pub struct State {
     /// The open thread's "More actions" menu in the chat header.
     pub thread_menu: bool,
     pub row_menu: Option<RowTarget>,
+    /// A tab's context menu: the tab it names and the pointer position.
+    pub tab_menu: Option<usize>,
+    pub tab_menu_at: Option<(f32, f32)>,
     /// The footer's settings menu is open.
     pub settings_menu: bool,
     pub settings: crate::ui::settings_ui::Dialog,
@@ -5937,12 +5945,16 @@ impl State {
             threads: vec![Thread::new(1)],
             active: 0,
             tabs: vec![1],
+            ghost_tab: None,
+            ghost_anchor: None,
             next_id: 2,
             dark: false,
             zoom: 1.0,
             show_activity: false,
             thread_menu: false,
             row_menu: None,
+            tab_menu: None,
+            tab_menu_at: None,
             settings_menu: false,
             settings: Default::default(),
             preferences: Default::default(),
@@ -6252,17 +6264,124 @@ impl State {
         }
         false
     }
-    pub fn select_thread(&mut self, index: usize) {
+    /// Plain navigation, as KSG Code's ghost tab: an already-open tab gets
+    /// focus; a new thread replaces the current ghost in place, or opens as a
+    /// fresh ghost right after the active kept tab.
+    pub fn show_thread(&mut self, index: usize) {
+        self.show_thread_inner(index, None);
+    }
+    fn show_thread_inner(&mut self, index: usize, anchor: Option<Option<usize>>) {
         if index >= self.threads.len() {
             return;
         }
-        let active = self.threads.get(self.active).map_or(0, |t| t.id);
-        insert_tab(&mut self.tabs, active, self.threads[index].id);
+        let id = self.threads[index].id;
+        if !self.tabs.contains(&id) {
+            let active = self.threads.get(self.active).map_or(0, |t| t.id);
+            if let Some(ghost) = self
+                .ghost_tab
+                .and_then(|ghost| self.tabs.iter().position(|tab| *tab == ghost))
+            {
+                self.tabs[ghost] = id;
+            } else {
+                insert_tab(&mut self.tabs, active, id);
+            }
+            self.ghost_tab = Some(id);
+            self.ghost_anchor = anchor.unwrap_or(None);
+        } else if let Some(anchor) = anchor {
+            self.ghost_anchor = anchor;
+        }
         self.tab_epoch += 1;
         self.requested_tab = None;
         self.requested_tab_restore = None;
         self.brief.record = None;
         self.focus_thread(index);
+    }
+    /// An explicit open: the tab is kept, never the ghost slot.
+    pub fn open_kept_tab(&mut self, index: usize) {
+        if index >= self.threads.len() {
+            return;
+        }
+        let active = self.threads.get(self.active).map_or(0, |t| t.id);
+        insert_tab(&mut self.tabs, active, self.threads[index].id);
+        if self.ghost_tab == Some(self.threads[index].id) {
+            self.ghost_tab = None;
+            self.ghost_anchor = None;
+        }
+        self.tab_epoch += 1;
+        self.requested_tab = None;
+        self.requested_tab_restore = None;
+        self.brief.record = None;
+        self.focus_thread(index);
+    }
+    /// A worker opened from its captain sits right after the captain's tab as
+    /// a ghost, and closing it returns focus to the captain.
+    pub fn show_worker_ghost(&mut self, index: usize) {
+        let anchor = self
+            .threads
+            .get(index)
+            .and_then(|t| t.crew_captain)
+            .and_then(|captain| self.captain_home(captain));
+        self.show_thread_inner(index, Some(anchor));
+        // Only a fresh ghost moves next to its captain; a worker that already
+        // holds a kept tab keeps its place in the strip.
+        let id = self.threads.get(index).map(|t| t.id);
+        if let (Some(id), Some(anchor_id)) = (id, anchor)
+            && self.ghost_tab == Some(id)
+            && let Some(position) = self.tabs.iter().position(|tab| *tab == id)
+            && let Some(anchor_pos) = self.tabs.iter().position(|tab| *tab == anchor_id)
+            && position != anchor_pos + 1
+        {
+            self.tabs.remove(position);
+            let anchor_pos = self
+                .tabs
+                .iter()
+                .position(|tab| *tab == anchor_id)
+                .unwrap_or(self.tabs.len() - 1);
+            self.tabs.insert((anchor_pos + 1).min(self.tabs.len()), id);
+        }
+    }
+    /// A send, a double-click or "Keep tab" makes the ghost permanent.
+    pub fn keep_tab(&mut self, id: usize) {
+        if self.ghost_tab == Some(id) {
+            self.ghost_tab = None;
+            self.ghost_anchor = None;
+            self.tab_epoch += 1;
+            self.checkpoint();
+        }
+    }
+    pub fn is_ghost_tab(&self, id: usize) -> bool {
+        self.ghost_tab == Some(id)
+    }
+    /// The tab menu's bulk closes, as KSG Code's thread tab menu.
+    pub fn close_other_tabs(&mut self, id: usize) {
+        for tab in self.tabs.clone() {
+            if tab != id {
+                self.close_tab(tab);
+            }
+        }
+        if let Some(index) = self.threads.iter().position(|t| t.id == id) {
+            self.show_thread(index);
+        }
+    }
+    pub fn close_tabs_to_right(&mut self, id: usize) {
+        let Some(position) = self.tabs.iter().position(|tab| *tab == id) else {
+            return;
+        };
+        for tab in self.tabs[position + 1..].to_vec() {
+            self.close_tab(tab);
+        }
+    }
+    pub fn close_all_tabs(&mut self) {
+        for tab in self.tabs.clone() {
+            self.close_tab(tab);
+        }
+    }
+    /// Removing a tab's ghost bookkeeping without touching the strip.
+    fn drop_ghost(&mut self, id: usize) {
+        if self.ghost_tab == Some(id) {
+            self.ghost_tab = None;
+            self.ghost_anchor = None;
+        }
     }
     /// Focus an existing tab. Background reducers must not open tabs.
     fn focus_thread(&mut self, index: usize) {
@@ -7187,7 +7306,7 @@ impl State {
         if self.client.is_some() {
             self.open_machine_thread(server, id);
         } else if let Some(index) = self.threads.iter().position(|t| t.id == id) {
-            self.select_thread(index);
+            self.show_thread(index);
         }
         if let Some(hit) = hit
             && self.current().id == id
@@ -7566,7 +7685,7 @@ impl State {
                     .collect();
             }
         } else {
-            self.select_thread(index);
+            self.show_thread(index);
         }
         if !mods.shift {
             self.selection_anchor = Some(id);
@@ -7999,6 +8118,10 @@ impl State {
             });
         }
         self.tabs.retain(|id| !ids.contains(id));
+        if self.ghost_tab.is_some_and(|ghost| ids.contains(&ghost)) {
+            self.ghost_tab = None;
+            self.ghost_anchor = None;
+        }
         for project in &mut self.projects.entries {
             if project.captain_thread.is_some_and(|id| ids.contains(&id)) {
                 project.captain_thread = None;
@@ -8237,11 +8360,26 @@ impl State {
         if !self.tabs.contains(&id) {
             return;
         }
+        let anchor = if self.ghost_tab == Some(id) {
+            self.ghost_anchor.take()
+        } else {
+            None
+        };
+        self.drop_ghost(id);
         if self.current().id != id {
             self.tabs.retain(|tab| *tab != id);
             return;
         }
         self.tab_epoch += 1;
+        // A worker ghost returns focus to the captain it was opened from.
+        if let Some(anchor) = anchor
+            && self.tabs.contains(&anchor)
+            && let Some(index) = self.threads.iter().position(|t| t.id == anchor)
+        {
+            self.tabs.retain(|tab| *tab != id);
+            self.focus_thread(index);
+            return;
+        }
         if let Some(neighbour) = tab_neighbour(&self.tabs, id)
             && let Some(index) = self.threads.iter().position(|t| t.id == neighbour)
         {
@@ -8260,7 +8398,7 @@ impl State {
             let t = &self.threads[i];
             if self.valid_after_park(t, id) {
                 self.tabs.retain(|tab| *tab != id);
-                self.select_thread(i);
+                self.show_thread(i);
                 return;
             }
         }
@@ -8561,6 +8699,10 @@ impl State {
                 self.tabs.insert(position.min(self.tabs.len()), id);
                 focus = Some(index);
             }
+        }
+        self.ghost_tab = self.ghost_tab.filter(|id| self.tabs.contains(id));
+        if self.ghost_tab.is_none() {
+            self.ghost_anchor = None;
         }
         if let Some(index) = preferred
             .and_then(|id| {
@@ -8886,7 +9028,7 @@ impl State {
                 self.apply_sticky_composer_to_draft(index);
             }
         }
-        self.select_thread(index);
+        self.open_kept_tab(index);
         self.sync_fallback_model(lifecycle::now() as i64);
     }
     pub fn open_captain(&mut self, captain: usize) {
@@ -8904,7 +9046,7 @@ impl State {
                 .captain_home(captain)
                 .and_then(|home| self.threads.iter().position(|thread| thread.id == home))
             {
-                self.select_thread(index);
+                self.open_kept_tab(index);
             }
             self.captain_picker = false;
             return;
@@ -8975,7 +9117,7 @@ impl State {
         self.show_archive = false;
         self.captain_picker = false;
         self.projects.captain_target = None;
-        self.select_thread(index);
+        self.open_kept_tab(index);
         if !self.catalog.models.is_empty() {
             self.apply_catalog();
         }
@@ -11335,10 +11477,10 @@ impl State {
                     if self.machines.selected == server
                         && let Some(index) = self.threads.iter().position(|t| t.id == thread_id)
                     {
-                        self.select_thread(index);
+                        self.show_thread(index);
                     }
                 } else if let Some(index) = self.threads.iter().position(|t| t.id == thread_id) {
-                    self.select_thread(index);
+                    self.show_thread(index);
                 }
             }
         }
@@ -12389,6 +12531,7 @@ impl State {
         }
         self.threads.retain(|t| t.id != thread_id);
         self.tabs.retain(|id| *id != thread_id);
+        self.drop_ghost(thread_id);
         if let Some(aid) = active_id
             && let Some(new_idx) = self.threads.iter().position(|t| t.id == aid)
         {
@@ -14117,6 +14260,26 @@ impl State {
         forced_fresh_context: Option<bool>,
         forced_compact_before_send: Option<bool>,
     ) -> bool {
+        // A send from a ghost tab keeps it, as KSG's ghost tab does on submit.
+        let sent_from = self.threads.get(self.active).map(|t| t.id);
+        let sent = self.dispatch_send_inner(
+            background,
+            approval_redirect,
+            forced_fresh_context,
+            forced_compact_before_send,
+        );
+        if sent && let Some(id) = sent_from {
+            self.keep_tab(id);
+        }
+        sent
+    }
+    fn dispatch_send_inner(
+        &mut self,
+        background: bool,
+        approval_redirect: bool,
+        forced_fresh_context: Option<bool>,
+        forced_compact_before_send: Option<bool>,
+    ) -> bool {
         if self.demo || self.ownership_denied || self.current().archived() {
             return false;
         }
@@ -15058,7 +15221,7 @@ impl State {
             .max_by_key(|(_, t)| (t.updated, t.id))
             .map(|(i, _)| i)
         {
-            self.select_thread(index);
+            self.show_thread(index);
         } else {
             self.new_thread_in(Some(id));
         }
@@ -15818,6 +15981,40 @@ impl State {
                     .collect();
                 let mut seen_tabs = std::collections::HashSet::new();
                 self.tabs.retain(|id| seen_tabs.insert(*id));
+                // Indexes saved before ghost tabs have no "ghostTab": keep the
+                // active tab and any tab still working, and drop the rest, as
+                // KSG Code's migration did when the strip learned ghosts.
+                if index["tabs"].is_array() && index.get("ghostTab").is_none() {
+                    let active_id = index["active"].as_u64().map(|id| id as usize);
+                    self.tabs.retain(|id| {
+                        Some(*id) == active_id
+                            || self.threads.iter().any(|t| {
+                                // Runtime status is not persisted; a run the
+                                // session can resume, a queued prompt or a
+                                // pending request is what "working" leaves
+                                // behind in the index.
+                                t.id == *id
+                                    && (t.provider_running_run.is_some()
+                                        || t.resumable_run_id.is_some()
+                                        || t.queued_prompt.is_some()
+                                        || t.pending_prompt.is_some())
+                            })
+                    });
+                    self.ghost_tab = None;
+                    self.ghost_anchor = None;
+                } else {
+                    self.ghost_tab = index["ghostTab"]
+                        .as_u64()
+                        .and_then(|id| usize::try_from(id).ok())
+                        .filter(|id| self.tabs.contains(id));
+                    self.ghost_anchor = index["ghostAnchor"]
+                        .as_u64()
+                        .and_then(|id| usize::try_from(id).ok())
+                        .filter(|id| self.tabs.contains(id));
+                    if self.ghost_tab.is_none() {
+                        self.ghost_anchor = None;
+                    }
+                }
                 // An archived thread is never reopened at launch. Without any live thread, land on
                 // the most recent workspace's draft, as KSG Code's index route does.
                 let active = self
@@ -16501,6 +16698,7 @@ impl State {
         }
         let mut index = json!({
             "version":crate::identity::INDEX_VERSION, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
+            "ghostTab":self.ghost_tab, "ghostAnchor":self.ghost_anchor,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
@@ -17811,7 +18009,7 @@ mod tests {
         state.threads[0].life.last_visited_at = Some(2);
         let solo = state.threads.iter().position(|t| t.id == 6).unwrap();
         state.threads[solo].project = Some(1);
-        state.select_thread(solo);
+        state.open_kept_tab(solo);
         assert!(!state.captain_expanded(7));
         assert!(state.visible_captain_workers(7).is_empty());
         assert_eq!(state.captain_worker_count(7), 2);
@@ -17828,7 +18026,7 @@ mod tests {
         state.threads[0].status = Status::Ready;
         state.threads[0].request = Some(serde_json::json!({"method": "input"}));
         assert!(state.visible_captain_workers(7).is_empty());
-        state.select_thread(6);
+        state.open_kept_tab(6);
         assert!(state.captain_expanded(7));
         assert_eq!(state.visible_captain_workers(7), vec![0, 1]);
     }
@@ -17840,7 +18038,7 @@ mod tests {
         state.threads[0].parent = Some(7);
         state.threads[0].delegated = true;
         state.threads[0].crew_captain = Some(0);
-        state.select_thread(6);
+        state.open_kept_tab(6);
         state.settle_thread(1);
         assert!(state.threads[0].life.settled());
         assert_eq!(state.threads[0].parent, Some(7));
@@ -18215,9 +18413,9 @@ mod tests {
             state.sidebar_threads().is_empty(),
             "the open draft's row does not pop in while typing"
         );
-        state.select_thread((active + 1) % state.threads.len());
+        state.open_kept_tab((active + 1) % state.threads.len());
         assert_eq!(state.sidebar_threads(), vec![active]);
-        state.select_thread(active);
+        state.open_kept_tab(active);
         state.current_mut().draft.replace_text("");
         assert_eq!(
             state.sidebar_threads(),
@@ -18305,10 +18503,10 @@ mod tests {
     fn closing_a_blank_drafts_tab_removes_it_and_keeps_a_tab() {
         let mut state = State::new(".".into(), false);
         state.current_mut().draft.replace_text("A prompt");
-        state.select_thread(0);
+        state.open_kept_tab(0);
         state.new_thread_in(None);
         state.current_mut().draft.replace_text("Keep this draft");
-        state.select_thread(0);
+        state.open_kept_tab(0);
         state.open_picker(ProjectPicker::NewThread);
         state.new_thread_in(Some(state.projects.entries.len()));
         let blank = state.current().id;
@@ -18319,7 +18517,7 @@ mod tests {
         assert!(!state.threads.iter().any(|t| t.id == blank));
         assert_eq!(state.tabs, vec![1, written]);
         assert_eq!(state.current().draft.text, "Keep this draft");
-        state.select_thread(1);
+        state.open_kept_tab(1);
         assert_eq!(state.current().draft.text, "Keep this draft");
         state.close_tab(written);
         assert!(state.threads.iter().any(|t| t.id == written));
@@ -18340,7 +18538,7 @@ mod tests {
         state.new_thread_in(Some(2));
         let blank = state.current().id;
         assert_eq!(state.tabs, vec![written, blank]);
-        state.select_thread(0);
+        state.open_kept_tab(0);
         assert_eq!(state.tabs, vec![written, blank]);
         assert!(
             state.snapshot()["threads"]
@@ -18352,7 +18550,7 @@ mod tests {
         );
         for _ in 0..3 {
             state.new_thread_in(Some(2));
-            state.select_thread(0);
+            state.open_kept_tab(0);
         }
         assert_eq!(
             state.tabs,
@@ -18362,7 +18560,7 @@ mod tests {
         state.new_thread_in(Some(2));
         assert_eq!(state.current().id, blank, "the workspace's draft is reused");
         state.current_mut().draft.replace_text("Typed");
-        state.select_thread(0);
+        state.open_kept_tab(0);
         assert_eq!(
             state.tabs,
             vec![written, blank],
@@ -18403,11 +18601,116 @@ mod tests {
     #[test]
     fn explicit_opens_insert_next_to_active_and_existing_tabs_never_move() {
         let mut state = tab_fixture();
-        state.select_thread(4);
+        state.open_kept_tab(4);
         assert_eq!(state.tabs, [1, 2, 5, 3, 4]);
-        state.select_thread(0);
+        state.open_kept_tab(0);
         assert_eq!(state.tabs, [1, 2, 5, 3, 4]);
         assert_eq!(state.current().id, 1);
+    }
+
+    #[test]
+    fn sidebar_clicks_reuse_one_ghost_tab_instead_of_piling_up() {
+        let mut state = tab_fixture();
+        // Ten untabbed threads the user clicks through in the sidebar.
+        for n in 0..10 {
+            let mut thread = Thread::new(10 + n);
+            thread.title = format!("Sidebar thread {n}");
+            state.threads.push(thread);
+        }
+        // The fixture's four tabs are kept; a fresh navigation opens a ghost.
+        state.show_thread(4);
+        assert_eq!(state.tabs, [1, 2, 5, 3, 4]);
+        assert_eq!(state.ghost_tab, Some(5));
+        // Clicking further threads replaces the ghost in place, so the strip
+        // stays the same size no matter how many rows the user clicks through.
+        for index in 5..15 {
+            state.show_thread(index);
+            assert_eq!(state.tabs.len(), 5, "click {index}");
+            assert_eq!(state.ghost_tab, Some(state.threads[index].id));
+        }
+        // An already-tabbed thread takes focus while the ghost slot keeps its
+        // last preview.
+        state.show_thread(0);
+        assert_eq!(state.ghost_tab, Some(19));
+        assert_eq!(state.current().id, 1);
+        // A double-click or "Keep tab" makes the ghost permanent. The ghost
+        // slot now names the tab the user most recently previewed.
+        state.keep_tab(19);
+        assert_eq!(state.ghost_tab, None);
+        state.show_thread(4);
+        // Thread 5's slot went to the last preview, so revisiting it opens a
+        // fresh ghost beside the active tab.
+        assert_eq!(state.tabs, [1, 5, 2, 19, 3, 4]);
+        assert_eq!(state.ghost_tab, Some(5));
+        assert_eq!(state.current().id, 5);
+    }
+
+    #[test]
+    fn worker_ghosts_anchor_to_their_captain_and_close_back_to_it() {
+        let mut state = tab_fixture();
+        // Thread 1 is a captain home; threads 2..5 are its crew workers.
+        state.threads[0].captain_home = true;
+        state.threads[0].captain = Some(0);
+        for index in 1..5 {
+            state.threads[index].crew_captain = Some(0);
+        }
+        state.tabs = vec![1];
+        state.active = 0;
+        // Opening five workers from the captain yields the captain tab plus a
+        // single ghost that sits right after it.
+        for index in 1..5 {
+            state.show_worker_ghost(index);
+            assert_eq!(state.tabs, [1, state.current().id], "worker {index}");
+            assert_eq!(state.ghost_tab, Some(state.current().id));
+            assert_eq!(state.ghost_anchor, Some(1));
+        }
+        // Closing the worker ghost focuses the captain tab it came from.
+        state.close_tab(state.ghost_tab.unwrap());
+        assert_eq!(state.current().id, 1);
+        assert_eq!(state.tabs, [1]);
+        assert_eq!(state.ghost_tab, None);
+        // A worker ghost that was sent in is kept: closing it uses the plain
+        // neighbour rule, not the anchor.
+        state.show_worker_ghost(1);
+        let worker = state.ghost_tab.unwrap();
+        state.keep_tab(worker);
+        state.open_kept_tab(0);
+        state.close_tab(1);
+        assert_eq!(state.current().id, worker);
+        assert_eq!(state.tabs, [worker]);
+    }
+
+    #[test]
+    fn an_index_without_ghost_tabs_drops_quiet_tabs_on_load() {
+        let mut state = tab_fixture();
+        // Runtime status is not persisted, so a thread mid-run or mid-wait
+        // shows up in the index as a resumable run or a queued prompt.
+        state.threads[2].provider_running_run = Some("run-3".into());
+        state.threads[3].resumable_run_id = Some("run-4".into());
+        state.tabs = vec![1, 2, 3, 4];
+        state.active = 0;
+        let mut index = state.snapshot();
+        // A saved index from before ghost tabs carries no "ghostTab".
+        index.as_object_mut().unwrap().remove("ghostTab");
+        index.as_object_mut().unwrap().remove("ghostAnchor");
+        let mut restored = State::new(".".into(), true);
+        restored.restore_global(&index).unwrap();
+        // The active tab and the two working tabs survive; the quiet tab is dropped.
+        assert_eq!(restored.tabs, [1, 3, 4]);
+        assert_eq!(restored.ghost_tab, None);
+        assert_eq!(restored.current().id, 1);
+    }
+
+    #[test]
+    fn ghost_state_round_trips_through_the_index() {
+        let mut state = tab_fixture();
+        state.show_thread(4);
+        assert_eq!(state.ghost_tab, Some(5));
+        let index = state.snapshot();
+        let mut restored = State::new(".".into(), true);
+        restored.restore_global(&index).unwrap();
+        assert_eq!(restored.ghost_tab, Some(5));
+        assert!(restored.tabs.contains(&5));
     }
 
     #[test]
@@ -18418,7 +18721,7 @@ mod tests {
         assert_eq!(state.tabs, [1, 3, 4]);
         state.close_tab(1);
         assert_eq!(state.current().id, 3);
-        state.select_thread(3);
+        state.open_kept_tab(3);
         state.close_tab(4);
         assert_eq!(state.current().id, 3);
         assert_eq!(state.tabs, [3]);
@@ -18612,7 +18915,7 @@ mod tests {
         let mut state = tab_fixture();
         state.new_thread_in(None);
         let blank = state.current().id;
-        state.select_thread(1);
+        state.open_kept_tab(1);
         let mut restored = State::new(".".into(), false);
         restored.restore_global(&state.snapshot()).unwrap();
         assert_eq!(restored.tabs, state.tabs);
@@ -18745,7 +19048,7 @@ mod tests {
         restored.restore_global(&state.snapshot()).unwrap();
         restored.restore_ui(&state.ui_snapshot()).unwrap();
         assert_eq!(restored.sidebar_threads().len(), 2);
-        restored.select_thread(2);
+        restored.open_kept_tab(2);
         assert_eq!(restored.project_scope, ProjectScope::All);
         assert!(restored.scope_additional.is_empty());
         for (i, t) in restored.threads.iter_mut().enumerate() {
@@ -23060,7 +23363,7 @@ mod tests {
         state.discard_draft(state.current().id);
         assert!(state.current().draft_images.is_empty());
         state.undo_thread_action();
-        state.select_thread(0);
+        state.open_kept_tab(0);
         assert_eq!(state.current().draft.text, "Draft with an image");
         assert_eq!(state.current().draft_images, vec![image.clone()]);
         let snapshot = state.ui_snapshot();
@@ -23135,7 +23438,7 @@ mod tests {
         state.new_thread();
         assert!(state.current().blank_draft());
         assert_eq!(state.sidebar_threads(), vec![0]);
-        state.select_thread(0);
+        state.open_kept_tab(0);
         assert_eq!(
             state.sidebar_threads(),
             vec![0],
@@ -23144,7 +23447,7 @@ mod tests {
         assert!(state.draft_listed(&state.threads[0]));
 
         // A pill alone is content.
-        state.select_thread(1);
+        state.open_kept_tab(1);
         let token = crate::composer_tokens::Token::File {
             path: PathBuf::from("src/main.rs"),
             directory: false,
@@ -23152,7 +23455,7 @@ mod tests {
         };
         state.current_mut().draft.insert_pill(token.id(), "main.rs");
         assert!(state.current().has_draft_content());
-        state.select_thread(0);
+        state.open_kept_tab(0);
         let mut listed = state.sidebar_threads();
         listed.sort();
         assert_eq!(listed, vec![0, 1]);
@@ -23326,7 +23629,7 @@ mod tests {
             .iter()
             .position(|t| t.id == original_id)
             .unwrap();
-        state.select_thread(orig_idx);
+        state.open_kept_tab(orig_idx);
         state.current_mut().native.follow_up = true;
         state.current_mut().draft.replace_text("Queued follow up");
         state.send_background();
@@ -24781,8 +25084,8 @@ mod tests {
         state.set_draft_start_from_origin(false);
 
         // Switch away to thread 0 and switch back: draft choices persist.
-        state.select_thread(0);
-        state.select_thread(t2_idx);
+        state.open_kept_tab(0);
+        state.open_kept_tab(t2_idx);
         assert_eq!(state.current().env_mode, Some(ThreadEnvMode::Worktree));
         assert_eq!(state.current().base_branch.as_deref(), Some("main"));
         assert_eq!(state.current().start_from_origin, Some(false));
@@ -25281,7 +25584,7 @@ mod tests {
         // A second thread with its own key starts closed and empty.
         let other = Thread::new(state.current().id + 1);
         state.threads.push(other);
-        state.select_thread(1);
+        state.open_kept_tab(1);
         let second_key = state.panel_key();
         assert_ne!(first_key, second_key);
         assert_eq!(
@@ -25294,7 +25597,7 @@ mod tests {
         state.right_panels.open_file(&key, "src/lib.rs", None);
 
         // Back on the first thread its Diff surface is still open and maximized.
-        state.select_thread(0);
+        state.open_kept_tab(0);
         let panel = state.right_panel();
         assert!(panel.open);
         assert!(panel.maximized);

@@ -1122,6 +1122,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         root = root.child(right_panel_tab_menu(s, p));
     }
+    if s.tab_menu.is_some() {
+        if let Some((x, y)) = s.tab_menu_at {
+            root = root.child(
+                el().key("thread-tab-menu-point")
+                    .absolute(x / zoom, y / zoom)
+                    .size(0.0, 0.0),
+            );
+        }
+        root = root.child(thread_tab_menu(s, p));
+    }
     if s.snooze_menu.is_some() {
         root = root.child(snooze_menu(s, p));
     }
@@ -5729,6 +5739,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         .radius(6.0)
         .fill(Color::TRANSPARENT)
         .hover(p.selected)
+        .pointer_buttons([rune::PointerButton::Middle])
         .on_press_tx({
             let content_match = !s.search.text.is_empty()
                 && !s.thread_title_search_matches(thread)
@@ -5737,7 +5748,12 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                     .contains_key(&(s.machines.selected.clone(), id));
             let server = s.machines.selected.clone();
             move |s: &mut State, tx| {
-                if content_match {
+                // KSG: a middle click opens the thread as a kept tab.
+                if tx.button() == rune::PointerButton::Middle {
+                    if let Some(index) = s.threads.iter().position(|t| t.id == id) {
+                        s.open_kept_tab(index);
+                    }
+                } else if content_match {
                     s.open_thread_at_search_match(&server, id);
                 } else {
                     s.click_thread(index, tx.mods());
@@ -7070,6 +7086,9 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
         };
         let thread = &s.threads[index];
         let active = index == s.active;
+        // KSG draws the ghost tab's title in italics once kept tabs sit
+        // beside it; a lone tab never reads as provisional.
+        let ghost = s.is_ghost_tab(id) && s.tabs.len() > 1;
         let project = s
             .project(thread.project)
             .map(|p| p.name.as_str())
@@ -7094,9 +7113,20 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                 .w(tab_width)
                 .min_w(tab_width)
                 .hover_group()
+                .pointer_buttons([rune::PointerButton::Middle])
                 .on_press_tx(move |s: &mut State, tx| {
-                    s.select_thread(index);
+                    // KSG: a middle click closes the tab.
+                    if tx.button() == rune::PointerButton::Middle {
+                        s.close_tab(id);
+                        return;
+                    }
+                    s.show_thread(index);
                     tx.scroll_into_view("active-tab");
+                })
+                .on_double_press(move |s: &mut State| s.keep_tab(id))
+                .on_secondary_press(move |s: &mut State, at, _| {
+                    s.tab_menu = Some(id);
+                    s.tab_menu_at = Some((at.x, at.y));
                 }),
             active,
             p,
@@ -7107,7 +7137,15 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
             // A tab at its minimum gives the width to the title.
             el()
         })
-        .child(label(&thread.title, TAB_TITLE, p.ink).truncate().grow(1.0));
+        .child(
+            label(
+                &thread.title,
+                if ghost { TAB_TITLE.italic() } else { TAB_TITLE },
+                p.ink,
+            )
+            .truncate()
+            .grow(1.0),
+        );
         if s.tabs.len() > 1 {
             // The close button shows on the active tab and on hover.
             let close = el()
@@ -7183,6 +7221,72 @@ fn right_panel_title(surface: &crate::right_panel::Surface) -> String {
 fn base_name(path: &str) -> &str {
     let after = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
     &path[after..]
+}
+
+/// Ported from KSG Code's thread tab context menu on the `row_menu` pattern: a
+/// ghost tab offers "Keep tab" first, then the close group. Items that would do
+/// nothing are disabled, as KSG does.
+fn thread_tab_menu(s: &State, p: Palette) -> El {
+    let id = s.tab_menu.expect("tab menu only mounts with a tab");
+    let index = s.tabs.iter().position(|tab| *tab == id);
+    let last = s.tabs.len().saturating_sub(1);
+    let anchor = if s.tab_menu_at.is_some() {
+        "thread-tab-menu-point".to_string()
+    } else {
+        format!("tab-{id}")
+    };
+    enum TabMenu {
+        Keep,
+        Close,
+        Others,
+        ToRight,
+        All,
+    }
+    let item = |key: &str, title: &str, glyph: &str, action: Option<TabMenu>| {
+        let Some(action) = action else {
+            return disabled_menu_item(key, title, glyph, p);
+        };
+        menu_item(key, title, glyph, p).on_press(move |s: &mut State| {
+            s.tab_menu = None;
+            match action {
+                TabMenu::Keep => s.keep_tab(id),
+                TabMenu::Close => s.close_tab(id),
+                TabMenu::Others => s.close_other_tabs(id),
+                TabMenu::ToRight => s.close_tabs_to_right(id),
+                TabMenu::All => s.close_all_tabs(),
+            }
+        })
+    };
+    let keep = s.is_ghost_tab(id).then_some(TabMenu::Keep);
+    let close = (s.tabs.len() > 1).then_some(TabMenu::Close);
+    let others = (s.tabs.len() > 1).then_some(TabMenu::Others);
+    let to_right = index.is_some_and(|i| i < last).then_some(TabMenu::ToRight);
+    let all = (!s.tabs.is_empty()).then_some(TabMenu::All);
+    col()
+        .key("thread-tab-menu")
+        .role("menu")
+        .focus_group()
+        .label("Tab actions")
+        .autofocus()
+        .w(222.0)
+        .padding(4.0)
+        .gap(1.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::Start, 2.0)
+        .modal(true, |s: &mut State| s.tab_menu = None)
+        .child(item("menu-tab-keep", "Keep tab", "pin", keep))
+        .child(item("menu-tab-close", "Close", "close", close))
+        .child(item("menu-tab-others", "Close others", "close", others))
+        .child(item(
+            "menu-tab-right",
+            "Close to the right",
+            "chevron",
+            to_right,
+        ))
+        .child(item("menu-tab-all", "Close all", "close", all))
 }
 
 /// Ported from KSG Code's `RightPanelTab`: `h-6 max-w-36 rounded-md gap-0.5 pl-1.5 pr-2`.
@@ -7612,7 +7716,7 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
     {
         header = header.child(label("From", SMALL, p.muted)).child(
             button("breadcrumb-parent", &s.threads[parent].title, p, move |s| {
-                s.select_thread(parent)
+                s.show_thread(parent)
             })
             .max_w(240.0)
             .shrink()
@@ -18195,7 +18299,7 @@ pub(crate) mod tests {
             rt.state.current_mut().draft.replace_text("Existing draft");
             rt.state.new_thread();
             rt.state.current_mut().draft.focused = false;
-            rt.state.select_thread(0);
+            rt.state.open_kept_tab(0);
             rt.frame(0.0);
             rt.frame(1.0);
             assert!(rt.state.current().draft.focused, "{width}");
@@ -21948,7 +22052,7 @@ pub(crate) mod tests {
             let second = rt.state.current().id;
             for action in 0..5 {
                 match action {
-                    0 => rt.state.select_thread(0),
+                    0 => rt.state.open_kept_tab(0),
                     1 => rt.state.close_tab(second),
                     2 => rt.state.settle_thread(rt.state.current().id),
                     3 => rt.state.archive_thread(rt.state.current().id),
@@ -23419,7 +23523,7 @@ pub(crate) mod tests {
             rt.update(|_, tx| tx.scroll_to_bottom_instant("conversation-1"));
             rt.frame(1.0);
             let other = rt.state.threads.iter().position(|t| t.id != 1).unwrap();
-            rt.update(|s, _| s.select_thread(other));
+            rt.update(|s, _| s.open_kept_tab(other));
             rt.frame(1.0);
             rt.state.threads[original]
                 .messages
@@ -23430,7 +23534,7 @@ pub(crate) mod tests {
                     images: vec![],
                     context: None,
                 });
-            rt.update(|s, _| s.select_thread(original));
+            rt.update(|s, _| s.open_kept_tab(original));
             for _ in 0..120 {
                 rt.frame(1.0 / 60.0);
             }
@@ -24076,7 +24180,7 @@ pub(crate) mod tests {
         press(&mut rt, "shelf-Snoozed");
         assert!(rt.state.shelves[0]);
         assert!(rt.find("thread-4").is_some());
-        rt.state.select_thread(3);
+        rt.state.open_kept_tab(3);
         rt.frame(0.0);
         rt.update(|_, tx| tx.scroll_into_view("shelf-Snoozed"));
         rt.frame(0.5);
@@ -24779,7 +24883,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == earlier)
             .unwrap();
-        rt.state.select_thread(index);
+        rt.state.open_kept_tab(index);
         rt.frame(0.0);
         press(&mut rt, "thread-actions");
         assert!(rt.find("menu-archive-thread").is_some());
@@ -24949,7 +25053,7 @@ pub(crate) mod tests {
         rt.state.current_mut().draft.replace_text("A prompt");
         rt.state.new_thread();
         rt.state.current_mut().draft.replace_text("Another prompt");
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         rt.state.pin_thread(1);
         rt.invalidate();
         rt.frame(0.0);
@@ -27899,7 +28003,7 @@ pub(crate) mod tests {
             rt.frame(1.0);
             assert!(rt.presented("worker-alert-99").is_some());
         }
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("thread-99").is_none());
@@ -28597,7 +28701,7 @@ pub(crate) mod tests {
                 "error":"Setup script exited with code 1."
             })));
             rt.state.threads.push(member);
-            rt.state.select_thread(rt.state.threads.len() - 1);
+            rt.state.open_kept_tab(rt.state.threads.len() - 1);
             rt.invalidate();
             rt.frame(1.0);
             let bar = rt.presented("crew-bar").expect("crew bar").0;
@@ -29012,7 +29116,7 @@ pub(crate) mod tests {
                         Box::new(|rt| {
                             let first = rt.state.tabs[0];
                             let index = rt.state.threads.iter().position(|t| t.id == first);
-                            rt.state.select_thread(index.unwrap());
+                            rt.state.open_kept_tab(index.unwrap());
                         }),
                     ),
                     (
@@ -29020,7 +29124,7 @@ pub(crate) mod tests {
                         Box::new(|rt| {
                             let last = *rt.state.tabs.last().unwrap();
                             let index = rt.state.threads.iter().position(|t| t.id == last);
-                            rt.state.select_thread(index.unwrap());
+                            rt.state.open_kept_tab(index.unwrap());
                         }),
                     ),
                     (
@@ -29028,6 +29132,32 @@ pub(crate) mod tests {
                         Box::new(|rt| {
                             let last = *rt.state.tabs.last().unwrap();
                             rt.state.close_tab(last);
+                        }),
+                    ),
+                    (
+                        "after ten sidebar previews",
+                        Box::new(|rt| {
+                            // Ghost tabs: sidebar clicks replace one slot
+                            // instead of growing the strip.
+                            let base = rt.state.next_id;
+                            for n in 0..10 {
+                                let mut thread = crate::model::Thread::new(base + n);
+                                thread.title = format!("Sidebar preview {n}");
+                                rt.state.threads.push(thread);
+                            }
+                            rt.state.next_id = base + 10;
+                            let before = rt.state.tabs.len();
+                            for index in (rt.state.threads.len() - 10)..rt.state.threads.len() {
+                                rt.state.show_thread(index);
+                                // The first click adds the ghost slot; the
+                                // next nine replace it in place.
+                                let expected = before + 1;
+                                assert_eq!(
+                                    rt.state.tabs.len(),
+                                    expected,
+                                    "sidebar clicks reuse the ghost tab"
+                                );
+                            }
                         }),
                     ),
                 ];
@@ -29082,7 +29212,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == middle)
             .unwrap();
-        rt.state.select_thread(index);
+        rt.state.open_kept_tab(index);
         // Tabs are already at their minimum width at these sizes, so only the strip changes.
         for width in [1100.0, 980.0, 860.0, 760.0, 700.0] {
             rt.set_viewport((width, 800.0), 1.0);
@@ -30833,7 +30963,7 @@ pub(crate) mod tests {
                 rt.presented("thread-1").is_some(),
                 "{width}: inactive draft stays listed"
             );
-            rt.state.select_thread(0);
+            rt.state.open_kept_tab(0);
             rt.invalidate();
             rt.frame(0.0);
             assert!(
@@ -33414,7 +33544,7 @@ pub(crate) mod tests {
             },
         ];
         rt.state.new_thread();
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         rt.frame(0.0);
         rt.frame(1.0);
 
@@ -33451,9 +33581,9 @@ pub(crate) mod tests {
         // Set again, persist across thread switch and save/reload in temp dir.
         press(&mut rt, "reply-message-msg-a1");
         rt.frame(1.0);
-        rt.state.select_thread(1);
+        rt.state.open_kept_tab(1);
         assert!(rt.state.current().draft_reply_to.is_none());
-        rt.state.select_thread(0);
+        rt.state.open_kept_tab(0);
         assert_eq!(
             rt.state
                 .current()
@@ -34288,7 +34418,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == draft_id)
             .unwrap();
-        rt.state.select_thread(draft_idx);
+        rt.state.open_kept_tab(draft_idx);
         assert_eq!(rt.state.multi_model_selections().len(), 3);
 
         // Persist and reload from temporary data directory.
@@ -34302,7 +34432,7 @@ pub(crate) mod tests {
             .iter()
             .position(|t| t.id == draft_id)
             .unwrap();
-        reloaded.select_thread(reloaded_idx);
+        reloaded.open_kept_tab(reloaded_idx);
         reloaded.vcs_branches = rt.state.vcs_branches.clone();
         assert_eq!(reloaded.multi_model_selections().len(), 3);
         assert_eq!(

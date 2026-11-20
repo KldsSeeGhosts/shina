@@ -958,7 +958,7 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
                     close_brief(s);
                 }
                 if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-                    s.select_thread(index);
+                    s.show_worker_ghost(index);
                 }
             })
             .child(super::crew_ui::mark_slot(thread.status, p))
@@ -1699,7 +1699,7 @@ fn earlier_section(s: &State, p: Palette, captain: usize) -> El {
             .hover_motion(motion(), motion())
             .on_press(move |s: &mut State| {
                 if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-                    s.select_thread(index);
+                    s.show_thread(index);
                 }
                 // A sheet covers the conversation it just opened; step out of the way.
                 if s.viewport_width < SHEET_BELOW {
@@ -1780,7 +1780,7 @@ fn reset_dialog(s: &State, p: Palette) -> Option<El> {
                                 .captain_home(captain)
                                 .and_then(|home| s.threads.iter().position(|t| t.id == home))
                         {
-                            s.select_thread(index);
+                            s.show_thread(index);
                         }
                     },
                 )),
@@ -1838,7 +1838,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
                 if let Some(index) =
                     home.and_then(|home| s.threads.iter().position(|t| t.id == home))
                 {
-                    s.select_thread(index);
+                    s.show_thread(index);
                 }
             },
         ));
@@ -3075,7 +3075,7 @@ mod tests {
         member.project = Some(1);
         member.crew_captain = Some(0);
         rt.state.threads.push(member);
-        rt.state.select_thread(rt.state.threads.len() - 1);
+        rt.state.open_kept_tab(rt.state.threads.len() - 1);
         rt.frame(0.25);
         let (bar, _) = rt.presented("crew-bar").expect("crew bar");
         assert!(rt.presented("crew-bar-open-captain").is_some());
@@ -3395,7 +3395,7 @@ mod tests {
             .iter()
             .position(|t| t.id == earlier_id)
             .unwrap();
-        rt.state.select_thread(index);
+        rt.state.open_kept_tab(index);
         rt.frame(0.5);
         assert_eq!(
             rt.state.captain_access(0),

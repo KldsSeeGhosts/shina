@@ -102,7 +102,7 @@ pub(super) fn open_thread(s: &mut State, id: usize) {
         return;
     }
     if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-        s.select_thread(index);
+        s.show_worker_ghost(index);
     }
 }
 
