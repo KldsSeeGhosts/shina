@@ -3,7 +3,7 @@ use crate::backend::{Event, Pi};
 use rune::Waker;
 use serde_json::Value;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,7 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(20);
 const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 const CATALOG_RETRY_TTL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AgentModel {
     pub provider: String,
     pub id: String,
@@ -286,29 +286,29 @@ impl NativeCatalog {
         self.pi.is_some()
     }
 
-    pub fn refresh(&mut self, harness: &str, workspace: PathBuf, wake: Waker, force: bool) {
+    pub fn refresh(&mut self, harness: &str, workspace: &Path, wake: Waker, force: bool) -> bool {
         if self.pi.is_some() {
-            return;
+            return false;
         }
         let now = Instant::now();
-        let changed = self.cwd.as_ref() != Some(&workspace);
+        let changed = self.cwd.as_deref() != Some(workspace);
         if !force {
             if self
                 .loaded
                 .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_TTL)
                 && !changed
             {
-                return;
+                return false;
             }
             if self.error.is_some()
                 && self
                     .last_attempt
                     .is_some_and(|at| now.saturating_duration_since(at) < CATALOG_RETRY_TTL)
             {
-                return;
+                return false;
             }
             if self.attempted && !changed && self.loaded.is_none() && self.error.is_none() {
-                return;
+                return false;
             }
         }
         let models = force
@@ -318,7 +318,7 @@ impl NativeCatalog {
                 .is_some_and(|at| now.saturating_duration_since(at) >= CATALOG_TTL);
         self.attempted = true;
         self.revision += 1;
-        self.cwd = Some(workspace.clone());
+        self.cwd = Some(workspace.to_path_buf());
         self.commands.clear();
         self.commands_loaded = false;
         self.models_loaded = !models;
@@ -327,16 +327,21 @@ impl NativeCatalog {
         self.started = Some(now);
         self.last_attempt = Some(now);
         let result = match harness {
-            "codex" => crate::codex::discover(workspace, wake, models),
-            "claude" => crate::claude::discover(workspace, wake),
-            "antigravity" => crate::antigravity::discover(workspace, wake),
-            "cursor" => crate::cursor::discover(workspace, wake),
+            "codex" => Ok(crate::codex::discover(
+                workspace.to_path_buf(),
+                wake,
+                models,
+            )),
+            "claude" => Ok(crate::claude::discover(workspace.to_path_buf(), wake)),
+            "antigravity" => crate::antigravity::discover(workspace.to_path_buf(), wake),
+            "cursor" => Ok(crate::cursor::discover(workspace.to_path_buf(), wake)),
             _ => unreachable!(),
         };
         match result {
             Ok(pi) => self.pi = Some(pi),
             Err(error) => self.fail(error),
         }
+        true
     }
 
     pub fn poll(&mut self, harness: &str) -> bool {

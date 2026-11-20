@@ -924,15 +924,18 @@ pub fn start(
     start: crate::harness::Start,
     wake: rune::Waker,
 ) -> Result<crate::backend::Pi, String> {
-    let agent = crate::harness::Agent {
+    let process = command(&start.workspace)?;
+    crate::acp::start_command(agent(), start, wake, process)
+}
+
+fn agent() -> crate::harness::Agent {
+    crate::harness::Agent {
         id: "antigravity".into(),
         name: "Antigravity".into(),
         command: "agy".into(),
         args: vec![],
         env: vec![],
-    };
-    let command = command(&start.workspace)?;
-    crate::acp::start_command(agent, start, wake, command)
+    }
 }
 /// Live catalog probe via `agy acp`, matching KSG's `AntigravityProvider` session discovery.
 pub fn discover(
@@ -940,9 +943,11 @@ pub fn discover(
     wake: rune::Waker,
 ) -> Result<crate::backend::Pi, String> {
     // ACP publishes models and commands once the temporary session is ready.
-    start(
+    crate::acp::start_with_command(
+        agent(),
         crate::harness::Start::discovery("antigravity", workspace),
         wake,
+        command,
     )
 }
 /// KSG `buildAntigravityModelsFromSession`. With a configured gateway model list it
