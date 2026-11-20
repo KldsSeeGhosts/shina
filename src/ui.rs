@@ -110,23 +110,64 @@ pub(crate) use pi_ui::questionnaire_key;
 
 /// Keyboard navigation uses the same server-scoped order as the unified sidebar.
 pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
-    if s.client.is_none() {
-        return s
-            .sidebar_navigation()
-            .into_iter()
-            .map(|index| (s.machines.selected.clone(), s.threads[index].id))
-            .collect();
-    }
+    let entries = sidebar_ui::entries(s);
     let mut rows = Vec::new();
-    let mut settled = 0;
-    for entry in sidebar_ui::entries(s) {
-        if !entry.captain && !entry.visible {
-            continue;
+    for entry in entries.iter().filter(|e| e.captain) {
+        rows.push((entry.server.to_owned(), entry.id));
+    }
+    let ordinary: Vec<_> = entries.iter().filter(|e| !e.captain).collect();
+    for entry in ordinary.iter().copied().filter(|e| e.draft && e.visible) {
+        rows.push((entry.server.to_owned(), entry.id));
+    }
+    let now = lifecycle::now();
+    if !s.search.text.is_empty() {
+        for entry in ordinary.iter().copied().filter(|e| !e.draft && e.visible) {
+            rows.push((entry.server.to_owned(), entry.id));
         }
-        if !entry.captain
-            && lifecycle::section(&entry.life, lifecycle::now()) == Section::Settled
-            && s.search.text.is_empty()
-        {
+        return rows;
+    }
+    if s.sidebar_grouped() {
+        let active_rows: Vec<_> = ordinary
+            .iter()
+            .copied()
+            .filter(|e| {
+                !e.draft
+                    && e.visible
+                    && matches!(
+                        lifecycle::section(&e.life, now),
+                        Section::Pinned | Section::Active
+                    )
+            })
+            .collect();
+        for group in sidebar_ui::groups(s, &active_rows) {
+            let collapsed = s.sidebar_group_collapsed(group.server, group.project);
+            for entry in group.rows {
+                if collapsed && !entry.selected(s) {
+                    continue;
+                }
+                rows.push((entry.server.to_owned(), entry.id));
+            }
+        }
+        for section in [Section::Snoozed, Section::Settled] {
+            let limit = if section == Section::Settled {
+                s.settled_visible
+            } else {
+                usize::MAX
+            };
+            for entry in ordinary
+                .iter()
+                .copied()
+                .filter(|e| !e.draft && e.visible && lifecycle::section(&e.life, now) == section)
+                .take(limit)
+            {
+                rows.push((entry.server.to_owned(), entry.id));
+            }
+        }
+        return rows;
+    }
+    let mut settled = 0;
+    for entry in ordinary.iter().copied().filter(|e| !e.draft && e.visible) {
+        if lifecycle::section(&entry.life, now) == Section::Settled {
             settled += 1;
             if settled > s.settled_visible {
                 continue;
@@ -333,6 +374,10 @@ const fn meta(size: f32) -> TextStyle {
 const META: TextStyle = meta(12.0);
 /// Section labels: KSG's sidebar group headings, sentence case with a little air.
 const META_LABEL: TextStyle = meta(12.0).tracking(0.1);
+/// Inter 13/500, thread titles in the bar and highlighted sidebar rows.
+const TITLE: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
+/// Inter 13/400, quiet read sidebar rows and breadcrumb workspace names.
+const ROW_QUIET: TextStyle = TextStyle::new(13.0, 400.0).lh(19.0).tracking(-0.08);
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
 /// Assistant answers use KSG Code's `.chat-markdown`: `text-sm leading-relaxed`, 14/22.5.
 const PROSE: TextStyle = TextStyle::new(14.0, 400.0).lh(22.5).tracking(-0.10);
@@ -397,7 +442,6 @@ const TIMER: TextStyle = META.features(TABULAR);
 const LABEL: TextStyle = TextStyle::new(14.0, 400.0).tracking(-0.10);
 const SMALL: TextStyle = TextStyle::new(12.0, 400.0);
 /// The project line of a sidebar card.
-const CARD_META: TextStyle = TextStyle::new(13.0, 400.0);
 /// Sidebar rows sit 8 px in from the sidebar's edge, and their content 12 px inside that, so
 /// icons and text share one left edge with the title strip and footer.
 const ROW_INSET: f32 = 12.0;
@@ -732,7 +776,7 @@ fn timer_label(seconds: u64) -> String {
 }
 
 /// The chat pane rounds its top corners and runs square to the window's bottom edge.
-const PANE_CORNERS: [f32; 4] = [6.0, 6.0, 0.0, 0.0];
+const PANE_CORNERS: [f32; 4] = [12.0, 12.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     #[cfg(test)]
@@ -3894,7 +3938,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         .h_full()
         .min_h(0.0)
         .pr(8.0)
-        .gap(2.0);
+        .gap(1.0);
     // One row holds search and the sidebar's actions, as in T3 Code: filter by workspace,
     // add a workspace, and start a thread.
     let scoped = !s.scope_additional.is_empty() || s.project_scope != ProjectScope::All;
@@ -3947,19 +3991,30 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     if let Some(notice) = crew_ui::recovery_banner(s, p) {
         side = side.child(notice);
     }
+    let mut scope_button = toggle_button(
+        "project-scope",
+        &format!("Workspace: {scope_words}"),
+        "filter",
+        scoped,
+        p,
+        |s| s.open_picker(ProjectPicker::Scope),
+    )
+    .help(format!("Workspace: {scope_words}"));
+    if scoped {
+        scope_button = scope_button.fill(p.coral_bg);
+    }
     side = side.child(
         row()
             .key("workspace-context")
-            .h(36.0)
-            .mb(6.0)
-            .pr(4.0)
-            .gap(2.0)
+            .h(32.0)
+            .mb(8.0)
             .center_y()
             .child(
                 row()
                     .key("thread-search-field")
                     .h(32.0)
-                    .px(ROW_INSET)
+                    .pl(10.0)
+                    .pr(4.0)
                     .gap(8.0)
                     .center_y()
                     .radius(8.0)
@@ -3975,7 +4030,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     })
                     .child(icon("search", p.muted))
                     .child(
-                        text_input(&s.search, LABEL)
+                        text_input(&s.search, ROW_QUIET)
                             .key("thread-search")
                             .label("Search conversations")
                             .placeholder("Search", p.muted)
@@ -3984,28 +4039,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                             .grow(1.0)
                             .min_w(0.0)
                             .on_edit(|s: &mut State| &mut s.search),
-                    ),
-            )
-            .child(
-                toggle_button(
-                    "project-scope",
-                    &format!("Workspace: {scope_words}"),
-                    "filter",
-                    scoped,
-                    p,
-                    |s| s.open_picker(ProjectPicker::Scope),
-                )
-                .help(format!("Workspace: {scope_words}")),
-            )
-            .child(project_switcher(s, p).help("Add workspace"))
-            .child(
-                icon_button("new-thread", "New thread", "compose", p, |_| {})
-                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
-                    .help(if s.projects.entries.iter().all(|project| project.hidden) {
-                        "New thread"
-                    } else {
-                        "New thread. Shift-click: in the current workspace"
-                    }),
+                    )
+                    .child(scope_button),
             ),
     );
     if !s.search.text.is_empty() && !s.sidebar_search.unsupported_servers.is_empty() {
@@ -4030,11 +4065,14 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         side = side.child(
             row()
                 .key("scope-chip")
-                .h(28.0)
-                .pl(ROW_INSET)
-                .pr(4.0)
+                .h(24.0)
+                .ml(4.0)
+                .mb(8.0)
+                .px(8.0)
                 .gap(6.0)
                 .center_y()
+                .radius(6.0)
+                .fill(p.selected)
                 .child(icon("folder", p.muted))
                 .child(label(&scope, SMALL, p.ink).truncate().shrink().min_w(0.0))
                 .child(match &scope_machine {
@@ -4042,19 +4080,26 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     None => el(),
                 })
                 .child(spacer())
-                .child(icon_button(
-                    "clear-project-scope",
-                    "Show all workspaces",
-                    "close",
-                    p,
-                    |s| {
-                        s.project_scope = ProjectScope::All;
-                        s.scope_additional.clear();
-                        s.machines.scope_remote.clear();
-                        s.selected_threads.clear();
-                        s.checkpoint();
-                    },
-                )),
+                .child(
+                    row()
+                        .key("clear-project-scope")
+                        .role("button")
+                        .label("Show all workspaces")
+                        .cursor(rune::Cursor::Pointer)
+                        .focusable(true)
+                        .size(16.0, 16.0)
+                        .radius(4.0)
+                        .center()
+                        .hover(p.selected)
+                        .on_press(|s: &mut State| {
+                            s.project_scope = ProjectScope::All;
+                            s.scope_additional.clear();
+                            s.machines.scope_remote.clear();
+                            s.selected_threads.clear();
+                            s.checkpoint();
+                        })
+                        .child(icon("close", p.muted).size(12.0, 12.0)),
+                ),
         );
     }
     if s.show_archive {
@@ -4083,14 +4128,14 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     // that in the same pass that sizes the area, so no earlier frame's measurement (stale on the
     // frame where zoom changes) can make it taller than the area. Its automatic minimum is its
     // own content, so a long list still scrolls.
-    let mut content = col().key("sidebar-content").pb(2.0).gap(2.0).grow(1.0);
+    let mut content = col().key("sidebar-content").pb(2.0).gap(1.0).grow(1.0);
     let entries = sidebar_ui::entries(s);
     let captains: Vec<_> = entries.iter().filter(|entry| entry.captain).collect();
     if !s.show_archive || !captains.is_empty() {
         let mut heading = section_title("Captains", p);
         if !captains.is_empty() {
             heading = heading.child(
-                meta_text(captains.len().to_string(), p.muted)
+                label(captains.len().to_string(), META.features(TABULAR), p.faint)
                     .key("captain-count")
                     .mr(6.0),
             );
@@ -4137,9 +4182,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 // KSG has no retired Captain record. Reuse its sidebar row layout, with
                 // Shina's resting portrait and a read-only Brief rather than a new thread.
                 let server = s.machines.selected.clone();
-                let pixels = s
-                    .artwork
-                    .face_pixels(profile.portrait, face_for(Status::Ready), 40.0);
+                let pixels =
+                    s.artwork
+                        .face_pixels(profile.portrait, face_for(Status::Ready), CAPTAIN_FACE);
                 content = content.child(
                     row()
                         .key(format!("former-captain-{captain}"))
@@ -4147,21 +4192,20 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         .label(format!("{}, former captain", profile.name))
                         .focusable(true)
                         .cursor(rune::Cursor::Pointer)
-                        .min_h(56.0)
+                        .h(40.0)
                         .px(8.0)
                         .gap(10.0)
                         .center_y()
                         .radius(6.0)
                         .hover(p.row)
-                        .child(pixel_portrait(s, &pixels, 40.0, p))
+                        .child(pixel_portrait(s, &pixels, CAPTAIN_FACE, p))
                         .child(
-                            col()
+                            label(&profile.name, CAPTAIN_NAME, p.ink)
+                                .truncate()
                                 .grow(1.0)
-                                .min_w(0.0)
-                                .gap(4.0)
-                                .child(label(&profile.name, CAPTAIN_NAME, p.ink).truncate())
-                                .child(meta_text("Demoted", p.muted)),
+                                .min_w(0.0),
                         )
+                        .child(meta_text("Demoted", p.faint))
                         .on_press(move |s: &mut State| {
                             if s.machines.selected == server
                                 && s.captain_phase(captain) == crate::model::CaptainPhase::Retired
@@ -4176,16 +4220,25 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let all: Vec<_> = entries.iter().filter(|entry| !entry.captain).collect();
     let visible: Vec<_> = all.iter().copied().filter(|entry| entry.visible).collect();
     let dragging = s.drag_thread.is_some();
-    // Omit an empty thread list under captains; without captains it holds the empty state.
-    let listed = if s.search.text.is_empty() {
-        !all.is_empty()
-    } else {
-        !visible.is_empty()
-    };
-    // Threads follow the captains without a heading of their own. The captains' label and a
-    // gap mark where the crews end.
-    if (listed || dragging) && !captains.is_empty() {
-        content = content.child(el().h(12.0));
+    if !s.show_archive {
+        let mut threads_head = section_title("Threads", p).key("threads-heading");
+        if !captains.is_empty() {
+            threads_head = threads_head.mt(8.0);
+        }
+        // Temporary `new-thread` button in the Threads heading until WS1 moves it into
+        // `sidebar_header` (spec §5 Workstream 2), so tests and users never lose it.
+        threads_head = threads_head
+            .child(project_switcher(s, p).help("Add workspace"))
+            .child(
+                icon_button("new-thread", "New thread", "compose", p, |_| {})
+                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
+                    .help(if s.projects.entries.iter().all(|project| project.hidden) {
+                        "New thread"
+                    } else {
+                        "New thread. Shift-click: in the current workspace"
+                    }),
+            );
+        content = content.child(threads_head);
     }
     let drafts: Vec<_> = visible
         .iter()
@@ -4193,9 +4246,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         .filter(|entry| entry.draft)
         .collect();
     if !drafts.is_empty() {
-        if !captains.is_empty() {
-            content = content.child(dotted_rule(p));
-        }
         content = content.child(section_title("Drafts", p));
         for entry in drafts {
             content = content.child(sidebar_ui::row(s, p, entry));
@@ -4211,12 +4261,42 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             content = content.child(sidebar_ui::row(s, p, entry));
         }
     } else {
-        for section in [
-            Section::Pinned,
-            Section::Active,
-            Section::Snoozed,
-            Section::Settled,
-        ] {
+        let grouped = s.sidebar_grouped() && !dragging;
+        if grouped {
+            let active_rows: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    !entry.draft
+                        && entry.visible
+                        && matches!(
+                            lifecycle::section(&entry.life, lifecycle::now()),
+                            Section::Pinned | Section::Active
+                        )
+                })
+                .collect();
+            for group in sidebar_ui::groups(s, &active_rows) {
+                let collapsed = s.sidebar_group_collapsed(group.server, group.project);
+                content = content.child(sidebar_ui::group_header(s, p, &group, collapsed));
+                for entry in group.rows {
+                    if collapsed && !entry.selected(s) {
+                        continue;
+                    }
+                    content = content.child(sidebar_ui::row(s, p, entry));
+                }
+            }
+        }
+        let sections: &[Section] = if grouped {
+            &[Section::Snoozed, Section::Settled]
+        } else {
+            &[
+                Section::Pinned,
+                Section::Active,
+                Section::Snoozed,
+                Section::Settled,
+            ]
+        };
+        for &section in sections {
             let rows: Vec<_> = all
                 .iter()
                 .copied()
@@ -4238,6 +4318,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 // bottom of the sidebar as in T3 Code.
                 if first_shelf {
                     content = content.child(spacer().min_h(12.0));
+                    content = content.child(rule(p).mx(ROW_INSET));
                     first_shelf = false;
                 }
                 let key = format!("shelf-{section:?}");
@@ -4247,7 +4328,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
                 // above Settled, so both stay whole above the footer when the list is longer than
                 // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
-                // The block carries its rule and the sidebar fill, so rows never show through.
+                // The block carries the sidebar fill, so rows never show through.
                 let settled_below = section == Section::Snoozed
                     && (dragging
                         || all.iter().any(|entry| {
@@ -4262,7 +4343,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                         .h(SHELF_HEADING)
                         .fill(p.bg)
                         .sticky_bottom(inset)
-                        .child(dotted_rule(p))
                         .child(
                             row()
                                 .key(&key)
@@ -4270,9 +4350,9 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                 .cursor(rune::Cursor::Pointer)
                                 .label(format!("{title}, {} threads", rows.len()))
                                 .focusable(true)
-                                .h(32.0)
+                                .h(SHELF_HEADING)
                                 .pl(ROW_INSET)
-                                .pr(8.0)
+                                .pr(4.0)
                                 .gap(6.0)
                                 .center_y()
                                 .radius(6.0)
@@ -4284,10 +4364,24 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                     s.shelves[shelf] = !s.shelves[shelf];
                                     s.checkpoint();
                                 })
-                                .child(meta_label(&title, p.muted))
+                                .child(meta_label(&title, p.faint))
                                 .child(spacer())
-                                .child(meta_text(rows.len().to_string(), p.muted))
-                                .child(icon(if open { "chevron" } else { "open" }, p.muted)),
+                                .child(label(
+                                    rows.len().to_string(),
+                                    META.features(TABULAR),
+                                    p.faint,
+                                ))
+                                .child(
+                                    icon(
+                                        if open {
+                                            "chevron-down"
+                                        } else {
+                                            "chevron-right"
+                                        },
+                                        p.faint,
+                                    )
+                                    .size(12.0, 12.0),
+                                ),
                         ),
                 );
             } else if dragging {
@@ -4416,8 +4510,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         row()
             .key("sidebar-footer")
             .h(40.0)
-            .pl(8.0)
-            .gap(6.0)
+            .px(4.0)
+            .gap(2.0)
             .center_y()
             .child(
                 toggle_button(
@@ -5111,30 +5205,22 @@ fn update_result_notice(notice: &crate::fleet_update::ResultNotice, p: Palette) 
 /// A sidebar section label: Inter 12/500, sentence case, muted. Counts and buttons follow it.
 fn section_title(title: &str, p: Palette) -> El {
     row()
-        .h(30.0)
+        .h(28.0)
         .pl(ROW_INSET)
         .pr(4.0)
         .center_y()
-        .child(meta_label(title, p.muted))
+        .child(meta_label(title, p.faint))
         .child(spacer())
 }
-/// The dotted divider (2 px on, 2 px off) between sidebar sections.
-/// A shelf heading's block: its dotted rule (1 px and 4 px either side) and the 32 px row.
-const SHELF_HEADING: f32 = 41.0;
-fn dotted_rule(p: Palette) -> El {
-    el().h(1.0)
-        .mx(ROW_INSET)
-        .my(4.0)
-        .border(1.0, p.line)
-        .border_dash(2.0, 2.0)
-        .a11y_hidden()
-}
-/// A selected sidebar row: KSG's rounded `row` fill with a hairline. Hover is a fill only.
-fn select_bar(item: El, selected: bool, p: Palette) -> El {
+/// A shelf heading's height.
+const SHELF_HEADING: f32 = 28.0;
+/// A selected sidebar row: KSG's `row` fill; light theme adds a hairline border.
+fn select_bar(item: El, selected: bool, dark: bool, p: Palette) -> El {
     if !selected {
         return item;
     }
-    item.fill(p.row).radius(8.0).border(1.0, p.line)
+    let bar = item.fill(p.row).radius(6.0);
+    if dark { bar } else { bar.border(1.0, p.line) }
 }
 fn face_for(status: Status) -> crate::visuals::Face {
     use crate::visuals::Face;
@@ -5187,9 +5273,9 @@ fn portrait_face(
 /// points is a whole number of device pixels per cell at every integer window scale.
 const PICKER_PORTRAIT: f32 = 40.0;
 /// Every machine uses the same portrait size, including before a captain is selected.
-const CAPTAIN_SLOT: f32 = 44.0;
-/// A sidebar portrait is 40 px inside its 44 px slot.
-const CAPTAIN_FACE: f32 = 40.0;
+const CAPTAIN_SLOT: f32 = 28.0;
+/// A sidebar portrait is 28 px inside its 28 px slot (head crop below 30 pt).
+const CAPTAIN_FACE: f32 = 28.0;
 /// Room for one badge at the end of the name line, kept even when there is none, so a
 /// badge arriving never moves the name.
 /// The widest a machine name and its connection note grow beside a workspace or a detail.
@@ -5197,14 +5283,11 @@ const MACHINE_CAP: f32 = 110.0;
 /// The least room left for a machine's name beside the workspace. Under it the tag is the icon
 /// alone, because a name cut to two letters and an ellipsis says nothing.
 const MACHINE_NAME_ROOM: f32 = 32.0;
-const BADGE_SLOT: f32 = 28.0;
 /// What a captain row spends beside its text: left padding, the portrait slot, the gap and the
 /// right padding.
-const CAPTAIN_TEXT_INSET: f32 = 6.0 + CAPTAIN_SLOT + 10.0 + 8.0;
-/// Room for "59m 59s" at the end of the status line.
-const TIMER_SLOT: f32 = 48.0;
-const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 600.0).tracking(-0.15);
-const CAPTAIN_STATUS: TextStyle = TextStyle::new(13.0, 500.0);
+const CAPTAIN_TEXT_INSET: f32 = 8.0 + CAPTAIN_SLOT + 10.0 + 8.0;
+const CAPTAIN_NAME: TextStyle = TITLE;
+const CAPTAIN_STATUS: TextStyle = SMALL;
 
 /// A sidebar portrait. It plays its status's animation strip through the shared stage in
 /// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
@@ -5240,7 +5323,6 @@ fn sidebar_portrait(
 #[derive(Clone, Copy)]
 pub(crate) enum CountKind {
     NeedsYou,
-    Unread,
 }
 
 fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
@@ -5251,7 +5333,6 @@ fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
     };
     let (fill, ink, frame) = match kind {
         CountKind::NeedsYou => (p.brass, p.on_brass, p.frame),
-        CountKind::Unread => (p.card, p.ink, p.frame),
     };
     // A square with Inter digits and a 1 px frame, no shadow.
     row()
@@ -5306,36 +5387,15 @@ fn captain_row(
     let running: Vec<&Thread> = family().filter(|t| t.status == Status::Running).collect();
     let requests = family().filter(|t| t.request.is_some()).count();
     let unread = family().filter(|t| t.unread()).count();
-    let plural = |n: usize, one: &str| {
-        if n == 1 {
-            format!("1 {one}")
-        } else {
-            format!("{n} {one}s")
-        }
+    let workspace = row_workspace(s, thread);
+    let crew_count = s.captain_worker_count(id);
+    let detail = if let Some(workspace) = &workspace {
+        workspace.clone()
+    } else if crew_count > 0 {
+        format!("{crew_count} crew")
+    } else {
+        String::new()
     };
-    let mut detail = match status {
-        Status::Running => plural(running.len().max(1), "thread"),
-        Status::Waiting if approval => "approval".into(),
-        Status::Waiting if requests > 0 => "a question".into(),
-        _ => {
-            let mut parts = vec![];
-            if thread.renamed {
-                parts.push(thread.title.clone());
-            }
-            let count = s.captain_worker_count(id);
-            if count > 0 {
-                parts.push(format!("{count} crew"));
-            }
-            parts.join(", ")
-        }
-    };
-    if let Some(workspace) = row_workspace(s, thread) {
-        detail = if detail.is_empty() {
-            workspace
-        } else {
-            format!("{detail}, {workspace}")
-        };
-    }
     let timer = (status == Status::Running)
         .then(|| running.iter().filter_map(|t| t.started).min())
         .flatten();
@@ -5343,110 +5403,57 @@ fn captain_row(
         .captain
         .is_some_and(|captain| s.captain_phase(captain) == crate::model::CaptainPhase::Archived);
     let status_label = if archived { "Archived" } else { status.label() };
-    let status_ink = if archived {
-        p.muted
-    } else {
-        status_ink(status, p)
-    };
-    let mut status_line = row()
+    let mut trailing = row()
         .key(format!("captain-status-{id}"))
-        .h(18.0)
-        .gap(8.0)
-        .center_y()
-        .child(meta_text(status_label, status_ink).key(format!("captain-state-{id}")));
-    if !detail.is_empty() {
-        status_line = status_line.child(
-            label(detail.clone(), CAPTAIN_STATUS, p.muted)
-                .key(format!("captain-detail-{id}"))
-                .truncate()
-                .shrink()
-                .min_w(workspace_floor(
-                    sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                    // The status word, three gaps, the machine icon and the timer slot.
-                    status_label.chars().count() as f32 * 6.6
-                        + 24.0
-                        + if multiple_machines(s) { ICON } else { 0.0 }
-                        + if timer.is_some() { TIMER_SLOT } else { 0.0 },
-                    &detail,
-                ))
-                .beside_tag(
-                    multiple_machines(s),
-                    sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                    status_label.chars().count() as f32 * 6.6
-                        + 24.0
-                        + ICON
-                        + if timer.is_some() { TIMER_SLOT } else { 0.0 },
-                    &detail,
-                ),
-        );
-    }
-    if multiple_machines(s) {
-        status_line = status_line.child(machine_tag(
-            s,
-            p,
-            &s.machines.selected,
-            format!("captain-machine-{id}"),
-            CAPTAIN_STATUS,
-            room_for_machine_name(
-                sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-                status_label.chars().count() as f32 * 6.6
-                    + 24.0
-                    + ICON
-                    + if timer.is_some() { TIMER_SLOT } else { 0.0 },
-                &detail,
-            ),
-        ));
-    }
-    // The machine sits 8 px after the workspace; the free space comes after it.
-    status_line = status_line.child(spacer());
-    if let Some(start) = timer {
-        status_line = status_line.child(
-            label(
-                elapsed_label(start.elapsed().as_secs()),
-                META.features(TABULAR),
-                p.muted,
-            )
-            .key(format!("captain-timer-{id}"))
-            .w(TIMER_SLOT)
-            .align(rune::Align::End),
-        );
-    }
-    let badge = if requests > 0 || status == Status::Waiting {
-        Some(
-            count_pill(requests.max(1), CountKind::NeedsYou, p)
-                .key(format!("captain-attention-{id}")),
-        )
-    } else if unread > 0 {
-        Some(count_pill(unread, CountKind::Unread, p).key(format!("captain-unread-{id}")))
-    } else {
-        None
-    };
-    let mut badges = row()
-        .key(format!("captain-badges-{id}"))
-        .w(BADGE_SLOT)
-        .h(18.0)
-        .center_y()
-        .child(spacer());
-    if let Some(badge) = badge {
-        badges = badges.child(badge);
-    }
-    let name_line = row()
         .h(20.0)
         .gap(6.0)
-        .center_y()
-        .child(
-            label(name, CAPTAIN_NAME, p.ink)
-                .key(format!("captain-name-{id}"))
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
-        )
-        .child(badges);
+        .center_y();
+    if requests > 0 || status == Status::Waiting {
+        trailing = trailing.child(
+            count_pill(requests.max(1), CountKind::NeedsYou, p)
+                .key(format!("captain-attention-{id}")),
+        );
+    } else if status == Status::Running {
+        trailing = trailing.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
+        if let Some(start) = timer {
+            trailing = trailing.child(
+                label(
+                    elapsed_label(start.elapsed().as_secs()),
+                    META.features(TABULAR),
+                    p.muted,
+                )
+                .key(format!("captain-timer-{id}")),
+            );
+        }
+    } else if unread > 0 {
+        trailing = trailing.child(
+            el().key(format!("captain-unread-{id}"))
+                .size(6.0, 6.0)
+                .radius(3.0)
+                .fill(p.sea)
+                .a11y_hidden(),
+        );
+    } else if status == Status::Failed {
+        trailing = trailing
+            .child(el().size(6.0, 6.0).radius(3.0).fill(p.danger).a11y_hidden())
+            .child(meta_text("Failed", p.danger));
+    }
     let size = CAPTAIN_FACE;
     let portrait = captain_portrait(s, thread.captain);
+    let portrait_el = sidebar_portrait(s, p, id, portrait, size, status);
+    let portrait_el = if requests > 0 || status == Status::Waiting {
+        status_badge(p, portrait_el, size, Status::Waiting)
+    } else {
+        portrait_el
+    };
     let (hover, active) = row_washes(s, p);
     let curve = |seconds| rune::Curve::tween(seconds, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
-    let mut description = format!("{name}, {}", status.label());
+    let mut description = format!("{name}, {}", status_label.to_lowercase());
+    if requests > 0 && approval {
+        description.push_str(&format!(", {requests} approval"));
+    } else if requests > 0 {
+        description.push_str(&format!(", {requests} question"));
+    }
     if !detail.is_empty() {
         description.push_str(&format!(", {detail}"));
     }
@@ -5456,45 +5463,84 @@ fn captain_row(
     if unread > 0 {
         description.push_str(&format!(", {unread} unread"));
     }
+    let show_detail = sidebar_row_width(s) >= 224.0 && !detail.is_empty();
+    let show_machine_name = sidebar_row_width(s) >= 232.0
+        && room_for_machine_name(
+            sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
+            ICON + 48.0,
+            &detail,
+        );
+    let mut content = row()
+        .grow(1.0)
+        .min_w(0.0)
+        .h(40.0)
+        .pl(8.0)
+        .pr(8.0)
+        .gap(10.0)
+        .center_y()
+        .child(
+            el().key(format!("portrait-slot-{id}"))
+                .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
+                .center()
+                .child(portrait_el),
+        )
+        .child(
+            label(name, CAPTAIN_NAME, p.ink)
+                .key(format!("captain-name-{id}"))
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+    if show_detail {
+        content = content.child(
+            label(detail, CAPTAIN_STATUS, p.faint)
+                .key(format!("thread-workspace-{id}"))
+                .truncate()
+                .shrink()
+                .min_w(0.0),
+        );
+    }
+    if multiple_machines(s) {
+        content = content.child(machine_tag(
+            s,
+            p,
+            &s.machines.selected,
+            format!("captain-machine-{id}"),
+            CAPTAIN_STATUS,
+            show_machine_name,
+        ));
+    }
+    content = content.child(spacer()).child(trailing);
     select_bar(
-        item.label(description)
+        item.label(description.clone())
+            .help(description)
             .radius(6.0)
             .fill(Color::TRANSPARENT)
             .hover(hover)
             .press(active)
             .hover_motion(curve(0.15), curve(0.2)),
         selected,
+        s.dark,
         p,
     )
-    .child(
-        row()
-            .grow(1.0)
-            .min_w(0.0)
-            .h(CAPTAIN_SLOT + 12.0)
-            .pl(6.0)
-            .pr(8.0)
-            .gap(10.0)
-            .center_y()
-            .child(
-                el().key(format!("portrait-slot-{id}"))
-                    .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
-                    .center()
-                    .child(sidebar_portrait(s, p, id, portrait, size, status)),
-            )
-            .child(
-                col()
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .gap(1.0)
-                    .child(name_line)
-                    .child(status_line),
-            ),
-    )
+    .child(content)
 }
 
 /// The corner mark that shows a portrait's status in pickers and headers.
 fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
-    if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
+    status_badge_keyed(p, portrait, size, status, None)
+}
+
+fn status_badge_keyed(
+    p: Palette,
+    portrait: El,
+    size: f32,
+    status: Status,
+    mark_key: Option<String>,
+) -> El {
+    let show_mark =
+        matches!(status, Status::Running | Status::Waiting | Status::Failed) || mark_key.is_some();
+    if show_mark {
         // A small square in the panel color, with a 1 px frame, keeps the mark readable over
         // the artwork. Every live avatar sits on the panel (chat turns, the hero, the brief).
         let (backing, mark) = if size <= 16.0 {
@@ -5505,6 +5551,10 @@ fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
             (10.0, 7.0)
         };
         let offset = size - backing + 2.0;
+        let mut dot = status_mark(status, p, mark);
+        if let Some(key) = mark_key {
+            dot = dot.key(key);
+        }
         return el().size(size, size).child(portrait).child(
             el().absolute(offset, offset)
                 .size(backing, backing)
@@ -5512,7 +5562,7 @@ fn status_badge(p: Palette, portrait: El, size: f32, status: Status) -> El {
                 .fill(p.panel)
                 .border(1.0, p.frame)
                 .center()
-                .child(status_mark(status, p, mark))
+                .child(dot)
                 .a11y_hidden(),
         );
     }
@@ -5776,51 +5826,77 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
     if captain_home && !worker {
         return captain_row(s, p, thread, item, row_status, approval, selected);
     }
-    let item = select_bar(item, selected, p);
+    let item = select_bar(item, selected, s.dark, p);
 
-    // The mark only shows what deserves a glance: work in progress, something that needs the
-    // user, a failure, an unread result, a draft or a pin. Quiet rows leave it out.
-    let dot = |ink: Color| el().size(6.0, 6.0).radius(3.0).fill(ink);
-    let mark = if approval || thread.request.is_some() || row_status == Status::Waiting {
-        Some(dot(p.brass))
-    } else if row_status == Status::Running || row_status == Status::Failed {
-        Some(status_mark(row_status, p, 7.0))
-    } else if thread.unread() || thread.life.woke(at) {
-        Some(dot(p.sea))
-    } else if draft {
-        Some(icon("edit", p.muted))
-    } else if thread.pinned() && !worker {
-        Some(icon("pin", p.muted))
-    } else {
-        // Interrupted and queued workers carry their chip's mark, so they never look finished.
-        worker
-            .then(|| crew_ui::worker_task_mark(s, thread))
-            .flatten()
-            .map(|status| status_mark(status, p, 7.0).key(format!("worker-task-mark-{id}")))
-    }
-    .map(|mark| {
-        let mark = el().size(14.0, 16.0).center().child(mark.a11y_hidden());
-        if worker && (thread.actionable() || thread.unread()) {
-            mark.key(format!("worker-alert-{id}"))
-        } else {
-            mark
-        }
-    });
-    let quiet = !selected && !thread.unread() && !thread.actionable();
     let shelved = matches!(section, Section::Snoozed | Section::Settled) && !captain_home;
+    let grouped = s.sidebar_grouped() && !shelved && !worker;
+    let dot = |ink: Color| el().size(6.0, 6.0).radius(3.0).fill(ink);
+    let project = s.project(thread.project);
+    // Lead slot (16x16): in Workspace grouping, show only status/unread/pin/draft marks so
+    // titles align under the group name; in Recent grouping, search, shelves, or worker rows,
+    // show the 16 pt project tile or captain portrait with any status badge overlaid.
+    let lead_content = if grouped {
+        if approval || thread.request.is_some() || row_status == Status::Waiting {
+            Some(status_mark(Status::Waiting, p, 7.0).a11y_hidden())
+        } else if row_status == Status::Running || row_status == Status::Failed {
+            Some(status_mark(row_status, p, 7.0).a11y_hidden())
+        } else if thread.unread() || thread.life.woke(at) {
+            Some(dot(p.sea).a11y_hidden())
+        } else if thread.pinned() {
+            Some(icon("pin", p.faint).size(12.0, 12.0).a11y_hidden())
+        } else if draft {
+            Some(icon("edit", p.faint).size(12.0, 12.0).a11y_hidden())
+        } else {
+            None
+        }
+    } else if worker {
+        let captain = thread.crew_captain;
+        let portrait = captain_portrait(s, captain);
+        let face = face_for(row_status);
+        let pixels = s.artwork.face_pixels(portrait, face, 16.0);
+        let base = pixel_portrait(s, &pixels, 16.0, p)
+            .key(format!("worker-captain-portrait-{id}"))
+            .a11y_hidden();
+        let task_mark = crew_ui::worker_task_mark(s, thread);
+        let badge_status = task_mark.unwrap_or(row_status);
+        let mark_key = if thread.actionable() || thread.unread() {
+            Some(format!("worker-alert-{id}"))
+        } else if task_mark.is_some() {
+            Some(format!("worker-task-mark-{id}"))
+        } else {
+            None
+        };
+        Some(status_badge_keyed(p, base, 16.0, badge_status, mark_key))
+    } else {
+        let tile = project_tile(s, p, project, 16.0);
+        Some(status_badge(p, tile, 16.0, row_status))
+    };
+    let lead = el()
+        .size(16.0, 16.0)
+        .center()
+        .child(lead_content.unwrap_or_else(el));
+    let highlighted = selected
+        || row_status == Status::Running
+        || row_status == Status::Waiting
+        || approval
+        || thread.request.is_some()
+        || thread.life.woke(at)
+        || thread.unread();
+    let (title_style, title_ink) = if shelved {
+        (ROW_QUIET, p.faint)
+    } else if highlighted {
+        (TITLE, p.ink)
+    } else {
+        (ROW_QUIET, p.muted)
+    };
     let title = label(
         if draft && !thread.draft.text.trim().is_empty() {
             thread.draft.text.lines().next().unwrap_or(&thread.title)
         } else {
             &thread.title
         },
-        if shelved {
-            LABEL
-        } else {
-            TextStyle::new(14.0, 500.0).tracking(-0.10)
-        },
-        // Settled and snoozed rows recede.
-        if quiet && shelved { p.muted } else { p.ink },
+        title_style,
+        title_ink,
     )
     .truncate()
     .grow(1.0)
@@ -5903,7 +5979,10 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
                     s.checkpoint();
                 }),
         );
-    } else if !state_label.is_empty() {
+    } else if matches!(
+        state_label,
+        "Approval" | "Input" | "Working" | "Waiting" | "Failed"
+    ) {
         let ink = if approval || row_status == Status::Waiting {
             p.brass
         } else if thread.status == Status::Failed {
@@ -5911,11 +5990,9 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
         } else {
             p.sea
         };
-        // A working row counts up, as T3 Code's status slot does.
+        // Working shows the timer alone without the word "Working" (spec §2.7).
         let text = match (state_label, thread.started) {
-            ("Working", Some(start)) => {
-                format!("Working {}", elapsed_label(start.elapsed().as_secs()))
-            }
+            ("Working", Some(start)) => elapsed_label(start.elapsed().as_secs()),
             _ => state_label.to_string(),
         };
         slot = slot.child(label(text, META.features(TABULAR), ink));
@@ -5929,129 +6006,31 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
             _ => relative_time(thread.updated),
         };
         if let Some(time) = time {
-            slot = slot.child(meta_text(time, p.muted).key(format!("thread-age-{id}")));
+            slot = slot.child(
+                label(time, META.features(TABULAR), p.faint).key(format!("thread-age-{id}")),
+            );
         }
     }
     if thread.machine != "local" {
         slot = slot.child(icon("cloud", p.muted));
     }
 
-    let project = s.project(thread.project);
-    // Pins and drafts lead the line, as T3 Code puts its pin before the project icon.
-    let lead = |line: El| match &mark {
-        Some(_) if thread.pinned() || draft || worker => line.child(mark.clone().unwrap()),
-        _ => line,
-    };
-
-    // Snoozed and settled rows stay one line inside their shelves.
-    if shelved {
-        // The title truncates 8 px before the status slot. The slot never shrinks and keeps its
-        // content at its right edge, so an age is a whole word, not a sliver.
-        let line = lead(
-            row()
-                .h(34.0)
-                .grow(1.0)
-                .min_w(0.0)
-                .px(ROW_INSET)
-                .gap(8.0)
-                .center_y(),
-        )
-        .child(project_tile(s, p, project, 16.0))
-        .child(title)
-        .child(slot.min_w(SHELF_SLOT).justify_end());
-        return item.child(line);
-    }
-
-    // A thread card, as T3 Code lays it out: the project's icon and name with the status on
-    // the right, then the title. A worker carries its captain's portrait and name where the
-    // project tile sits, so the flat row still says whose crew it belongs to.
-    let (tile, meta_name) = if worker {
-        let captain = thread.crew_captain;
-        let name = captain
-            .and_then(|c| s.captains.get(c))
-            .map(|c| c.name.as_str())
-            .unwrap_or("Crew")
-            .to_string();
-        let portrait = captain_portrait(s, captain);
-        let face = face_for(row_status);
-        let pixels = s.artwork.face_pixels(portrait, face, 16.0);
-        (
-            pixel_portrait(s, &pixels, 16.0, p)
-                .key(format!("worker-captain-portrait-{id}"))
-                .a11y_hidden(),
-            name,
-        )
-    } else {
-        (
-            project_tile(s, p, project, 16.0),
-            project
-                .map(|project| project.name.clone())
-                .unwrap_or_else(|| "No workspace".into()),
-        )
-    };
-    let top = lead(row().h(18.0).gap(8.0).center_y())
-        .child(tile)
-        .child(
-            // The workspace and, on a linked machine, the machine: two labels, not one joined.
-            row()
-                .grow(1.0)
-                .min_w(0.0)
-                .gap(8.0)
-                .center_y()
-                .child(
-                    label(meta_name.clone(), CARD_META, p.muted)
-                        .key(format!("thread-workspace-{id}"))
-                        .truncate()
-                        .shrink()
-                        .min_w(0.0)
-                        .beside_tag(
-                            multiple_machines(s),
-                            sidebar_row_width(s) - 2.0 * ROW_INSET,
-                            16.0 + ICON
-                                + slot_width(match state_label {
-                                    "" => None,
-                                    "Working" => Some("Working 59m 59s"),
-                                    other => Some(other),
-                                })
-                                + 32.0,
-                            &meta_name,
-                        ),
-                )
-                .child(if multiple_machines(s) {
-                    // The age or the status word, widest while it counts up.
-                    let slot = match state_label {
-                        "" => None,
-                        "Working" => Some("Working 59m 59s"),
-                        other => Some(other),
-                    };
-                    machine_tag(
-                        s,
-                        p,
-                        &s.machines.selected,
-                        format!("thread-machine-{id}"),
-                        CARD_META,
-                        room_for_machine_name(
-                            sidebar_row_width(s) - 2.0 * ROW_INSET,
-                            16.0 + ICON + slot_width(slot) + 32.0,
-                            &meta_name,
-                        ),
-                    )
-                } else {
-                    el()
-                })
-                // The machine sits 8 px after the workspace; the free space comes after it.
-                .child(spacer()),
-        )
-        .child(slot);
-    let mut card = col()
+    // One-line 32 pt slim row (KSG Code's `SidebarThreadRow` slim variant, spec §2.7).
+    let line = row()
+        .h(32.0)
         .grow(1.0)
         .min_w(0.0)
-        .px(ROW_INSET)
-        .pt(9.0)
-        .pb(10.0)
-        .gap(5.0)
-        .child(top)
-        .child(row().child(title));
+        .pl(ROW_INSET)
+        .pr(8.0)
+        .gap(8.0)
+        .center_y()
+        .child(lead)
+        .child(title)
+        .child(if shelved {
+            slot.min_w(SHELF_SLOT).justify_end()
+        } else {
+            slot
+        });
     if !shelved
         && !s.search.text.is_empty()
         && !s.thread_title_search_matches(thread)
@@ -6060,16 +6039,18 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
             .visible_matches
             .get(&(s.machines.selected.clone(), id))
     {
-        card = card.child(search_snippet_el(
-            &s.machines.selected,
-            id,
-            &hit.snippet,
-            &s.search.text,
-            p.muted,
-            p.brass,
+        return item.child(col().grow(1.0).min_w(0.0).pb(6.0).child(line).child(
+            el().pl(ROW_INSET + 24.0).pr(8.0).child(search_snippet_el(
+                &s.machines.selected,
+                id,
+                &hit.snippet,
+                &s.search.text,
+                p.muted,
+                p.brass,
+            )),
         ));
     }
-    item.child(card)
+    item.child(line)
 }
 
 pub(super) fn search_snippet_el(
@@ -6096,7 +6077,7 @@ pub(super) fn search_snippet_el(
 }
 
 /// The least width of a shelved row's status slot: room for "10m" and "1d".
-const SHELF_SLOT: f32 = 40.0;
+const SHELF_SLOT: f32 = 32.0;
 /// Tile colours for projects without an icon. Each project keeps one by its name.
 const PROJECT_HUES: [&str; 6] = [
     "#6E8FE8", "#4FA58A", "#9A7BDD", "#C99A32", "#CF6A8C", "#3E9DBF",
@@ -6194,12 +6175,6 @@ fn sidebar_row_width(s: &State) -> f32 {
     sidebar - 8.0
 }
 
-/// About how wide a status or age slot is: 12 px Inter figures of about 6.6 pt, with room for
-/// "1m" when the row shows nothing.
-fn slot_width(text: Option<&str>) -> f32 {
-    text.map_or(14.0, |text| text.chars().count() as f32 * 6.6)
-}
-
 /// About how wide `text` is at the sidebar's 13 px.
 pub(super) fn text_width(text: &str) -> f32 {
     text.chars().count() as f32 * 6.2
@@ -6251,23 +6226,6 @@ fn machine_tag(
         );
     }
     tag
-}
-
-/// A workspace name before a machine tag. When it is estimated to truncate it grows into the
-/// row's real leftover space and keeps 2 px more after its ellipsis, 10 px from the tag in
-/// all; otherwise it keeps its own width and the tag follows 8 px later. `taken` counts the
-/// row's other items and the machine icon, as `room_for_machine_name` does.
-pub(super) trait BesideTag {
-    fn beside_tag(self, machine: bool, row: f32, taken: f32, workspace: &str) -> Self;
-}
-impl BesideTag for El {
-    fn beside_tag(self, machine: bool, row: f32, taken: f32, workspace: &str) -> El {
-        if machine && text_width(workspace) > row - taken {
-            self.grow(1.0).mr(2.0)
-        } else {
-            self
-        }
-    }
 }
 
 /// Whether a row has 36 points to spare for a machine name after its other items and the
@@ -8758,6 +8716,35 @@ fn project_picker(s: &State, p: Palette) -> El {
         )
         // No hairline under the search box: its own frame already ends the field.
         .child(el().h(4.0));
+    if mode == ProjectPicker::Scope {
+        let grouped = s.sidebar_grouping == crate::model::SidebarGrouping::Workspace;
+        card = card
+            .child(
+                row()
+                    .key("group-by-workspace")
+                    .role("switch")
+                    .checked(grouped)
+                    .label("Group by workspace")
+                    .cursor(rune::Cursor::Pointer)
+                    .focusable(true)
+                    .h(34.0)
+                    .mx(4.0)
+                    .pl(12.0)
+                    .pr(10.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(6.0)
+                    .hover(p.selected)
+                    .on_press(|s: &mut State| s.toggle_sidebar_grouping())
+                    .child(
+                        label("Group by workspace", TITLE, p.ink)
+                            .grow(1.0)
+                            .min_w(0.0),
+                    )
+                    .child(switch_track(grouped, p)),
+            )
+            .child(rule(p).mx(8.0).my(2.0));
+    }
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
@@ -19248,7 +19235,6 @@ pub(crate) mod tests {
                 rt.frame(0.0);
                 rt.frame(1.0);
                 let mut checked = 0;
-                let mut named = 0;
                 for entry in sidebar_ui::entries(&rt.state) {
                     let key = |kind: &str| format!("{kind}-{}-{}", entry.server, entry.id);
                     let Some((row, _)) = rt.presented(&key("machine-thread")) else {
@@ -19305,17 +19291,14 @@ pub(crate) mod tests {
                         workspace[0] + workspace[2] <= tag[0] + 0.5,
                         "{width}/{sidebar_width}: the workspace runs into the machine tag"
                     );
-                    if tag[2] > ICON + 14.0 {
-                        named += 1;
-                    }
                     checked += 1;
                 }
-                assert!(checked > 0, "{width}/{sidebar_width}: no fleet rows");
-                // Where the sidebar is the default width or wider, rows say which machine.
+                // Detail labels hide below 224 pt of row width (spec §2.10), so only sidebars
+                // with room show workspace + machine pairs on captain rows.
                 if sidebar_row_width(&rt.state) >= 224.0 {
                     assert!(
-                        named * 2 >= checked,
-                        "{width}/{sidebar_width}: only {named} of {checked} rows name their machine"
+                        checked > 0,
+                        "{width}/{sidebar_width}: no fleet captain rows"
                     );
                 }
             }
@@ -20533,9 +20516,15 @@ pub(crate) mod tests {
     fn diff_tree_lays_out_reveals_and_virtualizes_at_all_widths() {
         use crate::right_panel::SingletonKind;
         // At 960 px the docked panel squeezes to ~362 px for the conversation's
-        // 360 px reserve — under the tree's 416 px lane minimum, so the tree
-        // and its toggle hide outright (KSG's implied threshold).
-        let mut rt = runtime(960.0);
+        // With the Inspector covering at 960 pt (spec §3.3), the diff lane is wide enough
+        // to fit the file tree; below 416 px it hides outright.
+        let mut rt = Runtime::with_text(
+            State::new(".".into(), false),
+            view,
+            (400.0, 720.0),
+            Env::new(false, 1.0),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+        );
         let key = rt.state.panel_key();
         rt.state.right_panels.open(&key, SingletonKind::Diff);
         rt.state.diffs.insert(
@@ -20553,10 +20542,13 @@ pub(crate) mod tests {
         rt.frame(0.5);
         rt.frame(0.5);
         assert!(rt.presented("diff-rows").is_some());
-        assert!(rt.presented("diff-tree").is_none(), "tree hides at 960");
+        assert!(
+            rt.presented("diff-tree").is_none(),
+            "tree hides below 416 px"
+        );
         assert!(
             rt.presented("diff-tree-toggle").is_none(),
-            "toggle hides at 960"
+            "toggle hides below 416 px"
         );
 
         for width in [1280.0, 1920.0] {
@@ -20763,7 +20755,13 @@ pub(crate) mod tests {
                 "{width}"
             );
             assert!(rt.presented("right-panel").is_some(), "{width}");
-            press(&mut rt, "header-diff");
+            if width < 1050.0 {
+                // While chat-header still sits inside chat-main (before WS1 moves it to top-bar),
+                // a covering Inspector covers chat-header; close via the panel's own close button.
+                press(&mut rt, "right-panel-close");
+            } else {
+                press(&mut rt, "header-diff");
+            }
             rt.frame(0.5);
             assert!(
                 rt.presented("right-panel").is_none(),
@@ -20777,7 +20775,11 @@ pub(crate) mod tests {
                     press(&mut rt, "header-right-panel");
                     rt.frame(0.5);
                     assert!(rt.presented("right-panel").is_some(), "{width}");
-                    press(&mut rt, "header-right-panel");
+                    if width < 1050.0 {
+                        press(&mut rt, "right-panel-close");
+                    } else {
+                        press(&mut rt, "header-right-panel");
+                    }
                     rt.frame(0.5);
                     assert!(rt.presented("right-panel").is_none(), "{width}");
                 }
@@ -24045,7 +24047,7 @@ pub(crate) mod tests {
                     age[2]
                 );
                 assert!(
-                    (age[0] + age[2] - (row[0] + row[2] - ROW_INSET)).abs() <= 2.5,
+                    (age[0] + age[2] - (row[0] + row[2] - 8.0)).abs() <= 2.5,
                     "{width}/{id}: the age {age:?} is not at the row's right edge {row:?}"
                 );
                 checked += 1;
@@ -24442,7 +24444,7 @@ pub(crate) mod tests {
                     let tag = if let Some(rest) = key.strip_prefix("captain-detail-") {
                         format!("captain-machine-{rest}")
                     } else if let Some(rest) = key.strip_prefix("thread-workspace-") {
-                        format!("thread-machine-{rest}")
+                        format!("captain-machine-{rest}")
                     } else if let Some(rest) = key.strip_prefix("machine-detail-") {
                         format!("machine-tag-{rest}")
                     } else if let Some(rest) = key.strip_prefix("machine-workspace-") {
@@ -24454,14 +24456,16 @@ pub(crate) mod tests {
                     let workspace = e.rect;
                     let gap = tag[0] - (workspace[0] + workspace[2]);
                     let at = format!("width {width}, sidebar {sidebar}, {key}");
-                    // Exactly 8 px, or 10 when the name truncates.
+                    // Captain row uses 10 px gap between detail and machine tag.
                     assert!(
-                        (gap - 8.0).abs() < 0.5 || (gap - 10.0).abs() < 0.5,
+                        (gap - 10.0).abs() < 0.5,
                         "{at}: {gap} px between {workspace:?} and {tag:?}"
                     );
                     pairs += 1;
                 }
-                assert!(pairs >= 4, "width {width}, sidebar {sidebar}: {pairs} rows");
+                if sidebar_row_width(&rt.state) >= 224.0 {
+                    assert!(pairs >= 1, "width {width}, sidebar {sidebar}: {pairs} rows");
+                }
             }
         }
     }
@@ -27899,12 +27903,9 @@ pub(crate) mod tests {
         assert!(rt.find("crew-rail-1").is_none());
         rt.state.search.replace_text("Delegated");
         rt.frame(0.0);
-        // The matching worker lists flat under its own match, named by its captain.
+        // The matching worker lists flat under its own match with its captain's portrait.
         assert!(rt.presented("thread-2").is_some());
-        assert_eq!(
-            element_text(&rt, "thread-workspace-2").as_deref(),
-            Some("Sable")
-        );
+        assert!(rt.presented("worker-captain-portrait-2").is_some());
         let (parent, _) = rt.presented("thread-1").unwrap();
         let (child, _) = rt.presented("thread-2").unwrap();
         assert!(child[1] > parent[1]);
@@ -31073,7 +31074,6 @@ pub(crate) mod tests {
 
     #[test]
     fn captain_status_stays_inside_its_row_and_never_moves_siblings() {
-        let mut status_widths = vec![];
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             for sidebar_width in [crate::model::DEFAULT_SIDEBAR_WIDTH, 200.0] {
                 let mut rt = runtime(width);
@@ -31098,12 +31098,7 @@ pub(crate) mod tests {
                 rt.invalidate();
                 rt.frame(0.0);
                 rt.frame(1.0);
-                let siblings = [
-                    format!("captain-name-{first}"),
-                    format!("portrait-slot-{first}"),
-                    format!("captain-badges-{first}"),
-                    format!("thread-{next}"),
-                ];
+                let siblings = [format!("portrait-slot-{first}"), format!("thread-{next}")];
                 let before: Vec<_> = siblings.iter().map(|k| rect(&rt, k)).collect();
                 for step in 0..4 {
                     let t = &mut rt.state.threads[i];
@@ -31127,13 +31122,19 @@ pub(crate) mod tests {
                     rt.frame(1.0);
                     rt.frame(1.0);
                     let row = rect(&rt, &format!("thread-{first}"));
-                    let mut parts = vec![
-                        format!("captain-state-{first}"),
-                        format!("captain-status-{first}"),
-                        format!("captain-name-{first}"),
-                    ];
+                    assert!(
+                        (row[3] - 40.0).abs() < 0.5,
+                        "{width}/{sidebar_width}: {row:?}"
+                    );
+                    let mut parts = vec![format!("captain-name-{first}")];
                     if step == 0 {
                         parts.push(format!("captain-timer-{first}"));
+                        parts.push(format!("captain-status-{first}"));
+                    } else if step == 1 {
+                        parts.push(format!("captain-attention-{first}"));
+                        parts.push(format!("captain-status-{first}"));
+                    } else if step == 2 {
+                        parts.push(format!("captain-status-{first}"));
                     }
                     for key in parts {
                         let r = rect(&rt, &key);
@@ -31146,9 +31147,6 @@ pub(crate) mod tests {
                             "{width}/{sidebar_width} step {step}: {key} {r:?} leaves {row:?}"
                         );
                     }
-                    if step == 1 {
-                        status_widths.push(rect(&rt, &format!("captain-state-{first}"))[2]);
-                    }
                     let after: Vec<_> = siblings.iter().map(|k| rect(&rt, k)).collect();
                     for (key, (a, b)) in siblings.iter().zip(before.iter().zip(&after)) {
                         assert!(
@@ -31159,12 +31157,6 @@ pub(crate) mod tests {
                 }
             }
         }
-        // "Needs you" is never squeezed: it has its full width at the narrowest sidebar too.
-        let widest = status_widths.iter().cloned().fold(0.0, f32::max);
-        assert!(
-            status_widths.iter().all(|w| (widest - w).abs() < 0.5),
-            "{status_widths:?}"
-        );
     }
 
     #[test]
@@ -31193,11 +31185,107 @@ pub(crate) mod tests {
                 row[0] + row[2] <= side[0] + side[2] + 0.5,
                 "{width}: {row:?}"
             );
-            let label = rt
-                .accessibility_json()
-                .to_string()
-                .contains("Working 50m 0s");
+            let label = rt.accessibility_json().to_string().contains("50m 0s");
             assert!(label, "{width}: the running timer is shown");
+        }
+    }
+
+    #[test]
+    fn sidebar_rows_follow_compact_grouped_hierarchy_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.compact_sidebar = width < 760.0;
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            // Captain rows are 40 pt tall; thread rows are 32 pt tall; no two overlap.
+            let mut prev_bottom = 0.0f32;
+            for i in rt.state.sidebar_captains() {
+                let id = rt.state.threads[i].id;
+                let r = rect(&rt, &format!("thread-{id}"));
+                assert!(
+                    (r[3] - 40.0).abs() < 0.5,
+                    "{width}: captain {id} height {r:?}"
+                );
+                assert!(
+                    r[1] >= prev_bottom - 0.5,
+                    "{width}: overlap at captain {id}"
+                );
+                prev_bottom = r[1] + r[3];
+            }
+
+            // Group headers precede their rows and collapse cleanly while keeping the selected row.
+            assert!(rt.presented("threads-heading").is_some(), "{width}");
+            let active_id = rt.state.current().id;
+            let active_proj = rt.state.current().project;
+            let proj_key = active_proj
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".into());
+            let group_key = format!("sidebar-group-local-{proj_key}");
+            let group_rect = rect(&rt, &group_key);
+            let active_rect = rect(&rt, &format!("thread-{active_id}"));
+            assert!(
+                (active_rect[3] - 32.0).abs() < 0.5,
+                "{width}: thread row height {active_rect:?}"
+            );
+            assert!(
+                group_rect[1] < active_rect[1],
+                "{width}: group header {group_rect:?} must precede active row {active_rect:?}"
+            );
+
+            // Collapse the group that has the active thread and another sibling:
+            // active stays visible, sibling hides and is skipped by sidebar_navigation.
+            let sibling = rt
+                .state
+                .threads
+                .iter()
+                .find(|t| {
+                    t.id != active_id
+                        && !rt.state.is_captain_home(t)
+                        && t.project == active_proj
+                        && rt.state.thread_section(t, lifecycle::now()) == Section::Active
+                })
+                .map(|t| t.id);
+            press(&mut rt, &group_key);
+            rt.frame(1.0);
+            assert!(
+                rt.presented(&format!("thread-{active_id}")).is_some(),
+                "{width}: selected row survives group collapse"
+            );
+            if let Some(sib) = sibling {
+                assert!(
+                    rt.presented(&format!("thread-{sib}")).is_none(),
+                    "{width}: unselected sibling hides when group collapses"
+                );
+                let nav = sidebar_navigation(&rt.state);
+                assert!(
+                    !nav.iter().any(|(_, id)| *id == sib),
+                    "{width}: sidebar_navigation must skip collapsed row {sib}"
+                );
+            }
+            // Re-expand and verify scoping hides group headers.
+            press(&mut rt, &group_key);
+            rt.frame(1.0);
+            if let Some(proj) = active_proj {
+                rt.state.set_project_scope(Some(proj), false);
+                rt.invalidate();
+                rt.frame(1.0);
+                assert!(
+                    rt.presented(&group_key).is_none(),
+                    "{width}: group header hides when scoped to one workspace"
+                );
+            }
+        }
+        // Contrast check on bg and row in both themes for sidebar text tokens.
+        for dark in [false, true] {
+            let p = palette(dark);
+            for bg in [p.bg, p.row] {
+                for ink in [p.ink, p.muted, p.faint] {
+                    let ratio = contrast(ink, bg);
+                    assert!(ratio >= 4.5, "dark {dark}: sidebar contrast {ratio:.2}:1");
+                }
+            }
         }
     }
 

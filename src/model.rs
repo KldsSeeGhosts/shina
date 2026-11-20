@@ -597,6 +597,14 @@ pub enum ProjectScope {
     NoProject,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarGrouping {
+    #[default]
+    Workspace,
+    Recent,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectPicker {
     NewThread,
@@ -4874,6 +4882,10 @@ pub struct State {
     context_import_rxs: Vec<std::sync::mpsc::Receiver<ContextAssetDownload>>,
     pub project_scope: ProjectScope,
     pub scope_additional: Vec<ProjectId>,
+    /// Whether ordinary sidebar threads group under workspace headers (default) or list flat.
+    pub sidebar_grouping: SidebarGrouping,
+    /// Workspace groups collapsed in the sidebar, keyed by `(server, project)`.
+    pub collapsed_groups: std::collections::BTreeSet<(String, Option<usize>)>,
     pub selected_threads: Vec<usize>,
     pub selection_anchor: Option<usize>,
     /// Whether the Snoozed and Settled shelves are open.
@@ -5991,6 +6003,8 @@ impl State {
             context_import_rxs: Vec::new(),
             project_scope: ProjectScope::All,
             scope_additional: vec![],
+            sidebar_grouping: SidebarGrouping::Workspace,
+            collapsed_groups: std::collections::BTreeSet::new(),
             selected_threads: vec![],
             selection_anchor: None,
             shelves: [false; 2],
@@ -7569,6 +7583,35 @@ impl State {
         });
         rows.extend(ordinary);
         rows
+    }
+    /// Whether the sidebar renders workspace group headers right now: Workspace grouping is
+    /// enabled, no search or archive filter is active, and the list is not narrowed to one
+    /// workspace.
+    pub fn sidebar_grouped(&self) -> bool {
+        self.sidebar_grouping == SidebarGrouping::Workspace
+            && self.search.text.is_empty()
+            && !self.show_archive
+            && self.project_scope == ProjectScope::All
+            && self.scope_additional.is_empty()
+            && self.machines.scope_remote.is_empty()
+    }
+    pub fn sidebar_group_collapsed(&self, server: &str, project: Option<usize>) -> bool {
+        self.collapsed_groups
+            .contains(&(server.to_string(), project))
+    }
+    pub fn toggle_sidebar_group(&mut self, server: String, project: Option<usize>) {
+        let key = (server, project);
+        if !self.collapsed_groups.remove(&key) {
+            self.collapsed_groups.insert(key);
+        }
+        self.checkpoint();
+    }
+    pub fn toggle_sidebar_grouping(&mut self) {
+        self.sidebar_grouping = match self.sidebar_grouping {
+            SidebarGrouping::Workspace => SidebarGrouping::Recent,
+            SidebarGrouping::Recent => SidebarGrouping::Workspace,
+        };
+        self.checkpoint();
     }
     /// Whether an unsent draft has a "Drafts" row. Other drafts need content. The open draft keeps
     /// whatever it had when it was opened, so its row does not appear or vanish while typing.
@@ -16478,6 +16521,17 @@ impl State {
         if let Some(width) = self.diff_tree_width {
             value["diffTreeWidth"] = json!(width);
         }
+        if self.sidebar_grouping != SidebarGrouping::default() {
+            value["sidebarGrouping"] = json!(self.sidebar_grouping);
+        }
+        if !self.collapsed_groups.is_empty() {
+            value["collapsedGroups"] = json!(
+                self.collapsed_groups
+                    .iter()
+                    .map(|(server, project)| json!([server, project]))
+                    .collect::<Vec<_>>()
+            );
+        }
         value
     }
     pub(crate) fn runtime_input_snapshot(
@@ -16562,6 +16616,28 @@ impl State {
                     crate::ui::diff_tree::MAX_W as f64,
                 ) as f32
             });
+        self.sidebar_grouping = ui
+            .get("sidebarGrouping")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        self.collapsed_groups = ui
+            .get("collapsedGroups")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        let pair = entry.as_array()?;
+                        let server = pair.first()?.as_str()?.to_owned();
+                        let project = match pair.get(1)? {
+                            Value::Null => None,
+                            v => Some(usize::try_from(v.as_u64()?).ok()?),
+                        };
+                        Some((server, project))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.project_scope = match ui["scope"].as_str() {
             Some("all") => ProjectScope::All,
             Some("none") => ProjectScope::NoProject,
