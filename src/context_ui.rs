@@ -12,8 +12,8 @@ use super::*;
 
 use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, motion, solid_button};
 use crate::model::{
-    CREW_CONTEXT_MAX_BYTES, ESSENTIAL_BUDGET, MemoryView, NOTES_CONTEXT_MAX_BYTES,
-    PROFILE_BUDGET, RULES_CONTEXT_MAX_BYTES,
+    CREW_CONTEXT_MAX_BYTES, ESSENTIAL_BUDGET, MemoryView, NOTES_CONTEXT_MAX_BYTES, PROFILE_BUDGET,
+    RULES_CONTEXT_MAX_BYTES,
 };
 
 /// KSG's `text-[13px] font-medium` detail rows.
@@ -94,7 +94,9 @@ fn document_source(s: &State, captain: usize, name: &'static str, audience: Audi
                 )
             }
         }
-        ("AGENTS.md", Audience::Crew) => (Delivery::NotSent, 0, Some(RULES_CONTEXT_MAX_BYTES), true),
+        ("AGENTS.md", Audience::Crew) => {
+            (Delivery::NotSent, 0, Some(RULES_CONTEXT_MAX_BYTES), true)
+        }
         ("NOTES.md", Audience::Captain) => {
             if meta.bytes == 0 {
                 (Delivery::Empty, 0, Some(NOTES_CONTEXT_MAX_BYTES), false)
@@ -114,8 +116,12 @@ fn document_source(s: &State, captain: usize, name: &'static str, audience: Audi
                 )
             }
         }
-        ("NOTES.md", Audience::Crew) => (Delivery::OnRequest, 0, Some(NOTES_CONTEXT_MAX_BYTES), false),
-        ("CREW.md", Audience::Captain) => (Delivery::NotSent, 0, Some(CREW_CONTEXT_MAX_BYTES), false),
+        ("NOTES.md", Audience::Crew) => {
+            (Delivery::OnRequest, 0, Some(NOTES_CONTEXT_MAX_BYTES), false)
+        }
+        ("CREW.md", Audience::Captain) => {
+            (Delivery::NotSent, 0, Some(CREW_CONTEXT_MAX_BYTES), false)
+        }
         ("CREW.md", Audience::Crew) => {
             if meta.bytes == 0 {
                 (Delivery::Empty, 0, Some(CREW_CONTEXT_MAX_BYTES), false)
@@ -239,7 +245,11 @@ pub(super) fn sources(s: &State, captain: usize, audience: Audience) -> Vec<Sour
             bytes: used,
             sent: used,
             budget: Some(ESSENTIAL_BUDGET),
-            delivery: if used == 0 { Delivery::Empty } else { Delivery::Whole },
+            delivery: if used == 0 {
+                Delivery::Empty
+            } else {
+                Delivery::Whole
+            },
             private: true,
         },
         Audience::Crew => Source {
@@ -335,7 +345,11 @@ fn audience_row(s: &State, p: Palette, captain: usize) -> El {
     for (index, key) in KEYS.iter().enumerate() {
         let is_crew = index == 1;
         let on = crew == is_crew;
-        let word = if is_crew { "Crew threads".to_string() } else { name.clone() };
+        let word = if is_crew {
+            "Crew threads".to_string()
+        } else {
+            name.clone()
+        };
         group = group.child(
             row()
                 .key(*key)
@@ -375,8 +389,16 @@ fn audience_row(s: &State, p: Palette, captain: usize) -> El {
 /// delivery class (spec §4.3's table).
 fn delivery_column(source: &Source, name: &str, narrow: bool, p: Palette) -> El {
     let mut col_ = col()
-        .w(if narrow { DOC_META_NARROW } else { DOC_META_WIDE })
-        .min_w(if narrow { DOC_META_NARROW } else { DOC_META_WIDE })
+        .w(if narrow {
+            DOC_META_NARROW
+        } else {
+            DOC_META_WIDE
+        })
+        .min_w(if narrow {
+            DOC_META_NARROW
+        } else {
+            DOC_META_WIDE
+        })
         .gap(4.0)
         .items_end();
     let size = match source.delivery {
@@ -430,9 +452,7 @@ fn delivery_column(source: &Source, name: &str, narrow: bool, p: Palette) -> El 
                         )
                         .child(label(size, TIMER, p.muted).key(format!("context-doc-size-{name}"))),
                 )
-                .child(
-                    label("Truncated", META, p.brass).key(format!("context-doc-state-{name}")),
-                );
+                .child(label("Truncated", META, p.brass).key(format!("context-doc-state-{name}")));
         }
         Delivery::Empty => {
             col_ = col_
@@ -541,9 +561,7 @@ fn document_row(s: &State, p: Palette, captain: usize, source: &Source, narrow: 
                 open_captain_document(s, captain, name);
             }
         })
-        .child(
-            icon(if source.private { "lock" } else { "file" }, p.muted).size(16.0, 16.0),
-        )
+        .child(icon(if source.private { "lock" } else { "file" }, p.muted).size(16.0, 16.0))
         .child(
             col()
                 .grow(1.0)
@@ -663,7 +681,10 @@ fn memory_backend_status(s: &State) -> Option<(String, bool)> {
             last_error,
             queued_count,
         } => Some((
-            format!("Learned memory offline{}. {last_error}", queued(queued_count)),
+            format!(
+                "Learned memory offline{}. {last_error}",
+                queued(queued_count)
+            ),
             false,
         )),
     }
@@ -901,8 +922,7 @@ fn profile_row(s: &State, p: Palette) -> El {
         .px(2.0)
         .child(profile_item(s, p).grow(1.0).min_w(0.0))
         .child(
-            label(format!("{} of 1 KiB", kib(bytes)), TIMER, p.faint)
-                .key("context-profile-bytes"),
+            label(format!("{} of 1 KiB", kib(bytes)), TIMER, p.faint).key("context-profile-bytes"),
         )
         .child(captain_ui::icon_action(
             s,
@@ -1023,11 +1043,11 @@ pub(super) fn memory_section(s: &State, p: Palette, captain: usize) -> El {
                 .py(4.0)
                 .gap(6.0)
                 .center_y()
-                .child(
-                    el().size(6.0, 6.0)
-                        .radius(3.0)
-                        .fill(if connected { p.sea } else { p.danger }),
-                )
+                .child(el().size(6.0, 6.0).radius(3.0).fill(if connected {
+                    p.sea
+                } else {
+                    p.danger
+                }))
                 .child(label(status, SMALL, p.muted).wrap().grow(1.0).min_w(0.0)),
         );
     }
@@ -1331,10 +1351,7 @@ fn window_section(s: &State, p: Palette) -> El {
             .child(spacer())
             .child(
                 label(
-                    usage
-                        .percent
-                        .map(context_percent_text)
-                        .unwrap_or_default(),
+                    usage.percent.map(context_percent_text).unwrap_or_default(),
                     TIMER,
                     usage
                         .percent
@@ -1347,27 +1364,18 @@ fn window_section(s: &State, p: Palette) -> El {
     if let Some(legend) = &legend {
         let approximate =
             crate::context_breakdown::is_approximate(usage.breakdown.as_deref(), Some(legend));
-        section = section.child(
-            el().px(10.0).child(
-                el().key("context-window-bar").child(context_breakdown_view(
-                    legend,
-                    approximate,
-                    t.context.active_segment(),
-                    p,
-                )),
-            ),
-        );
+        section = section.child(el().px(10.0).child(el().key("context-window-bar").child(
+            context_breakdown_view(legend, approximate, t.context.active_segment(), p),
+        )));
     } else if let Some(limit) = limit
         && limit > 0
     {
-        section = section.child(
-            el().px(10.0).child(usage_progress_bar(
-                "context-window-bar".into(),
-                Some("context-window-bar-fill".into()),
-                usage.percent.unwrap_or(0.0),
-                p,
-            )),
-        );
+        section = section.child(el().px(10.0).child(usage_progress_bar(
+            "context-window-bar".into(),
+            Some("context-window-bar-fill".into()),
+            usage.percent.unwrap_or(0.0),
+            p,
+        )));
     }
     let can_compact = !s.demo && t.can_compact();
     let keep_full = s.keep_full_history(t);
@@ -1396,20 +1404,22 @@ fn window_section(s: &State, p: Palette) -> El {
                 .hover(p.selected)
                 .on_press(|s: &mut State| s.toggle_keep_full_history())
                 .child(
-                    label(
-                        if keep_full { "Keep" } else { "Compact" },
-                        META,
-                        p.ink,
-                    )
-                    .key("context-keep-history-label"),
+                    label(if keep_full { "Keep" } else { "Compact" }, META, p.ink)
+                        .key("context-keep-history-label"),
                 )
                 .child(label("history before send", META, p.muted)),
         );
     }
     actions = actions.child(spacer()).child(
-        ghost_button(s, "context-compact".into(), "Compact", p, |s: &mut State| {
-            s.compact_context(None);
-        })
+        ghost_button(
+            s,
+            "context-compact".into(),
+            "Compact",
+            p,
+            |s: &mut State| {
+                s.compact_context(None);
+            },
+        )
         .disabled(!can_compact)
         .opacity(if can_compact { 1.0 } else { 0.55 }),
     );
@@ -1428,8 +1438,7 @@ fn attachments_section(s: &State, p: Palette) -> El {
     let section = captain_ui::section(
         "context-attachments",
         "Attachments",
-        (!(tray.is_empty() && sent.is_empty()))
-            .then(|| (tray.len() + sent.len()).to_string()),
+        (!(tray.is_empty() && sent.is_empty())).then(|| (tray.len() + sent.len()).to_string()),
         vec![],
         p,
     );
@@ -1463,12 +1472,7 @@ fn attachments_section(s: &State, p: Palette) -> El {
                     s.preview_attachments(s.current().draft_images.clone(), &id, true);
                 })
                 .child(icon("file", p.muted).size(16.0, 16.0))
-                .child(
-                    label(name, ROW_TEXT, p.ink)
-                        .truncate()
-                        .grow(1.0)
-                        .min_w(0.0),
-                )
+                .child(label(name, ROW_TEXT, p.ink).truncate().grow(1.0).min_w(0.0))
                 .child(label(size, TIMER, p.faint)),
         );
     }
@@ -1527,8 +1531,7 @@ fn workspace_section(s: &State, p: Palette) -> El {
 /// the work, plus CREW.md and NOTES.md with their crew delivery.
 fn from_captain_section(s: &State, p: Palette, captain: usize) -> El {
     let t = s.current();
-    let mut section =
-        captain_ui::section("context-documents", "From the captain", None, vec![], p);
+    let mut section = captain_ui::section("context-documents", "From the captain", None, vec![], p);
     let brief = t.messages.iter().enumerate().find(|(_, message)| {
         message.role == "Shina" && crew_ui::parse_brief(message.display_text()).is_some()
     });
@@ -1663,21 +1666,24 @@ pub(super) fn tab(s: &State, p: Palette) -> El {
             let access = s.captain_access(captain);
             let knowable = !matches!(
                 access,
-                crate::model::CaptainAccess::UpdateRequired | crate::model::CaptainAccess::NoRecords
+                crate::model::CaptainAccess::UpdateRequired
+                    | crate::model::CaptainAccess::NoRecords
             );
             let crew = s.context_audience_crew;
             body = body.child(audience_row(s, p, captain));
             body = body.child(rule_inset(p));
             body = body.child(window_section(s, p));
             if knowable {
-                body = body
-                    .child(rule_inset(p))
-                    .child(documents_section(
-                        s,
-                        p,
-                        captain,
-                        if crew { Audience::Crew } else { Audience::Captain },
-                    ));
+                body = body.child(rule_inset(p)).child(documents_section(
+                    s,
+                    p,
+                    captain,
+                    if crew {
+                        Audience::Crew
+                    } else {
+                        Audience::Captain
+                    },
+                ));
             }
             body = body.child(rule_inset(p));
             if crew {

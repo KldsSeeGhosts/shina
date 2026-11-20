@@ -171,11 +171,11 @@ pub use captain_policy_client::CaptainPolicyChange;
 #[path = "captain_digest.rs"]
 mod captain_digest;
 #[allow(unused_imports)]
-pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
-#[allow(unused_imports)]
 pub(crate) use captain_state::{
     CREW_CONTEXT_MAX_BYTES, NOTES_CONTEXT_MAX_BYTES, RULES_CONTEXT_MAX_BYTES,
 };
+#[allow(unused_imports)]
+pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
 #[path = "captain_lifecycle.rs"]
 mod captain_lifecycle;
 pub use captain_lifecycle::CaptainPhase;
@@ -211,9 +211,9 @@ mod run_control_tests;
 #[allow(dead_code)] // Public entry points are shared with the captain records UI.
 mod scope;
 #[allow(unused_imports)]
-pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
-#[allow(unused_imports)]
 pub(crate) use memory::{ESSENTIAL_BUDGET, PROFILE_BUDGET};
+#[allow(unused_imports)]
+pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
 pub use scope::RemoteProject;
 #[path = "capabilities.rs"]
 mod capabilities;

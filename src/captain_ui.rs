@@ -1481,7 +1481,28 @@ mod tests {
             press(&mut rt, &format!("memory-pin-{release}"));
             assert!(rt.state.memories(0).iter().all(|m| m.essential));
             assert!(rt.presented(&format!("memory-lock-{release}")).is_some());
-            press(&mut rt, &format!("memory-edit-{release}"));
+            // The edit and delete icons sit transparent until the row is hovered.
+            for _ in 0..30 {
+                if rt.find(&format!("memory-{release}")).is_some() {
+                    break;
+                }
+                rt.update(|_, tx| tx.scroll_into_view(format!("memory-{release}")));
+                rt.frame(0.5);
+            }
+            let (row_rect, _) = rt
+                .presented(&format!("memory-{release}"))
+                .unwrap_or_else(|| panic!("{width}: memory-{release} scrolled off"));
+            rt.pointer_move(row_rect[0] + 20.0, row_rect[1] + row_rect[3] / 2.0);
+            rt.frame(1.0);
+            let edit = format!("memory-edit-{release}");
+            let presented = rt.presented(&edit);
+            assert!(
+                presented.is_some(),
+                "{width}: {edit} not presented; actions {:?} row {:?}",
+                rt.presented(&format!("memory-actions-{release}")),
+                rt.presented(&format!("memory-{release}")),
+            );
+            press(&mut rt, &edit);
             rt.state
                 .brief
                 .edit

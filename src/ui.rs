@@ -14337,10 +14337,7 @@ fn context_pill_counts(s: &State) -> (Option<usize>, usize, usize) {
     let t = s.current();
     if let Some(captain) = captain_ui::home_brief_captain(s) {
         let list = context_ui::sources(s, captain, context_ui::Audience::Captain);
-        let sent = list
-            .iter()
-            .filter(|source| source.sent > 0)
-            .count();
+        let sent = list.iter().filter(|source| source.sent > 0).count();
         let truncated = list
             .iter()
             .filter(|source| source.delivery == context_ui::Delivery::Truncated)
@@ -14456,12 +14453,14 @@ fn context_ring(s: &State, t: &Thread, p: Palette, lane: f32) -> El {
                 el().size(CONTEXT_PILL_RING, CONTEXT_PILL_RING).child(ring)
             }
         });
-    if !minimal
-        && let Some(percent) = t.context.usage.percent
-    {
+    if !minimal && let Some(percent) = t.context.usage.percent {
         pill = pill.child(
-            label(context_percent_text(percent), TIMER, context_ink(percent, p))
-                .key("context-pill-percent"),
+            label(
+                context_percent_text(percent),
+                TIMER,
+                context_ink(percent, p),
+            )
+            .key("context-pill-percent"),
         );
     }
     if !compact {
@@ -22111,7 +22110,8 @@ pub(crate) mod tests {
             }
         }
         assert!(checked > 0, "no routine rows on screen");
-        // The memory controls overlay the row instead of reserving width at rest.
+        // The memory text column gives way to the essential switch and the
+        // controls overlay the row instead of reserving width at rest.
         press(&mut rt, "right-panel-segment-context");
         rt.frame(0.5);
         let mut memories = 0;
@@ -22123,12 +22123,13 @@ pub(crate) mod tests {
                 continue;
             };
             let (row, _) = rt.presented(&format!("memory-{id}")).unwrap();
+            let (switch, _) = rt.presented(&format!("memory-pin-{id}")).unwrap();
             let (actions, _) = rt.presented(&format!("memory-actions-{id}")).unwrap();
             assert!(
-                element.rect[0] + element.rect[2] >= row[0] + row[2] - 8.5,
-                "{key}: the text stops at {} in a row ending at {}",
+                element.rect[0] + element.rect[2] <= switch[0] + 0.5,
+                "{key}: the text runs to {} under the switch at {}",
                 element.rect[0] + element.rect[2],
-                row[0] + row[2]
+                switch[0]
             );
             assert!(actions[0] + actions[2] <= row[0] + row[2] + 0.5);
             memories += 1;
