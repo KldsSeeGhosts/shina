@@ -325,6 +325,20 @@ fn dispatch_global_command(
         }
         "rightPanel.toggle" => state.right_panel_toggle(),
         "diff.toggle" => state.right_panel_toggle_diff(),
+        "inspector.crew" => {
+            let key = state.panel_key();
+            state
+                .right_panels
+                .open(&key, crate::right_panel::SingletonKind::Crew);
+        }
+        "inspector.context" => {
+            let key = state.panel_key();
+            state
+                .right_panels
+                .open(&key, crate::right_panel::SingletonKind::Context);
+        }
+        "navigation.back" => state.nav_back(),
+        "navigation.forward" => state.nav_forward(),
         "rightPanel.toggleMaximized" => {
             // KSG ignores repeats here, and gates the toggle on the panel being open.
             if !key_repeat {
@@ -369,7 +383,14 @@ fn dispatch_global_command(
             }
         }
         "commandPalette.toggle" => {
-            state.search.focused = true;
+            if key_repeat {
+                return true;
+            }
+            if state.quick_switcher {
+                state.quick_switcher = false;
+            } else {
+                state.open_quick_switcher();
+            }
         }
         "view.zoomIn" => state.step_zoom(1),
         "view.zoomOut" => state.step_zoom(-1),

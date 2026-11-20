@@ -97,10 +97,14 @@ mod markdown_ui;
 mod pi_ui;
 #[path = "plan_ui.rs"]
 mod plan_ui;
+#[path = "quick_switcher.rs"]
+mod quick_switcher;
 #[path = "settings_ui.rs"]
 pub(crate) mod settings_ui;
 #[path = "sidebar_ui.rs"]
 mod sidebar_ui;
+#[path = "top_bar.rs"]
+mod top_bar;
 #[path = "transcript_context.rs"]
 pub(crate) mod transcript_context;
 #[path = "work_ui.rs"]
@@ -732,21 +736,11 @@ fn status(status: Status, p: Palette) -> El {
         .child(status_mark(status, p, 6.0))
         .child(meta_text(status.label(), status_ink(status, p)))
 }
-/// Room for "Working for 59m 59s" in the chat header, so live status never reflows the row
-/// around it.
-const HEADER_STATUS_SLOT: f32 = 156.0;
-/// A live status in a slot of fixed width. The text sits at the slot's end in tabular
-/// figures, never shrinks or truncates, and fades between values on Shina's motion curve, so
-/// "Ready" becoming "Working for 12m 05s" moves nothing beside it. Ready and Done show only
-/// the empty slot, as `status` shows nothing for them.
-fn status_slot(key: &str, status: Status, text: Option<String>, width: f32, p: Palette) -> El {
-    let mut slot = row()
-        .key(key)
-        .w(width)
-        .min_w(width)
-        .h(20.0)
-        .justify_end()
-        .center_y();
+/// A live status slot in the top bar, intrinsic width. The text sits in tabular
+/// figures and fades between values on Shina's motion curve, so a ticking timer
+/// never reflows the row around it.
+fn status_slot(key: &str, status: Status, text: Option<String>, p: Palette) -> El {
+    let mut slot = row().key(key).h(20.0).shrink().center_y();
     let text = match text {
         Some(text) => text,
         None if matches!(status, Status::Ready | Status::Completed) => return slot,
@@ -872,7 +866,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let tabs_width = cx
         .layout_with("thread-tabs", |r| r[2])
         .unwrap_or((s.viewport_width - 400.0).max(200.0));
-    top = top.child(header(s, p, narrow, tabs_width).grow(1.0).min_w(0.0));
+    top = top.child(top_bar::bar(s, p, narrow, compact, tabs_width));
     // The pane and the sidebar's sea strip both run to the window's bottom edge, so the bottom
     // of the window is one edge, not a strip under the pane and another under the sidebar.
     let mut workspace = row().grow(1.0).min_h(0.0).px(8.0);
@@ -935,17 +929,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     });
     {
         let mut body = row().key("chat-body").grow(1.0).min_h(0.0);
-        let main = composer_ui::motion_host(
-            s,
-            col()
-                .key("chat-main")
-                .grow(1.0)
-                .min_w(0.0)
-                .min_h(0.0)
-                .child(chat_header(s, p, narrow, compact).animated_changes())
-                // Scrolled messages are cut under the header, so give them a boundary.
-                .child(rule(p).key("chat-header-rule")),
-        );
+        let main =
+            composer_ui::motion_host(s, col().key("chat-main").grow(1.0).min_w(0.0).min_h(0.0));
         let main = if s.current().captain_home
             && s.current().captain.is_some_and(|captain| {
                 s.captain_phase(captain) == crate::model::CaptainPhase::Archived
@@ -1079,6 +1064,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(attachment_preview::view(s, p));
     } else if s.transcript_preview.is_some() {
         root = root.child(transcript_context::preview(s, p));
+    } else if s.quick_switcher {
+        root = root.child(quick_switcher::view(s, p));
     } else if s.rename_thread.is_some() || s.delete_thread.is_some() {
         root = root.child(thread_dialog(s, p));
     } else if s.plan_save_dialog.is_some() {
@@ -1754,7 +1741,13 @@ fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
 
     // Docked beside options, KSG holds one fixed height; alone, the list is as tall as its
     // tallest tab, so switching tabs or searching never resizes it.
-    let list_h = if stacked && has_options {
+    // The card is anchored above the composer (`anchored_fit`, 8 pt gutter): the
+    // room it leaves bounds the column, so a clamped card never overflows its
+    // own rows. One frame behind, as `anchored_fit` measures it.
+    let above = rune::memo::layout("composer")
+        .map(|rect| rect[1] - 16.0)
+        .unwrap_or(f32::MAX);
+    let list_h = (if stacked && has_options {
         224.0
     } else if has_options {
         MODEL_PICKER_H
@@ -1764,7 +1757,8 @@ fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
         } else {
             MODEL_PICKER_H
         })
-    };
+    })
+    .min(above.max(120.0));
     let list_col = col()
         .key("model-picker-list-col")
         .w(if stacked {
@@ -3841,7 +3835,7 @@ fn empty_list(s: &State, p: Palette, key: &str, text: &str) -> El {
 }
 
 /// The wordmark's size in points, for a header `line` points wide after the native controls
-/// and the gap before the tabs: Inter 15/600 whenever it clears the attention badge, 12 in a
+/// and the gap before the tabs: Inter 14/600 whenever it clears the attention badge, 12 in a
 /// narrow sidebar, and none in a truly narrow one.
 /// Width a macOS title strip reserves for the window buttons, which every platform assumes when
 /// it sizes the wordmark.
@@ -3853,9 +3847,11 @@ fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
     } else {
         0.0
     };
-    let before = HEADER_TOGGLE + HEADER_MARK;
-    if line >= before + wordmark_gap(15.0) + WORDMARK_WIDTH + badge {
-        Some(15.0)
+    // The compose button and its 2 pt gap follow the badge, so the wordmark
+    // reserves 26 pt for it: the mark drops out earlier on a 200 pt sidebar.
+    let before = HEADER_TOGGLE + HEADER_MARK + 26.0;
+    if line >= before + wordmark_gap(14.0) + WORDMARK_WIDTH + badge {
+        Some(14.0)
     } else if line >= before + wordmark_gap(12.0) + WORDMARK_WIDTH * 0.8 + badge {
         Some(12.0)
     } else {
@@ -3892,6 +3888,15 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
     header
         .child(spacer())
         .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
+        .child(
+            icon_button("new-thread", "New thread", "compose", p, |_| {})
+                .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
+                .help(if s.projects.entries.iter().all(|project| project.hidden) {
+                    "New thread"
+                } else {
+                    "New thread. Shift-click: in the current workspace"
+                }),
+        )
 }
 
 /// The title strip's left end when the sidebar is not docked: the toggle, the 24 px mark and
@@ -3907,6 +3912,15 @@ fn undocked_header(s: &State, p: Palette, compact: bool) -> El {
     }
     header
         .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
+        .child(
+            icon_button("new-thread", "New thread", "compose", p, |_| {})
+                .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
+                .help(if s.projects.entries.iter().all(|project| project.hidden) {
+                    "New thread"
+                } else {
+                    "New thread. Shift-click: in the current workspace"
+                }),
+        )
         .pr(HEADER_TAB_GAP)
 }
 /// The space between the attention badge, at the header's end, and the first tab.
@@ -4222,19 +4236,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         if !captains.is_empty() {
             threads_head = threads_head.mt(8.0);
         }
-        // Temporary `new-thread` button in the Threads heading until WS1 moves it into
-        // `sidebar_header` (spec §5 Workstream 2), so tests and users never lose it.
-        threads_head = threads_head
-            .child(project_switcher(s, p).help("Add workspace"))
-            .child(
-                icon_button("new-thread", "New thread", "compose", p, |_| {})
-                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
-                    .help(if s.projects.entries.iter().all(|project| project.hidden) {
-                        "New thread"
-                    } else {
-                        "New thread. Shift-click: in the current workspace"
-                    }),
-            );
+        threads_head = threads_head.child(project_switcher(s, p).help("Add workspace"));
         content = content.child(threads_head);
     }
     let drafts: Vec<_> = visible
@@ -6988,16 +6990,15 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
 }
 
 const TAB_GAP: f32 = 4.0;
-/// A tab is 32 pt tall, so in the 40 pt top strip its bottom frame sits 4 pt above the chat
-/// pane's top rule, the same distance as its top edge sits below the window edge.
-const TAB_HEIGHT: f32 = 32.0;
+/// A tab is 28 pt tall inside the 40 pt bar's 36 pt row, the spec's opt-in strip.
+const TAB_HEIGHT: f32 = 28.0;
 /// Below this a tab drops its leading icon and keeps the title.
 const TAB_PREFIX_WIDTH: f32 = 170.0;
 /// The narrowest a tab gets before the strip scrolls.
 const TAB_MIN_WIDTH: f32 = 120.0;
 /// Tabs are packed from the left and stop growing here, so a few tabs do not sit in wide empty
 /// slots.
-const TAB_MAX_WIDTH: f32 = 260.0;
+const TAB_MAX_WIDTH: f32 = 200.0;
 /// Inter 13/500, the title in a tab.
 const TAB_TITLE: TextStyle = TextStyle::new(13.0, 500.0);
 /// The 16 px leading icon in a tab, KSG `PaneTabs`' `ProjectFavicon`. Captain homes and
@@ -7059,7 +7060,7 @@ fn new_tab_button(p: Palette) -> El {
     .mr(2.0)
 }
 
-fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
+fn header(s: &State, p: Palette, _narrow: bool, tabs_width: f32) -> El {
     let mut tabs = row()
         .key("thread-tabs")
         .min_w(0.0)
@@ -7078,8 +7079,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
         .filter(|&&id| s.threads.iter().any(|t| t.id == id))
         .count()
         .max(1) as f32;
-    let tab_width = ((tabs_width + TAB_GAP) / count - TAB_GAP)
-        .clamp(TAB_MIN_WIDTH, if narrow { 210.0 } else { TAB_MAX_WIDTH });
+    let tab_width = ((tabs_width + TAB_GAP) / count - TAB_GAP).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
     for &id in &s.tabs {
         let Some(index) = s.threads.iter().position(|t| t.id == id) else {
             continue;
@@ -7285,170 +7285,6 @@ fn thread_tab_menu(s: &State, p: Palette) -> El {
             to_right,
         ))
         .child(item("menu-tab-all", "Close all", "close", all))
-}
-
-fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
-    // The tab strip already names the thread, so the header only holds controls: status, a
-    // "More actions" menu, the session panel toggle, and the diff and panel toggles KSG's
-    // PanelLayoutControls keeps at the right end.
-    let mut header = row()
-        .key("chat-header")
-        .w_full()
-        .h(36.0)
-        .px(10.0)
-        .center_y()
-        .gap(4.0);
-    if multiple_machines(s) {
-        let server = &s.machines.selected;
-        header = header.child(
-            row()
-                .key("chat-machine")
-                .gap(5.0)
-                .center_y()
-                .min_w(0.0)
-                .child(icon("monitor", p.muted))
-                .child(
-                    label(s.machine_label(server), SMALL, p.muted)
-                        .truncate()
-                        .min_w(0.0)
-                        .shrink(),
-                ),
-        );
-    }
-    // Crew threads link back to the thread that started them, unless the parent or crew bar
-    // above the composer already names it.
-    let t = s.current();
-    let bar_shown = t.peer_origin.is_some()
-        || t.parent.is_some() && t.delegated
-        || !t.delegated && t.crew_captain.is_some();
-    if let Some(parent) = (!bar_shown)
-        .then(|| s.current().parent)
-        .flatten()
-        .and_then(|id| s.threads.iter().position(|t| t.id == id))
-    {
-        header = header.child(label("From", SMALL, p.muted)).child(
-            button("breadcrumb-parent", &s.threads[parent].title, p, move |s| {
-                s.show_thread(parent)
-            })
-            .max_w(240.0)
-            .shrink()
-            .min_w(0.0),
-        );
-    }
-    // The away status takes the header's free space, so its width from the last layout is
-    // what the line has to fit in.
-    let available = rune::memo::layout_size("captain-away-slot").map(|size| size[0]);
-    if let Some(line) = captain_ui::away_status(s, p, available) {
-        header = header.child(
-            row()
-                .key("captain-away-slot")
-                .grow(1.0)
-                .min_w(0.0)
-                .center_y()
-                .child(line),
-        );
-    } else {
-        header = header.child(spacer());
-    }
-    header = header.child(if s.demo {
-        outlined(
-            row()
-                .key("demo-badge")
-                .h(20.0)
-                .px(6.0)
-                .mr(6.0)
-                .radius(6.0)
-                .center_y()
-                .fill(p.card)
-                .label("Demo data, read-only")
-                .child(meta_label("Demo", p.brass)),
-            p,
-        )
-    } else {
-        let t = s.current();
-        let text = match (t.status, t.started) {
-            (Status::Running, Some(start)) => Some(format!(
-                "Working for {}",
-                timer_label(start.elapsed().as_secs())
-            )),
-            _ => None,
-        };
-        status_slot("chat-status", t.status, text, HEADER_STATUS_SLOT, p)
-    });
-    header = header.child(toggle_button(
-        "thread-actions",
-        "More actions",
-        "more",
-        s.thread_menu,
-        p,
-        |s| s.thread_menu = !s.thread_menu,
-    ));
-    // KSG's panel controls sit at the header's right end: the diff stat and the Diff tab
-    // toggle, then the whole-panel toggle (KSG's PanelRight). The stat reads the totals the
-    // diff panel already computed, so it never starts a request just to fill the header.
-    let panel_key = s.panel_key();
-    let resolved = s.resolved_keybindings();
-    let ctx = s.shortcut_context(false);
-    let platform = crate::keybindings::Platform::current();
-    let shortcut = |command: &str| {
-        crate::keybindings::shortcut_label_for_command(&resolved, command, &ctx, platform)
-    };
-    // First control to drop as the row narrows is the stat, then the panel toggle; the diff
-    // toggle stays as long as the header draws.
-    if !narrow
-        && let Some(ready) = s
-            .diffs
-            .get(&panel_key)
-            .and_then(diff_panel::ThreadDiff::ready)
-        && (ready.additions > 0 || ready.deletions > 0)
-    {
-        header = header.child(diff_panel::diff_stat_label(
-            "header-diff-stat",
-            ready.additions,
-            ready.deletions,
-            p,
-        ));
-    }
-    let diff_open = s.right_panel_active_view() == Some(crate::right_panel::PanelView::Diff);
-    let mut diff = toggle_button(
-        "header-diff",
-        "Toggle diff",
-        "diff",
-        diff_open,
-        p,
-        |s: &mut State| s.right_panel_toggle_diff(),
-    );
-    if let Some(shortcut) = shortcut("diff.toggle") {
-        diff = diff.description(format!("Toggle diff ({shortcut})"));
-    }
-    header = header.child(diff);
-    if !compact {
-        let panel_open = s.right_panel().open;
-        let mut panel = toggle_button(
-            "header-right-panel",
-            "Toggle right panel",
-            "panel",
-            panel_open,
-            p,
-            |s: &mut State| s.right_panel_toggle(),
-        );
-        // A 6 pt brass dot while a captain home has a request waiting and the
-        // Inspector is closed, so the waiting state is visible without the tab.
-        if !panel_open && crew_ui::needs_you_shows(s) {
-            panel = panel.child(
-                el().size(6.0, 6.0)
-                    .radius(3.0)
-                    .fill(p.brass)
-                    .a11y_hidden()
-                    .pin(None, Some(2.0), Some(2.0), None),
-            );
-        }
-        if let Some(shortcut) = shortcut("rightPanel.toggle") {
-            panel = panel.description(format!("Toggle right panel ({shortcut})"));
-        }
-        header = header.child(panel);
-    }
-    header
 }
 
 /// Pin and archive, with their names, under the header's "More actions" button.
@@ -18831,7 +18667,7 @@ pub(crate) mod tests {
         }
         panic!("Tab never reaches {key}");
     }
-    fn tap(rt: &mut Runtime<State>, key: rune::Key) {
+    pub(super) fn tap(rt: &mut Runtime<State>, key: rune::Key) {
         rt.key(rune::KeyEvent {
             key,
             mods: Default::default(),
@@ -19175,6 +19011,22 @@ pub(crate) mod tests {
                     let (a, b) = (&pair[0], &pair[1]);
                     let (ra, rb) = (region(a), region(b));
                     assert!(ra <= rb, "{width}: {:?} comes before {:?}", a.key, b.key);
+                    // The tab strip scrolls: a focused tab pulls earlier tabs
+                    // out from under their recorded rects.
+                    let elements = rt.elements();
+                    let in_tabs = |e: &rune::ElementInfo| {
+                        let mut at = Some(e);
+                        while let Some(e) = at {
+                            if e.key.as_deref() == Some("thread-tabs") {
+                                return true;
+                            }
+                            at = e.parent.map(|i| &elements[i]);
+                        }
+                        false
+                    };
+                    if in_tabs(a) || in_tabs(b) {
+                        continue;
+                    }
                     if ra == rb && b.role != "separator" && a.role != "separator" {
                         let same_line = (a.rect[1] - b.rect[1]).abs() < 12.0;
                         assert!(
@@ -19210,7 +19062,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_opaque_cap_sits_under_the_chat_header_rule_over_a_scrolled_transcript() {
+    fn an_opaque_cap_sits_at_the_panes_top_edge_over_a_scrolled_transcript() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.populate_demo();
@@ -19219,17 +19071,16 @@ pub(crate) mod tests {
             rt.frame(1.0);
             // The demo transcript is longer than the pane and rests stuck to its bottom, so
             // content lies under the top edge.
-            let (rule, _) = rt.presented("chat-header-rule").unwrap();
+            let (pane, _) = rt.presented("chat-pane").unwrap();
             let (lane, _) = rt.presented("chat-lane").unwrap();
             assert!(
-                lane[1] < rule[1],
+                lane[1] < pane[1],
                 "width {width}: the transcript is not scrolled"
             );
             let (cap, _) = rt.presented("transcript-cap").unwrap();
             assert!(
-                (cap[1] - (rule[1] + rule[3])).abs() <= 0.5
-                    && (cap[3] - TRANSCRIPT_CAP).abs() < 0.01,
-                "width {width}: cap {cap:?} under rule {rule:?}"
+                (cap[1] - pane[1]).abs() <= 0.5 && (cap[3] - TRANSCRIPT_CAP).abs() < 0.01,
+                "width {width}: cap {cap:?} under pane top {pane:?}"
             );
             let info = rt
                 .elements()
@@ -19249,16 +19100,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_hairline_closes_the_chat_header_and_the_panel_toggle_opens_the_inspector() {
+    fn the_panel_toggle_opens_the_inspector() {
         for width in [960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.populate_demo();
             rt.state.open_captain(0);
             rt.frame(0.0);
-            let (header, _) = rt.presented("chat-header").unwrap();
-            let (rule, _) = rt.presented("chat-header-rule").unwrap();
-            assert_eq!(rule[3], 1.0, "{width}");
-            assert!((rule[1] - (header[1] + header[3])).abs() < 0.5, "{width}");
+            assert!(rt.presented("chat-header").is_none(), "{width}");
             assert!(rt.presented("right-panel").is_none(), "{width}");
             press(&mut rt, "header-right-panel");
             rt.frame(1.0);
@@ -20634,16 +20482,11 @@ pub(crate) mod tests {
     #[test]
     fn diff_tree_lays_out_reveals_and_virtualizes_at_all_widths() {
         use crate::right_panel::SingletonKind;
-        // At 960 px the docked panel squeezes to ~362 px for the conversation's
-        // With the Inspector covering at 960 pt (spec §3.3), the diff lane is wide enough
-        // to fit the file tree; below 416 px it hides outright.
-        let mut rt = Runtime::with_text(
-            State::new(".".into(), false),
-            view,
-            (400.0, 720.0),
-            Env::new(false, 1.0),
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
-        );
+        // A docked panel resized to its 360 px minimum leaves a lane under the
+        // tree's 416 px minimum, so the tree and its toggle hide outright
+        // (KSG's implied threshold).
+        let mut rt = runtime(1280.0);
+        rt.state.right_panel_width = crate::right_panel::MIN_WIDTH;
         let key = rt.state.panel_key();
         rt.state.right_panels.open(&key, SingletonKind::Diff);
         rt.state.diffs.insert(
@@ -20663,11 +20506,11 @@ pub(crate) mod tests {
         assert!(rt.presented("diff-rows").is_some());
         assert!(
             rt.presented("diff-tree").is_none(),
-            "tree hides below 416 px"
+            "tree hides on a 360 panel"
         );
         assert!(
             rt.presented("diff-tree-toggle").is_none(),
-            "toggle hides below 416 px"
+            "toggle hides on a 360 panel"
         );
 
         for width in [1280.0, 1920.0] {
@@ -20807,11 +20650,11 @@ pub(crate) mod tests {
         assert!(mounted < 200, "5,000 files: {mounted} tree rows built");
     }
 
-    /// KSG `PanelLayoutControls` in the chat header: the diff toggle opens and
+    /// KSG `PanelLayoutControls` in the top bar: the diff toggle opens and
     /// closes the Diff tab, the panel toggle the whole panel, and the loaded
     /// diff's totals sit beside the diff toggle once the row is wide enough.
     #[test]
-    fn header_diff_and_panel_buttons_toggle_the_right_panel_at_all_widths() {
+    fn top_bar_diff_and_panel_buttons_toggle_the_right_panel_at_all_widths() {
         // Two files: +2 -1 on src/a.rs, +3 on src/b.rs — "+5 -1" total.
         const PATCH: &str = "diff --git a/src/a.rs b/src/a.rs\n\
             --- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,4 @@\n keep\n-old\n+new\n+more\n tail\n\
@@ -20834,14 +20677,13 @@ pub(crate) mod tests {
             rt.frame(0.0);
             rt.frame(0.5);
 
-            let (header, _) = rt.presented("chat-header").unwrap();
-            // Every presented right-side control stays inside the header and
+            let (bar, _) = rt.presented("top-bar").unwrap();
+            // Every presented right-side control stays inside the bar and
             // clear of its neighbours and the status text's slot.
             let mut controls = Vec::new();
             for key in [
                 "chat-status",
                 "thread-actions",
-                "open-session-panel",
                 "header-diff-stat",
                 "header-diff",
                 "header-right-panel",
@@ -20852,8 +20694,8 @@ pub(crate) mod tests {
             }
             for (name, rect) in &controls {
                 assert!(
-                    rect[0] >= header[0] - 0.5 && rect[0] + rect[2] <= header[0] + header[2] + 0.5,
-                    "{width}: {name} {rect:?} escapes header {header:?}"
+                    rect[0] >= bar[0] - 0.5 && rect[0] + rect[2] <= bar[0] + bar[2] + 0.5,
+                    "{width}: {name} {rect:?} escapes bar {bar:?}"
                 );
             }
             for (i, (a, ar)) in controls.iter().enumerate() {
@@ -20863,50 +20705,37 @@ pub(crate) mod tests {
                 }
             }
 
-            // The diff toggle opens the panel on the Diff tab and presses off again.
-            assert!(rt.presented("header-diff").is_some(), "{width}");
-            press(&mut rt, "header-diff");
-            rt.frame(0.5);
-            let key = rt.state.panel_key();
-            assert_eq!(
-                rt.state.right_panels.active_view(&key),
-                Some(crate::right_panel::PanelView::Diff),
-                "{width}"
-            );
-            assert!(rt.presented("right-panel").is_some(), "{width}");
-            if width < 1050.0 {
-                // While chat-header still sits inside chat-main (before WS1 moves it to top-bar),
-                // a covering Inspector covers chat-header; close via the panel's own close button.
-                press(&mut rt, "right-panel-close");
-            } else {
+            // At compact widths the diff toggle drops; Diff is a tab in the
+            // Inspector there. Wider, it opens the panel on the Diff tab and
+            // presses off again.
+            if width >= 760.0 {
+                assert!(rt.presented("header-diff").is_some(), "{width}");
                 press(&mut rt, "header-diff");
+                rt.frame(0.5);
+                let key = rt.state.panel_key();
+                assert_eq!(
+                    rt.state.right_panels.active_view(&key),
+                    Some(crate::right_panel::PanelView::Diff),
+                    "{width}"
+                );
+                assert!(rt.presented("right-panel").is_some(), "{width}");
+                press(&mut rt, "header-diff");
+                rt.frame(0.5);
+                assert!(
+                    rt.presented("right-panel").is_none(),
+                    "{width}: a second press closes the panel"
+                );
+            } else {
+                assert!(rt.presented("header-diff").is_none(), "{width}");
             }
-            rt.frame(0.5);
-            assert!(
-                rt.presented("right-panel").is_none(),
-                "{width}: a second press closes the panel"
-            );
 
-            // The panel toggle shows and hides the whole panel; it drops out of
-            // the header only once the window is compact.
-            match rt.presented("header-right-panel") {
-                Some(_) => {
-                    press(&mut rt, "header-right-panel");
-                    rt.frame(0.5);
-                    assert!(rt.presented("right-panel").is_some(), "{width}");
-                    if width < 1050.0 {
-                        press(&mut rt, "right-panel-close");
-                    } else {
-                        press(&mut rt, "header-right-panel");
-                    }
-                    rt.frame(0.5);
-                    assert!(rt.presented("right-panel").is_none(), "{width}");
-                }
-                None => assert!(
-                    width < 760.0,
-                    "{width}: the panel toggle only drops when compact"
-                ),
-            }
+            // The panel toggle shows and hides the whole panel at every width.
+            press(&mut rt, "header-right-panel");
+            rt.frame(0.5);
+            assert!(rt.presented("right-panel").is_some(), "{width}");
+            press(&mut rt, "header-right-panel");
+            rt.frame(0.5);
+            assert!(rt.presented("right-panel").is_none(), "{width}");
 
             // The stat reads the loaded diff's totals at and above the narrow fold.
             assert_eq!(
@@ -24498,7 +24327,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_away_count_never_shrinks_and_the_phrase_shortens_to_background() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        // The away line mounts only at and above 1280, where it has room
+        // between the title and the actions (spec §1.2).
+        for width in [1280.0, 1920.0] {
             for sidebar in [200.0, 232.0, 320.0] {
                 let mut rt = runtime(width);
                 crate::captain_workspace_demo(&mut rt.state);
@@ -25801,14 +25632,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn header_status_keeps_its_slot_and_siblings_when_it_starts_working() {
+    fn top_bar_status_mounts_when_working_and_stays_inside_the_bar() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.frame(0.0);
             rt.frame(0.0);
-            let (header, _) = rt.presented("chat-header").unwrap();
-            let (slot, _) = rt.presented("chat-status").unwrap();
-            let (actions, _) = rt.presented("thread-actions").unwrap();
+            // Ready draws no status slot at all.
+            assert!(rt.presented("chat-status").is_none(), "{width}");
+            let (bar, _) = rt.presented("top-bar").unwrap();
             let t = rt.state.current_mut();
             t.status = Status::Running;
             t.started = Some(std::time::Instant::now() - std::time::Duration::from_secs(725));
@@ -25822,22 +25653,19 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(label.text.as_deref(), Some("Working for 12m 05s"));
             let (text, _) = rt.presented("chat-status-text").unwrap();
-            let (after_slot, _) = rt.presented("chat-status").unwrap();
-            assert_eq!(
-                slot, after_slot,
-                "{width}: the status slot moved or resized"
-            );
+            let (slot, _) = rt.presented("chat-status").unwrap();
+            let (actions, _) = rt.presented("top-bar-actions").unwrap();
             assert!(
-                text[0] >= after_slot[0] - 0.5
-                    && text[0] + text[2] <= after_slot[0] + after_slot[2] + 0.5
-                    && text[0] >= header[0]
-                    && text[0] + text[2] <= header[0] + header[2],
-                "{width}: status text {text:?} escapes {after_slot:?} in {header:?}"
+                text[0] >= slot[0] - 0.5
+                    && text[0] + text[2] <= slot[0] + slot[2] + 0.5
+                    && text[0] >= bar[0]
+                    && text[0] + text[2] <= bar[0] + bar[2],
+                "{width}: status text {text:?} escapes {slot:?} in {bar:?}"
             );
-            assert_eq!(
-                rt.presented("thread-actions").unwrap().0[0],
-                actions[0],
-                "{width}: More actions moved"
+            // The slot sits between the title and the actions.
+            assert!(
+                slot[0] + slot[2] <= actions[0] + 0.5,
+                "{width}: status {slot:?} crosses the actions {actions:?}"
             );
         }
     }
@@ -26090,11 +25918,12 @@ pub(crate) mod tests {
                 "{key} is not inside the title strip: {rect:?}"
             );
         }
+        // The actions live in the same 40 pt strip now, at its right end.
         for key in ["thread-actions", "header-right-panel"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
-                rect[1] >= strip[1] + strip[3],
-                "{key} is still in the window title strip"
+                rect[1] >= strip[1] && rect[1] + rect[3] <= strip[1] + strip[3] + 0.5,
+                "{key} is not inside the title strip: {rect:?}"
             );
         }
         assert!(rt.find("toggle-activity").is_none());
@@ -29383,7 +29212,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_narrow_scene_docks_the_compact_sidebar_with_the_small_wordmark() {
+    fn the_narrow_scene_docks_the_compact_sidebar_and_drops_the_wordmark() {
         let mut rt = runtime(620.0);
         crate::captain_workspace_demo(&mut rt.state);
         rt.state.compact_sidebar = true;
@@ -29393,8 +29222,10 @@ pub(crate) mod tests {
         rt.frame(1.0);
         let (side, _) = rt.presented("sidebar").expect("the sidebar is docked");
         assert!(side[2] <= 216.5, "{side:?}");
-        let (word, _) = rt.presented("shina-wordmark").unwrap();
-        assert!(word[2] < 40.0, "the wordmark drops to 11 px: {word:?}");
+        // The compose button's reservation leaves the wordmark no room beside
+        // the attention badge on a 200 pt sidebar.
+        assert!(rt.presented("shina-wordmark").is_none());
+        assert!(rt.presented("new-thread").is_some());
     }
 
     #[test]
@@ -29756,7 +29587,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_wordmark_stays_beside_the_attention_badge_in_a_docked_sidebar() {
-        for width in [960.0, 1280.0, 1920.0] {
+        for width in [1280.0, 1920.0] {
             let rt = crew_runtime(width);
             let (word, _) = rt.presented("shina-wordmark").unwrap_or_else(|| {
                 panic!("{width}: the wordmark is missing beside the attention badge")
@@ -29766,12 +29597,16 @@ pub(crate) mod tests {
                 word[0] + word[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
                 "{width}: the badge crowds the wordmark {word:?} {badge:?}"
             );
-            // At 15 px Inter semibold "Shina" is about 40 pt wide; the narrow fallback is 12 px.
+            // At 14 px Inter semibold "Shina" is about 38 pt wide; the narrow fallback is 12 px.
             assert!(
-                (word[2] - WORDMARK_WIDTH).abs() < 2.0 || word[2] < 38.0,
+                (word[2] - WORDMARK_WIDTH).abs() < 2.0 || word[2] < 39.0,
                 "{width}: {word:?}"
             );
         }
+        // The compose button's 26 pt makes the wordmark drop out earlier: at
+        // 960 the 216 pt sidebar and the badge leave it no room.
+        let rt = crew_runtime(960.0);
+        assert!(rt.presented("shina-wordmark").is_none());
     }
 
     #[test]
@@ -29833,14 +29668,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_wordmark_keeps_15_px_in_a_normal_sidebar_with_the_traffic_lights_and_a_badge() {
+    fn the_wordmark_keeps_14_px_in_a_normal_sidebar_with_the_traffic_lights_and_a_badge() {
         // A macOS title strip reserves about 72 pt for the window buttons on the left, and the
         // header keeps HEADER_TAB_GAP at its end.
         let line = |sidebar: f32| sidebar - TITLE_CONTROLS - HEADER_TAB_GAP;
-        assert_eq!(wordmark_size(line(232.0), true), Some(15.0));
-        assert_eq!(wordmark_size(line(232.0), false), Some(15.0));
-        assert!(wordmark_size(line(216.0), true).is_some());
-        assert!(wordmark_size(line(200.0), true).is_some());
+        assert_eq!(wordmark_size(line(232.0), true), Some(14.0));
+        assert_eq!(wordmark_size(line(232.0), false), Some(14.0));
+        assert!(wordmark_size(line(216.0), false).is_some());
         assert_eq!(wordmark_size(line(120.0), true), None);
     }
 
@@ -29858,20 +29692,17 @@ pub(crate) mod tests {
                 rt.frame(0.0);
                 rt.frame(0.5);
                 let at = format!("leading {leading}, sidebar {sidebar}");
-                let (mark, _) = rt
-                    .presented("shina-wordmark")
-                    .unwrap_or_else(|| panic!("{at}: no wordmark"));
-                let size = rt
-                    .elements()
-                    .into_iter()
-                    .find(|e| e.key.as_deref() == Some("shina-wordmark"))
-                    .unwrap()
-                    .rect[3];
-                assert!(size < 20.0, "{at}: the wordmark is not small ({size})");
-                let (badge, _) = rt.presented("attention-row").unwrap();
+                // The compose button's reservation drops the wordmark under a
+                // badge on a narrow sidebar, so the badge itself stays clear.
                 assert!(
-                    mark[0] + mark[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
-                    "{at}: wordmark {mark:?} runs into the badge {badge:?}"
+                    rt.presented("shina-wordmark").is_none(),
+                    "{at}: the wordmark did not drop out"
+                );
+                let (badge, _) = rt.presented("attention-row").unwrap();
+                let (logo, _) = rt.presented("shina-logo").unwrap();
+                assert!(
+                    logo[0] + logo[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
+                    "{at}: mark {logo:?} runs into the badge {badge:?}"
                 );
             }
         }
@@ -29898,9 +29729,13 @@ pub(crate) mod tests {
                 badge[0] >= logo[0] + logo[2] + BADGE_CLEARANCE - 0.5,
                 "{width}"
             );
+            // The compose button ends the undocked header, then the gap, then
+            // the nav cluster and the tabs.
+            let (compose, _) = rt.presented("new-thread").unwrap();
+            assert!(compose[0] >= badge[0] + badge[2] - 0.5, "{width}");
             let (tab, _) = rt.presented("active-tab").unwrap();
             assert!(
-                (tab[0] - (badge[0] + badge[2]) - HEADER_TAB_GAP).abs() < 0.5,
+                tab[0] >= compose[0] + compose[2] - 0.5,
                 "{width}: {badge:?} {tab:?}"
             );
         }
@@ -29926,7 +29761,9 @@ pub(crate) mod tests {
                 "{word:?} {badge:?}"
             );
         }
-        assert!((tab[0] - (badge[0] + badge[2]) - HEADER_TAB_GAP).abs() < 0.5);
+        let (compose, _) = rt.presented("new-thread").unwrap();
+        assert!(compose[0] >= badge[0] + badge[2] - 0.5);
+        assert!(tab[0] >= compose[0] + compose[2] - 0.5);
     }
 
     #[test]
@@ -29936,13 +29773,13 @@ pub(crate) mod tests {
             let (badge, _) = rt.presented("attention-row").unwrap();
             let (tab, _) = rt.presented("active-tab").unwrap();
             assert!(
-                (tab[0] - (badge[0] + badge[2]) - HEADER_TAB_GAP).abs() < 0.5,
+                tab[0] >= badge[0] + badge[2] + HEADER_TAB_GAP - 0.5,
                 "{width}: the badge sits {} pt before the first tab",
                 tab[0] - (badge[0] + badge[2])
             );
             let (pane, _) = rt.presented("chat-pane").unwrap();
             assert!(
-                (pane[1] - (tab[1] + tab[3]) - 4.0).abs() < 0.5,
+                (pane[1] - (tab[1] + tab[3]) - 6.0).abs() < 0.5,
                 "{width}: the tab ends {} pt above the pane",
                 pane[1] - (tab[1] + tab[3])
             );

@@ -1801,11 +1801,14 @@ mod tests {
                 ..Default::default()
             });
             rt.frame(1.0);
-            let (header, _) = rt.presented("chat-header").unwrap();
+            // The away line lives in the top bar's slot, at wide widths only.
+            if width < 1280.0 {
+                assert!(rt.presented("captain-away-status").is_none(), "{width}");
+                continue;
+            }
+            let (bar, _) = rt.presented("top-bar").unwrap();
             let (line, _) = rt.presented("captain-away-status").unwrap();
-            assert!(inside(header, line), "{width}: {line:?} outside {header:?}");
-            // The whole-panel toggle drops in compact headers; where it draws the
-            // status must still clear it.
+            assert!(inside(bar, line), "{width}: {line:?} outside {bar:?}");
             if let Some((panel_toggle, _)) = rt.presented("header-right-panel") {
                 assert!(line[0] + line[2] <= panel_toggle[0], "{width}");
             }
