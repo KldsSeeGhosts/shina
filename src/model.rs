@@ -4874,8 +4874,6 @@ pub struct State {
     pub fleet: crate::fleet_update::Fleet,
     /// The sidebar's "N need you" popover is open.
     pub attention_menu: bool,
-    /// The sibling-jump menu on a worker's parent or crew bar.
-    pub crew_siblings_menu: bool,
     /// Where a right-click opened the row menu, in window points.
     pub row_menu_at: Option<(f32, f32)>,
     pub hovered_row: Option<RowTarget>,
@@ -4898,12 +4896,9 @@ pub struct State {
     /// Whether the Snoozed and Settled shelves are open.
     pub shelves: [bool; 2],
     pub settled_visible: usize,
-    /// Captains whose Crew Roster is expanded, by `(server, captain)`. Absent means
-    /// collapsed, the default; a member that starts needing the user opens it once.
-    pub crew_roster_open: std::collections::HashSet<(String, usize)>,
-    /// Crew members already counted toward "needs you", so the roster opens only on the
-    /// arrival of a new one, not on every poll.
-    pub(crate) crew_roster_needing: std::collections::HashSet<(String, usize, usize)>,
+    /// Which request the one-row needs-you bar above the composer is showing, clamped to
+    /// the live request count each frame (spec §3.6).
+    pub needs_you_page: usize,
     pub undo: Option<UndoNotice>,
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
@@ -6004,7 +5999,6 @@ impl State {
             thread_defaults: Default::default(),
             fleet: Default::default(),
             attention_menu: false,
-            crew_siblings_menu: false,
             row_menu_at: None,
             hovered_row: None,
             rename_thread: None,
@@ -6023,8 +6017,7 @@ impl State {
             selection_anchor: None,
             shelves: [false; 2],
             settled_visible: 10,
-            crew_roster_open: Default::default(),
-            crew_roster_needing: Default::default(),
+            needs_you_page: 0,
             undo: None,
             toasts: Vec::new(),
             next_toast_id: 1,
@@ -7500,57 +7493,6 @@ impl State {
                 self.captain_worker(child, home) && child.archived() == self.show_archive
             })
             .count()
-    }
-    /// Whether the Crew Roster above a captain's composer is expanded. The set is keyed by
-    /// `(server, captain)`, so the state follows the captain across machines and home resets.
-    pub fn crew_roster_open(&self, captain: usize) -> bool {
-        self.crew_roster_open
-            .contains(&(self.machines.selected.clone(), captain))
-    }
-    pub fn toggle_crew_roster(&mut self, captain: usize) {
-        let key = (self.machines.selected.clone(), captain);
-        if !self.crew_roster_open.remove(&key) {
-            self.crew_roster_open.insert(key);
-        }
-        self.checkpoint();
-    }
-    /// A member that starts needing the user opens the roster once. Members that stop being
-    /// seen on the selected machine (release, archive) drop out of its tracking set so a
-    /// later return counts as new. Other machines keep their own entries, so switching away
-    /// and back does not re-open a roster whose request the user already saw. Runs over
-    /// every local captain home each poll.
-    pub fn refresh_crew_roster_attention(&mut self) {
-        let server = self.machines.selected.clone();
-        let homes: Vec<(usize, usize)> = self
-            .threads
-            .iter()
-            .filter(|t| self.is_captain_home(t))
-            .filter_map(|t| t.captain.map(|c| (t.id, c)))
-            .filter(|(id, c)| self.captain_home(*c) == Some(*id))
-            .collect();
-        let items = self.attention();
-        let mut needing: std::collections::HashSet<(String, usize, usize)> =
-            std::collections::HashSet::new();
-        for (home, captain) in &homes {
-            for item in &items {
-                if crate::ui::crew_ui::needs_you_item(self, *home, item) {
-                    needing.insert((server.clone(), *captain, item.thread_id));
-                }
-            }
-        }
-        let arrivals: Vec<usize> = needing
-            .iter()
-            .filter(|item| !self.crew_roster_needing.contains(*item))
-            .map(|(_, captain, _)| *captain)
-            .collect();
-        // Only the selected machine's entries refresh; every other server keeps
-        // what it last saw.
-        self.crew_roster_needing
-            .retain(|(item_server, _, _)| item_server != &server);
-        self.crew_roster_needing.extend(needing);
-        for captain in arrivals {
-            self.crew_roster_open.insert((server.clone(), captain));
-        }
     }
     /// Keyboard traversal follows the rows that the sidebar actually displays.
     pub fn sidebar_navigation(&self) -> Vec<usize> {
@@ -16485,7 +16427,6 @@ impl State {
             "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "rightPanelWidth":self.right_panel_width,
-            "crewRosterOpen": self.crew_roster_open.iter().collect::<Vec<_>>(),
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
@@ -16612,22 +16553,6 @@ impl State {
             .unwrap_or(crate::right_panel::DEFAULT_WIDTH);
         self.diff_hide_tests = ui["diffHideTests"].as_bool().unwrap_or(false);
         self.diff_tree_open = ui["diffTreeOpen"].as_bool().unwrap_or(false);
-        self.crew_roster_open = ui["crewRosterOpen"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        entry.as_array().and_then(|pair| {
-                            Some((
-                                pair.first()?.as_str()?.to_owned(),
-                                usize::try_from(pair.get(1)?.as_u64()?).ok()?,
-                            ))
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         self.diff_tree_width = ui
             .get("diffTreeWidth")
             .and_then(|v| v.as_f64())
@@ -17406,10 +17331,6 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | html_changed
         | attachment_changed
         | keybindings_changed;
-    // A crew member that starts needing the user opens its captain's roster once.
-    let roster_before = state.crew_roster_open.len();
-    state.refresh_crew_roster_attention();
-    let browsing = browsing | (state.crew_roster_open.len() != roster_before);
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -18400,47 +18321,6 @@ mod tests {
             .collect();
         expect.sort_unstable();
         assert_eq!(tail, expect);
-    }
-
-    #[test]
-    fn crew_roster_attention_history_survives_machine_switches() {
-        let mut state = State::new(".".into(), false);
-        state.populate_demo();
-        // Captain 0's home is thread id 7; give it a worker waiting on approval.
-        let index = state.threads.len();
-        let mut worker = Thread::new(11);
-        worker.parent = Some(7);
-        worker.delegated = true;
-        worker.crew_captain = Some(0);
-        worker.captain = Some(0);
-        worker.request = Some(json!({"method":"confirm"}));
-        state.threads.push(worker);
-        state.refresh_crew_roster_attention();
-        assert!(state.crew_roster_open(0), "a new request opens the roster");
-        // The user collapses it, then looks at another machine and comes back.
-        state.toggle_crew_roster(0);
-        state.machines.selected = "linked-machine".into();
-        state.refresh_crew_roster_attention();
-        state.machines.selected = "local".into();
-        state.refresh_crew_roster_attention();
-        assert!(
-            !state.crew_roster_open(0),
-            "returning to the machine must not re-open a roster the user collapsed"
-        );
-        // A genuinely new request still opens it once.
-        state
-            .threads
-            .iter_mut()
-            .find(|t| t.id == 11)
-            .unwrap()
-            .request = None;
-        state.refresh_crew_roster_attention();
-        state.threads[index].request = Some(json!({"method":"confirm"}));
-        state.refresh_crew_roster_attention();
-        assert!(
-            state.crew_roster_open(0),
-            "a request that leaves and returns counts as new"
-        );
     }
 
     #[test]

@@ -236,7 +236,7 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
     let identity = row()
         .key("brief-identity")
         .px(16.0)
-        .pt(6.0)
+        .pt(14.0)
         .pb(12.0)
         .gap(12.0)
         .center_y()
@@ -244,7 +244,7 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
             s,
             p,
             captain,
-            36.0,
+            40.0,
             if record {
                 crate::model::Status::Ready
             } else {
@@ -261,7 +261,7 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
                         .gap(8.0)
                         .center_y()
                         .child(
-                            label(&profile.name, CAPTAIN_SERIF, p.ink)
+                            label(&profile.name, IDENTITY, p.ink)
                                 .truncate()
                                 .shrink()
                                 .min_w(0.0),
@@ -291,7 +291,8 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
         crate::model::CaptainAccess::UpdateRequired | crate::model::CaptainAccess::NoRecords
     );
     // A retired record has no Inspector tabs (spec §3.9), so its sheet stacks the read-only
-    // Overview and Context sections together. Active/archived homes keep Context in its own tab.
+    // Overview and Context sections together. Active/archived homes keep Context in its own
+    // tab, and the Crew tab owns the roster and the manage/new/recruit controls.
     let sections: Vec<Option<El>> = if record {
         vec![
             knowable.then(|| digest_section(s, p, captain)),
@@ -313,9 +314,12 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
     } else {
         vec![
             knowable.then(|| digest_section(s, p, captain)),
-            knowable.then(|| crew_section(s, p, captain)),
             Some(
                 routines_section(s, p, captain)
+                    .disabled(access != crate::model::CaptainAccess::Full),
+            ),
+            Some(
+                behaviour_section(s, p, captain)
                     .disabled(access != crate::model::CaptainAccess::Full),
             ),
             super::captain_lifecycle_ui::section_visible(s, captain)
@@ -488,7 +492,11 @@ pub(super) fn digest_section(s: &State, p: Palette, captain: usize) -> El {
     });
     let has_activity = super::captain_activity_ui::activity_has_entries(s, captain);
     let mut section = section("brief-digest", "Digest", None, vec![open], p);
-    section = section.child(super::captain_activity_ui::activity(s, p, captain));
+    // Only "What's new" lives here; "Needs you" and "In progress" belong to the
+    // request bar and the Crew tab (spec §3.4).
+    section = section.child(super::captain_activity_ui::activity_whats_new(
+        s, p, captain,
+    ));
     // The only divider inside the section: activity above, the saved digest below.
     section = section.child(
         el().key("brief-digest-rule")
@@ -547,109 +555,49 @@ pub(super) fn digest_section(s: &State, p: Palette, captain: usize) -> El {
     section
 }
 
-/// The canonical crew, reduced to a count and a pointer: the Crew Roster above the captain's
-/// composer holds the member rows, the More menus and the recruit/new-thread controls. The
-/// Brief keeps the policy and recovery blocks. Crew membership has no KSG equivalent.
+/// The Inspector's Crew tab (spec §3.5): the grouped roster — Needs you, Working,
+/// Queued, Offline, Idle — one `crew_ui::roster_row` per member, plus a pinned 44 pt
+/// footer with New crew thread and Recruit on a Full-access captain. Crew membership
+/// has no KSG equivalent; the grouping follows the work rows' visual language.
 pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
     let access = s.captain_access(captain);
     if access == crate::model::CaptainAccess::NoRecords {
-        return section("brief-crew", "Crew", None, vec![], p)
+        return col()
+            .key("crew-roster-rows")
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
             .child(quiet_note(format!("Loading from {}.", machine_label(s)), p));
     }
-    let mut members = s.captain_crew(captain);
-    // Pending joins on this server appear as crew rows without touching canonical
-    // membership; pending moves/releases keep their rows too.
+    let home = s.captain_home(captain).unwrap_or_else(|| s.current().id);
+    let members = super::crew_ui::roster_members(s, home, captain);
     let pending: Vec<(usize, crate::model::CrewKind)> = s
         .crew_pending
         .iter()
         .filter(|((server, _), change)| *server == s.machines.selected && change.captain == captain)
         .map(|(_, change)| (change.thread, change.kind))
         .collect();
+    let current = s.current().id;
+    let mut rows = col().gap(2.0);
+    // Pending joins show a quiet in-flight row; vanished threads keep the receipt.
     for (thread, kind) in &pending {
-        if matches!(kind, crate::model::CrewKind::Join) && !members.contains(thread) {
-            members.push(*thread);
-        }
-    }
-    members.sort_by(|a, b| {
-        let rank = |id: &usize| {
-            s.threads.iter().find(|t| t.id == *id).map_or(3, |thread| {
-                if thread.request.is_some() {
-                    0
-                } else if thread.status.busy() {
-                    1
-                } else {
-                    2
-                }
-            })
-        };
-        rank(a).cmp(&rank(b)).then_with(|| {
-            let ua = s
-                .threads
-                .iter()
-                .find(|t| t.id == *a)
-                .map_or(0, |t| t.updated);
-            let ub = s
-                .threads
-                .iter()
-                .find(|t| t.id == *b)
-                .map_or(0, |t| t.updated);
-            ub.cmp(&ua)
-        })
-    });
-    members.dedup();
-    let mut rows = col().gap(2.0).child(
-        label(
-            if members.is_empty() {
-                "No crew members".into()
-            } else {
-                format!("{} crew members", members.len())
-            },
-            META,
-            p.muted,
-        )
-        .key("brief-crew-count")
-        .px(10.0)
-        .min_h(28.0),
-    );
-    // A pending membership change still shows its in-flight word; membership itself always
-    // comes from the projection.
-    for (thread, kind) in &pending {
-        if !members.contains(thread) {
+        if s.threads.iter().any(|t| t.id == *thread) {
             continue;
         }
-        let word = match kind {
-            crate::model::CrewKind::Join => "Joining",
-            crate::model::CrewKind::Release => "Leaving",
-            crate::model::CrewKind::Move { .. } => "Moving",
+        let note = match kind {
+            crate::model::CrewKind::Join => "Joining, but the thread is no longer here.",
+            crate::model::CrewKind::Release => "Leaving, but the thread is no longer here.",
+            crate::model::CrewKind::Move { .. } => "Moving, but the thread is no longer here.",
         };
-        if s.threads.iter().any(|t| t.id == *thread) {
-            let title = s
-                .threads
-                .iter()
-                .find(|t| t.id == *thread)
-                .map(|t| t.title.clone())
-                .unwrap_or_default();
-            rows = rows.child(
-                label(format!("{word}: {title}"), META, p.faint)
-                    .key(format!("brief-crew-{thread}"))
-                    .px(10.0)
-                    .min_h(20.0),
-            );
-        } else {
-            // The source thread can vanish (remote reset, archive) while its join is
-            // still pending; keep the command for its receipt and show a quiet row.
-            let note = match kind {
-                crate::model::CrewKind::Join => "Joining, but the thread is no longer here.",
-                crate::model::CrewKind::Release => "Leaving, but the thread is no longer here.",
-                crate::model::CrewKind::Move { .. } => "Moving, but the thread is no longer here.",
-            };
-            rows = rows.child(
-                label(note, META, p.faint)
-                    .key(format!("brief-crew-{thread}"))
-                    .px(10.0)
-                    .min_h(28.0),
-            );
-        }
+        rows = rows.child(
+            label(note, META, p.faint)
+                .key(format!("brief-crew-{thread}"))
+                .px(10.0)
+                .min_h(28.0),
+        );
     }
     if let Some(error) = s.crew_errors.get(&s.machines.selected) {
         rows = rows.child(
@@ -658,52 +606,144 @@ pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
                 .color(p.danger),
         );
     }
-    // The roster only renders above an active captain's primary home composer; on an
-    // earlier home the button opens that home first. An archived captain has no roster
-    // anywhere, so the row hides.
-    let roster_available = s.captain_phase(captain) == crate::model::CaptainPhase::Active;
-    let manage = roster_available.then(|| {
-        row()
-            .key("brief-crew-manage")
-            .role("button")
-            .cursor(rune::Cursor::Pointer)
-            .label("Manage in the crew roster")
-            .focusable(true)
-            .px(10.0)
-            .min_h(28.0)
-            .center_y()
-            .radius(6.0)
-            .hover(hover_wash(s, p))
-            .press(active_wash(s, p))
-            .hover_motion(motion(), motion())
-            .on_press(move |s: &mut State| {
-                // Until Workstream 3 moves the member rows into the Crew tab, opening the
-                // roster focuses the primary home, opens the composer roster, and closes a
-                // covering Inspector so the roster is actually visible.
-                if s.captain_home(captain) != Some(s.current().id) {
-                    s.open_captain(captain);
-                }
-                if !s.crew_roster_open(captain) {
-                    s.toggle_crew_roster(captain);
-                }
-                if s.inspector_covers() {
-                    let key = s.panel_key();
-                    s.right_panels.close(&key);
-                }
+    // Grouped roster (spec §3.5): Needs you, Working, Queued, Offline, Idle. Each member
+    // lands in the first group that claims it, so a queued row that also waits on you is
+    // filed under Needs you, and Idle is whatever is left.
+    use crate::model::Status;
+    let groups: [(&str, fn(&super::crew_ui::RosterMember) -> bool); 5] = [
+        ("Needs you", |m| m.status == Status::Waiting),
+        ("Working", |m| m.status == Status::Running),
+        ("Queued", |m| m.queued),
+        ("Offline", |m| m.status == Status::Paused),
+        ("Idle", |_| true),
+    ];
+    let mut any_group = false;
+    let mut placed: std::collections::HashSet<usize> = Default::default();
+    for (title, matches) in groups {
+        let group_members: Vec<&super::crew_ui::RosterMember> = members
+            .iter()
+            .filter(|m| !placed.contains(&m.thread_id) && matches(m))
+            .collect();
+        if group_members.is_empty() {
+            continue;
+        }
+        placed.extend(group_members.iter().map(|m| m.thread_id));
+        any_group = true;
+        rows = rows.child(
+            row()
+                .h(32.0)
+                .px(10.0)
+                .center_y()
+                .child(meta_label(title, p.muted))
+                .child(spacer())
+                .child(
+                    label(group_members.len().to_string(), TIMER, p.faint).key(format!(
+                        "crew-group-{}",
+                        title.to_lowercase().replace(' ', "-")
+                    )),
+                ),
+        );
+        for member in group_members {
+            let key = format!("crew-chip-{}", member.thread_id);
+            let mut member_row = super::crew_ui::roster_row(s, p, member, key, true)
+                .h(32.0)
+                .px(10.0);
+            if member.thread_id == current {
+                member_row = member_row.fill(super::crew_ui::active_wash(s, p));
+            }
+            rows = rows.child(member_row);
+        }
+    }
+    if !any_group {
+        rows = rows.child(
+            quiet_note(
+                "No crew yet. This captain starts crew threads as it delegates work.",
+                p,
+            )
+            .key("crew-roster-empty"),
+        );
+    }
+    let mut tab = col().key("crew-tab").grow(1.0).min_h(0.0).w_full();
+    tab = tab.child(
+        col()
+            .key("crew-roster-rows")
+            .grow(1.0)
+            .min_h(0.0)
+            .w_full()
+            .scroll(ScrollSpec {
+                stick_bottom: false,
             })
-            .child(label("Manage in the crew roster", META_LABEL, p.sea))
-    });
-    section(
-        "brief-crew",
-        "Crew",
-        Some(members.len().to_string()),
-        vec![],
+            .child(rows),
+    );
+    if access == crate::model::CaptainAccess::Full {
+        tab = tab.child(crew_roster_footer(s, p, captain));
+    }
+    tab
+}
+
+/// The pinned footer of the Crew tab: a rule above a 44 pt row with New crew thread and
+/// Recruit. Full access only, per spec §3.5.
+fn crew_roster_footer(s: &State, p: Palette, captain: usize) -> El {
+    let server = s.machines.selected.clone();
+    let draft_reason = s.crew_creation_unavailable(&server, captain);
+    let new_server = server.clone();
+    let mut new_thread = ghost_button(
+        s,
+        "crew-roster-new".into(),
+        "New crew thread",
         p,
+        move |s: &mut State| {
+            if s.machines.selected != new_server {
+                return;
+            }
+            if let Err(error) = s.begin_crew_draft(&new_server, captain) {
+                s.brief.error = Some(error);
+            }
+        },
     )
-    .child(rows)
-    .child(manage.unwrap_or_else(el))
-    .child(super::captain_activity_ui::policy_block(s, p, captain))
-    .child(super::captain_activity_ui::recovery_block(s, p, captain))
+    .disabled(draft_reason.is_some());
+    if let Some(reason) = draft_reason {
+        new_thread = new_thread.help(reason);
+    }
+    let recruit_server = server.clone();
+    col()
+        .key("crew-roster-footer")
+        .child(el().h(1.0).fill(hairline(p)))
+        .child(
+            row()
+                .h(44.0)
+                .px(8.0)
+                .gap(6.0)
+                .center_y()
+                .child(new_thread)
+                .child(ghost_button(
+                    s,
+                    "crew-roster-recruit".into(),
+                    "Recruit...",
+                    p,
+                    move |s: &mut State| {
+                        if s.machines.selected != recruit_server
+                            || s.captain_access(captain) != crate::model::CaptainAccess::Full
+                        {
+                            return;
+                        }
+                        s.brief.recruit = Some(crate::model::RecruitPicker {
+                            server: recruit_server.clone(),
+                            captain,
+                            query: rune::TextEdit::default(),
+                        });
+                    },
+                )),
+        )
+}
+
+/// The Overview's Behaviour section (spec §3.4): the Reports policy control and the
+/// Restart recovery block. These moved here from the old Crew section, which now shows
+/// only the roster.
+pub(super) fn behaviour_section(s: &State, p: Palette, captain: usize) -> El {
+    section("brief-behaviour", "Behaviour", None, vec![], p)
+        .child(super::captain_activity_ui::policy_block(s, p, captain))
+        .child(super::captain_activity_ui::recovery_block(s, p, captain))
 }
 
 fn machine_label(s: &State) -> String {
@@ -1291,10 +1331,6 @@ mod tests {
         }
         panic!("{key} never revealed inside {container}'s scroll viewport");
     }
-    /// The same, in the Brief's Overview body.
-    fn reveal_in_brief(rt: &mut Runtime<State>, key: &str) {
-        reveal_in(rt, "captain-brief", key);
-    }
     /// Every corner of `key`'s drawn box is inside its ancestors' clips, so the
     /// element is fully on screen rather than cut by the scroll viewport.
     fn fully_visible(rt: &Runtime<State>, key: &str) -> bool {
@@ -1309,11 +1345,6 @@ mod tests {
         ]
         .into_iter()
         .all(|(x, y)| rt.contains(key, x, y))
-    }
-    /// A press on a Brief control that may sit outside the scroll viewport.
-    fn press_in_brief(rt: &mut Runtime<State>, key: &str) {
-        reveal_in_brief(rt, key);
-        press(rt, key);
     }
     /// The same in the Context tab: switches the Inspector to Context first.
     fn press_in_context(rt: &mut Runtime<State>, key: &str) {
@@ -1835,7 +1866,7 @@ mod tests {
         }
     }
     #[test]
-    fn digest_crew_and_document_rows_stay_inside_the_brief() {
+    fn digest_behaviour_and_document_rows_stay_inside_the_brief() {
         for width in WIDTHS {
             let (mut rt, _) = brief_runtime(width);
             let (panel, _) = rt.presented("right-panel").expect("inspector is shown");
@@ -1845,8 +1876,18 @@ mod tests {
                     vec![
                         "brief-digest",
                         "brief-digest-open",
-                        "brief-crew",
-                        "brief-crew-manage",
+                        "brief-behaviour",
+                        "brief-report-policy",
+                        "brief-captain-recovery",
+                    ],
+                ),
+                (
+                    "right-panel-segment-crew",
+                    vec![
+                        "crew-tab",
+                        "crew-roster-footer",
+                        "crew-roster-new",
+                        "crew-roster-recruit",
                     ],
                 ),
                 (
@@ -1871,10 +1912,10 @@ mod tests {
                             break;
                         }
                         let (body, _) = rt
-                            .presented(if tab.ends_with("context") {
-                                "context-tab"
-                            } else {
-                                "captain-brief"
+                            .presented(match tab {
+                                "right-panel-segment-context" => "context-tab",
+                                "right-panel-segment-crew" => "crew-roster-rows",
+                                _ => "captain-brief",
                             })
                             .unwrap();
                         rt.wheel(body[0] + body[2] / 2.0, body[1] + 200.0, -2000.0);
@@ -1934,7 +1975,7 @@ mod tests {
     }
 
     #[test]
-    fn a_crew_member_thread_shows_the_crew_bar_with_open_and_leave() {
+    fn a_crew_member_thread_shows_no_bar_until_its_crew_change_is_pending() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
         rt.state.set_captain_scope(0, vec![1]).unwrap();
@@ -1947,18 +1988,27 @@ mod tests {
         rt.state.threads.push(member);
         rt.state.open_kept_tab(rt.state.threads.len() - 1);
         rt.frame(0.25);
-        let (bar, _) = rt.presented("crew-bar").expect("crew bar");
-        assert!(rt.presented("crew-bar-open-captain").is_some());
-        press(&mut rt, "crew-bar-more");
+        // A healthy crew member keeps the composer clear (spec §3.8).
+        assert!(rt.presented("crew-bar").is_none());
+        assert!(rt.presented("parent-bar").is_none());
+        assert!(rt.presented("composer").is_some());
+        // A pending release flips the bar to its notice form.
+        rt.state.crew_pending.insert(
+            (rt.state.machines.selected.clone(), uuid::Uuid::new_v4()),
+            crate::model::CrewChange {
+                captain: 0,
+                thread: thread_id,
+                kind: crate::model::CrewKind::Release,
+            },
+        );
+        rt.invalidate();
         rt.frame(0.25);
-        for key in ["crew-menu-move", "crew-bar-leave"] {
-            let (rect, _) = rt.presented(key).unwrap_or_else(|| panic!("{key}"));
-            assert!(rect[1] >= bar[1], "{key} above the bar");
-        }
-        // Leave calls the same release path the Brief's menu uses.
-        press(&mut rt, "crew-bar-leave");
+        let (bar, _) = rt.presented("crew-bar").expect("crew notice bar");
+        assert!((bar[3] - 36.0).abs() < 0.5, "{bar:?}");
+        rt.state.crew_pending.clear();
+        rt.invalidate();
         rt.frame(0.25);
-        assert_eq!(rt.state.threads.last().unwrap().crew_captain, None);
+        rt.frame(1.0);
         assert!(rt.presented("crew-bar").is_none());
     }
 
@@ -1987,7 +2037,9 @@ mod tests {
             next + 1
         };
         rt.state.next_id += 2;
+        // The recruit button lives in the Crew tab's pinned footer.
         press(&mut rt, "crew-roster-toggle");
+        rt.frame(0.25);
         press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         assert!(rt.presented("crew-recruit-palette").is_some());

@@ -8,6 +8,7 @@
 //! Context `context_ui::tab` (documents, scope, memory and earlier conversations,
 //! plus an open captain document) and Diff `diff_panel`. Workstreams 3 and 4
 //! reshape each body in place; the shell is settled here.
+use super::crew_ui::{active_wash, hairline, hover_wash, motion};
 use super::*;
 
 /// The tabs a thread offers, in strip order. Captain homes and crew workers get
@@ -317,9 +318,108 @@ fn session_body(s: &State, p: Palette) -> El {
 fn overview_body(s: &State, p: Palette) -> El {
     if let Some(captain) = captain_ui::home_brief_captain(s) {
         captain_ui::brief_panel_for(s, p, captain, false)
+    } else if s.current().crew_captain.is_some()
+        || s.current().delegated
+        || s.current().peer_origin.is_some()
+    {
+        worker_overview_body(s, p)
     } else {
         session_body(s, p)
     }
+}
+
+/// The Overview tab on a crew worker (spec §3.4): the worker's title and status, a
+/// pressable "Delegated by" row back to its captain, a "Runs" line for its placement,
+/// then the session details below.
+fn worker_overview_body(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let captain = t
+        .captain
+        .or(t.crew_captain)
+        .filter(|c| *c < s.captains.len());
+    let mut identity = row()
+        .key("brief-identity")
+        .px(16.0)
+        .pt(14.0)
+        .pb(12.0)
+        .gap(12.0)
+        .center_y();
+    if let Some(captain) = captain {
+        identity = identity.child(avatar(s, p, captain, 40.0, shown_status(s)));
+    }
+    identity = identity.child(
+        col()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(1.0)
+            .child(label(&t.title, IDENTITY, p.ink).truncate().min_w(0.0))
+            .child(label(crate::model::status_word(t.status), META, p.muted).truncate()),
+    );
+    let mut body = col()
+        .key("brief-sections")
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(identity)
+        .child(el().h(1.0).mx(16.0).fill(hairline(p)));
+    // "Delegated by": the captain's face and name, pressable back to its home.
+    if let Some(captain) = captain {
+        let profile = &s.captains[captain];
+        body = body.child(
+            captain_ui::section("brief-delegated", "Delegated by", None, vec![], p).child(
+                row()
+                    .key("open-captain-from-overview")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label(format!("Open {}", profile.name))
+                    .focusable(true)
+                    .px(10.0)
+                    .min_h(40.0)
+                    .gap(10.0)
+                    .center_y()
+                    .radius(6.0)
+                    .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(move |s: &mut State| s.open_captain(captain))
+                    .child(avatar(s, p, captain, 24.0, s.captain_status(captain)))
+                    .child(
+                        label(
+                            &profile.name,
+                            TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08),
+                            p.ink,
+                        )
+                        .truncate()
+                        .min_w(0.0),
+                    ),
+            ),
+        );
+    }
+    // "Runs": the placement details the parent bar used to carry.
+    if let Some(placement) = crew_ui::worker_placement(s, t.id) {
+        let machine = crew_ui::placement_machine(s, t.id, &placement);
+        let details = crew_ui::placement_details(&placement, &machine);
+        body = body.child(
+            captain_ui::section("brief-runs", "Runs", None, vec![], p).child(
+                label(details, SMALL, p.muted)
+                    .key("worker-placement")
+                    .wrap()
+                    .px(10.0)
+                    .pb(4.0),
+            ),
+        );
+    }
+    body = body
+        .child(el().h(1.0).mx(16.0).fill(hairline(p)))
+        .child(session_body(s, p));
+    col()
+        .key("worker-overview")
+        .min_h(0.0)
+        .h_full()
+        .w_full()
+        .child(body)
 }
 
 /// The Crew tab: the captain's roster section where a captain backs the
@@ -332,21 +432,105 @@ fn crew_body(s: &State, p: Palette) -> El {
         .or(t.crew_captain)
         .filter(|captain| *captain < s.captains.len());
     match captain {
-        Some(captain) => col()
-            .key("crew-tab")
-            .grow(1.0)
-            .min_h(0.0)
-            .w_full()
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(captain_ui::crew_section(s, p, captain)),
+        Some(captain) => captain_ui::crew_section(s, p, captain),
+        None if t.peer_origin.is_some() => peer_crew_body(s, p),
         None => col()
             .key("crew-tab")
             .min_h(0.0)
             .w_full()
             .child(captain_ui::quiet_note("This thread has no crew.", p)),
     }
+}
+
+/// The Crew tab on a peer-launched worker (spec §3.5): the workers the same remote
+/// delegation put on this machine, with the open worker filled. There is no local
+/// captain to foot the tab with, so no footer.
+fn peer_crew_body(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let Some(origin) = t.peer_origin.as_ref() else {
+        return col().key("crew-tab").min_h(0.0).w_full();
+    };
+    let members = crew_ui::peer_sibling_members(s, t.id, origin);
+    // The captain's name heads the list; the open worker's own row follows, filled.
+    let mut rows = col().gap(2.0).pt(8.0).child(
+        row()
+            .key("crew-tab-captain")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("Captain {}", origin.captain))
+            .focusable(true)
+            .h(32.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(6.0)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+            .child(
+                label(
+                    format!("Captain {}", origin.captain),
+                    TextStyle::new(12.0, 500.0).lh(16.0),
+                    p.muted,
+                )
+                .truncate(),
+            ),
+    );
+    // The open worker's own row leads the siblings, filled (spec §3.5).
+    let own_member = crew_ui::RosterMember {
+        thread_id: t.id,
+        title: if t.title.is_empty() {
+            "Untitled".into()
+        } else {
+            t.title.clone()
+        },
+        status: if t.request.is_some() {
+            crate::model::Status::Waiting
+        } else {
+            t.status
+        },
+        word: crate::model::status_word(t.status).to_string(),
+        clock: crate::model::status_word(t.status).to_string(),
+        remote_server: (t.machine != "local").then(|| t.machine.clone()),
+        rank: 0,
+        updated: t.updated,
+        queued: false,
+        place: None,
+    };
+    rows = rows.child(
+        crew_ui::roster_row(s, p, &own_member, format!("crew-chip-{}", t.id), false)
+            .h(32.0)
+            .px(10.0)
+            .fill(active_wash(s, p)),
+    );
+    for member in &members {
+        rows = rows.child(
+            crew_ui::roster_row(
+                s,
+                p,
+                member,
+                format!("crew-chip-{}", member.thread_id),
+                true,
+            )
+            .h(32.0)
+            .px(10.0),
+        );
+    }
+    if members.is_empty() {
+        rows = rows.child(
+            captain_ui::quiet_note("No other crew members on this machine.", p)
+                .key("crew-roster-empty"),
+        );
+    }
+    col()
+        .key("crew-tab")
+        .grow(1.0)
+        .min_h(0.0)
+        .w_full()
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .child(rows)
 }
 
 /// The Diff tab keeps its embedded header row, as before.

@@ -649,6 +649,13 @@ fn composer_suggestion_key(s: &mut State, event: &rune::KeyEvent, key_repeat: bo
 
 /// Ported from KSG Code's QueuedRunsControl: right-aligned unsent messages, per-message edit,
 /// remove and Send now actions, three initial rows and an explicit expansion control.
+/// Whether the queued list has messages, so the composer's stack can skip the
+/// part entirely instead of paying an empty gap (spec §3.6).
+pub(super) fn queued_messages_shows(s: &State) -> bool {
+    let t = s.current();
+    !t.native.queue.is_empty() || !t.native.steering.is_empty() || !t.native.follow_ups.is_empty()
+}
+
 pub(super) fn queued_messages(s: &State, p: Palette) -> El {
     let t = s.current();
     let count = t.native.queue.len() + t.native.steering.len() + t.native.follow_ups.len();

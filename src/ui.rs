@@ -393,11 +393,12 @@ const DIALOG_TITLE: TextStyle = TextStyle::new(20.0, 600.0)
     .lh(26.0)
     .tracking(-0.2)
     .family(rune::Family::Named("Source Serif 4"));
-/// A captain's name in the picker, the hero and the editor: Source Serif 4, tight.
-const CAPTAIN_SERIF: TextStyle = TextStyle::new(16.0, 600.0)
+/// The captain's name in the Inspector's Overview (spec §0.1 `IDENTITY`): Inter 16/600,
+/// tight tracking. Replaces the old Source Serif treatment, per the all-Inter rule.
+const IDENTITY: TextStyle = TextStyle::new(16.0, 600.0)
     .lh(22.0)
-    .tracking(-0.2)
-    .family(rune::Family::Named("Source Serif 4"));
+    .tracking(-0.16)
+    .family(rune::Family::Named("Inter Variable"));
 const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 500.0)
     .lh(32.0)
     .tracking(-0.6)
@@ -1185,18 +1186,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     .modal(true, |s: &mut State| s.brief.more = None),
             );
         }
-    }
-    if let Some(captain) = s.current().crew_captain
-        && s.brief.more == Some(s.current().id)
-    {
-        root = root.child(
-            crew_membership_ui::crew_bar_menu(s, p, captain, s.current().id)
-                .anchored_fit("crew-bar-more", rune::Side::Bottom, rune::Align::End, 4.0)
-                .modal(true, |s: &mut State| s.brief.more = None),
-        );
-    }
-    if let Some(menu) = crew_ui::siblings_menu(s, p) {
-        root = root.child(menu);
     }
     if let Some(menu) = crew_membership_ui::move_picker(s, p) {
         root = root.child(menu);
@@ -15593,30 +15582,26 @@ fn composer_decorations(
 struct AboveComposerBudget {
     /// Minimum height for the stack so no visible controls become unreachable.
     floor: f32,
-    /// Maximum height the crew roster's rows may take, or `None` to collapse to header-only.
-    roster_rows_max: Option<f32>,
 }
 
-fn above_composer_budget(s: &State, cap: f32) -> AboveComposerBudget {
+fn above_composer_budget(s: &State, _cap: f32) -> AboveComposerBudget {
     let t = s.current();
     let mut parts = 0usize;
     let mut others_floor = 0.0f32;
     if crew_ui::parent_bar_shows(s) {
         parts += 1;
-        others_floor += 52.0;
+        others_floor += 36.0;
     }
     if crew_ui::crew_bar_shows(s) {
         parts += 1;
-        others_floor += 48.0;
+        others_floor += 36.0;
     }
     let has_needs_you = crew_ui::needs_you_shows(s);
     if has_needs_you {
         parts += 1;
-        // Keep one approval card with its action buttons visible without scrolling; share the
-        // lane more tightly when the Plan panel is also open.
-        others_floor += if s.plan_panel_open() { 120.0 } else { 140.0 };
+        // One paged 52 pt request card; a typed-answer question form adds a little.
+        others_floor += if s.plan_panel_open() { 52.0 } else { 84.0 };
     }
-    let roster_open_height = crew_ui::crew_tray_open_extra_height(s);
     if crew_ui::crew_tray_shows(s) {
         parts += 1;
         others_floor += 28.0;
@@ -15639,27 +15624,8 @@ fn above_composer_budget(s: &State, cap: f32) -> AboveComposerBudget {
     if parts > 1 {
         others_floor += (parts - 1) as f32 * 8.0;
     }
-    let remaining = (cap - others_floor).max(0.0);
-    let roster_body = roster_open_height.unwrap_or(0.0);
-    // Keep the roster open when it fits within the cap; when other parts leave less than
-    // the full 150 px rows cap, let the roster shrink its rows scroll box down to one row
-    // (or footer only for 0 members) before collapsing to header-only.
-    let min_open_body = crew_ui::crew_tray_min_open_extra_height(s).unwrap_or(0.0);
-    let roster_rows_max = if roster_open_height.is_some() && remaining >= min_open_body {
-        let footer_and_gaps = crew_ui::crew_tray_footer_extra_height(s);
-        Some((remaining - footer_and_gaps).clamp(0.0, 150.0))
-    } else {
-        None
-    };
-    let floor = others_floor
-        + if roster_rows_max.is_some() {
-            roster_body.min(remaining)
-        } else {
-            0.0
-        };
     AboveComposerBudget {
-        floor,
-        roster_rows_max,
+        floor: others_floor,
     }
 }
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
@@ -15965,8 +15931,8 @@ fn composer(
     // The stack caps at 40% of the viewport, yielding only to the minimum floors so controls
     // stay reachable on short windows.
     let cap = viewport_cap.max(budget.floor);
-    let needs_you_part = crew_ui::needs_you(s, p);
-    let tray = crew_ui::crew_tray(s, p, lane, budget.roster_rows_max);
+    let needs_you_part = crew_ui::needs_you(s, p, lane);
+    let tray = crew_ui::crew_tray(s, p, lane, None);
     let mut stack = col()
         .key("above-composer-stack")
         .w_full()
@@ -15985,7 +15951,9 @@ fn composer(
     {
         stack = stack.child(part);
     }
-    stack = stack.child(pi_ui::queued_messages(s, p));
+    if pi_ui::queued_messages_shows(s) {
+        stack = stack.child(pi_ui::queued_messages(s, p));
+    }
     area = area.child(stack);
     // KSG Code's `ComposerSurface.Main`: a 15 px card with a hairline outline. A composer that
     // cannot send drops its shadow and its frame takes the lighter `line` colour.
@@ -24424,8 +24392,12 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
             rt.state.compact_sidebar = true;
-            // The summary lives in the roster's header; chip clocks need the roster open.
-            rt.state.refresh_crew_roster_attention();
+            // The summary lives in the strip; member rows and their clocks live in the
+            // Inspector's Crew tab now.
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Crew,
+            );
             rt.frame(0.0);
             rt.frame(1.0);
             // Two workers run. The review waits on an approval, and one more waits for a slot.
@@ -24448,11 +24420,23 @@ pub(crate) mod tests {
                 })
                 .filter_map(|e| e.text)
                 .collect();
-            assert_eq!(
-                words,
-                ["2 working", "1 needs you", "1 queued"],
-                "width {width}"
-            );
+            // Under 480 pt of lane the strip caps at two segments, needs you
+            // first (spec §3.6) — the Crew tab it opens holds the full summary.
+            if rt.presented("crew-tray-offline").is_none()
+                && rt.presented("crew-tray-queued").is_none()
+            {
+                assert_eq!(
+                    words,
+                    ["1 needs you", "2 working"],
+                    "width {width}: narrow lane keeps needs-you first"
+                );
+            } else {
+                assert_eq!(
+                    words,
+                    ["2 working", "1 needs you", "1 queued"],
+                    "width {width}"
+                );
+            }
             assert_eq!(rt.state.crew_working_now(7), 2, "width {width}");
             if let Some(status) = line("captain-away-status") {
                 assert!(status.ends_with("2 tasks"), "width {width}: {status}");
@@ -28731,19 +28715,17 @@ pub(crate) mod tests {
             let mut rt = crew_runtime(width);
             rt.state
                 .demo_remote_task(16, "Studio", crate::model::RemoteState::TargetOffline);
-            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(1.0);
-            assert_inside(
-                &mut rt,
-                width,
-                &[
-                    "task-card-16",
-                    "task-machine-16",
-                    "crew-chip-16",
-                    "crew-machine-16",
-                ],
+            assert_inside(&mut rt, width, &["task-card-16", "task-machine-16"]);
+            // The roster rows live in the Inspector's Crew tab now.
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Crew,
             );
+            rt.invalidate();
+            rt.frame(1.0);
+            assert_inside(&mut rt, width, &["crew-chip-16", "crew-machine-16"]);
             let title = rt.presented("task-title-16").unwrap().0;
             let tag = rt.presented("task-machine-16").unwrap().0;
             assert!(
@@ -28752,14 +28734,21 @@ pub(crate) mod tests {
             );
             press(&mut rt, "crew-chip-16");
             rt.frame(1.0);
-            assert_inside(&mut rt, width, &["parent-bar", "remote-result-machine"]);
+            // The remote target is offline, so the notice bar shows; a healthy worker
+            // would have no bar at all (spec §3.8).
+            assert_inside(&mut rt, width, &["parent-bar", "composer"]);
+            let notice = element_text(&rt, "parent-bar").unwrap_or_default();
+            assert!(notice.contains("offline"), "{width}: {notice}");
+            rt.state
+                .demo_remote_task(16, "Studio", crate::model::RemoteState::Running);
             rt.state.current_mut().peer_origin=Some(serde_json::from_value(json!({
                 "deviceId":uuid::Uuid::new_v4(),"serverId":uuid::Uuid::new_v4(),"serverLabel":"Home",
                 "parentThreadId":7,"taskId":"task-1","captain":"Rook"
             })).unwrap());
             rt.invalidate();
             rt.frame(1.0);
-            assert_inside(&mut rt, width, &["parent-bar", "parent-bar-name"]);
+            // A healthy peer worker has no bar above the composer.
+            assert!(rt.presented("parent-bar").is_none());
             rt.state.machines.dialog = true;
             rt.invalidate();
             rt.frame(1.0);
@@ -28781,8 +28770,6 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
             assert_eq!(rt.state.current().id, 7);
-            // The roster starts collapsed; a member needing the user opens it.
-            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(0.0);
             assert_inside(
@@ -28799,25 +28786,51 @@ pub(crate) mod tests {
                     "approve-2",
                     "decline-2",
                     "crew-tray",
-                    "crew-chip-19",
                     "composer",
                 ],
             );
-            // Delegations are task cards, not generic tool rows, and finished tasks stay off
-            // the task cards. Every crew member has a roster row, finished or not.
+            // Delegations are compact task rows, not generic tool rows, and finished tasks
+            // stay off the transcript. Every crew member has a row in the Crew tab.
             assert!(rt.presented("inline-tool-7-0").is_none());
-            assert!(rt.presented("crew-chip-1").is_some());
-            assert!(rt.presented("crew-chip-18").is_some());
-            // The approval stack scrolls inside KSG's max-h-80.
-            assert!(rt.presented("needs-you").unwrap().0[3] <= 320.5);
+            let card = rt.presented("task-card-16").unwrap().0;
+            assert!((card[3] - 32.0).abs() < 0.5, "{width}: {card:?}");
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Crew,
+            );
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "crew-roster-rows",
+                    "crew-chip-1",
+                    "crew-chip-16",
+                    "crew-chip-18",
+                    "crew-chip-19",
+                    "crew-roster-footer",
+                    "crew-roster-new",
+                    "crew-roster-recruit",
+                ],
+            );
             press(&mut rt, "crew-chip-16");
             rt.frame(1.0);
             assert_eq!(rt.state.current().id, 16, "{width}");
-            assert_inside(&mut rt, width, &["parent-bar", "open-captain", "composer"]);
+            // A healthy worker has nothing between the conversation and the composer.
+            assert!(rt.presented("parent-bar").is_none(), "{width}");
+            assert_inside(&mut rt, width, &["composer"]);
             assert!(rt.presented("crew-tray").is_none());
-            press(&mut rt, "open-captain");
+            // The worker's Overview links back to its captain.
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Overview,
+            );
+            rt.invalidate();
+            rt.frame(1.0);
+            press(&mut rt, "open-captain-from-overview");
             assert_eq!(rt.state.current().id, 7, "{width}");
-            press(&mut rt, "open-request-2");
+            press(&mut rt, "needs-you-source-2");
             assert_eq!(rt.state.current().id, 2, "{width}");
         }
     }
@@ -28879,94 +28892,76 @@ pub(crate) mod tests {
                 json!({"mode":"shared","newWorktree":false,"primaryCheckout":true,
                     "checkout":"/Users/someone/projects/shina","branch":"main"}),
             );
-            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(1.0);
+            // Task rows stay single-line; placement detail rides on the row's tooltip and
+            // in the worker's own Overview (spec §3.7, §3.8).
             for child in [16, 17, 18, 19] {
                 let card = rt.presented(&format!("task-card-{child}")).unwrap().0;
-                for part in ["", "-mode"] {
-                    let key = format!("task-placement-{child}{part}");
-                    let r = rt
-                        .presented(&key)
-                        .unwrap_or_else(|| panic!("{width}: {key} is missing"))
-                        .0;
-                    assert!(
-                        r[0] >= card[0] && r[0] + r[2] <= card[0] + card[2] + 0.5,
-                        "{width}: {key} {r:?} leaves its card {card:?}"
-                    );
-                }
+                assert!((card[3] - 32.0).abs() < 0.5, "{width}: {card:?}");
             }
-            // A long branch and checkout truncate inside the card, and the tooltip keeps them.
-            let card = rt.presented("task-card-16").unwrap().0;
-            for key in ["task-placement-16-branch", "task-placement-16-checkout"] {
-                let r = rt.presented(key).unwrap().0;
-                assert!(
-                    r[0] + r[2] <= card[0] + card[2] + 0.5,
-                    "{width}: {key} {r:?}"
-                );
-            }
-            assert_eq!(
-                element_text(&rt, "task-placement-16-mode").as_deref(),
-                Some("Worktree")
-            );
-            // The card's status word names the phase, so the line does not repeat it.
-            assert!(rt.presented("task-placement-17-phase").is_none());
-            assert!(
-                element_text(&rt, "task-card-17").is_some_and(|label| label.contains("Preparing"))
-            );
-            assert_eq!(
-                element_text(&rt, "task-placement-18-mode").as_deref(),
-                Some("Read only")
-            );
+            // Placement detail rides on the row's tooltip and in the worker's
+            // Overview (spec §3.8) — the single line stays clean.
+            let label = element_text(&rt, "task-card-16").unwrap_or_default();
+            assert!(label.contains("Open the worker"), "{width}: {label}");
             assert!(
                 element_text(&rt, "task-card-19")
-                    .is_some_and(|label| label.contains("Setup failed"))
+                    .unwrap_or_default()
+                    .contains("Setup failed"),
+                "{width}"
             );
-            // The failure and what to do next both wrap inside the card.
-            let card = rt.presented("task-card-19").unwrap().0;
-            for key in ["task-placement-19-error", "task-placement-19-recovery"] {
-                let r = rt.presented(key).unwrap_or_else(|| panic!("{key}")).0;
-                let text = element_text(&rt, key);
-                assert!(
-                    r[0] >= card[0] && r[0] + r[2] <= card[0] + card[2] + 0.5,
-                    "{width}: {key} {r:?} leaves {card:?}"
-                );
-                assert!(text.is_some_and(|t| !t.is_empty()), "{width}: {key}");
-            }
-            assert!(
-                element_text(&rt, "task-placement-19-recovery")
-                    .unwrap()
-                    .contains("same checkout")
-            );
-            // The tray chip carries the placement in its accessible name.
-            let chip = element_text(&rt, "crew-chip-16").unwrap_or_default();
-            assert!(
-                chip.contains("Branch: shina/delegate-a-very-long"),
-                "{chip}"
-            );
-            press(&mut rt, "crew-chip-16");
+            // Open the failed worker: the notice bar names the recovery, not a framed card.
+            press(&mut rt, "task-card-19");
             rt.frame(1.0);
-            let bar = rt.presented("parent-bar").unwrap().0;
-            for key in [
-                "parent-bar-placement",
-                "parent-bar-placement-branch",
-                "parent-bar-placement-checkout",
-            ] {
-                let r = rt
-                    .presented(key)
-                    .unwrap_or_else(|| panic!("{width}: {key} is missing"))
-                    .0;
-                assert!(
-                    r[0] >= bar[0] && r[0] + r[2] <= bar[0] + bar[2] + 0.5,
-                    "{width}: {key} {r:?} leaves {bar:?}"
-                );
-            }
-            assert_inside(&mut rt, width, &["parent-bar", "open-captain", "composer"]);
+            let notice = element_text(&rt, "parent-bar").unwrap_or_default();
+            assert!(notice.contains("Setup failed"), "{width}: {notice}");
+            assert!(notice.contains("same checkout"), "{width}: {notice}");
         }
     }
 
     #[test]
-    fn a_peer_workers_parent_bar_offers_the_crew_menu_for_its_local_siblings() {
+    fn a_healthy_workers_overview_lists_where_it_runs() {
+        let long_branch = "shina/delegate-a-very-long-task-name-that-keeps-going-past-the-card";
+        let long_checkout =
+            "/Users/someone/Library/Application Support/Shina/worktrees/shina/delegate-a-very-long";
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            set_placement(
+                &mut rt,
+                16,
+                json!({"branch":long_branch,"checkout":long_checkout}),
+            );
+            rt.state
+                .show_thread(rt.state.threads.iter().position(|t| t.id == 16).unwrap());
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Overview,
+            );
+            rt.invalidate();
+            rt.frame(1.0);
+            // No bar above the composer on a healthy worker.
+            assert!(rt.presented("parent-bar").is_none(), "{width}");
+            assert!(rt.presented("crew-bar").is_none(), "{width}");
+            // The Overview carries "Delegated by" and the Runs detail.
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "worker-overview",
+                    "open-captain-from-overview",
+                    "worker-placement",
+                ],
+            );
+            let runs = element_text(&rt, "worker-placement").unwrap_or_default();
+            assert!(runs.contains(long_branch), "{width}: {runs}");
+            press(&mut rt, "open-captain-from-overview");
+            rt.frame(1.0);
+            assert_eq!(rt.state.current().id, 7, "{width}");
+        }
+    }
+
+    #[test]
+    fn a_peer_workers_crew_tab_lists_its_local_siblings() {
         for width in [960.0, 1280.0] {
             let mut rt = runtime(width);
             rt.state.populate_demo();
@@ -28984,22 +28979,27 @@ pub(crate) mod tests {
                 thread.peer_origin = Some(origin(7));
             }
             rt.state.show_thread(0);
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Crew,
+            );
             rt.invalidate();
             rt.frame(0.0);
-            assert_inside(&mut rt, width, &["parent-bar", "crew-siblings"]);
-            press(&mut rt, "crew-siblings");
-            rt.frame(0.5);
-            // The menu lists the other worker this machine runs for the same origin.
-            let sibling = format!("crew-sibling-{}", rt.state.threads[1].id);
-            assert_inside(&mut rt, width, &["crew-siblings-menu", &sibling]);
-            let own = format!("crew-sibling-{}", rt.state.threads[0].id);
-            assert!(rt.find(&own).is_none(), "the open worker is not a row");
-            rt.frame(0.5);
+            // A healthy peer worker has no bar above the composer; its Crew tab lists the
+            // local siblings from the same delegation, with the open worker filled.
+            assert!(rt.presented("parent-bar").is_none());
+            let sibling = format!("crew-chip-{}", rt.state.threads[1].id);
+            let own = format!("crew-chip-{}", rt.state.threads[0].id);
+            assert_inside(
+                &mut rt,
+                width,
+                &["crew-tab", "crew-tab-captain", &sibling, &own],
+            );
         }
     }
 
     #[test]
-    fn a_crew_root_bar_shows_its_placement_and_a_failed_setup_at_supported_widths() {
+    fn a_crew_member_notice_bar_shows_a_failed_setup_at_supported_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
             let thread_id = rt.state.next_id;
@@ -29016,29 +29016,12 @@ pub(crate) mod tests {
             rt.state.open_kept_tab(rt.state.threads.len() - 1);
             rt.invalidate();
             rt.frame(1.0);
-            let bar = rt.presented("crew-bar").expect("crew bar").0;
-            for key in [
-                "crew-bar-name",
-                "crew-bar-placement",
-                "crew-bar-placement-phase",
-                "crew-bar-placement-error",
-                "crew-bar-placement-recovery",
-                "crew-bar-open-captain",
-            ] {
-                let r = rt
-                    .presented(key)
-                    .unwrap_or_else(|| panic!("{width}: {key} is missing"))
-                    .0;
-                assert!(
-                    r[0] >= bar[0] && r[0] + r[2] <= bar[0] + bar[2] + 0.5 && r[2] > 0.0,
-                    "{width}: {key} {r:?} leaves {bar:?}"
-                );
-            }
-            // Windows checkouts keep their own separator in the shortened path.
-            assert_eq!(
-                element_text(&rt, "crew-bar-placement-checkout").as_deref(),
-                Some("…\\shina\\crew-0123456789abcdef")
-            );
+            // A failed setup is the one thing that still draws a bar: a 36 pt borderless
+            // notice naming the recovery (spec §3.8).
+            let (bar, _) = rt.presented("crew-bar").expect("crew notice bar");
+            assert!((bar[3] - 36.0).abs() < 0.5, "{width}: {bar:?}");
+            let notice = element_text(&rt, "crew-bar").unwrap_or_default();
+            assert!(notice.contains("Setup failed"), "{width}: {notice}");
         }
     }
 
@@ -29065,20 +29048,29 @@ pub(crate) mod tests {
             );
             rt.invalidate();
             rt.frame(1.0);
-            assert_eq!(
-                element_text(&rt, "task-placement-16-mode").as_deref(),
-                Some("Read only"),
-                "{width}"
-            );
-            let label = element_text(&rt, "task-placement-16").unwrap_or_default();
+            // Placement detail lives in the worker's Overview now (spec §3.8).
+            let show_overview = |rt: &mut Runtime<State>, id: usize| {
+                rt.state
+                    .show_thread(rt.state.threads.iter().position(|t| t.id == id).unwrap());
+                rt.state.right_panels.open(
+                    &rt.state.panel_key(),
+                    crate::right_panel::SingletonKind::Overview,
+                );
+                rt.invalidate();
+                rt.frame(0.5);
+            };
+            show_overview(&mut rt, 16);
+            let label = element_text(&rt, "worker-placement").unwrap_or_default();
             assert!(label.starts_with("Read only on "), "{width}: {label}");
             assert!(
                 label.contains("Branch: shina/parent-task"),
                 "{width}: {label}"
             );
-            assert_eq!(
-                element_text(&rt, "task-placement-17-mode").as_deref(),
-                Some("Scratch folder"),
+            show_overview(&mut rt, 17);
+            assert!(
+                element_text(&rt, "worker-placement")
+                    .unwrap_or_default()
+                    .contains("Scratch folder"),
                 "{width}"
             );
         }
@@ -29102,51 +29094,60 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_crew_roster_is_one_column_capped_at_five_rows_at_all_widths() {
+    fn the_crew_tab_lists_each_member_once_grouped_by_state_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
-            assert!(rt.presented("crew-roster-rows").is_none());
-            assert!(rt.presented("crew-chip-16").is_none());
-            // The header is a 28 px row; clicking it opens the roster.
+            // The strip is a flat 28 pt row that opens the Crew tab; it never expands.
             let header = rt.presented("crew-roster-toggle").unwrap().0;
             assert!((header[3] - 28.0).abs() < 0.5, "{width}: {header:?}");
+            assert!(rt.presented("crew-roster-rows").is_none());
             press(&mut rt, "crew-roster-toggle");
             rt.frame(1.0);
-            let rows = rt.presented("crew-roster-rows").unwrap().0;
-            assert!(rows[3] <= 150.5, "{width}: {rows:?}");
-            let chips: Vec<[f32; 4]> = ["crew-chip-16", "crew-chip-17", "crew-chip-19"]
-                .iter()
-                .map(|key| rt.presented(key).unwrap().0)
-                .collect();
-            // One column of 30 px rows, 2 px apart.
-            let mut ys: Vec<f32> = chips.iter().map(|c| c[1]).collect();
-            ys.sort_by(f32::total_cmp);
-            assert!(
-                (ys[1] - ys[0] - 32.0).abs() < 1.0 && (ys[2] - ys[1] - 32.0).abs() < 1.0,
-                "{width}: one column: {chips:?}"
+            assert_eq!(
+                rt.state.right_panel_active_view(),
+                Some(crate::right_panel::PanelView::Crew),
+                "{width}"
             );
-            for chip in &chips {
-                assert!((chip[2] - chips[0][2]).abs() < 1.0, "{width}: {chips:?}");
-                assert!((chip[3] - 30.0).abs() < 0.5, "{width}: {chip:?}");
-            }
-            for chip in ["16", "17", "19"] {
-                let clock = rt.presented(&format!("crew-chip-clock-{chip}")).unwrap().0;
-                assert!(clock[2] >= 20.0, "timer {chip}: {clock:?}");
-            }
-            // Full-access footer: New crew thread and Recruit.
+            // Pressing again hides the panel, KSG-toggle style.
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
+            assert!(rt.presented("right-panel").is_none(), "{width}");
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
             assert_inside(
                 &mut rt,
                 width,
                 &[
+                    "crew-tab",
+                    "crew-roster-rows",
                     "crew-roster-footer",
                     "crew-roster-new",
                     "crew-roster-recruit",
                 ],
             );
-            press(&mut rt, "crew-roster-toggle");
-            rt.frame(1.0);
-            assert!(rt.presented("crew-roster-rows").is_none());
-            assert!(rt.presented("crew-chip-16").is_none());
+            // Every member has exactly one row, 32 pt, filed under its group.
+            for id in [1, 2, 16, 17, 18, 19] {
+                let chip = format!("crew-chip-{id}");
+                let (row, _) = rt
+                    .presented(&chip)
+                    .unwrap_or_else(|| panic!("{width}: {chip} missing"));
+                assert!((row[3] - 32.0).abs() < 0.5, "{width}: {chip} {row:?}");
+            }
+            // The groups appear in the spec's order: needs you leads, queued before idle.
+            for group in [
+                "crew-group-needs-you",
+                "crew-group-working",
+                "crew-group-queued",
+            ] {
+                assert!(rt.presented(group).is_some(), "{width}: {group} missing");
+            }
+            let needs = rt.presented("crew-group-needs-you").unwrap().0;
+            let working = rt.presented("crew-group-working").unwrap().0;
+            let queued = rt.presented("crew-group-queued").unwrap().0;
+            assert!(
+                needs[1] < working[1] && working[1] < queued[1],
+                "{width}: groups out of order"
+            );
         }
     }
 
@@ -29210,8 +29211,8 @@ pub(crate) mod tests {
         rt.frame(0.0);
         assert!(rt.presented(&format!("tab-icon-crew-{peer_id}")).is_some());
 
-        // 4. At 480 px height, a captain with zero members and no other panels still fits
-        // its open roster footer (New crew thread / Recruit) without disabling Expand.
+        // 4. At 480 px height, the crew strip is still one flat 28 pt row, and opening it
+        // shows the Crew tab roster with its pinned footer.
         let mut short_empty = Runtime::with_text(
             State::new(".".into(), false),
             view,
@@ -29224,40 +29225,35 @@ pub(crate) mod tests {
         short_empty.state.threads[0].captain = Some(0);
         short_empty.invalidate();
         short_empty.frame(0.0);
+        let strip = short_empty.presented("crew-tray").unwrap().0;
+        assert!((strip[3] - 28.0).abs() < 0.5, "{strip:?}");
         press(&mut short_empty, "crew-roster-toggle");
         short_empty.frame(1.0);
         assert_inside(
             &mut short_empty,
             620.0,
             &[
+                "crew-tab",
                 "crew-roster-footer",
                 "crew-roster-new",
                 "crew-roster-recruit",
             ],
         );
 
-        // 5. At 720 px height with Needs you + 6 crew members, opening the roster never
-        // pushes Needs you approval actions below the scroll fold.
+        // 5. With Needs you plus the strip, the stack stays inside 88 pt (52 + 8 + 28).
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
-            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(0.0);
             assert_inside(
                 &mut rt,
                 width,
-                &[
-                    "needs-you",
-                    "approve-2",
-                    "decline-2",
-                    "open-request-2",
-                    "crew-tray",
-                ],
+                &["needs-you", "approve-2", "decline-2", "crew-tray"],
             );
             let stack = rt.presented("above-composer-stack").unwrap().0;
             assert!(
-                stack[3] <= 720.0 * 0.4 + 2.0,
-                "{width}: above-composer-stack exceeded 40% cap: {stack:?}"
+                stack[3] <= 88.0 + 0.5,
+                "{width}: above-composer-stack exceeded 88 pt: {stack:?}"
             );
         }
     }
