@@ -3991,18 +3991,24 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     if let Some(notice) = crew_ui::recovery_banner(s, p) {
         side = side.child(notice);
     }
-    let mut scope_button = toggle_button(
-        "project-scope",
-        &format!("Workspace: {scope_words}"),
-        "filter",
-        scoped,
-        p,
-        |s| s.open_picker(ProjectPicker::Scope),
-    )
-    .help(format!("Workspace: {scope_words}"));
-    if scoped {
-        scope_button = scope_button.fill(p.coral_bg);
-    }
+    let scope_button = el()
+        .key("project-scope")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(format!("Workspace: {scope_words}"))
+        .help(format!("Workspace: {scope_words}"))
+        .focusable(true)
+        .size(24.0, 24.0)
+        .center()
+        .radius(6.0)
+        .fill(if scoped {
+            p.coral_bg
+        } else {
+            Color::TRANSPARENT
+        })
+        .hover(if scoped { p.coral_bg } else { p.selected })
+        .on_press(|s: &mut State| s.open_picker(ProjectPicker::Scope))
+        .child(tool_icon("filter", if scoped { p.sea } else { p.muted }));
     side = side.child(
         row()
             .key("workspace-context")
@@ -5425,6 +5431,10 @@ fn captain_row(
                 .key(format!("captain-timer-{id}")),
             );
         }
+    } else if status == Status::Failed {
+        trailing = trailing
+            .child(el().size(6.0, 6.0).radius(3.0).fill(p.danger).a11y_hidden())
+            .child(meta_text("Failed", p.danger));
     } else if unread > 0 {
         trailing = trailing.child(
             el().key(format!("captain-unread-{id}"))
@@ -5433,10 +5443,6 @@ fn captain_row(
                 .fill(p.sea)
                 .a11y_hidden(),
         );
-    } else if status == Status::Failed {
-        trailing = trailing
-            .child(el().size(6.0, 6.0).radius(3.0).fill(p.danger).a11y_hidden())
-            .child(meta_text("Failed", p.danger));
     }
     let size = CAPTAIN_FACE;
     let portrait = captain_portrait(s, thread.captain);
@@ -5793,7 +5799,18 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
                 } else if content_match {
                     s.open_thread_at_search_match(&server, id);
                 } else {
-                    s.click_thread(index, tx.mods());
+                    let order: Vec<usize> = sidebar_navigation(s)
+                        .into_iter()
+                        .filter(|(srv, _)| srv == &s.machines.selected)
+                        .map(|(_, tid)| tid)
+                        .filter(|tid| {
+                            s.threads
+                                .iter()
+                                .find(|t| t.id == *tid)
+                                .is_some_and(|t| !s.is_captain_home(t))
+                        })
+                        .collect();
+                    s.click_thread_in_order(index, tx.mods(), &order);
                 }
             }
         })
@@ -5991,9 +6008,16 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
             p.sea
         };
         // Working shows the timer alone without the word "Working" (spec §2.7).
-        let text = match (state_label, thread.started) {
-            ("Working", Some(start)) => elapsed_label(start.elapsed().as_secs()),
-            _ => state_label.to_string(),
+        let text = if state_label == "Working" {
+            elapsed_label(
+                thread
+                    .started
+                    .map(|start| start.elapsed().as_secs())
+                    .or(thread.elapsed)
+                    .unwrap_or(0),
+            )
+        } else {
+            state_label.to_string()
         };
         slot = slot.child(label(text, META.features(TABULAR), ink));
     } else {
@@ -6031,8 +6055,7 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
         } else {
             slot
         });
-    if !shelved
-        && !s.search.text.is_empty()
+    if !s.search.text.is_empty()
         && !s.thread_title_search_matches(thread)
         && let Some(hit) = s
             .sidebar_search
@@ -31275,8 +31298,74 @@ pub(crate) mod tests {
                     rt.presented(&group_key).is_none(),
                     "{width}: group header hides when scoped to one workspace"
                 );
+                // Multi-workspace filter keeps grouping on (spec §2.6).
+                if rt.state.projects.entries.len() >= 2 {
+                    let other = rt.state.projects.entries[1].id;
+                    if other != proj {
+                        rt.state.set_project_scope(Some(other), true);
+                        rt.invalidate();
+                        rt.frame(1.0);
+                        assert!(
+                            rt.state.sidebar_grouped(),
+                            "{width}: multi-workspace scope keeps grouping active"
+                        );
+                    }
+                }
             }
         }
+        // Unread failed captain shows Failed (not unread blue dot), and needs-you captain
+        // shows count pill without any visible "Needs you" status word.
+        let mut rt = runtime(1280.0);
+        rt.state.populate_demo();
+        let homes: Vec<usize> = rt
+            .state
+            .sidebar_captains()
+            .iter()
+            .map(|&i| rt.state.threads[i].id)
+            .collect();
+        let cap0 = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == homes[0])
+            .unwrap();
+        rt.state.threads[cap0].status = Status::Failed;
+        rt.state.threads[cap0].life.last_completed_at = Some(lifecycle::now());
+        rt.state.threads[cap0].life.last_visited_at = None;
+        let cap1 = rt
+            .state
+            .threads
+            .iter()
+            .position(|t| t.id == homes[1])
+            .unwrap();
+        rt.state.threads[cap1].status = Status::Waiting;
+        rt.state.threads[cap1].request = Some(json!({"method":"confirm"}));
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(
+            rt.presented(&format!("captain-unread-{}", homes[0]))
+                .is_none()
+        );
+        assert!(
+            rt.presented(&format!("captain-attention-{}", homes[1]))
+                .is_some()
+        );
+        let status_text =
+            element_text(&rt, &format!("captain-status-{}", homes[1])).unwrap_or_default();
+        assert!(!status_text.contains("Needs you"), "{status_text}");
+
+        // Grouping and collapsed groups survive switching machines on a fleet client.
+        let mut fleet = runtime(1280.0);
+        crate::fleet_demo(&mut fleet.state);
+        fleet.state.toggle_sidebar_grouping();
+        fleet.state.toggle_sidebar_group("local".into(), Some(1));
+        fleet.state.open_machine_thread("example-studio", 2);
+        assert_eq!(
+            fleet.state.sidebar_grouping,
+            crate::model::SidebarGrouping::Recent
+        );
+        assert!(fleet.state.sidebar_group_collapsed("local", Some(1)));
+
         // Contrast check on bg and row in both themes for sidebar text tokens.
         for dark in [false, true] {
             let p = palette(dark);

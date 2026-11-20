@@ -85,18 +85,21 @@ impl<'a> Entry<'a> {
     }
 
     fn recent_rank(&self, s: &State) -> u64 {
-        let updated = if let Some(index) = self.local {
+        // `updated` is in Unix seconds; lifecycle timestamps are in Unix milliseconds.
+        // Convert `updated` to ms before comparing, and exclude `pinned_at` so pinning
+        // a single row keeps it first inside its group without reordering the whole workspace.
+        let updated_ms = if let Some(index) = self.local {
             s.threads[index].updated
         } else {
             self.record.and_then(|r| r["updated"].as_u64()).unwrap_or(0)
-        };
+        }
+        .saturating_mul(1000);
         let life_ts = self
             .life
             .latest_user_message_at
             .max(self.life.last_completed_at)
-            .max(self.life.pinned_at)
             .unwrap_or(0);
-        updated.max(life_ts)
+        updated_ms.max(life_ts)
     }
 }
 
@@ -183,6 +186,16 @@ pub(super) fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: 
         .on_press(move |s: &mut State| s.toggle_sidebar_group(server.clone(), project))
         .child(lead)
         .child(label(&name, META, p.muted).truncate().grow(1.0).min_w(0.0));
+    if multiple_machines(s) {
+        header = header.child(machine_tag(
+            s,
+            p,
+            group.server,
+            format!("sidebar-group-machine-{}-{project_key}", group.server),
+            SMALL,
+            sidebar_row_width(s) >= 232.0,
+        ));
+    }
     if needs_you {
         header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.brass).a11y_hidden());
     } else if working {
@@ -281,13 +294,31 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             usize,
             Vec<(&Value, &crate::client_history::ThreadProjection)>,
         > = Default::default();
+        let mut home_by_captain: std::collections::HashMap<usize, usize> = Default::default();
+        if let Some(homes) = projection["index"]["captainHomes"].as_object() {
+            for (cap, home) in homes {
+                if let (Ok(cap), Some(home)) = (cap.parse::<usize>(), home.as_u64()) {
+                    home_by_captain.insert(cap, home as usize);
+                }
+            }
+        }
         for record in projection["index"]["threads"]
             .as_array()
             .into_iter()
             .flatten()
         {
-            if let (Some(parent), Some(id)) = (record["parent"].as_u64(), record["id"].as_u64()) {
-                children.entry(parent as usize).or_default().push((
+            let Some(id) = record["id"].as_u64() else {
+                continue;
+            };
+            let owner_home = record
+                .get("crewCaptain")
+                .and_then(Value::as_u64)
+                .and_then(|cap| home_by_captain.get(&(cap as usize)).copied())
+                .or_else(|| record["parent"].as_u64().map(|p| p as usize));
+            if let Some(home) = owner_home
+                && home != id as usize
+            {
+                children.entry(home).or_default().push((
                     record,
                     match views.get(&(id as usize)) {
                         Some(view) => *view,
@@ -342,8 +373,18 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                         .is_some_and(|parent| parent["captainHome"] == true);
             // Crew members list flat during search and in the archive, like local ones.
             let crew_worker = crew_member && (!query.is_empty() || s.show_archive);
+            // Keep a live remote captain visible in archive view when it has archived workers,
+            // matching the local `sidebar_captains` rule.
+            let captain_has_archived_worker = captain
+                && s.show_archive
+                && children.get(&id).is_some_and(|kids| {
+                    kids.iter().any(|(child, _)| {
+                        lifecycle::Lifecycle::from_record(child)
+                            .is_ok_and(|life| life.archived_at.is_some())
+                    })
+                });
             // Workspace IDs are paired with their server, including filter selections.
-            if life.archived_at.is_some() != s.show_archive
+            if (life.archived_at.is_some() != s.show_archive && !captain_has_archived_worker)
                 || !in_scope
                 || crew_member && !crew_worker
             {
@@ -501,6 +542,13 @@ fn status_of_view(view: &crate::client_history::ThreadProjection) -> Status {
     serde_json::from_value(view.record["status"].clone()).unwrap_or(Status::Ready)
 }
 
+fn view_running_seconds(view: &crate::client_history::ThreadProjection) -> Option<u64> {
+    if let Some(started_ms) = view.record["started_at"].as_u64() {
+        return Some(lifecycle::now().saturating_sub(started_ms) / 1000);
+    }
+    view.record["elapsed"].as_u64()
+}
+
 fn null_view() -> &'static crate::client_history::ThreadProjection {
     static NULL: std::sync::OnceLock<crate::client_history::ThreadProjection> =
         std::sync::OnceLock::new();
@@ -608,7 +656,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         let timer = std::iter::once(view)
             .chain(entry.children.iter().map(|(_, view)| *view))
             .filter(|view| status_of_view(view) == Status::Running)
-            .filter_map(|view| view.record["elapsed"].as_u64())
+            .filter_map(view_running_seconds)
             .max();
         let mut trailing = rune::row()
             .key(format!("machine-status-{}-{id}", entry.server))
@@ -626,12 +674,12 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                     p.muted,
                 ));
             }
-        } else if unread > 0 {
-            trailing = trailing.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
         } else if status == Status::Failed {
             trailing = trailing
                 .child(el().size(6.0, 6.0).radius(3.0).fill(p.danger).a11y_hidden())
                 .child(meta_text("Failed", p.danger));
+        } else if unread > 0 {
+            trailing = trailing.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
         }
         let portrait_el = pixel_portrait(s, &pixels, CAPTAIN_FACE, p)
             .key(format!("machine-portrait-{}-{id}", entry.server))
@@ -722,10 +770,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         ""
     };
     let age = if state_label == "Working" {
-        view.record["elapsed"]
-            .as_u64()
-            .map(elapsed_label)
-            .or_else(|| Some("Working".into()))
+        Some(elapsed_label(view_running_seconds(view).unwrap_or(0)))
     } else if matches!(state_label, "Approval" | "Input" | "Waiting" | "Failed") {
         Some(state_label.into())
     } else if shelved {

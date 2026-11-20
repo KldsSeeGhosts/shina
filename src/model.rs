@@ -7588,12 +7588,13 @@ impl State {
     /// enabled, no search or archive filter is active, and the list is not narrowed to one
     /// workspace.
     pub fn sidebar_grouped(&self) -> bool {
+        let single_workspace = self.project_scope != ProjectScope::All
+            && self.scope_additional.is_empty()
+            && self.machines.scope_remote.is_empty();
         self.sidebar_grouping == SidebarGrouping::Workspace
             && self.search.text.is_empty()
             && !self.show_archive
-            && self.project_scope == ProjectScope::All
-            && self.scope_additional.is_empty()
-            && self.machines.scope_remote.is_empty()
+            && !single_workspace
     }
     pub fn sidebar_group_collapsed(&self, server: &str, project: Option<usize>) -> bool {
         self.collapsed_groups
@@ -7879,6 +7880,14 @@ impl State {
         }
     }
     pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
+        let visible_ids: Vec<usize> = self
+            .visible_sidebar_threads()
+            .into_iter()
+            .map(|i| self.threads[i].id)
+            .collect();
+        self.click_thread_in_order(index, mods, &visible_ids);
+    }
+    pub fn click_thread_in_order(&mut self, index: usize, mods: rune::Mods, visible_ids: &[usize]) {
         let id = self.threads[index].id;
         if mods.cmd {
             if let Some(i) = self.selected_threads.iter().position(|t| *t == id) {
@@ -7887,16 +7896,12 @@ impl State {
                 self.selected_threads.push(id);
             }
         } else if mods.shift {
-            let order = self.visible_sidebar_threads();
-            let start = order
+            let start = visible_ids
                 .iter()
-                .position(|i| Some(self.threads[*i].id) == self.selection_anchor);
-            let end = order.iter().position(|i| self.threads[*i].id == id);
+                .position(|tid| Some(*tid) == self.selection_anchor);
+            let end = visible_ids.iter().position(|tid| *tid == id);
             if let (Some(a), Some(b)) = (start, end) {
-                self.selected_threads = order[a.min(b)..=a.max(b)]
-                    .iter()
-                    .map(|i| self.threads[*i].id)
-                    .collect();
+                self.selected_threads = visible_ids[a.min(b)..=a.max(b)].to_vec();
             }
         } else {
             self.show_thread(index);

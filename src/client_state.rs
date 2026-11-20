@@ -1924,6 +1924,8 @@ impl State {
             "sidebar",
             "sidebarWidth",
             "shelves",
+            "sidebarGrouping",
+            "collapsedGroups",
             "background",
             "preferences",
             "scope",
@@ -3248,6 +3250,8 @@ impl State {
             self.sidebar,
             self.sidebar_width,
             self.shelves,
+            self.sidebar_grouping,
+            self.collapsed_groups.clone(),
             self.background.settings.clone(),
             self.preferences.clone(),
         );
@@ -3342,6 +3346,8 @@ impl State {
             self.sidebar,
             self.sidebar_width,
             self.shelves,
+            self.sidebar_grouping,
+            self.collapsed_groups,
             self.background.settings,
             self.preferences,
         ) = device;
