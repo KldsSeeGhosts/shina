@@ -7443,8 +7443,10 @@ impl State {
         self.checkpoint();
     }
     /// A member that starts needing the user opens the roster once. Members that stop being
-    /// seen (release, archive, machine switch) drop out of the tracking set so a later
-    /// return counts as new. Runs over every local captain home each poll.
+    /// seen on the selected machine (release, archive) drop out of its tracking set so a
+    /// later return counts as new. Other machines keep their own entries, so switching away
+    /// and back does not re-open a roster whose request the user already saw. Runs over
+    /// every local captain home each poll.
     pub fn refresh_crew_roster_attention(&mut self) {
         let server = self.machines.selected.clone();
         let homes: Vec<(usize, usize)> = self
@@ -7464,13 +7466,16 @@ impl State {
                 }
             }
         }
-        let seen = &self.crew_roster_needing;
         let arrivals: Vec<usize> = needing
             .iter()
-            .filter(|item| !seen.contains(*item))
+            .filter(|item| !self.crew_roster_needing.contains(*item))
             .map(|(_, captain, _)| *captain)
             .collect();
-        self.crew_roster_needing = needing;
+        // Only the selected machine's entries refresh; every other server keeps
+        // what it last saw.
+        self.crew_roster_needing
+            .retain(|(item_server, _, _)| item_server != &server);
+        self.crew_roster_needing.extend(needing);
         for captain in arrivals {
             self.crew_roster_open.insert((server.clone(), captain));
         }
@@ -7478,8 +7483,50 @@ impl State {
     /// Keyboard traversal follows the rows that the sidebar actually displays.
     pub fn sidebar_navigation(&self) -> Vec<usize> {
         let mut rows: Vec<usize> = self.sidebar_captains();
-        rows.extend(self.searched_workers());
-        rows.extend(self.visible_sidebar_threads());
+        // Crew workers list flat during search and in the archive. The sidebar's
+        // own ordering (sidebar_ui::entries) interleaves them with ordinary rows,
+        // so traversal must reproduce that interleave rather than append them.
+        let mut ordinary: Vec<usize> = self.visible_sidebar_threads();
+        ordinary.extend(self.searched_workers());
+        let at = lifecycle::now();
+        let searching = !self.search.text.is_empty();
+        let title_match = |t: &Thread| !searching || self.thread_title_search_matches(t);
+        let order_pos = |index: usize| -> usize {
+            self.sidebar_search
+                .shown_order
+                .iter()
+                .position(|(server, id)| {
+                    server == &self.machines.selected && *id == self.threads[index].id
+                })
+                .unwrap_or(usize::MAX)
+        };
+        ordinary.sort_by(|&a, &b| {
+            let (ta, tb) = (&self.threads[a], &self.threads[b]);
+            let ordinary_rank = |state: &State| {
+                state
+                    .draft_listed(tb)
+                    .cmp(&state.draft_listed(ta))
+                    .then_with(|| {
+                        let sa = state.thread_section(ta, at);
+                        let sb = state.thread_section(tb, at);
+                        sa.cmp(&sb)
+                            .then_with(|| lifecycle::compare(sa, &ta.life, &tb.life))
+                            .then(ta.id.cmp(&tb.id))
+                    })
+            };
+            if searching {
+                title_match(tb).cmp(&title_match(ta)).then_with(|| {
+                    if !title_match(ta) && !title_match(tb) {
+                        order_pos(a).cmp(&order_pos(b)).then(ta.id.cmp(&tb.id))
+                    } else {
+                        ordinary_rank(self)
+                    }
+                })
+            } else {
+                ordinary_rank(self)
+            }
+        });
+        rows.extend(ordinary);
         rows
     }
     /// Whether an unsent draft has a "Drafts" row. Other drafts need content. The open draft keeps
@@ -18141,6 +18188,93 @@ mod tests {
         // Opening the captain changes nothing in the list: workers stay out of it.
         assert!(state.searched_workers().is_empty());
         assert!(!state.sidebar_navigation().contains(&0));
+    }
+
+    #[test]
+    fn searched_workers_interleave_with_ordinary_rows_in_navigation() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        // Two archived crew workers plus archived ordinary threads: the archive lists
+        // workers flat, and traversal must follow the rendered section order rather
+        // than putting every worker first.
+        for index in [0, 1] {
+            state.threads[index].parent = Some(7);
+            state.threads[index].delegated = true;
+            state.threads[index].crew_captain = Some(0);
+            state.threads[index].life.archived_at = Some(1);
+        }
+        // Thread id 3 keeps its pin: in the archive it still leads the Pinned rows.
+        state.threads[2].life.archived_at = Some(1);
+        state.show_archive = true;
+        assert_eq!(state.searched_workers(), vec![0, 1]);
+        assert!(!state.visible_sidebar_threads().is_empty());
+        let nav = state.sidebar_navigation();
+        // The pinned archived thread leads its section; a worker with an earlier
+        // archive stamp must not jump ahead of every ordinary row.
+        let pinned_pos = nav.iter().position(|i| *i == 2).unwrap();
+        let worker_positions: Vec<usize> = [0usize, 1]
+            .iter()
+            .map(|i| nav.iter().position(|j| j == i).unwrap())
+            .collect();
+        assert!(
+            worker_positions.iter().any(|pos| *pos > pinned_pos),
+            "workers should not all precede ordinary rows: {nav:?}"
+        );
+        // Rendered order check: navigation equals captains, then the interleaved
+        // ordinary order used by sidebar_ui::entries' comparator.
+        let captains = state.sidebar_captains();
+        assert_eq!(&nav[..captains.len()], &captains[..]);
+        // Every listed ordinary thread and every worker appears exactly once.
+        let mut tail = nav[captains.len()..].to_vec();
+        tail.sort_unstable();
+        let mut expect: Vec<usize> = state
+            .visible_sidebar_threads()
+            .into_iter()
+            .chain(state.searched_workers())
+            .collect();
+        expect.sort_unstable();
+        assert_eq!(tail, expect);
+    }
+
+    #[test]
+    fn crew_roster_attention_history_survives_machine_switches() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        // Captain 0's home is thread id 7; give it a worker waiting on approval.
+        let index = state.threads.len();
+        let mut worker = Thread::new(11);
+        worker.parent = Some(7);
+        worker.delegated = true;
+        worker.crew_captain = Some(0);
+        worker.captain = Some(0);
+        worker.request = Some(json!({"method":"confirm"}));
+        state.threads.push(worker);
+        state.refresh_crew_roster_attention();
+        assert!(state.crew_roster_open(0), "a new request opens the roster");
+        // The user collapses it, then looks at another machine and comes back.
+        state.toggle_crew_roster(0);
+        state.machines.selected = "linked-machine".into();
+        state.refresh_crew_roster_attention();
+        state.machines.selected = "local".into();
+        state.refresh_crew_roster_attention();
+        assert!(
+            !state.crew_roster_open(0),
+            "returning to the machine must not re-open a roster the user collapsed"
+        );
+        // A genuinely new request still opens it once.
+        state
+            .threads
+            .iter_mut()
+            .find(|t| t.id == 11)
+            .unwrap()
+            .request = None;
+        state.refresh_crew_roster_attention();
+        state.threads[index].request = Some(json!({"method":"confirm"}));
+        state.refresh_crew_roster_attention();
+        assert!(
+            state.crew_roster_open(0),
+            "a request that leaves and returns counts as new"
+        );
     }
 
     #[test]

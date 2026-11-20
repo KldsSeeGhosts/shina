@@ -944,28 +944,37 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
                 .color(p.danger),
         );
     }
-    let manage = row()
-        .key("brief-crew-manage")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label("Manage in the crew roster")
-        .focusable(true)
-        .px(10.0)
-        .min_h(28.0)
-        .center_y()
-        .radius(6.0)
-        .hover(hover_wash(s, p))
-        .press(active_wash(s, p))
-        .hover_motion(motion(), motion())
-        .on_press(move |s: &mut State| {
-            if s.viewport_width < SHEET_BELOW {
-                close_brief(s);
-            }
-            if !s.crew_roster_open(captain) {
-                s.toggle_crew_roster(captain);
-            }
-        })
-        .child(label("Manage in the crew roster", META_LABEL, p.sea));
+    // The roster only renders above an active captain's primary home composer; on an
+    // earlier home the button opens that home first. An archived captain has no roster
+    // anywhere, so the row hides.
+    let roster_available = s.captain_phase(captain) == crate::model::CaptainPhase::Active;
+    let manage = roster_available.then(|| {
+        row()
+            .key("brief-crew-manage")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label("Manage in the crew roster")
+            .focusable(true)
+            .px(10.0)
+            .min_h(28.0)
+            .center_y()
+            .radius(6.0)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+            .on_press(move |s: &mut State| {
+                if s.viewport_width < SHEET_BELOW {
+                    close_brief(s);
+                }
+                if s.captain_home(captain) != Some(s.current().id) {
+                    s.open_captain(captain);
+                }
+                if !s.crew_roster_open(captain) {
+                    s.toggle_crew_roster(captain);
+                }
+            })
+            .child(label("Manage in the crew roster", META_LABEL, p.sea))
+    });
     section(
         "brief-crew",
         "Crew",
@@ -974,7 +983,7 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         p,
     )
     .child(rows)
-    .child(manage)
+    .child(manage.unwrap_or_else(el))
     .child(super::captain_activity_ui::policy_block(s, p, captain))
     .child(super::captain_activity_ui::recovery_block(s, p, captain))
 }

@@ -125,18 +125,24 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 .as_u64()
                 .and_then(|parent| metadata.get(&(parent as usize)))
                 .is_some_and(|parent| parent["captainHome"] != true);
-            // Captain workers list flat during search and in the archive, like local ones.
-            let crew_worker = record["delegated"] == true
-                && !standalone_child
-                && record["parent"]
-                    .as_u64()
-                    .and_then(|parent| metadata.get(&(parent as usize)))
-                    .is_some_and(|parent| parent["captainHome"] == true)
-                && (!query.is_empty() || s.show_archive);
+            // Canonical crew membership decides, as `crew_captain` does locally: an
+            // independently recruited thread is crew even without a parent link. Older
+            // records without `crewCaptain` still mark a captain home's delegated child.
+            let crew_member = record
+                .get("crewCaptain")
+                .is_some_and(|value| !value.is_null())
+                || record["delegated"] == true
+                    && !standalone_child
+                    && record["parent"]
+                        .as_u64()
+                        .and_then(|parent| metadata.get(&(parent as usize)))
+                        .is_some_and(|parent| parent["captainHome"] == true);
+            // Crew members list flat during search and in the archive, like local ones.
+            let crew_worker = crew_member && (!query.is_empty() || s.show_archive);
             // Workspace IDs are paired with their server, including filter selections.
             if life.archived_at.is_some() != s.show_archive
                 || !in_scope
-                || record["delegated"] == true && !standalone_child && !crew_worker
+                || crew_member && !crew_worker
             {
                 continue;
             }
@@ -569,11 +575,29 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                 .child(icon(if entry.draft { "edit" } else { "pin" }, p.muted)),
         );
     }
-    // A remote worker carries its captain's portrait and name where the project tile sits.
-    let worker_captain = (!entry.captain && record["delegated"] == true)
+    // A remote crew member carries its captain's portrait and name where the project
+    // tile sits, whether it was delegated or independently recruited.
+    let delegated_to_home = record["delegated"] == true
+        && record["parent"]
+            .as_u64()
+            .and_then(|parent| {
+                projection["index"]["threads"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|record| record["id"].as_u64() == Some(parent))
+            })
+            .is_some_and(|parent| parent["captainHome"] == true);
+    let worker_captain = (!entry.captain
+        && (record
+            .get("crewCaptain")
+            .is_some_and(|value| !value.is_null())
+            || delegated_to_home))
         .then(|| {
-            record["captain"]
-                .as_u64()
+            record
+                .get("crewCaptain")
+                .and_then(|value| value.as_u64())
+                .or_else(|| record["captain"].as_u64())
                 .and_then(|index| projection["index"]["captains"].get(index as usize))
         })
         .flatten();

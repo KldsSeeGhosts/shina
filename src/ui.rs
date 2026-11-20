@@ -20074,6 +20074,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_crew_members_list_flat_with_the_captains_portrait() {
+        let mut rt = runtime(1280.0);
+        let mut client = crate::client::Client::new(rt.state.data_dir.clone());
+        let mut remote = crate::client::Client::new(rt.state.data_dir.clone());
+        remote.remote = Some(crate::peer::Link {
+            server_id: "fixture-server".into(),
+            host: "studio-mac".into(),
+            device_id: "fixture-device".into(),
+            token: "fixture".into(),
+            enabled: true,
+        });
+        client.linked.insert("fixture-server".into(), remote);
+        rt.state.client = Some(client);
+        // Thread 3 is crew by canonical membership alone: no parent, no delegation,
+        // the way an independently recruited thread arrives from a linked machine.
+        rt.state.machines.views.insert(
+            "fixture-server".into(),
+            json!({"index":{
+                "captains":[{"name":"Boss","portrait":0}],
+                "threads":[
+                    {"id":1,"title":"Remote thread","session":"s1","captainHome":false,"lifecycle":{}},
+                    {"id":2,"title":"Remote captain","captain":0,"captainHome":true,"lifecycle":{}},
+                    {"id":3,"title":"Recruited worker","session":"s3","captain":0,"crewCaptain":0,"captainHome":false,"lifecycle":{}}
+                ]}}).into(),
+        );
+        rt.frame(0.0);
+        // Without a query or the archive the member stays out of the list.
+        assert!(
+            rt.find("machine-thread-fixture-server-3").is_none(),
+            "a crew member must not list as an ordinary row"
+        );
+        // Search lists it flat, carrying the captain's 16 px portrait and name.
+        rt.state.search.replace_text("Recruited");
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("machine-thread-fixture-server-3").is_some());
+        assert!(
+            rt.presented("machine-captain-portrait-fixture-server-3")
+                .is_some(),
+            "crew rows carry the captain portrait"
+        );
+        // The archive lists it the same way without a query.
+        rt.state.search.replace_text("");
+        rt.state.machines.views.insert(
+            "fixture-server".into(),
+            json!({"index":{
+                "captains":[{"name":"Boss","portrait":0}],
+                "threads":[
+                    {"id":3,"title":"Recruited worker","session":"s3","captain":0,"crewCaptain":0,"captainHome":false,"archived":true,"updated":5}
+                ]}}).into(),
+        );
+        rt.state.show_archive = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("machine-thread-fixture-server-3").is_some());
+        assert!(
+            rt.presented("machine-captain-portrait-fixture-server-3")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn the_machine_selector_marks_a_pending_draft_change_and_blocks_sending() {
         for width in [620.0, 1280.0] {
             let mut rt = runtime(width);
@@ -28646,6 +28708,39 @@ pub(crate) mod tests {
                 );
             }
             assert_inside(&mut rt, width, &["parent-bar", "open-captain", "composer"]);
+        }
+    }
+
+    #[test]
+    fn a_peer_workers_parent_bar_offers_the_crew_menu_for_its_local_siblings() {
+        for width in [960.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            // Two workers the same remote captain delegated onto this machine.
+            let origin = |parent: usize| {
+                serde_json::from_value(json!({
+                    "deviceId":"origin-device","serverId":"origin-server","serverLabel":"Studio",
+                    "parentThreadId":parent,"taskId":uuid::Uuid::new_v4(),"captain":"Boss"
+                }))
+                .unwrap()
+            };
+            for index in [0, 1] {
+                let thread = &mut rt.state.threads[index];
+                thread.delegated = true;
+                thread.peer_origin = Some(origin(7));
+            }
+            rt.state.show_thread(0);
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_inside(&mut rt, width, &["parent-bar", "crew-siblings"]);
+            press(&mut rt, "crew-siblings");
+            rt.frame(0.5);
+            // The menu lists the other worker this machine runs for the same origin.
+            let sibling = format!("crew-sibling-{}", rt.state.threads[1].id);
+            assert_inside(&mut rt, width, &["crew-siblings-menu", &sibling]);
+            let own = format!("crew-sibling-{}", rt.state.threads[0].id);
+            assert!(rt.find(&own).is_none(), "the open worker is not a row");
+            rt.frame(0.5);
         }
     }
 

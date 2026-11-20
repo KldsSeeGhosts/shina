@@ -7,7 +7,7 @@
 //! `cubic-bezier(.23, 1, .32, 1)`. The visual skin follows docs/ui/pixel-voyage.md.
 use super::*;
 use crate::model::placement::{PlacementMode, PlacementPhase, ThreadPlacement};
-use crate::model::{AttentionItem, AttentionKind, TaskState, TaskView};
+use crate::model::{AttentionItem, AttentionKind, PeerOrigin, TaskState, TaskView};
 use rune::Transition;
 
 /// Row corners, shared by cards, chips and popover items.
@@ -921,7 +921,7 @@ struct RosterMember {
     rank: usize,
     updated: u64,
     place: Option<String>,
-    task_active: bool,
+    queued: bool,
 }
 
 fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
@@ -960,7 +960,13 @@ fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
                 (status, word.to_string())
             }
             None => {
-                let status = thread.map(|t| t.status).unwrap_or(Status::Ready);
+                // An untasked member is independent crew: a request in flight is a
+                // needs-you like any task's, the rest follows the thread's own status.
+                let status = if thread.is_some_and(|t| t.request.is_some()) {
+                    Status::Waiting
+                } else {
+                    thread.map(|t| t.status).unwrap_or(Status::Ready)
+                };
                 (status, crate::model::status_word(status).into())
             }
         };
@@ -1000,12 +1006,64 @@ fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
                 .or_else(|| thread.and_then(|t| (t.machine != "local").then(|| t.machine.clone()))),
             rank,
             updated: thread.map(|t| t.updated).unwrap_or(0),
-            task_active: task.is_some(),
+            queued: task.is_some_and(|task| task.state == TaskState::Queued),
             place: worker_placement(s, id).map(|placement| {
                 placement_details(&placement, &placement_machine(s, id, &placement))
             }),
         });
     }
+    members.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| b.updated.cmp(&a.updated)));
+    members
+}
+
+/// The other workers this machine runs for one peer delegation: threads sharing the
+/// open worker's origin server and parent task. Same rank and status rules as
+/// `roster_members`' untasked arm.
+fn peer_sibling_members(s: &State, open: usize, origin: &PeerOrigin) -> Vec<RosterMember> {
+    let mut members: Vec<RosterMember> = s
+        .threads
+        .iter()
+        .filter(|thread| {
+            thread.id != open
+                && thread.peer_origin.as_ref().is_some_and(|other| {
+                    other.server_id == origin.server_id
+                        && other.parent_thread_id == origin.parent_thread_id
+                })
+        })
+        .map(|thread| {
+            let status = if thread.request.is_some() {
+                Status::Waiting
+            } else {
+                thread.status
+            };
+            let word = crate::model::status_word(status).to_string();
+            let rank = if thread.request.is_some() || status == Status::Waiting {
+                0
+            } else if status.busy() {
+                1
+            } else {
+                3
+            };
+            RosterMember {
+                thread_id: thread.id,
+                title: if thread.title.is_empty() {
+                    "Untitled".into()
+                } else {
+                    thread.title.clone()
+                },
+                status,
+                clock: word.clone(),
+                word,
+                remote_server: (thread.machine != "local").then(|| thread.machine.clone()),
+                rank,
+                updated: thread.updated,
+                queued: false,
+                place: worker_placement(s, thread.id).map(|placement| {
+                    placement_details(&placement, &placement_machine(s, thread.id, &placement))
+                }),
+            }
+        })
+        .collect();
     members.sort_by(|a, b| a.rank.cmp(&b.rank).then_with(|| b.updated.cmp(&a.updated)));
     members
 }
@@ -1097,14 +1155,12 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32) -> Option<El> {
     let plan = super::plan_ui::plan_toggle(s, p);
     let open = s.crew_roster_open(captain);
     // One definition of working, shared with the chat header: running now. A worker waiting
-    // on an approval needs you instead, and a queued one waits for a slot.
-    // The summary counts only members with an active task, matching the tray's old
-    // tasks-only definition; an idle member is no task at all.
-    let active: Vec<&RosterMember> = members.iter().filter(|m| m.task_active).collect();
-    let count = |want: Status| active.iter().filter(|m| m.status == want).count();
+    // on an approval needs you instead, and a queued one waits for a slot. Independent crew
+    // members count the same way; only an idle member is no task at all.
+    let count = |want: Status| members.iter().filter(|m| m.status == want).count();
     let (working, needs_you) = (count(Status::Running), count(Status::Waiting));
     let offline = count(Status::Paused);
-    let queued = active.len() - working - needs_you - offline;
+    let queued = members.iter().filter(|m| m.queued).count();
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
     for (key, n, status, word) in [
         ("crew-tray-working", working, Status::Running, "working"),
@@ -1487,12 +1543,14 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
                 .label("Delegated work")
                 .min_h(48.0)
                 .py(8.0)
-                .px(20.0)
+                .pl(20.0)
+                .pr(8.0)
                 .gap(8.0)
                 .center_y()
                 .radius(12.0)
                 .border(1.0, hairline(p))
-                .child(who),
+                .child(who)
+                .child(siblings_button(s, p)),
         );
     }
     let parent = t
@@ -1589,8 +1647,8 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
             p.muted,
         ));
     }
-    if let Some((owner, home)) = captain.and_then(|c| s.captain_home(c).map(|h| (c, h))) {
-        bar = bar.child(siblings_button(s, p, owner, home));
+    if captain.is_some_and(|c| s.captain_home(c).is_some()) {
+        bar = bar.child(siblings_button(s, p));
     }
     let bar = bar.child(
         row()
@@ -1696,7 +1754,11 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .center_y()
         .child(who)
         .child(spacer())
-        .child(home.map_or_else(el, |home| siblings_button(s, p, captain, home)))
+        .child(if home.is_some() {
+            siblings_button(s, p)
+        } else {
+            el()
+        })
         .child(
             row()
                 .key("crew-bar-open-captain")
@@ -1769,7 +1831,7 @@ fn attention_word(kind: AttentionKind) -> &'static str {
 
 /// The "Crew" menu button on a worker's parent or crew bar: jumps between the captain's
 /// members without going back to the captain's home. Rows share the roster's row builder.
-pub(super) fn siblings_button(s: &State, p: Palette, captain: usize, home: usize) -> El {
+pub(super) fn siblings_button(s: &State, p: Palette) -> El {
     let mut button = row()
         .key("crew-siblings")
         .role("button")
@@ -1794,7 +1856,6 @@ pub(super) fn siblings_button(s: &State, p: Palette, captain: usize, home: usize
     if s.crew_siblings_menu {
         button = button.fill(hover_wash(s, p));
     }
-    let _ = (captain, home);
     button
 }
 
@@ -1805,6 +1866,31 @@ pub(super) fn siblings_menu(s: &State, p: Palette) -> Option<El> {
         return None;
     }
     let t = s.current();
+    // A peer-launched worker's crew lives on the origin machine; this menu jumps
+    // between the members the same delegation put on this one.
+    if let Some(origin) = &t.peer_origin {
+        let members = peer_sibling_members(s, t.id, origin);
+        let mut menu = popover("crew-siblings-menu", "Crew", s, p)
+            .role("menu")
+            .focus_group()
+            .w(280.0)
+            .anchored_fit("crew-siblings", rune::Side::Bottom, rune::Align::End, 4.0)
+            .modal(true, |s: &mut State| s.crew_siblings_menu = false);
+        if members.is_empty() {
+            menu = menu.child(
+                label("No other crew members on this machine", SMALL, p.muted)
+                    .key("crew-siblings-empty")
+                    .px(8.0)
+                    .py(6.0),
+            );
+        }
+        for member in members {
+            let id = member.thread_id;
+            menu =
+                menu.child(roster_row(s, p, &member, format!("crew-sibling-{id}"), false).w_full());
+        }
+        return Some(menu);
+    }
     let captain = t.crew_captain.or_else(|| {
         t.parent
             .and_then(|id| s.threads.iter().find(|p| p.id == id))
@@ -2102,5 +2188,48 @@ mod tests {
             (4, "Review", "completed", "Line one\nLine two", "none")
         );
         assert!(parse_completion("Shina: task from parent #1\n\nDo it").is_none());
+    }
+
+    #[test]
+    fn untasked_crew_members_classify_from_thread_state() {
+        let mut state = State::headless(
+            std::env::temp_dir().join(format!("shina-roster-test-{}", uuid::Uuid::new_v4())),
+        );
+        state.load_global_for_test();
+        state.demo = true;
+        state.captains = crate::captains::Captain::presets();
+        state.open_captain(0);
+        let home = state.current().id;
+        let mut members = Vec::new();
+        for (title, status, request) in [
+            ("Waiting on approval", Status::Ready, true),
+            ("Working alone", Status::Running, false),
+            ("Idle member", Status::Ready, false),
+        ] {
+            let id = state.next_id;
+            state.next_id += 1;
+            let mut thread = Thread::new(id);
+            thread.title = title.into();
+            thread.crew_captain = Some(0);
+            thread.captain = Some(0);
+            thread.status = status;
+            if request {
+                thread.request = Some(json!({"method":"confirm"}));
+            }
+            members.push(id);
+            state.threads.push(thread);
+        }
+        let roster = roster_members(&state, home, 0);
+        assert_eq!(roster.len(), 3);
+        let by_id = |id: usize| roster.iter().find(|m| m.thread_id == id).unwrap();
+        // A pending request is needs-you even when the thread status lags it,
+        // and it sorts to the front with the other attention rows.
+        assert_eq!(by_id(members[0]).status, Status::Waiting);
+        assert_eq!(by_id(members[0]).rank, 0);
+        assert_eq!(by_id(members[1]).status, Status::Running);
+        assert_eq!(by_id(members[1]).rank, 1);
+        assert_eq!(by_id(members[2]).status, Status::Ready);
+        assert_eq!(by_id(members[2]).rank, 3);
+        assert_eq!(roster[0].thread_id, members[0]);
     }
 }

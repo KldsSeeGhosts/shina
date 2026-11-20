@@ -247,6 +247,13 @@ fn dispatch_global_command(
                     .position(|(server, id)| {
                         server == &state.machines.selected && *id == state.current().id
                     })
+                    // A hidden worker has no row of its own; its captain's home
+                    // stays selected instead, so Previous/Next start there.
+                    .or_else(|| {
+                        order.iter().position(|(server, id)| {
+                            server == &state.machines.selected && *id == state.selected_row()
+                        })
+                    })
                     .unwrap_or(0);
                 let next = if command == "thread.previous" {
                     (i + order.len() - 1) % order.len()
@@ -1842,5 +1849,31 @@ mod tests {
             "after cancelled logoff"
         );
         assert!(!update::exit_recorded());
+    }
+
+    #[test]
+    fn previous_next_from_a_hidden_worker_starts_at_its_captains_row() {
+        let mut state = State::new(".".into(), false);
+        state.populate_demo();
+        // A worker stays out of the sidebar order; its captain's row stays selected.
+        let worker = 0;
+        state.threads[worker].parent = Some(7);
+        state.threads[worker].delegated = true;
+        state.threads[worker].crew_captain = Some(0);
+        state.show_thread(worker);
+        assert_eq!(state.current().id, 1);
+        assert!(!state.sidebar_navigation().contains(&worker));
+        let event = KeyEvent {
+            key: rune::Key::Text(" ".into()),
+            mods: Default::default(),
+        };
+        // The captain's home (thread 7) is the first row; next lands on thread 8.
+        dispatch_global_command(&mut state, "thread.next", &event, false, None);
+        assert_eq!(state.current().id, 8);
+        state.show_thread(worker);
+        dispatch_global_command(&mut state, "thread.previous", &event, false, None);
+        // Previous wraps to the last row rather than the worker's own position.
+        let last = state.sidebar_navigation().last().copied().unwrap();
+        assert_eq!(state.current().id, state.threads[last].id);
     }
 }
