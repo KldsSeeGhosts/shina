@@ -396,6 +396,47 @@ fn worker_overview_body(s: &State, p: Palette) -> El {
                     ),
             ),
         );
+    } else if let Some(origin) = &t.peer_origin {
+        let server_id = origin.server_id.clone();
+        let home_id = origin.parent_thread_id;
+        let linked = s
+            .client
+            .as_ref()
+            .is_some_and(|c| c.linked.contains_key(&server_id));
+        let mut cap_row = row()
+            .key("open-captain-from-overview")
+            .px(10.0)
+            .min_h(40.0)
+            .gap(10.0)
+            .center_y()
+            .radius(6.0)
+            .child(icon("crew", p.muted))
+            .child(
+                label(
+                    format!("{} on {}", origin.captain, origin.server_label),
+                    TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08),
+                    p.ink,
+                )
+                .truncate()
+                .min_w(0.0),
+            );
+        if linked {
+            cap_row = cap_row
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!(
+                    "Open {} on {}",
+                    origin.captain, origin.server_label
+                ))
+                .focusable(true)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .hover_motion(motion(), motion())
+                .on_press(move |s: &mut State| s.open_machine_thread(&server_id, home_id));
+        }
+        body = body.child(
+            captain_ui::section("brief-delegated", "Delegated by", None, vec![], p).child(cap_row),
+        );
     }
     // "Runs": the placement details the parent bar used to carry.
     if let Some(placement) = crew_ui::worker_placement(s, t.id) {
@@ -452,30 +493,40 @@ fn peer_crew_body(s: &State, p: Palette) -> El {
     };
     let members = crew_ui::peer_sibling_members(s, t.id, origin);
     // The captain's name heads the list; the open worker's own row follows, filled.
-    let mut rows = col().gap(2.0).pt(8.0).child(
-        row()
-            .key("crew-tab-captain")
+    let server_id = origin.server_id.clone();
+    let home_id = origin.parent_thread_id;
+    let linked = s
+        .client
+        .as_ref()
+        .is_some_and(|c| c.linked.contains_key(&server_id));
+    let mut cap_head = row()
+        .key("crew-tab-captain")
+        .h(32.0)
+        .px(10.0)
+        .gap(8.0)
+        .center_y()
+        .radius(6.0)
+        .child(
+            label(
+                format!("Captain {} ({})", origin.captain, origin.server_label),
+                TextStyle::new(12.0, 500.0).lh(16.0),
+                p.muted,
+            )
+            .truncate()
+            .min_w(0.0),
+        );
+    if linked {
+        cap_head = cap_head
             .role("button")
             .cursor(rune::Cursor::Pointer)
-            .label(format!("Captain {}", origin.captain))
+            .label(format!("Open Captain {}", origin.captain))
             .focusable(true)
-            .h(32.0)
-            .px(10.0)
-            .gap(8.0)
-            .center_y()
-            .radius(6.0)
             .hover(hover_wash(s, p))
             .press(active_wash(s, p))
             .hover_motion(motion(), motion())
-            .child(
-                label(
-                    format!("Captain {}", origin.captain),
-                    TextStyle::new(12.0, 500.0).lh(16.0),
-                    p.muted,
-                )
-                .truncate(),
-            ),
-    );
+            .on_press(move |s: &mut State| s.open_machine_thread(&server_id, home_id));
+    }
+    let mut rows = col().gap(2.0).pt(8.0).child(cap_head);
     // The open worker's own row leads the siblings, filled (spec §3.5).
     let own_member = crew_ui::RosterMember {
         thread_id: t.id,

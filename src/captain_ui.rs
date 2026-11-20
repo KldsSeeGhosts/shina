@@ -582,6 +582,36 @@ pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         .collect();
     let current = s.current().id;
     let mut rows = col().gap(2.0);
+    // On a worker thread, put a pressable captain row at the top of the Crew tab so the
+    // user always has a direct return path to the captain's home (spec §3.5).
+    if !s.is_captain_home(s.current()) {
+        let profile = &s.captains[captain];
+        rows = rows.child(
+            row()
+                .key("crew-tab-captain")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Open {}", profile.name))
+                .focusable(true)
+                .h(32.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .radius(6.0)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .hover_motion(motion(), motion())
+                .on_press(move |s: &mut State| s.open_captain(captain))
+                .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
+                .child(
+                    label(&profile.name, ROW_TEXT, p.ink)
+                        .truncate()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(meta_text("Captain", p.faint)),
+        );
+    }
     // Pending joins show a quiet in-flight row; vanished threads keep the receipt.
     for (thread, kind) in &pending {
         if s.threads.iter().any(|t| t.id == *thread) {

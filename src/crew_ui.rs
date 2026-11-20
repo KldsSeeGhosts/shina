@@ -242,7 +242,11 @@ fn placement_recovery(s: &State, thread: usize, sender: &str) -> String {
                 .is_some_and(|setup| setup.phase == crate::model::WorktreeSetupPhase::Failed)
     });
     if setup_failed {
-        "Nothing started. Open the worker to retry or skip its setup script.".into()
+        if s.current().id == thread {
+            "Setup failed. Retry or skip this worker's setup script below.".into()
+        } else {
+            "Nothing started. Open the worker to retry or skip its setup script.".into()
+        }
     } else {
         format!("Nothing started. New work from {sender} retries in the same checkout.")
     }
@@ -361,6 +365,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .label(format!("{}. {word}. Open the worker", task.title))
         .focusable(true)
         .h(32.0)
+        .pl(CARD_INDENT)
         .gap(8.0)
         .center_y()
         .radius(6.0)
@@ -989,20 +994,43 @@ pub(super) fn roster_row(
         .gap(7.0)
         .h(30.0)
         .pl(8.0)
-        .pr(10.0)
+        .pr(6.0)
         .radius(ROW_RADIUS)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
+        .hover_group_focus()
         .transition(Transition::offset(0.0, 4.0).combined(Transition::opacity()))
         .on_press(move |s: &mut State| {
+            if waiting {
+                // On a Needs you member, jump to the home's request bar at that item's page
+                // and dismiss a covering Inspector so the request is immediately visible.
+                if !s.is_captain_home(s.current())
+                    && let Some(captain) = s
+                        .threads
+                        .iter()
+                        .find(|t| t.id == child)
+                        .and_then(|t| t.crew_captain.or(t.captain))
+                {
+                    s.open_captain(captain);
+                }
+                let items = needs_you_items(s);
+                if let Some(idx) = items.iter().position(|item| item.thread_id == child) {
+                    s.needs_you_page = idx;
+                    if s.inspector_covers() {
+                        let key = s.panel_key();
+                        s.right_panels.close(&key);
+                    }
+                    return;
+                }
+            }
             open_thread(s, child);
         })
         .child(mark_slot(member.status, p))
         .child(
             label(&member.title, TextStyle::new(13.0, 500.0), p.ink)
                 .truncate()
-                .shrink()
+                .grow(1.0)
                 .min_w(0.0),
         )
         .child(
@@ -1025,9 +1053,22 @@ pub(super) fn roster_row(
             .key(format!("crew-chip-clock-{child}")),
         );
     if menu {
-        row_ = row_.on_secondary_press(move |s: &mut State, _at, _| {
-            s.brief.more = Some(child);
-        });
+        row_ = row_
+            .child(
+                icon_button(
+                    &format!("crew-chip-more-{child}"),
+                    "Crew actions",
+                    "more",
+                    p,
+                    move |s: &mut State| {
+                        s.brief.more = Some(child);
+                    },
+                )
+                .group_opacity(0.0, 1.0),
+            )
+            .on_secondary_press(move |s: &mut State, _at, _| {
+                s.brief.more = Some(child);
+            });
     }
     if let Some(place) = &member.place {
         row_ = row_.help(place.clone());
@@ -1061,50 +1102,52 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, _rows_max: Option<f32
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
     // Under 480 pt of lane the summary shows at most two segments, needs you first.
     let narrow = _lane < 480.0;
-    let segments: &[(&str, usize, Status, &str)] = if narrow {
-        if needs_you > 0 {
-            &[
-                (
-                    "crew-tray-needs-you",
-                    needs_you,
-                    Status::Waiting,
-                    "needs you",
-                ),
-                ("crew-tray-working", working, Status::Running, "working"),
-            ]
-        } else {
-            &[
-                ("crew-tray-working", working, Status::Running, "working"),
-                ("crew-tray-queued", queued, Status::Ready, "queued"),
-            ]
-        }
+    let ordered = [
+        (
+            "crew-tray-needs-you",
+            needs_you,
+            Status::Waiting,
+            "needs you",
+        ),
+        ("crew-tray-working", working, Status::Running, "working"),
+        ("crew-tray-queued", queued, Status::Ready, "queued"),
+        ("crew-tray-offline", offline, Status::Paused, "offline"),
+    ];
+    let wide_order = [
+        ("crew-tray-working", working, Status::Running, "working"),
+        (
+            "crew-tray-needs-you",
+            needs_you,
+            Status::Waiting,
+            "needs you",
+        ),
+        ("crew-tray-queued", queued, Status::Ready, "queued"),
+        ("crew-tray-offline", offline, Status::Paused, "offline"),
+    ];
+    let chosen: Vec<_> = if narrow {
+        ordered
+            .into_iter()
+            .filter(|(_, n, _, _)| *n > 0)
+            .take(2)
+            .collect()
     } else {
-        &[
-            ("crew-tray-working", working, Status::Running, "working"),
-            (
-                "crew-tray-needs-you",
-                needs_you,
-                Status::Waiting,
-                "needs you",
-            ),
-            ("crew-tray-queued", queued, Status::Ready, "queued"),
-            ("crew-tray-offline", offline, Status::Paused, "offline"),
-        ]
+        wide_order
+            .into_iter()
+            .filter(|(_, n, _, _)| *n > 0)
+            .collect()
     };
-    for (key, n, status, word) in segments.iter() {
-        if *n > 0 {
-            summary = summary.child(
-                row()
-                    .key(*key)
-                    .gap(6.0)
-                    .center_y()
-                    .child(mark_slot(*status, p))
-                    .child(super::meta_text(
-                        format!("{n} {word}"),
-                        super::status_ink(*status, p),
-                    )),
-            );
-        }
+    for (key, n, status, word) in chosen {
+        summary = summary.child(
+            row()
+                .key(key)
+                .gap(6.0)
+                .center_y()
+                .child(mark_slot(status, p))
+                .child(super::meta_text(
+                    format!("{n} {word}"),
+                    super::status_ink(status, p),
+                )),
+        );
     }
     Some(
         row()
@@ -1178,24 +1221,37 @@ pub(super) fn needs_you(s: &State, p: Palette, lane: f32) -> Option<El> {
         return None;
     }
     let items = needs_you_items(s);
-    let has_reports = super::crew_questions_ui::cards_shows(s);
-    if items.is_empty() && !has_reports {
+    let user_reports = super::crew_questions_ui::user_question_count(s);
+    let captain_line = super::crew_questions_ui::captain_questions_line(s, p);
+    let total = items.len() + user_reports;
+    if total == 0 && captain_line.is_none() {
         return None;
     }
-    let mut card_stack = col().gap(0.0);
-    if items.is_empty() {
-        // Only report questions are open: they keep their own card.
-        if let Some(cards) = super::crew_questions_ui::cards(s, p) {
-            card_stack = card_stack.child(cards);
+    let mut card_stack = col().gap(6.0);
+    if total > 0 {
+        // Unified pager over live requests AND user report questions: only one card
+        // mounts at a time so report questions never stack below approvals.
+        let page = s.needs_you_page.min(total - 1);
+        if page < items.len() {
+            card_stack = card_stack.child(needs_you_card(s, p, &items[page], page, total, lane));
+        } else if let Some(report_card) =
+            super::crew_questions_ui::user_question_card(s, p, page - items.len())
+        {
+            let mut wrapped = col().gap(4.0);
+            if total > 1 {
+                wrapped = wrapped.child(
+                    row()
+                        .gap(6.0)
+                        .center_y()
+                        .justify_end()
+                        .child(pager_controls(p, page, total)),
+                );
+            }
+            card_stack = card_stack.child(wrapped.child(report_card));
         }
-    } else {
-        // One request per page, clamped each frame (spec §3.6).
-        let page = s.needs_you_page.min(items.len() - 1);
-        let item = &items[page];
-        card_stack = card_stack.child(needs_you_card(s, p, item, page, items.len(), lane));
-        if let Some(cards) = super::crew_questions_ui::cards(s, p) {
-            card_stack = card_stack.child(cards);
-        }
+    }
+    if let Some(line) = captain_line {
+        card_stack = card_stack.child(line);
     }
     Some(
         col()
@@ -1205,6 +1261,46 @@ pub(super) fn needs_you(s: &State, p: Palette, lane: f32) -> Option<El> {
             .shrink()
             .child(card_stack),
     )
+}
+
+pub(super) fn needs_you_active_is_form(s: &State) -> bool {
+    let items = needs_you_items(s);
+    let user_reports = super::crew_questions_ui::user_question_count(s);
+    let total = items.len() + user_reports;
+    total > 0 && s.needs_you_page.min(total - 1) >= items.len()
+}
+
+fn pager_controls(p: Palette, page: usize, total: usize) -> El {
+    row()
+        .gap(4.0)
+        .center_y()
+        .child(icon_button(
+            "needs-you-prev",
+            "Previous request",
+            "chevron-left",
+            p,
+            move |s: &mut State| {
+                let total =
+                    needs_you_items(s).len() + super::crew_questions_ui::user_question_count(s);
+                let max = total.saturating_sub(1);
+                s.needs_you_page = s.needs_you_page.min(max).saturating_sub(1);
+            },
+        ))
+        .child(
+            label(format!("{} of {total}", page + 1), TIMER, p.faint).key("needs-you-page-count"),
+        )
+        .child(icon_button(
+            "needs-you-next",
+            "Next request",
+            "chevron-right",
+            p,
+            move |s: &mut State| {
+                let total =
+                    needs_you_items(s).len() + super::crew_questions_ui::user_question_count(s);
+                let max = total.saturating_sub(1);
+                s.needs_you_page = (s.needs_you_page + 1).min(max);
+            },
+        ))
 }
 
 /// The one paged request card: ring + question + source link on the left, pager and
@@ -1242,6 +1338,10 @@ fn needs_you_card(
     let can_answer =
         known && linked && remote.is_none_or(|remote| s.machine_connected(&remote.server_id));
     let title = crate::model::string(request, "title");
+    let message = crate::model::string(request, "message");
+    // Multi-line or long authorization payloads (such as Claude's plan approval) cannot
+    // be authorized safely from a one-line bar; route them to Review instead of blind Approve.
+    let needs_full_review = approval && (message.contains('\n') || message.chars().count() > 140);
     let kind_word = if approval { "Approval" } else { "Question" };
     // Second line: brass kind word, then the pressable source title (the old "Open"
     // button), then a chevron.
@@ -1302,33 +1402,16 @@ fn needs_you_card(
     }
     let mut actions = row().gap(6.0).center_y();
     if total > 1 {
-        actions = actions
-            .child(icon_button(
-                "needs-you-prev",
-                "Previous request",
-                "chevron-left",
-                p,
-                move |s: &mut State| {
-                    let max = needs_you_items(s).len().saturating_sub(1);
-                    s.needs_you_page = s.needs_you_page.min(max).saturating_sub(1);
-                },
-            ))
-            .child(
-                label(format!("{} of {total}", page + 1), TIMER, p.faint)
-                    .key("needs-you-page-count"),
-            )
-            .child(icon_button(
-                "needs-you-next",
-                "Next request",
-                "chevron-right",
-                p,
-                move |s: &mut State| {
-                    let max = needs_you_items(s).len().saturating_sub(1);
-                    s.needs_you_page = (s.needs_you_page + 1).min(max);
-                },
-            ));
+        actions = actions.child(pager_controls(p, page, total));
     }
-    actions = if approval {
+    actions = if needs_full_review {
+        actions.child(
+            solid_button(format!("review-{id}"), "Review", p, move |s| {
+                open_thread(s, id);
+            })
+            .disabled(!can_answer),
+        )
+    } else if approval {
         actions.child(super::approval_actions(s, id, true, can_answer, p))
     } else {
         actions.child(
@@ -1356,6 +1439,11 @@ fn needs_you_card(
         .key(format!("needs-you-{id}"))
         .role("group")
         .label(format!("{kind_word} from {}", item.short_title))
+        .help(if !message.is_empty() && message != title {
+            message.to_string()
+        } else {
+            String::new()
+        })
         .min_h(52.0)
         .px(12.0)
         .py(8.0)
@@ -1364,7 +1452,7 @@ fn needs_you_card(
         .fill(p.card)
         .border(1.0, hairline(p))
         .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
-    let mut row_ = row()
+    let row_ = row()
         .gap(10.0)
         .center_y()
         .child(mark_slot(Status::Waiting, p))
@@ -1388,21 +1476,17 @@ fn needs_you_card(
                 )
                 .child(meta),
         );
-    row_ = if lane_narrow {
-        row_.child(spacer())
-    } else {
-        row_
-    };
-    row_ = row_.child(actions);
-    content = content.child(row_);
     if lane_narrow {
-        content = content.child(
+        content = content.child(row_).child(
             row()
+                .key("needs-you-actions-wrap")
                 .gap(6.0)
                 .center_y()
                 .justify_end()
-                .child(el().key("needs-you-actions-wrap")),
+                .child(actions),
         );
+    } else {
+        content = content.child(row_.child(actions));
     }
     content
 }
@@ -1492,8 +1576,8 @@ fn worker_notice(s: &State, thread: usize) -> Option<String> {
 /// The worker's notice bar (spec §3.8): 36 pt, borderless `p.selected`, an alert icon in
 /// brass and the reason in SMALL ink. A healthy worker shows nothing — the top bar
 /// already carries the captain link and status.
-fn notice_bar(key: &'static str, reason: String, p: Palette) -> El {
-    row()
+fn notice_bar(key: &'static str, reason: String, action: Option<El>, p: Palette) -> El {
+    let mut bar = row()
         .key(key)
         .role("status")
         .label(reason.clone())
@@ -1504,7 +1588,11 @@ fn notice_bar(key: &'static str, reason: String, p: Palette) -> El {
         .radius(8.0)
         .fill(p.selected)
         .child(icon("alert", p.brass).size(16.0, 16.0))
-        .child(label(reason, SMALL, p.ink).wrap().grow(1.0).min_w(0.0))
+        .child(label(reason, SMALL, p.ink).wrap().grow(1.0).min_w(0.0));
+    if let Some(button) = action {
+        bar = bar.child(button);
+    }
+    bar
 }
 
 pub(super) fn parent_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
@@ -1513,7 +1601,41 @@ pub(super) fn parent_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
         // A recruited root member's notices go to `crew_bar`, not here.
         return None;
     }
-    worker_notice(s, t.id).map(|reason| notice_bar("parent-bar", reason, p))
+    let thread_id = t.id;
+    let setup_failed = t
+        .worktree_setup
+        .as_ref()
+        .is_some_and(|setup| setup.phase == crate::model::WorktreeSetupPhase::Failed);
+    let offline = s.remote_task(thread_id).is_some_and(|r| {
+        matches!(
+            r.state,
+            crate::model::RemoteState::TargetOffline | crate::model::RemoteState::UpdateRequired
+        )
+    });
+    worker_notice(s, thread_id).map(|reason| {
+        let action = if setup_failed {
+            Some(ghost_button(
+                s,
+                "parent-bar-retry-setup".into(),
+                "Retry setup",
+                p,
+                |s: &mut State| {
+                    s.retry_worktree_setup();
+                },
+            ))
+        } else if offline {
+            Some(ghost_button(
+                s,
+                "parent-bar-machines".into(),
+                "Machines",
+                p,
+                |s: &mut State| s.machines.dialog = true,
+            ))
+        } else {
+            None
+        };
+        notice_bar("parent-bar", reason, action, p)
+    })
 }
 
 /// Whether `crew_bar` draws, so the composer's stack budget can price it before building.
@@ -1534,7 +1656,7 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
     if t.delegated || t.peer_origin.is_some() || t.crew_captain.is_none() {
         return None;
     }
-    worker_notice(s, t.id).map(|reason| notice_bar("crew-bar", reason, p))
+    worker_notice(s, t.id).map(|reason| notice_bar("crew-bar", reason, None, p))
 }
 
 fn attention_word(kind: AttentionKind) -> &'static str {

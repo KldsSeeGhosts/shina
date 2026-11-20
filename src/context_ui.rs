@@ -12,8 +12,8 @@ use super::*;
 
 use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, motion, solid_button};
 use crate::model::{
-    CREW_CONTEXT_MAX_BYTES, ESSENTIAL_BUDGET, MemoryView, NOTES_CONTEXT_MAX_BYTES, PROFILE_BUDGET,
-    RULES_CONTEXT_MAX_BYTES,
+    CONTEXT_TRUNCATION, CREW_CONTEXT_MAX_BYTES, ESSENTIAL_BUDGET, MemoryView,
+    NOTES_CONTEXT_MAX_BYTES, PROFILE_BUDGET, RULES_CONTEXT_MAX_BYTES, covered_bytes,
 };
 
 /// KSG's `text-[13px] font-medium` detail rows.
@@ -66,13 +66,24 @@ pub(super) struct Source {
 
 /// Bytes a bounded-prefix document actually carries into the prompt. The
 /// truncation marker reserves room inside the budget, so a cut document sends
-/// fewer bytes than the cap (mirrors `captain_state::covered_bytes`).
-fn covered(text_len: usize, budget: usize) -> usize {
-    text_len.min(budget)
+/// fewer bytes than the cap, matching `captain_state::covered_bytes` exactly.
+fn covered(text: Option<&str>, text_len: usize, budget: usize) -> usize {
+    if let Some(body) = text
+        && body.len() == text_len
+    {
+        return covered_bytes(body, budget, CONTEXT_TRUNCATION);
+    }
+    if text_len <= budget {
+        text_len
+    } else {
+        budget.saturating_sub(CONTEXT_TRUNCATION.len())
+    }
 }
 
 fn document_source(s: &State, captain: usize, name: &'static str, audience: Audience) -> Source {
     let meta = s.captain_document_view(captain, name);
+    let (_, _, body_text) = s.captain_document_body(captain, name);
+    let body = (!body_text.is_empty()).then_some(body_text);
     let title = captain_docs_ui::document_title(name).to_string();
     let (delivery, sent, budget, private) = match (name, audience) {
         ("AGENTS.md", Audience::Captain) => {
@@ -81,7 +92,7 @@ fn document_source(s: &State, captain: usize, name: &'static str, audience: Audi
             } else if meta.bytes > RULES_CONTEXT_MAX_BYTES {
                 (
                     Delivery::Truncated,
-                    covered(meta.bytes, RULES_CONTEXT_MAX_BYTES),
+                    covered(body, meta.bytes, RULES_CONTEXT_MAX_BYTES),
                     Some(RULES_CONTEXT_MAX_BYTES),
                     true,
                 )
@@ -103,7 +114,7 @@ fn document_source(s: &State, captain: usize, name: &'static str, audience: Audi
             } else if meta.bytes > NOTES_CONTEXT_MAX_BYTES {
                 (
                     Delivery::Truncated,
-                    covered(meta.bytes, NOTES_CONTEXT_MAX_BYTES),
+                    covered(body, meta.bytes, NOTES_CONTEXT_MAX_BYTES),
                     Some(NOTES_CONTEXT_MAX_BYTES),
                     false,
                 )
@@ -128,7 +139,7 @@ fn document_source(s: &State, captain: usize, name: &'static str, audience: Audi
             } else if meta.bytes > CREW_CONTEXT_MAX_BYTES {
                 (
                     Delivery::Truncated,
-                    covered(meta.bytes, CREW_CONTEXT_MAX_BYTES),
+                    covered(body, meta.bytes, CREW_CONTEXT_MAX_BYTES),
                     Some(CREW_CONTEXT_MAX_BYTES),
                     false,
                 )
@@ -281,18 +292,11 @@ fn kib(bytes: usize) -> String {
 }
 
 /// Open a Captain document in the Context tab's viewer, closing a covering
-/// panel first where needed. From an earlier conversation of that captain the
-/// document opens on this thread's panel, read-only.
+/// panel first where needed. From the primary home, opens on the home's panel;
+/// from an earlier conversation or crew worker, opens on the current thread's
+/// own Inspector panel so the click is immediately visible.
 pub(super) fn open_captain_document(s: &mut State, captain: usize, name: &str) {
-    let earlier = s.captain_access(captain) == crate::model::CaptainAccess::Earlier;
-    let key = if earlier {
-        s.panel_key()
-    } else {
-        match s.captain_home(captain) {
-            Some(home) => crate::right_panel::key(&s.machines.selected, home),
-            None => return,
-        }
-    };
+    let key = s.panel_key();
     s.open_captain_document(&key, captain, name);
 }
 
@@ -967,7 +971,11 @@ pub(super) fn memory_section(s: &State, p: Palette, captain: usize) -> El {
         p,
     );
     section = section.child(budget_meter(&memories, p));
-    section = section.child(profile_row(s, p));
+    if record {
+        section = section.child(row().px(2.0).child(profile_item(s, p).grow(1.0).min_w(0.0)));
+    } else {
+        section = section.child(profile_row(s, p));
+    }
     if s.brief.adding && !record {
         section = section.child(memory_editor(s, p, captain, None));
     }
@@ -1012,6 +1020,25 @@ pub(super) fn memory_section(s: &State, p: Palette, captain: usize) -> El {
             for memory in extra.iter().skip(shown) {
                 section = section.child(memory_row(s, p, captain, memory, false));
             }
+            section = section.child(
+                row()
+                    .key("context-memory-more")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Show fewer non-essential memories. Collapse")
+                    .focusable(true)
+                    .min_h(32.0)
+                    .px(10.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(6.0)
+                    .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(|s: &mut State| s.context_memories_expanded = false)
+                    .child(label("Show fewer", SMALL, p.muted).grow(1.0).min_w(0.0))
+                    .child(icon("chevron-down", p.muted).size(14.0, 14.0)),
+            );
         } else {
             section = section.child(
                 row()
@@ -1073,7 +1100,7 @@ fn memory_locked(p: Palette) -> El {
             )
             .child(
                 label(
-                    "Your profile, memories and captain rules are never sent to crew threads.",
+                    "Your profile and captain rules are never sent to crew threads. Local crew never receives memories; remote peer-delegated workers may receive essential memories in their launch brief.",
                     SMALL,
                     p.muted,
                 )
@@ -1134,6 +1161,31 @@ pub(super) fn conversation_section_with(
                 .child(icon("chevron-right", p.muted).size(14.0, 14.0)),
         );
     } else {
+        let count = earlier.len();
+        section = section.child(
+            row()
+                .key("context-earlier-toggle")
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Earlier conversations, {count}. Collapse"))
+                .focusable(true)
+                .min_h(32.0)
+                .px(10.0)
+                .gap(6.0)
+                .center_y()
+                .radius(6.0)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .hover_motion(motion(), motion())
+                .on_press(|s: &mut State| s.context_earlier_expanded = false)
+                .child(
+                    label("Earlier conversations", ROW_TEXT, p.ink)
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(label(count.to_string(), TIMER, p.faint))
+                .child(icon("chevron-down", p.muted).size(14.0, 14.0)),
+        );
         for id in earlier {
             let Some(thread) = s.threads.iter().find(|t| t.id == id) else {
                 continue;
@@ -1176,7 +1228,11 @@ pub(super) fn conversation_section_with(
             section = section.child(item);
         }
     }
-    if with_reset {
+    if with_reset && s.captain_access(captain) == crate::model::CaptainAccess::Full {
+        let busy_home = s
+            .captain_home(captain)
+            .and_then(|home| s.threads.iter().find(|t| t.id == home))
+            .is_some_and(|t| t.status.busy() || t.configuring || t.queued());
         section = section.child(
             ghost_button(
                 s,
@@ -1185,6 +1241,7 @@ pub(super) fn conversation_section_with(
                 p,
                 |s: &mut State| s.brief.confirm_reset = true,
             )
+            .disabled(busy_home)
             .mx(10.0),
         );
     }
@@ -1338,7 +1395,7 @@ fn window_section(s: &State, p: Palette) -> El {
         (None, Some(limit)) => format!("of {}", context_tokens_text(limit)),
         (None, None) => String::new(),
     };
-    if usage.percent.is_none() && used.is_empty() {
+    if usage.percent.is_none() && usage.tokens.is_none() {
         return section.child(captain_ui::quiet_note(
             "Usage appears after the first reply.",
             p,
@@ -1451,33 +1508,42 @@ fn attachments_section(s: &State, p: Palette) -> El {
             p,
         ));
     }
-    let mut rows = col().gap(2.0);
-    for attachment in tray.into_iter().chain(sent.into_iter()) {
+    let make_row = |attachment: &crate::attachments::Attachment,
+                    source_list: Vec<crate::attachments::Attachment>,
+                    is_draft: bool| {
         let id = attachment.id.clone();
         let name = attachment.name.clone();
         let size = format!("{} KiB", kib(attachment.bytes as usize));
-        rows = rows.child(
-            row()
-                .key(format!("context-attachment-{id}"))
-                .role("button")
-                .label(format!("{name}, {size}"))
-                .cursor(rune::Cursor::Pointer)
-                .focusable(true)
-                .min_h(32.0)
-                .px(10.0)
-                .gap(10.0)
-                .center_y()
-                .radius(6.0)
-                .hover(hover_wash(s, p))
-                .press(active_wash(s, p))
-                .hover_motion(motion(), motion())
-                .on_press(move |s: &mut State| {
-                    s.preview_attachments(s.current().draft_images.clone(), &id, true);
-                })
-                .child(icon("file", p.muted).size(16.0, 16.0))
-                .child(label(name, ROW_TEXT, p.ink).truncate().grow(1.0).min_w(0.0))
-                .child(label(size, TIMER, p.faint)),
-        );
+        row()
+            .key(format!("context-attachment-{id}"))
+            .role("button")
+            .label(format!("{name}, {size}"))
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .min_h(32.0)
+            .px(10.0)
+            .gap(10.0)
+            .center_y()
+            .radius(6.0)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+            .on_press(move |s: &mut State| {
+                s.preview_attachments(source_list.clone(), &id, is_draft);
+            })
+            .child(icon("file", p.muted).size(16.0, 16.0))
+            .child(label(name, ROW_TEXT, p.ink).truncate().grow(1.0).min_w(0.0))
+            .child(label(size, TIMER, p.faint))
+    };
+    let mut rows = col().gap(2.0);
+    let draft_list = t.draft_images.clone();
+    for attachment in &tray {
+        rows = rows.child(make_row(attachment, draft_list.clone(), true));
+    }
+    let sent_list: Vec<crate::attachments::Attachment> =
+        sent.iter().map(|a| (*a).clone()).collect();
+    for attachment in &sent {
+        rows = rows.child(make_row(attachment, sent_list.clone(), false));
     }
     section.child(rows)
 }
@@ -1589,14 +1655,40 @@ fn rule_inset(p: Palette) -> El {
 /// Edit, Save and Cancel actions.
 fn doc_header(s: &State, p: Palette, captain: usize, name: &str) -> El {
     let panel = s.panel_key();
-    let meta = s.captain_document_view(captain, name);
-    let budget = match name {
-        "AGENTS.md" => Some(RULES_CONTEXT_MAX_BYTES),
-        "NOTES.md" => Some(NOTES_CONTEXT_MAX_BYTES),
-        "CREW.md" => Some(CREW_CONTEXT_MAX_BYTES),
-        _ => None,
+    let audience = if captain_ui::home_brief_captain(s).is_some() && !s.context_audience_crew {
+        Audience::Captain
+    } else {
+        Audience::Crew
     };
-    let truncated = budget.is_some_and(|budget| meta.bytes > budget);
+    let static_name: &'static str = match name {
+        "AGENTS.md" => "AGENTS.md",
+        "NOTES.md" => "NOTES.md",
+        "CREW.md" => "CREW.md",
+        "DIGEST.md" => "DIGEST.md",
+        _ => "",
+    };
+    let source = document_source(s, captain, static_name, audience);
+    let draft_key = crate::model::DocumentDraftKey {
+        server: s.machines.selected.clone(),
+        captain,
+        name: name.to_string(),
+    };
+    let full_access = s.captain_access(captain) == crate::model::CaptainAccess::Full;
+    let live_draft = full_access
+        .then(|| s.captain_drafts.get(&draft_key))
+        .flatten();
+    let (bytes, sent, truncated) = match (live_draft, source.budget, source.delivery) {
+        (Some(draft), Some(budget), Delivery::Whole | Delivery::Truncated | Delivery::Empty) => {
+            let len = draft.text.text.len();
+            let cov = covered(Some(&draft.text.text), len, budget);
+            (len, cov, len > budget)
+        }
+        _ => (
+            source.bytes,
+            source.sent,
+            source.delivery == Delivery::Truncated,
+        ),
+    };
     let title = captain_docs_ui::document_title(name);
     let mut header = row()
         .key("context-doc-header")
@@ -1616,25 +1708,14 @@ fn doc_header(s: &State, p: Palette, captain: usize, name: &str) -> El {
     if truncated {
         header = header.child(spacer()).child(
             label(
-                format!(
-                    "{} of {} KiB sent",
-                    kib(covered(meta.bytes, budget.unwrap())),
-                    kib(meta.bytes)
-                ),
+                format!("{} of {} KiB sent", kib(sent), kib(bytes)),
                 TIMER,
                 p.brass,
             )
             .key("context-doc-sent"),
         );
     }
-    let key = crate::model::DocumentDraftKey {
-        server: s.machines.selected.clone(),
-        captain,
-        name: name.to_string(),
-    };
-    if s.captain_drafts.get(&key).is_none()
-        && s.captain_access(captain) == crate::model::CaptainAccess::Full
-    {
+    if live_draft.is_none() && full_access {
         if !truncated {
             header = header.child(spacer());
         }
@@ -1710,12 +1791,59 @@ pub(super) fn tab(s: &State, p: Palette) -> El {
                 .child(from_captain_section(s, p, captain));
         }
         (None, None) => {
-            body = body
-                .child(window_section(s, p))
-                .child(rule_inset(p))
-                .child(attachments_section(s, p))
-                .child(rule_inset(p))
-                .child(workspace_section(s, p));
+            if let Some(origin) = &t.peer_origin {
+                let mut from =
+                    captain_ui::section("context-documents", "From the captain", None, vec![], p);
+                let brief = t.messages.iter().enumerate().find(|(_, message)| {
+                    message.role == "Shina"
+                        && crew_ui::parse_brief(message.display_text()).is_some()
+                });
+                if let Some((index, message)) = brief {
+                    let size = format!("{} KiB", kib(message.display_text().len()));
+                    from = from.child(
+                        row()
+                            .key("context-brief-row")
+                            .role("button")
+                            .label(format!("Brief, {size}"))
+                            .cursor(rune::Cursor::Pointer)
+                            .focusable(true)
+                            .min_h(36.0)
+                            .px(10.0)
+                            .gap(10.0)
+                            .center_y()
+                            .radius(6.0)
+                            .hover(hover_wash(s, p))
+                            .press(active_wash(s, p))
+                            .hover_motion(motion(), motion())
+                            .on_press_tx(move |s: &mut State, tx| {
+                                tx.scroll_into_view(format!("message-{}-{index}", s.current().id));
+                            })
+                            .child(icon("file", p.muted).size(16.0, 16.0))
+                            .child(label("Brief", ROW_TEXT, p.ink).grow(1.0).min_w(0.0))
+                            .child(label(size, TIMER, p.faint)),
+                    );
+                }
+                from = from.child(captain_ui::quiet_note(
+                    &format!(
+                        "Delegated from {} on {}. Shared captain documents stay on the home host.",
+                        origin.captain, origin.server_label
+                    ),
+                    p,
+                ));
+                body = body
+                    .child(window_section(s, p))
+                    .child(rule_inset(p))
+                    .child(from)
+                    .child(rule_inset(p))
+                    .child(workspace_section(s, p));
+            } else {
+                body = body
+                    .child(window_section(s, p))
+                    .child(rule_inset(p))
+                    .child(attachments_section(s, p))
+                    .child(rule_inset(p))
+                    .child(workspace_section(s, p));
+            }
         }
     }
     col()
@@ -1736,12 +1864,21 @@ pub(super) fn view(s: &State, p: Palette) -> (String, El) {
         &s.right_panel().viewer
     {
         let (captain, name) = (*captain, name.clone());
+        let esc_panel = s.panel_key();
         return (
             format!("right-panel-body-captain-doc:{captain}:{name}"),
             col()
                 .min_h(0.0)
                 .w_full()
                 .h_full()
+                .on_key(move |s: &mut State, ev, _| {
+                    if ev.key == rune::Key::Escape {
+                        s.request_close_viewer(&esc_panel);
+                        true
+                    } else {
+                        false
+                    }
+                })
                 .child(doc_header(s, p, captain, &name))
                 .child(rule(p))
                 .child(

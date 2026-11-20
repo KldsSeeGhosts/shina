@@ -361,59 +361,86 @@ pub(super) fn cards_shows(s: &State) -> bool {
 /// home, mounted inside `crew_ui::needs_you` after its live request cards.
 /// `cards` returns None when nothing is open, and no report question ever counts
 /// the captain row's "Needs you" mark by itself — that comes from live requests.
-pub(super) fn cards(s: &State, p: Palette) -> Option<El> {
+pub(super) fn user_question_count(s: &State) -> usize {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return 0;
+    }
+    t.captain
+        .filter(|captain| s.captains.get(*captain).is_some())
+        .map(|captain| {
+            s.open_crew_questions(captain, QuestionRecipient::User)
+                .len()
+        })
+        .unwrap_or(0)
+}
+
+/// One paged user report question card (indexed into `open_crew_questions(captain, User)`).
+pub(super) fn user_question_card(s: &State, p: Palette, index: usize) -> Option<El> {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return None;
+    }
+    let captain = t.captain?;
+    let user = s.open_crew_questions(captain, QuestionRecipient::User);
+    let view = user.get(index)?;
+    Some(
+        col()
+            .key("needs-you-reports")
+            .role("group")
+            .label("Crew report questions")
+            .child(card(s, p, view, false)),
+    )
+}
+
+/// The collapsed captain-questions line (when crew questions are waiting on the captain).
+pub(super) fn captain_questions_line(s: &State, p: Palette) -> Option<El> {
     let t = s.current();
     if !s.is_captain_home(t) {
         return None;
     }
     let captain = t.captain?;
     let profile = s.captains.get(captain)?;
-    let user = s.open_crew_questions(captain, QuestionRecipient::User);
     let crew = s.open_crew_questions(captain, QuestionRecipient::Captain);
-    if user.is_empty() && crew.is_empty() {
+    if crew.is_empty() {
         return None;
     }
     let mut stack = col().gap(8.0);
-    for view in &user {
-        stack = stack.child(card(s, p, view, false));
-    }
-    if !crew.is_empty() {
-        let name = profile.name.clone();
-        let count = crew.len();
-        let open = s.crew_questions_captain_open;
-        stack = stack.child(
-            row()
-                .key("needs-you-captain-line")
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label(format!("{count} questions waiting on {name}"))
-                .focusable(true)
-                .center_y()
-                .gap(6.0)
-                .h(32.0)
-                .px(8.0)
-                .radius(6.0)
-                .hover(crew_ui::hover_wash(s, p))
-                .press(crew_ui::active_wash(s, p))
-                .hover_motion(crew_ui::motion(), crew_ui::motion())
-                .on_press(|s: &mut State| {
-                    s.crew_questions_captain_open = !s.crew_questions_captain_open;
-                })
-                .child(icon(if open { "chevron-up" } else { "chevron" }, p.muted))
-                .child(meta_text(
-                    format!("{count} questions waiting on {name}"),
-                    p.muted,
-                )),
-        );
-        if open {
-            for view in &crew {
-                stack = stack.child(card(s, p, view, true));
-            }
+    let name = profile.name.clone();
+    let count = crew.len();
+    let open = s.crew_questions_captain_open;
+    stack = stack.child(
+        row()
+            .key("needs-you-captain-line")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("{count} questions waiting on {name}"))
+            .focusable(true)
+            .center_y()
+            .gap(6.0)
+            .h(32.0)
+            .px(8.0)
+            .radius(6.0)
+            .hover(crew_ui::hover_wash(s, p))
+            .press(crew_ui::active_wash(s, p))
+            .hover_motion(crew_ui::motion(), crew_ui::motion())
+            .on_press(|s: &mut State| {
+                s.crew_questions_captain_open = !s.crew_questions_captain_open;
+            })
+            .child(icon(if open { "chevron-up" } else { "chevron" }, p.muted))
+            .child(meta_text(
+                format!("{count} questions waiting on {name}"),
+                p.muted,
+            )),
+    );
+    if open {
+        for view in &crew {
+            stack = stack.child(card(s, p, view, true));
         }
     }
     Some(
         stack
-            .key("needs-you-reports")
+            .key("needs-you-reports-captain")
             .role("group")
             .label("Crew report questions"),
     )
@@ -481,6 +508,10 @@ mod tests {
             let mut rt = crew_runtime(width);
             let rid = question_report(&mut rt, "user");
             rt.invalidate();
+            rt.frame(1.0);
+            // The demo has one live approval on page 0; advance the unified pager to the
+            // report question card on page 1.
+            press(&mut rt, "needs-you-next");
             rt.frame(1.0);
             for key in [
                 format!("needs-you-report-{rid}"),
@@ -612,14 +643,25 @@ mod tests {
         };
         // Context waits and keeps its question visible; Ignore never sends and
         // still keeps the question. Both carry the snapshot tag.
-        for (rid, words) in [
+        for (page, (rid, words)) in [
             (
                 &context,
                 format!("waiting to reach {}", name.to_lowercase()),
             ),
             (&ignore, format!("not sent to {}", name.to_lowercase())),
-        ] {
-            let card = element(&format!("needs-you-report-{rid}")).expect("the card stays");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Page 0 is the demo's live approval; pages 1 and 2 hold the two report cards.
+            rt.state.needs_you_page = page + 1;
+            rt.invalidate();
+            rt.frame(1.0);
+            let card = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(&format!("needs-you-report-{rid}")))
+                .expect("the card stays");
             let label = card.label.expect("the card labels itself");
             assert!(label.contains(&words), "{rid}: {label}");
             assert!(

@@ -172,7 +172,8 @@ pub use captain_policy_client::CaptainPolicyChange;
 mod captain_digest;
 #[allow(unused_imports)]
 pub(crate) use captain_state::{
-    CREW_CONTEXT_MAX_BYTES, NOTES_CONTEXT_MAX_BYTES, RULES_CONTEXT_MAX_BYTES,
+    CONTEXT_TRUNCATION, CREW_CONTEXT_MAX_BYTES, NOTES_CONTEXT_MAX_BYTES, RULES_CONTEXT_MAX_BYTES,
+    covered_bytes,
 };
 #[allow(unused_imports)]
 pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};

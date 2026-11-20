@@ -82,7 +82,11 @@ pub(super) fn document_panel_body(s: &State, p: Palette, captain: usize, name: &
     if let Some(reason) = access_reason(access) {
         body = body.child(quiet_note(reason, p).key("captain-doc-readonly"));
     }
-    if let Some(draft) = draft {
+    // Never mount or expose the primary home's live draft editor on read-only views
+    // (earlier conversations, archived/retired records, or read-only workers).
+    if access == crate::model::CaptainAccess::Full
+        && let Some(draft) = draft
+    {
         body = body.child(editor_body(s, p, &key, draft));
     } else {
         body = body.child(reading_body(s, p, captain, name, text, &captain_name));
@@ -483,7 +487,7 @@ pub(super) fn discard_dialog(s: &State, p: Palette) -> Option<El> {
         .border(1.0, p.frame)
         .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
-        .child(label(title, DIALOG_TITLE, p.ink))
+        .child(label(title, TextStyle::new(16.0, 600.0).lh(22.0), p.ink))
         .child(
             label(
                 "Your draft has not been saved.",

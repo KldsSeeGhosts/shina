@@ -1168,7 +1168,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     for dialog in captain_ui::dialogs(s, p) {
         root = root.child(dialog);
     }
-    if let Some(captain) = captain_ui::brief_captain(s) {
+    let crew_overlay_captain = captain_ui::brief_captain(s)
+        .or_else(|| s.current().crew_captain.filter(|c| *c < s.captains.len()));
+    if let Some(captain) = crew_overlay_captain {
         if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
             root = root.child(menu);
         }
@@ -14374,7 +14376,14 @@ fn context_ring(s: &State, t: &Thread, p: Palette, lane: f32) -> El {
     let warning = truncated + left_out;
     let mut a11y = t.context.accessible_label(limit);
     if let Some(count) = sources {
-        a11y.push_str(&format!(". {count} sources sent each turn"));
+        if captain_ui::home_brief_captain(s).is_some() {
+            a11y.push_str(&format!(". {count} sources sent each turn"));
+        } else {
+            a11y.push_str(&format!(
+                ". {count} attached {}",
+                if count == 1 { "file" } else { "files" }
+            ));
+        }
     }
     if truncated > 0 {
         a11y.push_str(&format!(
@@ -15584,7 +15593,7 @@ struct AboveComposerBudget {
     floor: f32,
 }
 
-fn above_composer_budget(s: &State, _cap: f32) -> AboveComposerBudget {
+fn above_composer_budget(s: &State, _cap: f32, lane: f32) -> AboveComposerBudget {
     let t = s.current();
     let mut parts = 0usize;
     let mut others_floor = 0.0f32;
@@ -15599,8 +15608,12 @@ fn above_composer_budget(s: &State, _cap: f32) -> AboveComposerBudget {
     let has_needs_you = crew_ui::needs_you_shows(s);
     if has_needs_you {
         parts += 1;
-        // One paged 52 pt request card; a typed-answer question form adds a little.
-        others_floor += if s.plan_panel_open() { 52.0 } else { 84.0 };
+        // One paged 52 pt request card, or 84 pt when wrapped under 520 pt or showing a form.
+        others_floor += if lane < 520.0 || crew_ui::needs_you_active_is_form(s) {
+            84.0
+        } else {
+            52.0
+        };
     }
     if crew_ui::crew_tray_shows(s) {
         parts += 1;
@@ -15927,7 +15940,7 @@ fn composer(
     // stack past the cap it draws collapsed (its header's count still reads), as the
     // toggle's closed state does.
     let viewport_cap = (s.viewport_height * 0.4).max(120.0);
-    let budget = above_composer_budget(s, viewport_cap);
+    let budget = above_composer_budget(s, viewport_cap, lane);
     // The stack caps at 40% of the viewport, yielding only to the minimum floors so controls
     // stay reachable on short windows.
     let cap = viewport_cap.max(budget.floor);
