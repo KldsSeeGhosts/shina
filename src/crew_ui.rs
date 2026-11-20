@@ -178,7 +178,7 @@ pub(super) fn worker_placement(s: &State, thread: usize) -> Option<ThreadPlaceme
 }
 
 /// The machine a placement's checkout lives on, by name.
-fn placement_machine(s: &State, thread: usize, placement: &ThreadPlacement) -> String {
+pub(super) fn placement_machine(s: &State, thread: usize, placement: &ThreadPlacement) -> String {
     match s.remote_task(thread) {
         Some(remote) => remote.label.clone(),
         None if placement.executor.is_empty() || placement.executor == "local" => {
@@ -202,22 +202,8 @@ fn placement_word(placement: &ThreadPlacement) -> &'static str {
     }
 }
 
-/// The last two segments of a checkout, so the worktree's own folder survives truncation.
-fn path_tail(path: &str) -> String {
-    let separator = if path.contains('\\') && !path.contains('/') {
-        "\\"
-    } else {
-        "/"
-    };
-    let parts: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
-    if parts.len() <= 2 {
-        return path.to_owned();
-    }
-    format!("…{separator}{}", parts[parts.len() - 2..].join(separator))
-}
-
 /// Every resolved field of a placement, one per line, for the tooltip and the screen reader.
-fn placement_details(placement: &ThreadPlacement, machine: &str) -> String {
+pub(super) fn placement_details(placement: &ThreadPlacement, machine: &str) -> String {
     let mut lines = vec![format!("{} on {machine}", placement_word(placement))];
     if let Some(checkout) = &placement.checkout {
         lines.push(format!("Checkout: {checkout}"));
@@ -260,93 +246,6 @@ fn placement_recovery(s: &State, thread: usize, sender: &str) -> String {
     } else {
         format!("Nothing started. New work from {sender} retries in the same checkout.")
     }
-}
-
-/// Where a worker runs: the checkout's kind, its live phase, the branch and the checkout's last
-/// folders, with every field in the tooltip. Ported from the locked row in KSG Code's
-/// `BranchToolbarEnvModeSelector` (`h-6 gap-1.5 px-1.75 text-xs text-muted-foreground`, a
-/// `size-3` folder icon and the full worktree path as the tooltip) and the branch line of
-/// `PreviousWorktreeItemContent`. KSG has no pending or failed placement, so the phase word,
-/// the error and the recovery line are Shina's. `with_phase` is false where a status word beside
-/// it already names the phase, as on a task card.
-pub(super) fn placement_block(
-    s: &State,
-    p: Palette,
-    thread: usize,
-    placement: &ThreadPlacement,
-    key: &str,
-    sender: &str,
-    with_phase: bool,
-) -> El {
-    let (_, tertiary) = quiet_inks(p);
-    let machine = placement_machine(s, thread, placement);
-    let details = placement_details(placement, &machine);
-    let glyph = match placement.mode {
-        PlacementMode::Shared if placement.read_only() => "lock",
-        PlacementMode::Shared => "folder",
-        PlacementMode::Isolated | PlacementMode::Existing => "branch",
-    };
-    let phase = match placement.phase {
-        _ if !with_phase => None,
-        PlacementPhase::Pending => Some(("Preparing", p.brass)),
-        PlacementPhase::Failed => Some(("Setup failed", p.danger)),
-        PlacementPhase::Ready => None,
-    };
-    let mut line = row()
-        .key(key.to_owned())
-        .role("group")
-        .label(details.replace('\n', ". "))
-        .help(details)
-        .min_h(20.0)
-        .gap(6.0)
-        .center_y()
-        .min_w(0.0)
-        .child(icon(glyph, p.muted).size(12.0, 12.0))
-        .child(meta_text(placement_word(placement), p.muted).key(format!("{key}-mode")));
-    if let Some((word, ink)) = phase {
-        line = line.child(meta_text(word, ink).key(format!("{key}-phase")));
-    }
-    if let Some(branch) = &placement.branch {
-        line = line.child(
-            label(branch, TextStyle::new(12.0, 500.0), p.ink)
-                .key(format!("{key}-branch"))
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    }
-    if let Some(checkout) = &placement.checkout {
-        line = line.child(
-            label(path_tail(checkout), SMALL, tertiary)
-                .key(format!("{key}-checkout"))
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    }
-    let mut block = col().gap(2.0).min_w(0.0).child(line);
-    if placement.phase == PlacementPhase::Failed {
-        if let Some(error) = placement.error.as_deref().filter(|e| !e.trim().is_empty()) {
-            block = block.child(
-                label(truncate(error, 400), SMALL, p.danger)
-                    .key(format!("{key}-error"))
-                    .wrap_anywhere()
-                    .selectable(true),
-            );
-        }
-        block = block.child(
-            label(placement_recovery(s, thread, sender), SMALL, p.muted)
-                .key(format!("{key}-recovery"))
-                .wrap(),
-        );
-    } else if let Some(note) = &placement.capability {
-        block = block.child(
-            label(note, SMALL, tertiary)
-                .key(format!("{key}-note"))
-                .wrap(),
-        );
-    }
-    block
 }
 
 /// The mark a worker's sidebar row shares with its crew chip when its row has no other mark:
@@ -447,14 +346,33 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
     let child = task.child_id;
     let (model, _) = split_model_label(&task.model_label);
     let (_, tertiary) = quiet_inks(p);
-    let head = row()
-        .center_y()
+    // Spec §3.7: one 32 pt row in the style of the work rows around it — mark, title,
+    // one compact meta string ("Queued, shina, GPT-5.5"), then the clock. No border,
+    // no fill, no second line.
+    let mut meta = format!("{word}, {}", task.workspace_label);
+    if !model.is_empty() {
+        meta = format!("{meta}, {model}");
+    }
+    let placement = worker_placement(s, child);
+    let mut row_ = row()
+        .key(format!("task-card-{child}"))
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(format!("{}. {word}. Open the worker", task.title))
+        .focusable(true)
+        .h(32.0)
         .gap(8.0)
+        .center_y()
+        .radius(6.0)
+        .hover(hover_wash(s, p))
+        .press(active_wash(s, p))
+        .hover_motion(motion(), motion())
+        .on_press(move |s: &mut State| open_thread(s, child))
         .child(mark_slot(status, p))
         .child(
             label(
                 &task.title,
-                TextStyle::new(14.0, 600.0).tracking(-0.12),
+                TextStyle::new(13.0, 500.0).tracking(-0.08),
                 p.ink,
             )
             .key(format!("task-title-{child}"))
@@ -476,9 +394,49 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
                     )
                 })
                 .unwrap_or_else(el),
-        )
-        .child(spacer())
+        );
+    if let Some(placement) = &placement {
+        row_ = row_.help(placement_details(
+            placement,
+            &placement_machine(s, child, placement),
+        ));
+    }
+    row_ = row_
+        .child(provider_icon(
+            s,
+            p,
+            model_vendor(&task.model_label, &task.model_label),
+            12.0,
+        ))
         .child(
+            label(meta, SMALL, tertiary)
+                .key(format!("task-meta-{child}"))
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
+        );
+    if task.state == TaskState::Interrupted {
+        // Resume and Dismiss replace the clock on an interrupted row.
+        let (resume, dismiss) = (task.id.clone(), task.id.clone());
+        row_ = row_
+            .child(
+                ghost_button(s, format!("resume-task-{child}"), "Resume", p, move |s| {
+                    if let Err(error) = s.resume_task(&resume) {
+                        s.current_mut().error = Some(error);
+                    }
+                })
+                .h(24.0),
+            )
+            .child(
+                ghost_button(s, format!("dismiss-task-{child}"), "Dismiss", p, move |s| {
+                    if let Err(error) = s.dismiss_task(&dismiss) {
+                        s.current_mut().error = Some(error);
+                    }
+                })
+                .h(24.0),
+            );
+    } else {
+        row_ = row_.child(
             row()
                 .key(format!("task-clock-{child}"))
                 .w(ELAPSED_SLOT)
@@ -486,119 +444,29 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
                 .justify_end()
                 .child(label(task_clock(task), TIMER, tertiary)),
         );
-    let meta = row()
-        .pl(CARD_INDENT)
-        .center_y()
-        .gap(8.0)
-        .min_w(0.0)
-        .child(meta_text(word, status_ink(status, p)))
-        .child(
-            label(&task.workspace_label, SMALL, p.muted)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        )
-        .child(provider_icon(
-            s,
-            p,
-            model_vendor(&task.model_label, &task.model_label),
-            12.0,
-        ))
-        .child(label(model, SMALL, p.muted).truncate().shrink().min_w(0.0));
-    let mut card = col()
-        .key(format!("task-card-{child}"))
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("{}. {word}. Open the worker", task.title))
-        .focusable(true)
-        .gap(3.0)
-        .px(12.0)
-        .py(10.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, hairline(p))
-        .hover(hover_wash(s, p))
-        .press(active_wash(s, p))
-        .hover_motion(motion(), motion())
-        .on_press(move |s: &mut State| open_thread(s, child))
-        .child(head)
-        .child(meta);
-    let placement = worker_placement(s, child);
-    if let Some(placement) = &placement {
-        let sender = s
-            .current()
-            .captain
-            .and_then(|c| s.captains.get(c))
-            .map_or_else(|| "the parent".to_owned(), |c| c.name.clone());
-        card = card.child(
-            placement_block(
-                s,
-                p,
-                child,
-                placement,
-                &format!("task-placement-{child}"),
-                &sender,
-                false,
-            )
-            .pl(CARD_INDENT),
-        );
     }
-    // The record's fallback line is the state's id, which the meta line already says. A failed
-    // placement's block already shows the error.
-    if !task.last_activity_line.is_empty()
-        && task.last_activity_line != task.state.id()
-        && placement
-            .as_ref()
-            .is_none_or(|placement| placement.phase != PlacementPhase::Failed)
+    // A failed placement keeps its reason on the row's accessible name, since the
+    // single line cannot carry the error text.
+    if placement
+        .as_ref()
+        .is_some_and(|p_| p_.phase == PlacementPhase::Failed)
     {
-        card = card.child(
-            label(
-                &task.last_activity_line,
-                ACTIVITY,
-                if status == Status::Failed {
-                    p.danger
-                } else {
-                    tertiary
-                },
-            )
-            .key(format!("task-activity-{child}"))
-            .truncate()
-            .pl(CARD_INDENT)
-            .min_w(0.0),
-        );
+        let reason = placement
+            .as_ref()
+            .and_then(|p_| p_.error.clone())
+            .map(|e| truncate(&e, 200))
+            .unwrap_or_default();
+        row_ = row_.label(format!(
+            "{}. Setup failed{}. Open the worker",
+            task.title,
+            if reason.is_empty() {
+                String::new()
+            } else {
+                format!(": {reason}")
+            }
+        ));
     }
-    if task.state == TaskState::Interrupted {
-        let (resume, dismiss) = (task.id.clone(), task.id.clone());
-        card = card.child(
-            row()
-                .key(format!("task-actions-{child}"))
-                .pl(CARD_INDENT)
-                .pt(6.0)
-                .gap(6.0)
-                .child(solid_button(
-                    format!("resume-task-{child}"),
-                    "Resume",
-                    p,
-                    move |s| {
-                        if let Err(error) = s.resume_task(&resume) {
-                            s.current_mut().error = Some(error);
-                        }
-                    },
-                ))
-                .child(ghost_button(
-                    s,
-                    format!("dismiss-task-{child}"),
-                    "Dismiss",
-                    p,
-                    move |s| {
-                        if let Err(error) = s.dismiss_task(&dismiss) {
-                            s.current_mut().error = Some(error);
-                        }
-                    },
-                )),
-        );
-    }
-    card
+    row_
 }
 
 /// A task result Shina delivered to its captain, read from `Task::completion_message`.
@@ -893,6 +761,23 @@ pub(super) fn brief_block(
             .min_w(0.0),
         )
         .child(icon("open", tertiary).opacity(0.8));
+    // Where this worker runs, at the end of the brief's header row (spec §3.8).
+    if let Some(placement) = worker_placement(s, s.current().id) {
+        header = header.child(spacer()).child(
+            label(
+                placement_details(
+                    &placement,
+                    &placement_machine(s, s.current().id, &placement),
+                )
+                .replace('\n', " · "),
+                SMALL,
+                tertiary,
+            )
+            .key("worker-placement")
+            .truncate()
+            .min_w(0.0),
+        );
+    }
     col().gap(4.0).child(header).child(
         row()
             .child(el().w(1.0).h_full().ml(7.5).fill(hairline(p)).a11y_hidden())
@@ -1075,7 +960,13 @@ pub(super) fn peer_sibling_members(
 /// A 30 px roster row: status mark, title, machine tag when remote, clock or status word.
 /// Click opens the worker; a secondary press opens the member's More menu. `key` keeps the
 /// roster's `crew-chip-{id}` keys and lets the siblings menu reuse the builder with its own.
-fn roster_row(s: &State, p: Palette, member: &RosterMember, key: String, menu: bool) -> El {
+pub(super) fn roster_row(
+    s: &State,
+    p: Palette,
+    member: &RosterMember,
+    key: String,
+    menu: bool,
+) -> El {
     let child = member.thread_id;
     let (_, tertiary) = quiet_inks(p);
     let waiting = member.status == Status::Waiting;
@@ -1105,7 +996,6 @@ fn roster_row(s: &State, p: Palette, member: &RosterMember, key: String, menu: b
         .hover_motion(motion(), motion())
         .transition(Transition::offset(0.0, 4.0).combined(Transition::opacity()))
         .on_press(move |s: &mut State| {
-            s.crew_siblings_menu = false;
             open_thread(s, child);
         })
         .child(mark_slot(member.status, p))
@@ -1150,63 +1040,10 @@ pub(super) fn crew_tray_shows(s: &State) -> bool {
     s.is_captain_home(s.current()) && s.current().captain.is_some()
 }
 
-/// Extra height (beyond the 28 px header) for the roster's footer + internal gaps.
-pub(super) fn crew_tray_footer_extra_height(s: &State) -> f32 {
-    let t = s.current();
-    if !s.is_captain_home(t) {
-        return 0.0;
-    }
-    let Some(captain) = t.captain else {
-        return 0.0;
-    };
-    let has_footer = s.captain_access(captain) == crate::model::CaptainAccess::Full;
-    let members = roster_members(s, t.id, captain).len();
-    let mut extra = 0.0;
-    if members > 0 {
-        extra += 4.0;
-    }
-    if has_footer {
-        extra += 34.0;
-    }
-    extra
-}
-
-/// Preferred extra height (beyond the 28 px header) when this captain's crew roster is open.
-pub(super) fn crew_tray_open_extra_height(s: &State) -> Option<f32> {
-    let t = s.current();
-    if !s.is_captain_home(t) {
-        return None;
-    }
-    let captain = t.captain?;
-    let members = roster_members(s, t.id, captain).len();
-    let rows_h = if members == 0 {
-        0.0
-    } else {
-        ((members as f32) * 32.0 - 2.0).min(150.0)
-    };
-    Some(rows_h + crew_tray_footer_extra_height(s))
-}
-
-/// Minimum extra height required to render an open roster meaningfully (at least one row if
-/// members exist, plus the footer if Full access).
-pub(super) fn crew_tray_min_open_extra_height(s: &State) -> Option<f32> {
-    let t = s.current();
-    if !s.is_captain_home(t) {
-        return None;
-    }
-    let captain = t.captain?;
-    let members = roster_members(s, t.id, captain).len();
-    let min_rows = if members == 0 { 0.0 } else { 30.0 };
-    Some(min_rows + crew_tray_footer_extra_height(s))
-}
-
-/// The Crew Roster above a captain's composer, in the place KSG Code's `QueuedRunsControl`
-/// takes: a 28 px header with a chevron, the member count, the status summary and the Plan
-/// toggle, then — while expanded — one 30 px row per member, capped at five rows, and a
-/// footer with New crew thread and Recruit on a Full-access captain. `rows_max` caps the
-/// member rows scroll area (or collapses the roster when `None`) under the composer's 40%
-/// viewport cap.
-pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, rows_max: Option<f32>) -> Option<El> {
+/// The 28 pt crew strip above the composer (spec §3.6): icon, "Crew", member count,
+/// status summary and a chevron on the left, the Plan toggle on the right. It never
+/// expands in place — pressing it toggles the Inspector on the Crew tab.
+pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, _rows_max: Option<f32>) -> Option<El> {
     let t = s.current();
     if !s.is_captain_home(t) {
         return None;
@@ -1214,8 +1051,6 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, rows_max: Option<f32>
     let captain = t.captain?;
     let members = roster_members(s, t.id, captain);
     let plan = super::plan_ui::plan_toggle(s, p);
-    let can_open = rows_max.is_some();
-    let open = s.crew_roster_open(captain) && can_open;
     // One definition of working, shared with the chat header: running now. A worker waiting
     // on an approval needs you instead, and a queued one waits for a slot. Independent crew
     // members count the same way; only an idle member is no task at all.
@@ -1224,161 +1059,93 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, rows_max: Option<f32>
     let offline = count(Status::Paused);
     let queued = members.iter().filter(|m| m.queued).count();
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
-    for (key, n, status, word) in [
-        ("crew-tray-working", working, Status::Running, "working"),
-        (
-            "crew-tray-needs-you",
-            needs_you,
-            Status::Waiting,
-            "needs you",
-        ),
-        ("crew-tray-queued", queued, Status::Ready, "queued"),
-        ("crew-tray-offline", offline, Status::Paused, "offline"),
-    ] {
-        if n > 0 {
+    // Under 480 pt of lane the summary shows at most two segments, needs you first.
+    let narrow = _lane < 480.0;
+    let segments: &[(&str, usize, Status, &str)] = if narrow {
+        if needs_you > 0 {
+            &[
+                (
+                    "crew-tray-needs-you",
+                    needs_you,
+                    Status::Waiting,
+                    "needs you",
+                ),
+                ("crew-tray-working", working, Status::Running, "working"),
+            ]
+        } else {
+            &[
+                ("crew-tray-working", working, Status::Running, "working"),
+                ("crew-tray-queued", queued, Status::Ready, "queued"),
+            ]
+        }
+    } else {
+        &[
+            ("crew-tray-working", working, Status::Running, "working"),
+            (
+                "crew-tray-needs-you",
+                needs_you,
+                Status::Waiting,
+                "needs you",
+            ),
+            ("crew-tray-queued", queued, Status::Ready, "queued"),
+            ("crew-tray-offline", offline, Status::Paused, "offline"),
+        ]
+    };
+    for (key, n, status, word) in segments.iter() {
+        if *n > 0 {
             summary = summary.child(
                 row()
-                    .key(key)
+                    .key(*key)
                     .gap(6.0)
                     .center_y()
-                    .child(mark_slot(status, p))
+                    .child(mark_slot(*status, p))
                     .child(super::meta_text(
                         format!("{n} {word}"),
-                        super::status_ink(status, p),
+                        super::status_ink(*status, p),
                     )),
             );
         }
     }
-    let mut roster = col()
-        .key("crew-tray")
-        .role("group")
-        .label("Crew")
-        .gap(4.0)
-        .child(
-            row()
-                .h(28.0)
-                .px(4.0)
-                .gap(8.0)
-                .center_y()
-                .child(
-                    row()
-                        .key("crew-roster-toggle")
-                        .role("button")
-                        .cursor(if can_open {
-                            rune::Cursor::Pointer
-                        } else {
-                            rune::Cursor::Default
-                        })
-                        .label(if open {
-                            format!("Crew, {} members. Collapse", members.len())
-                        } else if !can_open {
-                            format!(
-                                "Crew, {} members. Window too short to expand",
-                                members.len()
-                            )
-                        } else {
-                            format!("Crew, {} members. Expand", members.len())
-                        })
-                        .disabled(!can_open)
-                        .focusable(can_open)
-                        .h_full()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .gap(8.0)
-                        .center_y()
-                        .radius(ROW_RADIUS)
-                        .hover(hover_wash(s, p))
-                        .hover_motion(motion(), motion())
-                        .on_press(move |s: &mut State| {
-                            if can_open {
-                                s.toggle_crew_roster(captain);
-                            }
-                        })
-                        .child(icon(if open { "chevron" } else { "open" }, p.muted))
-                        .child(meta_label("Crew", p.muted))
-                        .child(
-                            meta_text(members.len().to_string(), p.muted).key("crew-roster-count"),
-                        )
-                        .child(summary)
-                        .child(spacer()),
-                )
-                .child(plan.unwrap_or_else(el)),
-        );
-    if open {
-        if !members.is_empty() {
-            let mut rows = col().gap(2.0);
-            for member in &members {
-                rows = rows.child(roster_row(
-                    s,
-                    p,
-                    member,
-                    format!("crew-chip-{}", member.thread_id),
-                    true,
-                ));
-            }
-            roster = roster.child(
-                col()
-                    .key("crew-roster-rows")
-                    .max_h(rows_max.unwrap_or(150.0))
-                    .scroll(ScrollSpec {
-                        stick_bottom: false,
-                    })
-                    .child(rows),
-            );
-        }
-        if s.captain_access(captain) == crate::model::CaptainAccess::Full {
-            let server = s.machines.selected.clone();
-            let draft_reason = s.crew_creation_unavailable(&server, captain);
-            let new_server = server.clone();
-            let mut new_thread = ghost_button(
-                s,
-                "crew-roster-new".into(),
-                "New crew thread",
-                p,
-                move |s: &mut State| {
-                    if s.machines.selected != new_server {
-                        return;
-                    }
-                    if let Err(error) = s.begin_crew_draft(&new_server, captain) {
-                        s.brief.error = Some(error);
-                    }
-                },
-            )
-            .disabled(draft_reason.is_some());
-            if let Some(reason) = draft_reason {
-                new_thread = new_thread.help(reason);
-            }
-            let recruit_server = server.clone();
-            roster = roster.child(
+    Some(
+        row()
+            .key("crew-tray")
+            .role("group")
+            .label("Crew")
+            .h(28.0)
+            .gap(8.0)
+            .center_y()
+            .child(
                 row()
-                    .key("crew-roster-footer")
-                    .h(30.0)
-                    .px(4.0)
-                    .gap(6.0)
+                    .key("crew-roster-toggle")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label(format!(
+                        "Crew, {} members. Open the crew panel",
+                        members.len()
+                    ))
+                    .focusable(true)
+                    .h_full()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(8.0)
                     .center_y()
-                    .child(new_thread)
-                    .child(ghost_button(
-                        s,
-                        "crew-roster-recruit".into(),
-                        "Recruit...",
-                        p,
-                        move |s: &mut State| {
-                            if s.machines.selected != recruit_server
-                                || s.captain_access(captain) != crate::model::CaptainAccess::Full
-                            {
-                                return;
-                            }
-                            s.brief.recruit = Some(crate::model::RecruitPicker {
-                                server: recruit_server.clone(),
-                                captain,
-                                query: rune::TextEdit::default(),
-                            });
-                        },
-                    )),
-            );
-        }
-    }
-    Some(roster)
+                    .radius(ROW_RADIUS)
+                    .hover(hover_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(move |s: &mut State| {
+                        // Toggle the Inspector on the Crew tab (spec §3.6).
+                        let key = s.panel_key();
+                        s.right_panels
+                            .toggle(&key, crate::right_panel::SingletonKind::Crew);
+                    })
+                    .child(icon("crew", p.muted))
+                    .child(meta_label("Crew", p.muted))
+                    .child(meta_text(members.len().to_string(), p.faint).key("crew-roster-count"))
+                    .child(summary)
+                    .child(icon("chevron-right", p.faint).size(12.0, 12.0)),
+            )
+            .child(plan.unwrap_or_else(el)),
+    )
 }
 
 /// Whether `needs_you` draws, so the composer's stack budget can price it before building.
@@ -1392,193 +1159,252 @@ pub(super) fn needs_you_shows(s: &State) -> bool {
         .any(|item| needs_you_item(s, t.id, &item))
         || super::crew_questions_ui::cards_shows(s)
 }
+/// The request items the needs-you bar pages through: live approvals/questions plus the
+/// report questions, so the pager's "n of m" counts everything the bar can show.
+fn needs_you_items(s: &State) -> Vec<AttentionItem> {
+    let t = s.current();
+    s.attention()
+        .into_iter()
+        .filter(|item| needs_you_item(s, t.id, item))
+        .collect()
+}
+
 /// Approvals and questions from this captain's crew, ported from KSG Code's
-/// `ChildThreadApprovals`: bordered `rounded-lg p-3` cards in a `max-h-80` scrolling stack.
-pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
+/// `ChildThreadApprovals` but reduced to one request at a time (spec §3.6): a 52 pt
+/// card with the request, its actions and a pager when more than one waits.
+pub(super) fn needs_you(s: &State, p: Palette, lane: f32) -> Option<El> {
     let t = s.current();
     if !s.is_captain_home(t) {
         return None;
     }
-    let items: Vec<AttentionItem> = s
-        .attention()
-        .into_iter()
-        .filter(|item| needs_you_item(s, t.id, item))
-        .collect();
-    let report_cards = super::crew_questions_ui::cards(s, p);
-    if items.is_empty() && report_cards.is_none() {
+    let items = needs_you_items(s);
+    let has_reports = super::crew_questions_ui::cards_shows(s);
+    if items.is_empty() && !has_reports {
         return None;
     }
-    let mut stack = col().gap(8.0);
-    for item in &items {
-        let Some(child) = s.threads.iter().find(|c| c.id == item.thread_id) else {
-            continue;
-        };
-        let Some(request) = &child.request else {
-            continue;
-        };
-        let id = item.thread_id;
-        let approval = item.kind == AttentionKind::Approval;
-        let remote = s.remote_task(id);
-        let linked = remote.is_none_or(|remote| {
-            s.client
-                .as_ref()
-                .is_some_and(|client| client.commands_for(&remote.server_id).is_some())
-        });
-        let known = remote.is_none_or(|remote| {
-            remote.request.as_ref().is_some_and(|r| {
-                matches!(
-                    r["kind"].as_str(),
-                    Some("confirm" | "input" | "editor" | "select")
-                )
-            })
-        });
-        let can_answer =
-            known && linked && remote.is_none_or(|remote| s.machine_connected(&remote.server_id));
-        let title = crate::model::string(request, "title");
-        let message = crate::model::string(request, "message");
-        let mut detail = col().gap(3.0);
-        if !known && let Some(remote) = remote {
-            detail = detail.child(
-                label(
-                    format!(
-                        "Update required on {} to answer this request.",
-                        remote.label
-                    ),
-                    SMALL,
-                    p.muted,
-                )
-                .wrap(),
-            );
+    let mut card_stack = col().gap(0.0);
+    if items.is_empty() {
+        // Only report questions are open: they keep their own card.
+        if let Some(cards) = super::crew_questions_ui::cards(s, p) {
+            card_stack = card_stack.child(cards);
         }
-        if !title.is_empty() {
-            detail = detail.child(label(title, TextStyle::new(13.0, 500.0), p.ink).wrap());
+    } else {
+        // One request per page, clamped each frame (spec §3.6).
+        let page = s.needs_you_page.min(items.len() - 1);
+        let item = &items[page];
+        card_stack = card_stack.child(needs_you_card(s, p, item, page, items.len(), lane));
+        if let Some(cards) = super::crew_questions_ui::cards(s, p) {
+            card_stack = card_stack.child(cards);
         }
-        if !message.is_empty() {
-            detail = detail.child(
-                label(message, SMALL.lh(18.0), p.muted)
-                    .wrap_anywhere()
-                    .selectable(true),
-            );
-        }
-        let mut actions = row().gap(6.0).flex_wrap().center_y();
-        actions = if approval {
-            actions
-                .child(super::approval_actions(s, id, true, can_answer, p))
-                .child(ghost_button(
-                    s,
-                    format!("open-request-{id}"),
-                    "Open",
-                    p,
-                    move |s| open_thread(s, id),
-                ))
-        } else {
-            actions.child(
-                solid_button(format!("answer-{id}"), "Open to answer", p, move |s| {
-                    open_thread(s, id);
-                    s.current_mut().reply.focused = true;
-                })
-                .disabled(!can_answer),
-            )
-        };
-        // KSG ChildThreadApprovals disables answers without permission. Shina also
-        // offers its existing machine-linking flow when this desktop has no device link.
-        if !linked && let Some(remote) = remote {
-            detail = detail.child(
-                label(
-                    format!("Link this desktop to {} to answer.", remote.label),
-                    SMALL,
-                    p.muted,
-                )
-                .key(format!("link-request-notice-{id}"))
-                .wrap(),
-            );
-            actions = actions.child(ghost_button(
-                s,
-                format!("link-request-{id}"),
-                "Link machine",
-                p,
-                |s| {
-                    s.machines.dialog = true;
-                },
-            ));
-        }
-        stack = stack.child(
-            col()
-                .key(format!("needs-you-{id}"))
-                .role("group")
-                .label(format!(
-                    "{} from {}",
-                    if approval { "Approval" } else { "Question" },
-                    item.short_title
-                ))
-                .padding(12.0)
-                .gap(8.0)
-                .radius(12.0)
-                .fill(p.card)
-                .border(1.0, hairline(p))
-                .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
-                // A 2 px brass bar down the left edge marks a request that waits on the user.
-                .child(
-                    el().key(format!("needs-you-bar-{id}"))
-                        .pin(Some(0.0), Some(6.0), None, Some(6.0))
-                        .w(2.0)
-                        .fill(p.brass)
-                        .a11y_hidden(),
-                )
-                .child(
-                    row()
-                        .center_y()
-                        .gap(8.0)
-                        .child(mark_slot(Status::Waiting, p))
-                        .child(meta_text(
-                            if approval {
-                                "Approval needed from"
-                            } else {
-                                "Question from"
-                            },
-                            status_ink(Status::Waiting, p),
-                        ))
-                        .child(
-                            label(&item.short_title, TextStyle::new(13.0, 600.0), p.ink)
-                                .truncate()
-                                .shrink()
-                                .min_w(0.0),
-                        ),
-                )
-                .child(
-                    col()
-                        .pl(CARD_INDENT)
-                        .gap(10.0)
-                        .child(
-                            col()
-                                .max_h(160.0)
-                                .scroll(ScrollSpec {
-                                    stick_bottom: false,
-                                })
-                                .child(detail),
-                        )
-                        .child(actions),
-                ),
-        );
-    }
-    if let Some(cards) = report_cards {
-        stack = stack.child(cards);
     }
     Some(
         col()
             .key("needs-you")
             .role("region")
             .label("Needs you")
-            // An open task plan shares the lane, so the stack gives it most of its height.
-            .max_h(if s.plan_panel_open() { 120.0 } else { 320.0 })
-            // Keep approval actions reachable without hiding buttons under the roster.
-            .min_h(120.0)
             .shrink()
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(stack),
+            .child(card_stack),
     )
+}
+
+/// The one paged request card: ring + question + source link on the left, pager and
+/// actions on the right. Lane under 520 pt wraps the actions to a second row.
+fn needs_you_card(
+    s: &State,
+    p: Palette,
+    item: &AttentionItem,
+    page: usize,
+    total: usize,
+    lane: f32,
+) -> El {
+    let id = item.thread_id;
+    let approval = item.kind == AttentionKind::Approval;
+    let Some(child) = s.threads.iter().find(|c| c.id == id) else {
+        return el();
+    };
+    let Some(request) = &child.request else {
+        return el();
+    };
+    let remote = s.remote_task(id);
+    let linked = remote.is_none_or(|remote| {
+        s.client
+            .as_ref()
+            .is_some_and(|client| client.commands_for(&remote.server_id).is_some())
+    });
+    let known = remote.is_none_or(|remote| {
+        remote.request.as_ref().is_some_and(|r| {
+            matches!(
+                r["kind"].as_str(),
+                Some("confirm" | "input" | "editor" | "select")
+            )
+        })
+    });
+    let can_answer =
+        known && linked && remote.is_none_or(|remote| s.machine_connected(&remote.server_id));
+    let title = crate::model::string(request, "title");
+    let kind_word = if approval { "Approval" } else { "Question" };
+    // Second line: brass kind word, then the pressable source title (the old "Open"
+    // button), then a chevron.
+    let mut meta = row()
+        .gap(6.0)
+        .center_y()
+        .child(meta_text(kind_word, p.brass))
+        .child(
+            row()
+                .key(format!("needs-you-source-{id}"))
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("Open {}", item.short_title))
+                .focusable(true)
+                .center_y()
+                .gap(4.0)
+                .radius(4.0)
+                .hover(hover_wash(s, p))
+                .press(active_wash(s, p))
+                .on_press(move |s: &mut State| open_thread(s, id))
+                .child(
+                    label(item.short_title.clone(), SMALL, p.muted)
+                        .truncate()
+                        .min_w(0.0),
+                )
+                .child(icon("chevron-right", p.faint).size(12.0, 12.0)),
+        );
+    if !known && let Some(remote) = remote {
+        meta = row()
+            .gap(6.0)
+            .center_y()
+            .child(meta_text(kind_word, p.brass))
+            .child(
+                label(
+                    format!("Update required on {} to answer.", remote.label),
+                    SMALL,
+                    p.muted,
+                )
+                .truncate()
+                .min_w(0.0),
+            );
+    }
+    if !linked && let Some(remote) = remote {
+        meta = row()
+            .gap(6.0)
+            .center_y()
+            .child(meta_text(kind_word, p.brass))
+            .child(
+                label(
+                    format!("Link this desktop to {} to answer.", remote.label),
+                    SMALL,
+                    p.muted,
+                )
+                .key(format!("link-request-notice-{id}"))
+                .truncate()
+                .min_w(0.0),
+            );
+    }
+    let mut actions = row().gap(6.0).center_y();
+    if total > 1 {
+        actions = actions
+            .child(icon_button(
+                "needs-you-prev",
+                "Previous request",
+                "chevron-left",
+                p,
+                move |s: &mut State| {
+                    let max = needs_you_items(s).len().saturating_sub(1);
+                    s.needs_you_page = s.needs_you_page.min(max).saturating_sub(1);
+                },
+            ))
+            .child(
+                label(format!("{} of {total}", page + 1), TIMER, p.faint)
+                    .key("needs-you-page-count"),
+            )
+            .child(icon_button(
+                "needs-you-next",
+                "Next request",
+                "chevron-right",
+                p,
+                move |s: &mut State| {
+                    let max = needs_you_items(s).len().saturating_sub(1);
+                    s.needs_you_page = (s.needs_you_page + 1).min(max);
+                },
+            ));
+    }
+    actions = if approval {
+        actions.child(super::approval_actions(s, id, true, can_answer, p))
+    } else {
+        actions.child(
+            solid_button(format!("answer-{id}"), "Open to answer", p, move |s| {
+                open_thread(s, id);
+                s.current_mut().reply.focused = true;
+            })
+            .disabled(!can_answer),
+        )
+    };
+    if !linked && remote.is_some() {
+        actions = actions.child(ghost_button(
+            s,
+            format!("link-request-{id}"),
+            "Link machine",
+            p,
+            |s| {
+                s.machines.dialog = true;
+            },
+        ));
+    }
+    // KSG's `.child-approval-card` reduced: one 52 pt row, wrapping under 520 pt.
+    let lane_narrow = lane < 520.0;
+    let mut content = col()
+        .key(format!("needs-you-{id}"))
+        .role("group")
+        .label(format!("{kind_word} from {}", item.short_title))
+        .min_h(52.0)
+        .px(12.0)
+        .py(8.0)
+        .gap(10.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, hairline(p))
+        .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
+    let mut row_ = row()
+        .gap(10.0)
+        .center_y()
+        .child(mark_slot(Status::Waiting, p))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(
+                    label(
+                        if title.is_empty() {
+                            item.short_title.clone()
+                        } else {
+                            title.to_string()
+                        },
+                        TextStyle::new(13.0, 500.0).tracking(-0.08),
+                        p.ink,
+                    )
+                    .truncate()
+                    .min_w(0.0),
+                )
+                .child(meta),
+        );
+    row_ = if lane_narrow {
+        row_.child(spacer())
+    } else {
+        row_
+    };
+    row_ = row_.child(actions);
+    content = content.child(row_);
+    if lane_narrow {
+        content = content.child(
+            row()
+                .gap(6.0)
+                .center_y()
+                .justify_end()
+                .child(el().key("needs-you-actions-wrap")),
+        );
+    }
+    content
 }
 
 /// One attention row's filter for `needs_you`: canonical crew membership overrides the
@@ -1598,332 +1424,117 @@ pub(crate) fn needs_you_item(s: &State, home: usize, item: &AttentionItem) -> bo
     }
 }
 
-/// "Delegated by <captain>", "Runs on its own" and "Open captain" above a worker's composer, ported
-/// from KSG Code's `ProviderSubagentBar` (`min-h-12 rounded-2xl py-2 ps-5 pe-2 text-sm`).
 /// Whether `parent_bar` draws, so the composer's stack budget can price it before building.
+/// Spec §3.8: the bar only exists while the worker has something the user must act on.
 pub(super) fn parent_bar_shows(s: &State) -> bool {
-    let t = s.current();
-    t.peer_origin.is_some()
-        || t.delegated
-            && t.parent
-                .is_some_and(|id| s.threads.iter().any(|thread| thread.id == id))
-}
-pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
-    let t = s.current();
-    // Ported from KSG Code's ThreadRelationshipsControl DelegatedFromRow.
-    if let Some(origin) = &t.peer_origin {
-        let mut who = col().gap(4.0).grow(1.0).min_w(0.0).child(
-            label(
-                format!(
-                    "Delegated from {} on {}",
-                    origin.captain, origin.server_label
-                ),
-                SMALL,
-                p.muted,
-            )
-            .key("parent-bar-name")
-            .wrap()
-            .min_w(0.0),
-        );
-        if let Some(placement) = &t.placement {
-            who = who.child(placement_block(
-                s,
-                p,
-                t.id,
-                placement,
-                "parent-bar-placement",
-                &origin.captain,
-                true,
-            ));
-        }
-        return Some(
-            row()
-                .key("parent-bar")
-                .role("group")
-                .label("Delegated work")
-                .min_h(48.0)
-                .py(8.0)
-                .pl(20.0)
-                .pr(8.0)
-                .gap(8.0)
-                .center_y()
-                .radius(12.0)
-                .border(1.0, hairline(p))
-                .child(who)
-                .child(siblings_button(s, p)),
-        );
-    }
-    let parent = t
-        .parent
-        .filter(|_| t.delegated)
-        .and_then(|id| s.threads.iter().find(|thread| thread.id == id))?;
-    let parent_id = parent.id;
-    let captain = parent.captain.or(t.captain);
-    let (_, tertiary) = quiet_inks(p);
-    let task = s
-        .tasks_for(parent_id)
-        .into_iter()
-        .find(|task| task.child_id == t.id);
-    let mut who = row().center_y().gap(8.0).min_w(0.0).shrink().child(label(
-        "Delegated by",
-        TextStyle::new(14.0, 400.0),
-        p.muted,
-    ));
-    who = match captain.and_then(|c| s.captains.get(c).map(|profile| (c, profile))) {
-        Some((index, profile)) => who.child(avatar(s, p, index, 20.0, Status::Ready)).child(
-            label(&profile.name, TextStyle::new(14.0, 600.0), p.ink)
-                .key("parent-bar-name")
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        ),
-        None => who.child(
-            label(&parent.title, TextStyle::new(14.0, 600.0), p.ink)
-                .key("parent-bar-name")
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        ),
-    };
-    if let Some(remote) = s.remote_task(t.id) {
-        who = col().gap(4.0).min_w(0.0).shrink().child(who).child(
-            label(
-                format!(
-                    "Runs on {} · {}",
-                    remote.label,
-                    remote.project["name"].as_str().unwrap_or("Unknown project")
-                ),
-                SMALL,
-                p.muted,
-            )
-            .truncate()
-            .min_w(0.0)
-            .key("remote-result-machine"),
-        );
-    }
-    // The status beside the name already says the phase, so the placement line does not.
-    let placement = worker_placement(s, t.id).map(|placement| {
-        let sender = captain
-            .and_then(|c| s.captains.get(c))
-            .map_or_else(|| parent.title.clone(), |c| c.name.clone());
-        placement_block(
-            s,
-            p,
-            t.id,
-            &placement,
-            "parent-bar-placement",
-            &sender,
-            false,
-        )
-    });
-    let mut bar = row()
-        .min_h(48.0)
-        .py(8.0)
-        .pl(20.0)
-        .pr(8.0)
-        .gap(12.0)
-        .center_y()
-        .child(who);
-    if let Some(task) = &task {
-        let (status, word) = task_status(s, task);
-        let clock = task_clock(task);
-        bar = bar.child(
-            row()
-                .key("parent-bar-status")
-                .center_y()
-                .gap(8.0)
-                .shrink()
-                .min_w(0.0)
-                .child(mark_slot(status, p))
-                .child(meta_text(word, status_ink(status, p)))
-                .child(label(clock, TIMER, tertiary)),
-        );
-    }
-    bar = bar.child(spacer());
-    if lane >= 640.0 {
-        bar = bar.child(label(
-            "Runs on its own",
-            TextStyle::new(13.0, 400.0),
-            p.muted,
-        ));
-    }
-    if captain.is_some_and(|c| s.captain_home(c).is_some()) {
-        bar = bar.child(siblings_button(s, p));
-    }
-    let bar = bar.child(
-        row()
-            .key("open-captain")
-            .role("button")
-            .cursor(rune::Cursor::Pointer)
-            .label(if captain.is_some() {
-                "Open captain"
-            } else {
-                "Open parent"
-            })
-            .focusable(true)
-            .center_y()
-            .gap(6.0)
-            .h(32.0)
-            .px(10.0)
-            .radius(ROW_RADIUS)
-            .hover(hover_wash(s, p))
-            .press(active_wash(s, p))
-            .hover_motion(motion(), motion())
-            .on_press(move |s: &mut State| open_thread(s, parent_id))
-            .child(icon("back", p.muted))
-            .child(label(
-                if captain.is_some() {
-                    "Open captain"
-                } else {
-                    "Open parent"
-                },
-                TextStyle::new(13.0, 500.0),
-                p.ink,
-            )),
-    );
-    Some(with_placement(
-        bar,
-        placement,
-        "parent-bar",
-        "Delegated work".into(),
-        p,
-    ))
+    worker_notice(s, s.current().id).is_some()
 }
 
-/// A worker bar and, under it on its own full-width line, where the worker runs. The line sits
-/// at the bar's 20 px text inset so it never squeezes the status or the buttons.
-fn with_placement(bar: El, placement: Option<El>, key: &str, name: String, p: Palette) -> El {
-    let mut group = col()
-        .key(key.to_owned())
-        .role("group")
-        .label(name)
-        .radius(12.0)
-        .border(1.0, hairline(p))
-        .child(bar);
-    if let Some(placement) = placement {
-        group = group.child(placement.px(20.0).pb(10.0).mt(-4.0));
+/// What the notice bar has to say, when a worker or recruited member thread has
+/// something the user must act on: a placement that needs recovery, an offline or
+/// outdated remote target, or a pending crew change. `None` on a healthy thread.
+fn worker_notice(s: &State, thread: usize) -> Option<String> {
+    let t = s.threads.iter().find(|t| t.id == thread)?;
+    let is_worker =
+        t.peer_origin.is_some() || (t.delegated && t.parent.is_some()) || t.crew_captain.is_some();
+    if !is_worker {
+        return None;
     }
-    group
+    // A failed placement the user must retry or skip.
+    if let Some(placement) = worker_placement(s, thread) {
+        if placement.phase == PlacementPhase::Failed {
+            let sender = t
+                .captain
+                .or(t.crew_captain)
+                .and_then(|c| s.captains.get(c))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "the captain".into());
+            return Some(format!(
+                "Setup failed. {}",
+                placement_recovery(s, thread, &sender)
+            ));
+        }
+    }
+    // A remote target needing attention.
+    if let Some(remote) = s.remote_task(thread) {
+        match remote.state {
+            crate::model::RemoteState::TargetOffline => {
+                return Some(format!(
+                    "{} went offline. Work resumes when it reconnects.",
+                    remote.label
+                ));
+            }
+            crate::model::RemoteState::UpdateRequired => {
+                return Some(format!("Update required on {} to continue.", remote.label));
+            }
+            _ => {}
+        }
+    }
+    // A recruited member's pending crew change.
+    if t.peer_origin.is_none() {
+        let server = s.machines.selected.clone();
+        let pending = s
+            .crew_pending
+            .iter()
+            .find(|((srv, _), change)| change.thread == thread && *srv == server);
+        if let Some((_, change)) = pending {
+            let word = match change.kind {
+                crate::model::CrewKind::Join => "Joining the crew…",
+                crate::model::CrewKind::Release => "Leaving the crew…",
+                crate::model::CrewKind::Move { .. } => "Moving to another crew…",
+            };
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
+/// The worker's notice bar (spec §3.8): 36 pt, borderless `p.selected`, an alert icon in
+/// brass and the reason in SMALL ink. A healthy worker shows nothing — the top bar
+/// already carries the captain link and status.
+fn notice_bar(key: &'static str, reason: String, p: Palette) -> El {
+    row()
+        .key(key)
+        .role("status")
+        .label(reason.clone())
+        .min_h(36.0)
+        .px(12.0)
+        .gap(8.0)
+        .center_y()
+        .radius(8.0)
+        .fill(p.selected)
+        .child(icon("alert", p.brass).size(16.0, 16.0))
+        .child(label(reason, SMALL, p.ink).wrap().grow(1.0).min_w(0.0))
+}
+
+pub(super) fn parent_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
+    let t = s.current();
+    if t.crew_captain.is_some() && !t.delegated && t.peer_origin.is_none() {
+        // A recruited root member's notices go to `crew_bar`, not here.
+        return None;
+    }
+    worker_notice(s, t.id).map(|reason| notice_bar("parent-bar", reason, p))
 }
 
 /// Whether `crew_bar` draws, so the composer's stack budget can price it before building.
+/// Only a pending crew change on a recruited member counts — a healthy member shows
+/// nothing.
 pub(super) fn crew_bar_shows(s: &State) -> bool {
     let t = s.current();
     !t.delegated
         && t.peer_origin.is_none()
-        && t.crew_captain.is_some_and(|c| s.captains.get(c).is_some())
+        && t.crew_captain.is_some()
+        && worker_notice(s, t.id).is_some()
 }
-/// The independent crew root's bar: which captain's crew it belongs to, and a button back
-/// to that captain's home. Delegated workers keep `parent_bar` instead.
+
+/// The independent crew member's notice bar: same borderless `p.selected` treatment as
+/// `parent_bar`, shown only while a pending crew change needs the user.
 pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
     let t = s.current();
-    if t.delegated || t.peer_origin.is_some() {
+    if t.delegated || t.peer_origin.is_some() || t.crew_captain.is_none() {
         return None;
     }
-    let captain = t.crew_captain?;
-    let profile = s.captains.get(captain)?;
-    let home = s.captain_home(captain);
-    let thread_id = t.id;
-    let open_server = s.machines.selected.clone();
-    let more_server = open_server.clone();
-    let who = row()
-        .center_y()
-        .gap(8.0)
-        .min_w(0.0)
-        .shrink()
-        .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
-        .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
-        .child(
-            label(&profile.name, TextStyle::new(14.0, 600.0), p.ink)
-                .key("crew-bar-name")
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        )
-        .child(label("'s crew", TextStyle::new(14.0, 400.0), p.muted));
-    let placement = t.placement.as_ref().map(|placement| {
-        placement_block(
-            s,
-            p,
-            thread_id,
-            placement,
-            "crew-bar-placement",
-            &profile.name,
-            true,
-        )
-    });
-    let bar = row()
-        .min_h(48.0)
-        .py(8.0)
-        .pl(20.0)
-        .pr(8.0)
-        .gap(12.0)
-        .center_y()
-        .child(who)
-        .child(spacer())
-        .child(if home.is_some() {
-            siblings_button(s, p)
-        } else {
-            el()
-        })
-        .child(
-            row()
-                .key("crew-bar-open-captain")
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label("Open captain")
-                .focusable(true)
-                .center_y()
-                .gap(6.0)
-                .h(32.0)
-                .px(10.0)
-                .radius(ROW_RADIUS)
-                .hover(hover_wash(s, p))
-                .press(active_wash(s, p))
-                .hover_motion(motion(), motion())
-                .on_press(move |s: &mut State| {
-                    if s.machines.selected == open_server && home.is_some() {
-                        s.open_captain(captain);
-                    }
-                })
-                .child(icon("back", p.muted))
-                .child(label("Open captain", TextStyle::new(13.0, 500.0), p.ink)),
-        )
-        .child({
-            let open = s.brief.more == Some(thread_id);
-            row()
-                .key("crew-bar-more")
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label("Crew actions")
-                .focusable(true)
-                .center_y()
-                .h(32.0)
-                .w(32.0)
-                .center()
-                .radius(ROW_RADIUS)
-                .hover(hover_wash(s, p))
-                .press(active_wash(s, p))
-                .hover_motion(motion(), motion())
-                .on_press(move |s: &mut State| {
-                    if s.machines.selected != more_server {
-                        return;
-                    }
-                    s.brief.more = if s.brief.more == Some(thread_id) {
-                        None
-                    } else {
-                        Some(thread_id)
-                    };
-                })
-                .child(icon("more", if open { p.ink } else { p.muted }))
-        });
-    Some(with_placement(
-        bar,
-        placement,
-        "crew-bar",
-        format!("In {}'s crew", profile.name),
-        p,
-    ))
+    worker_notice(s, t.id).map(|reason| notice_bar("crew-bar", reason, p))
 }
 
 fn attention_word(kind: AttentionKind) -> &'static str {
@@ -1936,99 +1547,6 @@ fn attention_word(kind: AttentionKind) -> &'static str {
     }
 }
 
-/// The "Crew" menu button on a worker's parent or crew bar: jumps between the captain's
-/// members without going back to the captain's home. Rows share the roster's row builder.
-pub(super) fn siblings_button(s: &State, p: Palette) -> El {
-    let mut button = row()
-        .key("crew-siblings")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(if s.crew_siblings_menu {
-            "Close the crew menu"
-        } else {
-            "Open the crew menu"
-        })
-        .focusable(true)
-        .center_y()
-        .gap(6.0)
-        .h(32.0)
-        .px(10.0)
-        .radius(ROW_RADIUS)
-        .hover(hover_wash(s, p))
-        .press(active_wash(s, p))
-        .hover_motion(motion(), motion())
-        .on_press(|s: &mut State| s.crew_siblings_menu = !s.crew_siblings_menu)
-        .child(icon("crew", p.muted))
-        .child(label("Crew", TextStyle::new(13.0, 500.0), p.ink));
-    if s.crew_siblings_menu {
-        button = button.fill(hover_wash(s, p));
-    }
-    button
-}
-
-/// The siblings popover: every member of the captain's crew, in the roster's order, minus
-/// the open worker itself. Anchored to `crew-siblings`; a click opens the worker.
-pub(super) fn siblings_menu(s: &State, p: Palette) -> Option<El> {
-    if !s.crew_siblings_menu {
-        return None;
-    }
-    let t = s.current();
-    // A peer-launched worker's crew lives on the origin machine; this menu jumps
-    // between the members the same delegation put on this one.
-    if let Some(origin) = &t.peer_origin {
-        let members = peer_sibling_members(s, t.id, origin);
-        let mut menu = popover("crew-siblings-menu", "Crew", s, p)
-            .role("menu")
-            .focus_group()
-            .w(280.0)
-            .anchored_fit("crew-siblings", rune::Side::Bottom, rune::Align::End, 4.0)
-            .modal(true, |s: &mut State| s.crew_siblings_menu = false);
-        if members.is_empty() {
-            menu = menu.child(
-                label("No other crew members on this machine", SMALL, p.muted)
-                    .key("crew-siblings-empty")
-                    .px(8.0)
-                    .py(6.0),
-            );
-        }
-        for member in members {
-            let id = member.thread_id;
-            menu =
-                menu.child(roster_row(s, p, &member, format!("crew-sibling-{id}"), false).w_full());
-        }
-        return Some(menu);
-    }
-    let captain = t.crew_captain.or_else(|| {
-        t.parent
-            .and_then(|id| s.threads.iter().find(|p| p.id == id))
-            .and_then(|p| p.captain.or(t.captain))
-    })?;
-    let home = s.captain_home(captain)?;
-    let mut menu = popover("crew-siblings-menu", "Crew", s, p)
-        .role("menu")
-        .focus_group()
-        .w(280.0)
-        .anchored_fit("crew-siblings", rune::Side::Bottom, rune::Align::End, 4.0)
-        .modal(true, |s: &mut State| s.crew_siblings_menu = false);
-    let mut any = false;
-    for member in roster_members(s, home, captain)
-        .into_iter()
-        .filter(|m| m.thread_id != t.id)
-    {
-        any = true;
-        let id = member.thread_id;
-        menu = menu.child(roster_row(s, p, &member, format!("crew-sibling-{id}"), false).w_full());
-    }
-    if !any {
-        menu = menu.child(
-            label("No other crew members", SMALL, p.muted)
-                .key("crew-siblings-empty")
-                .px(8.0)
-                .py(6.0),
-        );
-    }
-    Some(menu)
-}
 fn attention_status(kind: AttentionKind) -> Status {
     match kind {
         AttentionKind::Failed => Status::Failed,

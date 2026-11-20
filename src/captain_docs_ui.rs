@@ -18,10 +18,6 @@ const TEXT_CAP: usize = 64 * 1024;
 
 const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
-/// What each crew reads from the document every turn: the captain reads AGENTS.md and
-/// NOTES.md itself, CREW.md goes to crew threads, the digest is read on demand.
-const CONTEXT_BYTES: usize = 8 * 1024;
-
 /// The friendly labels from the design: AGENTS.md is the captain's rules, NOTES.md its plan,
 /// CREW.md the crew's shared rules, DIGEST.md the digest it writes on demand.
 pub(super) fn document_title(name: &str) -> &'static str {
@@ -31,17 +27,6 @@ pub(super) fn document_title(name: &str) -> &'static str {
         "CREW.md" => "Crew rules",
         "DIGEST.md" => "Digest",
         _ => "Document",
-    }
-}
-
-/// Who the document is shared with, from `captain_mcp`'s read rules.
-pub(super) fn sharing_note(name: &str) -> &'static str {
-    match name {
-        "AGENTS.md" => "Only this captain reads these. Crew threads never see them.",
-        "NOTES.md" => "Shared with crew threads.",
-        "CREW.md" => "Every crew thread reads these.",
-        "DIGEST.md" => "Read on demand.",
-        _ => "",
     }
 }
 
@@ -69,15 +54,17 @@ fn access_reason(access: CaptainAccess) -> Option<String> {
     }
 }
 
-/// The right-panel body of a Captain document surface: header, then the reading view or
-/// the editor for this machine's draft.
-pub(super) fn document_panel(s: &State, p: Palette, captain: usize, name: &str) -> El {
+/// The document surface's body without its own title block: the access note,
+/// then the reading view or the editor for this machine's draft. The Context
+/// tab draws its own `context-doc-header` above this (spec §4.3), so the
+/// 24 px serif title row only appears where no back control exists.
+pub(super) fn document_panel_body(s: &State, p: Palette, captain: usize, name: &str) -> El {
     let key = DocumentDraftKey {
         server: s.machines.selected.clone(),
         captain,
         name: name.into(),
     };
-    let (_, updated_at, text) = s.captain_document_body(captain, name);
+    let (_, _, text) = s.captain_document_body(captain, name);
     let captain_name = s
         .captains
         .get(captain)
@@ -86,71 +73,12 @@ pub(super) fn document_panel(s: &State, p: Palette, captain: usize, name: &str) 
     let access = s.captain_access(captain);
     let draft = s.captain_drafts.get(&key);
     let title = document_title(name);
-    let age = match relative_time(updated_at / 1000) {
-        Some(age) => format!("Updated {age} ago"),
-        None => "Never edited".into(),
-    };
-    let mut meta = row()
-        .gap(8.0)
-        .center_y()
-        .child(label(name.to_string(), META_LABEL, p.faint))
-        .child(label(age, META, p.muted))
-        .child(
-            label(sharing_note(name), META, p.muted)
-                .truncate()
-                .min_w(0.0),
-        );
-    if name == "AGENTS.md" {
-        meta = el()
-            .children([
-                outlined(
-                    el().h(16.0)
-                        .px(5.0)
-                        .center()
-                        .radius(3.0)
-                        .child(label("Private", META_LABEL, p.muted)),
-                    p,
-                ),
-                meta,
-            ])
-            .gap(6.0)
-            .center_y();
-    }
-    let mut header = row()
-        .key("captain-doc-header")
-        .px(10.0)
-        .py(8.0)
-        .gap(8.0)
-        .center_y()
-        .child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .gap(3.0)
-                .child(label(title, DIALOG_TITLE, p.ink).truncate())
-                .child(meta),
-        );
-    if draft.is_none() && access == CaptainAccess::Full {
-        let name_owned = name.to_string();
-        header = header.child(ghost_button(
-            s,
-            "captain-doc-edit".into(),
-            "Edit",
-            p,
-            move |s: &mut State| {
-                s.captain_document_begin_edit(captain, &name_owned);
-            },
-        ));
-    }
     let mut body = col()
         .key("captain-doc-panel")
         .role("region")
         .label(format!("{title}, {captain_name}"))
         .w_full()
-        .h_full()
-        .min_h(0.0)
-        .child(header)
-        .child(el().h(1.0).fill(hairline(p)));
+        .min_h(0.0);
     if let Some(reason) = access_reason(access) {
         body = body.child(quiet_note(reason, p).key("captain-doc-readonly"));
     }
@@ -379,11 +307,11 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
         "DIGEST.md" => None,
         "CREW.md" => Some(format!(
             "Crew threads read the first {} KiB each turn and the rest on request.",
-            CONTEXT_BYTES / 1024
+            crate::model::NOTES_CONTEXT_MAX_BYTES / 1024
         )),
         _ => Some(format!(
             "The captain reads the first {} KiB each turn and the rest on request.",
-            CONTEXT_BYTES / 1024
+            crate::model::RULES_CONTEXT_MAX_BYTES / 1024
         )),
     };
     let mut footer = row()

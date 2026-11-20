@@ -10,7 +10,7 @@ use serde_json::Value;
 
 /// Code and tool output tokenize denser than prose. One ratio keeps the
 /// estimate simple; the reported total absorbs the remaining error.
-const CHARS_PER_TOKEN: f64 = 3.5;
+pub(crate) const CHARS_PER_TOKEN: f64 = 3.5;
 const CONTEXT_SYSTEM_LABEL: &str = "System";
 const VISIBLE_BREAKDOWN_ROWS: usize = 5;
 const MAX_BREAKDOWN_ROWS: usize = 32;

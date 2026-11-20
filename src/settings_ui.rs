@@ -2131,7 +2131,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 "settings-profile-row",
                 "Your profile",
                 "Name, time zone and preferences shared with captains.",
-                captain_ui::profile_item(s, p).w(160.0),
+                context_ui::profile_item(s, p).w(160.0),
                 p,
             );
             for (index, item) in captain_ui::background_settings(s, p)
@@ -3773,7 +3773,7 @@ mod tests {
             json!(crate::power::KeepAwake::WhileRunning)
         );
         state.settings_menu = true;
-        captain_ui::open_profile(&mut state);
+        context_ui::open_profile(&mut state);
         assert_eq!(state.brief.profile_name.text, "Remote user");
         assert_eq!(state.settings.profile_target.as_deref(), Some("remote"));
         // The editor keeps its target even if the settings context changes meanwhile.
