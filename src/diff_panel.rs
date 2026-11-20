@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::review::{
-    ReviewDiffFileArg, ReviewDiffFileStat, ReviewDiffPreviewInput, ReviewDiffPreviewResult,
-    ReviewDiffPreviewSource, ReviewPreviewSourceKind, ReviewSourceKind,
+    DiffBlocker, ReviewDiffFileArg, ReviewDiffFileStat, ReviewDiffPreviewInput,
+    ReviewDiffPreviewResult, ReviewDiffPreviewSource, ReviewPreviewSourceKind, ReviewSourceKind,
 };
 use crate::review_patch::{ChangeKind, FileDiff, LineKind, RenderablePatch};
 use std::borrow::Cow;
@@ -148,7 +148,57 @@ pub enum Done {
     NotRepo,
     /// The owning machine lacks `review-diff-v1`; the name is its label.
     Unsupported(String),
+    Blocked(DiffBlocker),
     Failed(String),
+}
+
+/// Match panel keys at the UI boundary, then look up by machine and thread.
+#[derive(Default)]
+pub(crate) struct DiffCache(HashMap<String, HashMap<usize, ThreadDiff>>);
+
+impl DiffCache {
+    fn split(key: &str) -> Option<(&str, usize)> {
+        let (machine, thread) = key.rsplit_once(':')?;
+        Some((machine, thread.parse().ok()?))
+    }
+    pub fn get(&self, key: &str) -> Option<&ThreadDiff> {
+        let (machine, thread) = Self::split(key)?;
+        self.0.get(machine)?.get(&thread)
+    }
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut ThreadDiff> {
+        let (machine, thread) = Self::split(key)?;
+        self.get_thread_mut(machine, thread)
+    }
+    fn get_thread_mut(&mut self, machine: &str, thread: usize) -> Option<&mut ThreadDiff> {
+        self.0.get_mut(machine)?.get_mut(&thread)
+    }
+    fn entry(&mut self, key: &str) -> &mut ThreadDiff {
+        let (machine, thread) = Self::split(key).expect("diff panel key");
+        self.0
+            .entry(machine.into())
+            .or_default()
+            .entry(thread)
+            .or_default()
+    }
+    fn keys(&self) -> impl Iterator<Item = String> + '_ {
+        self.0.iter().flat_map(|(machine, threads)| {
+            threads
+                .keys()
+                .map(|&thread| crate::right_panel::key(machine, thread))
+        })
+    }
+    #[cfg(test)]
+    pub fn insert(&mut self, key: String, diff: ThreadDiff) {
+        *self.entry(&key) = diff;
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&String> for DiffCache {
+    type Output = ThreadDiff;
+    fn index(&self, key: &String) -> &Self::Output {
+        self.get(key).expect("diff panel key")
+    }
 }
 
 /// Per-thread panel state, keyed like `right_panels`.
@@ -587,10 +637,22 @@ fn flatten(files: &[FileEntry], hide_tests: bool, collapsed: &HashSet<String>) -
 // --- state ------------------------------------------------------------------
 
 impl State {
+    fn diff_visible(&self, panel_key: &str) -> bool {
+        self.right_panels.active_view(panel_key) == Some(crate::right_panel::PanelView::Diff)
+            && DiffCache::split(panel_key)
+                == Some((self.machines.selected.as_str(), self.current().id))
+            && self
+                .background
+                .handle
+                .as_ref()
+                .is_none_or(|handle| handle.is_visible())
+    }
+
     /// KSG `refreshOnShow` plus first mount: (re)read when the tab is stale, or
     /// schedule a queued refresh for its interval floor. Called by the body's
     /// `on_visible`.
     pub(crate) fn diff_shown(&mut self, tx: &mut Tx) {
+        self.diff_track_current_completion();
         let key = self.panel_key();
         let (due, wanted, first_load_pending) =
             self.diffs.get(&key).map_or((true, false, false), |d| {
@@ -613,6 +675,10 @@ impl State {
                 });
             tx.wake_after(wait);
         }
+        if self.diffs.get(&key).is_some_and(|diff| !diff.loading) {
+            self.diff_load_next(&key);
+            self.diff_apply_pending_reveal(&key);
+        }
     }
 
     /// The current thread's diff (re)read: show, scope change, refresh, retry.
@@ -622,7 +688,8 @@ impl State {
     }
 
     fn diff_request_key(&mut self, panel_key: &str) {
-        let diff = self.diffs.entry(panel_key.to_string()).or_default();
+        self.diff_blockers.remove(panel_key);
+        let diff = self.diffs.entry(panel_key);
         self.next_diff_request_id += 1;
         let request = self.next_diff_request_id;
         diff.request = request;
@@ -630,10 +697,11 @@ impl State {
         diff.last_refresh_at = Some(Instant::now());
         diff.refresh_wanted = false;
         let scope = diff.scope;
+        let owner = DiffCache::split(panel_key);
         let Some(index) = self
             .threads
             .iter()
-            .position(|t| crate::right_panel::key(&t.machine, t.id) == panel_key)
+            .position(|t| owner == Some((t.machine.as_str(), t.id)))
         else {
             self.diff_apply_done(
                 panel_key,
@@ -642,7 +710,18 @@ impl State {
             );
             return;
         };
+        diff.seen_completed_at = self.threads[index].life.last_completed_at;
         let machine = self.threads[index].machine.clone();
+        if self.client.is_some() && !self.machine_connected(&machine) {
+            self.diff_apply_done(
+                panel_key,
+                request,
+                Done::Blocked(DiffBlocker::MachineOffline {
+                    machine: self.machine_label(&machine),
+                }),
+            );
+            return;
+        }
         let cwd = match self.thread_directory(index) {
             Ok(dir) => dir.to_string_lossy().into_owned(),
             Err(error) => {
@@ -653,14 +732,6 @@ impl State {
         let input = preview_input(scope, &cwd);
         if let Some(client) = &self.client {
             // The thread's owning machine answers review.getDiffPreview.
-            if !self.machine_connected(&machine) {
-                self.diff_apply_done(
-                    panel_key,
-                    request,
-                    Done::Failed("This machine is not reachable right now.".into()),
-                );
-                return;
-            }
             if !client.supports_capability(&machine, crate::protocol::REVIEW_DIFF) {
                 let label = self.machine_label(&machine);
                 self.diff_apply_done(panel_key, request, Done::Unsupported(label));
@@ -675,7 +746,9 @@ impl State {
                 self.diff_apply_done(
                     panel_key,
                     request,
-                    Done::Failed("This machine is not reachable right now.".into()),
+                    Done::Blocked(DiffBlocker::MachineOffline {
+                        machine: self.machine_label(&machine),
+                    }),
                 );
                 return;
             };
@@ -704,14 +777,18 @@ impl State {
         self.diff_rxs.push(rx);
         let wake = self.wake.clone();
         let panel_key = panel_key.to_string();
+        let branch = self.threads[index].branch.clone();
         #[cfg(test)]
         let git_ctx = self.test_git_context.clone().unwrap_or_default();
         #[cfg(not(test))]
         let git_ctx = crate::vcs::GitContext::default();
         std::thread::spawn(move || {
-            let done = match crate::review::get_diff_preview(&input, &git_ctx) {
+            let done = match crate::review::blocked_diff_preview(&input, &git_ctx) {
                 Ok(result) => preview_done(scope, &input.cwd, result),
-                Err(error) => Done::Failed(error),
+                Err(DiffBlocker::WorktreeMissing { path, .. }) => {
+                    Done::Blocked(DiffBlocker::WorktreeMissing { path, branch })
+                }
+                Err(error) => Done::Blocked(error),
             };
             let _ = tx.send(DiffMsg::Preview {
                 panel_key,
@@ -730,12 +807,27 @@ impl State {
         if diff.request != request {
             return;
         }
+        match &done {
+            Done::Blocked(blocker) => {
+                self.diff_blockers.insert(panel_key.into(), blocker.clone());
+            }
+            _ => {
+                self.diff_blockers.remove(panel_key);
+            }
+        }
         diff.loading = false;
         diff.done = Some(done);
         self.diff_rebuild_rows(panel_key);
         self.diff_load_next(panel_key);
         // A timeline file press that arrived while the request was out
         // resolves against the result that just landed.
+        self.diff_apply_pending_reveal(panel_key);
+    }
+
+    fn diff_apply_pending_reveal(&mut self, panel_key: &str) {
+        if !self.diff_visible(panel_key) {
+            return;
+        }
         let pending = self
             .diffs
             .get_mut(panel_key)
@@ -777,7 +869,7 @@ impl State {
         let Some(index_thread) = self
             .threads
             .iter()
-            .position(|t| crate::right_panel::key(&t.machine, t.id) == panel_key)
+            .position(|t| DiffCache::split(panel_key) == Some((t.machine.as_str(), t.id)))
         else {
             self.diff_apply_file(
                 panel_key,
@@ -924,6 +1016,9 @@ impl State {
     /// KSG `loadNextFiles`: when the list-end boundary shows and the first
     /// unsettled file is not in flight, request the next batch of four.
     pub(crate) fn diff_load_next(&mut self, panel_key: &str) -> bool {
+        if !self.diff_visible(panel_key) {
+            return false;
+        }
         let indices: Vec<usize> = {
             let Some(diff) = self.diffs.get_mut(panel_key) else {
                 return false;
@@ -1021,7 +1116,7 @@ impl State {
     /// The app-wide test filter: a display-only filter, so only rows rebuild.
     pub(crate) fn diff_toggle_hide_tests(&mut self) {
         self.diff_hide_tests = !self.diff_hide_tests;
-        let keys: Vec<String> = self.diffs.keys().cloned().collect();
+        let keys: Vec<String> = self.diffs.keys().collect();
         for key in keys {
             self.diff_rebuild_rows(&key);
         }
@@ -1031,7 +1126,7 @@ impl State {
     /// scope's data clears while the request runs (KSG's query remount).
     pub(crate) fn diff_set_scope(&mut self, scope: Scope) {
         let key = self.panel_key();
-        let diff = self.diffs.entry(key.clone()).or_default();
+        let diff = self.diffs.entry(&key);
         if diff.scope == scope {
             return;
         }
@@ -1047,9 +1142,18 @@ impl State {
         let Some(thread) = self.threads.get(index) else {
             return;
         };
-        let key = crate::right_panel::key(&thread.machine, thread.id);
-        if let Some(diff) = self.diffs.get_mut(&key) {
+        if let Some(diff) = self.diffs.get_thread_mut(&thread.machine, thread.id) {
             diff.refresh_wanted = true;
+        }
+    }
+
+    fn diff_track_current_completion(&mut self) {
+        let thread = &self.threads[self.active];
+        if let Some(diff) = self.diffs.get_thread_mut(&thread.machine, thread.id) {
+            if diff.seen_completed_at != thread.life.last_completed_at {
+                diff.refresh_wanted = true;
+            }
+            diff.seen_completed_at = thread.life.last_completed_at;
         }
     }
 
@@ -1240,8 +1344,16 @@ pub(crate) fn handle_rpc(
                 panel_key,
                 request,
                 done: match parsed {
+                    Ok(result) if result.sources.is_empty() => {
+                        Done::Blocked(DiffBlocker::NotARepository { path: cwd })
+                    }
                     Ok(result) => preview_done(scope, &cwd, result),
-                    Err(error) => Done::Failed(error),
+                    Err(error) => Done::Blocked(DiffBlocker::from_wire_error(&error).unwrap_or(
+                        DiffBlocker::GitFailed {
+                            path: cwd,
+                            detail: error,
+                        },
+                    )),
                 },
             },
             DiffPending::File {
@@ -1253,7 +1365,10 @@ pub(crate) fn handle_rpc(
                 request: preview_request,
                 outcome: match parsed {
                     Ok(result) => file_outcome(&path, result),
-                    Err(error) => FileOutcome::Failed(error),
+                    Err(error) => FileOutcome::Failed(
+                        DiffBlocker::from_wire_error(&error)
+                            .map_or(error, |blocker| blocker.to_string()),
+                    ),
                 },
                 path,
             },
@@ -1277,24 +1392,11 @@ pub(crate) fn tick(state: &mut State, tx: &mut Tx) -> bool {
         }
     }
     state.diff_rxs = remaining;
-    // A turn finishing bumps last_completed_at for local and remote threads.
-    for (key, diff) in state.diffs.iter_mut() {
-        let completed = state
-            .threads
-            .iter()
-            .find(|t| crate::right_panel::key(&t.machine, t.id) == *key)
-            .and_then(|t| t.life.last_completed_at);
-        if diff.seen_completed_at.is_some() && diff.seen_completed_at != completed {
-            diff.refresh_wanted = true;
-        }
-        diff.seen_completed_at = completed;
-    }
     let panel_key = state.panel_key();
-    let visible =
-        state.right_panels.active_view(&panel_key) == Some(crate::right_panel::PanelView::Diff);
-    if !visible {
+    if !state.diff_visible(&panel_key) {
         return changed;
     }
+    state.diff_track_current_completion();
     let (wanted, due) = state.diffs.get(&panel_key).map_or((false, true), |d| {
         (
             d.refresh_wanted,
@@ -2096,6 +2198,7 @@ pub(super) fn body(s: &State, p: Palette) -> El {
         )
         .into(),
         Some(Done::Failed(error)) => centered_state(error.clone(), p, true).into(),
+        Some(Done::Blocked(blocker)) => centered_state(blocker.to_string(), p, true).into(),
         Some(Done::Empty) => centered_state(EMPTY_TEXT, p, false).into(),
         Some(Done::Missing) => centered_state(MISSING_TEXT, p, false).into(),
         Some(Done::Ready(ready)) => ready_body(s, p, &panel_key, ready).into(),

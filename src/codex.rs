@@ -278,6 +278,7 @@ struct Client {
     hydration: Option<(Value, Value)>,
     history_cursors: HashSet<String>,
     child_parents: HashMap<String, String>,
+    child_agents: HashMap<String, Value>,
     goal: Value,
     prompt_suggestions: bool,
     active_run_id: Option<String>,
@@ -350,6 +351,7 @@ impl Client {
             hydration: None,
             history_cursors: HashSet::new(),
             child_parents: HashMap::new(),
+            child_agents: HashMap::new(),
             goal: Value::Null,
             prompt_suggestions,
             active_run_id: None,
@@ -990,6 +992,7 @@ impl Client {
         self.compacted_turns.clear();
         self.text.clear();
         self.child_parents.clear();
+        self.child_agents.clear();
         self.turns = thread["turns"].as_array().cloned().unwrap_or_default();
         for turn in self.turns.clone() {
             self.replay(&turn);
@@ -2096,6 +2099,36 @@ impl Client {
                 .entry(child.into())
                 .or_insert_with(|| id.into());
         }
+        let mut owned_agents = Vec::new();
+        if matches!(kind, "collabAgentToolCall" | "subAgentActivity") {
+            for mut run in subagent_results(item)
+                .as_array()
+                .into_iter()
+                .flatten()
+                .cloned()
+            {
+                let Some(child) = run["providerId"].as_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(parent) = self.child_parents.get(&child).cloned() else {
+                    continue;
+                };
+                if let Some(previous) = self.child_agents.get(&child) {
+                    if let Some(brief) = previous["task"].as_str().filter(|text| !text.is_empty()) {
+                        run["task"] = json!(brief);
+                    }
+                    if run["activity"].is_null() {
+                        run["activity"] = previous["activity"].clone();
+                    }
+                }
+                self.child_agents.insert(child, run.clone());
+                if parent == id {
+                    owned_agents.push(run);
+                } else if emit {
+                    self.events.push(json!({"type":"subagent_activity_update","toolCallId":parent,"results":[run]}));
+                }
+            }
+        }
         match kind {
             "contextCompaction" => {
                 // Some versions send the deprecated notification first. It already
@@ -2207,6 +2240,9 @@ impl Client {
                         self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":item,"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
+                if emit && !done && !owned_agents.is_empty() {
+                    self.events.push(json!({"type":"subagent_activity_update","toolCallId":id,"results":owned_agents}));
+                }
                 if done {
                     let failed = matches!(item["status"].as_str(), Some("failed" | "declined"))
                         || item["exitCode"].as_i64().is_some_and(|code| code != 0)
@@ -2229,8 +2265,8 @@ impl Client {
                         .or_else(|| item["result"]["structuredContent"].get("nestedCalls"))
                         .cloned()
                         .unwrap_or(Value::Null);
-                    if matches!(kind, "collabAgentToolCall" | "subAgentActivity") {
-                        result["details"]["results"] = subagent_results(item);
+                    if !owned_agents.is_empty() {
+                        result["details"]["results"] = json!(owned_agents);
                     }
                     let mut saved = result.clone();
                     saved["role"] = json!("toolResult");
@@ -2265,6 +2301,16 @@ impl Client {
         let thread = params["threadId"].as_str().unwrap_or("");
         match method {
             "item/started" | "item/completed" => {
+                let child_item = &params["item"];
+                let activity = child_item["command"]
+                    .as_str()
+                    .or_else(|| child_item["text"].as_str().filter(|text| !text.is_empty()))
+                    .or_else(|| child_item["name"].as_str())
+                    .or_else(|| child_item["type"].as_str());
+                if let (Some(run), Some(activity)) = (self.child_agents.get_mut(thread), activity) {
+                    run["activity"] = json!(activity);
+                    self.events.push(json!({"type":"subagent_activity_update","toolCallId":parent,"results":[run]}));
+                }
                 if matches!(
                     params["item"]["type"].as_str(),
                     Some(
@@ -2305,6 +2351,17 @@ impl Client {
                     params["itemId"].as_str().unwrap_or("")
                 ));
                 self.notification(method, &params)?;
+            }
+            "turn/completed" => {
+                if let Some(run) = self.child_agents.get_mut(thread) {
+                    run["finished"] = json!(true);
+                    run["stopReason"] = json!(match params["turn"]["status"].as_str() {
+                        Some("failed") => "error",
+                        Some("interrupted" | "cancelled") => "aborted",
+                        _ => "stop",
+                    });
+                    self.events.push(json!({"type":"subagent_activity_update","toolCallId":parent,"results":[run]}));
+                }
             }
             _ => {}
         }
@@ -2850,17 +2907,27 @@ fn tool_metadata(item: &Value) -> Value {
 
 fn subagent_results(item: &Value) -> Value {
     let mut agents = item["agentsStates"].as_object().map(|states| states.iter().map(|(id, state)| {
-        json!({"agent":id,"task":item["prompt"].as_str().unwrap_or("Codex subagent"),
+        json!({"agent":state["nickname"].as_str().or(item["agentNickname"].as_str()).unwrap_or(id),
+            "providerId":id,"task":item["prompt"].as_str().unwrap_or(""),
             "model":item["model"],"finished":!matches!(state["status"].as_str(),Some("pendingInit"|"running")),
+            "queued":state["status"] == "pendingInit",
             "stopReason":if state["status"] == "errored" {"error"} else if state["status"] == "shutdown" {"aborted"} else {"stop"},
             "exitCode":if state["status"] == "errored" {1} else {0},
             "messages":[{"role":"assistant","content":[{"type":"text","text":state["message"].as_str().unwrap_or("")}]}]})
     }).collect::<Vec<_>>()).unwrap_or_default();
-    if agents.is_empty()
-        && let Some(id) = item["agentThreadId"].as_str()
+    for id in item["receiverThreadIds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .chain(item["agentThreadId"].as_str())
     {
+        if agents.iter().any(|run| run["providerId"] == id) {
+            continue;
+        }
         agents.push(
-            json!({"agent":id,"task":item["agentPath"],"model":item["model"],
+            json!({"agent":item["agentNickname"].as_str().unwrap_or(id),"providerId":id,
+            "task":item["prompt"].as_str().or(item["agentPath"].as_str()).unwrap_or(""),"model":item["model"],
             "finished":item["kind"] == "completed" || item["kind"] == "interrupted",
             "stopReason":if item["kind"] == "interrupted" {"aborted"} else {"stop"},"exitCode":0}),
         );

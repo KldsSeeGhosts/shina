@@ -118,6 +118,12 @@ fn strip(s: &State, p: Palette) -> El {
                 "Overview",
                 crate::right_panel::SingletonKind::Overview,
             ),
+            crate::right_panel::PanelView::Agents => (
+                "right-panel-segment-agents",
+                "Agents",
+                "crew",
+                crate::right_panel::SingletonKind::Agents,
+            ),
             crate::right_panel::PanelView::Crew => (
                 "right-panel-segment-crew",
                 "crew",
@@ -605,6 +611,9 @@ fn body(s: &State, p: Palette) -> (String, El) {
     match resolved_view(s) {
         crate::right_panel::PanelView::Overview => {
             ("right-panel-body-overview".into(), overview_body(s, p))
+        }
+        crate::right_panel::PanelView::Agents => {
+            ("right-panel-body-agents".into(), overview_body(s, p))
         }
         crate::right_panel::PanelView::Crew => ("right-panel-body-crew".into(), crew_body(s, p)),
         crate::right_panel::PanelView::Context => context_ui::view(s, p),

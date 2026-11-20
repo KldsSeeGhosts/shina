@@ -69,6 +69,7 @@ impl Surface {
 pub enum PanelView {
     #[default]
     Overview,
+    Agents,
     Crew,
     Context,
     Diff,
@@ -77,6 +78,7 @@ pub enum PanelView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingletonKind {
     Overview,
+    Agents,
     Crew,
     Context,
     Diff,
@@ -86,6 +88,7 @@ impl SingletonKind {
     fn into_view(self) -> PanelView {
         match self {
             Self::Overview => PanelView::Overview,
+            Self::Agents => PanelView::Agents,
             Self::Crew => PanelView::Crew,
             Self::Context => PanelView::Context,
             Self::Diff => PanelView::Diff,

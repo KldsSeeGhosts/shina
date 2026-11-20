@@ -4034,11 +4034,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
                     .field_focus(&s.search, p)
                     .hover(p.selected)
-                    .on_layout_tx(|s: &mut State, _rect, tx| {
-                        if !s.sync_sidebar_search_input() {
-                            tx.live_only();
-                        }
-                    })
                     .child(icon("search", p.muted))
                     .child(
                         text_input(&s.search, ROW_QUIET)
@@ -4049,7 +4044,10 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                             .single_line()
                             .grow(1.0)
                             .min_w(0.0)
-                            .on_edit(|s: &mut State| &mut s.search),
+                            .on_edit(|s: &mut State| &mut s.search)
+                            .on_input_change(|s: &mut State, tx| {
+                                s.poll_sidebar_search(tx);
+                            }),
                     )
                     .child(scope_button),
             ),
@@ -12000,6 +11998,51 @@ pub(crate) fn timeline_text_row(
         .iter()
         .find(|(_, _, piece, _)| *piece == want)
         .map(|(_, _, _, key)| (*key).clone())
+}
+
+/// The virtual row for a tool jump, including the work slice of a long turn.
+pub(crate) fn timeline_tool_row(t: &Thread, index: usize) -> Option<String> {
+    let tool = t.tools.get(index)?;
+    let structure = disclosed_timeline_structure(t);
+    let message = tool.anchor.message;
+    for row in structure.rows.iter() {
+        match row {
+            TimelineRow::AssistantTurn { start, end, key } if (*start..*end).contains(&message) => {
+                return Some(format!("{key}/inline-tool-{}-{index}", t.id));
+            }
+            TimelineRow::TurnPiece {
+                start,
+                end,
+                key,
+                piece: TurnPiece::Work { lo, hi },
+            } if (*start..*end).contains(&message) => {
+                let parts = turn_parts_in(t, &structure.events, *start, *end);
+                let (last, preamble) = turn_shape(t, &parts);
+                let live = *end == t.messages.len() && t.status.busy();
+                let contains_tool = |item: WorkItem| match (&parts[item.part()], item) {
+                    (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => {
+                        matches!(entries[k], WorkEntry::Tool(i) if i == index)
+                    }
+                    (TranscriptPart::Work(entries), WorkItem::Part(_)) => {
+                        entry_tools(entries).any(|i| i == index)
+                    }
+                    (TranscriptPart::Tools(indices), _) => indices.contains(&index),
+                    _ => false,
+                };
+                if work_items(t, &parts, last, preamble, live)
+                    .get(*lo..*hi)
+                    .is_some_and(|items| items.iter().copied().any(contains_tool))
+                {
+                    return Some(format!("{key}/inline-tool-{}-{index}", t.id));
+                }
+            }
+            TimelineRow::LiveTurn { start, key } if *start == message => {
+                return Some(format!("{key}/inline-tool-{}-{index}", t.id));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Splits a long running or expanded turn into a head, slices of `SLICE_ITEMS` work
@@ -23916,6 +23959,7 @@ pub(crate) mod tests {
             rt.state.threads[1].renamed = true;
             // Thread 2 is unvisited (no messages loaded locally), matched via server search!
             rt.state.search.replace_text("alpha");
+            rt.state.sync_sidebar_search_input();
             rt.state.sidebar_search.visible_query = "alpha".into();
             rt.state.sidebar_search.visible_matches.insert(
                 ("local".into(), 2),

@@ -201,6 +201,13 @@ impl Storage {
         serde_json::from_slice(&fs::read(self.failed_release()).ok()?).ok()
     }
 
+    fn clear_failure(&self) -> std::io::Result<()> {
+        match fs::remove_file(self.failed_release()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
+
     fn save_failure(&self, tag: &str, reason: &str) -> Result<(), String> {
         fs::create_dir_all(&self.root).map_err(|e| e.to_string())?;
         crate::store::write_atomic(
@@ -991,6 +998,8 @@ pub struct Updater {
     next_check: Option<Instant>,
     rate_limited_until: Option<Instant>,
     manual_check: bool,
+    manual_check_in_flight: bool,
+    up_to_date_until: Option<Instant>,
     /// Set after a real authentication denial: no networked attempts until the next launch.
     suspended: Option<String>,
     notice: Option<String>,
@@ -1013,6 +1022,8 @@ impl Default for Updater {
             next_check: None,
             rate_limited_until: None,
             manual_check: false,
+            manual_check_in_flight: false,
+            up_to_date_until: None,
             suspended: None,
             notice: None,
             failed_release: None,
@@ -2906,7 +2917,7 @@ pub fn coordinated_helper() -> Result<(), String> {
             clear_journal(&directory);
             service_guard.disarm();
             let _ = fs::remove_file(storage.manifest());
-            let _ = fs::remove_file(storage.failed_release());
+            let _ = storage.clear_failure();
         }
         result
     }))
@@ -2980,15 +2991,34 @@ impl Updater {
             .map(|f| (f.tag, f.reason))
     }
     pub fn retry_failed_release(&mut self) -> Result<(), String> {
-        match fs::remove_file(self.storage.failed_release()) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("Could not retry update: {error}")),
-        }
-        self.failed_release = None;
-        self.notice = None;
+        self.clear_failure()
+            .map_err(|error| format!("Could not retry update: {error}"))?;
         self.retry();
         Ok(())
+    }
+
+    pub fn clear_failure(&mut self) -> std::io::Result<()> {
+        self.storage.clear_failure()?;
+        self.failed_release = None;
+        self.notice = None;
+        self.suspended = None;
+        self.diagnostics.clear();
+        Ok(())
+    }
+
+    pub(crate) fn success_up_to_date(&self, now: Instant) -> bool {
+        self.up_to_date_until.is_some_and(|until| now < until)
+    }
+
+    pub(crate) fn retry_at(&self) -> Option<String> {
+        let wait = self
+            .rate_limited_until?
+            .checked_duration_since(Instant::now())?;
+        Some(
+            (chrono::Local::now() + chrono::Duration::from_std(wait).ok()?)
+                .format("%H:%M")
+                .to_string(),
+        )
     }
     pub fn status(&self) -> &Status {
         &self.status
@@ -3088,6 +3118,16 @@ impl Updater {
             return;
         }
         self.failed_release = self.storage.load_failure();
+        // The relaunched client can start before the helper removes its ledger.
+        // A rollback opens the older version, so only the installed version is cleared.
+        if self.failed_release.as_ref().is_some_and(|failed| {
+            matches!(
+                (parse_version(&failed.tag), parse_version(env!("CARGO_PKG_VERSION"))),
+                (Some(failed), Some(installed)) if failed <= installed
+            )
+        }) {
+            let _ = self.clear_failure();
+        }
         if let Some(failed) = &self.failed_release {
             self.notice = Some(format!("Update {} failed. {}", failed.tag, failed.reason));
         }
@@ -3234,19 +3274,27 @@ impl Updater {
     /// Time until the next scheduled check, for `Tx::wake_after`.
     pub fn remaining(&self, now: Instant) -> Option<Duration> {
         self.next_check
+            .into_iter()
+            .chain(self.up_to_date_until)
+            .min()
             .map(|next| next.saturating_duration_since(now))
     }
 
     /// Consumes finished worker events and starts due work. Returns whether anything visible
     /// changed.
     pub fn poll(&mut self, now: Instant, wake: Waker) -> bool {
+        let expired = self.up_to_date_until.is_some_and(|until| now >= until);
+        if expired {
+            self.up_to_date_until = None;
+        }
         let Some(event) = self
             .events
             .as_ref()
             .and_then(|events| events.try_recv().ok())
         else {
+            let checking = self.status == Status::Checking;
             self.start_due_work(now, wake);
-            return false;
+            return expired || !checking && self.status == Status::Checking;
         };
         self.events = None;
         let changed = self.apply(event, now, wake.clone());
@@ -3272,6 +3320,8 @@ impl Updater {
         };
         self.status = Status::Checking;
         let manual = std::mem::take(&mut self.manual_check);
+        self.manual_check_in_flight = manual;
+        self.up_to_date_until = None;
         self.spawn(wake, move |host| {
             Event::Checked(if manual {
                 host.fetch_release_manual(&target)
@@ -3362,9 +3412,12 @@ impl Updater {
             }
             Event::Checked(Ok(None)) => {
                 self.last_check = Some(chrono::Local::now().format("%H:%M:%S").to_string());
-                if self.failed_release.is_none() {
-                    self.notice = None;
+                if let Err(error) = self.clear_failure() {
+                    self.record(format!("Could not clear update failure: {error}"));
                 }
+                self.up_to_date_until = self
+                    .manual_check_in_flight
+                    .then_some(now + Duration::from_secs(6));
                 self.idle_from(now);
                 true
             }
@@ -3378,7 +3431,12 @@ impl Updater {
                 ..
             } => {
                 match self.write_manifest(&update) {
-                    Ok(()) => self.ready(update),
+                    Ok(()) => {
+                        if let Err(error) = self.clear_failure() {
+                            self.record(format!("Could not clear update failure: {error}"));
+                        }
+                        self.ready(update);
+                    }
                     Err(error) => {
                         self.storage.discard_attempts(&None);
                         cleanup_prepared(&update.target, None);
@@ -3996,6 +4054,46 @@ mod tests {
 
     fn newer() -> Scripted {
         Scripted::new(|| Ok(Some(release("v99.0.0"))))
+    }
+
+    #[test]
+    fn a_failure_clears_on_the_next_success() {
+        let (mut updater, _, _) = installed(Scripted::new(|| Ok(None)));
+        updater
+            .storage
+            .save_failure("v99.0.0", "Checksum mismatch")
+            .unwrap();
+        updater.failed_release = updater.storage.load_failure();
+        updater.notice = Some("Checksum mismatch".into());
+        updater.record("Checksum mismatch");
+        updater.manual_check_in_flight = true;
+        let now = Instant::now();
+        updater.apply(Event::Checked(Ok(None)), now, wake());
+        assert!(!updater.storage.failed_release().exists());
+        assert!(updater.failed_release_detail().is_none());
+        assert!(updater.notice().is_none());
+        assert!(updater.diagnostics().next().is_none());
+        assert!(updater.success_up_to_date(now + Duration::from_secs(5)));
+        assert!(!updater.success_up_to_date(now + Duration::from_secs(6)));
+
+        updater
+            .storage
+            .save_failure("v99.0.0", "Restart failed")
+            .unwrap();
+        updater.failed_release = updater.storage.load_failure();
+        updater.record("Restart failed");
+        let update = saved_update(&updater, "v100.0.0");
+        updater.apply(
+            Event::Downloaded {
+                attempt: updater.storage.attempt(),
+                outcome: Ok(update),
+            },
+            now,
+            wake(),
+        );
+        assert!(matches!(updater.status(), Status::Ready { .. }));
+        assert!(updater.failed_release_detail().is_none());
+        assert!(updater.diagnostics().next().is_none());
     }
 
     #[test]

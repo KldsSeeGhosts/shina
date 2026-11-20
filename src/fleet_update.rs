@@ -9,7 +9,7 @@ use std::{
 
 const HANDOFF_GRACE: Duration = Duration::from_secs(30);
 const HANDOFF_GRACE_MS: i64 = 30_000;
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,6 +308,10 @@ impl ServerUpdates {
         });
     }
     pub fn poll(&mut self, directory: &Path) -> bool {
+        self.poll_at(directory, Instant::now())
+    }
+
+    pub(crate) fn poll_at(&mut self, directory: &Path, now: Instant) -> bool {
         let before = self.status(None, &Value::Null);
         let release_changed = self.release.poll();
         let mut disconnected = false;
@@ -344,6 +348,13 @@ impl ServerUpdates {
                 self.phase = "restarting".into();
             }
         }
+        if self
+            .last_probe
+            .is_some_and(|probed| now.saturating_duration_since(probed) < PROBE_INTERVAL)
+        {
+            return release_changed || before != self.status(None, &Value::Null);
+        }
+        self.last_probe = Some(now);
         if let Some(outcome) = read_outcome(directory)
             && (!self.active() || self.id.is_some())
             && self.id.as_deref().is_none_or(|id| id == outcome.update_id)
@@ -352,14 +363,7 @@ impl ServerUpdates {
             self.outcome = Some(outcome);
             self.diagnostic = None;
         }
-        let probe_due = self
-            .last_probe
-            .is_none_or(|probed| probed.elapsed() >= PROBE_INTERVAL);
-        if !probe_due {
-            return release_changed || before != self.status(None, &Value::Null);
-        }
         if self.phase == "checking" && self.id.is_none() {
-            self.last_probe = Some(Instant::now());
             match request_file(&directory.join("updates/request.json")) {
                 Ok(Some(request)) => {
                     if let Some(id) = request["updateId"].as_str() {
@@ -380,7 +384,7 @@ impl ServerUpdates {
                 }
             }
         } else {
-            self.reconcile(directory, Instant::now());
+            self.reconcile(directory, now);
         }
         if !self.active() && self.host.is_none() {
             self.host = Some(Box::new(InstalledHost));
@@ -895,8 +899,8 @@ impl crate::model::State {
     }
     /// Machines whose server this run can move to the target release (KSG
     /// `collectServerUpdateTargets` on the client side).
-    fn server_update_targets(&self) -> usize {
-        let mut counted: std::collections::HashSet<String> = Default::default();
+    pub(crate) fn server_update_offers(&self) -> std::collections::BTreeMap<String, String> {
+        let mut offers = std::collections::BTreeMap::new();
         if let Some(client) = &self.client {
             for (id, remote) in &client.linked {
                 let current = remote.version().unwrap_or_else(|| {
@@ -922,7 +926,7 @@ impl crate::model::State {
                 }
                 let online = remote.commands.connected();
                 if skip_reason(online, &hello, &status, &target).is_none() {
-                    counted.insert(id.clone());
+                    offers.insert(id.clone(), target);
                 }
             }
         }
@@ -938,7 +942,7 @@ impl crate::model::State {
             .discovered_target(local_status)
             .ok()
             .flatten()
-            .is_some_and(|target| {
+            .filter(|target| {
                 !crate::update::is_newer(&target, env!("CARGO_PKG_VERSION"))
                     && local_status["runningVersion"]
                         .as_str()
@@ -953,13 +957,16 @@ impl crate::model::State {
                         .is_none()
                     })
             });
-        counted.len() + usize::from(local_service)
+        if let Some(target) = local_service {
+            offers.insert("local".into(), target);
+        }
+        offers
     }
     /// KSG `describeUpdateEverything`'s button summary, or None when nothing updates:
     /// "Update this app, 2 servers and 3 providers".
     pub fn update_everything_summary(&self) -> Option<String> {
         let local = self.updater.prepared_update().is_some();
-        let servers = self.server_update_targets();
+        let servers = self.server_update_offers().len();
         let providers = self.all_provider_candidates().len();
         let mut parts = Vec::new();
         if local {

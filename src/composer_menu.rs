@@ -254,9 +254,17 @@ pub(crate) fn poll_mention_search(s: &mut State, tx: &mut Tx) -> bool {
             let query = query.clone();
             let wake = s.wake.clone();
             std::thread::spawn(move || {
-                let result = crate::workspace_search::resolve_cwd(&cwd, &roots).map(|cwd| {
-                    crate::workspace_search::search(&cwd, &query, MENTION_PATH_LIMIT, None, false)
-                });
+                let result = crate::workspace_search::resolve_cwd(&cwd, &roots)
+                    .map_err(|error| error.to_string())
+                    .map(|cwd| {
+                        crate::workspace_search::search(
+                            &cwd,
+                            &query,
+                            MENTION_PATH_LIMIT,
+                            None,
+                            false,
+                        )
+                    });
                 let _ = txc.send((seq, result));
                 wake();
             });

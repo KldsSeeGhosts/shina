@@ -2,6 +2,52 @@ use super::*;
 use crate::model::{AccessMode, Status, Thread};
 
 #[test]
+fn live_child_updates_the_originating_collab_tool_after_spawn_completes() {
+    let mut client = Client::new(spec(SessionSource::New, "read-only"));
+    let mut thread = Thread::new(1);
+    let spawn = json!({"type":"collabAgentToolCall","id":"spawn","tool":"spawnAgent",
+        "receiverThreadIds":["child"],"prompt":"Read the docs"});
+    client.item(&spawn, false, true);
+    for event in std::mem::take(&mut client.events) {
+        thread.apply(event);
+    }
+    let runs = crate::agents::runs(&thread);
+    assert_eq!(runs[0].provider_id, Some("child"));
+    assert_eq!(runs[0].brief, "Read the docs");
+    assert_eq!(crate::agents::active_count(&thread), 1);
+
+    client.item(&spawn, true, true);
+    client
+        .child_notification(
+            "item/started",
+            &json!({"threadId":"child","item":{
+                "id":"read","type":"commandExecution","command":"git status"
+            }}),
+            "spawn",
+        )
+        .unwrap();
+    for event in std::mem::take(&mut client.events) {
+        thread.apply(event);
+    }
+    let runs = crate::agents::runs(&thread);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].activity, Some("git status"));
+    assert_eq!(runs[0].provider_id, Some("child"));
+    assert_eq!(crate::agents::active_count(&thread), 1);
+    client
+        .child_notification(
+            "turn/completed",
+            &json!({"threadId":"child","turn":{"status":"completed"}}),
+            "spawn",
+        )
+        .unwrap();
+    for event in std::mem::take(&mut client.events) {
+        thread.apply(event);
+    }
+    assert_eq!(crate::agents::active_count(&thread), 0);
+}
+
+#[test]
 fn user_input_questions_use_ksg_native_defaults_not_unoffered_extensions() {
     let mut client = Client::new(spec(SessionSource::New, "approval-required"));
     client.server_request(

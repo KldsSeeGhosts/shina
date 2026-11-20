@@ -1953,7 +1953,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 10,
+            version,
+            crate::database::SCHEMA_VERSION,
             "the schema gate is durable even when identity data rolls back"
         );
         let rows: i64 = connection
@@ -2364,7 +2365,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, crate::database::SCHEMA_VERSION);
         for table in ["task_operations", "task_input_intents"] {
             let exists: bool = connection
                 .query_row(
@@ -2408,7 +2409,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, crate::database::SCHEMA_VERSION);
         let operation: String = connection
             .query_row(
                 "SELECT payload FROM task_operations WHERE scope='fixture' AND request_key='key'",
@@ -2447,7 +2448,10 @@ mod tests {
         let directory = profile_dir("identity-newer-schema");
         let connection = Connection::open(directory.join("state.sqlite")).unwrap();
         connection
-            .execute_batch("CREATE TABLE untouched(value TEXT); PRAGMA user_version=11;")
+            .execute_batch(&format!(
+                "CREATE TABLE untouched(value TEXT); PRAGMA user_version={};",
+                crate::database::SCHEMA_VERSION + 1
+            ))
             .unwrap();
         drop(connection);
         let error = match Database::open(&directory) {

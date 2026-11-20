@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod acp;
+mod agents;
 mod antigravity;
 mod approval;
 mod assistant_citation;
@@ -94,6 +95,7 @@ mod timeline_position;
 mod tray;
 mod ui;
 mod update;
+mod update_status;
 mod usage_limits;
 mod vcs;
 mod visuals;

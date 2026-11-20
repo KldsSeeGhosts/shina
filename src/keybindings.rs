@@ -2684,6 +2684,7 @@ mod tests {
         ));
 
         // Rebinding thread.undo works through the registry.
+        state.current_mut().status = crate::model::Status::Ready;
         let id = state.current().id;
         state.pin_thread(id);
         let pinned_after_action = state.current().pinned();

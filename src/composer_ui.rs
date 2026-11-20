@@ -734,6 +734,7 @@ pub(super) fn changed(s: &mut State) {
     t.typing_guard.on_type(std::time::Instant::now());
     t.update_submission_error();
     s.ensure_composer_commands();
+    s.mark_device_ui_dirty();
 }
 
 pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx) {

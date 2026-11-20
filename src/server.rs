@@ -41,6 +41,7 @@ struct Shared {
     database: crate::database::Database,
     connections: Arc<tokio::sync::Semaphore>,
     calls: mpsc::Sender<Call>,
+    command_wake: rune::Waker,
     snapshots: watch::Receiver<Arc<Value>>,
     history_streams: Arc<Mutex<crate::history::Streams>>,
     client_pids: Arc<Mutex<HashMap<String, Option<u32>>>>,
@@ -65,9 +66,10 @@ impl Drop for Upload {
     }
 }
 
-/// Project root paths from the current snapshot, for workspace-bound commands.
-fn project_roots(snapshot: &Value) -> Vec<std::path::PathBuf> {
-    snapshot["state"]["index"]["projects"]
+/// The notification watch carries a cursor, not the committed registry.
+fn project_roots(database: &crate::database::Database) -> Result<Vec<PathBuf>, String> {
+    Ok(database
+        .committed_projects()?
         .as_array()
         .map(|projects| {
             projects
@@ -76,7 +78,20 @@ fn project_roots(snapshot: &Value) -> Vec<std::path::PathBuf> {
                 .map(std::path::PathBuf::from)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
+}
+
+fn command_response(id: Value, result: Result<Value, String>) -> Value {
+    if let Some(blocker) = result
+        .as_ref()
+        .err()
+        .and_then(|error| crate::review::DiffBlocker::from_wire_error(error))
+    {
+        return json!({"jsonrpc":"2.0","id":id,"error":{
+            "code":-32000,"message":blocker.to_string(),"data":{"diffBlocker":blocker}
+        }});
+    }
+    protocol::response(id, result)
 }
 
 fn authorized(shared: &Shared, headers: &HeaderMap, method: &str) -> Option<String> {
@@ -1171,8 +1186,8 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     if shared.remote { Err("Create pairing codes on the host.".into()) }
                     else { shared.pairing.lock().expect("pairing").create_scoped(crate::lifecycle::now(), params.get("args").unwrap_or(params)["peer"] == true) }
                 } else if matches!(method, "peer.link" | "peer.list" | "peer.unlink") {
-                    if method == "peer.link" {
-                        crate::model::warm_repository_records(&snapshots.borrow()["state"]["index"]["projects"]);
+                    if method == "peer.link" && let Ok(projects) = shared.database.committed_projects() {
+                        crate::model::warm_repository_records(&projects);
                     }
                     // Host maintenance only. A peer-delegate credential can never link onward.
                     let args = params.get("args").unwrap_or(params);
@@ -1214,18 +1229,12 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         let image_only = args["imageOnly"] == true;
                         let database = shared.database.clone();
                         let device = device.clone();
-                        let snapshots = shared.snapshots.clone();
+                        let server_id = shared.discovery.server_id.clone();
                         tokio::task::spawn_blocking(move || {
                             database.authorize(&device, "workspace.searchEntries", &json!({}))?;
-                            let roots: Vec<std::path::PathBuf> =
-                                snapshots.borrow()["state"]["index"]["projects"]
-                                    .as_array()
-                                    .map(|projects| projects.iter()
-                                        .filter_map(|project| project["path"].as_str())
-                                        .map(std::path::PathBuf::from)
-                                        .collect())
-                                    .unwrap_or_default();
-                            let cwd = crate::workspace_search::resolve_cwd(&cwd, &roots)?;
+                            let roots = project_roots(&database)?;
+                            let cwd = crate::workspace_search::resolve_cwd(&cwd, &roots)
+                                .map_err(|error| error.on_server(&server_id).wire_error())?;
                             let result = crate::workspace_search::search(
                                 &cwd, &query, limit, kind.as_deref(), image_only,
                             );
@@ -1244,30 +1253,24 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                         let path = args["path"].as_str().unwrap_or("").to_string();
                         let database = shared.database.clone();
                         let device = device.clone();
-                        let snapshots = shared.snapshots.clone();
                         let directory = shared.directory.clone();
                         tokio::task::spawn_blocking(move || {
                             database.authorize(&device, "workspace.readFile", &json!({}))?;
-                            let snapshot = snapshots.borrow().clone();
-                            let roots: Vec<std::path::PathBuf> = snapshot["state"]["index"]["projects"]
-                                .as_array()
-                                .map(|projects| projects.iter()
-                                    .filter_map(|project| project["path"].as_str())
-                                    .map(std::path::PathBuf::from)
-                                    .collect())
-                                .unwrap_or_default();
-                            // Skill instruction paths this server reported may
-                            // live outside project roots; only those exact
-                            // paths bypass the root check.
-                            let skills: Vec<std::path::PathBuf> = snapshot["state"]["threads"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .flat_map(|thread| thread["skills"].as_array().into_iter().flatten())
-                                .filter_map(|skill| skill["path"].as_str())
-                                .map(std::path::PathBuf::from)
-                                .collect();
-                            let resolved = crate::workspace_search::resolve_read(&cwd, &path, &roots, &skills)?;
+                            let roots = project_roots(&database)?;
+                            let resolved = match crate::workspace_search::resolve_read(&cwd, &path, &roots, &[]) {
+                                Ok(path) => path,
+                                Err(error) if !std::path::Path::new(&path).is_absolute() => return Err(error),
+                                Err(_) => {
+                                    // Only exact paths reported as skill instructions may
+                                    // bypass the project root check.
+                                    let snapshot = database.committed_snapshot()?;
+                                    let skills = snapshot["state"]["threads"].as_array().into_iter().flatten()
+                                        .flat_map(|thread| thread["skills"].as_array().into_iter().flatten())
+                                        .filter_map(|skill| skill["path"].as_str()).map(PathBuf::from)
+                                        .collect::<Vec<_>>();
+                                    crate::workspace_search::resolve_read(&cwd, &path, &roots, &skills)?
+                                }
+                            };
                             let name = resolved
                                 .file_name()
                                 .unwrap_or_default()
@@ -1291,11 +1294,12 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             Ok(input) => {
                                 let database = shared.database.clone();
                                 let device = device.clone();
-                                let snapshots = shared.snapshots.clone();
+                                let server_id = shared.discovery.server_id.clone();
                                 tokio::task::spawn_blocking(move || {
                                     database.authorize(&device, "review.getBranchCommits", &json!({}))?;
-                                    let roots = project_roots(&snapshots.borrow());
-                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)?;
+                                    let roots = project_roots(&database)?;
+                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)
+                                        .map_err(|error| error.on_server(&server_id).wire_error())?;
                                     let result = crate::review::get_branch_commits(
                                         &input,
                                         &crate::vcs::GitContext::default(),
@@ -1319,15 +1323,16 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             Ok(input) => {
                                 let database = shared.database.clone();
                                 let device = device.clone();
-                                let snapshots = shared.snapshots.clone();
+                                let server_id = shared.discovery.server_id.clone();
                                 tokio::task::spawn_blocking(move || {
                                     database.authorize(&device, "review.getDiffPreview", &json!({}))?;
-                                    let roots = project_roots(&snapshots.borrow());
-                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)?;
-                                    let result = crate::review::get_diff_preview(
+                                    let roots = project_roots(&database)?;
+                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)
+                                        .map_err(|error| error.on_server(&server_id).wire_error())?;
+                                    let result = crate::review::blocked_diff_preview(
                                         &input,
                                         &crate::vcs::GitContext::default(),
-                                    )?;
+                                    ).map_err(crate::review::DiffBlocker::wire_error)?;
                                     database.authorize(&device, "review.getDiffPreview", &json!({}))?;
                                     serde_json::to_value(result).map_err(|_| {
                                         "Could not encode the diff preview result.".into()
@@ -1346,12 +1351,13 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                             Ok(input) => {
                                 let database = shared.database.clone();
                                 let device = device.clone();
-                                let snapshots = shared.snapshots.clone();
+                                let server_id = shared.discovery.server_id.clone();
                                 let state_dir = shared.directory.clone();
                                 tokio::task::spawn_blocking(move || {
                                     database.authorize(&device, "review.getDiffFileContents", &json!({}))?;
-                                    let roots = project_roots(&snapshots.borrow());
-                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)?;
+                                    let roots = project_roots(&database)?;
+                                    crate::review::resolve_workspace_cwd(&input.cwd, &roots)
+                                        .map_err(|error| error.on_server(&server_id).wire_error())?;
                                     let result = crate::review::get_diff_file_contents(
                                         &input,
                                         &crate::vcs::GitContext::default(),
@@ -1834,6 +1840,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     if shared.calls.try_send(Call { device:device.clone(),command,reply }).is_err() {
                         Err("Runtime command queue is full. Retry the same commandId.".into())
                     } else {
+                        (shared.command_wake)();
                         match tokio::time::timeout(Duration::from_secs(30), response).await {
                             Ok(Ok(result)) => result,
                             _ => Err("Runtime unavailable. Resolve the receipt before retrying.".into())
@@ -1853,7 +1860,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     value["instanceId"] = json!(shared.discovery.instance_id);
                 }
                 crate::outbox::peer_ack_boundary(&shared.directory, method, &result);
-                if !send(&mut socket, protocol::response(id, result)).await { break; }
+                if !send(&mut socket, command_response(id, result)).await { break; }
             }
             changed = snapshots.changed() => {
                 if changed.is_err() { break; }
@@ -2017,7 +2024,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
     let wake: rune::Waker = Arc::new(move || {
         let _ = wake_send.try_send(());
     });
-    let mut runtime = RuntimeState::open(directory.clone(), wake)?;
+    let mut runtime = RuntimeState::open(directory.clone(), wake.clone())?;
     crate::store::write_atomic(&version_path, env!("CARGO_PKG_VERSION").as_bytes())
         .map_err(|e| e.to_string())?;
     let (calls, mut incoming) = mpsc::channel::<Call>(32);
@@ -2063,6 +2070,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         database: runtime.database.clone().expect("durable runtime"),
         connections: Arc::new(tokio::sync::Semaphore::new(32)),
         calls,
+        command_wake: wake,
         snapshots: receive,
         history_streams: history_streams.clone(),
         client_pids: Arc::default(),
@@ -2356,6 +2364,14 @@ mod tests {
             minor: u32,
             configure: impl FnOnce(&mut RuntimeState),
         ) -> Self {
+            Self::configured_notifications(name, minor, false, configure).await
+        }
+        async fn configured_notifications(
+            name: &str,
+            minor: u32,
+            production_notifications: bool,
+            configure: impl FnOnce(&mut RuntimeState),
+        ) -> Self {
             let directory = crate::store::directory().unwrap().join(name);
             std::fs::create_dir_all(&directory).unwrap();
             let database = crate::database::Database::open(&directory).unwrap();
@@ -2391,7 +2407,11 @@ mod tests {
                     while !stopping.load(Ordering::Acquire) {
                         if let Ok(call) = incoming.try_recv() {
                             runtime.accept_call(call);
-                            let snapshot = Arc::new(runtime.snapshot());
+                            let snapshot = Arc::new(if production_notifications {
+                                runtime.notification()
+                            } else {
+                                runtime.snapshot()
+                            });
                             worker_streams
                                 .lock()
                                 .expect("history streams")
@@ -2402,7 +2422,11 @@ mod tests {
                             std::thread::sleep(Duration::from_millis(2));
                         }
                         if runtime.poll_prepared_calls() {
-                            let snapshot = Arc::new(runtime.snapshot());
+                            let snapshot = Arc::new(if production_notifications {
+                                runtime.notification()
+                            } else {
+                                runtime.snapshot()
+                            });
                             worker_streams
                                 .lock()
                                 .expect("history streams")
@@ -2416,7 +2440,11 @@ mod tests {
                             injected = true;
                         }
                         if injected || runtime.test_peer_pump() {
-                            let snapshot = Arc::new(runtime.snapshot());
+                            let snapshot = Arc::new(if production_notifications {
+                                runtime.notification()
+                            } else {
+                                runtime.snapshot()
+                            });
                             worker_streams
                                 .lock()
                                 .expect("history streams")
@@ -2452,6 +2480,7 @@ mod tests {
                 database,
                 connections: Arc::new(tokio::sync::Semaphore::new(32)),
                 calls,
+                command_wake: Arc::new(|| {}),
                 snapshots: receive,
                 history_streams,
                 client_pids: Arc::default(),
@@ -5423,13 +5452,15 @@ mod tests {
     }
 
     #[test]
-    fn review_commands_round_trip_through_a_project_root() {
+    fn diff_resolves_for_a_project_thread_and_a_registered_worktree() {
         if !crate::vcs::git_available() {
             eprintln!("skipping test: git is not on PATH");
             return;
         }
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let fixture = Fixture::new("review-rpc").await;
+            let fixture =
+                Fixture::configured_notifications("review-rpc", protocol::MINOR, true, |_| {})
+                    .await;
             let profile = fixture.shared.directory.join("client");
             let link = fixture.link(&profile).await;
 
@@ -5489,11 +5520,43 @@ mod tests {
             assert_eq!(put["status"], "accepted", "{put}");
             let expected = crate::projects::normalize_path(&repo);
             wait_until(|| {
-                fixture.shared.snapshots.borrow()["state"]["index"]["projects"]
-                    .as_array()
-                    .is_some_and(|projects| projects.iter().any(|p| p["path"] == json!(expected)))
+                let watch = fixture.shared.snapshots.borrow();
+                watch["seq"].as_u64().is_some_and(|seq| seq > 0) && watch.get("state").is_none()
             })
             .await;
+            let roots = project_roots(&fixture.shared.database).unwrap();
+            assert!(roots.contains(&expected));
+            let worktree = fixture.shared.directory.join("other-checkout");
+            run_git(&[
+                "worktree",
+                "add",
+                "-qb",
+                "review-worktree",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ]);
+            std::fs::write(worktree.join("file.txt"), "base\nworktree change\n").unwrap();
+            for cwd in [&repo, &worktree] {
+                let cwd = cwd.to_str().unwrap();
+                let direct = crate::review::resolve_workspace_cwd(cwd, &roots).unwrap();
+                assert_eq!(
+                    direct,
+                    crate::workspace_search::resolve_cwd(cwd, &roots).unwrap()
+                );
+                let diff =
+                    crate::client::remote_rpc(&link, "review.getDiffPreview", json!({"cwd": cwd}))
+                        .await
+                        .unwrap();
+                assert!(!diff["sources"].as_array().unwrap().is_empty(), "{diff}");
+                let search = crate::client::remote_rpc(
+                    &link,
+                    "workspace.searchEntries",
+                    json!({"cwd": cwd, "query":"file.txt"}),
+                )
+                .await
+                .unwrap();
+                assert!(search.to_string().contains("file.txt"), "{search}");
+            }
 
             // review.getBranchCommits lists the feature commits, newest first.
             let commits = crate::client::remote_rpc(

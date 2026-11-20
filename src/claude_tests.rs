@@ -4,6 +4,33 @@ use crate::model::{AccessMode, Status, Thread};
 const SESSION: &str = "40000000-0000-4000-8000-000000000031";
 
 #[test]
+fn claude_task_tracks_its_nested_tool_activity_while_running() {
+    let mut client = client("full-access");
+    let mut thread = Thread::new(1);
+    client.tool_start(
+        &json!({"id":"task","name":"Task","input":{
+            "subagent_type":"Explore","prompt":"Find entry points"
+        }}),
+        "",
+        true,
+    );
+    client.tool_start(
+        &json!({"id":"nested","name":"Read","input":{"file_path":"src/main.rs"}}),
+        "task",
+        true,
+    );
+    for record in std::mem::take(&mut client.events) {
+        thread.apply(record);
+    }
+    let runs = crate::agents::runs(&thread);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].tool_id, "task");
+    assert_eq!(runs[0].brief, "Find entry points");
+    assert_eq!(runs[0].activity, Some("src/main.rs"));
+    assert_eq!(runs[0].state, crate::agents::AgentState::Working);
+}
+
+#[test]
 fn native_image_budget_falls_back_to_the_attachment_path() {
     let file = crate::attachments::attach_bytes("pixel.png", {
         let mut png = std::io::Cursor::new(Vec::new());
