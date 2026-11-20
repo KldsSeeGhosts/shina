@@ -532,10 +532,12 @@ impl State {
         }
         self.captain_inbox = events;
         self.captain_waits = waits;
-        // Crew-outcome events mirror their report: a delivered report's event
-        // is settled no matter what the saved event says, and a report
-        // captured before the inbox existed gets its mirror now. The report
-        // keeps its own frozen policy and delivered flag.
+        // Crew-outcome events and their reports reconcile both ways on
+        // restore. A report saved as delivered settles its open event; a
+        // report captured before the inbox existed gets its mirror now; and
+        // the surviving event's state writes the report's `hold_delivery`
+        // mirror so a held record never reads as releasable before the first
+        // poll. The report keeps its own frozen policy and delivered flag.
         for index in 0..self.captain_reports.len() {
             let report = &self.captain_reports[index];
             let position = self
@@ -550,6 +552,18 @@ impl State {
                     self.captain_inbox[position].state = InboxState::Accepted;
                 }
                 _ => {}
+            }
+        }
+        for index in 0..self.captain_reports.len() {
+            let state = self
+                .captain_inbox
+                .iter()
+                .find(|e| {
+                    e.id == self.captain_reports[index].id && e.kind == InboxKind::CrewOutcome
+                })
+                .map(|e| e.state);
+            if let Some(state) = state {
+                self.captain_reports[index].hold_delivery = state == InboxState::Held;
             }
         }
         for event in &self.captain_inbox {
@@ -575,9 +589,68 @@ impl State {
         changed
     }
 
+    /// The single canonical transition for a report's delivery state. The
+    /// `crew_outcome` event moves to `state` and the report's serde mirror
+    /// follows immediately, so no read ever sees the two disagree. A report
+    /// captured since the last poll gets its mirror event here first. A
+    /// terminal event is never reopened. Reports whether the event actually
+    /// changed state; a same-state transition is a no-op.
+    pub(crate) fn transition_report_event(&mut self, report_id: &str, state: InboxState) -> bool {
+        if !self
+            .captain_inbox
+            .iter()
+            .any(|e| e.id == report_id && e.kind == InboxKind::CrewOutcome)
+            && let Some(report) = self
+                .captain_reports
+                .iter()
+                .find(|report| report.id == report_id)
+        {
+            let event = report_event(report);
+            self.captain_inbox.push(event);
+        }
+        let Some(position) = self
+            .captain_inbox
+            .iter()
+            .position(|e| e.id == report_id && e.kind == InboxKind::CrewOutcome)
+        else {
+            return false;
+        };
+        let event = &mut self.captain_inbox[position];
+        if event.state.terminal() {
+            return false;
+        }
+        let moved = event.state != state;
+        if moved {
+            event.state = state;
+            event.updated_at = lifecycle::now();
+        }
+        if let Some(report) = self
+            .captain_reports
+            .iter_mut()
+            .find(|report| report.id == report_id)
+        {
+            report.delivered = report.delivered || state == InboxState::Accepted;
+            report.hold_delivery = !report.delivered && state == InboxState::Held;
+        }
+        moved
+    }
+
+    /// The canonical read of a report's delivery event. The report's serde
+    /// `delivered`/`hold_delivery` fields mirror this; producers and recovery
+    /// always consult the event itself.
+    pub(crate) fn report_event_state(&self, report_id: &str) -> Option<InboxState> {
+        self.captain_inbox
+            .iter()
+            .find(|e| e.id == report_id && e.kind == InboxKind::CrewOutcome)
+            .map(|e| e.state)
+    }
+
     /// One logical event per durable report, plus accepted-history reconcile
-    /// for every kind. A terminal event never moves again; report delivery
-    /// only advances `pending`/`held` records.
+    /// for every kind. The `crew_outcome` event is the canonical record of a
+    /// report's delivery: acceptance evidence moves an open event to
+    /// `accepted`, and the report's own `delivered`/`hold_delivery` fields are
+    /// mirrors written back here and nowhere else. A terminal event never
+    /// moves again; report delivery only advances `pending`/`held` records.
     fn sync_inbox_events(&mut self, now: u64) -> bool {
         let mut changed = false;
         for index in 0..self.captain_reports.len() {
@@ -593,19 +666,36 @@ impl State {
                 .expect("crew report event");
             let report = &self.captain_reports[index];
             let event = &mut self.captain_inbox[position];
-            if event.state.terminal() {
-                continue;
+            if !event.state.terminal() {
+                // Acceptance evidence settles an open event the same way the
+                // report reconciler worked: a delivery id in any of the
+                // Captain's homes' accepted history acknowledges it.
+                let accepted = self
+                    .threads
+                    .iter()
+                    .filter(|thread| thread.captain_home && thread.captain == Some(report.captain))
+                    .any(|thread| {
+                        thread
+                            .accepted_deliveries
+                            .iter()
+                            .any(|seen| *seen == event.id)
+                    });
+                if accepted {
+                    event.state = InboxState::Accepted;
+                    event.updated_at = now;
+                    changed = true;
+                }
             }
-            let next = if report.delivered {
-                InboxState::Accepted
-            } else if report.hold_delivery {
-                InboxState::Held
-            } else {
-                InboxState::Pending
-            };
-            if event.state != next {
-                event.state = next;
-                event.updated_at = now;
+            // Mirror the canonical event state onto the report's serde fields.
+            // Delivery only ever settles: a cancelled or superseded event on a
+            // deleted Captain never flips a delivered record back, and `held`
+            // simply follows the event's Held state for an undelivered one.
+            let delivered = report.delivered || event.state == InboxState::Accepted;
+            let held = !delivered && event.state == InboxState::Held;
+            let report = &mut self.captain_reports[index];
+            if report.delivered != delivered || report.hold_delivery != held {
+                report.delivered = delivered;
+                report.hold_delivery = held;
                 changed = true;
             }
         }
@@ -981,19 +1071,23 @@ impl State {
             }
             released |= task.release_result_notifications();
         }
-        let homes: Vec<Option<usize>> = self
-            .captain_reports
+        // Reports release through the same canonical event transition as
+        // every other held kind, driven off the event ledger itself rather
+        // than the report mirror. Context-policy events keep their hold under
+        // unattended recovery, so they are excluded here and below alike.
+        let report_releases: Vec<String> = self
+            .captain_inbox
             .iter()
-            .map(|report| self.captain_home(report.captain))
+            .filter(|event| {
+                event.kind == InboxKind::CrewOutcome
+                    && self.captain_home(event.captain) == Some(parent_thread_id)
+                    && event.policy != ReportPolicy::Context
+                    && event.state == InboxState::Held
+            })
+            .map(|event| event.id.clone())
             .collect();
-        for (index, report) in self.captain_reports.iter_mut().enumerate() {
-            if homes[index] == Some(parent_thread_id)
-                && report.policy != ReportPolicy::Context
-                && report.hold_delivery
-            {
-                report.hold_delivery = false;
-                released = true;
-            }
+        for id in report_releases {
+            released |= self.transition_report_event(&id, InboxState::Pending);
         }
         released |= self.captain_question_answers.iter().any(|answer| {
             answer.hold_delivery
@@ -1499,7 +1593,7 @@ impl State {
 
 /// The inbox mirror of one durable crew report: same id, same frozen policy,
 /// same turn/agent source.
-fn report_event(report: &crew_reports::CrewReport) -> InboxEvent {
+pub(crate) fn report_event(report: &crew_reports::CrewReport) -> InboxEvent {
     let state = if report.delivered {
         InboxState::Accepted
     } else if report.hold_delivery {
