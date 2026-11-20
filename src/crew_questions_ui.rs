@@ -636,11 +636,6 @@ mod tests {
         let ignore = policy_report(&mut rt, ReportPolicy::Ignore);
         rt.invalidate();
         rt.frame(1.0);
-        let element = |key: &str| {
-            rt.elements()
-                .into_iter()
-                .find(|e| e.key.as_deref() == Some(key))
-        };
         // Context waits and keeps its question visible; Ignore never sends and
         // still keeps the question. Both carry the snapshot tag.
         for (page, (rid, words)) in [

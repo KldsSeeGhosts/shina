@@ -237,19 +237,28 @@ fn open_activity_source(s: &mut State, tx: &mut Tx, server: String, captain: usi
     let kind = entry["kind"].as_str().unwrap_or("");
     if kind == "crew_question" {
         let rid = entry["reportId"].as_str().unwrap_or("").to_string();
-        let card_drawn = !rid.is_empty()
+        let question_index = (!rid.is_empty()
             && s.captain_phase(captain) == crate::model::CaptainPhase::Active
-            && s.captain_home(captain).is_some()
-            && s.open_crew_questions(captain, QuestionRecipient::User)
+            && s.captain_home(captain).is_some())
+        .then(|| {
+            s.open_crew_questions(captain, QuestionRecipient::User)
                 .iter()
-                .any(|view| view.report_id == rid);
-        if card_drawn {
+                .position(|view| view.report_id == rid)
+        })
+        .flatten();
+        if let Some(q_idx) = question_index {
             let home = s.captain_home(captain).expect("home checked above");
             if s.current().id != home
                 && let Some(index) = s.threads.iter().position(|t| t.id == home)
             {
                 s.show_thread(index);
             }
+            let live_count = s
+                .attention()
+                .into_iter()
+                .filter(|item| super::crew_ui::needs_you_item(s, home, item))
+                .count();
+            s.needs_you_page = live_count + q_idx;
             tx.scroll_into_view(format!("needs-you-report-{rid}"));
             tx.focus(format!("needs-you-report-{rid}-text"), true);
             return;
@@ -1190,6 +1199,10 @@ mod tests {
     fn a_crew_question_row_opens_its_question_card() {
         let mut rt = runtime(620.0);
         brief(&mut rt);
+        // At 620 pt the Inspector covers the chat lane; close it to inspect the home's
+        // needs-you bar, then advance the unified pager past the demo's live approval.
+        let key = rt.state.panel_key();
+        rt.state.right_panels.close(&key);
         rt.state.demo = false;
         let w0 = worker(&rt, "Crew worker 0");
         let rid = report(
@@ -1197,6 +1210,8 @@ mod tests {
             w0,
             Some(json!({"text":"Which branch?","recipient":"user"})),
         );
+        // `brief()` seeds two live approvals (pages 0 and 1); the report question is page 2.
+        rt.state.needs_you_page = 2;
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);

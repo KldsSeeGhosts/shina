@@ -193,6 +193,7 @@ fn thread_title(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         .h(28.0)
         .px(8.0)
         .gap(8.0)
+        .center_y()
         .radius(8.0)
         .min_w(0.0)
         .shrink()
@@ -211,8 +212,15 @@ fn thread_title(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
             let id = s.current().id;
             s.row_menu = Some(RowTarget::Thread(id));
             s.row_menu_at = Some((at.x, at.y));
-        })
-        .child(tab_icon(s, p, t).a11y_hidden());
+        });
+    // Captain home and crew worker first segments already carry the captain's 16 pt face;
+    // only prepend `tab_icon` when the first segment does not.
+    let first_has_face = (t.crew_captain.is_some()
+        && t.crew_captain.is_some_and(|c| s.captains.get(c).is_some()))
+        || (s.is_captain_home(t) && t.captain.is_some_and(|c| s.captains.get(c).is_some()));
+    if !first_has_face {
+        title = title.child(tab_icon(s, p, t).a11y_hidden());
+    }
     if let Some(first) = first {
         title = title.child(first).child(
             icon("chevron-right", p.faint)

@@ -1253,14 +1253,18 @@ pub(super) fn needs_you(s: &State, p: Palette, lane: f32) -> Option<El> {
     if let Some(line) = captain_line {
         card_stack = card_stack.child(line);
     }
-    Some(
-        col()
-            .key("needs-you")
-            .role("region")
-            .label("Needs you")
-            .shrink()
-            .child(card_stack),
-    )
+    let is_form = total > 0 && s.needs_you_page.min(total - 1) >= items.len();
+    let mut region = col()
+        .key("needs-you")
+        .role("region")
+        .label("Needs you")
+        .shrink();
+    if is_form {
+        region = region.max_h(220.0).scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    }
+    Some(region.child(card_stack))
 }
 
 pub(super) fn needs_you_active_is_form(s: &State) -> bool {
