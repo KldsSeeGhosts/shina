@@ -7,7 +7,7 @@ use crate::{
 use rune::Waker;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     net::TcpStream,
     path::PathBuf,
@@ -46,12 +46,14 @@ pub(crate) fn probe_live(agent: &Agent) -> Result<Value, String> {
 }
 
 fn probe_uncached(agent: &Agent) -> Result<Value, String> {
-    let mut child = agent
-        .process()?
+    let mut command = agent.process()?;
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    // The same owned launch as sessions: no console window on Windows and the
+    // job object reaps agent descendants on every return path.
+    let mut child = crate::process::Process::spawn(&mut command)
         .map_err(|error| format!("Could not start ACP harness {}: {error}", agent.id))?;
     let mut stdin = child
         .stdin
@@ -61,12 +63,18 @@ fn probe_uncached(agent: &Agent) -> Result<Value, String> {
         .stdout
         .take()
         .ok_or("ACP probe could not open stdout.")?;
+    // KSG agentProfile: Devin's initialize advertises client terminals and the
+    // cognition.ai capability meta in probes too.
+    let mut client_capabilities =
+        json!({"fs":{"readTextFile":false,"writeTextFile":false},"terminal":agent.id == "devin"});
+    if agent.id == "devin" {
+        client_capabilities["_meta"] = crate::devin::client_capabilities_meta();
+    }
     let request = json!({
         "jsonrpc":"2.0","id":"shina-probe","method":"initialize",
         "params":{"protocolVersion":1,
             "clientInfo":{"name":"Shina","version":env!("CARGO_PKG_VERSION")},
-            "clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},
-                "terminal":false}}
+            "clientCapabilities":client_capabilities}
     });
     stdin
         .write_all(format!("{request}\n").as_bytes())
@@ -121,10 +129,19 @@ pub(crate) fn start_command(
     wake: Waker,
     command: std::process::Command,
 ) -> Result<Pi, String> {
+    start_with_command(agent, start, wake, |_| Ok(command))
+}
+
+pub(crate) fn start_with_command(
+    agent: Agent,
+    start: Start,
+    wake: Waker,
+    command: impl FnOnce(&std::path::Path) -> Result<std::process::Command, String> + Send + 'static,
+) -> Result<Pi, String> {
     if matches!(start.source, SessionSource::Fork(_)) {
         return Err("ACP conversation forks are not supported. Start a new thread instead.".into());
     }
-    if start.link.is_none() {
+    if !start.metadata_only && start.link.is_none() {
         return Err("ACP requires Shina's MCP bridge. Retry after the bridge is available.".into());
     }
     let claude = crate::composer_skills::is_claude(&agent);
@@ -147,6 +164,10 @@ pub(crate) fn start_command(
         session_key,
         move |input, events, wake, stopped, owner| {
             let action = || {
+                let command = command(&start.workspace)?;
+                if stopped.load(Ordering::Acquire) {
+                    return Ok(());
+                }
                 let skills = if claude {
                     crate::composer_skills::claude_config(inherit_config)
                         .map(|config| {
@@ -199,6 +220,12 @@ struct Permission {
     question: Option<Value>,
 }
 
+/// A `terminal/wait_for_exit` request answered once the child actually exits.
+struct TerminalWaiter {
+    id: Value,
+    terminal: String,
+}
+
 /// KSG Code's opt-in ACP extension. Standard ACP v1 does not admit active steering.
 fn supports_active_steering(meta: &Value) -> bool {
     let advertisement = &meta["t3code/steering"];
@@ -246,15 +273,31 @@ struct Client {
     /// The real `agy` CLI wraps setMode with antigravityCliSessionMode; a
     /// harnesses.json override is an arbitrary executable and does not.
     antigravity_cli: bool,
+    /// A gateway URL was configured for this session (KSG authMethod "gateway").
+    antigravity_gateway: bool,
+    /// The configured gateway model list; non-empty enables KSG's gateway branch.
+    gateway_models: String,
+    /// The adapter-owned `reasoningEffort` pick, re-applied to each route select.
+    gateway_effort: Option<String>,
+    /// `setup.models` from session start: legacy combined ids for gateway row lookup.
+    legacy_models: Value,
     /// The session's ACP `modes` block, for KSG's setMode modeState.
     modes: Value,
     file_reads: bool,
+    /// KSG `registryAgentId === "devin"`: normalization, subagent routing and
+    /// `shellCommands` client terminals.
+    devin: bool,
+    /// Child session ids Devin has introduced, via reroute metadata or subagent tools.
+    devin_children: HashSet<String>,
+    terminals: crate::devin::Terminals,
+    terminal_waiters: Vec<TerminalWaiter>,
 }
 
 impl Client {
     fn new(start: Start) -> Self {
         let awareness_sent = start.context_sent;
         let restart_steering = !matches!(start.id.as_str(), "github-copilot-cli" | "copilot");
+        let devin = start.id == "devin" && !start.metadata_only;
         Self {
             start,
             capabilities: Value::Null,
@@ -289,8 +332,16 @@ impl Client {
             thinking_levels: HashMap::new(),
             pending_thinking: None,
             antigravity_cli: false,
+            antigravity_gateway: false,
+            gateway_models: String::new(),
+            gateway_effort: None,
+            legacy_models: Value::Null,
             modes: Value::Null,
             file_reads: false,
+            devin,
+            devin_children: HashSet::new(),
+            terminals: crate::devin::Terminals::default(),
+            terminal_waiters: vec![],
         }
     }
 
@@ -324,7 +375,8 @@ impl Client {
         // qualified 1.4.5 release; writes stay off so the agent keeps its diff edits.
         let (client_info, read_files) = if self.antigravity {
             let version = self.antigravity_version.as_deref();
-            self.file_reads = !crate::antigravity::is_qualified_release(version);
+            self.file_reads =
+                !self.start.metadata_only && !crate::antigravity::is_qualified_release(version);
             (crate::antigravity::client_info(version), self.file_reads)
         } else {
             (
@@ -332,11 +384,22 @@ impl Client {
                 false,
             )
         };
-        self.request("initialize", json!({
-            "protocolVersion":1,
-            "clientInfo":client_info,
-            "clientCapabilities":{"fs":{"readTextFile":read_files,"writeTextFile":false},"terminal":false}
-        }), json!({"type":"initialize"}));
+        // KSG agentProfile: Devin gets client terminals plus the cognition.ai
+        // capability hints that switch on subagent context and message grouping.
+        let mut client_capabilities =
+            json!({"fs":{"readTextFile":read_files,"writeTextFile":false},"terminal":self.devin});
+        if self.devin {
+            client_capabilities["_meta"] = crate::devin::client_capabilities_meta();
+        }
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion":1,
+                "clientInfo":client_info,
+                "clientCapabilities":client_capabilities
+            }),
+            json!({"type":"initialize"}),
+        );
     }
 
     fn reply(&mut self, request: &Value, data: Value) {
@@ -372,6 +435,9 @@ impl Client {
     }
 
     fn mcp_servers(&self) -> Result<Value, String> {
+        if self.start.metadata_only {
+            return Ok(json!([]));
+        }
         let host = self
             .start
             .link
@@ -402,7 +468,9 @@ impl Client {
                 let id = record["params"]["sessionId"]
                     .as_str()
                     .ok_or("ACP update has no sessionId.")?;
-                if self.session.as_deref().is_some_and(|session| session != id) {
+                if self.session.as_deref().is_some_and(|session| session != id)
+                    && !(self.devin && self.devin_children.contains(id))
+                {
                     return Err("ACP agent sent an update for another session.".into());
                 }
                 if let SessionSource::Resume(expected) = &self.start.source
@@ -411,7 +479,41 @@ impl Client {
                 {
                     return Err("ACP agent replayed another session.".into());
                 }
-                self.update(&record["params"]["update"]);
+                if self.devin {
+                    // KSG's adapter order: resolve embedded terminal content on the raw
+                    // notification, then normalizeDevinSessionUpdate reroutes children.
+                    let mut resolved = record["params"].clone();
+                    if let Some(content) = resolved["update"]["content"].as_array_mut() {
+                        for part in content.iter_mut() {
+                            if part["type"] == "terminal" {
+                                let terminal = part["terminalId"].as_str().unwrap_or("");
+                                let text = self
+                                    .terminals
+                                    .output_snapshot(id, terminal)
+                                    .unwrap_or_else(|| format!("[terminal {terminal}]"));
+                                *part = json!({"type":"content",
+                                    "content":{"type":"text","text":text}});
+                            }
+                        }
+                    }
+                    let mut normalized = crate::devin::normalize_session_update(&resolved);
+                    if let Some(child) = normalized["sessionId"].as_str().map(str::to_owned) {
+                        if child != id {
+                            self.devin_children.insert(child.clone());
+                        }
+                        // KSG projectSubagentTool keys child work `{child}:tool:{id}`.
+                        if Some(child.as_str()) != self.session.as_deref()
+                            && self.devin_children.contains(&child)
+                            && let Some(tool_id) = normalized["update"]["toolCallId"].as_str()
+                        {
+                            normalized["update"]["toolCallId"] =
+                                json!(format!("{child}:{tool_id}"));
+                        }
+                    }
+                    self.update(&normalized["update"]);
+                } else {
+                    self.update(&record["params"]["update"]);
+                }
             } else if method == "session/request_permission" && record.get("id").is_some() {
                 self.permission(&record)?;
             } else if record.get("id").is_some() {
@@ -427,6 +529,11 @@ impl Client {
                             "error":{"code":code,"message":message}}),
                     };
                     self.wire.push(response);
+                    return Ok(());
+                }
+                // KSG makeAcpClientTerminals: Devin advertised `terminal` at initialize.
+                if self.devin && method.starts_with("terminal/") {
+                    self.terminal_request(method, &record);
                     return Ok(());
                 }
                 self.wire.push(json!({"jsonrpc":"2.0","id":record["id"],"error":{"code":-32601,"message":format!("Shina does not support ACP client capability {method}. Filesystem and terminal capabilities were not advertised.")}}));
@@ -473,6 +580,7 @@ impl Client {
         if !record["error"].is_null() {
             let error = &record["error"];
             if kind == "start"
+                && !self.start.metadata_only
                 && error["code"] == -32602
                 && self.capabilities["mcpCapabilities"]["http"] == true
                 && self.capabilities["mcpCapabilities"]["stdio"] != false
@@ -487,6 +595,34 @@ impl Client {
                 retry["params"] = params.clone();
                 self.request(request["method"].as_str().unwrap(), params, retry);
                 return Ok(());
+            }
+            if kind == "antigravity_gateway" {
+                // KSG: some gateway families advertise their default tier without the
+                // "-medium" suffix; select the family the agent does advertise.
+                let route = request["route"].as_str().unwrap_or("");
+                let row = request["row"].as_str().unwrap_or("");
+                let values: Vec<&str> = crate::antigravity::model_options(&self.config_options)
+                    .into_iter()
+                    .filter_map(|o| o["value"].as_str())
+                    .collect();
+                if error["code"] == -32602
+                    && error["message"].as_str()
+                        == Some(format!("Unknown model ID: {route}").as_str())
+                    && route == format!("{row}-medium")
+                    && !values.contains(&route)
+                    && values.contains(&row)
+                    && let Some(config) = crate::antigravity::model_config(&self.config_options)
+                {
+                    let config_id = config["id"].as_str().unwrap_or("").to_owned();
+                    let mut retry = request.clone();
+                    retry["route"] = json!(row);
+                    self.request(
+                        "session/set_config_option",
+                        json!({"sessionId":self.session,"configId":config_id,"value":row}),
+                        retry,
+                    );
+                    return Ok(());
+                }
             }
             let message = error["message"].as_str().unwrap_or("Unknown ACP error");
             let message = if let Some(host) = &self.start.link {
@@ -516,6 +652,8 @@ impl Client {
             if kind == "prompt" {
                 // The request may already have run tools. Do not restore/replay accepted input.
                 return Err(message);
+            } else if kind == "antigravity_gateway" {
+                self.reject(&request["original"], message);
             } else {
                 self.reject(&request, message);
             }
@@ -533,11 +671,16 @@ impl Client {
                 self.events
                     .push(json!({"type":"harness_update","field":"turnCapabilities",
                     "value":self.turn_capabilities()}));
-                // KSG authenticateEagerly with authMethodId oauth-personal.
+                // KSG authenticateEagerly with the resolved authMethodId.
                 if self.antigravity {
+                    let method = if self.antigravity_gateway {
+                        "gateway"
+                    } else {
+                        "oauth-personal"
+                    };
                     self.request(
                         "authenticate",
-                        json!({"methodId":"oauth-personal"}),
+                        json!({"methodId":method}),
                         json!({"type":"authenticate"}),
                     );
                     return Ok(());
@@ -561,7 +704,7 @@ impl Client {
                 self.ready = true;
                 // KSG sessionModeForPolicy: the thread's runtime policy becomes the
                 // session mode at setup; the agy CLI maps yolo/auto_edit to default.
-                if self.antigravity {
+                if self.antigravity && !self.start.metadata_only {
                     let access = self
                         .start
                         .link
@@ -645,6 +788,36 @@ impl Client {
                 }
                 self.reply(&request, self.model.clone());
             }
+            // KSG applyAntigravityAcpModelSelection gateway select: the resolved route
+            // lands in the model config option; the caller's pick replies on success.
+            "antigravity_gateway" => {
+                if result["configOptions"].is_array() {
+                    self.configure_models(result);
+                } else {
+                    // A bare set_model reply carries no configOptions; mark the row
+                    // containing the resolved route current.
+                    let route = request["route"].as_str().unwrap_or("");
+                    let selections =
+                        crate::antigravity::gateway_model_selections(&self.gateway_models);
+                    let rows = crate::antigravity::gateway_model_rows(
+                        &selections,
+                        &self.gateway_entries(),
+                    );
+                    if let Some(row) = rows
+                        .iter()
+                        .find(|row| row.slug == route || row.routes.iter().any(|(v, _)| v == route))
+                        && let Some(model) = self.models.iter().find(|m| m["id"] == row.slug)
+                    {
+                        self.model = model.clone();
+                    }
+                }
+                let original = request["original"].clone();
+                if original["type"] == "set_option" {
+                    self.reply(&original, result.clone());
+                } else {
+                    self.reply(&original, self.model.clone());
+                }
+            }
             "antigravity_mode" => {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
@@ -715,6 +888,7 @@ impl Client {
             SessionSource::Fork(_) => return Err("ACP forks are unsupported.".into()),
         };
         if self.antigravity
+            && !self.start.metadata_only
             && let Some(meta) = crate::antigravity::session_meta(
                 &self.initialize_result,
                 Some(crate::mcp::INSTRUCTIONS),
@@ -845,8 +1019,14 @@ impl Client {
                 &self.config_options,
                 &mut self.thinking_levels,
             );
-            let (mut rows, current) =
-                crate::antigravity::session_models(result, &self.thinking_levels);
+            if result["models"].is_object() {
+                self.legacy_models = result["models"].clone();
+            }
+            let (mut rows, current) = crate::antigravity::session_models(
+                result,
+                &self.thinking_levels,
+                &self.gateway_models,
+            );
             crate::antigravity::apply_manifest(&mut rows);
             self.model_option = crate::antigravity::model_config(&self.config_options)
                 .and_then(|c| c["id"].as_str().map(str::to_owned));
@@ -912,7 +1092,38 @@ impl Client {
         value["isDefault"] = row["isDefault"].clone();
         value["aliases"] = row["aliases"].clone();
         value["isLegacy"] = row["isLegacy"].clone();
-        if row["thinking"].is_object() {
+        if let Some(efforts) = row["efforts"].as_array() {
+            // KSG buildSelectOptionDescriptor(ANTIGRAVITY_GATEWAY_EFFORT_OPTION_ID):
+            // the adapter owns the pick and routes it through the model config option.
+            let descriptor = crate::descriptors::ProviderOptionDescriptor::Select {
+                id: crate::antigravity::GATEWAY_EFFORT_OPTION_ID.into(),
+                label: "Reasoning".into(),
+                description: None,
+                options: efforts
+                    .iter()
+                    .map(|e| crate::descriptors::ProviderOptionChoice {
+                        id: e["id"].as_str().unwrap_or_default().to_owned(),
+                        label: e["label"].as_str().unwrap_or_default().to_owned(),
+                        description: None,
+                        is_default: e["isDefault"] == true,
+                    })
+                    .collect(),
+                current_value: efforts
+                    .iter()
+                    .find(|e| e["isDefault"] == true)
+                    .and_then(|e| e["id"].as_str())
+                    .map(str::to_owned),
+                prompt_injected_values: vec![],
+                role: None,
+            };
+            value["thinkingLevels"] = json!(
+                efforts
+                    .iter()
+                    .filter_map(|e| e["id"].as_str())
+                    .collect::<Vec<_>>()
+            );
+            value["capabilities"] = json!({"optionDescriptors":[descriptor]});
+        } else if row["thinking"].is_object() {
             let descriptors = crate::descriptors::acp_provider_option_descriptors(
                 Some(std::slice::from_ref(&row["thinking"])),
                 None,
@@ -929,8 +1140,136 @@ impl Client {
         value
     }
 
+    /// KSG `[...antigravityModelOptions, ...legacyModels?.availableModels]`, the entry
+    /// list `applyAntigravityAcpModelSelection` groups gateway rows over.
+    fn gateway_entries(&self) -> Vec<(String, String)> {
+        crate::antigravity::model_options(&self.config_options)
+            .into_iter()
+            .filter_map(|e| {
+                Some((
+                    e["value"].as_str()?.to_owned(),
+                    e["name"].as_str().unwrap_or("").to_owned(),
+                ))
+            })
+            .chain(
+                self.legacy_models["availableModels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| {
+                        Some((
+                            m["modelId"].as_str()?.to_owned(),
+                            m["name"].as_str().unwrap_or("").to_owned(),
+                        ))
+                    }),
+            )
+            .collect()
+    }
+
+    /// KSG applyAntigravityAcpModelSelection, gateway branch: resolve a pick (or the
+    /// stored effort pick) to a route and select it through the model config option.
+    /// Returns true when the record was handled.
+    fn antigravity_gateway_select(&mut self, requested: Option<&str>, record: &Value) -> bool {
+        let selections = crate::antigravity::gateway_model_selections(&self.gateway_models);
+        if selections.is_empty() {
+            return false;
+        }
+        let rows = crate::antigravity::gateway_model_rows(&selections, &self.gateway_entries());
+        let current = crate::antigravity::current_model(&self.config_options).or_else(|| {
+            self.legacy_models["currentModelId"]
+                .as_str()
+                .map(str::to_owned)
+        });
+        let row = match requested {
+            Some(id) => rows
+                .iter()
+                .find(|row| row.slug == id || row.routes.iter().any(|(v, _)| v == id)),
+            None => current
+                .as_deref()
+                .and_then(|current| {
+                    rows.iter().find(|row| {
+                        row.slug == current || row.routes.iter().any(|(v, _)| v == current)
+                    })
+                })
+                .or_else(|| rows.first()),
+        };
+        let Some(row) = row else {
+            return if requested.is_none()
+                || self.gateway_effort.is_some()
+                || requested.is_some_and(|id| {
+                    crate::antigravity::has_configured_gateway_model(&selections, id)
+                }) {
+                self.reject(
+                    record,
+                    format!(
+                        "Antigravity model '{}' is unavailable. Select an available model.",
+                        requested.unwrap_or(crate::antigravity::DEFAULT_MODEL)
+                    ),
+                );
+                true
+            } else {
+                false
+            };
+        };
+        let effort = self.gateway_effort.as_deref();
+        let exact = requested.filter(|id| *id != row.slug).and_then(|id| {
+            row.routes
+                .iter()
+                .find(|(v, _)| v == id)
+                .map(|(v, _)| v.clone())
+        });
+        let route = match effort {
+            Some(effort) => row
+                .efforts
+                .iter()
+                .find(|e| e.value == effort)
+                .map(|e| e.route.clone()),
+            None => Some(exact.unwrap_or_else(|| row.default_route.clone())),
+        };
+        let Some(route) = route else {
+            self.reject(
+                record,
+                format!(
+                    "Antigravity model '{} ({})' is unavailable. Select an available model.",
+                    row.slug,
+                    effort.unwrap_or("")
+                ),
+            );
+            return true;
+        };
+        let pending =
+            json!({"type":"antigravity_gateway","original":record,"route":route,"row":row.slug});
+        if let Some(config_id) = crate::antigravity::model_config(&self.config_options)
+            .and_then(|c| c["id"].as_str().map(str::to_owned))
+        {
+            // KSG allowUnlistedValue: a gateway route need not be an advertised value.
+            self.request(
+                "session/set_config_option",
+                json!({"sessionId":self.session,"configId":config_id,"value":route}),
+                pending,
+            );
+        } else if Some(route.as_str()) != current.as_deref() {
+            self.request(
+                "session/set_model",
+                json!({"sessionId":self.session,"modelId":route}),
+                pending,
+            );
+        } else {
+            // KSG returns without sending when the resolved route is already current.
+            self.reply(record, self.model.clone());
+        }
+        true
+    }
+
     fn command(&mut self, record: Value) -> Result<(), String> {
         let kind = record["type"].as_str().unwrap_or("");
+        if self.start.metadata_only && !matches!(kind, "get_available_models" | "get_commands") {
+            self.reject(
+                &record,
+                "ACP catalog discovery only supports metadata requests.",
+            );
+            return Ok(());
+        }
         if kind == "extension_ui_response" {
             let key = record["id"].as_str().unwrap_or("");
             if let Some(permission) = self.permissions.remove(key) {
@@ -1044,19 +1383,29 @@ impl Client {
                 if self.running {
                     self.reject(&record, "Wait for the ACP run to finish before changing its model.");
                 } else if self.antigravity {
-                    // KSG applyAntigravityAcpModelSelection (no gateway branch in Shina).
-                    let requested = record["modelId"].as_str().unwrap_or("");
+                    // KSG applyAntigravityAcpModelSelection.
+                    let raw = record["modelId"].as_str().unwrap_or("");
+                    let requested = (!raw.is_empty() && raw != crate::antigravity::DEFAULT_MODEL)
+                        .then_some(raw);
+                    // A new row's selection starts from its descriptor defaults, like
+                    // KSG's freshly-built modelSelection options.
+                    if requested != self.model["id"].as_str() {
+                        self.gateway_effort = None;
+                    }
+                    if self.antigravity_gateway_select(requested, &record) {
+                        return Ok(());
+                    }
                     let resolved = crate::antigravity::resolve_model(
                         &self.config_options,
-                        Some(requested),
+                        requested,
                         None,
                     );
                     let current = crate::antigravity::current_model(&self.config_options);
                     let Some(resolved) = resolved else {
-                        self.reject(&record, format!("Antigravity model '{requested}' is unavailable. Select an available model."));
+                        self.reject(&record, format!("Antigravity model '{raw}' is unavailable. Select an available model."));
                         return Ok(());
                     };
-                    if requested.is_empty() && current.as_deref() == Some(resolved.as_str()) {
+                    if requested.is_none() && current.as_deref() == Some(resolved.as_str()) {
                         self.reply(&record, self.model.clone());
                     } else if let Some(option) = &self.model_option {
                         let split = crate::antigravity::split_model(&self.config_options, &resolved);
@@ -1121,6 +1470,30 @@ impl Client {
                     self.reject(&record, "Wait for the ACP run to finish before changing options.");
                 } else if let Some(option_id) = record["optionId"].as_str() {
                     if self.antigravity
+                        && option_id == crate::antigravity::GATEWAY_EFFORT_OPTION_ID
+                        && !crate::antigravity::gateway_model_selections(&self.gateway_models)
+                            .is_empty()
+                    {
+                        // KSG ownedModelOptionIds: the effort pick lives in the model
+                        // selection and re-routes the current family through the
+                        // model config option instead of a reasoningEffort config.
+                        self.gateway_effort = record["value"]
+                            .as_str()
+                            .filter(|v| {
+                                !v.is_empty() && *v != crate::descriptors::ACP_EMPTY_OPTION_VALUE
+                            })
+                            .map(str::to_owned);
+                        let current_slug = self.model["id"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        if !self.antigravity_gateway_select(current_slug.as_deref(), &record) {
+                            self.reject(
+                                &record,
+                                "Antigravity model is unavailable. Select an available model.",
+                            );
+                        }
+                    } else if self.antigravity
                         && crate::antigravity::is_mode_choice(&self.config_options, option_id)
                         && let Some(denial) = self
                             .antigravity_mode_denial(record["value"].as_str().unwrap_or(""))
@@ -1314,18 +1687,97 @@ impl Client {
             .push(json!({"type":"queue_update","steering":[],"followUp":texts}));
     }
 
+    /// KSG makeAcpClientTerminals dispatch. `wait_for_exit` defers until the watcher
+    /// thread records an exit status; the loop flushes waiters on every pass.
+    fn terminal_request(&mut self, method: &str, record: &Value) {
+        let id = record["id"].clone();
+        let params = record["params"].clone();
+        let (result, deferred) = match method {
+            "terminal/create" => (
+                self.terminals
+                    .create(&params, &self.start.workspace)
+                    .map(|terminal| json!({"terminalId":terminal})),
+                false,
+            ),
+            "terminal/output" => (self.terminals.output(&params), false),
+            "terminal/kill" => (self.terminals.kill(&params).map(|()| json!({})), false),
+            "terminal/release" => (self.terminals.release(&params).map(|()| json!({})), false),
+            "terminal/wait_for_exit" => match self.terminals.exit_status(&params) {
+                Ok(Some(status)) => (Ok(status), false),
+                Ok(None) => (Ok(Value::Null), params["terminalId"].is_string()),
+                Err(error) => (Err(error), false),
+            },
+            _ => (
+                Err(format!(
+                    "Shina does not support ACP client capability {method}."
+                )),
+                false,
+            ),
+        };
+        if deferred {
+            self.terminal_waiters.push(TerminalWaiter {
+                id,
+                terminal: params["terminalId"].as_str().unwrap().to_owned(),
+            });
+            return;
+        }
+        match result {
+            Ok(result) => self
+                .wire
+                .push(json!({"jsonrpc":"2.0","id":id,"result":result})),
+            Err(message) => self
+                .wire
+                .push(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":message}})),
+        }
+    }
+
+    /// Answer every `terminal/wait_for_exit` whose child has recorded an exit status.
+    fn flush_terminal_waiters(&mut self) {
+        let mut index = 0;
+        while index < self.terminal_waiters.len() {
+            let Some(status) = self
+                .terminals
+                .exit_status_of(&self.terminal_waiters[index].terminal)
+            else {
+                index += 1;
+                continue;
+            };
+            let waiter = self.terminal_waiters.remove(index);
+            self.wire
+                .push(json!({"jsonrpc":"2.0","id":waiter.id,"result":status}));
+        }
+    }
+
     fn permission(&mut self, record: &Value) -> Result<(), String> {
+        if self.start.metadata_only {
+            self.wire
+                .push(permission_response(record["id"].clone(), None));
+            return Ok(());
+        }
         let params = &record["params"];
         if self
             .session
             .as_deref()
             .is_some_and(|session| params["sessionId"] != session)
+            && !(self.devin
+                && params["sessionId"]
+                    .as_str()
+                    .is_some_and(|session| self.devin_children.contains(session)))
         {
             return Err("ACP permission request belongs to another session.".into());
         }
         let options = params["options"]
             .as_array()
             .ok_or("ACP permission request has no options.")?;
+        // KSG devinAnswerablePermissionOptions: `plan_bypass` is filtered before any
+        // automatic or supervised selection can send its id back to Devin.
+        let filtered;
+        let options: &[Value] = if self.devin {
+            filtered = crate::devin::answerable_permission_options(params);
+            &filtered
+        } else {
+            options
+        };
         let interaction = self.start.id.contains("antigravity")
             && params["toolCall"]["toolCallId"]
                 .as_str()
@@ -1514,23 +1966,82 @@ impl Client {
                     );
                 }
             }
-            "tool_call" | "tool_call_update" => {
+            "tool_call" | "tool_call_update" | "tool_call_content_chunk" => {
                 let Some(id) = update["toolCallId"].as_str() else {
                     return;
                 };
                 let new = !self.tools.contains_key(id);
+                let chunk = update["sessionUpdate"] == "tool_call_content_chunk";
                 let tool = self.tools.entry(id.into()).or_insert_with(|| json!({}));
                 for (key, value) in update.as_object().into_iter().flatten() {
-                    if !value.is_null() {
+                    if value.is_null() || (chunk && key == "content") {
+                        continue;
+                    }
+                    // Devin's _meta carries subagent lifecycle keys; a completion-only
+                    // update must not erase the started keys the card still reads.
+                    if self.devin
+                        && key == "_meta"
+                        && tool["_meta"].is_object()
+                        && value.is_object()
+                    {
+                        for (meta_key, meta_value) in value.as_object().unwrap() {
+                            tool["_meta"][meta_key] = meta_value.clone();
+                        }
+                    } else {
                         tool[key] = value.clone();
                     }
                 }
+                if chunk {
+                    // KSG's reducer streams chunk text into the tool's content parts.
+                    if !tool["content"].is_array() {
+                        tool["content"] = json!([]);
+                    }
+                    let content = tool["content"].as_array_mut().unwrap();
+                    let part = &update["content"];
+                    if part["type"] == "content"
+                        && part["content"]["type"] == "text"
+                        && let Some(last) = content.last_mut().filter(|last| {
+                            last["type"] == "content" && last["content"]["type"] == "text"
+                        })
+                    {
+                        let merged = format!(
+                            "{}{}",
+                            last["content"]["text"].as_str().unwrap_or(""),
+                            part["content"]["text"].as_str().unwrap_or("")
+                        );
+                        last["content"]["text"] = json!(merged);
+                    } else {
+                        content.push(part.clone());
+                    }
+                }
                 let tool = tool.clone();
-                let name = tool["title"]
-                    .as_str()
-                    .or_else(|| tool["kind"].as_str())
-                    .unwrap_or("ACP tool");
-                let metadata = tool_metadata(&tool);
+                // KSG normalizeDevinToolCall then extractDevinSubagentUpdate, both on
+                // the merged state.
+                let tool = if self.devin {
+                    crate::devin::normalize_tool_call(&tool)
+                } else {
+                    tool
+                };
+                let subagent = if self.devin {
+                    let subagent = crate::devin::extract_subagent_update(&tool);
+                    if let Some(subagent) = &subagent {
+                        self.devin_children
+                            .insert(subagent.child_session_id.clone());
+                    }
+                    subagent
+                } else {
+                    None
+                };
+                let name = subagent
+                    .as_ref()
+                    .and_then(|subagent| subagent.title.clone())
+                    .or_else(|| tool["title"].as_str().map(str::to_owned))
+                    .or_else(|| tool["kind"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "ACP tool".to_owned());
+                let mut metadata = tool_metadata(&tool);
+                if subagent.is_some() {
+                    metadata["toolKind"] = json!("subagent");
+                }
                 if new {
                     self.history_chunk(
                         "assistant",
@@ -1540,13 +2051,23 @@ impl Client {
                         self.events.push(json!({"type":"tool_execution_start","toolCallId":id,"toolName":name,"args":tool["rawInput"],"toolKind":metadata["toolKind"],"changes":metadata["changes"]}));
                     }
                 }
-                let done = matches!(tool["status"].as_str(), Some("completed" | "failed"));
-                let result = tool_result(&tool);
+                // The extracted subagent lifecycle settles a tool even when the agent
+                // leaves the call's own status running.
+                let failed = tool["status"] == "failed"
+                    || subagent.as_ref().is_some_and(|s| s.status == "failed");
+                let done = matches!(tool["status"].as_str(), Some("completed" | "failed"))
+                    || subagent.as_ref().is_some_and(|s| s.status != "running");
+                let mut result = tool_result(&tool);
+                if let Some(summary) = subagent.as_ref().and_then(|s| s.result.as_ref())
+                    && let Some(content) = result["content"].as_array_mut()
+                {
+                    content.push(json!({"type":"text","text":summary}));
+                }
                 if done {
                     let mut saved = result.clone();
                     saved["role"] = json!("toolResult");
                     saved["toolCallId"] = json!(id);
-                    saved["isError"] = json!(tool["status"] == "failed");
+                    saved["isError"] = json!(failed);
                     if let Some(previous) = self
                         .history
                         .iter_mut()
@@ -1559,7 +2080,7 @@ impl Client {
                 }
                 if emit {
                     let mut event = json!({"type":if done {"tool_execution_end"} else {"tool_execution_update"},
-                        "toolCallId":id,"isError":tool["status"]=="failed"});
+                        "toolCallId":id,"isError":failed});
                     event[if done { "result" } else { "partialResult" }] = result;
                     self.events.push(event);
                 }
@@ -1881,11 +2402,7 @@ fn run(
     });
     let diagnostics = output.clone();
     let diagnostic_wake = wake.clone();
-    let bridge_token = start
-        .link
-        .as_ref()
-        .map(|host| host.token.clone())
-        .unwrap_or_default();
+    let bridge_token = start.link.as_ref().map(|host| host.token.clone());
     let errors = thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut sent = 0;
@@ -1897,7 +2414,11 @@ fn run(
             {
                 Ok(0) | Err(_) => break,
                 _ => {
-                    let text = String::from_utf8_lossy(&bytes).replace(&bridge_token, "[redacted]");
+                    let text = String::from_utf8_lossy(&bytes);
+                    let text = match bridge_token.as_deref() {
+                        Some(token) => std::borrow::Cow::Owned(text.replace(token, "[redacted]")),
+                        None => text,
+                    };
                     // KSG makeAntigravityStderrHandler: the BROWSER helper marks the OAuth URL.
                     if is_antigravity && let Some(url) = crate::antigravity::stderr_auth_url(&text)
                     {
@@ -1953,6 +2474,11 @@ fn run(
     client.claude_skills = claude_skills;
     if is_antigravity {
         client.antigravity = true;
+        // A configured gateway switches authenticate to the "gateway" method and
+        // narrows the model catalog to the configured gateway families.
+        let gateway = crate::antigravity::gateway()?;
+        client.antigravity_gateway = gateway.is_some();
+        client.gateway_models = gateway.map(|gateway| gateway.models).unwrap_or_default();
         // Version gating only applies to the real `agy` CLI, never a registry override.
         let program = std::path::Path::new(&*executable)
             .file_name()
@@ -2038,6 +2564,8 @@ fn run(
                     }
                 }
             }
+            // terminal/wait_for_exit answers once the child records an exit status.
+            client.flush_terminal_waiters();
             // Publish responses before the UI can dispatch its next operation.
             if !client.wire.is_empty() || !client.events.is_empty() {
                 continue;

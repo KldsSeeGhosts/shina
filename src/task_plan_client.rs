@@ -68,6 +68,7 @@ mod tests {
     fn a_connected_panel_refreshes_mcp_draft_edits_without_a_task_change() {
         let mut state = State::new(std::path::PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         state.captains = Captain::presets();
         state.open_captain(0);
         let home = state.current().id;

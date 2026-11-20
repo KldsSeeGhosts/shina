@@ -18,6 +18,19 @@ const MAX_HELPER_LINE: usize = AUTH_BROWSER_MARKER.len() + MAX_AUTH_URL + 2;
 /// KSG `CLIENT_FILE_MAX_BYTES`.
 const CLIENT_FILE_MAX: u64 = 8 * 1024 * 1024;
 
+/// KSG `ANTIGRAVITY_GATEWAY_EFFORT_OPTION_ID`: the per-row route picker the
+/// adapter owns in gateway mode; it never reaches the agent as a config option.
+pub const GATEWAY_EFFORT_OPTION_ID: &str = "reasoningEffort";
+/// KSG `EFFORTS` in AntigravityGatewayModels.ts, in descriptor order.
+const GATEWAY_EFFORTS: &[(&str, &str)] = &[
+    ("minimal", "Minimal"),
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra High"),
+    ("max", "Max"),
+];
+
 /// KSG `parseAntigravityVersion`: first dotted triple, anything else is unknown.
 pub fn parse_version(version: Option<&str>) -> Option<[u64; 3]> {
     let version = version?.trim();
@@ -205,6 +218,192 @@ pub fn resolve_model(
         return Some(default.into());
     }
     current_model(options)
+}
+
+/// KSG `routeFamily`: the family part of a `family-effort` route id.
+fn route_family(id: &str) -> &str {
+    match id.rsplit_once('-') {
+        Some((family, suffix)) if GATEWAY_EFFORTS.iter().any(|(e, _)| suffix == *e) => family,
+        _ => id,
+    }
+}
+/// KSG `ROUTE_SUFFIX.test`: whether an id ends in a known `-effort` route suffix.
+fn has_route_suffix(id: &str) -> bool {
+    id.rsplit_once('-')
+        .is_some_and(|(_, suffix)| GATEWAY_EFFORTS.iter().any(|(e, _)| suffix == *e))
+}
+/// KSG `matchesRoute`: an exact route, or a family selection matching the route's family.
+fn matches_route(selection: &str, id: &str) -> bool {
+    selection == id || (!has_route_suffix(selection) && selection == route_family(id))
+}
+/// KSG `antigravityGatewayModelSelections`: comma list, `(effort)` settings tails
+/// folded into route ids, deduplicated, blanks dropped.
+pub fn gateway_model_selections(configured: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut selections = Vec::new();
+    for id in configured.split(',') {
+        let id = id.trim();
+        let normalized = match id.rfind('(') {
+            Some(open)
+                if id.ends_with(')')
+                    && GATEWAY_EFFORTS
+                        .iter()
+                        .any(|(e, _)| id[open + 1..id.len() - 1].eq_ignore_ascii_case(e)) =>
+            {
+                format!(
+                    "{}-{}",
+                    &id[..open],
+                    id[open + 1..id.len() - 1].to_lowercase()
+                )
+            }
+            _ => id.to_owned(),
+        };
+        if !normalized.is_empty() && seen.insert(normalized.clone()) {
+            selections.push(normalized);
+        }
+    }
+    selections
+}
+/// KSG `antigravityHasConfiguredGatewayModel`: exact, family or route-family match.
+pub fn has_configured_gateway_model(selections: &[String], model: &str) -> bool {
+    selections
+        .iter()
+        .any(|s| matches_route(s, model) || route_family(s) == model)
+}
+
+/// KSG `AntigravityGatewayModelOption` rows: a family of selectable routes.
+pub struct GatewayRow {
+    pub slug: String,
+    pub name: String,
+    pub routes: Vec<(String, String)>,
+    pub efforts: Vec<GatewayEffort>,
+    pub default_route: String,
+}
+pub struct GatewayEffort {
+    pub value: String,
+    pub label: &'static str,
+    pub route: String,
+    pub is_default: bool,
+}
+
+fn gateway_insert(
+    grouped: &mut Vec<(String, Vec<(String, String)>)>,
+    index: &mut std::collections::HashMap<String, usize>,
+    family: &str,
+    value: &str,
+    name: &str,
+) {
+    let position = *index.entry(family.to_owned()).or_insert_with(|| {
+        grouped.push((family.to_owned(), vec![]));
+        grouped.len() - 1
+    });
+    let entries = &mut grouped[position].1;
+    if let Some(existing) = entries.iter_mut().find(|(v, _)| v == value) {
+        *existing = (value.to_owned(), name.to_owned());
+    } else {
+        entries.push((value.to_owned(), name.to_owned()));
+    }
+}
+/// KSG `LABEL_SUFFIX`: a display name's trailing ` (effort)` is dropped.
+fn strip_label_suffix(name: &str) -> &str {
+    if let Some(open) = name.rfind(" (") {
+        let inner = &name[open + 2..];
+        if inner.ends_with(')') {
+            let label = inner[..inner.len() - 1].to_ascii_lowercase();
+            if matches!(
+                label.as_str(),
+                "minimal" | "low" | "medium" | "high" | "xhigh" | "extra high" | "max"
+            ) {
+                return &name[..open];
+            }
+        }
+    }
+    name
+}
+/// KSG `antigravityGatewayModelRows`: group configured routes by family. A configured
+/// tier the agent folds into the family option stays, named after the family.
+pub fn gateway_model_rows(selections: &[String], models: &[(String, String)]) -> Vec<GatewayRow> {
+    let mut grouped: Vec<(String, Vec<(String, String)>)> = vec![];
+    let mut index = std::collections::HashMap::new();
+    for selection in selections {
+        let mut matched = false;
+        for (value, name) in models {
+            if !matches_route(selection, value) {
+                continue;
+            }
+            matched = true;
+            let family = route_family(value).to_owned();
+            gateway_insert(&mut grouped, &mut index, &family, value, name);
+        }
+        if matched || !has_route_suffix(selection) {
+            continue;
+        }
+        // The agent folds tier routes into one family option and can omit tiers it
+        // does not know. The gateway still serves a configured tier of a family the
+        // agent advertises, so keep it rather than hide a working level.
+        let family = route_family(selection).to_owned();
+        if let Some((_, name)) = models
+            .iter()
+            .find(|(v, _)| v == &family || route_family(v) == family)
+        {
+            gateway_insert(&mut grouped, &mut index, &family, selection, name);
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(family, entries)| {
+            let first = entries.first().cloned().unwrap_or_default();
+            let mut efforts: Vec<GatewayEffort> = GATEWAY_EFFORTS
+                .iter()
+                .filter_map(|(effort, label)| {
+                    entries
+                        .iter()
+                        .find(|(v, _)| v == &format!("{family}-{effort}"))
+                        .map(|(v, _)| GatewayEffort {
+                            value: (*effort).to_owned(),
+                            label,
+                            route: v.clone(),
+                            is_default: false,
+                        })
+                })
+                .collect();
+            let default = efforts
+                .iter()
+                .position(|e| e.value == "medium")
+                .unwrap_or(0);
+            if let Some(effort) = efforts.get_mut(default) {
+                effort.is_default = true;
+            }
+            let family_selected = selections.iter().any(|s| s == &family)
+                || selections
+                    .iter()
+                    .filter(|s| route_family(s) == family)
+                    .count()
+                    > 1;
+            let name = {
+                let trimmed = strip_label_suffix(first.1.trim());
+                if trimmed.is_empty() {
+                    family.clone()
+                } else {
+                    trimmed.to_owned()
+                }
+            };
+            GatewayRow {
+                slug: if family_selected {
+                    family
+                } else {
+                    first.0.clone()
+                },
+                name,
+                routes: entries,
+                default_route: efforts
+                    .get(default)
+                    .map(|e| e.route.clone())
+                    .unwrap_or_else(|| first.0.clone()),
+                efforts,
+            }
+        })
+        .collect()
 }
 
 /// KSG `isAntigravitySignInRequiredError`: -32000, or -32603 "No browser is available here",
@@ -465,9 +664,59 @@ pub fn directories() -> Result<(PathBuf, PathBuf), String> {
         state.join("antigravity-tmp"),
     ))
 }
+/// KSG `AntigravityAuthConfig` for the gateway method, resolved from the environment.
+/// `SHINA_ANTIGRAVITY_*` names win; the `AGY_*` names `agy acp` reads are fallbacks.
+pub struct Gateway {
+    pub url: String,
+    pub api_key: Option<String>,
+    pub models: String,
+}
+/// KSG `antigravityAuthConfigIssue` for `gateway`: the URL must be http(s).
+fn is_http_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some_and(|h| !h.is_empty())
+    })
+}
+fn gateway_from(get: impl Fn(&str) -> Option<String>) -> Result<Option<Gateway>, String> {
+    let value = |name: &str| {
+        get(name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let Some(url) = value("SHINA_ANTIGRAVITY_GATEWAY_URL")
+        .or_else(|| value("AGY_LLM_GATEWAY_URL"))
+        .or_else(|| value("AGY_GATEWAY_URL"))
+    else {
+        return Ok(None);
+    };
+    if !is_http_url(&url) {
+        return Err("The Antigravity gateway URL must be an http or https URL.".into());
+    }
+    Ok(Some(Gateway {
+        url,
+        api_key: value("SHINA_ANTIGRAVITY_API_KEY")
+            .or_else(|| value("AGY_LLM_GATEWAY_API_KEY"))
+            .or_else(|| value("AGY_GATEWAY_API_KEY")),
+        models: value("SHINA_ANTIGRAVITY_GATEWAY_MODELS")
+            .or_else(|| value("AGY_LLM_GATEWAY_MODELS"))
+            .unwrap_or_default(),
+    }))
+}
+/// The gateway configured for the next `agy` launch, or `Err` for a set but invalid URL.
+pub fn gateway() -> Result<Option<Gateway>, String> {
+    gateway_from(|name| std::env::var(name).ok())
+}
+/// KSG `authMethod` resolution from the environment: `gateway` when a gateway URL is set.
+fn auth_method() -> Result<&'static str, String> {
+    Ok(if gateway()?.is_some() {
+        "gateway"
+    } else {
+        "oauth-personal"
+    })
+}
 /// KSG `antigravityProfileSettings`: names the auth method so a logout clears only it.
-fn profile_settings() -> String {
-    "{\"auth\":{\"type\":\"oauth-personal\"}}\n".into()
+fn profile_settings(auth_method: &str) -> String {
+    format!("{{\"auth\":{{\"type\":\"{auth_method}\"}}}}\n")
 }
 /// KSG `prepareAntigravityProfile`: private profile dirs (0700) and settings.json.
 pub fn prepare_profile() -> Result<(PathBuf, PathBuf, PathBuf), String> {
@@ -482,7 +731,7 @@ pub fn prepare_profile() -> Result<(PathBuf, PathBuf, PathBuf), String> {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
     }
-    std::fs::write(acp.join("settings.json"), profile_settings())
+    std::fs::write(acp.join("settings.json"), profile_settings(auth_method()?))
         .map_err(|_| "The Antigravity profile settings could not be written.".to_owned())?;
     Ok((gemini_home, acp, tmp))
 }
@@ -515,9 +764,28 @@ const REMOVED_ENV: &[&str] = &[
     "ELECTRON_RUN_AS_NODE",
     "CHROME_CRASHPAD_PIPE_NAME",
 ];
+/// Gateway/CPA names `agy acp` may read. They survive `env_clear` only once a gateway
+/// is resolved, so a stray `AGY_*` value can never half-enable the gateway method.
+const GATEWAY_ENV: &[&str] = &[
+    "AGY_ACP_ENABLE_GATEWAY_AUTH",
+    "AGY_LLM_GATEWAY_URL",
+    "AGY_LLM_GATEWAY_API_KEY",
+    "AGY_LLM_GATEWAY_HEADERS",
+    "AGY_LLM_GATEWAY_MODELS",
+    "AGY_GATEWAY_URL",
+    "AGY_GATEWAY_API_KEY",
+    "AGY_GATEWAY_HEADERS",
+];
 /// KSG `antigravityEnvironment`: filtered base env plus profile isolation. BROWSER runs
 /// Shina's own helper so the agent's browser open lands as a stderr marker instead.
 pub fn environment(gemini_home: &Path, tmp: &Path) -> Result<Vec<(String, String)>, String> {
+    environment_in(gemini_home, tmp, std::env::vars().collect())
+}
+fn environment_in(
+    gemini_home: &Path,
+    tmp: &Path,
+    base: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>, String> {
     let helper = std::env::current_exe().map_err(|e| e.to_string())?;
     let quote = |v: &str| format!("'{}'", v.replace('\'', "'\"'\"'"));
     let browser = [
@@ -541,11 +809,39 @@ pub fn environment(gemini_home: &Path, tmp: &Path) -> Result<Vec<(String, String
                 .into(),
         );
     }
-    let mut env: Vec<(String, String)> = std::env::vars()
+    let lookup = |name: &str| {
+        base.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    };
+    let mut env: Vec<(String, String)> = base
+        .iter()
         .filter(|(key, _)| {
             !REMOVED_ENV.contains(&key.to_uppercase().as_str()) && !key.starts_with("SHINA_")
         })
+        .cloned()
         .collect();
+    if let Some(gateway) = gateway_from(&lookup)? {
+        // KSG authEnvironment for the gateway method. Parent-exported gateway/CPA
+        // names pass through verbatim; the resolved set then overrides, so the
+        // SHINA_ names and fallbacks win wherever they disagree.
+        for (key, value) in &base {
+            if GATEWAY_ENV.contains(&key.to_uppercase().as_str()) && !value.is_empty() {
+                env.push((key.clone(), value.clone()));
+            }
+        }
+        // The runtime keeps its gateway method behind this rollout flag.
+        env.extend([
+            ("AGY_ACP_ENABLE_GATEWAY_AUTH".into(), "1".into()),
+            ("AGY_LLM_GATEWAY_URL".into(), gateway.url),
+        ]);
+        if let Some(api_key) = gateway.api_key {
+            env.push(("AGY_LLM_GATEWAY_API_KEY".into(), api_key));
+        }
+        if !gateway.models.is_empty() {
+            env.push(("AGY_LLM_GATEWAY_MODELS".into(), gateway.models));
+        }
+    }
     env.extend([
         (
             "GEMINI_HOME".into(),
@@ -556,6 +852,21 @@ pub fn environment(gemini_home: &Path, tmp: &Path) -> Result<Vec<(String, String
         ("PYTHONUNBUFFERED".into(), "1".into()),
         ("TMPDIR".into(), tmp.to_string_lossy().into_owned()),
     ]);
+    // KSG `authMethod: "gateway"`: providers.json or SHINA_ANTIGRAVITY_* can
+    // point `agy` at a CLIPROXYAPI-style gateway. REMOVED_ENV already kept the
+    // AGY_* names out of the inherited list, so these only ever append.
+    let providers = crate::provider_config::Registry::read();
+    if let Some(error) = providers.error {
+        return Err(error);
+    }
+    if let Some(gateway) = providers.gateway("antigravity") {
+        env.extend(
+            gateway
+                .antigravity_environment()
+                .into_iter()
+                .map(|(name, value)| (name, value.to_string_lossy().into_owned())),
+        );
+    }
     Ok(env)
 }
 /// KSG `buildAntigravityAcpSpawnInput` for the agy CLI (harnessPath null): `agy acp`
@@ -585,12 +896,14 @@ pub fn cli_available() -> bool {
 /// Version for `client_info`/file-read gating; unknown stays None like KSG's path installs.
 pub fn cli_version() -> Option<String> {
     let (executable, _) = crate::harness::executable("agy").ok()?;
-    let out = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    command
         .arg("--version")
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .output()
-        .ok()?;
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    // Discovery runs in the background, so use the owned no-window launcher.
+    let out =
+        crate::process::output(&mut command, std::time::Duration::from_secs(5), 16 * 1024).ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let found = text
         .split_whitespace()
@@ -613,21 +926,40 @@ pub fn start(
     start: crate::harness::Start,
     wake: rune::Waker,
 ) -> Result<crate::backend::Pi, String> {
-    let agent = crate::harness::Agent {
+    let process = command(&start.workspace)?;
+    crate::acp::start_command(agent(), start, wake, process)
+}
+
+fn agent() -> crate::harness::Agent {
+    crate::harness::Agent {
         id: "antigravity".into(),
         name: "Antigravity".into(),
         command: "agy".into(),
         args: vec![],
         env: vec![],
-    };
-    let command = command(&start.workspace)?;
-    crate::acp::start_command(agent, start, wake, command)
+    }
 }
-/// KSG `buildAntigravityModelsFromSession` without the gateway branch (Shina has no
-/// gateway-models input). Model list ids stay combined `family-level`.
+/// Live catalog probe via `agy acp`, matching KSG's `AntigravityProvider` session discovery.
+pub fn discover(
+    workspace: std::path::PathBuf,
+    wake: rune::Waker,
+) -> Result<crate::backend::Pi, String> {
+    // ACP publishes models and commands once the temporary session is ready.
+    crate::acp::start_with_command(
+        agent(),
+        crate::harness::Start::discovery("antigravity", workspace),
+        wake,
+        command,
+    )
+}
+/// KSG `buildAntigravityModelsFromSession`. With a configured gateway model list it
+/// exposes only the configured families, each effort riding one `reasoningEffort`
+/// descriptor instead of the agent's thinking select. Otherwise model ids stay
+/// combined `family-level`.
 pub fn session_models(
     setup: &Value,
     thinking_levels: &std::collections::HashMap<String, Option<Value>>,
+    gateway_models: &str,
 ) -> (Vec<Value>, Option<String>) {
     let options = setup["configOptions"]
         .as_array()
@@ -672,6 +1004,38 @@ pub fn session_models(
             })
             .collect()
     };
+    let selections = gateway_model_selections(gateway_models);
+    if !selections.is_empty() {
+        let all: Vec<(String, String)> = entries
+            .iter()
+            .cloned()
+            .chain(model_options(&options).into_iter().filter_map(|e| {
+                Some((
+                    e["value"].as_str()?.to_owned(),
+                    e["name"].as_str().unwrap_or("").to_owned(),
+                ))
+            }))
+            .collect();
+        let rows = gateway_model_rows(&selections, &all);
+        let preferred = rows.iter().find(|row| {
+            row.routes
+                .iter()
+                .any(|(v, _)| current.as_deref() == Some(v.as_str()))
+        });
+        let default_slug = preferred
+            .or_else(|| rows.first())
+            .map(|row| row.slug.clone());
+        let models = rows
+            .iter()
+            .map(|row| {
+                json!({"slug":row.slug,"name":row.name,
+                    "isDefault":Some(row.slug.as_str())==default_slug.as_deref(),
+                    "aliases":(Some(row.slug.as_str())==default_slug.as_deref()).then(||vec![DEFAULT_MODEL]),
+                    "efforts":row.efforts.iter().map(|e| json!({"id":e.value,"label":e.label,"isDefault":e.is_default})).collect::<Vec<_>>()})
+            })
+            .collect();
+        return (models, default_slug);
+    }
     let current_thinking = thinking_config(&options);
     let mut seen = std::collections::HashSet::new();
     let mut names = std::collections::HashSet::new();
@@ -742,6 +1106,43 @@ pub fn apply_manifest(models: &mut Vec<Value>) {
         model["isDefault"] = json!(true);
         model["aliases"] = json!([DEFAULT_MODEL]);
     }
+}
+/// Fallback Antigravity catalog from `assets/model-manifest.json` before a live session reports models.
+pub fn manifest_models() -> Vec<crate::session::AgentModel> {
+    let manifest = manifest();
+    let default_slug = manifest["defaults"]["chat"].as_str();
+    let Some(entries) = manifest["models"].as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let slug = entry["slug"].as_str()?.trim();
+            if slug.is_empty() {
+                return None;
+            }
+            let name = entry["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(slug)
+                .to_owned();
+            let is_default = default_slug == Some(slug);
+            Some(crate::session::AgentModel {
+                provider: "antigravity".into(),
+                id: slug.to_owned(),
+                name,
+                aliases: if is_default {
+                    vec![DEFAULT_MODEL.to_owned()]
+                } else {
+                    vec![]
+                },
+                is_default,
+                is_legacy: entry["status"] == "legacy",
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 /// Open the captured sign-in URL on user click only (platform opener, detached).
 pub fn open_browser(url: &str) -> Result<(), String> {

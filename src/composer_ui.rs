@@ -490,7 +490,7 @@ pub(super) fn image_arrival(s: &State, collapsed: bool) -> f32 {
     transition.progress(s.composer_ui.clock.get())
 }
 
-pub(super) fn measurement_probes(s: &State, p: Palette) -> El {
+pub(super) fn measurement_probes(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     col()
         .key("composer-measurements")
         .absolute(0.0, 0.0)
@@ -498,7 +498,7 @@ pub(super) fn measurement_probes(s: &State, p: Palette) -> El {
         .inert()
         .opacity(0.0)
         .a11y_hidden()
-        .child(row().child(model_effort_trigger(s, p, true, false).key("measure-model")))
+        .child(row().child(model_effort_trigger(s, model, p, true, false).key("measure-model")))
         .child(row().child(machine_selector(s, p, false).key("measure-machine")))
         .child(row().child(captain_selector_trigger(s, p, false).key("measure-captain")))
         .child(row().child(access_trigger(
@@ -784,7 +784,14 @@ pub(super) fn collapsed(s: &State, width: f32, expanded_width: f32) -> bool {
 
 /// Natural widths use Rune's font metrics and the controls' actual padding, gaps and icons.
 /// This is the native equivalent of restingComposerControlsMeasurement's scrollWidth reads.
-pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked: bool) -> El {
+pub(super) fn controls(
+    s: &State,
+    model: &ComposerModelDisplay,
+    p: Palette,
+    width: f32,
+    resting: bool,
+    locked: bool,
+) -> El {
     if s.demo {
         return row()
             .key("composer-footer")
@@ -881,7 +888,11 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
     let count = if show_access { 3 } else { 2 };
     // The expanded strip carries the model and effort triggers and the context ring on its
     // right, as KSG's `ComposerControlsBar`; they keep their room before the blocks shrink.
-    let expanded_fixed = if resting { 0.0 } else { strip_fixed(s, width) };
+    let expanded_fixed = if resting {
+        0.0
+    } else {
+        strip_fixed(s, model, width)
+    };
     let fixed = (if resting {
         measurement.map_or(fixed, |m| m[0])
     } else {
@@ -938,7 +949,7 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         controls = controls.child(bind_anchor(
             s,
             3,
-            model_effort_trigger(s, p, true, locked)
+            model_effort_trigger(s, model, p, true, locked)
                 .min_w(52.0)
                 .offset(model_x - controls_x, model_y - controls_y),
         ));
@@ -992,13 +1003,13 @@ pub(super) fn controls(s: &State, p: Palette, width: f32, resting: bool, locked:
         controls = controls.child(spacer()).child(bind_anchor(
             s,
             3,
-            model_trigger(s, p, strip_model_icon_only(width), locked, false)
+            model_trigger(s, model, p, strip_model_icon_only(width), locked, false)
                 .h(24.0)
                 .px(7.0)
                 .max_w(strip_model_max(width))
                 .offset(model_x - controls_x, model_y - controls_y),
         ));
-        if let Some(effort) = effort_trigger(s, p, locked, strip_compact(width)) {
+        if let Some(effort) = effort_trigger(model, p, locked, strip_compact(width)) {
             controls = controls.child(effort);
         }
         if context_ring_shown(t) {
@@ -1065,7 +1076,7 @@ fn strip_model_max(width: f32) -> f32 {
 
 /// The room the context strip keeps on its right for the model and effort triggers and the
 /// context ring, before the run context blocks lose labels or move into the overflow menu.
-pub(super) fn strip_fixed(s: &State, width: f32) -> f32 {
+pub(super) fn strip_fixed(s: &State, display: &ComposerModelDisplay, width: f32) -> f32 {
     let t = s.current();
     let text_width = |value: &str| rune::text::measure(value, &[], SMALL, None).0;
     // Provider icon, gap and padding around the model's name.
@@ -1074,15 +1085,14 @@ pub(super) fn strip_fixed(s: &State, width: f32) -> f32 {
     } else {
         (text_width(split_model_label(&t.model).0) + 14.0 + 7.0 + 14.0).min(strip_model_max(width))
     };
-    let (effort, both_default, _) = composer_effort(s);
-    let effort = if both_default || effort.is_empty() || s.multi_model_selections().len() > 1 {
+    let effort = if !display.show_effort() {
         0.0
     } else {
         // Gauge, gap, padding and the strip's 4 pt gap.
         let label = if strip_compact(width) {
             -6.0
         } else {
-            text_width(&effort)
+            text_width(&display.effort)
         };
         label + 14.0 + 6.0 + 14.0 + 4.0
     };

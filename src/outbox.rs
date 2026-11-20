@@ -136,7 +136,7 @@ pub fn drain(database: &crate::database::Database, effects: Vec<Effect>) -> Resu
         return Ok(());
     }
     let _dispatch = database
-        .claim_dispatch()?
+        .claim_dispatch("committed provider or tool replies")?
         .ok_or("Dispatch is fenced for maintenance.")?;
     for effect in effects {
         #[cfg(debug_assertions)]

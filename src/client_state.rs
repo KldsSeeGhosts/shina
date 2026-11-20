@@ -1786,7 +1786,7 @@ impl State {
             "catalog":{"loading":self.catalog.loading(),"error":self.catalog.error,
                 "models":self.catalog.models,"defaultModel":self.catalog.default_model,
                 "defaultThinking":self.catalog.default_thinking},
-            "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot()},
+            "nativeCatalogs":{"codex":self.codex_catalog.snapshot(),"claude":self.claude_catalog.snapshot(),"antigravity":self.antigravity_catalog.snapshot(),"cursor":self.cursor_catalog.snapshot()},
             "peers":self.peers,
             "directories":self.threads.iter().enumerate().filter_map(|(index,thread)| self.thread_directory(index).ok().map(|path| (thread.id.to_string(),json!(path)))).collect::<serde_json::Map<_,_>>(),
             "undo":self.undo,
@@ -1942,7 +1942,6 @@ impl State {
     pub(super) fn poll_client(&mut self, tx: &mut Tx) -> bool {
         let changed = self.poll_client_background(tx)
             | self.updater.poll(Instant::now(), self.wake.clone())
-            | self.refresh_machine_notice()
             | self.tick_mobile_pairing(crate::lifecycle::now(), tx)
             | self.tick_composer_notices_at(Instant::now(), Some(tx));
         if self.background.quitting {
@@ -2200,8 +2199,6 @@ impl State {
                 continue;
             }
             if server != "local" && matches!(event, crate::client::Event::Maintenance(..)) {
-                // A restarting machine is not ready, so the unreachable notice covers it.
-                self.refresh_machine_notice();
                 continue;
             }
             match event {
@@ -2623,9 +2620,15 @@ impl State {
             self.threads.push(thread);
         }
         // Keep device drafts and open tabs, even after another device deletes a server record.
+        // On the first projection, do not retain the synthetic startup placeholder thread (id 1)
+        // when it was not in saved device tabs.
+        let keep_tabs = !first
+            || self.client_views["localUi"]["tabs"]
+                .as_array()
+                .is_some_and(|saved| !saved.is_empty());
         self.threads.extend(
             old.into_iter()
-                .filter(|t| t.client_draft || tabs.contains(&t.id)),
+                .filter(|t| t.client_draft || (keep_tabs && tabs.contains(&t.id))),
         );
         self.refresh_captain_contexts();
         // Document surfaces are client-local, so a remote reset must carry them to the
@@ -2664,7 +2667,7 @@ impl State {
                 let mut thread = Thread::new(id);
                 thread.client_draft = true;
                 thread.project = draft["project"].as_u64().map(|id| id as usize);
-                thread.harness = draft["harness"].as_str().unwrap_or("pi").into();
+                thread.harness = draft["harness"].as_str().unwrap_or("codex").into();
                 thread.selected_model =
                     serde_json::from_value(draft["model"].clone()).unwrap_or_default();
                 thread.selected_thinking = draft["thinking"].as_str().map(str::to_owned);
@@ -2809,8 +2812,14 @@ impl State {
             .get_mut("localUi")
             .map(Value::take)
             .unwrap_or(Value::Null);
+        self.update_projected_native_models(&projection.state);
+        let catalog_changed = ["models", "defaultModel", "defaultThinking"]
+            .into_iter()
+            .any(|key| self.client_views["catalog"][key] != projection["catalog"][key]);
         self.client_views = projection.state;
-        self.apply_projected_catalog();
+        if catalog_changed {
+            self.apply_projected_catalog();
+        }
         self.apply_native_catalogs();
         if first && !local.is_null() {
             // Live cached editors also own pending sends and isolated queue edits. Restoring the
@@ -3032,56 +3041,12 @@ impl State {
                 .and_then(|client| client.linked.get(server))
                 .is_none_or(crate::client::Client::enabled)
     }
-    /// The names of the linked machines whose connection is not ready.
-    pub fn unreachable_machines(&self) -> Vec<String> {
-        let Some(client) = &self.client else {
-            return Vec::new();
-        };
-        client
-            .linked
-            .keys()
-            .filter(|server| self.machine_enabled(server) && !self.machine_connected(server))
-            .map(|server| self.machine_label(server))
-            .collect()
-    }
     /// The open thread's machine, by name, while this desktop cannot reach it.
     pub fn unreachable_selected(&self) -> Option<String> {
         (self.client.is_some()
             && (!self.machine_connected(&self.machines.selected)
                 || !self.machines.views.contains_key(&self.machines.selected)))
         .then(|| self.machine_label(&self.machines.selected))
-    }
-    /// Raises one notice naming every linked machine that is down ("Studio and Laptop are
-    /// unreachable. Reconnecting.") and clears it when all of them are ready again. It never
-    /// replaces or clears another notice. Returns whether the notice changed.
-    pub(super) fn refresh_machine_notice(&mut self) -> bool {
-        let down = self.unreachable_machines();
-        let ours =
-            self.machines.notice.is_some() && self.machines.notice == self.machines.auto_notice;
-        if down.is_empty() {
-            if ours {
-                self.machines.notice = None;
-                self.machines.auto_notice = None;
-                return true;
-            }
-            self.machines.auto_notice = None;
-            return false;
-        }
-        if self.machines.notice.is_some() && !ours {
-            return false;
-        }
-        let names = match down.as_slice() {
-            [one] => format!("{one} is"),
-            [first @ .., last] => format!("{} and {last} are", first.join(", ")),
-            [] => unreachable!("checked above"),
-        };
-        let text = format!("{names} unreachable. Reconnecting.");
-        if self.machines.notice.as_deref() == Some(text.as_str()) {
-            return false;
-        }
-        self.machines.notice = Some(text.clone());
-        self.machines.auto_notice = Some(text);
-        true
     }
     pub(crate) fn tick_composer_notices_at(&mut self, now: Instant, tx: Option<&mut Tx>) -> bool {
         let active = if self.demo || self.client.is_none() {
@@ -3153,10 +3118,11 @@ impl State {
             self.machines.views.remove(server);
             self.machines.threads.remove(server);
             self.machines.recover.remove(server);
-            self.refresh_machine_notice();
             if self.machines.selected == server {
+                // select_machine restores the local workspace's saved tabs, or
+                // opens a device draft when nothing is restorable. Forcing a
+                // projectless draft here would add a "No workspace" tab on top.
                 self.select_machine("local");
-                self.new_client_draft(None);
             }
         }
         self.tick_composer_notices_at(Instant::now(), None);
@@ -3194,6 +3160,14 @@ impl State {
     }
     /// Server/thread ids remain a pair. Only one server's records enter the State facade.
     pub fn select_machine(&mut self, server: &str) {
+        self.select_machine_inner(server, true);
+    }
+
+    pub fn select_machine_without_draft(&mut self, server: &str) {
+        self.select_machine_inner(server, false);
+    }
+
+    fn select_machine_inner(&mut self, server: &str, open_fallback_draft: bool) {
         self.machines.picker = false;
         if server == self.machines.selected {
             return;
@@ -3279,6 +3253,10 @@ impl State {
             self.background.settings.clone(),
             self.preferences.clone(),
         );
+        self.projected_native_catalogs.clear();
+        self.catalog.models.clear();
+        self.catalog.default_model = None;
+        self.catalog.default_thinking.clear();
         self.client_views =
             json!({"localUi":self.machines.ui[server],"cachedEditors":cached_editors});
         if let Some(mut projection) = projection {
@@ -3314,7 +3292,9 @@ impl State {
             .collect();
         if restored_tabs.is_empty() {
             self.tabs.clear();
-            self.new_client_draft(None);
+            if open_fallback_draft {
+                self.new_client_draft(None);
+            }
         } else {
             self.tabs = restored_tabs;
             let needs_ghost_migration = self.machines.ui[server].get("ghostTab").is_none();
@@ -3400,7 +3380,15 @@ impl State {
     /// the draft moves to the matching logical project on the target machine, or
     /// to its scratch project when nothing matches.
     pub fn retarget_draft(&mut self, server: &str) {
-        if !self.can_retarget_draft() || !self.machine_connected(server) {
+        if !self.can_retarget_draft() {
+            return;
+        }
+        let known_offline_target = !self.machine_connected(server)
+            && matches!(
+                self.draft_route_target(server, self.current().project),
+                RouteTarget::Project(_)
+            );
+        if !self.machine_connected(server) && !known_offline_target {
             return;
         }
         self.machines.picker = false;
@@ -3897,10 +3885,7 @@ impl State {
     }
 
     pub fn choose_draft_project(&mut self, project: Option<usize>) {
-        if (self.machines.draft_picker.as_ref() == Some(&self.machines.selected)
-            || self.current().crew_draft.is_some())
-            && self.current().client_draft
-        {
+        if self.current().client_draft {
             if self.current().project != project {
                 self.current_mut().base_branch = None;
             }
@@ -6995,6 +6980,7 @@ mod tests {
     #[test]
     fn native_catalog_projection_populates_a_device_draft_before_any_native_session() {
         let (mut state, mut server, mut commands) = tab_client();
+        server.default_harness = "pi".into();
         server.codex_catalog.models = vec![AgentModel::from_harness_value(&json!({
             "provider":"codex","id":"catalog-only","name":"Catalog only","thinkingLevels":["low","high"],
             "serviceTiers":[{"id":"default","name":"Standard"},{"id":"fast","name":"Fast"}]
@@ -7347,6 +7333,84 @@ mod tests {
         assert_eq!(state.tabs, [2]);
         assert_eq!(state.current().id, 2);
         assert_eq!(state.ghost_tab, None);
+    }
+
+    #[test]
+    fn disconnecting_the_selected_machine_restores_local_tabs_without_a_new_draft() {
+        let dir =
+            std::env::temp_dir().join(format!("shina-disconnect-tabs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let server_id = uuid::Uuid::new_v4().to_string();
+        let link = crate::peer::Link {
+            server_id: server_id.clone(),
+            host: "127.0.0.1:9".into(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            token: "test-token".into(),
+            enabled: true,
+        };
+        link.save(&dir).unwrap();
+
+        let mut state = State::headless(dir.clone());
+        let (mut client, _) = crate::client::Client::test_connected(dir.clone());
+        let mut remote = crate::client::Client::new(dir.clone());
+        remote.remote = Some(link);
+        client.linked.insert(server_id.clone(), remote);
+        state.client = Some(client);
+
+        // Local has one server thread open in a tab.
+        let mut local = State::headless(dir.clone());
+        local.threads = (1..=2)
+            .map(|id| {
+                let mut thread = Thread::new(id);
+                thread.title = format!("Thread {id}");
+                thread.renamed = true;
+                thread
+            })
+            .collect();
+        local.next_id = 3;
+        let local_projection = local.projection();
+        state
+            .machines
+            .views
+            .insert("local".into(), local_projection.clone().into());
+        state.apply_projection(local_projection).unwrap();
+        state.checkpoint_client();
+        let saved_tabs = state.machines.ui["local"]["tabs"].clone();
+        let saved_active = state.current().id;
+
+        // Visit the linked machine, then disconnect it while it is selected.
+        let mut remote_proj = State::headless(dir.clone());
+        remote_proj.threads[0].title = "Remote thread".into();
+        state
+            .machines
+            .views
+            .insert(server_id.clone(), remote_proj.projection().into());
+        state.select_machine(&server_id);
+        state.disconnect_server(&server_id);
+
+        assert_eq!(state.machines.selected, "local");
+        assert_eq!(state.machines.ui["local"]["tabs"], saved_tabs);
+        assert_eq!(
+            state.tabs,
+            saved_tabs
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|id| id as usize)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(state.current().id, saved_active);
+        assert!(
+            !state.current().client_draft,
+            "disconnect must not open a 'No workspace' draft over the restored tab"
+        );
+        assert!(
+            !state.threads.iter().any(|t| t.client_draft),
+            "disconnect must not leave a device draft behind on local"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

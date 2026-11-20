@@ -27,6 +27,134 @@ pub const MISSING: &str = "Claude Code is unavailable. Shina checks PATH and ~/.
 pub const AUTH_ERROR: &str =
     "Claude authentication failed. Run `claude auth login` outside Shina, then retry.";
 
+/// KSG `ClaudeHome.ts` (`mergeClaudeProcessEnvironment`): a nested Claude
+/// session's own variables must not steer the child process.
+const CLAUDE_SESSION_VARIABLES: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_DESKTOP_APP_VERSION",
+    "CLAUDE_EFFORT",
+    "CLAUDE_PID",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "ELECTRON_RUN_AS_NODE",
+];
+
+/// The `env` values Shina reads from Claude's user and managed settings, like
+/// KSG's `readClaudeSettingsEnv`; later files win.
+fn claude_settings_env() -> HashMap<String, String> {
+    let mut paths = vec![config_directory().join("settings.json")];
+    // KSG `claudeManagedSettingsPaths`: managed settings override the user's.
+    if cfg!(windows) {
+        if let Some(data) = std::env::var_os("ProgramData") {
+            paths.push(PathBuf::from(data).join("ClaudeCode/managed-settings.json"));
+        }
+        if let Some(files) = std::env::var_os("ProgramFiles") {
+            paths.push(PathBuf::from(files).join("ClaudeCode/managed-settings.json"));
+        }
+    } else if cfg!(target_os = "macos") {
+        paths.push(PathBuf::from(
+            "/Library/Application Support/ClaudeCode/managed-settings.json",
+        ));
+    } else {
+        paths.push(PathBuf::from("/etc/claude-code/managed-settings.json"));
+    }
+    let mut env = HashMap::new();
+    for path in paths {
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(settings) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+        if let Some(object) = settings["env"].as_object() {
+            for (key, value) in object {
+                if let Some(value) = value.as_str() {
+                    env.insert(key.clone(), value.to_owned());
+                }
+            }
+        }
+    }
+    env
+}
+
+/// KSG applies the settings-env entrypoint itself because Claude Code reads
+/// `CLAUDE_CODE_ENTRYPOINT` from the process env, not its settings `env`.
+fn claude_entrypoint() -> String {
+    claude_settings_env()
+        .get("CLAUDE_CODE_ENTRYPOINT")
+        .cloned()
+        .unwrap_or_else(|| "shina".into())
+}
+
+/// Ported from `ClaudeProvider.ts` (`claudeGatewayDiscoveryGraceMs`): with
+/// gateway model discovery on, Claude Code refreshes its model cache in the
+/// background after initialization, so the probe keeps the subprocess alive
+/// for the discovery timeout.
+fn claude_gateway_discovery_grace() -> Duration {
+    let settings = claude_settings_env();
+    // KSG spreads the settings `env` over the process env; either source counts.
+    let env = |key: &str| {
+        settings
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+    };
+    let enabled = env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if enabled.is_empty() || enabled == "0" || enabled == "false" {
+        return Duration::ZERO;
+    }
+    if env("ANTHROPIC_BASE_URL")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Duration::ZERO;
+    }
+    let ms = env("CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(3_000);
+    Duration::from_millis(ms)
+}
+
+/// KSG `ClaudeExecutable.ts`: a `.cmd` shim that does not point at a JavaScript
+/// entry forwards to the package's own executable next to it.
+fn windows_package_entry(shim: &Path) -> Option<PathBuf> {
+    let dir = shim.parent()?;
+    for candidate in [
+        &[
+            "node_modules",
+            "@anthropic-ai",
+            "claude-code",
+            "bin",
+            "claude.exe",
+        ][..],
+        &["node_modules", "@anthropic-ai", "claude-code", "cli.js"][..],
+        &[
+            "..",
+            "Packages",
+            "Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe",
+            "claude.exe",
+        ][..],
+    ] {
+        let path = candidate.iter().collect::<PathBuf>();
+        let path = dir.join(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 pub fn process() -> Result<Command, String> {
     let candidates = if let Some(path) = std::env::var_os("SHINA_CLAUDE_CLI") {
         vec![PathBuf::from(path)]
@@ -57,10 +185,22 @@ pub fn process() -> Result<Command, String> {
 
 fn resolve_process(candidates: Vec<PathBuf>) -> Result<Command, String> {
     for path in candidates {
-        if let Ok((executable, script)) = crate::harness::executable(&path.to_string_lossy()) {
+        let resolved = crate::harness::executable(&path.to_string_lossy()).or_else(|error| {
+            if cfg!(windows) && path.extension().is_some_and(|ext| ext == "cmd") {
+                windows_package_entry(&path)
+                    .map(|entry| (entry, None))
+                    .ok_or(error)
+            } else {
+                Err(error)
+            }
+        });
+        if let Ok((executable, script)) = resolved {
             let mut command = Command::new(executable);
             if let Some(script) = script {
                 command.arg(script);
+            }
+            for variable in CLAUDE_SESSION_VARIABLES {
+                command.env_remove(variable);
             }
             command
                 .env_remove(crate::mcp::URL_ENV)
@@ -68,7 +208,11 @@ fn resolve_process(candidates: Vec<PathBuf>) -> Result<Command, String> {
                 .env_remove("SHINA_RUNTIME_MODE")
                 .env_remove("SHINA_PI_BRIDGE_PATH")
                 // Causes known startup failures to arrive as structured result messages.
-                .env("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "1");
+                .env("CLAUDE_CODE_STARTUP_FAILURE_RESULTS", "1")
+                // KSG `mergeClaudeProcessEnvironment`: provider/provider-env values
+                // like ANTHROPIC_BASE_URL inherit untouched; the entrypoint is
+                // Shina's unless Claude's settings `env` overrides it.
+                .env("CLAUDE_CODE_ENTRYPOINT", claude_entrypoint());
             return Ok(command);
         }
     }
@@ -79,17 +223,20 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
     start_process(process()?, start, wake)
 }
 
-pub fn discover(workspace: PathBuf, wake: Waker) -> Result<Pi, String> {
-    let command = process()?;
+pub fn discover(workspace: PathBuf, wake: Waker) -> Pi {
     let start = Start::discovery("claude", workspace);
-    Ok(Pi::worker(
+    Pi::worker(
         wake,
         start.owner.clone(),
         None,
         move |input, events, wake, stopped, owner| {
+            let command = process()?;
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
             run_mode(command, start, input, events, wake, stopped, owner, true)
         },
-    ))
+    )
 }
 
 fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, String> {
@@ -263,6 +410,9 @@ struct Client {
     settings_done: bool,
     /// Grace for `system`/`init`; CLIs that never emit it still finish at this point.
     init_deadline: Option<Instant>,
+    /// When initialization finished; gateway model discovery gets a probe grace
+    /// after this point so its model-cache refresh can land (KSG).
+    ready_at: Option<Instant>,
 }
 
 impl Client {
@@ -323,6 +473,7 @@ impl Client {
             init_seen: false,
             settings_done: false,
             init_deadline: None,
+            ready_at: None,
         }
     }
 
@@ -539,6 +690,25 @@ impl Client {
             });
     }
 
+    /// Resolves a client-facing modelId (saved id, alias, reported id, or the
+    /// `default` pointer) to the catalog slug its row uses.
+    fn selection_slug(&self, id: &str) -> String {
+        // `resolveClaudeModelSlug` resolves aliases; `resolveClaudeReportedModelSlug`
+        // additionally strips the `-\d{8}` date suffix Claude reports on ids.
+        let mut slug = crate::claude_catalog::resolve_claude_model_slug(&self.catalog, id);
+        slug = crate::claude_catalog::resolve_claude_reported_model_slug(&self.catalog, &slug);
+        if slug == "default"
+            && let Some(default) = self
+                .models
+                .iter()
+                .find(|m| m["isDefault"] == true)
+                .and_then(|m| m["id"].as_str())
+        {
+            slug = default.to_owned();
+        }
+        slug
+    }
+
     /// KSG `resolveClaudeCatalogApiModelId` for a manifest slug under the options
     /// applied so far.
     fn api_model_id(&self, slug: &str) -> String {
@@ -647,6 +817,7 @@ impl Client {
             }
         }
         self.ready = true;
+        self.ready_at = Some(Instant::now());
         self.reply(
             &json!({"type":"get_available_models","id":"models"}),
             json!({"models":self.models}),
@@ -802,18 +973,21 @@ impl Client {
                         // slug the client asked for (`optionId` switches keep their row).
                         let slug = pending.original["modelId"]
                             .as_str()
-                            .map(|id| {
-                                crate::claude_catalog::resolve_claude_reported_model_slug(
-                                    &self.catalog,
-                                    id,
-                                )
-                            })
+                            .map(|id| self.selection_slug(id))
                             .or_else(|| self.model["id"].as_str().map(str::to_owned));
                         if let Some(model) = slug
                             .as_ref()
                             .and_then(|slug| self.models.iter().find(|m| m["id"] == *slug))
+                            .cloned()
+                            .or_else(|| {
+                                // A custom/CPA slug the catalog never listed still
+                                // applies; give it a bare row like KSG's customModels.
+                                slug.map(|slug| {
+                                    json!({"provider":"claude","id":slug,"name":slug,"isCustom":true})
+                                })
+                            })
                         {
-                            self.model = model.clone();
+                            self.model = model;
                         }
                         self.usage = Value::Null;
                         self.reply(&pending.original, self.model.clone());
@@ -1496,27 +1670,13 @@ impl Client {
             "set_session_name" => self.reply(&record, json!({})),
             "set_model" => {
                 // Saved and reported ids resolve to manifest slugs before lookup.
-                let reported = record["modelId"].as_str().unwrap_or("");
-                // `resolveClaudeModelSlug` resolves aliases; `resolveClaudeReportedModelSlug`
-                // additionally strips the `-\d{8}` date suffix Claude reports on ids.
-                let mut slug =
-                    crate::claude_catalog::resolve_claude_model_slug(&self.catalog, reported);
-                slug =
-                    crate::claude_catalog::resolve_claude_reported_model_slug(&self.catalog, &slug);
-                if slug == "default"
-                    && let Some(default) = self
-                        .models
-                        .iter()
-                        .find(|m| m["isDefault"] == true)
-                        .and_then(|m| m["id"].as_str())
-                {
-                    slug = default.to_owned();
-                }
-                if self.running || !self.models.iter().any(|m| m["id"] == slug) {
+                let slug = self.selection_slug(record["modelId"].as_str().unwrap_or(""));
+                if self.running {
                     self.reject(&record, "Choose an advertised Claude model while idle.");
                 } else {
                     // KSG `resolveClaudeCatalogApiModelId`: apiModel, else slug, never
                     // the display name, with manifest modelSuffixes applied.
+                    // An unlisted CPA/custom slug routes as its own api id.
                     let api_id = self.api_model_id(&slug);
                     self.request(json!({"subtype":"set_model","model":api_id}), record);
                 }
@@ -2650,6 +2810,11 @@ fn run_mode(
     if probe {
         client.version = claude_cli_version();
     }
+    let gateway_grace = if probe {
+        claude_gateway_discovery_grace()
+    } else {
+        Duration::ZERO
+    };
     client.launch(&mut command);
     command
         .current_dir(&client.start.workspace)
@@ -2759,6 +2924,9 @@ fn run_mode(
                     .pending
                     .values()
                     .any(|p| p.request["subtype"] == "get_usage")
+                && client
+                    .ready_at
+                    .is_some_and(|at| at.elapsed() >= gateway_grace)
             {
                 return Ok(());
             }

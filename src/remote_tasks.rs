@@ -1033,6 +1033,9 @@ mod tests {
         .unwrap();
         let mut state = State::headless(directory);
         state.demo = true;
+        // These fixtures exercise Pi delegation: the peer below advertises
+        // only the pi harness and cpa models.
+        state.threads[0].harness = "pi".into();
         let workspace = state.data_dir.join("workspace");
         assert!(
             std::process::Command::new("git")
@@ -3705,6 +3708,8 @@ mod tests {
                 .send_command
                 .is_some()
         );
+        // Windows refuses to delete a directory under an open sqlite handle.
+        drop(database);
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 
@@ -10033,7 +10038,7 @@ impl State {
             let wake = self.wake.clone();
             let db = database.clone();
             std::thread::spawn(move || {
-                let Ok(Some(_dispatch)) = db.claim_dispatch() else {
+                let Ok(Some(_dispatch)) = db.claim_dispatch("linked peer status check") else {
                     return;
                 };
                 let runtime = peer_runtime();
@@ -10160,7 +10165,10 @@ impl State {
                     let _dispatch = if command.method == "peer.thread.wait" {
                         None
                     } else {
-                        Some(db.claim_dispatch()?.ok_or("Dispatch is fenced.")?)
+                        Some(
+                            db.claim_dispatch("linked peer task command")?
+                                .ok_or("Dispatch is fenced.")?,
+                        )
                     };
                     #[cfg(debug_assertions)]
                     test_peer_send_barrier(&command);
@@ -10184,7 +10192,7 @@ impl State {
                                         return Err(format!("Update required on {}. The wait contract is incompatible.", link.host));
                                     }
                                     if status["finished"] == true {
-                                        let _dispatch = db.claim_dispatch()?.ok_or("Dispatch is fenced.")?;
+                                        let _dispatch = db.claim_dispatch("linked peer task completion")?.ok_or("Dispatch is fenced.")?;
                                         return peer_completion(&link, &thread_id, &status).await;
                                     }
                                 }

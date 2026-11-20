@@ -1642,6 +1642,7 @@ mod tests {
             false,
         );
         state.load_global_for_test();
+        state.use_pi_for_test();
         state.captains = Captain::presets();
         state.open_captain(0);
         state

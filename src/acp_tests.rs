@@ -452,6 +452,266 @@ fn acp_diff_parts_keep_native_unified_patches_without_old_new_text() {
     );
 }
 
+fn devin_client() -> Client {
+    let mut start = spec(SessionSource::New);
+    start.id = "devin".into();
+    let mut client = Client::new(start);
+    client.ready = true;
+    client.session = Some("root-session".into());
+    client
+}
+
+#[test]
+fn devin_initialization_advertises_terminals_and_cognition_capabilities() {
+    let mut start = spec(SessionSource::New);
+    start.id = "devin".into();
+    let mut client = Client::new(start);
+    client.initialize();
+    let request = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "initialize")
+        .unwrap();
+    let capabilities = &request["params"]["clientCapabilities"];
+    assert_eq!(capabilities["terminal"], true);
+    assert_eq!(capabilities["_meta"]["cognition.ai/subagentSupport"], true);
+    assert_eq!(capabilities["_meta"]["cognition.ai/messageGrouping"], true);
+    // Other ACP agents keep the unadvertised defaults.
+    let mut client = Client::new(spec(SessionSource::New));
+    client.initialize();
+    let request = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "initialize")
+        .unwrap();
+    assert_eq!(request["params"]["clientCapabilities"]["terminal"], false);
+    assert!(request["params"]["clientCapabilities"]["_meta"].is_null());
+}
+
+#[test]
+fn devin_updates_route_child_work_under_namespaced_tool_ids() {
+    let mut client = devin_client();
+    client.running = true;
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"root-session","update":{"sessionUpdate":"tool_call",
+            "toolCallId":"shared-tool","title":"Root call","kind":"execute","status":"in_progress"}}}))
+        .unwrap();
+    // The same toolCallId under a subagent context reroutes and namespaces like
+    // KSG's `{nativeTaskId}:tool:{toolCallId}`.
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"root-session","update":{"sessionUpdate":"tool_call",
+            "toolCallId":"shared-tool","title":"Child call","kind":"execute","status":"completed",
+            "_meta":{"cognition.ai/subagent_context":{"parentAgentId":"child-1"}}}}}))
+        .unwrap();
+    let starts: Vec<&Value> = client
+        .events
+        .iter()
+        .filter(|event| event["type"] == "tool_execution_start")
+        .collect();
+    let ids: Vec<&str> = starts
+        .iter()
+        .filter_map(|event| event["toolCallId"].as_str())
+        .collect();
+    assert!(ids.contains(&"shared-tool"), "{ids:?}");
+    assert!(ids.contains(&"child-1:shared-tool"), "{ids:?}");
+    // A direct child-session update is accepted once the child id is known.
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"child-1","update":{"sessionUpdate":"tool_call_update",
+            "toolCallId":"extra","title":"More","status":"completed"}}}))
+        .unwrap();
+    assert!(client.tools.contains_key("child-1:extra"));
+    // An unknown session still fails.
+    assert!(
+        client
+            .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"stranger","update":{"sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"?"}}}}))
+            .is_err()
+    );
+}
+
+#[test]
+fn devin_subagent_tools_project_the_subagent_lifecycle() {
+    let mut client = devin_client();
+    client.running = true;
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"root-session","update":{"sessionUpdate":"tool_call","toolCallId":"spawn",
+            "title":"Tool","kind":"subagent","status":"in_progress",
+            "_meta":{"cognition.ai/subagent_started":{"agentId":"child-1","task":"Research","title":"Researcher","model":"swe-2"},
+                "cognition.ai/inferenceToolName":"delegate_task"}}}}))
+        .unwrap();
+    let start = client
+        .events
+        .iter()
+        .find(|event| event["type"] == "tool_execution_start")
+        .unwrap();
+    // The started meta's title wins over even the inferred tool name.
+    assert_eq!(start["toolName"], "Researcher");
+    assert_eq!(start["toolKind"], "subagent");
+    assert!(client.devin_children.contains("child-1"));
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"root-session","update":{"sessionUpdate":"tool_call_update","toolCallId":"spawn",
+            "status":"completed",
+            "_meta":{"cognition.ai/subagent_completed":{"agentId":"child-1","success":true,"summary":"Finished."}}}}}))
+        .unwrap();
+    let end = client
+        .events
+        .iter()
+        .find(|event| event["type"] == "tool_execution_end")
+        .unwrap();
+    assert_eq!(end["isError"], false);
+    assert!(
+        end["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["text"] == "Finished."),
+        "{}",
+        end["result"]
+    );
+}
+
+#[test]
+fn devin_permission_requests_never_answer_plan_bypass() {
+    let permission_record = |options: Value| {
+        json!({"id":9,"params":{"sessionId":"root-session","title":"Finish the plan?",
+            "toolCall":{"toolCallId":"plan-exit","title":"Plan","kind":"plan"},
+            "options":options}})
+    };
+    let options = json!([
+        {"optionId":"plan_bypass","kind":"allow_once","name":"Bypass permissions"},
+        {"optionId":"plan_accept_edits","kind":"allow_once","name":"Accept edits"},
+        {"optionId":"plan_reject","kind":"reject_once","name":"Reject"}]);
+    // Full access auto-answers the first answerable allow option, not the bypass.
+    let mut client = devin_client();
+    client.start.link.as_mut().unwrap().access_mode = "full-access".into();
+    client
+        .permission(&permission_record(options.clone()))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+        "plan_accept_edits"
+    );
+    // A supervised accept maps to the filtered allow option too.
+    let mut client = devin_client();
+    client.permission(&permission_record(options)).unwrap();
+    let key = client.events.last().unwrap()["id"].clone();
+    client
+        .command(json!({"type":"extension_ui_response","id":key,"decision":"accept"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["optionId"],
+        "plan_accept_edits"
+    );
+    // A request whose only allow option is the bypass cancels safely.
+    let mut client = devin_client();
+    client.start.link.as_mut().unwrap().access_mode = "full-access".into();
+    client
+        .permission(&permission_record(json!([
+            {"optionId":"plan_bypass","kind":"allow_once","name":"Bypass"},
+            {"optionId":"plan_reject","kind":"reject_once","name":"Reject"}])))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["result"]["outcome"]["outcome"],
+        "cancelled"
+    );
+}
+
+#[test]
+fn devin_terminal_requests_create_capture_and_wait() {
+    let mut client = devin_client();
+    client.terminal_request(
+        "terminal/create",
+        &json!({"id":1,"params":{"sessionId":"root-session","command":"echo from-terminal"}}),
+    );
+    let terminal = client.wire.last().unwrap()["result"]["terminalId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    client.terminal_request(
+        "terminal/wait_for_exit",
+        &json!({"id":2,"params":{"sessionId":"root-session","terminalId":terminal}}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client.terminal_waiters.is_empty() {
+        client.flush_terminal_waiters();
+        assert!(Instant::now() < deadline, "terminal waiter never resolved");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let response = client.wire.iter().find(|record| record["id"] == 2).unwrap();
+    assert_eq!(response["result"]["exitCode"], 0);
+    client.terminal_request(
+        "terminal/output",
+        &json!({"id":3,"params":{"sessionId":"root-session","terminalId":terminal}}),
+    );
+    let output = &client.wire.last().unwrap()["result"];
+    assert!(
+        output["output"].as_str().unwrap().contains("from-terminal"),
+        "{output}"
+    );
+    // A non-devin client never advertised terminals and refuses the methods.
+    let mut client = Client::new(spec(SessionSource::New));
+    client
+        .incoming(
+            json!({"jsonrpc":"2.0","id":4,"method":"terminal/create","params":{
+            "sessionId":"s","command":"echo no"}}),
+        )
+        .unwrap();
+    assert_eq!(client.wire.last().unwrap()["error"]["code"], -32601);
+}
+
+#[test]
+fn devin_embedded_terminal_content_resolves_to_output_text() {
+    let mut client = devin_client();
+    client.running = true;
+    let terminal = client
+        .terminals
+        .create(
+            &json!({"sessionId":"root-session","command":"echo embedded-out"}),
+            &client.start.workspace,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.terminals.exit_status_of(&terminal).is_none() {
+        assert!(Instant::now() < deadline, "embedded terminal never exited");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"root-session","update":{"sessionUpdate":"tool_call","toolCallId":"shell",
+            "title":"Tool","kind":"execute","status":"completed",
+            "content":[{"type":"terminal","terminalId":terminal}],
+            "_meta":{"cognition.ai/inferenceToolName":"bash"}}}}))
+        .unwrap();
+    let start = client
+        .events
+        .iter()
+        .find(|event| event["type"] == "tool_execution_start")
+        .unwrap();
+    // The _meta inference name replaced the generic "Tool" title.
+    assert_eq!(start["toolName"], "bash");
+    let end = client
+        .events
+        .iter()
+        .find(|event| event["type"] == "tool_execution_end")
+        .unwrap();
+    let texts: Vec<&str> = end["result"]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("embedded-out")),
+        "{texts:?}"
+    );
+}
+
 fn spec(source: SessionSource) -> Start {
     Start {
         id: "fixture".into(),
@@ -468,6 +728,7 @@ fn spec(source: SessionSource) -> Start {
         owner: Arc::default(),
         context_sent: false,
         prompt_suggestions: false,
+        metadata_only: false,
     }
 }
 
@@ -554,6 +815,67 @@ fn live_thread(agent: Agent, source: SessionSource) -> Thread {
     thread
 }
 
+#[test]
+fn antigravity_linkless_discovery_returns_models_and_commands() {
+    let (mut agent, log) = fixture(&["--antigravity", "--discovery", "--no-mcp"]);
+    agent.id = "antigravity".into();
+    let start = Start::discovery(&agent.id, crate::store::directory().unwrap());
+    let pi = super::start(agent, start, Arc::new(|| {})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut models, mut commands) = (false, false);
+    let mut diagnostics = vec![];
+    while !models || !commands {
+        match pi
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(Event::Record(record)) if record["command"] == "get_available_models" => {
+                assert_eq!(record["success"], true, "{record}");
+                assert!(
+                    record["data"]["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|model| model["id"] == "gemini-3.8-flash-high"),
+                    "{record}"
+                );
+                models = true;
+            }
+            Ok(Event::Record(record)) if record["command"] == "get_commands" => {
+                assert_eq!(record["success"], true, "{record}");
+                assert_eq!(record["data"]["commands"][0]["name"], "fixture");
+                commands = true;
+            }
+            Ok(Event::Record(_)) => {}
+            Ok(Event::Diagnostic(message)) => diagnostics.push(message),
+            Ok(Event::Error(error)) => panic!("ACP discovery failed: {error}\n{diagnostics:?}"),
+            Ok(Event::Exited) => panic!("ACP discovery exited before returning its catalog"),
+            Err(error) => {
+                panic!("ACP discovery did not return its catalog: {error}\n{diagnostics:?}")
+            }
+        }
+    }
+    let wire = records(&log);
+    assert_eq!(
+        wire.iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect::<Vec<_>>(),
+        ["initialize", "authenticate", "session/new"]
+    );
+    assert_eq!(wire[2]["params"]["mcpServers"], json!([]));
+}
+
+#[test]
+fn interactive_acp_requires_an_mcp_bridge() {
+    let (agent, _log) = fixture(&["--antigravity"]);
+    let mut start = spec(SessionSource::New);
+    start.link = None;
+    let Err(error) = super::start(agent, start, Arc::new(|| {})) else {
+        panic!("Interactive ACP must not start without an MCP bridge");
+    };
+    assert!(error.contains("ACP requires Shina's MCP bridge"), "{error}");
+}
+
 /// KSG AntigravityAcpSupport: initialize, eager authenticate, session/new with
 /// model+thinking_level config options, combined `family-level` selection.
 #[test]
@@ -637,6 +959,126 @@ fn antigravity_fake_agent_authenticate_config_options_and_combined_model() {
     );
     assert_eq!(sets[3]["params"]["configId"], "thinking_level");
     assert_eq!(sets[3]["params"]["value"], "high");
+}
+
+/// KSG applyAntigravityAcpModelSelection, gateway branch: family-level picks send
+/// the family's default effort route through the model config option, the
+/// adapter-owned reasoningEffort pick re-routes the current family, and a
+/// `family-medium` the agent does not list retries as the family itself.
+#[test]
+fn antigravity_gateway_family_selection_sends_effort_routes() {
+    let options = json!([
+        {"value":"gemini-4-hydrogen","name":"Gemini 4 Hydrogen"},
+        {"value":"gemini-4-hydrogen-high","name":"Gemini 4 Hydrogen"},
+        {"value":"gemini-4-hydrogen-low","name":"Gemini 4 Hydrogen"},
+        {"value":"claude-opus-5-5","name":"Claude Opus 5.5"},
+        {"value":"claude-opus-5-5-high","name":"Claude Opus 5.5 (High)"}]);
+    let model_option = |current: &str| {
+        json!({"id":"model","name":"Model","category":"model","type":"select",
+            "currentValue":current,"options":options})
+    };
+    let mut client = Client::new(spec(SessionSource::New));
+    client.antigravity = true;
+    client.antigravity_gateway = true;
+    client.gateway_models = "gemini-4-hydrogen-low, gemini-4-hydrogen-medium, gemini-4-hydrogen-high, claude-opus-5-5-high".into();
+    client.ready = true;
+    client.session = Some("fixture-session".into());
+    client.configure_models(&json!({
+        "configOptions":[model_option("gemini-4-hydrogen-high")],
+        "models":{"currentModelId":"gemini-4-hydrogen-high",
+            "availableModels":[{"modelId":"gemini-4-hydrogen-high","name":"Gemini 4 Hydrogen"}]}
+    }));
+    // Rows nest under the family slug; the current route marks its row default.
+    let ids: Vec<&str> = client
+        .models
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, ["gemini-4-hydrogen", "claude-opus-5-5-high"]);
+    assert_eq!(client.model["id"], "gemini-4-hydrogen");
+    // A family-level pick sends the default (medium) effort route.
+    client
+        .command(json!({"type":"set_model","id":"pick","modelId":"gemini-4-hydrogen"}))
+        .unwrap();
+    let request = client.wire.last().unwrap().clone();
+    assert_eq!(request["method"], "session/set_config_option");
+    assert_eq!(
+        request["params"],
+        json!({"sessionId":"fixture-session","configId":"model","value":"gemini-4-hydrogen-medium"})
+    );
+    // KSG -32602 retry: the agent folds its medium tier into the family option.
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":request["id"],
+            "error":{"code":-32602,"message":"Unknown model ID: gemini-4-hydrogen-medium"}}))
+        .unwrap();
+    let retry = client.wire.last().unwrap().clone();
+    assert_eq!(retry["method"], "session/set_config_option");
+    assert_eq!(retry["params"]["value"], "gemini-4-hydrogen");
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":retry["id"],
+            "result":{"configOptions":[model_option("gemini-4-hydrogen")]}}))
+        .unwrap();
+    let reply = client.events.last().unwrap();
+    assert_eq!(reply["id"], "pick");
+    assert_eq!(reply["success"], true);
+    assert_eq!(reply["data"]["id"], "gemini-4-hydrogen");
+    // The adapter-owned effort pick sends its exact route through the model config.
+    client
+        .command(
+            json!({"type":"set_option","id":"effort","optionId":"reasoningEffort","value":"high"}),
+        )
+        .unwrap();
+    let request = client.wire.last().unwrap().clone();
+    assert_eq!(
+        request["params"],
+        json!({"sessionId":"fixture-session","configId":"model","value":"gemini-4-hydrogen-high"})
+    );
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":request["id"],
+            "result":{"configOptions":[model_option("gemini-4-hydrogen-high")]}}))
+        .unwrap();
+    assert_eq!(client.events.last().unwrap()["id"], "effort");
+    assert_eq!(client.events.last().unwrap()["success"], true);
+    // The effort pick persists for the next selection on the same row...
+    client
+        .command(json!({"type":"set_model","id":"again","modelId":"gemini-4-hydrogen"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["value"],
+        "gemini-4-hydrogen-high"
+    );
+    client
+        .incoming(
+            json!({"jsonrpc":"2.0","id":client.wire.last().unwrap()["id"],
+            "result":{"configOptions":[model_option("gemini-4-hydrogen-high")]}}),
+        )
+        .unwrap();
+    // ...but a different row starts from its own default.
+    client
+        .command(json!({"type":"set_model","id":"opus","modelId":"claude-opus-5-5-high"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["params"]["value"],
+        "claude-opus-5-5-high"
+    );
+    // An unconfigured model is rejected.
+    client
+        .command(json!({"type":"set_model","id":"nope","modelId":"gpt-6.2-sol"}))
+        .unwrap();
+    assert_eq!(client.events.last().unwrap()["success"], false);
+    // The gateway auth method drives the eager authenticate call.
+    let mut client = Client::new(spec(SessionSource::New));
+    client.antigravity = true;
+    client.antigravity_gateway = true;
+    client.initialize();
+    let init = client.wire.pop().unwrap();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":init["id"],
+            "result":{"protocolVersion":1,"agentCapabilities":{}}}))
+        .unwrap();
+    let auth = client.wire.pop().unwrap();
+    assert_eq!(auth["method"], "authenticate");
+    assert_eq!(auth["params"]["methodId"], "gateway");
 }
 
 #[test]
@@ -1080,6 +1522,42 @@ fn acp_reports_option_descriptors_and_applies_config_and_mode_options() {
         "thought_level"
     );
     assert_eq!(client.wire.last().unwrap()["params"]["value"], "high");
+}
+
+/// An unflagged probe spawn pops a console window on Windows for console hosts
+/// like agy or claude. The fixture reports its own console handle and pid so the
+/// test can check both the launch flags and that the probe reaps the agent.
+#[cfg(windows)]
+#[test]
+fn an_initialize_probe_has_no_console_window_and_reaps_the_agent() {
+    let (agent, log) = fixture(&["--record-launch"]);
+    let capabilities = probe(&agent).unwrap();
+    assert_eq!(capabilities["mcpCapabilities"]["stdio"], true);
+    let wire = records(&log);
+    let launch = wire
+        .iter()
+        .find_map(|record| record.get("fixtureLaunch"))
+        .expect("fixture launch record");
+    assert!(
+        launch.get("consoleWindow").is_some_and(Value::is_null),
+        "the probe agent inherited or created a console: {launch}"
+    );
+    assert_eq!(
+        wire.iter()
+            .filter_map(|record| record["method"].as_str())
+            .collect::<Vec<_>>(),
+        ["initialize"],
+        "the probe must send initialize only: {wire:?}"
+    );
+    let pid = launch["pid"].as_u64().expect("fixture pid") as u32;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while crate::process::is_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the probe agent outlived the probe"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

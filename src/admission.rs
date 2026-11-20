@@ -2175,6 +2175,8 @@ mod tests {
     fn demo() -> State {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        // These tests exercise the cpa driver's admission path.
+        state.threads[0].harness = "pi".into();
         state
     }
 

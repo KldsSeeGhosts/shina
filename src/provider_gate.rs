@@ -70,6 +70,8 @@ mod tests {
     #[test]
     fn update_gate_applies_to_new_threads_and_only_its_driver() {
         let mut state = State::headless(crate::store::directory().unwrap());
+        // threads[0] is the non-codex driver: the codex hold must skip it.
+        state.threads[0].harness = "pi".into();
         state.hold_provider("codex");
         let mut thread = Thread::new(2);
         thread.harness = "codex".into();

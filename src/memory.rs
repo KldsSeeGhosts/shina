@@ -913,6 +913,7 @@ mod tests {
 
     fn fixture() -> State {
         let mut state = State::new(PathBuf::new(), false);
+        state.use_pi_for_test();
         state.captains = Captain::presets();
         state.open_captain(0);
         state

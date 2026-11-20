@@ -212,6 +212,8 @@ pub use scope::RemoteProject;
 mod capabilities;
 #[path = "codex_model.rs"]
 mod codex_model;
+#[cfg(test)]
+pub(crate) use codex_model::PICKER_MAP_BUILDS;
 #[path = "placement.rs"]
 pub(crate) mod placement;
 #[cfg(test)]
@@ -603,6 +605,8 @@ pub enum ProjectPicker {
     AddProject,
     /// Add or remove a workspace in the open captain's scope, from its Brief panel.
     CaptainScope,
+    /// Pick the workspace for the New captain editor; the choice stays on the modal.
+    CaptainWorkspace,
 }
 
 /// UI-only state for the captain Brief panel and the profile editor in `captain_ui.rs`.
@@ -1660,7 +1664,7 @@ impl Thread {
             recovery_command: None,
             projected_harness_choice: false,
             id,
-            harness: "pi".into(),
+            harness: "codex".into(),
             harness_context_sent: false,
             harness_state: json!({}),
             project: None,
@@ -1868,6 +1872,7 @@ impl Thread {
                 owner: self.connection_owner.clone(),
                 context_sent: self.harness_context_sent,
                 prompt_suggestions: self.prompt_suggestions_enabled && !self.delegated,
+                metadata_only: false,
             },
             wake,
         ) {
@@ -4805,6 +4810,7 @@ pub struct State {
     server_seq: u64,
     persist_transcripts: bool,
     client_views: Value,
+    projected_native_catalogs: std::collections::BTreeMap<String, codex_model::NativeModelMetadata>,
     /// Which emitted thread records the last projections actually applied.
     pub(crate) apply_stats: client_state::ApplyStats,
     next_client_draft: usize,
@@ -5103,7 +5109,11 @@ pub struct State {
     pub catalog: Catalog,
     pub codex_catalog: crate::session::NativeCatalog,
     pub claude_catalog: crate::session::NativeCatalog,
+    pub antigravity_catalog: crate::session::NativeCatalog,
+    pub cursor_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
+    provider_availability: crate::harness::AvailabilityProbe,
+    refresh_optional_catalogs: bool,
     pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
     /// True only when this reducer runs under the durable server batch (or a
@@ -5932,6 +5942,7 @@ impl State {
             persist_transcripts: false,
             dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
+            projected_native_catalogs: Default::default(),
             apply_stats: Default::default(),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
@@ -6015,7 +6026,7 @@ impl State {
             stash_pulse: 0,
             lifecycle_error: None,
             auto_settle_days: 3,
-            default_harness: "pi".into(),
+            default_harness: "codex".into(),
             drag_thread: None,
             drag_target: None,
             drop_rects: Default::default(),
@@ -6153,7 +6164,11 @@ impl State {
             catalog: Catalog::default(),
             codex_catalog: Default::default(),
             claude_catalog: Default::default(),
+            antigravity_catalog: Default::default(),
+            cursor_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
+            provider_availability: Default::default(),
+            refresh_optional_catalogs: false,
             managed_policy: if cfg!(test) {
                 None
             } else {
@@ -6195,6 +6210,12 @@ impl State {
     }
     pub fn current_mut(&mut self) -> &mut Thread {
         &mut self.threads[self.active]
+    }
+    #[cfg(test)]
+    pub(crate) fn use_pi_for_test(&mut self) {
+        // Keep synthetic tests independent of the configured default and native CLIs.
+        self.default_harness = "pi".into();
+        self.current_mut().harness = "pi".into();
     }
     /// The key the current thread's right-panel state lives under: machine plus thread id, so
     /// the same numeric id on two hosts stays separate.
@@ -9272,12 +9293,13 @@ impl State {
         }
         self.captain_picker = false;
         let used_names: std::collections::HashSet<String> = self
-            .captains
-            .iter()
-            .map(|c| c.name.to_lowercase())
+            .picker_captains()
+            .map(|captain| self.captains[captain].name.to_lowercase())
             .collect();
-        let used_portraits: std::collections::HashSet<usize> =
-            self.captains.iter().map(|c| c.portrait).collect();
+        let used_portraits: std::collections::HashSet<usize> = self
+            .picker_captains()
+            .map(|captain| self.captains[captain].portrait)
+            .collect();
         let (portrait, suggested_name) = (0..crate::visuals::PORTRAITS)
             .find(|i| {
                 !used_portraits.contains(i)
@@ -9338,6 +9360,24 @@ impl State {
             return;
         }
         if self.client.is_some() {
+            let target_server = self
+                .captain_editor
+                .as_ref()
+                .map(|editor| editor.server.clone());
+            if let Some(server) = target_server
+                && server != self.machines.selected
+            {
+                if !self.machine_connected(&server) {
+                    return;
+                }
+                let editor = self.captain_editor.take();
+                let captain_project = self.captain_project;
+                let captain_target = self.projects.captain_target;
+                self.select_machine_without_draft(&server);
+                self.captain_editor = editor;
+                self.captain_project = captain_project;
+                self.projects.captain_target = captain_target;
+            }
             if let Some(editor) = &self.captain_editor {
                 if editor.server != self.machines.selected {
                     return;
@@ -13964,11 +14004,8 @@ impl State {
                 options,
             });
         }
-        let models = self.harness_models(harness);
-        let model = models
-            .iter()
-            .find(|m| m.is_default)
-            .or_else(|| models.first())
+        let model = self
+            .default_harness_model(harness)
             .map(|m| m.id.clone())
             .unwrap_or_else(|| {
                 crate::model_selection::default_model_by_provider(harness).to_owned()
@@ -14039,10 +14076,8 @@ impl State {
         {
             return m.name.clone();
         }
-        self.harness_models(harness)
-            .into_iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.name)
+        self.harness_model(harness, model_id)
+            .map(|m| m.name.clone())
             .unwrap_or_else(|| model_id.to_owned())
     }
 
@@ -15101,10 +15136,10 @@ impl State {
     }
 
     pub fn refresh_catalog(&mut self) {
+        self.refresh_provider_availability(true);
         if self.forward("catalog.refresh", json!({})) {
             return;
         }
-        self.harnesses = crate::harness::Registry::read();
         self.refresh_native_catalogs(true);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_some()
@@ -15134,6 +15169,7 @@ impl State {
     /// Ported from KSG Code's `ProviderModelPicker.tsx`: opening the picker refreshes the model
     /// catalog through the capability-gated `modelCatalogOnly` path, throttled by 5 minutes.
     pub fn refresh_catalog_on_open(&mut self) {
+        self.refresh_provider_availability(false);
         if self.client.is_some() {
             if !self.supports_model_catalog_refresh() {
                 return;
@@ -15141,24 +15177,20 @@ impl State {
             self.forward("catalog.refresh", json!({"modelCatalogOnly": true}));
             return;
         }
-        self.harnesses = crate::harness::Registry::read();
         self.refresh_native_catalogs(false);
         if !self.demo && self.runtime_enabled {
             self.catalog
                 .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
-        }
-        if !self.catalog.models.is_empty() {
-            self.apply_catalog();
         }
     }
 
     /// Explicit retry button bypasses the on-demand throttle and retry backoff.
     pub fn force_refresh_catalog(&mut self) {
         self.catalog.error = None;
+        self.refresh_provider_availability(true);
         if self.forward("catalog.refresh", json!({"force": true})) {
             return;
         }
-        self.harnesses = crate::harness::Registry::read();
         self.refresh_native_catalogs(true);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_some()
@@ -15256,7 +15288,9 @@ impl State {
             if thread.harness != "pi" {
                 continue;
             }
-            thread.models = self.catalog.models.clone();
+            if thread.models != self.catalog.models {
+                thread.models.clone_from(&self.catalog.models);
+            }
             if thread.model_id.is_empty()
                 && thread.session.is_none()
                 && let Some(model) = &self.catalog.default_model
@@ -15580,7 +15614,7 @@ impl State {
             }
         };
         self.default_harness = match index.get("defaultHarness") {
-            None => "pi".into(),
+            None => "codex".into(),
             Some(value) => value
                 .as_str()
                 .filter(|id| crate::harness::valid_id(id))
@@ -15681,6 +15715,10 @@ impl State {
                             return None;
                         }
                         thread.harness = harness.into();
+                    } else {
+                        // Indexes saved before per-thread harnesses have no
+                        // harness field; those threads are all Pi sessions.
+                        thread.harness = "pi".into();
                     }
                     if let Some(sent) = record.get("harnessContextSent") {
                         thread.harness_context_sent = sent.as_bool()?;
@@ -16753,13 +16791,12 @@ impl State {
         }) {
             return Some("A delegated task is running or queued. Restart when it finishes.");
         }
-        if self.threads.iter().any(|t| {
-            t.status.busy()
-                || t.configuring
-                || t.session_started.is_some()
-                || t.queued()
-                || t.request.is_some()
-        }) {
+        // A provider can be starting or applying model settings before any work is sent.
+        if self
+            .threads
+            .iter()
+            .any(|t| t.status.busy() || t.queued() || t.request.is_some())
+        {
             return Some("A thread is still working. Restart when it finishes.");
         }
         if self.projects.cloning() {
@@ -17264,10 +17301,12 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
         return browsing | composer_changed;
     }
+    let availability_changed = state.poll_provider_availability();
     if state.client.is_some() {
         return state.poll_client(tx)
             | crate::ui::diff_panel::tick(state, tx)
             | browsing
+            | availability_changed
             | composer_changed;
     }
     let browsing = browsing | state.poll_fleet();
@@ -17287,6 +17326,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut changed = browsing
         | composer_changed
+        | availability_changed
         | background_changed
         | state.updater.poll(Instant::now(), state.wake.clone());
     if let Some(remaining) = state.updater.remaining(Instant::now()) {
@@ -17305,12 +17345,20 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(remaining) = state.catalog.remaining() {
         tx.wake_after(remaining);
     }
-    state.refresh_native_catalogs(false);
-    if state.codex_catalog.poll("codex") | state.claude_catalog.poll("claude") {
+    changed |= state.refresh_native_catalogs(false);
+    if state.codex_catalog.poll("codex")
+        | state.claude_catalog.poll("claude")
+        | state.antigravity_catalog.poll("antigravity")
+        | state.cursor_catalog.poll("cursor")
+    {
         state.apply_native_catalogs();
         changed = true;
     }
-    if state.codex_catalog.loading() || state.claude_catalog.loading() {
+    if state.codex_catalog.loading()
+        || state.claude_catalog.loading()
+        || state.antigravity_catalog.loading()
+        || state.cursor_catalog.loading()
+    {
         tx.wake_after(Duration::from_millis(50));
     }
     changed |= state.prewarm_current();
@@ -19130,6 +19178,7 @@ mod tests {
     #[test]
     fn background_settle_and_crew_creation_do_not_open_tabs_or_move_focus() {
         let mut state = tab_fixture();
+        state.use_pi_for_test();
         let before = (state.tabs.clone(), state.current().id);
         state.sweep_lifecycle(lifecycle::now() + 100 * 86_400_000);
         state.demo = true;
@@ -19175,6 +19224,8 @@ mod tests {
     #[test]
     fn new_threads_keep_default_effort_when_the_inherited_effort_is_invalid() {
         let mut state = tab_fixture();
+        state.default_harness = "pi".into();
+        state.current_mut().harness = "pi".into();
         let model = AgentModel::from_value(
             &json!({"provider":"cpa","id":"chosen","name":"Chosen","reasoning":true}),
         )
@@ -19417,12 +19468,6 @@ mod tests {
             );
         }
         state.threads[0].status = Status::Ready;
-        state.threads[0].configuring = true;
-        assert!(state.update_restart_blocker().is_some());
-        state.threads[0].configuring = false;
-        state.threads[0].session_started = Some(Instant::now());
-        assert!(state.update_restart_blocker().is_some());
-        state.threads[0].session_started = None;
         state.threads[0].queued_prompt = Some((
             Prompt {
                 text: "queued".into(),
@@ -19455,6 +19500,36 @@ mod tests {
         // A composer draft is saved, so it never blocks.
         state.threads[0].draft.replace_text("unsent");
         assert_eq!(state.update_restart_blocker(), None);
+    }
+
+    #[test]
+    fn update_restart_blocker_ignores_idle_prewarm_but_not_pending_input() {
+        let mut state = ready_state();
+        let (pi, input, _events) = crate::backend::Pi::test_connection();
+        let thread = &mut state.threads[0];
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.session_started = Some(Instant::now());
+        assert_eq!(state.update_restart_blocker(), None);
+        state.threads[0].configuring = true;
+        assert_eq!(state.update_restart_blocker(), None);
+
+        state.threads[0].pending_prompt =
+            Some(("1-1".into(), Prompt::new("Send".into(), vec![]), 0));
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].pending_prompt = None;
+        state.threads[0].status = Status::Running;
+        assert!(state.update_restart_blocker().is_some());
+        state.threads[0].status = Status::Ready;
+        assert_eq!(state.update_restart_blocker(), None);
+
+        state.begin_runtime_shutdown();
+        state.stop_runtime();
+        assert!(state.threads[0].pi.is_none());
+        assert!(matches!(
+            input.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
@@ -20228,6 +20303,7 @@ mod tests {
         let mut state = State::new(".".into(), false);
         // Prevent a real subprocess in this unit test; connect_thread is tested live below.
         state.demo = true;
+        state.use_pi_for_test();
         let (reply, answer) = mpsc::channel();
         state.mcp_request(crate::mcp::Request {
             thread: 1,
@@ -20259,6 +20335,7 @@ mod tests {
     fn explicit_delegation_selection_applies_before_the_first_prompt_and_is_reported() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.current_mut().harness = "pi".into();
         let fast = model_with_levels("fast", &["off", "low"]);
         let deep = model_with_levels(
             "deep",
@@ -20431,6 +20508,7 @@ mod tests {
     fn invalid_delegation_targets_are_rejected_without_creating_children() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.threads[0].harness = "pi".into();
         let fast = model_with_levels("fast", &["off", "low"]);
         let deep = model_with_levels(
             "deep",
@@ -20522,6 +20600,7 @@ mod tests {
     fn delegation_inherits_pinned_selection_and_overrides_only_given_fields() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.threads[0].harness = "pi".into();
         state.threads[0].model_provider = "cpa".into();
         state.threads[0].model_id = "fast".into();
         state.threads[0].thinking = "low".into();
@@ -20589,6 +20668,7 @@ mod tests {
     fn delegation_uses_the_catalog_default_when_the_caller_has_no_selection() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
+        state.threads[0].harness = "pi".into();
         let fast = model_with_levels("fast", &["off", "low"]);
         let deep = model_with_levels(
             "deep",
@@ -20618,6 +20698,7 @@ mod tests {
         state.catalog.models = vec![fast.clone(), deep.clone()];
         state.catalog.default_model = Some(fast);
         state.catalog.default_thinking = "low".into();
+        state.threads[0].harness = "pi".into();
         state.threads[0].selected_model = Some(("cpa".into(), "deep".into()));
         state.threads[0].selected_thinking = Some("max".into());
         let capabilities = state
@@ -20648,7 +20729,7 @@ mod tests {
         assert_eq!(capabilities["runtime"]["harness"], "pi");
         assert_eq!(
             capabilities["runtime"]["providers"],
-            json!(["cpa", "codex", "claude"])
+            json!(["cpa", "codex", "claude", "cursor"])
         );
         assert_eq!(capabilities["runtime"]["hosts"], json!(["local"]));
         assert_eq!(capabilities["runtime"]["machine"], "local");
@@ -20781,6 +20862,7 @@ mod tests {
     #[test]
     fn capabilities_report_discovery_not_ready_without_inventing_models() {
         let mut state = State::new(".".into(), false);
+        state.threads[0].harness = "pi".into();
         state.catalog.error = Some("Model discovery timed out.".into());
         let capabilities = state
             .mcp_call(1, "orchestrator_capabilities", &json!({}))
@@ -20811,6 +20893,7 @@ mod tests {
     #[test]
     fn capabilities_use_caller_metadata_when_catalog_discovery_is_unavailable() {
         let mut state = State::new(".".into(), false);
+        state.threads[0].harness = "pi".into();
         let deep = model_with_levels(
             "deep",
             &["off", "minimal", "low", "medium", "high", "xhigh", "max"],
@@ -21825,6 +21908,7 @@ mod tests {
     fn direct_provider_models_are_hidden_and_cannot_receive_prompts() {
         let (pi, commands, _events) = Pi::test_connection();
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.pi = Some(pi);
         thread.status = Status::Ready;
         thread.apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
@@ -21874,6 +21958,7 @@ mod tests {
     #[test]
     fn offline_picker_choices_are_applied_before_the_first_prompt() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.set_model("cpa".into(), "chosen".into());
         thread.set_thinking("high".into());
         assert_eq!(thread.model_id, "chosen");
@@ -21949,6 +22034,7 @@ mod tests {
     #[test]
     fn context_stats_refresh_on_startup_turns_and_model_changes() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         let (pi, commands, _events) = Pi::test_connection();
         thread.pi = Some(pi);
         thread.initializing = true;
@@ -22131,6 +22217,7 @@ mod tests {
     #[test]
     fn catalog_image_metadata_and_rejected_model_changes_preserve_actual_support() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "pi".into();
         state.current_mut().model_id = "vision".into();
         state.catalog.models = vec![
             AgentModel::from_value(&json!({
@@ -22282,6 +22369,7 @@ mod tests {
     #[test]
     fn failed_startup_settings_restore_the_message_instead_of_sending_with_defaults() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.set_model("cpa".into(), "missing".into());
         thread.draft.replace_text("Keep my model choice");
         thread.send();
@@ -22338,6 +22426,8 @@ mod tests {
     #[test]
     fn catalog_defaults_do_not_overwrite_a_saved_thinking_choice() {
         let mut state = State::new(".".into(), false);
+        state.default_harness = "pi".into();
+        state.current_mut().harness = "pi".into();
         state.current_mut().set_thinking("high".into());
         let model = AgentModel::from_value(
             &json!({"provider":"cpa","id":"default","name":"Default CPA","reasoning":true}),
@@ -22637,6 +22727,7 @@ mod tests {
     #[test]
     fn mcp_lists_the_callers_project_without_changing_captain_ownership() {
         let mut state = State::new(".".into(), false);
+        state.use_pi_for_test();
         // Rosters start empty; these tests exercise the earlier named presets.
         state.captains = crate::captains::Captain::presets();
         state.open_captain(0);
@@ -22755,7 +22846,13 @@ mod tests {
         duplicate["path"] = verbatim.to_string_lossy().as_ref().into();
         index["projects"].as_array_mut().unwrap().push(duplicate);
         index["threads"][0]["project"] = 2.into();
+        index["threads"][0]["harness"] = "pi".into();
         index["projectScope"] = 2.into();
+        let uid = index["identity"]["projectCheckoutIds"]["1"].clone();
+        index["identity"]["projectCheckoutIds"]
+            .as_object_mut()
+            .unwrap()
+            .insert("2".into(), uid);
         let mut restored = State::new(PathBuf::new(), false);
         restored.restore_global(&index).unwrap();
         assert_eq!(restored.projects.entries.len(), 1);
@@ -23273,6 +23370,7 @@ mod tests {
     #[test]
     fn image_only_prompts_send_typed_pi_images_with_ksg_path_context() {
         let mut thread = Thread::new(1);
+        thread.harness = "pi".into();
         thread.model_provider = "cpa".into();
         thread.supports_images = Some(true);
         let (pi, commands, _events) = Pi::test_connection();
@@ -23694,6 +23792,7 @@ mod tests {
     #[test]
     fn retry_after_a_crash_resends_the_snapshotted_image_message() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "pi".into();
         state.current_mut().model_provider = "cpa".into();
         state.current_mut().supports_images = Some(true);
         state.current_mut().session = Some("saved.jsonl".into());
@@ -24686,6 +24785,7 @@ mod tests {
     #[test]
     fn usage_limits_command_raises_notice_without_sending_and_requires_capability() {
         let mut state = State::new(".".into(), false);
+        state.current_mut().harness = "pi".into();
         // Pi has no report, so `/usage-limits` is not offered and sends as ordinary text.
         state.current_mut().draft.focused = true;
         state.current_mut().draft.replace_text("/");
@@ -25466,6 +25566,7 @@ mod tests {
         );
         state.catalog.models = models.clone();
         state.catalog.default_model = models.first().cloned();
+        state.default_harness = "pi".into();
         state.current_mut().harness = "pi".into();
         state.current_mut().models = models;
         if let Some(first) = state.catalog.models.first().cloned() {

@@ -3613,6 +3613,7 @@ mod tests {
     fn three_children_start_and_eight_unfinished_tasks_are_the_limit() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         for _ in 0..8 {
             state
                 .mcp_call(1, "delegate_task", &json!({"prompt":"A bounded task"}))
@@ -4174,6 +4175,7 @@ mod tests {
             let mut runtime =
                 crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
             runtime.state.demo = true;
+            runtime.state.use_pi_for_test();
             runtime.state.runtime_enabled = false;
             let database = runtime.database.clone().unwrap();
             database.begin().unwrap();
@@ -4387,6 +4389,7 @@ mod tests {
     fn read_only_modes_round_trip_and_children_use_the_default_worker_mode() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         state.threads[0].native.access = AccessMode::ReadOnly;
         state
             .mcp_call(
@@ -4658,6 +4661,7 @@ mod tests {
     fn keyed_delegation_replays_one_task_and_rejects_changed_intent() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         let first = state
             .mcp_call(1, "delegate_task", &delegate_args("run-1"))
             .unwrap();
@@ -4699,6 +4703,7 @@ mod tests {
     fn keyed_delegation_replays_at_capacity_and_after_completion() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         let first = state
             .mcp_call(1, "delegate_task", &delegate_args("cap-1"))
             .unwrap();
@@ -4727,6 +4732,7 @@ mod tests {
     fn keyed_delegation_replays_after_the_child_records_are_gone() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         let first = state
             .mcp_call(1, "delegate_task", &delegate_args("gone-1"))
             .unwrap();
@@ -4760,6 +4766,7 @@ mod tests {
     fn keyed_delegation_survives_a_snapshot_restart() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         let first = state
             .mcp_call(1, "delegate_task", &delegate_args("boot-1"))
             .unwrap();
@@ -4781,6 +4788,7 @@ mod tests {
     fn keyed_delegation_scopes_to_the_captain_across_home_resets() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         state.captains = Captain::presets();
         state.open_captain(0);
         let home = state.captain_home(0).unwrap();
@@ -4802,12 +4810,15 @@ mod tests {
     fn keyed_delegation_scopes_to_the_caller_and_unkeyed_calls_allocate() {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         let first = state
             .mcp_call(1, "delegate_task", &delegate_args("scope-1"))
             .unwrap();
         // A different caller may reuse the same key for its own task.
         let caller = state.next_id;
-        state.threads.push(Thread::new(caller));
+        let mut thread = Thread::new(caller);
+        thread.harness = "pi".into();
+        state.threads.push(thread);
         state.next_id += 1;
         let other = state
             .mcp_call(caller, "delegate_task", &delegate_args("scope-1"))
@@ -4879,6 +4890,7 @@ mod tests {
             std::env::temp_dir().join(format!("shina-delegate-{}", uuid::Uuid::new_v4()));
         let mut runtime = crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
         runtime.state.demo = true;
+        runtime.state.use_pi_for_test();
         let database = runtime.database.clone().unwrap();
         let before = database.read("index.json").unwrap().unwrap();
         database
@@ -4928,6 +4940,7 @@ mod tests {
             let mut runtime =
                 crate::runtime::RuntimeState::open(directory.clone(), Arc::new(|| {})).unwrap();
             runtime.state.demo = true;
+            runtime.state.use_pi_for_test();
             let database = runtime.database.clone().unwrap();
             database.begin().unwrap();
             let capture = crate::outbox::Capture::begin();
@@ -4986,6 +4999,7 @@ mod tests {
             let mut runtime =
                 crate::runtime::RuntimeState::open(directory.clone(), Arc::new(|| {})).unwrap();
             runtime.state.demo = true;
+            runtime.state.use_pi_for_test();
             let database = runtime.database.clone().unwrap();
             let identity = database.identity().unwrap();
             server_id = identity["controllerId"].as_str().unwrap().to_owned();

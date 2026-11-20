@@ -1185,12 +1185,12 @@ mod tests {
         // Claude Code below claude-fable-5-2's minVersion does not list it.
         let bundled = bundled_claude_model_catalog(0);
         assert!(
-            !resolve_claude_models_for_version(&bundled, Some("2.1.289"))
+            !resolve_claude_models_for_version(&bundled, Some("2.1.320"))
                 .iter()
                 .any(|m| m.slug == "claude-fable-5-2")
         );
         assert!(
-            resolve_claude_models_for_version(&bundled, Some("2.1.290"))
+            resolve_claude_models_for_version(&bundled, Some("2.1.321"))
                 .iter()
                 .any(|m| m.slug == "claude-fable-5-2")
         );

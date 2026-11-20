@@ -742,6 +742,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .borrow_mut()
         .open(&s.machines.selected, s.current().id, unloaded);
     let p = palette(s.dark);
+    let composer_model = ComposerModelDisplay::new(s);
     composer_ui::measure(s, cx);
     cx.foreground(p.ink);
     cx.focus_ring(2.0, 2.0, p.ring);
@@ -930,6 +931,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             };
             main.child(empty_thread(
                 s,
+                &composer_model,
                 p,
                 wide,
                 main_width,
@@ -940,6 +942,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             main.child(conversation(s, p, wide, main_width))
                 .child(composer(
                     s,
+                    &composer_model,
                     p,
                     wide,
                     main_width,
@@ -1076,7 +1079,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
         root = root.child(captain_editor(s, p, height));
     } else if s.settings_picker.is_some() {
-        root = root.child(settings_picker(s, p));
+        root = root.child(settings_picker(s, &composer_model, p));
     } else if s.captain_picker {
         root = root.child(captain_picker(s, p));
     } else if s.projects.clone_open {
@@ -1205,7 +1208,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         });
         root = root.child(crew_ui::attention_menu(s, p, pane));
     }
-    root = root.child(composer_ui::measurement_probes(s, p));
+    root = root.child(composer_ui::measurement_probes(s, &composer_model, p));
     root = match frame {
         Some((w, h)) if (zoom - 1.0).abs() > 0.001 => root.w(w / zoom).h(h / zoom).scale(zoom),
         _ => root.w_full().h_full(),
@@ -1305,17 +1308,118 @@ fn effort_name(level: &str) -> String {
     }
 }
 
-/// The composer's one model control, as KSG Code's `ComposerModelEffort` trigger: the
-/// provider's mark, the model's name without its route, and descriptor-driven traits.
+/// Shared by the visible footer, its measurement probe and any open picker in this view.
+struct ComposerModelDisplay {
+    descriptors: Vec<crate::descriptors::ProviderOptionDescriptor>,
+    effort: String,
+    both_default: bool,
+    traits: crate::descriptors::TraitsTriggerDisplay,
+    selections: Vec<crate::model_selection::ModelSelection>,
+    label: String,
+    trigger_label: String,
+    unavailable: bool,
+    multi_labels: Vec<(String, String)>,
+}
+
+impl ComposerModelDisplay {
+    fn new(s: &State) -> Self {
+        use crate::model_picker::get_display_model_name;
+        let entries = s.provider_instance_entries();
+        let (instance_id, model, options) = s.resolve_composer_model(&entries);
+        let descriptors = s.model_descriptors(&instance_id, &model, &options);
+        let selected = crate::model_selection::ModelSelection {
+            instance_id,
+            model,
+            options,
+        };
+        let (effort, both_default, traits) = composer_effort(s, &descriptors, &selected);
+        let entry = |id: &str| entries.iter().find(|e| e.instance_id == id);
+        let selected_entry = entry(&selected.instance_id);
+        let option = selected_entry.and_then(|e| s.picker_model_option(e, &selected.model));
+        let display_name = |opt: &crate::model_picker::PickerModelOption, short| {
+            get_display_model_name(
+                &opt.name,
+                opt.short_name.as_deref(),
+                opt.sub_provider.as_deref(),
+                short,
+            )
+        };
+        let fallback = split_model_label(&s.current().model).0;
+        let label = option
+            .as_ref()
+            .map(|opt| display_name(opt, true))
+            .unwrap_or_else(|| fallback.to_owned());
+        let trigger_label = if option.is_some() {
+            label.clone()
+        } else {
+            crate::model_picker::retained_model_while_provider_locked(
+                selected_entry,
+                &[],
+                &selected.model,
+            )
+            .map(|opt| display_name(&opt, true))
+            .unwrap_or_else(|| label.clone())
+        };
+        let unavailable = option.as_ref().is_some_and(|opt| opt.is_unavailable);
+        let selections = s.multi_model_selections_from(selected);
+        let multi_labels = if selections.len() > 1 {
+            selections
+                .iter()
+                .enumerate()
+                .map(|(index, selection)| {
+                    let other;
+                    let opt = if index == 0 {
+                        option.as_ref()
+                    } else {
+                        other = entry(&selection.instance_id)
+                            .and_then(|e| s.picker_model_option(e, &selection.model));
+                        other.as_ref()
+                    };
+                    let suffix = if opt.is_some_and(|m| m.is_unavailable) {
+                        " (Unavailable)"
+                    } else {
+                        ""
+                    };
+                    let short = opt
+                        .map(|m| display_name(m, true))
+                        .unwrap_or_else(|| split_model_label(&selection.model).0.to_owned());
+                    let full = opt
+                        .map(|m| display_name(m, false))
+                        .unwrap_or_else(|| selection.model.clone());
+                    (format!("{short}{suffix}"), format!("{full}{suffix}"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            descriptors,
+            effort,
+            both_default,
+            traits,
+            selections,
+            label,
+            trigger_label,
+            unavailable,
+            multi_labels,
+        }
+    }
+
+    fn show_effort(&self) -> bool {
+        !self.both_default && !self.effort.is_empty() && self.selections.len() == 1
+    }
+}
+
 /// The reasoning effort the composer shows, as KSG's `ComposerModelEffort` trigger reads it,
 /// with the descriptors' trigger display. `None` when both the model and effort are defaults.
-fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTriggerDisplay) {
+fn composer_effort(
+    s: &State,
+    descriptors: &[crate::descriptors::ProviderOptionDescriptor],
+    selection: &crate::model_selection::ModelSelection,
+) -> (String, bool, crate::descriptors::TraitsTriggerDisplay) {
     let t = s.current();
-    let (resolved_instance, resolved_model_id, resolved_opts) =
-        s.resolved_composer_model_selection();
     let (name, _) = split_model_label(&t.model);
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let controls = crate::descriptors::split_column_and_footer_controls(descriptors);
     let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
     let primary_is_prompt_controlled = descriptors
         .iter()
@@ -1333,18 +1437,14 @@ fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTrigge
             _ => false,
         })
         && prompt_ultrathink != crate::descriptors::PromptUltrathink::None;
-    let selection = crate::model_selection::ModelSelection {
-        instance_id: resolved_instance.clone(),
-        model: resolved_model_id.clone(),
-        options: resolved_opts.clone(),
-    };
     let display = crate::descriptors::build_traits_trigger_display(
-        &descriptors,
+        descriptors,
         primary_is_prompt_controlled,
-        Some(&selection),
+        Some(selection),
         None,
     );
-    let fallback_thinking = resolved_opts
+    let fallback_thinking = selection
+        .options
         .iter()
         .find(|o| matches!(o.id.as_str(), "thinking" | "effort" | "reasoningEffort"))
         .and_then(|o| o.value.as_str())
@@ -1367,16 +1467,27 @@ fn composer_effort(s: &State) -> (String, bool, crate::descriptors::TraitsTrigge
     (effort, both_default, display)
 }
 
-fn model_effort_trigger(s: &State, p: Palette, narrow: bool, locked: bool) -> El {
-    model_trigger(s, p, narrow, locked, true)
+fn model_effort_trigger(
+    s: &State,
+    model: &ComposerModelDisplay,
+    p: Palette,
+    narrow: bool,
+    locked: bool,
+) -> El {
+    model_trigger(s, model, p, narrow, locked, true)
 }
 
 /// Ported from KSG Code's `ComposerModelEffort` reasoning trigger: a gauge and the effort,
 /// beside the model in the context strip. It opens the same model and effort picker.
 /// `compact` drops the label for a narrow strip, as KSG's controls bar does.
-fn effort_trigger(s: &State, p: Palette, locked: bool, compact: bool) -> Option<El> {
-    let (effort, both_default, _) = composer_effort(s);
-    if both_default || effort.is_empty() || s.multi_model_selections().len() > 1 {
+fn effort_trigger(
+    model: &ComposerModelDisplay,
+    p: Palette,
+    locked: bool,
+    compact: bool,
+) -> Option<El> {
+    let effort = &model.effort;
+    if !model.show_effort() {
         return None;
     }
     let mut trigger = row()
@@ -1411,71 +1522,25 @@ fn effort_trigger(s: &State, p: Palette, locked: bool, compact: bool) -> Option<
 }
 
 /// The model trigger. `with_effort` keeps the effort inside it, as the resting composer does.
-fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort: bool) -> El {
+fn model_trigger(
+    s: &State,
+    model: &ComposerModelDisplay,
+    p: Palette,
+    narrow: bool,
+    locked: bool,
+    with_effort: bool,
+) -> El {
     let t = s.current();
-    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
-    let entries = s.provider_instance_entries();
-    let active_entry = entries.iter().find(|e| e.instance_id == resolved_instance);
-    let active_model_option = s
-        .picker_models_by_instance()
-        .get(&resolved_instance)
-        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id).cloned())
-        .or_else(|| {
-            crate::model_picker::retained_model_while_provider_locked(
-                active_entry,
-                &[],
-                &resolved_model_id,
-            )
-        });
     let (name, _) = split_model_label(&t.model);
-    let (effort, both_default, display) = composer_effort(s);
-    let multi_selections = s.multi_model_selections();
+    let effort = &model.effort;
+    let display = &model.traits;
+    let multi_selections = &model.selections;
     if multi_selections.len() > 1 {
-        let picker_models = s.picker_models_by_instance();
-        let mut short_labels = Vec::with_capacity(multi_selections.len());
-        let mut full_labels = Vec::with_capacity(multi_selections.len());
-        let mut vendors = Vec::with_capacity(multi_selections.len().min(3));
-        for (idx, sel) in multi_selections.iter().enumerate() {
-            let opt = picker_models
-                .get(&sel.instance_id)
-                .and_then(|opts| opts.iter().find(|o| o.slug == sel.model));
-            let unavailable = if opt.is_some_and(|m| m.is_unavailable) {
-                " (Unavailable)"
-            } else {
-                ""
-            };
-            let short = opt
-                .map(|m| {
-                    format!(
-                        "{}{unavailable}",
-                        crate::model_picker::get_display_model_name(
-                            &m.name,
-                            m.short_name.as_deref(),
-                            m.sub_provider.as_deref(),
-                            true,
-                        )
-                    )
-                })
-                .unwrap_or_else(|| format!("{}{unavailable}", split_model_label(&sel.model).0));
-            let full = opt
-                .map(|m| {
-                    format!(
-                        "{}{unavailable}",
-                        crate::model_picker::get_display_model_name(
-                            &m.name,
-                            m.short_name.as_deref(),
-                            m.sub_provider.as_deref(),
-                            false,
-                        )
-                    )
-                })
-                .unwrap_or_else(|| format!("{}{unavailable}", sel.model));
-            if idx < 3 {
-                vendors.push(model_vendor(&sel.model, &full));
-            }
-            short_labels.push(short);
-            full_labels.push(full);
-        }
+        let short_labels = model
+            .multi_labels
+            .iter()
+            .map(|(short, _)| short.as_str())
+            .collect::<Vec<_>>();
         let multiple_label = if short_labels.len() > 2 {
             format!(
                 "{}, {} more",
@@ -1485,10 +1550,15 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
         } else {
             short_labels.join(", ")
         };
-        let all_model_names = full_labels.join(", ");
+        let all_model_names = model
+            .multi_labels
+            .iter()
+            .map(|(_, full)| full.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut icons = row().center_y().gap(2.0).shrink();
-        for vendor in vendors {
-            icons = icons.child(provider_icon(s, p, vendor, 14.0));
+        for (sel, (_, full)) in multi_selections.iter().zip(&model.multi_labels).take(3) {
+            icons = icons.child(provider_icon(s, p, model_vendor(&sel.model, full), 14.0));
         }
         let mut trigger = row()
             .key("model-effort")
@@ -1561,20 +1631,7 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
             s.open_model_picker(SettingsPicker::Model);
         });
     }
-    let trigger_unavailable = active_model_option
-        .as_ref()
-        .is_some_and(|m| m.is_unavailable);
-    let display_name = active_model_option
-        .as_ref()
-        .map(|m| {
-            crate::model_picker::get_display_model_name(
-                &m.name,
-                m.short_name.as_deref(),
-                m.sub_provider.as_deref(),
-                true,
-            )
-        })
-        .unwrap_or_else(|| name.to_owned());
+    let display_name = &model.trigger_label;
     let trigger = trigger.child(provider_icon(
         s,
         p,
@@ -1587,16 +1644,16 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
     }
     let mut trigger = trigger.child(
         if with_effort {
-            label(&display_name, TextStyle::new(13.0, 600.0), p.ink)
+            label(display_name, TextStyle::new(13.0, 600.0), p.ink)
         } else {
             // In the context strip the model reads like KSG's other strip controls.
-            label(&display_name, SMALL, p.muted)
+            label(display_name, SMALL, p.muted)
         }
         .truncate()
         .shrink()
         .min_w(0.0),
     );
-    if with_effort && !both_default {
+    if with_effort && !model.both_default {
         trigger = trigger.child(meta_text(effort, p.muted).truncate().shrink().min_w(0.0));
     }
     if display.speed_label.is_some() {
@@ -1608,7 +1665,7 @@ fn model_trigger(s: &State, p: Palette, narrow: bool, locked: bool, with_effort:
     if let Some(cw) = &display.context_window {
         trigger = trigger.child(meta_text(cw, p.muted).truncate().shrink().min_w(0.0));
     }
-    if trigger_unavailable {
+    if model.unavailable {
         trigger = trigger.child(outlined(
             meta_text("Unavailable", p.muted)
                 .px(4.0)
@@ -1632,29 +1689,12 @@ const REASONING_W: f32 = 272.0;
 
 /// The model picker or the reasoning menu, whichever is open. KSG Code keeps them apart:
 /// `ProviderModelPicker` for the model and `ComposerReasoningPicker` for its levels.
-fn settings_picker(s: &State, p: Palette) -> El {
+fn settings_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     if s.settings_picker == Some(SettingsPicker::Thinking) {
-        reasoning_picker(s, p)
+        reasoning_picker(s, model, p)
     } else {
-        model_picker(s, p)
+        model_picker(s, model, p)
     }
-}
-
-/// The selected model's short name, for the headers of the options column and reasoning menu.
-fn picker_model_label(s: &State) -> String {
-    let (resolved_instance, resolved_model_id, _) = s.resolved_composer_model_selection();
-    s.picker_models_by_instance()
-        .get(&resolved_instance)
-        .and_then(|opts| opts.iter().find(|o| o.slug == resolved_model_id))
-        .map(|m| {
-            crate::model_picker::get_display_model_name(
-                &m.name,
-                m.short_name.as_deref(),
-                m.sub_provider.as_deref(),
-                true,
-            )
-        })
-        .unwrap_or_else(|| split_model_label(&s.current().model).0.to_owned())
 }
 
 /// A popover above the composer, right edges aligned, sized to the window (Floating UI's
@@ -1691,12 +1731,13 @@ fn finish_model_pick(s: &mut State) {
 /// list at one fixed height, and the `ComposerEffortColumn` (`optionsOnly`) beside it when the
 /// model has options besides reasoning. Below 640 px the column stacks under the list, as
 /// KSG's `max-sm` classes do. Reasoning, speed and permissions have their own controls.
-fn model_picker(s: &State, p: Palette) -> El {
+fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     let t = s.current();
     let can_choose = !t.status.busy() && !t.configuring;
     let stacked = s.viewport_width <= 640.0;
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let controls = crate::descriptors::split_column_and_footer_controls(&model.descriptors);
+    let entries = s.provider_instance_entries();
+    let options = s.picker_models_for_entries(&entries);
     let has_options = !controls.others.is_empty();
     let room = (s.viewport_width - 16.0).max(240.0);
     let width = if stacked {
@@ -1715,7 +1756,11 @@ fn model_picker(s: &State, p: Palette) -> El {
     } else if has_options {
         MODEL_PICKER_H
     } else {
-        tallest_model_tab_h(s).min(if stacked { 320.0 } else { MODEL_PICKER_H })
+        tallest_model_tab_h(s, &options, entries.len()).min(if stacked {
+            320.0
+        } else {
+            MODEL_PICKER_H
+        })
     };
     let list_col = col()
         .key("model-picker-list-col")
@@ -1728,7 +1773,16 @@ fn model_picker(s: &State, p: Palette) -> El {
         .shrink()
         .min_w(0.0)
         .min_h(0.0);
-    let list_col = model_list(s, p, can_choose, list_col, true, !(stacked && has_options));
+    let snapshot = picker_snapshot_from(s, entries, &options);
+    let list_col = model_list(
+        s,
+        p,
+        can_choose,
+        list_col,
+        &snapshot,
+        &model.selections,
+        !(stacked && has_options),
+    );
     let mut body = if stacked { col() } else { row() }
         .key("model-picker-body")
         .w_full()
@@ -1737,7 +1791,6 @@ fn model_picker(s: &State, p: Palette) -> El {
         .shrink()
         .child(list_col);
     if has_options {
-        let model_label = picker_model_label(s);
         body = body
             .child(if stacked {
                 rule(p)
@@ -1749,7 +1802,7 @@ fn model_picker(s: &State, p: Palette) -> El {
                 p,
                 can_choose,
                 stacked,
-                &model_label,
+                &model.label,
                 &controls,
             ));
     }
@@ -1784,7 +1837,9 @@ fn model_picker(s: &State, p: Palette) -> El {
 /// The model list's height for its tallest provider tab or favorites, from KSG's
 /// `tallestTabUnits`: a one-line row is 32 pt, a two-line row 48 pt, 2 pt apart, plus the
 /// search row and the list's padding. It never drops below the provider rail.
-fn tallest_model_tab_h(s: &State) -> f32 {
+type PickerModels = std::collections::BTreeMap<String, Vec<crate::model_picker::PickerModelOption>>;
+
+fn tallest_model_tab_h(s: &State, options: &PickerModels, entry_count: usize) -> f32 {
     use crate::model_picker::provider_model_key;
     const CHROME: f32 = 51.0 + 12.0;
     let favorites: std::collections::HashSet<String> = s
@@ -1795,11 +1850,11 @@ fn tallest_model_tab_h(s: &State) -> f32 {
     let row = |two_line: bool| if two_line { 48.0 } else { 32.0 };
     let mut tallest: f32 = 0.0;
     let mut favorites_h: f32 = 0.0;
-    for (instance, models) in s.picker_models_by_instance() {
+    for (instance, models) in options {
         let mut tab_h: f32 = 0.0;
         let mut legacy = false;
-        for model in &models {
-            let favorite = favorites.contains(&provider_model_key(&instance, &model.slug));
+        for model in models {
+            let favorite = favorites.contains(&provider_model_key(instance, &model.slug));
             if favorite {
                 favorites_h += row(true) + 2.0;
             }
@@ -1814,7 +1869,7 @@ fn tallest_model_tab_h(s: &State) -> f32 {
         }
         tallest = tallest.max(tab_h);
     }
-    let rail = (s.provider_instance_entries().len() + 1) as f32 * 40.0 + 8.0;
+    let rail = (entry_count + 1) as f32 * 40.0 + 8.0;
     (CHROME + tallest.max(favorites_h)).max(rail).max(160.0)
 }
 
@@ -2094,17 +2149,16 @@ fn switch_track(on: bool, p: Palette) -> El {
 /// Ported from KSG Code's `ComposerReasoningPicker`: its own menu above the effort chip, with
 /// the reasoning levels under a header that names the model and the speed controls below
 /// them. The levels keep Shina's Codex slider, laid out for this narrower menu.
-fn reasoning_picker(s: &State, p: Palette) -> El {
+fn reasoning_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     let t = s.current();
     let can_choose = !t.status.busy() && !t.configuring;
-    let descriptors = s.active_model_descriptors();
-    let controls = crate::descriptors::split_column_and_footer_controls(&descriptors);
+    let controls = crate::descriptors::split_column_and_footer_controls(&model.descriptors);
     let title = controls
         .effort
         .as_ref()
         .map(|d| d.label().to_owned())
         .unwrap_or_else(|| "Reasoning".into());
-    let model_label = picker_model_label(s);
+    let model_label = &model.label;
     let card = col()
         .key("reasoning-picker")
         .role("dialog")
@@ -2127,7 +2181,7 @@ fn reasoning_picker(s: &State, p: Palette) -> El {
                 .child(label(&title, META, p.muted))
                 .child(spacer())
                 .child(
-                    label(&model_label, META, p.muted)
+                    label(model_label, META, p.muted)
                         .key("effort-model-label")
                         .truncate()
                         .shrink()
@@ -2813,6 +2867,16 @@ struct PickerSnapshot {
 }
 
 fn picker_snapshot(s: &State) -> PickerSnapshot {
+    let entries = s.provider_instance_entries();
+    let options = s.picker_models_for_entries(&entries);
+    picker_snapshot_from(s, entries, &options)
+}
+
+fn picker_snapshot_from(
+    s: &State,
+    entries: Vec<crate::model_picker::ProviderInstanceEntry>,
+    options_by_instance: &PickerModels,
+) -> PickerSnapshot {
     use crate::model_picker::{
         ModelPickerItem, ModelPickerSearchableModel, ModelPickerTab,
         is_provider_instance_picker_ready, is_provider_instance_picker_visible,
@@ -2822,8 +2886,6 @@ fn picker_snapshot(s: &State) -> PickerSnapshot {
     };
 
     let t = s.current();
-    let entries = s.provider_instance_entries();
-    let options_by_instance = s.picker_models_by_instance();
     let favorites = s.effective_model_favorites();
     let favorites_set: std::collections::HashSet<String> = favorites
         .iter()
@@ -3061,7 +3123,8 @@ fn model_list(
     p: Palette,
     can_choose: bool,
     card: El,
-    autofocus_search: bool,
+    snap: &PickerSnapshot,
+    selections: &[crate::model_selection::ModelSelection],
     round_bottom: bool,
 ) -> El {
     use crate::model_picker::{
@@ -3070,10 +3133,9 @@ fn model_list(
     };
 
     let t = s.current();
-    let snap = picker_snapshot(s);
     let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
 
-    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 400.0))
+    let search_field = text_input(&s.model_search, TextStyle::new(13.0, 400.0))
         .key("model-search")
         .label("Search models")
         .placeholder("Search models...", p.muted)
@@ -3100,10 +3162,8 @@ fn model_list(
                 return true;
             }
             false
-        });
-    if autofocus_search {
-        search_field = search_field.autofocus();
-    }
+        })
+        .autofocus();
 
     let header = row().center_y().gap(8.0).h(50.0).px(10.0).shrink().child(
         row()
@@ -3268,11 +3328,7 @@ fn model_list(
     }
 
     let multi_enabled = s.multiple_models_enabled();
-    let multi_selections = if multi_enabled {
-        s.multi_model_selections()
-    } else {
-        Vec::new()
-    };
+    let multi_selections = if multi_enabled { selections } else { &[] };
 
     let rows_mix_providers = snap
         .visible_models
@@ -4344,73 +4400,11 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         side = side.child(update_everything_button(&summary, p));
     } else if let Some(row) = update_row(s, p) {
         side = side.child(row);
+    } else if let Some(row) = check_updates_row(s, p) {
+        side = side.child(row);
     }
     if let Some(notice) = &s.fleet.result_notice {
         side = side.child(update_result_notice(notice, p));
-    }
-    for (server, view) in &s.machines.views {
-        let outcome = &view["updateNotice"];
-        if let Some(id) = outcome["updateId"].as_str()
-            && !s
-                .preferences
-                .dismissed_updates
-                .iter()
-                .any(|dismissed| dismissed == id)
-        {
-            let title = if outcome["success"] == true {
-                format!(
-                    "{} updated to {}",
-                    s.machine_label(server),
-                    outcome["tag"].as_str().unwrap_or("")
-                )
-            } else {
-                format!(
-                    "{} update failed: {}",
-                    s.machine_label(server),
-                    outcome["reason"].as_str().unwrap_or("Unknown failure")
-                )
-            };
-            let id = id.to_owned();
-            side = side.child(
-                row()
-                    .key(format!("update-outcome-{id}"))
-                    .gap(4.0)
-                    .px(8.0)
-                    .py(4.0)
-                    .child(
-                        label(
-                            title,
-                            SMALL,
-                            if outcome["success"] == true {
-                                p.sea
-                            } else {
-                                p.danger
-                            },
-                        )
-                        .wrap()
-                        .grow(1.0)
-                        .min_w(0.0),
-                    )
-                    .child(icon_button(
-                        &format!("dismiss-update-{id}"),
-                        "Dismiss update notice",
-                        "close",
-                        p,
-                        move |s| {
-                            s.preferences.dismissed_updates.push(id.clone());
-                            if s.preferences.dismissed_updates.len() > 64 {
-                                s.preferences.dismissed_updates.remove(0);
-                            }
-                            s.checkpoint();
-                        },
-                    )),
-            );
-        }
-    }
-    if let Some(notice) = &s.machines.auto_notice
-        && s.machines.notice.as_ref() == Some(notice)
-    {
-        side = side.child(machine_notice(notice, p));
     }
     if let Some(error) = &s.lifecycle_error {
         side = side.child(label(error, SMALL, p.danger).wrap().padding(8.0));
@@ -4722,27 +4716,6 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// The one notice for linked machines this desktop cannot reach: a framed card with a brass
-/// mark and a pixel-type label. It goes away when the connections are ready again.
-fn machine_notice(text: &str, p: Palette) -> El {
-    outlined(
-        row()
-            .key("machine-unreachable")
-            .role("status")
-            .label(text)
-            .mx(8.0)
-            .mb(8.0)
-            .px(8.0)
-            .py(7.0)
-            .gap(8.0)
-            .radius(6.0)
-            .fill(p.card)
-            .child(el().size(8.0, 8.0).mt(3.0).fill(p.brass).a11y_hidden())
-            .child(meta_text(text, p.ink).wrap().grow(1.0).min_w(0.0)),
-        p,
-    )
-}
-
 /// Shown only while an update is on its way or waits for a restart. Downloading is passive;
 /// the only action is one restart, disabled while any thread still has work.
 /// Ported from KSG Code's sidebar/SidebarUpdatePill.tsx.
@@ -4826,6 +4799,63 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
             Some(button)
         }
     }
+}
+
+/// KSG `SidebarUpdatePill`'s idle state: the one-button "Check for updates"
+/// that probes the app release and every machine's providers and server. It
+/// only exists on builds that update themselves; dev runs and demos show
+/// nothing. A running check reads "Checking for updates" and takes no press.
+fn check_updates_row(s: &State, p: Palette) -> Option<El> {
+    use crate::update::Status;
+    if !s.updater.self_update_enabled() {
+        return None;
+    }
+    if matches!(s.updater.status(), Status::Checking) {
+        return Some(
+            row()
+                .key("check-updates")
+                .role("status")
+                .label("Checking for updates".to_owned())
+                .h(30.0)
+                .mx(8.0)
+                .mb(8.0)
+                .px(10.0)
+                .gap(8.0)
+                .center_y()
+                .radius(12.0)
+                .fill(p.card)
+                .child(icon("reload", p.muted))
+                .child(label(
+                    "Checking for updates",
+                    TextStyle::new(12.5, 520.0),
+                    p.muted,
+                )),
+        );
+    }
+    Some(
+        row()
+            .key("check-updates")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label("Check for updates".to_owned())
+            .h(30.0)
+            .mx(8.0)
+            .mb(8.0)
+            .px(10.0)
+            .gap(8.0)
+            .center_y()
+            .radius(12.0)
+            .fill(p.sea_bg)
+            .focusable(true)
+            .hover(p.selected)
+            .on_press(|s: &mut State| s.check_for_updates())
+            .child(icon("reload", p.sea))
+            .child(label(
+                "Check for updates",
+                TextStyle::new(12.5, 520.0),
+                p.sea,
+            )),
+    )
 }
 
 /// The single footer control while any server or provider can update, KSG
@@ -6174,7 +6204,7 @@ fn workspace_named_by_filter(s: &State, server: &str, project: Option<usize>) ->
         }
 }
 /// A machine's name for labels and tooltips. Whether this desktop can reach it is not part of
-/// a row; it shows as one notice and in the open thread (`State::unreachable_machines`).
+/// a row; the open thread says so in the composer notice stack.
 fn machine_caption(s: &State, server: &str) -> String {
     s.machine_label(server)
 }
@@ -6369,7 +6399,8 @@ fn captain_picker(s: &State, p: Palette) -> El {
     let t = s.current();
     let selected_captain = t.captain;
     let query = s.captain_picker_query.text.trim().to_lowercase();
-    let filtered: Vec<usize> = (0..s.captains.len())
+    let filtered: Vec<usize> = s
+        .picker_captains()
         .filter(|&id| {
             if query.is_empty() {
                 return true;
@@ -6763,7 +6794,7 @@ fn captain_editor(s: &State, p: Palette, height: f32) -> El {
                                 .as_ref()
                                 .is_some_and(|e| e.editing.is_none() && e.promotion.is_none())
                             {
-                                s.open_picker(ProjectPicker::NewThread);
+                                s.open_picker(ProjectPicker::CaptainWorkspace);
                             }
                         })
                         .child(project_tile(s, p, s.project(captain_project), 16.0))
@@ -8703,9 +8734,15 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
         .client
         .as_ref()
         .is_some_and(|client| !client.linked.is_empty());
+    // The New captain editor shares the new-thread picker's machine grouping, but its
+    // choice lands on the editor's `captain_project`, never on a draft thread.
+    let draft_pick = matches!(
+        mode,
+        ProjectPicker::NewThread | ProjectPicker::CaptainWorkspace
+    );
     let across = matches!(mode, ProjectPicker::Scope | ProjectPicker::CaptainScope)
-        || mode == ProjectPicker::NewThread && multiple;
-    if mode != ProjectPicker::CaptainScope && !(mode == ProjectPicker::NewThread && multiple) {
+        || draft_pick && multiple;
+    if mode != ProjectPicker::CaptainScope && !(draft_pick && multiple) {
         choices.push((PickerChoice::NoProject, "No workspace".to_string(), None));
     }
     for id in s.sorted_projects() {
@@ -8745,12 +8782,13 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             if server == &s.machines.selected {
                 continue;
             }
-            if mode == ProjectPicker::NewThread
+            if draft_pick
                 && (!s.machine_connected(server)
-                    || s.machines
-                        .draft_picker
-                        .as_ref()
-                        .is_some_and(|target| target != server))
+                    || mode == ProjectPicker::NewThread
+                        && s.machines
+                            .draft_picker
+                            .as_ref()
+                            .is_some_and(|target| target != server))
             {
                 continue;
             }
@@ -8774,23 +8812,25 @@ fn picker_choices(s: &State, mode: ProjectPicker) -> Vec<(PickerChoice, String, 
             _ => (false, String::new()),
         });
     }
-    if mode == ProjectPicker::NewThread && multiple {
+    if draft_pick && multiple {
         choices.retain(|(choice, _, _)| match choice {
             PickerChoice::Project(_) => {
                 s.machine_connected(&s.machines.selected)
-                    && s.machines
-                        .draft_picker
-                        .as_ref()
-                        .is_none_or(|target| target == &s.machines.selected)
+                    && (mode == ProjectPicker::CaptainWorkspace
+                        || s.machines
+                            .draft_picker
+                            .as_ref()
+                            .is_none_or(|target| target == &s.machines.selected))
             }
             _ => true,
         });
         for server in machine_options(s) {
             if !s.machine_connected(&server)
-                || s.machines
-                    .draft_picker
-                    .as_ref()
-                    .is_some_and(|target| target != &server)
+                || mode == ProjectPicker::NewThread
+                    && s.machines
+                        .draft_picker
+                        .as_ref()
+                        .is_some_and(|target| target != &server)
             {
                 continue;
             }
@@ -8841,19 +8881,23 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
             } else if mode == ProjectPicker::Scope {
                 s.set_machine_scope(server, Some(id), shift);
             } else if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
-                s.select_machine(&server);
+                s.select_machine_without_draft(&server);
                 if s.machines.selected == server {
                     s.choose_draft_project(Some(id));
                 }
+            } else if mode == ProjectPicker::CaptainWorkspace {
+                captain_workspace_pick(s, &server, Some(id));
             }
             return;
         }
         PickerChoice::MachineNoProject(server) => {
             if mode == ProjectPicker::NewThread && s.machine_connected(&server) {
-                s.select_machine(&server);
+                s.select_machine_without_draft(&server);
                 if s.machines.selected == server {
                     s.choose_draft_project(None);
                 }
+            } else if mode == ProjectPicker::CaptainWorkspace {
+                captain_workspace_pick(s, &server, None);
             }
             return;
         }
@@ -8867,7 +8911,31 @@ fn choose_picker(s: &mut State, mode: ProjectPicker, choice: PickerChoice, shift
                 captain_ui::toggle_scope(s, project);
             }
         }
+        ProjectPicker::CaptainWorkspace => {
+            s.captain_project = Some(project);
+            s.project_picker = None;
+            s.checkpoint();
+        }
     }
+}
+
+/// A machine pick in the New captain modal records the target machine and workspace on the
+/// editor without switching the active machine or draft behind the modal until Save.
+fn captain_workspace_pick(s: &mut State, server: &str, project: Option<usize>) {
+    if !s.machine_connected(server) {
+        return;
+    }
+    if let Some(editor) = s.captain_editor.as_mut() {
+        if editor.editing.is_some() || editor.promotion.is_some() {
+            return;
+        }
+        editor.server = server.into();
+        editor.machine_picker = false;
+    }
+    s.captain_project = Some(project);
+    s.projects.captain_target = None;
+    s.project_picker = None;
+    s.checkpoint();
 }
 
 /// Ported from KSG Code's CommandPalette and CommandPaletteLookups project/environment
@@ -8882,6 +8950,7 @@ fn project_picker(s: &State, p: Palette) -> El {
     let placeholder = match mode {
         ProjectPicker::Scope => "Filter by workspace...",
         ProjectPicker::NewThread => "New thread in...",
+        ProjectPicker::CaptainWorkspace => "Workspace...",
         ProjectPicker::AddProject => "Add workspace",
         ProjectPicker::CaptainScope => "Add to this captain's scope...",
     };
@@ -8971,8 +9040,12 @@ fn project_picker(s: &State, p: Palette) -> El {
     });
     let mut last_machine = None;
     for (index, (choice, name, machine)) in choices.iter().enumerate() {
-        if matches!(mode, ProjectPicker::NewThread | ProjectPicker::CaptainScope)
-            && machine != &last_machine
+        if matches!(
+            mode,
+            ProjectPicker::NewThread
+                | ProjectPicker::CaptainScope
+                | ProjectPicker::CaptainWorkspace
+        ) && machine != &last_machine
         {
             if let Some(machine) = machine {
                 list = list.child(
@@ -9039,6 +9112,16 @@ fn project_picker(s: &State, p: Palette) -> El {
             }
             (ProjectPicker::Scope, PickerChoice::MachineProject(server, id)) => {
                 s.project_scope != ProjectScope::All && s.scope_includes_on(server, Some(*id))
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::Project(id)) => {
+                s.captain_project.unwrap_or(s.current().project) == Some(*id)
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::NoProject) => {
+                s.captain_project.unwrap_or(s.current().project).is_none()
+            }
+            (ProjectPicker::CaptainWorkspace, PickerChoice::MachineNoProject(server)) => {
+                *server == s.machines.selected
+                    && s.captain_project.unwrap_or(s.current().project).is_none()
             }
             _ => false,
         };
@@ -10635,10 +10718,12 @@ fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) ->
     if let Some(key) = key {
         words = words.key(key);
     }
+    // A full-width row bounds the label, so it truncates at the lane instead of overflowing.
     row()
         .min_h(26.0)
         .center_y()
         .gap(5.0)
+        .w_full()
         .min_w(0.0)
         .child(el().size(24.0, 24.0).center().child(tool_icon(glyph, ink)))
         .child(words)
@@ -12878,6 +12963,19 @@ fn thread_find_bar(s: &State, p: Palette, pane_width: f32) -> El {
     framed(bar, p).pin(None, Some(12.0), Some(12.0), None)
 }
 
+/// A running turn's height motion. Streaming prose reveals at the stream's pace. While the
+/// turn ends in work, its live row replaces itself as steps start and end and its thought
+/// preview comes and goes, so the row snaps to each new height instead of easing toward it
+/// behind the feathered edge, which flickered and cut the newest step in half.
+fn live_turn_motion(t: &Thread, turn: El, start: usize, end: usize) -> El {
+    let parts = turn_parts(t, start, end);
+    if parts.is_empty() || live_tail(t, &parts).is_some() {
+        turn.fold_glide(rune::Spring::NONE).fold_feather(0.0)
+    } else {
+        turn.streaming(true)
+    }
+}
+
 /// Ported from KSG Code's `MessagesTimeline` (`LegendList` virtualisation, `estimatedItemSize={90}`,
 /// scroll anchoring and stick-to-bottom).
 fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
@@ -12983,15 +13081,18 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
                     TimelineRow::AssistantTurn { start, end, .. } => {
                         let turn = assistant_turn(s, p, wide, *start, *end);
                         if *end == s.current().messages.len() && s.current().status.busy() {
-                            turn.streaming(true)
+                            live_turn_motion(s.current(), turn, *start, *end)
                         } else {
                             turn.fold_glide(rune::Spring::new(0.20, 0.0))
                                 .fold_feather(14.0)
                         }
                     }
-                    TimelineRow::LiveTurn { start, .. } => {
-                        assistant_turn(s, p, wide, *start, *start).streaming(true)
-                    }
+                    TimelineRow::LiveTurn { start, .. } => live_turn_motion(
+                        s.current(),
+                        assistant_turn(s, p, wide, *start, *start),
+                        *start,
+                        *start,
+                    ),
                     TimelineRow::TurnPiece {
                         start, end, piece, ..
                     } => assistant_turn_piece(s, p, wide, *start, *end, Some(*piece)),
@@ -13547,6 +13648,7 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
 /// the headline off it.
 fn empty_thread(
     s: &State,
+    model: &ComposerModelDisplay,
     p: Palette,
     wide: bool,
     pane_width: f32,
@@ -13578,7 +13680,7 @@ fn empty_thread(
         .min_h(0.0)
         .items_center()
         .child(above)
-        .child(composer(s, p, wide, pane_width, caret_edges))
+        .child(composer(s, model, p, wide, pane_width, caret_edges))
         .child(below)
 }
 
@@ -15715,6 +15817,7 @@ fn above_composer_budget(s: &State, cap: f32) -> AboveComposerBudget {
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
     s: &State,
+    model: &ComposerModelDisplay,
     p: Palette,
     wide: bool,
     pane_width: f32,
@@ -16353,7 +16456,7 @@ fn composer(
             preview = preview.child(context_ring(t, p));
         }
         preview = preview.child(action);
-        let controls = composer_ui::controls(s, p, lane - 32.0, true, locked);
+        let controls = composer_ui::controls(s, model, p, lane - 32.0, true, locked);
         let composer_card = composer_ui::frame_card(s, p, card.child(preview).child(controls));
         return col()
             .key("composer-lane")
@@ -16540,7 +16643,7 @@ fn composer(
                     .child(meta_text("Open a real workspace", p.sea)),
             )
     } else {
-        composer_ui::controls(s, p, lane - 16.0, false, locked)
+        composer_ui::controls(s, model, p, lane - 16.0, false, locked)
     };
     area = area.child(composer_shell(
         p,
@@ -18213,6 +18316,53 @@ pub(crate) mod tests {
         rt
     }
 
+    #[test]
+    fn composer_redraws_and_text_commits_do_not_build_picker_maps() {
+        use crate::model::PICKER_MAP_BUILDS;
+
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.catalog.models = (0..128)
+                .map(|index| crate::session::AgentModel {
+                    provider: "cpa".into(),
+                    id: format!("cpa/fixture-{index}"),
+                    name: format!("Fixture {index}"),
+                    ..Default::default()
+                })
+                .collect();
+            rt.state.current_mut().model_id = "cpa/fixture-127".into();
+            rt.state.current_mut().model = "Fixture 127".into();
+            PICKER_MAP_BUILDS.with(|count| count.set(0));
+            for _ in 0..3 {
+                rt.invalidate();
+                rt.frame(0.0);
+            }
+            assert!(rt.presented("model-effort").is_some(), "{width}");
+            assert!(rt.presented("measure-model").is_some(), "{width}");
+            press(&mut rt, "composer-input");
+            for text in ["a", "b", "c", "d"] {
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Text(text.into()),
+                    mods: Default::default(),
+                });
+                rt.frame(0.0);
+            }
+            assert_eq!(rt.state.current().draft.text, "abcd");
+            assert_eq!(PICKER_MAP_BUILDS.with(|count| count.get()), 0, "{width}");
+
+            take_timeline_counts();
+            rt.state.settings_picker = Some(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("model-list").is_some(), "{width}");
+            assert_eq!(
+                PICKER_MAP_BUILDS.with(|count| count.get()) as u64,
+                take_timeline_counts().views,
+                "{width}: one picker map per open view"
+            );
+        }
+    }
+
     fn connected_machines(rt: &mut Runtime<State>) {
         let projection = rt.state.projection();
         let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
@@ -18370,16 +18520,18 @@ pub(crate) mod tests {
                     State::new(".".into(), false),
                     |s, cx| {
                         composer_ui::measure(s, cx);
+                        let model = ComposerModelDisplay::new(s);
                         let mut root = col()
                             .w(s.viewport_width + if s.show_archive { 32.0 } else { 20.0 })
                             .child(composer_ui::controls(
                                 s,
+                                &model,
                                 palette(false),
                                 s.viewport_width,
                                 s.show_archive,
                                 false,
                             ))
-                            .child(composer_ui::measurement_probes(s, palette(false)));
+                            .child(composer_ui::measurement_probes(s, &model, palette(false)));
                         if s.composer_ui.overflow.get() {
                             root = root.child(composer_ui::overflow_menu(s, palette(false)));
                         }
@@ -18425,9 +18577,10 @@ pub(crate) mod tests {
                     if resting {
                         return m[0] + blocks_w;
                     }
-                    let mut width = blocks_w + composer_ui::strip_fixed(state, 580.0);
+                    let model = ComposerModelDisplay::new(state);
+                    let mut width = blocks_w + composer_ui::strip_fixed(state, &model, 580.0);
                     for _ in 0..3 {
-                        width = blocks_w + composer_ui::strip_fixed(state, width);
+                        width = blocks_w + composer_ui::strip_fixed(state, &model, width);
                     }
                     width
                 };
@@ -18871,6 +19024,80 @@ pub(crate) mod tests {
             assert_eq!(rt.state.captain_editor.as_ref().unwrap().server, "studio");
         }
     }
+
+    #[test]
+    fn new_captain_workspace_picker_updates_the_editor_not_the_draft() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let root = std::env::temp_dir().join(format!("shina-captain-ws-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("one")).unwrap();
+        std::fs::create_dir_all(root.join("two")).unwrap();
+        let one = rt.state.add_project(root.join("one")).unwrap().unwrap();
+        let two = rt.state.add_project(root.join("two")).unwrap().unwrap();
+        rt.state.begin_new_captain();
+        rt.invalidate();
+        rt.frame(0.5);
+        let draft_project = rt.state.current().project;
+        let threads = rt.state.threads.len();
+        press(&mut rt, "captain-project-choice");
+        assert_eq!(
+            rt.state.project_picker,
+            Some(ProjectPicker::CaptainWorkspace)
+        );
+        press(&mut rt, &format!("choose-project-{two}"));
+        assert_eq!(rt.state.project_picker, None);
+        assert!(rt.state.captain_editor.is_some());
+        assert_eq!(rt.state.captain_project, Some(Some(two)));
+        // The pick belongs to the modal: the draft thread behind it does not move.
+        assert_eq!(rt.state.current().project, draft_project);
+        assert_eq!(rt.state.threads.len(), threads);
+        rt.invalidate();
+        rt.frame(0.5);
+        assert!(rt.presented("captain-project-choice").is_some());
+        press(&mut rt, "captain-project-choice");
+        press(&mut rt, "choose-no-project");
+        assert_eq!(rt.state.captain_project, Some(None));
+        assert_eq!(rt.state.current().project, draft_project);
+        assert_eq!(rt.state.threads.len(), threads);
+        press(&mut rt, "captain-project-choice");
+        press(&mut rt, &format!("choose-project-{one}"));
+        assert_eq!(rt.state.captain_project, Some(Some(one)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_captain_workspace_picker_retargets_the_captain_machine() {
+        let mut rt = runtime(1280.0);
+        rt.frame(0.0);
+        let root =
+            std::env::temp_dir().join(format!("shina-captain-machine-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let project = rt.state.add_project(root.clone()).unwrap().unwrap();
+        connected_machines(&mut rt);
+        rt.state.begin_new_captain();
+        rt.state.open_picker(ProjectPicker::CaptainWorkspace);
+        let choices = picker_choices(&rt.state, ProjectPicker::CaptainWorkspace);
+        assert!(choices.iter().any(|(choice, _, _)| matches!(
+            choice,
+            PickerChoice::MachineProject(server, id) if server == "studio" && *id == project
+        )));
+        assert!(choices.iter().any(|(choice, _, _)| matches!(
+            choice,
+            PickerChoice::MachineNoProject(server) if server == "studio"
+        )));
+        choose_picker(
+            &mut rt.state,
+            ProjectPicker::CaptainWorkspace,
+            PickerChoice::MachineProject("studio".into(), project),
+            false,
+        );
+        assert_eq!(rt.state.machines.selected, "local");
+        assert_eq!(rt.state.project_picker, None);
+        let editor = rt.state.captain_editor.as_ref().unwrap();
+        assert_eq!(editor.server, "studio");
+        assert_eq!(rt.state.captain_project, Some(Some(project)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     /// Tab once and return the focused element.
     fn tab(rt: &mut Runtime<State>) -> rune::ElementInfo {
         rt.key(rune::KeyEvent {
@@ -19037,6 +19264,7 @@ pub(crate) mod tests {
             walk_menu(&mut rt, "captain-list", true, &at("captain picker"));
 
             let mut rt = fresh();
+            rt.state.current_mut().harness = "pi".into();
             rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
                 {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true},
                 {"provider":"cpa","id":"model-b","name":"Model B","reasoning":true},
@@ -19511,57 +19739,55 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unreachable_machines_raise_one_notice_and_the_open_thread_says_so() {
-        let mut rt = runtime(1280.0);
-        crate::fleet_demo(&mut rt.state);
-        // Real machines, not demo data: their fixture clients are not connected.
-        rt.state.demo = false;
-        let poll = |rt: &mut Runtime<State>| {
-            rt.update(|state, tx| {
-                crate::model::poll(state, 0.0, tx);
-            });
-            rt.invalidate();
-            rt.frame(1.0);
-        };
-        poll(&mut rt);
-        let notice = rt.state.machines.notice.clone().expect("a notice");
-        assert!(
-            notice.contains("Studio")
-                && notice.contains("Laptop")
-                && notice.ends_with("unreachable. Reconnecting."),
-            "{notice}"
-        );
-        assert!(notice.contains(" and "), "one notice lists both: {notice}");
-        assert_eq!(
-            rt.state.machines.auto_notice.as_deref(),
-            Some(notice.as_str())
-        );
-        assert!(rt.presented("machine-unreachable").is_some());
-        // Rows still say nothing about the connection.
-        let tree = rt.accessibility_json();
-        let sidebar = find(&tree, "sidebar").expect("sidebar");
-        assert!(!sidebar.to_string().contains("offline"));
-        // The open thread on an unreachable machine says so in the composer notice stack.
-        rt.state.open_machine_thread("example-studio", 3);
-        poll(&mut rt);
-        assert_eq!(rt.state.machines.selected, "example-studio");
-        let tree = rt.accessibility_json();
-        let notice = find(
-            &tree,
-            "composer-notice-environment-unavailable:example-studio",
-        )
-        .expect("the composer notice says so");
-        assert_eq!(notice["name"], "Studio is offline: This device is offline");
-        // Another message is never replaced or cleared by it.
-        rt.state.machines.notice = Some("Something else".into());
-        poll(&mut rt);
-        assert_eq!(rt.state.machines.notice.as_deref(), Some("Something else"));
-        // The notice clears itself once the machines are ready: none are linked any more.
-        rt.state.machines.notice = rt.state.machines.auto_notice.clone();
-        rt.state.client.as_mut().unwrap().linked.clear();
-        poll(&mut rt);
-        assert!(rt.state.machines.notice.is_none());
-        assert!(rt.presented("machine-unreachable").is_none());
+    fn unreachable_machines_show_only_above_the_composer_for_the_open_thread() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            crate::fleet_demo(&mut rt.state);
+            // Real machines, not demo data: their fixture clients are not connected.
+            rt.state.demo = false;
+            rt.state.compact_sidebar = width < 760.0;
+            let poll = |rt: &mut Runtime<State>| {
+                rt.update(|state, tx| {
+                    crate::model::poll(state, 0.0, tx);
+                });
+                rt.invalidate();
+                rt.frame(1.0);
+            };
+            poll(&mut rt);
+            // No stuck sidebar notice for machines the user is not using.
+            assert!(rt.state.machines.notice.is_none(), "{width}");
+            assert!(rt.presented("machine-unreachable").is_none(), "{width}");
+            let sidebar = find(&rt.accessibility_json(), "sidebar")
+                .expect("sidebar")
+                .to_string();
+            assert!(!sidebar.contains("unreachable"), "{width}: {sidebar}");
+            // The composer banner names only the machine the open thread targets.
+            assert!(
+                rt.presented("composer-notice-environment-unavailable:example-studio")
+                    .is_none(),
+                "{width}"
+            );
+            assert!(
+                rt.presented("composer-notice-environment-unavailable:example-laptop")
+                    .is_none(),
+                "{width}"
+            );
+            rt.state.open_machine_thread("example-studio", 3);
+            poll(&mut rt);
+            assert_eq!(rt.state.machines.selected, "example-studio");
+            let tree = rt.accessibility_json();
+            let notice = find(
+                &tree,
+                "composer-notice-environment-unavailable:example-studio",
+            )
+            .expect("the composer notice says so");
+            assert_eq!(notice["name"], "Studio is offline: This device is offline");
+            assert!(rt.presented("machine-unreachable").is_none(), "{width}");
+            let sidebar = find(&rt.accessibility_json(), "sidebar")
+                .expect("sidebar")
+                .to_string();
+            assert!(!sidebar.contains("unreachable"), "{width}: {sidebar}");
+        }
     }
 
     #[test]
@@ -22268,28 +22494,29 @@ pub(crate) mod tests {
             );
             assert!(rt.presented("harness-tag-codex").is_none());
             assert!(rt.presented("harness-tag-claude").is_none());
-            if crate::claude::process().is_ok() {
-                press(&mut rt, "choose-harness-claude");
-                assert_eq!(
-                    rt.state.model_picker_tab,
-                    Some(crate::model_picker::ModelPickerTab::Instance(
-                        "claude".into()
-                    ))
-                );
-            } else {
-                assert!(
-                    find(&rt.accessibility_json(), "choose-harness-claude")
-                        .and_then(|node| node["states"].as_array().cloned())
-                        .is_some_and(|states| states.iter().any(|x| x == "disabled")),
-                    "{width}: claude should be disabled when missing"
-                );
-                rt.state.model_picker_tab = Some(crate::model_picker::ModelPickerTab::Instance(
-                    "claude".into(),
-                ));
-                rt.invalidate();
-                rt.frame(0.0);
-                assert!(rt.presented("claude-unavailable").is_some());
-            }
+            assert!(
+                find(&rt.accessibility_json(), "choose-harness-claude")
+                    .and_then(|node| node["states"].as_array().cloned())
+                    .is_some_and(|states| states.iter().any(|x| x == "disabled")),
+                "{width}: claude should be disabled when missing"
+            );
+            rt.state.model_picker_tab = Some(crate::model_picker::ModelPickerTab::Instance(
+                "claude".into(),
+            ));
+            rt.invalidate();
+            rt.frame(0.0);
+            assert!(rt.presented("claude-unavailable").is_some());
+            rt.state.claude_catalog.installed = true;
+            rt.state.model_picker_tab = None;
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "choose-harness-claude");
+            assert_eq!(
+                rt.state.model_picker_tab,
+                Some(crate::model_picker::ModelPickerTab::Instance(
+                    "claude".into()
+                ))
+            );
             press(&mut rt, "choose-harness-fixture");
             assert_eq!(
                 rt.state.model_picker_tab,
@@ -22588,6 +22815,7 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             let (pi, commands, _) = crate::backend::Pi::test_connection();
             let t = rt.state.current_mut();
+            t.harness = "pi".into();
             t.pi = Some(pi);
             t.session = Some("fixture.jsonl".into());
             t.draft.focused = true;
@@ -23298,6 +23526,32 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         assert!(find(&rt.accessibility_json(), "update-restart").is_none());
+    }
+
+    #[test]
+    fn the_check_for_updates_row_is_one_button_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            // A development build shows nothing.
+            assert!(rt.find("check-updates").is_none(), "{width}");
+            rt.state.updater = crate::update::Updater::test_checkable();
+            rt.invalidate();
+            rt.frame(0.0);
+            let tree = rt.accessibility_json();
+            let button = find(&tree, "check-updates")
+                .unwrap_or_else(|| panic!("{width}: check-updates missing"));
+            assert_eq!(button["role"], "button", "{width}");
+            press(&mut rt, "check-updates");
+            rt.frame(0.0);
+        }
+        // A running check reads as a status, not a second button.
+        let mut rt = runtime(1280.0);
+        rt.state.updater = crate::update::Updater::test_checking();
+        rt.frame(0.0);
+        let tree = rt.accessibility_json();
+        let status = find(&tree, "check-updates").expect("checking row");
+        assert_eq!(status["role"], "status");
     }
 
     #[test]
@@ -25369,6 +25623,7 @@ pub(crate) mod tests {
     fn unknown_after_compaction_stays_inside_a_narrow_composer() {
         let mut rt = runtime(620.0);
         let thread = rt.state.current_mut();
+        thread.harness = "pi".into();
         thread.model = "Vision".into();
         thread.context_window = Some(200_000);
         thread.context.usage = ContextUsage {
@@ -27382,9 +27637,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_long_live_step_truncates_inside_the_lane() {
+        let command = format!(
+            "\"C:\\\\WINDOWS\\\\System32\\\\powershell.exe\" -Command 'tailscale ping {}'",
+            "kidsseemac ".repeat(40)
+        );
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = streak_runtime(width);
+            rt.state.current_mut().tools[3].detail = command.clone();
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.frame(2.0);
+            let lane = rt.presented("chat-lane").unwrap().0;
+            for key in ["live-work-1", "live-work-text-1"] {
+                let rect = rt.presented(key).unwrap().0;
+                eprintln!("{width}: lane {lane:?} {key} {rect:?}");
+                assert!(
+                    rect[0] + rect[2] <= lane[0] + lane[2] + 0.5,
+                    "{width}: {key} {rect:?} overflows {lane:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_work_row_snaps_to_its_new_height() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = streak_runtime(width);
+            let run = |rt: &mut Runtime<State>, frames: usize| {
+                for _ in 0..frames {
+                    rt.frame(1.0 / 60.0);
+                }
+            };
+            run(&mut rt, 180);
+            // The virtual list keys the turn's row; its drawn height is the growth height.
+            let row = disclosed_timeline_structure(rt.state.current())
+                .rows
+                .last()
+                .unwrap()
+                .key()
+                .to_owned();
+            let bottom = |rt: &Runtime<State>| rt.presented(&row).unwrap().0[3];
+            let before = bottom(&rt);
+            // A long thought heading over the running step makes the live row taller.
+            rt.state.current_mut().thoughts[2].text =
+                format!("**{}**", "Checking the tests again ".repeat(12));
+            rt.invalidate();
+            run(&mut rt, 1);
+            let next = bottom(&rt);
+            run(&mut rt, 180);
+            let settled = bottom(&rt);
+            assert!(settled > before + 10.0, "{width}: {before} {settled}");
+            assert_eq!(next, settled, "{width}: the live row eased from {before}");
+        }
+    }
+
+    #[test]
     fn thought_and_tool_streaks_fold_before_prose_and_into_one_live_row() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = streak_runtime(width);
+            rt.state.current_mut().harness = "pi".into();
+            rt.state.current_mut().started =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
+            rt.invalidate();
+            rt.frame(1.0);
             let t = rt.state.current();
             let parts = turn_parts(t, 0, 1);
             use WorkEntry::{Thought, Tool};
@@ -27515,7 +27831,10 @@ pub(crate) mod tests {
     #[test]
     fn the_working_bar_words_stopping_pauses_and_compaction() {
         let mut rt = streak_runtime(1280.0);
+        rt.state.current_mut().harness = "pi".into();
         rt.state.current_mut().request = Some(json!({"id":"q","method":"confirm"}));
+        rt.state.current_mut().started =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
         rt.invalidate();
         rt.frame(1.0);
         assert!(texts(&rt).iter().any(|text| text == "Paused at "));
@@ -28285,6 +28604,7 @@ pub(crate) mod tests {
     fn crew_runtime(width: f32) -> Runtime<State> {
         let mut rt = runtime(width);
         crate::captain_workspace_demo(&mut rt.state);
+        rt.state.use_pi_for_test();
         rt.invalidate();
         rt.frame(0.0);
         rt
@@ -29883,6 +30203,7 @@ pub(crate) mod tests {
     #[test]
     fn composer_has_no_connection_controls_and_pickers_work_without_a_process() {
         let mut rt = runtime(1280.0);
+        rt.state.current_mut().harness = "pi".into();
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
             {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true,
              "thinkingLevelMap":{"minimal":null,"low":null,"medium":null}}
@@ -29917,6 +30238,7 @@ pub(crate) mod tests {
     fn native_model_and_reasoning_pickers_send_real_rpc_commands() {
         let mut rt = runtime(1280.0);
         let (pi, commands, _events) = crate::backend::Pi::test_connection();
+        rt.state.current_mut().harness = "pi".into();
         rt.state.current_mut().pi = Some(pi);
         rt.state.current_mut().status = Status::Ready;
         rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
@@ -30458,6 +30780,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 },
             ];
+            rt.state.current_mut().harness = "pi".into();
             rt.state.choose_harness("codex");
             rt.state.open_model_picker(SettingsPicker::Model);
             rt.invalidate();
@@ -30530,6 +30853,7 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.set_viewport((width, 900.0), 1.0);
+            rt.state.current_mut().harness = "pi".into();
             // Loading state while cached models exist shows refreshing indicator inside card
             rt.state.catalog.models = vec![crate::session::AgentModel {
                 provider: "cpa".into(),
@@ -31425,6 +31749,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn captain_picker_never_offers_deleted_captains() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.delete_captain_for_test(1);
+            rt.state.delete_captain_for_test(3);
+            rt.state.open_captain_selector();
+            rt.frame(0.1);
+            for captain in [0usize, 2] {
+                assert!(
+                    rt.find(&format!("choose-captain-{captain}")).is_some(),
+                    "{width}: live captain {captain}"
+                );
+            }
+            for captain in [1usize, 3] {
+                assert!(
+                    rt.find(&format!("choose-captain-{captain}")).is_none(),
+                    "{width}: deleted captain {captain}"
+                );
+            }
+            rt.state.captain_picker_query.replace_text("Deleted");
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(rt.find("choose-captain-0").is_none());
+            assert!(rt.find("choose-captain-2").is_none());
+        }
+    }
+
+    #[test]
     fn no_projects_hero_and_add_project_browse_parity_fit_at_all_widths() {
         let root = std::env::temp_dir().join(format!("shina-browse-parity-{}", std::process::id()));
         std::fs::create_dir_all(root.join("alpha-one")).unwrap();
@@ -31780,6 +32133,7 @@ pub(crate) mod tests {
         rt.on_key = Some(crate::key);
         {
             let t = rt.state.current_mut();
+            t.harness = "pi".into();
             t.models = vec![
                 crate::session::AgentModel {
                     provider: "cpa".into(),

@@ -268,9 +268,6 @@ pub struct Machines {
     pub mobile_host: rune::TextEdit,
     pub mobile_share: Option<crate::mobile_share::Share>,
     pub notice: Option<String>,
-    /// The text of `notice` while it is the unreachable-machines notice, so it clears itself
-    /// when the connections are ready again and never clears another message.
-    pub auto_notice: Option<String>,
     pub devices: Value,
     pub pending: Option<std::sync::mpsc::Receiver<Result<MachineResult, String>>>,
 }
@@ -321,7 +318,6 @@ impl Default for Machines {
             mobile_host: Default::default(),
             mobile_share: None,
             notice: None,
-            auto_notice: None,
             devices: Value::Null,
             pending: None,
         }

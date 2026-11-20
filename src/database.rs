@@ -40,7 +40,7 @@ struct Inner {
     revocations: Vec<String>,
     failure: Option<String>,
     dispatch_fenced: bool,
-    claimed_dispatches: usize,
+    claimed_dispatches: BTreeMap<&'static str, usize>,
     history_events: Vec<Value>,
     document_revision: u64,
 }
@@ -49,10 +49,18 @@ struct Inner {
 pub struct Database(Arc<Mutex<Inner>>);
 
 /// A claimed external effect must settle before maintenance can prepare a restart.
-pub struct Dispatch(Database);
+pub struct Dispatch(Database, &'static str);
 impl Drop for Dispatch {
     fn drop(&mut self) {
-        self.0.0.lock().expect("database").claimed_dispatches -= 1;
+        let mut inner = self.0.0.lock().expect("database");
+        let count = inner
+            .claimed_dispatches
+            .get_mut(self.1)
+            .expect("dispatch claim");
+        *count -= 1;
+        if *count == 0 {
+            inner.claimed_dispatches.remove(self.1);
+        }
     }
 }
 
@@ -76,7 +84,7 @@ pub fn for_path(path: &Path) -> Option<Database> {
 }
 
 impl Database {
-    pub fn claim_dispatch(&self) -> Result<Option<Dispatch>, String> {
+    pub fn claim_dispatch(&self, kind: &'static str) -> Result<Option<Dispatch>, String> {
         let mut inner = self.0.lock().expect("database");
         if let Some(failure) = &inner.failure {
             return Err(failure.clone());
@@ -84,16 +92,20 @@ impl Database {
         if inner.dispatch_fenced {
             return Ok(None);
         }
-        inner.claimed_dispatches += 1;
-        Ok(Some(Dispatch(self.clone())))
+        *inner.claimed_dispatches.entry(kind).or_default() += 1;
+        Ok(Some(Dispatch(self.clone(), kind)))
     }
 
     /// Shares the runtime's maintenance/validation fence with asynchronous workers.
     /// The lock makes fencing and claiming mutually exclusive.
-    pub fn fence_dispatch(&self, fenced: bool) -> usize {
+    pub fn fence_dispatch(&self, fenced: bool) -> Vec<&'static str> {
         let mut inner = self.0.lock().expect("database");
         inner.dispatch_fenced = fenced;
-        inner.claimed_dispatches
+        if fenced {
+            inner.claimed_dispatches.keys().copied().collect()
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn open(directory: &Path) -> Result<Self, String> {
@@ -280,7 +292,7 @@ impl Database {
             revocations: Vec::new(),
             failure: None,
             dispatch_fenced: false,
-            claimed_dispatches: 0,
+            claimed_dispatches: BTreeMap::new(),
             history_events: Vec::new(),
             document_revision: 0,
         })));

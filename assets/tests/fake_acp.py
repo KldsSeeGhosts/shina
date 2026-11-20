@@ -13,10 +13,22 @@ args.add_argument("--no-load", action="store_true")
 args.add_argument("--resume", action="store_true")
 args.add_argument("--auth-denied", action="store_true")
 args.add_argument("--antigravity", action="store_true")
+args.add_argument("--discovery", action="store_true")
 args.add_argument("--delay-seconds", type=float, default=0)
 args.add_argument("--no-history", action="store_true")
 args.add_argument("--no-mcp", action="store_true")
+args.add_argument("--record-launch", action="store_true")
 opts = args.parse_args()
+
+if opts.record_launch and sys.platform == "win32":
+    import ctypes
+
+    console_window = ctypes.windll.kernel32.GetConsoleWindow
+    console_window.restype = ctypes.c_void_p
+    launch = {"pid": os.getpid(), "consoleWindow": console_window()}
+    with open(opts.log, "a", encoding="utf8") as log:
+        log.write(json.dumps({"fixtureLaunch": launch}) + "\n")
+
 session = "fixture-session"
 pending = None
 permission_prompt = None
@@ -67,7 +79,7 @@ for line in sys.stdin:
     params = record.get("params", {})
     if method == "initialize":
         assert params["protocolVersion"] == 1
-        assert params["clientCapabilities"]["fs"]["readTextFile"] == opts.antigravity
+        assert params["clientCapabilities"]["fs"]["readTextFile"] == (opts.antigravity and not opts.discovery)
         assert params["clientCapabilities"]["fs"]["writeTextFile"] is False
         assert params["clientCapabilities"]["terminal"] is False
         capabilities = {"loadSession": not opts.no_load and not opts.resume,
@@ -88,9 +100,12 @@ for line in sys.stdin:
             continue
         assert params["cwd"]
         session_cwd = params["cwd"]
-        mcp = params["mcpServers"][0]
-        assert mcp["name"] == "shina"
-        if opts.stdio:
+        if opts.discovery:
+            assert method == "session/new"
+            assert params["mcpServers"] == []
+        elif opts.stdio:
+            mcp = params["mcpServers"][0]
+            assert mcp["name"] == "shina"
             assert mcp["args"] == ["--mcp-bridge"]
             assert {v["name"] for v in mcp["env"]} == {"SHINA_MCP_URL", "SHINA_MCP_TOKEN"}
             endpoint = {v["name"]: v["value"] for v in mcp["env"]}
@@ -99,6 +114,8 @@ for line in sys.stdin:
                 json.dump({"url": endpoint["SHINA_MCP_URL"],
                            "token": endpoint["SHINA_MCP_TOKEN"]}, out)
         else:
+            mcp = params["mcpServers"][0]
+            assert mcp["name"] == "shina"
             assert mcp["type"] == "http"
             assert mcp["url"].startswith("http://127.0.0.1:")
             assert mcp["headers"][0]["value"].startswith("Bearer ")
@@ -116,7 +133,10 @@ for line in sys.stdin:
             "name": "fixture", "description": "A fake command"}])
         update("plan", entries=[{"content": "Read fixture", "priority": "high", "status": "pending"}])
         if opts.antigravity:
-            assert params["_meta"]["antigravity"]["systemPrompt"]["append"]
+            if opts.discovery:
+                assert "_meta" not in params
+            else:
+                assert params["_meta"]["antigravity"]["systemPrompt"]["append"]
             agy_config = agy_options()
             result(req_id, {"sessionId": session, "configOptions": agy_config,
                 "models": {"currentModelId": "gemini-3.8-flash",

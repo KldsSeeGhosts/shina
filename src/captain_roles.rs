@@ -399,6 +399,8 @@ mod tests {
         let database = crate::database::Database::open(&directory).unwrap();
         let mut state = State::headless(directory);
         state.demo = true;
+        // These tests exercise Pi session-file promotion and demotion.
+        state.threads[0].harness = "pi".into();
         state.captains = Captain::presets();
         database.begin().unwrap();
         (state, database)
@@ -555,6 +557,7 @@ mod tests {
         let mut earlier = Thread::new(earlier_id);
         earlier.captain = Some(captain);
         earlier.captain_home = true;
+        earlier.harness = "pi".into();
         earlier.session = Some("earlier.jsonl".into());
         state.threads.push(earlier);
         let earlier_index = state.threads.len() - 1;

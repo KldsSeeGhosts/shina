@@ -1419,6 +1419,7 @@ mod tests {
     fn demo() -> State {
         let mut state = State::new(PathBuf::new(), false);
         state.demo = true;
+        state.use_pi_for_test();
         state
     }
 

@@ -19,6 +19,7 @@ use axum::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    net::{SocketAddr, TcpListener},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -1176,7 +1177,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     // Host maintenance only. A peer-delegate credential can never link onward.
                     let args = params.get("args").unwrap_or(params);
                     let dispatch=if method=="peer.list" {Ok(None)} else {
-                        shared.database.claim_dispatch().and_then(|dispatch|dispatch.map(Some).ok_or("Server is draining. Retry peer linking after maintenance.".into()))
+                        shared.database.claim_dispatch("peer linking").and_then(|dispatch|dispatch.map(Some).ok_or("Server is draining. Retry peer linking after maintenance.".into()))
                     };
                     match dispatch {
                         Err(error)=>Err(error),
@@ -1916,13 +1917,59 @@ pub fn serve() -> Result<(), String> {
     serve_profile(directory, tailnet, port)
 }
 
+fn bind_tailnet(port: u16) -> Result<Vec<TcpListener>, String> {
+    // Validate and bind the full set before starting any remote accept loop.
+    crate::peer::bind_addresses(crate::peer::tailscale_addresses)?
+        .into_iter()
+        .map(|ip| {
+            let address = SocketAddr::new(ip, port);
+            let listener = TcpListener::bind(address)
+                .map_err(|error| format!("Could not bind Tailscale address {address}: {error}"))?;
+            listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+            Ok(listener)
+        })
+        .collect()
+}
+
+async fn wait_for_tailnet(
+    bind: impl Fn() -> Result<Vec<TcpListener>, String> + Send + Sync + 'static,
+    delay: Duration,
+) -> Vec<tokio::net::TcpListener> {
+    let bind = Arc::new(bind);
+    let mut last_error = None;
+    loop {
+        let attempt = Arc::clone(&bind);
+        let result = tokio::task::spawn_blocking(move || attempt())
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .and_then(|listeners| {
+                listeners
+                    .into_iter()
+                    .map(tokio::net::TcpListener::from_std)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(listeners) => {
+                if last_error.is_some() {
+                    eprintln!("Shina: Tailscale listeners are ready.");
+                }
+                return listeners;
+            }
+            Err(error) if last_error.as_ref() != Some(&error) => {
+                eprintln!(
+                    "Shina: {error}. Local is available; retrying Tailscale without a wildcard fallback."
+                );
+                last_error = Some(error);
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(delay).await;
+    }
+}
+
 fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result<(), String> {
-    // Resolve every listener before starting any remote accept loop.
-    let addresses = if tailnet {
-        crate::peer::bind_addresses(crate::peer::tailscale_addresses)?
-    } else {
-        vec![]
-    };
     let _owner = Owner::acquire(&directory)?;
     server_auth::protect(&directory)?;
     // Orphans from a previous process are never resumable with its lost staging ids.
@@ -2040,15 +2087,6 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         }
     });
     let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
-    let mut remote_servers = Vec::new();
-    for address in addresses {
-        let listener = std::net::TcpListener::bind((address, port.unwrap_or(crate::peer::PORT)))
-            .map_err(|_| "Could not bind the Tailscale address. No wildcard fallback was used.")?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
-        remote_servers
-            .push(network.spawn(axum::serve(listener, router(remote.clone())).into_future()));
-    }
     let server = network.spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -2073,6 +2111,18 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
         discovery.server_id.clone(),
         remote.shutdown.clone(),
     ));
+    let remote_server = tailnet.then(|| {
+        network.spawn(async move {
+            let port = port.unwrap_or(crate::peer::PORT);
+            let listeners =
+                wait_for_tailnet(move || bind_tailnet(port), Duration::from_secs(5)).await;
+            let mut servers = tokio::task::JoinSet::new();
+            for listener in listeners {
+                servers.spawn(axum::serve(listener, router(remote.clone())).into_future());
+            }
+            while servers.join_next().await.is_some() {}
+        })
+    });
     while !*stop_state.borrow() && !server.is_finished() {
         let was_fenced = runtime.maintenance.fenced();
         let mut changed = false;
@@ -2128,7 +2178,7 @@ fn serve_profile(directory: PathBuf, tailnet: bool, port: Option<u16>) -> Result
     // Let the final maintenance response/notification leave its network task.
     std::thread::sleep(Duration::from_millis(150));
     server.abort();
-    for server in remote_servers {
+    if let Some(server) = remote_server {
         server.abort();
     }
     cleanup.abort();
@@ -2246,6 +2296,44 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
+
+    #[test]
+    fn tailnet_bind_retries_after_port_becomes_available() {
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+        let (failed, failure) = oneshot::channel();
+        let failed = Mutex::new(Some(failed));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let retry = tokio::spawn(wait_for_tailnet(
+                    move || {
+                        let listener = TcpListener::bind(address).inspect_err(|_| {
+                            if let Some(failed) = failed.lock().unwrap().take() {
+                                let _ = failed.send(());
+                            }
+                        });
+                        let listener = listener.map_err(|error| error.to_string())?;
+                        listener.set_nonblocking(true).unwrap();
+                        Ok(vec![listener])
+                    },
+                    Duration::from_millis(20),
+                ));
+                tokio::time::timeout(Duration::from_secs(5), failure)
+                    .await
+                    .expect("the first bind should fail")
+                    .unwrap();
+                assert!(!retry.is_finished());
+                drop(occupied);
+                let listeners = tokio::time::timeout(Duration::from_secs(5), retry)
+                    .await
+                    .expect("the listener should bind after the port is released")
+                    .unwrap();
+                assert_eq!(listeners[0].local_addr().unwrap(), address);
+            });
+    }
 
     struct Fixture {
         shared: Shared,
@@ -3514,6 +3602,13 @@ mod tests {
                 .await;
             assert_eq!(opened["status"], "accepted", "{opened}");
             let home_thread = opened["result"]["threadId"].as_u64().unwrap() as usize;
+            let harness = home
+                .local_command(
+                    "thread.configure",
+                    json!({"threadId":home_thread,"harness":"pi"}),
+                )
+                .await;
+            assert_eq!(harness["status"], "accepted", "{harness}");
             // Ordinary one-way pairing: only home holds a credential to the
             // target. The target has no link back at all.
             let code = target

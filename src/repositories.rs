@@ -405,6 +405,7 @@ pub(crate) fn checkout_target(data_dir: &Path, id: &str, _name: &str) -> PathBuf
     // provisioned clone is later registered under.
     let base = data_dir
         .canonicalize()
+        .map(|path| crate::projects::clean_path(&path))
         .unwrap_or_else(|_| data_dir.to_path_buf());
     base.join("checkouts").join(key)
 }
@@ -1449,6 +1450,8 @@ mod tests {
         .unwrap();
         let mut state = State::headless(directory);
         state.demo = true;
+        // Repository fixtures delegate over the cpa catalog on the pi harness.
+        state.threads[0].harness = "pi".into();
         state.catalog.models = vec![
             AgentModel::from_value(
                 &json!({"provider":"cpa","id":"fixture","name":"Fixture","reasoning":true}),

@@ -239,6 +239,7 @@ fn spec(source: SessionSource, access: &str) -> Start {
         owner: Arc::default(),
         context_sent: false,
         prompt_suggestions: false,
+        metadata_only: false,
     }
 }
 
@@ -1811,6 +1812,7 @@ fn claude_context_breakdown_uses_get_context_usage_categories_on_completed_turn(
 fn claude_fresh_session_passes_session_id_and_not_resume() {
     let client = Client::new(Start {
         prompt_suggestions: false,
+        metadata_only: false,
         id: "claude".into(),
         workspace: PathBuf::from("."),
         source: SessionSource::New,
@@ -1901,4 +1903,140 @@ fn claude_prompt_suggestion_stores_for_settled_run_and_discards_late_answer() {
         thread.apply(event);
     }
     assert_eq!(thread.prompt_suggestion, None);
+}
+
+/// KSG `mergeClaudeProcessEnvironment`: CPA/provider env vars inherit
+/// untouched, a nested session's variables are stripped, and the entrypoint is set.
+#[test]
+fn process_preserves_cpa_environment_and_strips_nested_session_vars() {
+    let dir = crate::store::directory().unwrap();
+    let cli = dir.join("claude-entry.js");
+    std::fs::write(&cli, "// fixture").unwrap();
+    let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir.join("claude-config")) };
+    let command = resolve_process(vec![cli]).unwrap();
+    match saved {
+        Some(value) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", value) },
+        None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+    }
+    // CLIPROXYAPI/provider variables are inherited, never removed.
+    for key in [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_GIT_BASH_PATH",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+    ] {
+        assert!(
+            command.get_envs().all(|(name, _)| name != key),
+            "{key} was removed"
+        );
+    }
+    for removed in CLAUDE_SESSION_VARIABLES {
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == *removed && value.is_none()),
+            "{removed} is still set"
+        );
+    }
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "CLAUDE_CODE_ENTRYPOINT")
+            .and_then(|(_, value)| value),
+        Some(std::ffi::OsStr::new("shina"))
+    );
+    assert_eq!(
+        command
+            .get_envs()
+            .find(|(name, _)| *name == "CLAUDE_CODE_STARTUP_FAILURE_RESULTS")
+            .and_then(|(_, value)| value),
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
+/// KSG applies the settings `env` entrypoint itself because Claude reads it
+/// from the process env; the gateway discovery grace follows the same env.
+#[test]
+fn settings_env_entrypoint_and_gateway_grace_follow_the_config_dir() {
+    let dir = crate::store::directory().unwrap();
+    let config = dir.join("claude-config");
+    std::fs::create_dir_all(&config).unwrap();
+    let saved = std::env::var_os("CLAUDE_CONFIG_DIR");
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &config) };
+    std::fs::write(
+        config.join("settings.json"),
+        json!({"env":{
+            "CLAUDE_CODE_ENTRYPOINT":"corp-cli",
+            "ANTHROPIC_BASE_URL":"http://127.0.0.1:8317",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1",
+            "CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS":"250"}})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(claude_entrypoint(), "corp-cli");
+    assert_eq!(claude_gateway_discovery_grace(), Duration::from_millis(250));
+    // The settings file wins over the process env and disables the grace.
+    std::fs::write(
+        config.join("settings.json"),
+        json!({"env":{
+            "ANTHROPIC_BASE_URL":"http://127.0.0.1:8317",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"0"}})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(claude_gateway_discovery_grace(), Duration::ZERO);
+    match saved {
+        Some(value) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", value) },
+        None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+    }
+}
+
+/// CPA routes and custom slugs send the routed api id, and an unlisted slug is
+/// accepted instead of rejected.
+#[test]
+fn cpa_and_custom_slugs_route_through_set_model() {
+    let mut client = client("full-access");
+    for slug in [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-2",
+        "claude-haiku-5-5",
+        "corp-internal-claude",
+    ] {
+        client.wire.clear();
+        client
+            .command(json!({"type":"set_model","id":"pick","modelId":slug}))
+            .unwrap();
+        let request = client
+            .wire
+            .iter()
+            .find(|record| {
+                record["type"] == "control_request" && record["request"]["subtype"] == "set_model"
+            })
+            .expect("set_model request")
+            .clone();
+        assert_eq!(request["request"]["model"], slug);
+        client
+            .incoming(json!({"type":"control_response","response":{
+                "subtype":"success","request_id":request["request_id"],"response":{}}}))
+            .unwrap();
+        assert_eq!(client.model["id"], slug, "{slug} was rejected");
+        if slug == "corp-internal-claude" {
+            assert_eq!(client.model["isCustom"], true);
+        }
+    }
+    // A slug while a turn runs is still refused.
+    client.running = true;
+    client
+        .command(json!({"type":"set_model","id":"busy","modelId":"claude-opus-5-5"}))
+        .unwrap();
+    let reply = client
+        .events
+        .iter()
+        .find(|event| event["command"] == "set_model" && event["id"] == "busy")
+        .expect("rejection");
+    assert_eq!(reply["success"], false);
 }

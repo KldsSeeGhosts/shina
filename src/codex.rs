@@ -21,30 +21,45 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn process() -> Result<Command, String> {
-    let mut candidates = vec![];
-    if let Some(path) = std::env::var_os("SHINA_CODEX_CLI") {
-        candidates.push(path.to_string_lossy().into_owned());
-    } else {
-        candidates.push("codex".into());
-        if cfg!(windows)
-            && let Some(local) = std::env::var_os("LOCALAPPDATA")
-        {
-            candidates.push(
-                PathBuf::from(local)
-                    .join("Programs/OpenAI/Codex/bin/codex.exe")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            candidates.push(
-                PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default())
-                    .join("AppData/Local/Programs/OpenAI/Codex/bin/codex.exe")
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
+/// The installed Windows Codex app's binary, like KSG's local Codex discovery.
+fn codex_windows_program_paths(
+    local_app_data: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Vec<String> {
+    let mut paths = vec![];
+    if let Some(local) = local_app_data {
+        paths.push(
+            PathBuf::from(local)
+                .join("Programs/OpenAI/Codex/bin/codex.exe")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        paths.push(
+            PathBuf::from(user_profile.unwrap_or_default())
+                .join("AppData/Local/Programs/OpenAI/Codex/bin/codex.exe")
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
-    for command in candidates {
+    paths
+}
+
+fn codex_candidates() -> Vec<String> {
+    if let Some(path) = std::env::var_os("SHINA_CODEX_CLI") {
+        return vec![path.to_string_lossy().into_owned()];
+    }
+    let mut candidates = vec!["codex".into()];
+    if cfg!(windows) {
+        candidates.extend(codex_windows_program_paths(
+            std::env::var_os("LOCALAPPDATA"),
+            std::env::var_os("USERPROFILE"),
+        ));
+    }
+    candidates
+}
+
+pub fn process() -> Result<Command, String> {
+    for command in codex_candidates() {
         if let Ok((executable, script)) = crate::harness::executable(&command) {
             let mut command = Command::new(executable);
             if let Some(script) = script {
@@ -53,7 +68,10 @@ pub fn process() -> Result<Command, String> {
             // Preserve Codex's own configured provider environment, like KSG. Do not
             // propagate another Shina thread's bearer token or Pi bridge settings.
             command
-                .arg("app-server")
+                .args(["app-server", "-c", "thread_unload_delay_secs=0"])
+                // KSG `codexAppServerEnvironment`: the app-server refreshes
+                // models_cache.json under this originator, not the plain CLI's.
+                .env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "shina")
                 .env_remove(crate::mcp::URL_ENV)
                 .env_remove(crate::mcp::TOKEN_ENV)
                 .env_remove("SHINA_RUNTIME_MODE")
@@ -68,14 +86,17 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
     start_process(process()?, start, wake)
 }
 
-pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Result<Pi, String> {
-    let command = process()?;
+pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Pi {
     let start = Start::discovery("codex", workspace);
-    Ok(Pi::worker(
+    Pi::worker(
         wake,
         start.owner.clone(),
         None,
         move |input, events, wake, stopped, owner| {
+            let command = process()?;
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
             run_mode(
                 command,
                 start,
@@ -87,7 +108,7 @@ pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Result<Pi, Str
                 Some(models),
             )
         },
-    ))
+    )
 }
 
 fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, String> {
@@ -221,6 +242,33 @@ struct Client {
     /// `snapshot.version`); drives the manifest's update-required advisory.
     version: Option<String>,
     service_tier: Option<String>,
+    /// Raw `account/read` result before email concealment (KSG `snapshot.account`).
+    account: Value,
+    /// Merged `config/read` result (KSG `snapshot.config`); `Null` when unreadable.
+    config: Value,
+    /// `config/read` settled or was ruled out; model rows wait on it like KSG's snapshot.
+    config_done: bool,
+    /// KSG `snapshot.serviceTier`: `service_tier` from the merged config.
+    config_service_tier: Option<String>,
+    /// `account/read` settled or timed out; a chatgpt probe's catalog wait keys off it.
+    account_done: bool,
+    /// `model/list` pagination completed; rows build once the config settles too.
+    models_done: bool,
+    /// The pending model request, replayed by `finish_models` after `config/read`.
+    models_request: Option<Value>,
+    usage_probe_sent: bool,
+    /// `initialize.codexHome` when the CLI reports it, for the cache poll.
+    codex_home: Option<PathBuf>,
+    /// Process spawn as Unix milliseconds; the catalog wait wants a cache stamp
+    /// newer than this (KSG `spawnedAtMs`).
+    spawned_at_ms: u64,
+    /// KSG `requestCodexChatGptModels`: probe-only deadline while the shared
+    /// models_cache.json refresh for our originator is still in flight.
+    catalog_deadline: Option<Instant>,
+    /// The post-refresh `model/list` is in flight; its rows replace the first set.
+    catalog_relisting: bool,
+    /// Rows of the post-refresh list, swapped over `raw_models` on completion.
+    relist_models: Vec<Value>,
     turns: Vec<Value>,
     turn_items: Vec<Value>,
     usage_limits: Value,
@@ -280,6 +328,19 @@ impl Client {
             native_extensions: false,
             version: None,
             service_tier: None,
+            account: Value::Null,
+            config: Value::Null,
+            config_done: false,
+            config_service_tier: None,
+            account_done: false,
+            models_done: false,
+            models_request: None,
+            usage_probe_sent: false,
+            codex_home: None,
+            spawned_at_ms: 0,
+            catalog_deadline: None,
+            catalog_relisting: false,
+            relist_models: vec![],
             turns: vec![],
             turn_items: vec![],
             usage_limits: Value::Null,
@@ -307,7 +368,10 @@ impl Client {
     fn request(&mut self, method: &str, params: Value, request: Value) {
         self.serial += 1;
         let id = format!("shina-codex-{}", self.serial);
-        let timeout = if matches!(request["type"].as_str(), Some("rateLimits" | "account")) {
+        let timeout = if matches!(
+            request["type"].as_str(),
+            Some("rateLimits" | "account" | "config")
+        ) {
             Duration::from_secs(5)
         } else {
             Duration::from_secs(30)
@@ -415,9 +479,24 @@ impl Client {
                 "Codex {kind} failed: {error}. Configure providers or sign in outside Shina if required, then retry."
             );
             let error = auth_guidance(&error);
+            if kind == "models" && self.catalog_relisting {
+                // KSG `?? models`: the cached first list still applies when the
+                // post-refresh relist fails.
+                self.models_done = true;
+                return self.finish_models();
+            }
             if matches!(kind, "rateLimits" | "account") {
                 // Usage and account metadata are optional. An older CLI or API-key account has none.
+                self.account_done |= kind == "account";
+                self.finish_models()?;
                 return Ok(());
+            }
+            if kind == "config" {
+                // Routing config is optional like KSG's caught `config/read` failure;
+                // without it Codex's native route stays unproven, so usage is skipped.
+                self.config_done = true;
+                self.maybe_probe_usage();
+                return self.finish_models();
             }
             if kind == "skills" {
                 let lower = error.to_ascii_lowercase();
@@ -477,6 +556,7 @@ impl Client {
         let result = &record["result"];
         match kind {
             "initialize" => {
+                self.codex_home = result["codexHome"].as_str().map(PathBuf::from);
                 self.native_extensions = supports_extensions(result);
                 self.events.push(
                     json!({"type":"harness_update","field":"codexNativeExtensions",
@@ -501,10 +581,12 @@ impl Client {
                 );
                 if self.probe != Some(false) {
                     self.request("account/read", json!({}), json!({"type":"account"}));
+                    // KSG `CodexAppServerProviderSnapshot`: the merged config names
+                    // the route CPA/proxy traffic takes and its service tier.
                     self.request(
-                        "account/rateLimits/read",
-                        Value::Null,
-                        json!({"type":"rateLimits"}),
+                        "config/read",
+                        json!({"includeLayers":false}),
+                        json!({"type":"config"}),
                     );
                 }
                 if self.probe != Some(false) {
@@ -514,10 +596,27 @@ impl Client {
                 }
             }
             "account" => {
+                self.account = result.clone();
+                self.account_done = true;
                 let mut acct = result.clone();
                 crate::usage_limits::conceal_account_json(&mut acct);
                 self.usage_account = acct;
                 self.events.push(json!({"type":"harness_update","field":"usageAccount","value":self.usage_account}));
+                self.maybe_probe_usage();
+                self.finish_models()?;
+            }
+            "config" => {
+                self.config = result["config"].clone();
+                self.config_done = true;
+                self.config_service_tier = self.config["service_tier"].as_str().map(str::to_owned);
+                // KSG `codexCustomEndpoint`: a CPA/proxy route's origin is the
+                // endpoint the account's credentials actually apply to.
+                if let Some(endpoint) = crate::codex_catalog::codex_custom_endpoint(&self.config) {
+                    self.events.push(json!({"type":"harness_update",
+                        "field":"endpoint","value":endpoint}));
+                }
+                self.maybe_probe_usage();
+                self.finish_models()?;
             }
             "rateLimits" => {
                 let read = &result["rateLimitsByLimitId"]["codex"];
@@ -565,8 +664,12 @@ impl Client {
                 let page = result["data"]
                     .as_array()
                     .ok_or("Codex returned an invalid model list.")?;
-                self.raw_models.extend(page.iter().cloned());
-                if self.raw_models.len() > 4096 {
+                if self.catalog_relisting {
+                    self.relist_models.extend(page.iter().cloned());
+                } else {
+                    self.raw_models.extend(page.iter().cloned());
+                }
+                if self.raw_models.len() + self.relist_models.len() > 4096 {
                     return Err("Codex model list exceeds Shina's limit.".into());
                 }
                 if let Some(cursor) = result["nextCursor"].as_str().filter(|s| !s.is_empty()) {
@@ -575,84 +678,16 @@ impl Client {
                     }
                     self.request("model/list", json!({"limit":100,"cursor":cursor}), request);
                 } else {
-                    self.models = self
-                        .raw_models
-                        .iter()
-                        .filter(|m| m["hidden"] != true)
-                        .filter_map(model_value)
-                        .collect();
-                    // KSG orders `applyPreferredCodexDefaultModel` before the catalog.
-                    crate::codex_catalog::apply_preferred_codex_default_model(&mut self.models);
-                    // `applyCodexModelCatalog`: the manifest's `codex` section
-                    // classifies rows by family, fills in catalog metadata, and
-                    // names models the installed CLI predates.
-                    let catalog = crate::codex_catalog::bundled_codex_provider_catalog(
-                        crate::lifecycle::now(),
-                    );
-                    let (models, update_required) = crate::codex_catalog::apply_codex_model_catalog(
-                        std::mem::take(&mut self.models),
-                        catalog.as_ref(),
-                        self.version.as_deref(),
-                    );
-                    self.models = models;
-                    if self.probe.is_some() {
-                        self.events.push(json!({"type":"harness_update",
-                            "field":"updateRequiredModels","value":update_required}));
+                    if self.catalog_relisting {
+                        // KSG `?? models`: the post-refresh set replaces the cache.
+                        std::mem::swap(&mut self.raw_models, &mut self.relist_models);
+                        self.relist_models.clear();
                     }
-                    if self.ready && self.probe.is_none() {
-                        if let Some(model) = self
-                            .models
-                            .iter()
-                            .find(|model| model["id"] == self.model["id"])
-                        {
-                            self.model = model.clone();
-                        }
-                        self.reply(
-                            &json!({"type":"get_available_models","id":request["id"]}),
-                            json!({"models":self.models}),
-                        );
-                        self.reply(
-                            &json!({"type":"get_available_thinking_levels","id":"levels"}),
-                            json!({"levels":self.levels()}),
-                        );
-                        return Ok(());
-                    }
-                    if self.probe.is_some() {
-                        self.reply(
-                            &json!({"type":"get_available_models","id":"models"}),
-                            json!({"models":self.models}),
-                        );
-                        self.ready = true;
-                        if self.skills_loaded {
-                            self.reply(
-                                &json!({"type":"get_commands","id":"commands"}),
-                                json!({"commands":self.commands()}),
-                            );
-                        }
-                        return Ok(());
-                    }
-                    let mut params = self.session_params();
-                    let method = match &self.start.source {
-                        SessionSource::New => {
-                            if self.native_extensions {
-                                params["historyMode"] = json!("paginated");
-                            }
-                            "thread/start"
-                        }
-                        SessionSource::Resume(id) => {
-                            params["threadId"] = json!(id);
-                            "thread/resume"
-                        }
-                        SessionSource::Fork(id) => {
-                            if !self.native_extensions {
-                                return Err("This Codex version has no verified conversation fork protocol. Update Codex outside Shina.".into());
-                            }
-                            params["threadId"] = json!(id);
-                            params["deferGoalContinuation"] = json!(true);
-                            "thread/fork"
-                        }
-                    };
-                    self.request(method, params, json!({"type":"start"}));
+                    // KSG builds the provider snapshot from account, config and
+                    // models together; rows wait for `config/read` to settle.
+                    self.models_done = true;
+                    self.models_request = Some(request);
+                    self.finish_models()?;
                 }
             }
             "start" => {
@@ -1260,14 +1295,27 @@ impl Client {
             }
             "prompt" => self.prompt(record)?,
             "set_model" => {
-                if self.running {
-                    self.reject(&record, "Wait for Codex to finish before changing models.");
-                } else if let Some(model) = self
+                // CPA/custom slugs route fine even when `model/list` did not
+                // advertise them; an unlisted id gets a bare row instead of a
+                // rejection, like KSG's `appendCustomCodexModels`.
+                let model = self
                     .models
                     .iter()
                     .find(|m| m["id"] == record["modelId"])
                     .cloned()
-                {
+                    .or_else(|| {
+                        record["modelId"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| {
+                                json!({"provider":"codex","id":id,"name":id,"isCustom":true,
+                                    "thinkingLevels":[],"input":["text"],
+                                    "capabilities":{"optionDescriptors":[]}})
+                            })
+                    });
+                if self.running {
+                    self.reject(&record, "Wait for Codex to finish before changing models.");
+                } else if let Some(model) = model {
                     self.model = model;
                     self.service_tier = None;
                     if !self
@@ -1334,6 +1382,171 @@ impl Client {
             }
             _ => self.reject(&record, format!("Codex does not support {kind} in Shina.")),
         }
+        Ok(())
+    }
+
+    /// `models_cache.json`'s directory: `initialize.codexHome`, else `CODEX_HOME`,
+    /// else the default `~/.codex`. `None` when none of them resolve.
+    fn catalog_home(&self) -> Option<PathBuf> {
+        self.codex_home
+            .clone()
+            .or_else(|| std::env::var_os("CODEX_HOME").map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                    .map(|home| PathBuf::from(home).join(".codex"))
+            })
+            .filter(|home| !home.as_os_str().is_empty())
+    }
+
+    /// KSG `readCodexModelsCacheFetchedAt` + the refresh repeat: every loop tick
+    /// reads the cache stamp; a stamp at-or-after spawn, or the 3 s deadline,
+    /// sends the fresh `model/list`.
+    fn poll_catalog_refresh(&mut self) {
+        let Some(deadline) = self.catalog_deadline else {
+            return;
+        };
+        let fetched = self
+            .catalog_home()
+            .and_then(|home| std::fs::read_to_string(home.join("models_cache.json")).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|cache| {
+                chrono::DateTime::parse_from_rfc3339(cache["fetched_at"].as_str()?)
+                    .ok()
+                    .map(|stamp| stamp.timestamp_millis().max(0) as u64)
+            });
+        if fetched.is_none_or(|at| at < self.spawned_at_ms) && Instant::now() < deadline {
+            return;
+        }
+        self.catalog_deadline = None;
+        self.catalog_relisting = true;
+        self.model_cursors.clear();
+        self.request("model/list", json!({"limit":100}), json!({"type":"models"}));
+    }
+
+    /// KSG `nativeUsage`: subscription rate limits only exist when the account
+    /// is an OpenAI login and the merged config routes to OpenAI natively.
+    /// A CPA/proxy route reports no OpenAI quota, so the probe is skipped.
+    fn maybe_probe_usage(&mut self) {
+        if self.usage_probe_sent || self.account.is_null() || !self.config_done {
+            return;
+        }
+        self.usage_probe_sent = true;
+        if crate::codex_catalog::codex_routes_spend_native_quota(&self.account, &self.config) {
+            self.request(
+                "account/rateLimits/read",
+                Value::Null,
+                json!({"type":"rateLimits"}),
+            );
+        }
+    }
+
+    /// The model rows KSG builds in `CodexAppServerProviderSnapshot`: discovery
+    /// plus the configured default tier, once `model/list` and `config/read`
+    /// have both settled. `config/read` stays optional on older CLIs.
+    fn finish_models(&mut self) -> Result<(), String> {
+        if !self.models_done || !self.config_done {
+            return Ok(());
+        }
+        // KSG awaits `account/read` before listing models: the account type
+        // decides whether the originator-scoped cache wait applies at all.
+        if self.probe.is_some() && !self.account_done {
+            return Ok(());
+        }
+        // KSG `requestCodexChatGptModels`: a chatgpt probe waits for the
+        // app-server's models_cache.json refresh before its final list. Other
+        // account types list the cached catalog once.
+        if self.probe.is_some()
+            && !self.catalog_relisting
+            && self.account["account"]["type"].as_str() == Some("chatgpt")
+            && self.catalog_home().is_some()
+        {
+            if self.catalog_deadline.is_none() {
+                self.catalog_deadline = Some(Instant::now() + Duration::from_secs(3));
+            }
+            return Ok(());
+        }
+        self.models_done = false;
+        let request = self
+            .models_request
+            .take()
+            .unwrap_or_else(|| json!({"type":"models"}));
+        let configured_tier = self.config_service_tier.clone();
+        self.models = self
+            .raw_models
+            .iter()
+            .filter(|m| m["hidden"] != true)
+            .filter_map(|m| model_value(m, configured_tier.as_deref()))
+            .collect();
+        // KSG orders `applyPreferredCodexDefaultModel` before the catalog.
+        crate::codex_catalog::apply_preferred_codex_default_model(&mut self.models);
+        // `applyCodexModelCatalog`: the manifest's `codex` section
+        // classifies rows by family, fills in catalog metadata, and
+        // names models the installed CLI predates.
+        let catalog = crate::codex_catalog::bundled_codex_provider_catalog(crate::lifecycle::now());
+        let (models, update_required) = crate::codex_catalog::apply_codex_model_catalog(
+            std::mem::take(&mut self.models),
+            catalog.as_ref(),
+            self.version.as_deref(),
+        );
+        self.models = models;
+        if self.probe.is_some() {
+            self.events.push(json!({"type":"harness_update",
+                "field":"updateRequiredModels","value":update_required}));
+        }
+        if self.ready && self.probe.is_none() {
+            if let Some(model) = self
+                .models
+                .iter()
+                .find(|model| model["id"] == self.model["id"])
+            {
+                self.model = model.clone();
+            }
+            self.reply(
+                &json!({"type":"get_available_models","id":request["id"]}),
+                json!({"models":self.models}),
+            );
+            self.reply(
+                &json!({"type":"get_available_thinking_levels","id":"levels"}),
+                json!({"levels":self.levels()}),
+            );
+            return Ok(());
+        }
+        if self.probe.is_some() {
+            self.reply(
+                &json!({"type":"get_available_models","id":"models"}),
+                json!({"models":self.models}),
+            );
+            self.ready = true;
+            if self.skills_loaded {
+                self.reply(
+                    &json!({"type":"get_commands","id":"commands"}),
+                    json!({"commands":self.commands()}),
+                );
+            }
+            return Ok(());
+        }
+        let mut params = self.session_params();
+        let method = match &self.start.source {
+            SessionSource::New => {
+                if self.native_extensions {
+                    params["historyMode"] = json!("paginated");
+                }
+                "thread/start"
+            }
+            SessionSource::Resume(id) => {
+                params["threadId"] = json!(id);
+                "thread/resume"
+            }
+            SessionSource::Fork(id) => {
+                if !self.native_extensions {
+                    return Err("This Codex version has no verified conversation fork protocol. Update Codex outside Shina.".into());
+                }
+                params["threadId"] = json!(id);
+                params["deferGoalContinuation"] = json!(true);
+                "thread/fork"
+            }
+        };
+        self.request(method, params, json!({"type":"start"}));
         Ok(())
     }
 
@@ -2241,7 +2454,7 @@ impl Client {
     }
 }
 
-fn model_value(model: &Value) -> Option<Value> {
+fn model_value(model: &Value, configured_service_tier: Option<&str>) -> Option<Value> {
     let id = model["model"].as_str().or_else(|| model["id"].as_str())?;
     let levels: Vec<_> = model["supportedReasoningEfforts"]
         .as_array()
@@ -2249,7 +2462,10 @@ fn model_value(model: &Value) -> Option<Value> {
         .flatten()
         .filter_map(|level| level["reasoningEffort"].as_str())
         .collect();
-    let capabilities = crate::descriptors::map_codex_model_capabilities(model, None);
+    // KSG `applyConfiguredCodexServiceTier`: the config's `service_tier` becomes
+    // the descriptor default (with `fast` resolving to `priority`).
+    let capabilities =
+        crate::descriptors::map_codex_model_capabilities(model, configured_service_tier);
     Some(
         json!({"provider":"codex","id":id,"name":model["displayName"].as_str().unwrap_or(id),
         "thinkingLevels":levels,"input":model.get("inputModalities").cloned().unwrap_or_else(||json!(["text","image"])),
@@ -2422,6 +2638,8 @@ fn run_mode(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // KSG `spawnedAtMs`: the catalog wait wants a cache write newer than spawn.
+    let spawned_at_ms = crate::lifecycle::now();
     let mut process = crate::process::Process::spawn(&mut command)
         .map_err(|e| format!("Could not start Codex: {e}"))?;
     let mut stdin = process.stdin.take().unwrap();
@@ -2469,6 +2687,7 @@ fn run_mode(
     });
     let mut client = Client::new(start);
     client.probe = probe;
+    client.spawned_at_ms = spawned_at_ms;
     client.initialize();
     let result = (|| {
         loop {
@@ -2491,12 +2710,28 @@ fn run_mode(
                 }
             }
             let now = Instant::now();
+            let mut config_expired = false;
+            let mut account_expired = false;
             client.pending.retain(|_, p| {
-                !(matches!(
+                let droppable = matches!(
                     p.request["type"].as_str(),
-                    Some("prompt_suggestion" | "rateLimits" | "account")
-                ) && now >= p.deadline)
+                    Some("prompt_suggestion" | "rateLimits" | "account" | "config")
+                ) && now >= p.deadline;
+                config_expired |= droppable && p.request["type"] == "config";
+                account_expired |= droppable && p.request["type"] == "account";
+                !droppable
             });
+            if config_expired {
+                client.config_done = true;
+                client.maybe_probe_usage();
+                client.finish_models()?;
+            }
+            if account_expired {
+                client.account_done = true;
+                client.maybe_probe_usage();
+                client.finish_models()?;
+            }
+            client.poll_catalog_refresh();
             if client.pending.values().any(|p| now >= p.deadline) {
                 return Err("Codex did not acknowledge an operation within 30 seconds.".into());
             }
