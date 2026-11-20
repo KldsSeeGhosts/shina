@@ -129,13 +129,6 @@ pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
             }
         }
         rows.push((entry.server.to_owned(), entry.id));
-        if entry.captain && entry.local.is_some() {
-            rows.extend(
-                s.visible_captain_workers(entry.id)
-                    .into_iter()
-                    .map(|index| (entry.server.to_owned(), s.threads[index].id)),
-            );
-        }
     }
     rows
 }
@@ -406,10 +399,6 @@ const CARD_META: TextStyle = TextStyle::new(12.5, 430.0);
 const ROW_INSET: f32 = 12.0;
 /// Tool, thinking and status lines in the transcript.
 const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
-/// Height of one-line sidebar rows: navigation, workers and shelved threads.
-/// Workers sit a step below their captain: shorter rows on the captain's rail.
-const CREW_ROW: f32 = 30.0;
-
 /// A text field's focus look, shared by every field: KSG's 1 px `--input` border that turns the
 /// `--ring` blue while the field has focus. Put it on the box that draws the field's edge.
 trait FieldFocus {
@@ -1166,13 +1155,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
             root = root.child(menu);
         }
-        if s.show_activity
-            && let Some(thread_id) = s.brief.more
-        {
+        // A secondary press on a Crew Roster row opens the member's More menu right there,
+        // anchored to the row.
+        if let Some(thread_id) = s.brief.more {
             root = root.child(
                 crew_membership_ui::more_menu(s, p, captain, thread_id)
                     .anchored_fit(
-                        format!("brief-crew-more-{thread_id}"),
+                        format!("crew-chip-{thread_id}"),
                         rune::Side::Bottom,
                         rune::Align::End,
                         4.0,
@@ -1190,6 +1179,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .anchored_fit("crew-bar-more", rune::Side::Bottom, rune::Align::End, 4.0)
                 .modal(true, |s: &mut State| s.brief.more = None),
         );
+    }
+    if let Some(menu) = crew_ui::siblings_menu(s, p) {
+        root = root.child(menu);
     }
     if let Some(menu) = crew_membership_ui::move_picker(s, p) {
         root = root.child(menu);
@@ -4072,39 +4064,16 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         content = content.child(heading);
         for entry in &captains {
             let home = entry.id;
-            let workers = entry
-                .local
-                .map(|_| s.visible_captain_workers(home))
-                .unwrap_or_default();
-            let mut crew = col()
-                .key(if s.client.is_some() {
-                    format!("crew-{}-{home}", entry.server)
-                } else {
-                    format!("crew-{home}")
-                })
-                .gap(1.0)
-                .child(sidebar_ui::row(s, p, entry));
-            if !workers.is_empty() {
-                // Both content and row highlights are inset beneath their owning captain, and
-                // the rail runs down from the centre of the captain's portrait.
-                let mut children = col()
-                    .key(format!("crew-threads-{home}"))
-                    .ml(6.0 + CAPTAIN_SLOT / 2.0)
-                    .pl(6.0)
+            content = content.child(
+                col()
+                    .key(if s.client.is_some() {
+                        format!("crew-{}-{home}", entry.server)
+                    } else {
+                        format!("crew-{home}")
+                    })
                     .gap(1.0)
-                    .child(
-                        el().key(format!("crew-rail-{home}"))
-                            .pin(Some(0.0), Some(0.0), None, Some(CREW_ROW / 2.0))
-                            .w(1.0)
-                            .fill(p.line)
-                            .a11y_hidden(),
-                    );
-                for index in workers {
-                    children = children.child(thread_row(s, index, p, true));
-                }
-                crew = crew.child(children);
-            }
-            content = content.child(crew);
+                    .child(sidebar_ui::row(s, p, entry)),
+            );
         }
     }
     if s.show_archive {
@@ -5671,13 +5640,18 @@ pub(crate) fn tick_portraits(
     s.portraits.tick(now, rows)
 }
 
-fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
+fn thread_row(s: &State, index: usize, p: Palette) -> El {
     let thread = &s.threads[index];
     let id = thread.id;
     let (row_status, approval) = row_status(s, thread);
     let captain_home = s.is_captain_home(thread);
+    // A crew worker drawn in the ordinary thread list: only search and the archive put it
+    // there, and its meta line names its captain instead of a workspace tile.
+    let worker = thread.crew_captain.is_some();
     let target = RowTarget::Thread(id);
-    let selected = id == s.current().id || s.selected_threads.contains(&id);
+    // A captain row stands for its whole crew, so it stays selected while one of its
+    // workers is open; `selected_row` maps the open worker back to its home.
+    let selected = id == s.selected_row() || s.selected_threads.contains(&id);
     let section = s.thread_section(thread, lifecycle::now());
     let hovered = s.hovered_row == Some(target);
     let draft = thread.is_draft();
@@ -5722,9 +5696,9 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
             },
             if approval {
                 "needs approval"
-            } else if nested && (thread.request.is_some() || thread.status == Status::Waiting) {
+            } else if worker && (thread.request.is_some() || thread.status == Status::Waiting) {
                 "needs input"
-            } else if nested && thread.unread() && !thread.actionable() {
+            } else if worker && thread.unread() && !thread.actionable() {
                 "unread result"
             } else if state_label.is_empty() {
                 row_status.label()
@@ -5781,10 +5755,10 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 s.hovered_row = None;
             }
         });
-    if !nested && !captain_home && thread.machine == "local" {
+    if !worker && !captain_home && thread.machine == "local" {
         item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
     }
-    if captain_home && !nested {
+    if captain_home && !worker {
         return captain_row(s, p, thread, item, row_status, approval, selected);
     }
     let item = select_bar(item, selected, p);
@@ -5800,18 +5774,18 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         Some(dot(p.sea))
     } else if draft {
         Some(icon("edit", p.muted))
-    } else if thread.pinned() && !nested {
+    } else if thread.pinned() && !worker {
         Some(icon("pin", p.muted))
     } else {
         // Interrupted and queued workers carry their chip's mark, so they never look finished.
-        nested
+        worker
             .then(|| crew_ui::worker_task_mark(s, thread))
             .flatten()
             .map(|status| status_mark(status, p, 7.0).key(format!("worker-task-mark-{id}")))
     }
     .map(|mark| {
         let mark = el().size(14.0, 16.0).center().child(mark.a11y_hidden());
-        if nested && (thread.actionable() || thread.unread()) {
+        if worker && (thread.actionable() || thread.unread()) {
             mark.key(format!("worker-alert-{id}"))
         } else {
             mark
@@ -5825,36 +5799,18 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
         } else {
             &thread.title
         },
-        if nested || shelved {
+        if shelved {
             LABEL
         } else {
             TextStyle::new(14.0, 520.0).tracking(-0.10)
         },
-        // Settled, snoozed and quiet worker rows recede.
-        if quiet && (nested || shelved) {
-            p.muted
-        } else {
-            p.ink
-        },
+        // Settled and snoozed rows recede.
+        if quiet && shelved { p.muted } else { p.ink },
     )
     .truncate()
     .grow(1.0)
     .shrink()
     .min_w(0.0);
-
-    if nested {
-        let mut line = row()
-            .h(CREW_ROW)
-            .w_full()
-            .pl(10.0)
-            .pr(8.0)
-            .gap(8.0)
-            .center_y();
-        // Every worker row has the status slot, empty or not, so all titles share one left edge
-        // and none looks nested under the row above.
-        line = line.child(mark.unwrap_or_else(|| el().size(14.0, 16.0)));
-        return item.child(line.child(title));
-    }
 
     // The status slot: hover actions, then what needs attention, then how old the row is.
     // Hover puts Snooze and Settle where the age sat; everything else is in the right-click menu.
@@ -5968,7 +5924,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     let project = s.project(thread.project);
     // Pins and drafts lead the line, as T3 Code puts its pin before the project icon.
     let lead = |line: El| match &mark {
-        Some(_) if thread.pinned() || draft => line.child(mark.clone().unwrap()),
+        Some(_) if thread.pinned() || draft || worker => line.child(mark.clone().unwrap()),
         _ => line,
     };
 
@@ -5992,9 +5948,34 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
     }
 
     // A thread card, as T3 Code lays it out: the project's icon and name with the status on
-    // the right, then the title.
+    // the right, then the title. A worker carries its captain's portrait and name where the
+    // project tile sits, so the flat row still says whose crew it belongs to.
+    let (tile, meta_name) = if worker {
+        let captain = thread.crew_captain;
+        let name = captain
+            .and_then(|c| s.captains.get(c))
+            .map(|c| c.name.as_str())
+            .unwrap_or("Crew")
+            .to_string();
+        let portrait = captain_portrait(s, captain);
+        let face = face_for(row_status);
+        let pixels = s.artwork.face_pixels(portrait, face, 16.0);
+        (
+            pixel_portrait(s, &pixels, 16.0, p)
+                .key(format!("worker-captain-portrait-{id}"))
+                .a11y_hidden(),
+            name,
+        )
+    } else {
+        (
+            project_tile(s, p, project, 16.0),
+            project
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| "No workspace".into()),
+        )
+    };
     let top = lead(row().h(18.0).gap(8.0).center_y())
-        .child(project_tile(s, p, project, 16.0))
+        .child(tile)
         .child(
             // The workspace and, on a linked machine, the machine: two labels, not one joined.
             row()
@@ -6003,32 +5984,25 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(
-                    label(
-                        project
-                            .map(|project| project.name.clone())
-                            .unwrap_or_else(|| "No workspace".into()),
-                        CARD_META,
-                        p.muted,
-                    )
-                    .key(format!("thread-workspace-{id}"))
-                    .truncate()
-                    .shrink()
-                    .min_w(0.0)
-                    .beside_tag(
-                        multiple_machines(s),
-                        sidebar_row_width(s) - 2.0 * ROW_INSET,
-                        16.0 + ICON
-                            + slot_width(match state_label {
-                                "" => None,
-                                "Working" => Some("Working 59m 59s"),
-                                other => Some(other),
-                            })
-                            + 32.0,
-                        project.map_or("No workspace", |project| project.name.as_str()),
-                    ),
+                    label(meta_name.clone(), CARD_META, p.muted)
+                        .key(format!("thread-workspace-{id}"))
+                        .truncate()
+                        .shrink()
+                        .min_w(0.0)
+                        .beside_tag(
+                            multiple_machines(s),
+                            sidebar_row_width(s) - 2.0 * ROW_INSET,
+                            16.0 + ICON
+                                + slot_width(match state_label {
+                                    "" => None,
+                                    "Working" => Some("Working 59m 59s"),
+                                    other => Some(other),
+                                })
+                                + 32.0,
+                            &meta_name,
+                        ),
                 )
                 .child(if multiple_machines(s) {
-                    let workspace = project.map_or("No workspace", |project| project.name.as_str());
                     // The age or the status word, widest while it counts up.
                     let slot = match state_label {
                         "" => None,
@@ -6044,7 +6018,7 @@ fn thread_row(s: &State, index: usize, p: Palette, nested: bool) -> El {
                         room_for_machine_name(
                             sidebar_row_width(s) - 2.0 * ROW_INSET,
                             16.0 + ICON + slot_width(slot) + 32.0,
-                            workspace,
+                            &meta_name,
                         ),
                     )
                 } else {
@@ -7545,10 +7519,15 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
                 ),
         );
     }
-    // Crew threads link back to the thread that started them; nothing else repeats the tab.
-    if let Some(parent) = s
-        .current()
-        .parent
+    // Crew threads link back to the thread that started them, unless the parent or crew bar
+    // above the composer already names it.
+    let t = s.current();
+    let bar_shown = t.peer_origin.is_some()
+        || t.parent.is_some() && t.delegated
+        || !t.delegated && t.crew_captain.is_some();
+    if let Some(parent) = (!bar_shown)
+        .then(|| s.current().parent)
+        .flatten()
         .and_then(|id| s.threads.iter().position(|t| t.id == id))
     {
         header = header.child(label("From", SMALL, p.muted)).child(
@@ -24233,6 +24212,8 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
             rt.state.compact_sidebar = true;
+            // The summary lives in the roster's header; chip clocks need the roster open.
+            rt.state.refresh_crew_roster_attention();
             rt.frame(0.0);
             rt.frame(1.0);
             // Two workers run. The review waits on an approval, and one more waits for a slot.
@@ -24280,6 +24261,8 @@ pub(crate) mod tests {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
             rt.state.compact_sidebar = true;
+            // Workers list flat only while searching; the marks ride along on those rows.
+            rt.state.search.replace_text("the");
             rt.frame(0.0);
             let fill = |rt: &Runtime<State>, key: &str| {
                 rt.elements()
@@ -27773,20 +27756,118 @@ pub(crate) mod tests {
         child.life.pinned_at = Some(1);
         rt.state.threads.push(child);
         rt.frame(0.0);
-        let (parent, _) = rt.presented("thread-1").unwrap();
-        let (child, _) = rt.presented("thread-2").unwrap();
-        assert!(child[0] >= parent[0] + 24.0 && child[1] > parent[1]);
-        assert!(child[0] + child[2] <= parent[0] + parent[2] + 0.5);
+        // The captain is a single row; its worker never nests beneath it.
+        assert!(rt.presented("thread-1").is_some());
+        assert!(rt.presented("thread-2").is_none());
+        assert!(rt.find("crew-threads-1").is_none());
+        assert!(rt.find("crew-rail-1").is_none());
         rt.state.search.replace_text("Delegated");
         rt.frame(0.0);
+        // The matching worker lists flat under its own match, named by its captain.
+        assert!(rt.presented("thread-2").is_some());
+        assert_eq!(
+            element_text(&rt, "thread-workspace-2").as_deref(),
+            Some("Sable")
+        );
+        let (parent, _) = rt.presented("thread-1").unwrap();
+        let (child, _) = rt.presented("thread-2").unwrap();
+        assert!(child[1] > parent[1]);
         assert!(
             rt.presented("thread-1").is_some(),
             "matching workers retain their captain as context during search"
         );
         press(&mut rt, "thread-2");
         assert_eq!(rt.state.current().id, 2);
-        assert!(rt.presented("thread-2").is_some());
-        assert!(rt.state.sidebar_threads().is_empty());
+        rt.state.search.replace_text("");
+        rt.frame(0.0);
+        // The worker's row is gone from the list, and the captain stays selected for it.
+        assert!(rt.presented("thread-2").is_none());
+        assert!(rt.presented("thread-1").is_some());
+        assert_eq!(rt.state.selected_row(), 1);
+    }
+
+    #[test]
+    fn opening_a_captain_or_its_workers_never_moves_a_sidebar_row() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            // Rosters start empty; these tests exercise the earlier named presets.
+            rt.state.captains = crate::captains::Captain::presets();
+            rt.state.open_captain(0);
+            let home = rt.state.current().id;
+            for n in 0..12 {
+                let id = rt.state.next_id;
+                rt.state.next_id += 1;
+                let mut worker = crate::model::Thread::new(id);
+                worker.title = format!("Crew worker {n}");
+                worker.parent = Some(home);
+                worker.delegated = true;
+                worker.captain = Some(0);
+                worker.crew_captain = Some(0);
+                worker.project = rt.state.current().project;
+                rt.state.threads.push(worker);
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            // No worker keys, rails or nested rows exist at rest.
+            for key in rt.elements().iter().filter_map(|e| e.key.as_deref()) {
+                assert!(
+                    !key.starts_with("crew-threads-") && !key.starts_with("crew-rail-"),
+                    "{width}: {key}"
+                );
+            }
+            let rows = |rt: &Runtime<State>| -> Vec<(String, f32)> {
+                rt.elements()
+                    .into_iter()
+                    .filter_map(|e| {
+                        e.key
+                            .filter(|k| {
+                                k.starts_with("thread-")
+                                    || k.starts_with("machine-thread-")
+                                    || k.starts_with("shelf-")
+                                    || k.strip_prefix("crew-").is_some_and(|rest| {
+                                        rest.chars().all(|c| c.is_ascii_digit())
+                                    })
+                            })
+                            .and_then(|k| rt.presented(k.as_str()).map(|(r, _)| (k, r[1])))
+                    })
+                    .collect()
+            };
+            // A different thread is open; capture the resting order.
+            rt.state.new_thread_in(None);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let before = rows(&rt);
+            assert!(!before.is_empty(), "{width}: sidebar rows missing");
+            // Opening the captain moves nothing.
+            rt.state.open_captain(0);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert_eq!(before, rows(&rt), "{width}: captain open moved rows");
+            // Opening any worker moves nothing either.
+            for n in [0, 5, 11] {
+                let index = rt
+                    .state
+                    .threads
+                    .iter()
+                    .position(|t| t.title == format!("Crew worker {n}"))
+                    .unwrap();
+                rt.state.show_worker_ghost(index);
+                rt.invalidate();
+                rt.frame(0.0);
+                rt.frame(1.0);
+                assert_eq!(before, rows(&rt), "{width}: worker {n} moved rows");
+            }
+            // Still no nested keys after every open.
+            for key in rt.elements().iter().filter_map(|e| e.key.as_deref()) {
+                assert!(
+                    !key.starts_with("crew-threads-") && !key.starts_with("crew-rail-"),
+                    "{width}: {key}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -27814,7 +27895,8 @@ pub(crate) mod tests {
         rt.state.threads.push(child);
         rt.frame(0.0);
         let worker_key = format!("thread-{worker_id}");
-        assert!(rt.presented(&worker_key).is_some());
+        // Workers never list beside their captain; the archive shows them flat.
+        assert!(rt.presented(&worker_key).is_none());
         rt.state.threads.last_mut().unwrap().life.archived_at = Some(1);
         rt.state.show_archive = true;
         rt.invalidate();
@@ -27822,7 +27904,8 @@ pub(crate) mod tests {
         rt.frame(1.0);
         let (home, _) = rt.presented(&format!("thread-{parent}")).unwrap();
         let (worker, _) = rt.presented(&worker_key).unwrap();
-        assert!(worker[0] >= home[0] + 24.0 && worker[1] > home[1]);
+        // Archived workers list flat, at the same inset as any row.
+        assert!((worker[0] - home[0]).abs() < 1.0 && worker[1] > home[1]);
         assert!(
             !rt.state
                 .sidebar_threads()
@@ -27842,6 +27925,7 @@ pub(crate) mod tests {
         rt.state.captains = crate::captains::Captain::presets();
         rt.state.open_captain(0);
         let mut child = crate::model::Thread::new(99);
+        child.title = "Alerting worker".into();
         child.parent = Some(rt.state.current().id);
         child.delegated = true;
         child.crew_captain = Some(0);
@@ -27860,7 +27944,21 @@ pub(crate) mod tests {
             child.life.last_visited_at = Some(if state == 2 { 1 } else { 3 });
             rt.invalidate();
             rt.frame(1.0);
-            assert!(rt.presented("worker-alert-99").is_some());
+            // Nothing enters the sidebar: the captain's own badge carries the alert,
+            // and a search for the worker shows the flat row's alert mark.
+            assert!(rt.presented("worker-alert-99").is_none());
+            assert!(rt.find("thread-99").is_none());
+            rt.state.search.replace_text("Alerting worker");
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(
+                rt.presented("worker-alert-99").is_some(),
+                "state {state}: the flat worker row carries its alert mark"
+            );
+            rt.state.search.replace_text("");
+            rt.invalidate();
+            rt.frame(0.0);
         }
         rt.state.open_kept_tab(0);
         rt.invalidate();
@@ -28317,6 +28415,7 @@ pub(crate) mod tests {
             let mut rt = crew_runtime(width);
             rt.state
                 .demo_remote_task(16, "Studio", crate::model::RemoteState::TargetOffline);
+            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(1.0);
             assert_inside(
@@ -28366,6 +28465,10 @@ pub(crate) mod tests {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
             assert_eq!(rt.state.current().id, 7);
+            // The roster starts collapsed; a member needing the user opens it.
+            rt.state.refresh_crew_roster_attention();
+            rt.invalidate();
+            rt.frame(0.0);
             assert_inside(
                 &mut rt,
                 width,
@@ -28385,10 +28488,10 @@ pub(crate) mod tests {
                 ],
             );
             // Delegations are task cards, not generic tool rows, and finished tasks stay off
-            // the tray.
+            // the task cards. Every crew member has a roster row, finished or not.
             assert!(rt.presented("inline-tool-7-0").is_none());
-            assert!(rt.presented("crew-chip-1").is_none());
-            assert!(rt.presented("crew-chip-18").is_none());
+            assert!(rt.presented("crew-chip-1").is_some());
+            assert!(rt.presented("crew-chip-18").is_some());
             // The approval stack scrolls inside KSG's max-h-80.
             assert!(rt.presented("needs-you").unwrap().0[3] <= 320.5);
             press(&mut rt, "crew-chip-16");
@@ -28460,6 +28563,7 @@ pub(crate) mod tests {
                 json!({"mode":"shared","newWorktree":false,"primaryCheckout":true,
                     "checkout":"/Users/someone/projects/shina","branch":"main"}),
             );
+            rt.state.refresh_crew_roster_attention();
             rt.invalidate();
             rt.frame(1.0);
             for child in [16, 17, 18, 19] {
@@ -28649,54 +28753,51 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_crew_tray_is_two_equal_columns_from_560_and_one_column_below() {
-        let chips = |rt: &Runtime<State>| -> Vec<[f32; 4]> {
-            ["crew-chip-16", "crew-chip-17", "crew-chip-19"]
+    fn the_crew_roster_is_one_column_capped_at_five_rows_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crew_runtime(width);
+            assert!(rt.presented("crew-roster-rows").is_none());
+            assert!(rt.presented("crew-chip-16").is_none());
+            // The header is a 28 px row; clicking it opens the roster.
+            let header = rt.presented("crew-roster-toggle").unwrap().0;
+            assert!((header[3] - 28.0).abs() < 0.5, "{width}: {header:?}");
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
+            let rows = rt.presented("crew-roster-rows").unwrap().0;
+            assert!(rows[3] <= 150.5, "{width}: {rows:?}");
+            let chips: Vec<[f32; 4]> = ["crew-chip-16", "crew-chip-17", "crew-chip-19"]
                 .iter()
                 .map(|key| rt.presented(key).unwrap().0)
-                .collect()
-        };
-        let rt = crew_runtime(1280.0);
-        let wide = chips(&rt);
-        // Three chips fill two rows of two columns, so two of them share a row.
-        let mut rows: Vec<f32> = wide.iter().map(|c| c[1]).collect();
-        rows.sort_by(f32::total_cmp);
-        rows.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-        assert_eq!(rows.len(), 2, "two rows: {wide:?}");
-        let mut columns: Vec<f32> = wide.iter().map(|c| c[0]).collect();
-        columns.sort_by(f32::total_cmp);
-        columns.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-        assert_eq!(columns.len(), 2, "two columns: {wide:?}");
-        for chip in &wide {
+                .collect();
+            // One column of 30 px rows, 2 px apart.
+            let mut ys: Vec<f32> = chips.iter().map(|c| c[1]).collect();
+            ys.sort_by(f32::total_cmp);
             assert!(
-                (chip[2] - wide[0][2]).abs() < 1.0,
-                "equal columns: {wide:?}"
+                (ys[1] - ys[0] - 32.0).abs() < 1.0 && (ys[2] - ys[1] - 32.0).abs() < 1.0,
+                "{width}: one column: {chips:?}"
             );
-        }
-        assert!(
-            (columns[1] - columns[0] - wide[0][2] - 8.0).abs() < 1.0,
-            "8 px between columns"
-        );
-        assert!(
-            (rows[1] - rows[0] - 30.0 - 6.0).abs() < 1.0,
-            "6 px between rows"
-        );
-        // The timer keeps its width beside the longest title.
-        for chip in ["16", "17", "19"] {
-            let clock = rt.presented(&format!("crew-chip-clock-{chip}")).unwrap().0;
-            assert!(clock[2] >= 20.0, "timer {chip}: {clock:?}");
-        }
-        let rt = crew_runtime(560.0);
-        let narrow = chips(&rt);
-        for pair in narrow.windows(2) {
-            assert!(
-                (pair[0][0] - pair[1][0]).abs() < 1.0 && (pair[0][1] - pair[1][1]).abs() > 20.0,
-                "narrow lanes stack in one column: {narrow:?}"
+            for chip in &chips {
+                assert!((chip[2] - chips[0][2]).abs() < 1.0, "{width}: {chips:?}");
+                assert!((chip[3] - 30.0).abs() < 0.5, "{width}: {chip:?}");
+            }
+            for chip in ["16", "17", "19"] {
+                let clock = rt.presented(&format!("crew-chip-clock-{chip}")).unwrap().0;
+                assert!(clock[2] >= 20.0, "timer {chip}: {clock:?}");
+            }
+            // Full-access footer: New crew thread and Recruit.
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "crew-roster-footer",
+                    "crew-roster-new",
+                    "crew-roster-recruit",
+                ],
             );
-            assert!(
-                (pair[0][2] - pair[1][2]).abs() < 1.0,
-                "stacked chips share a width"
-            );
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
+            assert!(rt.presented("crew-roster-rows").is_none());
+            assert!(rt.presented("crew-chip-16").is_none());
         }
     }
 

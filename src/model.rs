@@ -4854,6 +4854,8 @@ pub struct State {
     pub fleet: crate::fleet_update::Fleet,
     /// The sidebar's "N need you" popover is open.
     pub attention_menu: bool,
+    /// The sibling-jump menu on a worker's parent or crew bar.
+    pub crew_siblings_menu: bool,
     /// Where a right-click opened the row menu, in window points.
     pub row_menu_at: Option<(f32, f32)>,
     pub hovered_row: Option<RowTarget>,
@@ -4872,6 +4874,12 @@ pub struct State {
     /// Whether the Snoozed and Settled shelves are open.
     pub shelves: [bool; 2],
     pub settled_visible: usize,
+    /// Captains whose Crew Roster is expanded, by `(server, captain)`. Absent means
+    /// collapsed, the default; a member that starts needing the user opens it once.
+    pub crew_roster_open: std::collections::HashSet<(String, usize)>,
+    /// Crew members already counted toward "needs you", so the roster opens only on the
+    /// arrival of a new one, not on every poll.
+    pub(crate) crew_roster_needing: std::collections::HashSet<(String, usize, usize)>,
     pub undo: Option<UndoNotice>,
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
@@ -5962,6 +5970,7 @@ impl State {
             thread_defaults: Default::default(),
             fleet: Default::default(),
             attention_menu: false,
+            crew_siblings_menu: false,
             row_menu_at: None,
             hovered_row: None,
             rename_thread: None,
@@ -5978,6 +5987,8 @@ impl State {
             selection_anchor: None,
             shelves: [false; 2],
             settled_visible: 10,
+            crew_roster_open: Default::default(),
+            crew_roster_needing: Default::default(),
             undo: None,
             toasts: Vec::new(),
             next_toast_id: 1,
@@ -7390,26 +7401,21 @@ impl State {
                 .visible_matches
                 .contains_key(&(self.machines.selected.clone(), thread.id))
     }
-    /// Whether a captain shows its whole crew: while it or one of its workers is open, while
-    /// searching, and in the archive.
-    pub fn captain_expanded(&self, home: usize) -> bool {
-        home == self.selected_row() || !self.search.text.is_empty() || self.show_archive
-    }
-    /// Workers stay inside their captain. Alerts never expand a collapsed crew.
-    pub fn visible_captain_workers(&self, home: usize) -> Vec<usize> {
-        if !self.captain_expanded(home) {
+    /// Crew workers that match the current search or archive filter. They list as flat
+    /// ordinary rows under their own match, not nested under the captain. With no query and
+    /// the archive closed, workers never enter the thread list.
+    pub fn searched_workers(&self) -> Vec<usize> {
+        if self.search.text.is_empty() && !self.show_archive {
             return vec![];
         }
-        let Some(parent) = self.threads.iter().find(|thread| thread.id == home) else {
-            return vec![];
-        };
         self.threads
             .iter()
             .enumerate()
             .filter(|(_, child)| {
-                self.captain_worker(child, home)
+                child.crew_captain.is_some()
                     && child.archived() == self.show_archive
-                    && (self.thread_search_matches(parent) || self.thread_search_matches(child))
+                    && self.in_scope(child)
+                    && self.thread_search_matches(child)
             })
             .map(|(index, _)| index)
             .collect()
@@ -7423,13 +7429,56 @@ impl State {
             })
             .count()
     }
+    /// Whether the Crew Roster above a captain's composer is expanded. The set is keyed by
+    /// `(server, captain)`, so the state follows the captain across machines and home resets.
+    pub fn crew_roster_open(&self, captain: usize) -> bool {
+        self.crew_roster_open
+            .contains(&(self.machines.selected.clone(), captain))
+    }
+    pub fn toggle_crew_roster(&mut self, captain: usize) {
+        let key = (self.machines.selected.clone(), captain);
+        if !self.crew_roster_open.remove(&key) {
+            self.crew_roster_open.insert(key);
+        }
+        self.checkpoint();
+    }
+    /// A member that starts needing the user opens the roster once. Members that stop being
+    /// seen (release, archive, machine switch) drop out of the tracking set so a later
+    /// return counts as new. Runs over every local captain home each poll.
+    pub fn refresh_crew_roster_attention(&mut self) {
+        let server = self.machines.selected.clone();
+        let homes: Vec<(usize, usize)> = self
+            .threads
+            .iter()
+            .filter(|t| self.is_captain_home(t))
+            .filter_map(|t| t.captain.map(|c| (t.id, c)))
+            .filter(|(id, c)| self.captain_home(*c) == Some(*id))
+            .collect();
+        let items = self.attention();
+        let mut needing: std::collections::HashSet<(String, usize, usize)> =
+            std::collections::HashSet::new();
+        for (home, captain) in &homes {
+            for item in &items {
+                if crate::ui::crew_ui::needs_you_item(self, *home, item) {
+                    needing.insert((server.clone(), *captain, item.thread_id));
+                }
+            }
+        }
+        let seen = &self.crew_roster_needing;
+        let arrivals: Vec<usize> = needing
+            .iter()
+            .filter(|item| !seen.contains(*item))
+            .map(|(_, captain, _)| *captain)
+            .collect();
+        self.crew_roster_needing = needing;
+        for captain in arrivals {
+            self.crew_roster_open.insert((server.clone(), captain));
+        }
+    }
     /// Keyboard traversal follows the rows that the sidebar actually displays.
     pub fn sidebar_navigation(&self) -> Vec<usize> {
-        let mut rows = vec![];
-        for index in self.sidebar_captains() {
-            rows.push(index);
-            rows.extend(self.visible_captain_workers(self.threads[index].id));
-        }
+        let mut rows: Vec<usize> = self.sidebar_captains();
+        rows.extend(self.searched_workers());
         rows.extend(self.visible_sidebar_threads());
         rows
     }
@@ -16266,6 +16315,7 @@ impl State {
             "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "rightPanelWidth":self.right_panel_width,
+            "crewRosterOpen": self.crew_roster_open.iter().collect::<Vec<_>>(),
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
             "scopeAdditional":self.scope_additional,
@@ -16381,6 +16431,22 @@ impl State {
             .unwrap_or(crate::right_panel::DEFAULT_WIDTH);
         self.diff_hide_tests = ui["diffHideTests"].as_bool().unwrap_or(false);
         self.diff_tree_open = ui["diffTreeOpen"].as_bool().unwrap_or(false);
+        self.crew_roster_open = ui["crewRosterOpen"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        entry.as_array().and_then(|pair| {
+                            Some((
+                                pair.first()?.as_str()?.to_owned(),
+                                usize::try_from(pair.get(1)?.as_u64()?).ok()?,
+                            ))
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.diff_tree_width = ui
             .get("diffTreeWidth")
             .and_then(|v| v.as_f64())
@@ -17138,6 +17204,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | html_changed
         | attachment_changed
         | keybindings_changed;
+    // A crew member that starts needing the user opens its captain's roster once.
+    let roster_before = state.crew_roster_open.len();
+    state.refresh_crew_roster_attention();
+    let browsing = browsing | (state.crew_roster_open.len() != roster_before);
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -18018,7 +18088,7 @@ mod tests {
         });
         state.search.replace_text("unique worker");
         assert_eq!(state.sidebar_captains(), vec![6]);
-        assert_eq!(state.visible_captain_workers(7), vec![0]);
+        assert_eq!(state.searched_workers(), vec![0]);
         assert_eq!(state.sidebar_navigation(), vec![6, 0]);
         state.search.replace_text("Juniper");
         assert!(
@@ -18052,25 +18122,25 @@ mod tests {
         let solo = state.threads.iter().position(|t| t.id == 6).unwrap();
         state.threads[solo].project = Some(1);
         state.open_kept_tab(solo);
-        assert!(!state.captain_expanded(7));
-        assert!(state.visible_captain_workers(7).is_empty());
+        assert!(state.searched_workers().is_empty());
         assert_eq!(state.captain_worker_count(7), 2);
         state.threads[1].life.last_visited_at = state.threads[1].life.last_completed_at;
-        assert!(state.visible_captain_workers(7).is_empty());
+        assert!(state.searched_workers().is_empty());
         state.threads[0].request = Some(serde_json::json!({"method": "confirm"}));
-        assert!(state.visible_captain_workers(7).is_empty());
+        assert!(state.searched_workers().is_empty());
         assert!(state.row_pending(&state.threads[6]));
         assert_eq!(state.sidebar_navigation()[0], 6);
         assert!(!state.sidebar_navigation().contains(&0));
         state.threads[0].request = None;
         state.threads[0].status = Status::Failed;
-        assert!(state.visible_captain_workers(7).is_empty());
+        assert!(state.searched_workers().is_empty());
         state.threads[0].status = Status::Ready;
         state.threads[0].request = Some(serde_json::json!({"method": "input"}));
-        assert!(state.visible_captain_workers(7).is_empty());
+        assert!(state.searched_workers().is_empty());
         state.open_kept_tab(6);
-        assert!(state.captain_expanded(7));
-        assert_eq!(state.visible_captain_workers(7), vec![0, 1]);
+        // Opening the captain changes nothing in the list: workers stay out of it.
+        assert!(state.searched_workers().is_empty());
+        assert!(!state.sidebar_navigation().contains(&0));
     }
 
     #[test]
@@ -18084,8 +18154,10 @@ mod tests {
         state.settle_thread(1);
         assert!(state.threads[0].life.settled());
         assert_eq!(state.threads[0].parent, Some(7));
-        assert!(state.visible_captain_workers(7).contains(&0));
+        // A settled worker stays in the crew but out of the sidebar's shelves.
+        assert_eq!(state.threads[0].crew_captain, Some(0));
         assert!(!state.sidebar_threads().contains(&0));
+        assert!(!state.visible_sidebar_threads().contains(&0));
         state.undo_thread_action();
         assert!(!state.threads[0].life.settled());
         state.settle_thread(6);
@@ -18111,7 +18183,7 @@ mod tests {
         state.search.replace_text("duplicate listener");
         state.show_archive = true;
         assert_eq!(state.sidebar_captains(), vec![6]);
-        assert_eq!(state.visible_captain_workers(7), vec![0]);
+        assert_eq!(state.searched_workers(), vec![0]);
         assert!(!state.threads[6].archived());
         assert!(state.visible_sidebar_threads().is_empty());
         state.search.replace_text("not present");
