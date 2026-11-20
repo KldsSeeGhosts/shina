@@ -4844,7 +4844,6 @@ pub struct State {
     pub dark: bool,
     /// Whole-window zoom, changed with Ctrl+= / Ctrl+- and reset with Ctrl+0.
     pub zoom: f32,
-    pub show_activity: bool,
     /// The open thread's "More actions" menu in the chat header.
     pub thread_menu: bool,
     pub row_menu: Option<RowTarget>,
@@ -4952,7 +4951,6 @@ pub struct State {
     pub picker_highlight: usize,
     /// The Add workspace palette is browsing folders; the query holds the path.
     pub picker_browsing: bool,
-    pub activity_full: bool,
     pub show_archive: bool,
     pub sidebar: bool,
     /// Whether the sidebar is shown while the window is too narrow for it to stay docked.
@@ -5969,7 +5967,6 @@ impl State {
             next_id: 2,
             dark: false,
             zoom: 1.0,
-            show_activity: false,
             thread_menu: false,
             row_menu: None,
             tab_menu: None,
@@ -6051,7 +6048,6 @@ impl State {
             picker_query: TextEdit::default(),
             picker_highlight: 0,
             picker_browsing: false,
-            activity_full: false,
             show_archive: false,
             sidebar: true,
             compact_sidebar: false,
@@ -6227,23 +6223,27 @@ impl State {
         self.right_panels.get(&self.panel_key())
     }
     /// `rightPanel.toggle`: hide an open panel, show it when it has surfaces, and open the
-    /// Diff surface on a thread that has none yet (KSG's `toggleRightPanel`).
+    /// Inspector on its last tab (or Overview on a fresh panel), as KSG's
+    /// `toggleRightPanel`.
     pub fn right_panel_toggle(&mut self) {
         let key = self.panel_key();
         if self.right_panels.get(&key).open || self.right_panels.get(&key).viewer.is_some() {
             self.right_panels.toggle_visibility(&key);
         } else {
-            self.right_panels
-                .open(&key, crate::right_panel::SingletonKind::Diff);
+            self.right_panels.show(&key);
         }
-        self.close_side_region();
     }
     /// `diff.toggle`: KSG's `onToggleDiff`, the Diff surface's toggle.
     pub fn right_panel_toggle_diff(&mut self) {
         let key = self.panel_key();
         self.right_panels
             .toggle(&key, crate::right_panel::SingletonKind::Diff);
-        self.close_side_region();
+    }
+    /// `threadPanel.toggle`: the Inspector's Overview tab, toggled as a surface.
+    pub fn right_panel_toggle_overview(&mut self) {
+        let key = self.panel_key();
+        self.right_panels
+            .toggle(&key, crate::right_panel::SingletonKind::Overview);
     }
     /// `rightPanel.toggleMaximized`: KSG gates it on the panel being open.
     pub fn right_panel_toggle_maximized(&mut self) {
@@ -6267,24 +6267,6 @@ impl State {
             return true;
         }
         false
-    }
-    /// The panel and the Brief or Session drawer share one right-side region: an
-    /// opening panel hides the drawer.
-    pub(crate) fn close_side_region(&mut self) {
-        if self.right_panels.get(&self.panel_key()).open {
-            self.show_activity = false;
-            self.activity_full = false;
-            self.brief.confirm_reset = false;
-            self.brief.record = None;
-        }
-    }
-    /// The drawer equivalent of [`State::close_side_region`]: an opening Brief or
-    /// Session drawer hides the current thread's panel.
-    pub(crate) fn close_right_panel_for_drawer(&mut self) {
-        let key = self.panel_key();
-        if self.right_panels.get(&key).open {
-            self.right_panels.close(&key);
-        }
     }
     pub fn expire_undo(&mut self) -> bool {
         let at = lifecycle::now();
@@ -6460,7 +6442,9 @@ impl State {
             self.threads[previous].cancel_questionnaire_advance();
         }
         self.active = index;
-        self.close_side_region();
+        // A retired record's sheet belongs to the thread it was opened from.
+        self.brief.record = None;
+        self.brief.confirm_reset = false;
         self.plan_menu = None;
         self.env_mode_picker = false;
         self.base_branch_picker = false;
@@ -25887,30 +25871,30 @@ mod tests {
     }
 
     // `rightPanel.toggle`: an empty thread opens the Diff segment; an open one hides and
-    // re-shows keeping its segment (KSG `toggleRightPanel`).
+    // re-shows keeping its tab (KSG `toggleRightPanel`).
     #[test]
-    fn right_panel_toggle_opens_diff_then_hides_and_reshows() {
+    fn right_panel_toggle_opens_overview_then_hides_and_reshows() {
         let mut state = State::new(".".into(), false);
 
-        // Empty thread: opens the Diff segment.
+        // Empty thread: opens the Inspector on its default tab.
         state.right_panel_toggle();
         let panel = state.right_panel();
         assert!(panel.open);
-        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
+        assert_eq!(panel.view, crate::right_panel::PanelView::Overview);
 
-        // Open panel on Diff: hides, keeping the segment selection.
+        // Open panel: hides, keeping the tab selection.
         state.right_panel_toggle();
         let hidden = state.right_panel();
         assert!(!hidden.open);
-        assert_eq!(hidden.view, crate::right_panel::PanelView::Diff);
+        assert_eq!(hidden.view, crate::right_panel::PanelView::Overview);
 
-        // Hidden: re-shows on the same segment.
+        // Hidden: re-shows on the same tab.
         state.right_panel_toggle();
         let shown = state.right_panel();
         assert!(shown.open);
-        assert_eq!(shown.view, crate::right_panel::PanelView::Diff);
+        assert_eq!(shown.view, crate::right_panel::PanelView::Overview);
 
-        // Open on the viewer: hides too.
+        // Open on a document: hides too.
         let key = state.panel_key();
         state
             .right_panels
@@ -25918,10 +25902,10 @@ mod tests {
         state.right_panel_toggle();
         let hidden = state.right_panel();
         assert!(!hidden.open);
-        assert_eq!(hidden.view, crate::right_panel::PanelView::Viewer);
+        assert_eq!(hidden.view, crate::right_panel::PanelView::Context);
     }
 
-    // `diff.toggle` on the viewer segment shows Diff without hiding; on Diff it hides.
+    // `diff.toggle` on the Context tab shows Diff without hiding; on Diff it hides.
     #[test]
     fn right_panel_toggle_diff_switches_or_hides() {
         let mut state = State::new(".".into(), false);
@@ -25982,14 +25966,15 @@ mod tests {
         let panel = state.right_panel();
         assert!(panel.open);
         assert!(panel.viewer.is_none());
-        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
+        assert_eq!(panel.view, crate::right_panel::PanelView::Context);
 
         // With no viewer left the same shortcut closes the panel.
         assert!(state.right_panel_close_active());
-        assert_eq!(
-            state.right_panel(),
-            crate::right_panel::ThreadPanel::default()
-        );
+        // The panel keeps its last tab so a re-open lands on Context, not back
+        // on the default.
+        let panel = state.right_panel();
+        assert!(!panel.open);
+        assert_eq!(panel.view, crate::right_panel::PanelView::Context);
         assert!(!state.right_panel_close_active());
     }
 
@@ -26018,12 +26003,12 @@ mod tests {
             .right_panels
             .open_captain_document(&key, 0, "NOTES.md");
 
-        // Back on the first thread its Diff view is still open and maximized.
+        // Back on the first thread its panel is still open and maximized.
         state.open_kept_tab(0);
         let panel = state.right_panel();
         assert!(panel.open);
         assert!(panel.maximized);
-        assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
+        assert_eq!(panel.view, crate::right_panel::PanelView::Overview);
 
         // Deleting a thread forgets its panel state.
         let mut ids = std::collections::HashSet::new();

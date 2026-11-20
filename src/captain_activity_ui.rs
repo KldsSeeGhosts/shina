@@ -228,8 +228,14 @@ fn open_activity_source(s: &mut State, tx: &mut Tx, server: String, captain: usi
     if !source_known(s, &server, thread) {
         return;
     }
-    if s.brief.record.is_some() || s.viewport_width < SHEET_BELOW {
-        close_brief(s);
+    close_brief(s);
+    // The card opens on the primary home's chat; a covering Inspector would hide it.
+    if s.brief.record.is_some()
+        || crate::right_panel::covers(s.viewport_width - 16.0)
+        || s.right_panel().maximized
+    {
+        let key = s.panel_key();
+        s.right_panels.close(&key);
     }
     let kind = entry["kind"].as_str().unwrap_or("");
     if kind == "crew_question" {
@@ -885,7 +891,10 @@ mod tests {
         asking.title = "Deploy worker".into();
         asking.request = Some(json!({"method":"confirm","title":"Allow deploy?","message":""}));
         rt.state.threads.push(asking);
-        rt.state.show_activity = true;
+        let key = rt.state.panel_key();
+        rt.state
+            .right_panels
+            .open(&key, crate::right_panel::SingletonKind::Overview);
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
@@ -902,6 +911,15 @@ mod tests {
         rt.pointer_down(rect[0] + 8.0, rect[1] + 4.0);
         rt.pointer_up(rect[0] + 8.0, rect[1] + 4.0);
         rt.frame(0.0);
+    }
+
+    /// Open the Inspector on `kind`, as pressing its strip segment does.
+    fn open_tab(rt: &mut rune::Runtime<State>, kind: crate::right_panel::SingletonKind) {
+        let key = rt.state.panel_key();
+        rt.state.right_panels.open(&key, kind);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.5);
     }
 
     /// Every label the panel presented, for wording assertions.
@@ -952,7 +970,8 @@ mod tests {
             for text in presented_labels(&rt) {
                 assert!(!text.contains(" · "), "{width}: {text}");
             }
-            rt.state.show_activity = false;
+            let key = rt.state.panel_key();
+            rt.state.right_panels.close(&key);
         }
     }
 
@@ -991,7 +1010,8 @@ mod tests {
                 })
                 .count();
             assert_eq!(three, 3, "{width}");
-            rt.state.show_activity = false;
+            let key = rt.state.panel_key();
+            rt.state.right_panels.close(&key);
         }
     }
 
@@ -1216,7 +1236,7 @@ mod tests {
         rt.frame(1.0);
         // The sheet closes, the primary home is selected and the card's answer
         // field takes focus — an answer typed on the worker is not a record.
-        assert!(!rt.state.show_activity);
+        assert!(!rt.state.right_panel().open);
         assert_eq!(rt.state.current().id, home);
         let focused = rt.elements().into_iter().find(|e| e.focused);
         assert_eq!(
@@ -1267,6 +1287,7 @@ mod tests {
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
         press_in_brief(&mut rt, "captain-report-policy-context");
         let command = commands.try_recv().expect("the CAS command was sent");
         assert_eq!(command.method, "captain.reportPolicy");
@@ -1326,6 +1347,7 @@ mod tests {
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(1.0);
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
             press_in_brief(&mut rt, "captain-recovery-change");
             let command = commands.try_recv().expect("recovery command");
             assert_eq!(command.method, "captain.recoveryMode");
@@ -1379,9 +1401,7 @@ mod tests {
         rt.state.machines.selected = "studio".into();
         // The link reports disconnected only off the demo path.
         rt.state.demo = false;
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
         let reason =
             element_text(&rt, "captain-report-policy-reason").expect("the reason note draws");
         assert!(reason.ends_with("is unreachable."), "{reason}");
@@ -1441,6 +1461,7 @@ mod tests {
         // The headless State has no client, so the send refuses; the reason
         // lands on the block's error row, never a toast.
         rt.state.client = None;
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
         press_in_brief(&mut rt, "captain-report-policy-context");
         assert!(rt.presented("captain-report-policy-error").is_some());
         assert_eq!(rt.state.captain_report_policy(0), ReportPolicy::React);
@@ -1463,9 +1484,7 @@ mod tests {
             .views
             .insert("studio".into(), projection.into());
         rt.state.machines.selected = "studio".into();
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
         assert!(rt.presented("captain-report-policy").is_none());
         let reason =
             element_text(&rt, "captain-report-policy-reason").expect("the reason note draws");

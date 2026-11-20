@@ -1,6 +1,6 @@
-//! A captain's Brief panel (scope, memory, routines, earlier conversations and reset), the
-//! "You" profile editor, the background rows in the settings menu, and the quiet away line in
-//! a captain's header.
+//! A captain's Brief content (scope, memory, routines, earlier conversations and reset),
+//! shown in the Inspector's Overview and Context tabs, the "You" profile editor, the
+//! background rows in the settings menu, and the quiet away line in a captain's header.
 //!
 //! The Brief is ported from KSG Code's `chat/ThreadDetailsPanel.tsx` and
 //! `chat/ThreadDetailsSection.tsx`: sections with a small muted heading and a hairline between
@@ -13,10 +13,10 @@ use crate::power::KeepAwake;
 use crate::routines::{RoutineView, Schedule};
 use rune::Transition;
 
-/// The Brief's width beside the chat, as KSG's right panel.
-pub(super) const PANEL_WIDTH: f32 = 320.0;
 /// Below this window width (ui.rs's `narrow`) the Brief is a sheet over the chat.
 pub(super) const SHEET_BELOW: f32 = 1050.0;
+/// The width rows and chips assume for the Inspector's panels.
+pub(super) const PANEL_WIDTH: f32 = 420.0;
 /// Rows, chips and inputs share this corner.
 /// Rows, buttons and chips.
 const ROW_RADIUS: f32 = 4.0;
@@ -78,8 +78,6 @@ pub(super) fn is_earlier(s: &State) -> bool {
 }
 
 pub(super) fn close_brief(s: &mut State) {
-    s.show_activity = false;
-    s.activity_full = false;
     s.brief.confirm_reset = false;
     s.brief.record = None;
 }
@@ -202,35 +200,6 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
     // workspace or routine controls and no private document edits.
     let record = s.brief.record.is_some();
     let profile = &s.captains[captain];
-    let header = row()
-        .key("captain-brief-header")
-        .h(36.0)
-        .px(8.0)
-        .center_y()
-        .gap(4.0)
-        .child(
-            row()
-                .center_y()
-                .gap(6.0)
-                .px(8.0)
-                .h(25.0)
-                .radius(6.0)
-                .fill(p.selected)
-                .child(icon("list", p.muted))
-                .child(label(
-                    if record { "Captain record" } else { "Brief" },
-                    SMALL,
-                    p.ink,
-                )),
-        )
-        .child(spacer())
-        .child(icon_button(
-            "close-brief",
-            "Hide the captain's brief",
-            "panel",
-            p,
-            close_brief,
-        ));
     let mut role = profile.role.trim().to_string();
     if role.is_empty() {
         role = "Captain".into();
@@ -316,15 +285,9 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
     let sections = [
         knowable.then(|| digest_section(s, p, captain)),
         (knowable && !record).then(|| crew_section(s, p, captain)),
-        knowable.then(|| documents_section(s, p, captain)),
-        (!record).then(|| {
-            scope_section(s, p, captain).disabled(access != crate::model::CaptainAccess::Full)
-        }),
-        Some(memory_section(s, p, captain)),
         (!record).then(|| {
             routines_section(s, p, captain).disabled(access != crate::model::CaptainAccess::Full)
         }),
-        Some(earlier_section(s, p, captain)),
         super::captain_lifecycle_ui::section_visible(s, captain)
             .then(|| super::captain_lifecycle_ui::section(s, p, captain)),
     ];
@@ -339,9 +302,7 @@ pub(super) fn brief_panel(s: &State, p: Palette) -> El {
         .label(format!("{}'s brief", profile.name))
         .min_h(0.0)
         .h_full()
-        .child(header)
-        // The same closing rule as the chat header, so one line runs across the pane.
-        .child(rule(p).key("brief-header-rule"))
+        .w_full()
         .children(brief_notice(s, p, captain, access))
         .child(
             col()
@@ -434,39 +395,11 @@ fn brief_notice(
         .collect()
 }
 
-/// The Brief beside the chat on a wide pane. A retired record always draws as a sheet over
-/// the chat instead: there is no home conversation for it to sit beside.
-pub(super) fn brief_side(s: &State, p: Palette) -> El {
-    if s.brief.record.is_some() {
-        let width = (s.viewport_width - 48.0).clamp(280.0, 360.0);
-        return row()
-            .key("brief-sheet")
-            .instant_changes()
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .justify_end()
-            .px(8.0)
-            .pb(8.0)
-            .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
-            .modal(false, close_brief)
-            .on_press(close_brief)
-            .focusable(false)
-            .child(
-                brief_panel(s, p)
-                    .w(width)
-                    .fill(p.panel)
-                    .radius(12.0)
-                    .border(1.0, p.frame)
-                    .box_shadow(soft_shadow(p))
-                    .on_press(|_: &mut State| {})
-                    .transition(Transition::offset(16.0, 0.0).combined(Transition::opacity())),
-            );
-    }
-    brief_panel(s, p).w(PANEL_WIDTH).min_w(PANEL_WIDTH)
-}
-
-/// On a narrow pane the Brief slides over the chat as a sheet, as KSG's `ui/sheet.tsx` on the
+/// A retired record's Brief opens as a sheet over the chat, as KSG's `ui/sheet.tsx` on the
 /// right: a dimmed backdrop that closes it, and the panel inset 8 px with a 12 px radius.
-/// `top` keeps the title strip and its window buttons clear.
+/// A record has no home thread, so it has no Inspector to sit in; this is the only place
+/// `brief_panel` draws outside the Inspector. `top` keeps the title strip and its window
+/// buttons clear.
 pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
     let width = (s.viewport_width - 48.0).clamp(280.0, 360.0);
     row()
@@ -494,7 +427,7 @@ pub(super) fn brief_sheet(s: &State, p: Palette, top: f32) -> El {
 }
 
 /// Workspace chips, added and removed through the workspace picker.
-fn scope_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn scope_section(s: &State, p: Palette, captain: usize) -> El {
     let scope = s.captain_scope(captain);
     let remote_scope = s.remote_captain_scope(captain);
     let add = icon_action(
@@ -623,7 +556,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
 /// as the age of the activity above it. The preview bounds itself to six
 /// lines when activity sits above it, twelve when it stands alone. The
 /// document is only read on demand and the section never writes it.
-fn digest_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn digest_section(s: &State, p: Palette, captain: usize) -> El {
     let meta = s
         .captain_document_meta(captain)
         .into_iter()
@@ -715,17 +648,12 @@ fn open_captain_document(s: &mut State, captain: usize, name: &str) {
         }
     };
     s.open_captain_document(&key, captain, name);
-    // Below the sheet fold the Brief and the panel cannot share the window, so the
-    // document takes the region; on wide windows the Brief stays open as its index.
-    if s.viewport_width < SHEET_BELOW && s.doc_discard.is_none() {
-        close_brief(s);
-    }
 }
 
 /// Planning documents, in the row style of Shina's `earlier_section` entries: a pressable
 /// row per file that opens its right-panel tab. Row order and contents follow the section
 /// structure of KSG's `ThreadDetailsSection`.
-fn documents_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn documents_section(s: &State, p: Palette, captain: usize) -> El {
     let mut rows = col().gap(2.0);
     for name in ["NOTES.md", "AGENTS.md", "CREW.md"] {
         let meta = s
@@ -836,7 +764,7 @@ fn documents_section(s: &State, p: Palette, captain: usize) -> El {
 /// The canonical crew, reduced to a count and a pointer: the Crew Roster above the captain's
 /// composer holds the member rows, the More menus and the recruit/new-thread controls. The
 /// Brief keeps the policy and recovery blocks. Crew membership has no KSG equivalent.
-fn crew_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
     let access = s.captain_access(captain);
     if access == crate::model::CaptainAccess::NoRecords {
         return section("brief-crew", "Crew", None, vec![], p)
@@ -963,15 +891,12 @@ fn crew_section(s: &State, p: Palette, captain: usize) -> El {
             .press(active_wash(s, p))
             .hover_motion(motion(), motion())
             .on_press(move |s: &mut State| {
-                if s.viewport_width < SHEET_BELOW {
-                    close_brief(s);
-                }
                 if s.captain_home(captain) != Some(s.current().id) {
                     s.open_captain(captain);
                 }
-                if !s.crew_roster_open(captain) {
-                    s.toggle_crew_roster(captain);
-                }
+                let key = s.panel_key();
+                s.right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Crew);
             })
             .child(label("Manage in the crew roster", META_LABEL, p.sea))
     });
@@ -1327,7 +1252,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView) -> El 
     )
 }
 
-fn memory_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn memory_section(s: &State, p: Palette, captain: usize) -> El {
     let memories = s.memories(captain);
     let record =
         s.brief.record.is_some() || s.captain_access(captain) != crate::model::CaptainAccess::Full;
@@ -1555,7 +1480,7 @@ fn routine_row(s: &State, p: Palette, routine: &RoutineView, now: i64) -> El {
         )
 }
 
-fn routines_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn routines_section(s: &State, p: Palette, captain: usize) -> El {
     let routines = s.routines(captain);
     let mut section = section(
         "brief-routines",
@@ -1577,7 +1502,7 @@ fn routines_section(s: &State, p: Palette, captain: usize) -> El {
     section
 }
 
-fn earlier_section(s: &State, p: Palette, captain: usize) -> El {
+pub(super) fn earlier_section(s: &State, p: Palette, captain: usize) -> El {
     let earlier = s.earlier_conversations(captain);
     let mut section = section(
         "brief-earlier",
@@ -1619,10 +1544,6 @@ fn earlier_section(s: &State, p: Palette, captain: usize) -> El {
             .on_press(move |s: &mut State| {
                 if let Some(index) = s.threads.iter().position(|t| t.id == id) {
                     s.show_thread(index);
-                }
-                // A sheet covers the conversation it just opened; step out of the way.
-                if s.viewport_width < SHEET_BELOW {
-                    close_brief(s);
                 }
             })
             .child(icon("thread", p.muted))
@@ -1839,49 +1760,6 @@ pub(super) fn away_status(s: &State, p: Palette, available: Option<f32>) -> Opti
         line = line.child(super::meta_text(detail, ink).key("captain-away-count"));
     }
     Some(line)
-}
-
-/// The header control that opens the Brief, labelled because it names a captain feature.
-pub(super) fn brief_button(s: &State, p: Palette) -> El {
-    let on = s.show_activity;
-    let press = |s: &mut State| {
-        if s.show_activity {
-            close_brief(s);
-        } else {
-            s.show_activity = true;
-            s.activity_full = false;
-            s.close_right_panel_for_drawer();
-        }
-    };
-    if on {
-        // With the Brief open the panel names itself, so the control is the same icon-only
-        // active toggle as the other header buttons.
-        return toggle_button(
-            "open-brief",
-            "Hide the captain's brief",
-            "info",
-            true,
-            p,
-            press,
-        );
-    }
-    row()
-        .key("open-brief")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label("Show the captain's brief")
-        .focusable(true)
-        .h(24.0)
-        .px(8.0)
-        .gap(6.0)
-        .center_y()
-        .radius(6.0)
-        .hover(hover_wash(s, p))
-        .press(active_wash(s, p))
-        .hover_motion(motion(), motion())
-        .on_press(press)
-        .child(icon("info", p.muted))
-        .child(label("Brief", TextStyle::new(13.0, 500.0), p.muted))
 }
 
 /// Add or remove a workspace from the picker in its captain-scope mode.
@@ -2366,10 +2244,12 @@ mod tests {
         rt.frame(0.0);
         rt.frame(1.0);
     }
-    /// Scroll the Brief to its end, as a wheel over the panel does. Wheels until the
-    /// scroll-top identity stops moving, so taller bodies still reach the bottom.
-    fn scroll_brief(rt: &mut Runtime<State>) {
-        let (panel, _) = rt.presented("captain-brief").unwrap();
+    /// Scroll the Brief's body to its end, as a wheel over the panel does. Wheels
+    /// until the scroll-top identity stops moving, so taller bodies still reach
+    /// the bottom. `container` is the scroll region's key: "captain-brief" for
+    /// Overview, "context-tab" for Context.
+    fn scroll_panel_body(rt: &mut Runtime<State>, container: &str) {
+        let (panel, _) = rt.presented(container).unwrap();
         let mut prev = f32::INFINITY;
         for _ in 0..24 {
             rt.wheel(panel[0] + panel[2] / 2.0, panel[1] + 200.0, -2000.0);
@@ -2384,17 +2264,24 @@ mod tests {
             prev = y;
         }
     }
-    /// Scroll `key` until its whole box is in the Brief's viewport. A visible
+    fn scroll_brief(rt: &mut Runtime<State>) {
+        scroll_panel_body(rt, "captain-brief");
+    }
+    /// Scroll `key` until its whole box is in `container`'s viewport. A visible
     /// centre alone does not rule out clipping at the edge.
-    fn reveal_in_brief(rt: &mut Runtime<State>, key: &str) {
+    fn reveal_in(rt: &mut Runtime<State>, container: &str, key: &str) {
         for _ in 0..24 {
             if fully_visible(rt, key) {
                 return;
             }
-            rt.update(|_, tx| tx.scroll_into_view_in("captain-brief", key.to_string()));
+            rt.update(|_, tx| tx.scroll_into_view_in(container, key.to_string()));
             rt.frame(0.5);
         }
-        panic!("{key} never revealed inside the brief's scroll viewport");
+        panic!("{key} never revealed inside {container}'s scroll viewport");
+    }
+    /// The same, in the Brief's Overview body.
+    fn reveal_in_brief(rt: &mut Runtime<State>, key: &str) {
+        reveal_in(rt, "captain-brief", key);
     }
     /// Every corner of `key`'s drawn box is inside its ancestors' clips, so the
     /// element is fully on screen rather than cut by the scroll viewport.
@@ -2416,11 +2303,26 @@ mod tests {
         reveal_in_brief(rt, key);
         press(rt, key);
     }
+    /// The same in the Context tab: switches the Inspector to Context first.
+    fn press_in_context(rt: &mut Runtime<State>, key: &str) {
+        press(rt, "right-panel-segment-context");
+        reveal_in(rt, "context-tab", key);
+        press(rt, key);
+    }
     fn inside(outer: [f32; 4], inner: [f32; 4]) -> bool {
         inner[0] >= outer[0] - 0.5
             && inner[1] >= outer[1] - 0.5
             && inner[0] + inner[2] <= outer[0] + outer[2] + 0.5
             && inner[1] + inner[3] <= outer[1] + outer[3] + 0.5
+    }
+
+    /// Open the Inspector on `kind`, as pressing its strip segment does.
+    fn open_tab(rt: &mut Runtime<State>, kind: crate::right_panel::SingletonKind) {
+        let key = rt.state.panel_key();
+        rt.state.right_panels.open(&key, kind);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.5);
     }
 
     /// A store-backed captain home on a temp dir, so documents and crew really save.
@@ -2474,14 +2376,17 @@ mod tests {
                 chrono::Local::now(),
             )
             .unwrap();
+        let key = rt.state.panel_key();
+        rt.state
+            .right_panels
+            .open(&key, crate::right_panel::SingletonKind::Overview);
         rt.frame(0.0);
-        press(&mut rt, "open-brief");
         rt.frame(1.0);
         (rt, routine)
     }
 
     #[test]
-    fn brief_sections_fit_beside_or_over_the_chat_at_supported_widths() {
+    fn brief_sections_fit_inside_the_inspector_at_supported_widths() {
         for width in WIDTHS {
             let (mut rt, routine) = brief_runtime(width);
             let (panel, _) = rt.presented("captain-brief").expect("brief is shown");
@@ -2489,20 +2394,26 @@ mod tests {
                 panel[0] >= 0.0 && panel[0] + panel[2] <= width + 0.5,
                 "{width}: {panel:?}"
             );
-            // Narrow windows show it as a sheet over the chat; wide ones beside it.
-            assert_eq!(
-                rt.presented("brief-sheet").is_some(),
-                width < 1050.0,
-                "{width}"
-            );
-            assert!(rt.presented("session-panel").is_none());
+            // The Inspector docks where it fits and covers the chat where it does not.
+            assert_eq!(rt.presented("right-panel").is_some(), true, "{width}");
             assert!(rt.presented("composer").is_some(), "{width}");
-            // The header's close control is fixed above the scroll viewport: it
-            // shows, fully on screen, without scrolling.
-            let (close, _) = rt.presented("close-brief").expect("close-brief");
-            assert!(inside(panel, close), "{width}: {close:?} outside {panel:?}");
-            assert!(fully_visible(&rt, "close-brief"), "{width}");
-            // Sections below the header scroll into the viewport fully, not clipped.
+            let (inspector, _) = rt.presented("right-panel").expect("right panel");
+            // Sections below the strip scroll into the viewport fully, not clipped.
+            for key in ["brief-identity", "brief-digest", "brief-routines"] {
+                rt.update(|_, tx| tx.scroll_into_view(key.to_string()));
+                rt.frame(0.5);
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{key} at {width}"));
+                assert!(
+                    rect[0] >= inspector[0]
+                        && rect[0] + rect[2] <= inspector[0] + inspector[2] + 0.5,
+                    "{key} at {width}: {rect:?} outside {inspector:?}"
+                );
+            }
+            // Scope, memory and reset live in the Context tab.
+            press(&mut rt, "right-panel-segment-context");
+            rt.frame(0.5);
             for key in [
                 "brief-scope-1",
                 "brief-scope-remove-2",
@@ -2510,37 +2421,39 @@ mod tests {
                 "memory-budget",
                 "brief-memory-add",
             ] {
-                reveal_in_brief(&mut rt, key);
+                reveal_in(&mut rt, "context-tab", key);
                 let (rect, _) = rt
                     .presented(key)
                     .unwrap_or_else(|| panic!("{key} at {width}"));
                 assert!(
-                    inside(panel, rect),
-                    "{key} at {width}: {rect:?} outside {panel:?}"
+                    inside(inspector, rect),
+                    "{key} at {width}: {rect:?} outside {inspector:?}"
                 );
                 assert!(
                     fully_visible(&rt, key),
                     "{key} at {width}: {rect:?} clipped by the scroll viewport"
                 );
             }
-            // Rows lower in the scroll still lay out inside the panel's width. The
-            // delete overlay is transparent until hover, so it scrolls to without
-            // the clip check the visible rows take.
+            // Routine rows sit in the Overview tab.
+            press(&mut rt, "right-panel-segment-overview");
+            rt.frame(0.5);
             for key in [
                 format!("routine-pause-{routine}"),
                 format!("routine-delete-{routine}"),
                 "brief-reset".into(),
             ] {
-                rt.update(|_, tx| tx.scroll_into_view_in("captain-brief", key.clone()));
+                rt.update(|_, tx| tx.scroll_into_view(key.clone()));
                 rt.frame(1.0);
                 let (rect, _) = rt
                     .presented(&key)
                     .unwrap_or_else(|| panic!("{key} at {width}"));
                 assert!(
-                    rect[0] >= panel[0] && rect[0] + rect[2] <= panel[0] + panel[2] + 0.5,
+                    rect[0] >= inspector[0]
+                        && rect[0] + rect[2] <= inspector[0] + inspector[2] + 0.5,
                     "{key} at {width}"
                 );
             }
+            let _ = panel;
         }
     }
 
@@ -2548,7 +2461,9 @@ mod tests {
     fn memory_rows_pin_edit_and_delete_through_the_state_api() {
         for width in WIDTHS {
             let (mut rt, _) = brief_runtime(width);
-            scroll_brief(&mut rt);
+            press(&mut rt, "right-panel-segment-context");
+            rt.frame(0.5);
+            scroll_panel_body(&mut rt, "context-tab");
             let memories = rt.state.memories(0);
             let release = memories.iter().find(|m| !m.essential).unwrap().id.clone();
             press(&mut rt, &format!("memory-pin-{release}"));
@@ -2702,18 +2617,14 @@ mod tests {
     fn the_brief_header_has_the_same_rule_under_it_as_the_chat_header() {
         for width in [960.0, 1280.0, 1920.0] {
             let (rt, _) = brief_runtime(width);
-            let (rule, _) = rt.presented("brief-header-rule").unwrap();
-            let (panel, _) = rt.presented("captain-brief").unwrap();
+            // The Inspector's strip is a fixed 36 pt with its own rule under it.
+            let (strip, _) = rt.presented("right-panel-strip").unwrap();
+            let (rule, _) = rt.presented("right-panel-strip-rule").unwrap();
+            assert!((strip[3] - 36.0).abs() < 0.1, "{width}: {strip:?}");
             assert!((rule[3] - 1.0).abs() < 0.1, "{width}: {rule:?}");
             assert!(
-                (rule[2] - panel[2]).abs() < 1.0 && (rule[0] - panel[0]).abs() < 1.0,
-                "{width}: the rule {rule:?} spans the panel {panel:?}"
-            );
-            // It lines up with the chat header's rule, and the identity row sits below it.
-            let (chat, _) = rt.presented("chat-header-rule").unwrap();
-            assert!(
-                (rule[1] - chat[1]).abs() < 1.0,
-                "{width}: {rule:?} {chat:?}"
+                (rule[1] - (strip[1] + strip[3])).abs() < 1.0,
+                "{width}: {rule:?} {strip:?}"
             );
             let (flag, _) = rt.presented("brief-pennant").unwrap();
             assert!(flag[1] >= rule[1] + rule[3], "{width}: {flag:?} {rule:?}");
@@ -2730,7 +2641,7 @@ mod tests {
                 linked_at:0, last_reached_at:Some(0), last_error:None,
                 capabilities:json!({"projects":[{"id":9,"name":"Scratch","path":"C:\\scratch","machine":"local"}]}),
             });
-            press_in_brief(&mut rt, "brief-scope-add");
+            press_in_context(&mut rt, "brief-scope-add");
             let key = format!("choose-project-{server}-9");
             assert!(rt.presented(&key).is_some(), "{width}");
             press(&mut rt, &key);
@@ -2741,12 +2652,12 @@ mod tests {
                     project_id: 9,
                 }]
             );
-            reveal_in_brief(&mut rt, &format!("brief-scope-{server}-9"));
+            reveal_in(&mut rt, "context-tab", &format!("brief-scope-{server}-9"));
             assert!(
                 rt.presented(&format!("brief-scope-{server}-9")).is_some(),
                 "{width}"
             );
-            press_in_brief(&mut rt, &format!("brief-scope-remove-{server}-9"));
+            press_in_context(&mut rt, &format!("brief-scope-remove-{server}-9"));
             assert!(rt.state.remote_captain_scope(0).is_empty());
         }
     }
@@ -2755,9 +2666,9 @@ mod tests {
     fn scope_chips_remove_and_the_picker_adds_a_workspace() {
         for width in WIDTHS {
             let (mut rt, _) = brief_runtime(width);
-            press_in_brief(&mut rt, "brief-scope-remove-2");
+            press_in_context(&mut rt, "brief-scope-remove-2");
             assert_eq!(rt.state.captain_scope(0), vec![1], "{width}");
-            press_in_brief(&mut rt, "brief-scope-add");
+            press_in_context(&mut rt, "brief-scope-add");
             assert_eq!(rt.state.project_picker, Some(ProjectPicker::CaptainScope));
             assert!(rt.presented("choose-no-project").is_none());
             press(&mut rt, "choose-project-3");
@@ -2788,8 +2699,11 @@ mod tests {
             assert_eq!(rt.state.earlier_conversations(0), vec![old]);
             assert_eq!(rt.state.memories(0).len(), 2);
             assert_eq!(rt.state.captain_scope(0), vec![1, 2]);
-            scroll_brief(&mut rt);
             // The earlier conversation opens read-only, with a way back.
+            // The reset selects a fresh home, so open the Inspector on Context for it.
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
+            rt.frame(0.5);
+            reveal_in(&mut rt, "context-tab", &format!("earlier-{old}"));
             press(&mut rt, &format!("earlier-{old}"));
             assert_eq!(rt.state.current().id, old);
             rt.frame(3.0);
@@ -2818,8 +2732,11 @@ mod tests {
             let (header, _) = rt.presented("chat-header").unwrap();
             let (line, _) = rt.presented("captain-away-status").unwrap();
             assert!(inside(header, line), "{width}: {line:?} outside {header:?}");
-            let (brief, _) = rt.presented("open-brief").unwrap();
-            assert!(line[0] + line[2] <= brief[0], "{width}");
+            // The whole-panel toggle drops in compact headers; where it draws the
+            // status must still clear it.
+            if let Some((panel_toggle, _)) = rt.presented("header-right-panel") {
+                assert!(line[0] + line[2] <= panel_toggle[0], "{width}");
+            }
         }
     }
 
@@ -2910,43 +2827,66 @@ mod tests {
     fn digest_crew_and_document_rows_stay_inside_the_brief() {
         for width in WIDTHS {
             let (mut rt, _) = brief_runtime(width);
-            let (panel, _) = rt.presented("captain-brief").expect("brief is shown");
-            for key in [
-                "brief-digest",
-                "brief-digest-open",
-                "brief-crew",
-                "brief-crew-manage",
-                "brief-documents",
-                "brief-document-NOTES.md",
-                "brief-document-AGENTS.md",
-                "brief-document-CREW.md",
+            let (panel, _) = rt.presented("right-panel").expect("inspector is shown");
+            for (tab, keys) in [
+                (
+                    "right-panel-segment-overview",
+                    vec![
+                        "brief-digest",
+                        "brief-digest-open",
+                        "brief-crew",
+                        "brief-crew-manage",
+                    ],
+                ),
+                (
+                    "right-panel-segment-context",
+                    vec![
+                        "brief-documents",
+                        "brief-document-NOTES.md",
+                        "brief-document-AGENTS.md",
+                        "brief-document-CREW.md",
+                    ],
+                ),
             ] {
-                // Rows below the fold mount as the panel scrolls; every mounted row
-                // must sit fully inside the Brief.
-                let mut rect = None;
-                for _ in 0..12 {
-                    if let Some((found, _)) = rt.presented(key) {
-                        rect = Some(found);
-                        break;
+                press(&mut rt, tab);
+                rt.frame(0.5);
+                for key in keys {
+                    // Rows below the fold mount as the panel scrolls; every mounted row
+                    // must sit fully inside the Inspector.
+                    let mut rect = None;
+                    for _ in 0..12 {
+                        if let Some((found, _)) = rt.presented(key) {
+                            rect = Some(found);
+                            break;
+                        }
+                        let (body, _) = rt
+                            .presented(if tab.ends_with("context") {
+                                "context-tab"
+                            } else {
+                                "captain-brief"
+                            })
+                            .unwrap();
+                        rt.wheel(body[0] + body[2] / 2.0, body[1] + 200.0, -2000.0);
+                        rt.frame(1.0);
                     }
-                    scroll_brief(&mut rt);
+                    let rect = rect.unwrap_or_else(|| panic!("{key} at {width}"));
+                    assert!(
+                        inside(panel, rect),
+                        "{key} at {width}: {rect:?} outside {panel:?}"
+                    );
                 }
-                let rect = rect.unwrap_or_else(|| panic!("{key} at {width}"));
-                assert!(
-                    inside(panel, rect),
-                    "{key} at {width}: {rect:?} outside {panel:?}"
-                );
             }
         }
     }
 
     #[test]
-    fn a_document_panel_covers_the_chat_up_to_1280_and_sits_inline_at_1920() {
+    fn a_document_panel_covers_the_chat_at_620_and_sits_inline_from_960() {
         // The panel is a sheet over the conversation wherever the chat column cannot
-        // spare 720 px for both (620 outright, 1280 with the Brief docked).
-        for width in [620.0, 1280.0] {
+        // spare 720 px for both. With the Inspector's 360 px floor plus the chat's
+        // 360 px floor, only 620 covers outright; at 960 and above it docks inline.
+        for width in [620.0] {
             let mut rt = store_runtime(width);
-            rt.state.show_activity = true;
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
             press(&mut rt, "brief-document-NOTES.md");
             rt.frame(0.0);
             let (doc, _) = rt
@@ -2961,9 +2901,9 @@ mod tests {
             );
         }
         // At 960 and 1920 the column fits an inline panel and keeps its 360 px floor.
-        for width in [960.0, 1920.0] {
+        for width in [960.0, 1280.0, 1920.0] {
             let mut rt = store_runtime(width);
-            rt.state.show_activity = true;
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
             press(&mut rt, "brief-document-NOTES.md");
             rt.frame(0.0);
             let (doc, _) = rt
@@ -3016,7 +2956,6 @@ mod tests {
     fn the_recruit_palette_groups_eligible_rows_and_shows_full_reasons() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
-        rt.state.show_activity = true;
         rt.state.set_captain_scope(0, vec![1]).unwrap();
         let next = rt.state.next_id;
         let joinable = {
@@ -3056,7 +2995,7 @@ mod tests {
     #[test]
     fn a_saving_document_does_not_render_conflict_actions_for_its_new_revision() {
         let mut rt = store_runtime(1280.0);
-        rt.state.show_activity = true;
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
         press(&mut rt, "brief-document-NOTES.md");
         press(&mut rt, "captain-doc-edit");
         let key = crate::model::DocumentDraftKey {
@@ -3102,8 +3041,7 @@ mod tests {
     fn editing_a_document_saves_through_the_panel_and_conflicts_keep_the_draft() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
-        press(&mut rt, "open-brief");
-        rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
         press(&mut rt, "brief-document-NOTES.md");
         rt.frame(0.5);
         press(&mut rt, "captain-doc-edit");
@@ -3159,7 +3097,6 @@ mod tests {
     fn the_recruit_search_return_only_joins_the_matching_row() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
-        rt.state.show_activity = true;
         rt.state.set_captain_scope(0, vec![1]).unwrap();
         let base = rt.state.next_id;
         // The out-of-scope row sits first in thread order; it must stay disabled.
@@ -3273,7 +3210,7 @@ mod tests {
     fn a_pending_join_survives_its_source_thread_disappearing() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
-        rt.state.show_activity = true;
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
         // The remote accepted the join command, then a projection removed the
         // thread before the receipt; rendering must not panic on the gap.
         let missing = rt.state.next_id + 50;
@@ -3286,7 +3223,7 @@ mod tests {
             },
         );
         rt.frame(0.5);
-        scroll_brief(&mut rt);
+        reveal_in(&mut rt, "crew-tab", &format!("brief-crew-{missing}"));
         rt.frame(0.5);
         assert!(
             rt.presented(&format!("brief-crew-{missing}")).is_some(),
@@ -3299,7 +3236,6 @@ mod tests {
     fn an_earlier_conversation_reads_documents_on_its_own_panel() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
-        rt.state.show_activity = true;
         // An earlier conversation of captain 0: same captain_home identity, not the
         // current primary home.
         let earlier_id = rt.state.next_id;
@@ -3323,7 +3259,8 @@ mod tests {
             rt.state.captain_access(0),
             crate::model::CaptainAccess::Earlier
         );
-        scroll_brief(&mut rt);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
+        scroll_panel_body(&mut rt, "context-tab");
         press(&mut rt, "brief-document-NOTES.md");
         rt.frame(0.5);
         assert!(rt.presented("captain-doc-panel").is_some());
@@ -3363,7 +3300,6 @@ mod tests {
         member.never_sent = false;
         rt.state.threads.push(member);
         rt.frame(0.25);
-        rt.state.show_activity = true;
         press(&mut rt, "crew-roster-toggle");
         rt.state.brief.more = Some(member_id);
         rt.invalidate();
@@ -3396,8 +3332,7 @@ mod tests {
     fn crew_rows_release_and_recruit_through_the_brief() {
         let mut rt = store_runtime(1280.0);
         rt.frame(0.25);
-        press(&mut rt, "open-brief");
-        rt.frame(1.0);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
         let thread_id = rt.state.next_id;
         rt.state.next_id += 1;
         rt.state.set_captain_scope(0, vec![1]).unwrap();

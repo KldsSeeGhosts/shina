@@ -1215,7 +1215,11 @@ mod tests {
             rt.state.compact_sidebar = width < 760.0;
             rt.state.open_captain(0);
             rt.frame(0.0);
-            press(&mut rt, "open-brief");
+            let key = rt.state.panel_key();
+            rt.state
+                .right_panels
+                .open(&key, crate::right_panel::SingletonKind::Overview);
+            rt.invalidate();
             rt.frame(1.0);
             let (panel, _) = rt.presented("captain-brief").unwrap();
             for key in [
@@ -1225,6 +1229,8 @@ mod tests {
                 "brief-demote",
                 "brief-delete-captain",
             ] {
+                rt.update(|_, tx| tx.scroll_into_view(key.to_string()));
+                rt.frame(0.5);
                 let (rect, _) = rt
                     .presented(key)
                     .unwrap_or_else(|| panic!("{key} at {width}"));

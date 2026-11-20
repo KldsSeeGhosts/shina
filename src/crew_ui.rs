@@ -911,20 +911,20 @@ pub(super) fn brief_block(
 /// One member of a captain's Crew Roster: the thread, its task when one exists, and the
 /// ordering rank. Needs-you rows lead, then working, then queued, then idle, each by
 /// `updated`. `crew-chip-{id}` keys stay stable across all of them.
-struct RosterMember {
-    thread_id: usize,
-    title: String,
-    status: Status,
-    word: String,
-    clock: String,
-    remote_server: Option<String>,
-    rank: usize,
-    updated: u64,
-    place: Option<String>,
-    queued: bool,
+pub(super) struct RosterMember {
+    pub(super) thread_id: usize,
+    pub(super) title: String,
+    pub(super) status: Status,
+    pub(super) word: String,
+    pub(super) clock: String,
+    pub(super) remote_server: Option<String>,
+    pub(super) rank: usize,
+    pub(super) updated: u64,
+    pub(super) place: Option<String>,
+    pub(super) queued: bool,
 }
 
-fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
+pub(super) fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
     let tasks: std::collections::HashMap<usize, TaskView> = s
         .tasks_for(home)
         .into_iter()
@@ -1019,7 +1019,11 @@ fn roster_members(s: &State, home: usize, captain: usize) -> Vec<RosterMember> {
 /// The other workers this machine runs for one peer delegation: threads sharing the
 /// open worker's origin server and parent task. Same rank and status rules as
 /// `roster_members`' untasked arm.
-fn peer_sibling_members(s: &State, open: usize, origin: &PeerOrigin) -> Vec<RosterMember> {
+pub(super) fn peer_sibling_members(
+    s: &State,
+    open: usize,
+    origin: &PeerOrigin,
+) -> Vec<RosterMember> {
     let mut members: Vec<RosterMember> = s
         .threads
         .iter()

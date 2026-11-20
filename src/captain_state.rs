@@ -910,7 +910,7 @@ impl State {
     }
 
     /// Close the viewer item; a dirty document draft parks the close behind a
-    /// confirmation. The panel stays open on the Diff segment.
+    /// confirmation. The Context tab falls back to its document list.
     pub fn request_close_viewer(&mut self, panel: &str) {
         let surface_id = self
             .right_panels
@@ -989,10 +989,6 @@ impl State {
             crate::model::DiscardKind::Replace { captain, name } if viewer_matches => {
                 self.right_panels
                     .open_captain_document(&discard.panel, captain, &name);
-                // Match captain_ui::SHEET_BELOW (1050.0): below the sheet fold, close the Brief.
-                if self.viewport_width < 1050.0 {
-                    self.close_side_region();
-                }
             }
             crate::model::DiscardKind::Close | crate::model::DiscardKind::Replace { .. } => {}
         }
@@ -2836,7 +2832,7 @@ mod tests {
                 name: "NOTES.md".into(),
             })
         );
-        assert_eq!(new_panel.view, crate::right_panel::PanelView::Viewer);
+        assert_eq!(new_panel.view, crate::right_panel::PanelView::Context);
         assert!(new_panel.open);
         let old_panel = state.right_panels.get(&old_key);
         assert!(old_panel.viewer.is_none());

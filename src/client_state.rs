@@ -2566,8 +2566,6 @@ impl State {
                 && self.captain_phase(*captain) != CaptainPhase::Retired
         }) {
             self.brief.record = None;
-            self.show_activity = false;
-            self.activity_full = false;
         }
         self.peers = serde_json::from_value(projection["peers"].clone()).unwrap_or_default();
         let metadata = std::mem::take(&mut self.threads);

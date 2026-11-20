@@ -75,6 +75,8 @@ pub(crate) mod composer_press;
 pub(crate) mod composer_stash;
 #[path = "composer_ui.rs"]
 pub(crate) mod composer_ui;
+#[path = "context_ui.rs"]
+mod context_ui;
 #[path = "crew_membership_ui.rs"]
 mod crew_membership_ui;
 #[path = "crew_questions_ui.rs"]
@@ -87,6 +89,8 @@ pub(crate) mod diff_panel;
 pub(crate) mod diff_tree;
 #[path = "icons.rs"]
 mod icons;
+#[path = "inspector_ui.rs"]
+mod inspector_ui;
 #[path = "markdown_ui.rs"]
 mod markdown_ui;
 #[path = "pi_ui.rs"]
@@ -773,14 +777,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .unwrap_or(900.0)
     });
     let wide = main_width >= WIDE_PANE;
-    let mut context_popover_shown = false;
     let chrome = cx.chrome_insets();
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
     // by k and scaled back up, so layout, hit testing and text stay native at every step.
     let zoom = s.zoom.clamp(0.5, 2.0);
-    // The right panel's tab strip matches the native titlebar's strip height, so tabs and
-    // the window's controls sit on the same centre line as the thread tabs.
-    let strip_h = chrome.height.max(40.0 * zoom) / zoom;
     // Pixel art is scaled to whole device pixels for this scale, so tell it what that is.
     s.artwork.set_scale(cx.env().scale * zoom);
     let leading = if chrome.leading > 0.0 {
@@ -882,17 +882,13 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.panel)
         .corners(PANE_CORNERS)
         .clip_corners(PANE_CORNERS);
-    // A captain home shows its Brief instead of session details: beside the chat, or as a
-    // sheet over it on a narrow window.
-    let brief = s.show_activity && captain_ui::brief_captain(s).is_some();
+    // A retired captain record has no home thread, so it has no Inspector to sit in:
+    // it draws as a sheet over the conversation instead.
     let brief_record = s.brief.record.as_ref().is_some_and(|(server, captain)| {
         *server == s.machines.selected
             && s.captain_phase(*captain) == crate::model::CaptainPhase::Retired
     });
-    let brief_sheet = narrow || brief_record;
-    if s.show_activity && !brief && (narrow || s.activity_full) {
-        pane = pane.child(activity(s, p, true));
-    } else {
+    {
         let mut body = row().key("chat-body").grow(1.0).min_h(0.0);
         let main = composer_ui::motion_host(
             s,
@@ -955,30 +951,15 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // maximized panel covers it at any width.
         let panel = s.right_panel();
         let panel_open = panel.open;
-        // A docked drawer (the Brief's 320 px or the activity tray) plus its 1 px divider
-        // comes off the same container the panel measures, in the measured path and the
-        // fallback alike, so a covering sheet and the inline clamp see the chat's width.
-        let docked_drawer = if brief && !brief_sheet {
-            captain_ui::PANEL_WIDTH + 1.0
-        } else if s.show_activity && !brief {
-            300.0 + 1.0
-        } else {
-            0.0
-        };
-        let body_width = cx
-            .layout_with("chat-body", |r| r[2])
-            .map(|width| (width - docked_drawer).max(0.0))
-            .unwrap_or_else(|| {
-                let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
-                cx.layout_with("workspace-root", move |r| {
-                    r[2] - 16.0 - sidebar - docked_drawer
-                })
+        let body_width = cx.layout_with("chat-body", |r| r[2]).unwrap_or_else(|| {
+            let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+            cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
                 .unwrap_or(900.0)
-            });
+        });
         let covering = panel_open && (panel.maximized || crate::right_panel::covers(body_width));
         let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
         if covering {
-            main_wrap = main_wrap.child(right_panel(s, p, zoom, strip_h, None).pin(
+            main_wrap = main_wrap.child(inspector_ui::view(s, p, zoom, None).pin(
                 Some(0.0),
                 Some(0.0),
                 Some(0.0),
@@ -989,17 +970,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         if panel_open && !covering {
             let max = crate::right_panel::max_width(s.viewport_width, body_width);
             let width = crate::right_panel::clamp_width(s.right_panel_width, max);
-            body = body.child(right_panel(s, p, zoom, strip_h, Some(max)).w(width));
-        }
-        context_popover_shown = true;
-        if brief && !brief_sheet {
-            body = body
-                .child(el().w(1.0).h_full().fill(p.line))
-                .child(captain_ui::brief_side(s, p));
-        } else if s.show_activity && !brief {
-            body = body
-                .child(el().w(1.0).h_full().fill(p.line))
-                .child(activity(s, p, false));
+            body = body.child(inspector_ui::view(s, p, zoom, Some(max)).w(width));
         }
         pane = pane.child(body);
     }
@@ -1034,30 +1005,27 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(workspace.child(pane));
     // The context popover floats at the root, after the ring it anchors to, so the composer
     // never makes room for it and no clipping ancestor cuts it off.
-    if context_popover_shown && let Some(toolbar) = assistant_selection_toolbar(s, p, cx) {
+    if let Some(toolbar) = assistant_selection_toolbar(s, p, cx) {
         root = root.child(toolbar);
     }
-    if context_popover_shown && composer_menu::trigger(s).is_some() {
+    if composer_menu::trigger(s).is_some() {
         root = root.child(composer_menu::overlay(s, p, cx, s.viewport_width));
     }
-    if context_popover_shown
-        && context_ring_shown(s.current())
-        && s.current().context.popover_open()
-    {
+    if context_ring_shown(s.current()) && s.current().context.popover_open() {
         root = root.child(context_popover(s, p));
     }
-    if context_popover_shown && let Some(notice) = s.composer_notices.open_details_notice() {
+    if let Some(notice) = s.composer_notices.open_details_notice() {
         root = root.child(composer_notice_details_popover(notice, p));
     }
     // Citation chips get a comment action pinned over each pill's right end,
     // mounted at the root like the other composer overlays so nothing clips it.
     // The collapsed preview shares the field's key, so check it is not showing.
-    if context_popover_shown && cx.layout_with("composer-preview", |_| ()).is_none() {
+    if cx.layout_with("composer-preview", |_| ()).is_none() {
         for action in citation_comment::chip_actions(s, p, cx, zoom) {
             root = root.child(action);
         }
     }
-    if brief && brief_sheet {
+    if brief_record {
         let top = chrome.height.max(40.0 * zoom) / zoom;
         root = root.child(captain_ui::brief_sheet(s, p, top));
     }
@@ -1173,8 +1141,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             );
         }
     }
-    if !s.show_activity
-        && let Some(captain) = s.current().crew_captain
+    if let Some(captain) = s.current().crew_captain
         && s.brief.more == Some(s.current().id)
     {
         root = root.child(
@@ -4199,9 +4166,6 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                 && s.captain_phase(captain) == crate::model::CaptainPhase::Retired
                             {
                                 s.brief.record = Some((server.clone(), captain));
-                                s.show_activity = true;
-                                s.activity_full = false;
-                                s.close_right_panel_for_drawer();
                             }
                         }),
                 );
@@ -7350,240 +7314,6 @@ fn thread_tab_menu(s: &State, p: Palette) -> El {
         .child(item("menu-tab-all", "Close all", "close", all))
 }
 
-/// One segment of the strip's two-choice control: a 24 px pressable row with an icon and
-/// its title, framed like the Keep awake choices (`h-6 px-2 rounded-md` with the chosen
-/// segment's 1 px frame; idle segments keep a clear border so nothing shifts).
-fn right_panel_segment(
-    s: &State,
-    p: Palette,
-    key: &str,
-    glyph: &str,
-    title: &str,
-    on: bool,
-    action: impl Fn(&mut State) + 'static,
-) -> El {
-    let _ = s;
-    row()
-        .key(key.to_string())
-        .role("tab")
-        .label(title.to_string())
-        .focusable(true)
-        .cursor(rune::Cursor::Pointer)
-        .h(24.0)
-        .px(8.0)
-        .gap(5.0)
-        .center_y()
-        .radius(6.0)
-        .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
-        .fill(if on { p.card } else { Color::TRANSPARENT })
-        .hover(p.selected)
-        .press(p.selected)
-        .on_press(action)
-        .child(icon(glyph, if on { p.ink } else { p.muted }).size(12.0, 12.0))
-        .child(
-            label(
-                title.to_string(),
-                TextStyle::new(12.0, 500.0),
-                if on { p.ink } else { p.muted },
-            )
-            .truncate(),
-        )
-}
-
-/// The strip atop the panel: a two-segment control (Diff, then the open viewer item when
-/// there is one), then the maximize and close controls. It replaces KSG's `RightPanelTabs`
-/// scrollable tab list, which a fixed two-segment panel never needs.
-fn right_panel_strip(s: &State, p: Palette, strip_h: f32) -> El {
-    let panel = s.right_panel();
-    let viewer = panel.viewer.clone();
-    let mut segments = row()
-        .key("right-panel-tabs")
-        .grow(1.0)
-        .min_w(0.0)
-        .center_y()
-        .gap(2.0)
-        .child(right_panel_segment(
-            s,
-            p,
-            "right-panel-segment-diff",
-            "diff",
-            "Diff",
-            panel.view == crate::right_panel::PanelView::Diff,
-            |s: &mut State| {
-                let key = s.panel_key();
-                s.right_panels
-                    .open(&key, crate::right_panel::SingletonKind::Diff);
-            },
-        ));
-    if let Some(viewer_surface) = &viewer {
-        let title = match viewer_surface {
-            crate::right_panel::Surface::CaptainDocument { name, .. } => {
-                captain_docs_ui::document_title(name).to_string()
-            }
-        };
-        segments = segments.child(right_panel_segment(
-            s,
-            p,
-            "right-panel-segment-viewer",
-            "file",
-            &title,
-            panel.view == crate::right_panel::PanelView::Viewer,
-            |s: &mut State| {
-                let key = s.panel_key();
-                s.right_panels.show_viewer(&key);
-            },
-        ));
-    }
-    row()
-        .key("right-panel-strip")
-        .h(strip_h)
-        .pl(8.0)
-        .pr(12.0)
-        .center_y()
-        .gap(4.0)
-        .child(segments)
-        .child(
-            row()
-                .center_y()
-                .gap(2.0)
-                .child(icon_button(
-                    "right-panel-maximize",
-                    if panel.maximized {
-                        "Restore panel"
-                    } else {
-                        "Maximize panel"
-                    },
-                    if panel.maximized {
-                        "minimize"
-                    } else {
-                        "expand"
-                    },
-                    p,
-                    |s: &mut State| s.right_panel_toggle_maximized(),
-                ))
-                .child(icon_button(
-                    "right-panel-close",
-                    "Close panel",
-                    "close",
-                    p,
-                    move |s: &mut State| {
-                        s.right_panel_close_active();
-                    },
-                )),
-        )
-}
-
-/// Ported from KSG Code's `RightPanelResizeHandle`: a 4 px hit strip pinned on the panel's
-/// left edge, holding a 1 px line that shows `p.frame` on hover and `p.coral` while
-/// dragging. Left/Right step by KSG's 16 px; Home/End jump to the minimum and maximum.
-fn right_panel_resize(s: &State, p: Palette, zoom: f32, max: f32) -> El {
-    let dragging = s.right_panel_resizing;
-    el().key("right-panel-resize")
-        .role("separator")
-        .label("Resize panel")
-        .focusable(true)
-        .w(4.0)
-        .h_full()
-        .cursor(rune::Cursor::ResizeColumn)
-        .hover_group()
-        .center()
-        .pin(Some(0.0), Some(0.0), None, Some(0.0))
-        .on_drag(move |s: &mut State, drag, _| {
-            if drag.phase == rune::Phase::Down {
-                drag.data = s.right_panel_width;
-                s.right_panel_resizing = true;
-            }
-            if drag.cancelled() {
-                s.right_panel_width = drag.data;
-            } else {
-                // The handle sits on the left edge, so dragging left widens the panel.
-                let width = drag.data - drag.dx / zoom;
-                s.right_panel_width = crate::right_panel::clamp_width(width, max);
-            }
-            if drag.phase == rune::Phase::Up {
-                s.right_panel_resizing = false;
-                s.checkpoint();
-            }
-        })
-        .on_key(move |s: &mut State, ev, _| {
-            use crate::right_panel::{KEYBOARD_STEP, MIN_WIDTH};
-            let next = match ev.key {
-                rune::Key::Left => Some(s.right_panel_width - KEYBOARD_STEP),
-                rune::Key::Right => Some(s.right_panel_width + KEYBOARD_STEP),
-                rune::Key::Home => Some(MIN_WIDTH),
-                rune::Key::End => Some(max),
-                _ => None,
-            };
-            let Some(next) = next else {
-                return false;
-            };
-            s.right_panel_width = crate::right_panel::clamp_width(next, max);
-            s.checkpoint();
-            true
-        })
-        .child(
-            el().w(1.0)
-                .h_full()
-                .a11y_hidden()
-                .fill(if dragging { p.coral } else { p.frame })
-                .group_opacity(if dragging { 1.0 } else { 0.0 }, 1.0),
-        )
-}
-
-/// Ported from KSG Code's `ChatRightPanel` + `PreviewPanelShell`: the 2 px `p.frame` left
-/// edge line, the tab strip, KSG's `DiffPanelShell` embedded header row (`h-7 mb-3`, empty
-/// for now so the diff and explorer headers of later tasks slot in), then the active
-/// surface's placeholder body. `resize_max` is `Some` only when the panel sits inline, so
-/// a covering sheet has no resize handle, matching KSG's `PreviewPanel`.
-fn right_panel(s: &State, p: Palette, zoom: f32, strip_h: f32, resize_max: Option<f32>) -> El {
-    let panel = s.right_panel();
-    let (key, body) = match (panel.view, &panel.viewer) {
-        (
-            crate::right_panel::PanelView::Viewer,
-            Some(crate::right_panel::Surface::CaptainDocument { captain, name }),
-        ) => (
-            format!("right-panel-body-captain-doc:{captain}:{name}"),
-            captain_docs_ui::document_panel(s, p, *captain, name),
-        ),
-        _ => ("right-panel-body-diff".to_string(), diff_panel::body(s, p)),
-    };
-    let panel_el = el()
-        .key("right-panel")
-        .role("group")
-        .label("Workspace panel")
-        .h_full()
-        .min_h(0.0)
-        .fill(p.panel)
-        .child(el().w(2.0).h_full().a11y_hidden().fill(p.frame))
-        .child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .min_h(0.0)
-                .child(right_panel_strip(s, p, strip_h))
-                .child(match panel.view {
-                    crate::right_panel::PanelView::Diff => diff_panel::header(s, p),
-                    crate::right_panel::PanelView::Viewer => el(),
-                })
-                .child(match panel.view {
-                    crate::right_panel::PanelView::Diff => el().h(12.0),
-                    crate::right_panel::PanelView::Viewer => el(),
-                })
-                .child(
-                    el().key(key)
-                        .grow(1.0)
-                        .min_h(0.0)
-                        .min_w(0.0)
-                        .center()
-                        .child(body),
-                ),
-        );
-    match resize_max {
-        Some(max) => panel_el.child(right_panel_resize(s, p, zoom, max)),
-        None => panel_el,
-    }
-}
-
 fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
     // The tab strip already names the thread, so the header only holds controls: status, a
     // "More actions" menu, the session panel toggle, and the diff and panel toggles KSG's
@@ -7680,25 +7410,6 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
         p,
         |s| s.thread_menu = !s.thread_menu,
     ));
-    if captain_ui::brief_captain(s).is_some() {
-        // With the Brief docked open it has its own close control in the drawer's header, so
-        // the chat header does not repeat it. Closed, or over the chat as a sheet, it stays.
-        if !(s.show_activity && !narrow) {
-            header = header.child(captain_ui::brief_button(s, p));
-        }
-    } else if !s.show_activity {
-        header = header.child(icon_button(
-            "open-session-panel",
-            "Show session details",
-            "info",
-            p,
-            |s| {
-                s.show_activity = true;
-                s.activity_full = false;
-                s.close_right_panel_for_drawer();
-            },
-        ));
-    }
     // KSG's panel controls sit at the header's right end: the diff stat and the Diff tab
     // toggle, then the whole-panel toggle (KSG's PanelRight). The stat reads the totals the
     // diff panel already computed, so it never starts a request just to fill the header.
@@ -7740,14 +7451,26 @@ fn chat_header(s: &State, p: Palette, narrow: bool, compact: bool) -> El {
     }
     header = header.child(diff);
     if !compact {
+        let panel_open = s.right_panel().open;
         let mut panel = toggle_button(
             "header-right-panel",
             "Toggle right panel",
             "panel",
-            s.right_panel().open,
+            panel_open,
             p,
             |s: &mut State| s.right_panel_toggle(),
         );
+        // A 6 pt brass dot while a captain home has a request waiting and the
+        // Inspector is closed, so the waiting state is visible without the tab.
+        if !panel_open && crew_ui::needs_you_shows(s) {
+            panel = panel.child(
+                el().size(6.0, 6.0)
+                    .radius(3.0)
+                    .fill(p.brass)
+                    .a11y_hidden()
+                    .pin(None, Some(2.0), Some(2.0), None),
+            );
+        }
         if let Some(shortcut) = shortcut("rightPanel.toggle") {
             panel = panel.description(format!("Toggle right panel ({shortcut})"));
         }
@@ -17835,123 +17558,6 @@ fn machine_dialog(s: &State, p: Palette) -> El {
         )
 }
 
-fn activity(s: &State, p: Palette, narrow: bool) -> El {
-    let t = s.current();
-    let mut pane = col().key("session-panel").min_h(0.0);
-    pane = if narrow {
-        pane.grow(1.0)
-    } else {
-        pane.w(300.0).h_full()
-    };
-    pane = pane.child(
-        row()
-            .key("session-panel-header")
-            .h(36.0)
-            .px(8.0)
-            .center_y()
-            .gap(4.0)
-            .child(
-                row()
-                    .center_y()
-                    .gap(6.0)
-                    .px(8.0)
-                    .h(25.0)
-                    .radius(6.0)
-                    .fill(p.selected)
-                    .child(icon("thread", p.muted))
-                    .child(label("Session", SMALL, p.ink)),
-            )
-            .child(spacer())
-            .child(icon_button(
-                "expand-session-panel",
-                if s.activity_full {
-                    "Restore split view"
-                } else {
-                    "Expand session details"
-                },
-                "expand",
-                p,
-                |s| s.activity_full = !s.activity_full,
-            ))
-            .child(icon_button(
-                "close-session-panel",
-                "Hide session details",
-                "panel",
-                p,
-                |s| {
-                    s.show_activity = false;
-                    s.activity_full = false;
-                },
-            )),
-    );
-    // The same closing rule as the chat header, so one line runs across the pane.
-    pane = pane.child(rule(p).key("session-header-rule"));
-    let mut details = col()
-        .padding(16.0)
-        .gap(16.0)
-        .child(label(&t.title, TextStyle::new(14.0, 600.0), p.ink).wrap())
-        .child(status(t.status, p))
-        .child(rule(p))
-        .child(
-            col()
-                .gap(5.0)
-                .child(meta_label("Model", p.muted))
-                .child(label(&t.model, LABEL, p.ink).wrap()),
-        )
-        .child(
-            col()
-                .gap(5.0)
-                .child(meta_label("Conversation", p.muted))
-                .child(
-                    label(
-                        if t.session.is_some() {
-                            format!("Saved locally by {}", harness_name(s, &t.harness))
-                        } else {
-                            "No saved session yet".to_string()
-                        },
-                        LABEL,
-                        p.ink,
-                    )
-                    .wrap(),
-                ),
-        );
-    if let Some(session) = &t.session {
-        details = details.child(
-            label(session, SMALL, p.muted)
-                .wrap_anywhere()
-                .selectable(true),
-        );
-    }
-    if !t.diagnostics.is_empty() {
-        details = details
-            .child(rule(p))
-            .child(label("Session notices", LABEL, p.ink));
-    }
-    for diagnostic in &t.diagnostics {
-        details = details.child(
-            label(truncate(diagnostic, 600), SMALL, p.muted)
-                .wrap_anywhere()
-                .selectable(true),
-        );
-    }
-    for diagnostic in s.updater.diagnostics() {
-        details = details.child(
-            label(diagnostic, SMALL, p.muted)
-                .wrap_anywhere()
-                .selectable(true),
-        );
-    }
-    pane.child(
-        col()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(details),
-    )
-}
-
 /// Ported from KSG Code's ComposerPendingApprovalActions.
 fn approval_actions(s: &State, id: usize, inline: bool, allowed: bool, p: Palette) -> El {
     let Some(t) = s.threads.iter().find(|t| t.id == id) else {
@@ -19537,29 +19143,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_hairline_closes_the_chat_header_and_the_brief_toggle_is_an_icon_when_open() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+    fn a_hairline_closes_the_chat_header_and_the_panel_toggle_opens_the_inspector() {
+        for width in [960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.populate_demo();
-            rt.state.compact_sidebar = width < 760.0;
             rt.state.open_captain(0);
             rt.frame(0.0);
             let (header, _) = rt.presented("chat-header").unwrap();
             let (rule, _) = rt.presented("chat-header-rule").unwrap();
             assert_eq!(rule[3], 1.0, "{width}");
             assert!((rule[1] - (header[1] + header[3])).abs() < 0.5, "{width}");
-            let (closed, _) = rt.presented("open-brief").unwrap();
-            assert!(closed[2] > 40.0, "{width}: the closed button names itself");
-            press(&mut rt, "open-brief");
+            assert!(rt.presented("right-panel").is_none(), "{width}");
+            press(&mut rt, "header-right-panel");
             rt.frame(1.0);
-            // Over the chat as a sheet, the header keeps an icon-only toggle. Docked, the
-            // drawer's own control closes it and the header drops its toggle.
-            match rt.presented("open-brief") {
-                Some((open, _)) => {
-                    assert_eq!([open[2], open[3]], [24.0, 24.0], "{width}: icon only")
-                }
-                None => assert!(rt.presented("close-brief").is_some(), "{width}"),
-            }
+            // The Inspector opens on the captain's Overview, closing on its own control.
+            assert!(rt.presented("right-panel").is_some(), "{width}");
+            assert!(rt.presented("captain-brief").is_some(), "{width}");
+            press(&mut rt, "right-panel-close");
+            rt.frame(1.0);
+            assert!(rt.presented("right-panel").is_none(), "{width}");
         }
     }
     #[test]
@@ -20601,14 +20203,19 @@ pub(crate) mod tests {
                 chrono::Local::now(),
             )
             .unwrap();
-        rt.state.show_activity = true;
+        let panel_key = rt.state.panel_key();
+        rt.state
+            .right_panels
+            .open(&panel_key, crate::right_panel::SingletonKind::Overview);
         rt.frame(0.0);
         assert!(rt.presented(&format!("routine-delete-{id}")).is_some());
         let (panel, _) = rt.presented("captain-brief").unwrap();
         rt.wheel(panel[0] + panel[2] / 2.0, panel[1] + 200.0, -2000.0);
         rt.frame(1.0);
+        rt.update(|_, tx| tx.scroll_into_view(format!("routine-pause-{id}")));
+        rt.frame(1.0);
         press(&mut rt, &format!("routine-pause-{id}"));
-        assert!(rt.state.routines(0)[0].paused);
+        assert!(rt.state.routines(0)[0].paused,);
         press(&mut rt, &format!("routine-delete-{id}"));
         assert!(rt.state.routines(0).is_empty());
         assert!(rt.state.current().pi.is_none());
@@ -20683,13 +20290,13 @@ pub(crate) mod tests {
                 assert!(rt.presented("composer-input").is_some(), "{width}");
             }
 
-            // The viewer segment switches to the document body.
-            press(&mut rt, "right-panel-segment-viewer");
+            // The Context segment switches to the document body.
+            press(&mut rt, "right-panel-segment-context");
             rt.frame(0.5);
             let key = rt.state.panel_key();
             assert_eq!(
                 rt.state.right_panels.get(&key).view,
-                crate::right_panel::PanelView::Viewer,
+                crate::right_panel::PanelView::Context,
                 "{width}"
             );
             assert!(
@@ -22358,16 +21965,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_docked_brief_has_one_control_and_routine_schedules_are_whole() {
+    fn a_docked_overview_has_one_control_and_routine_schedules_are_whole() {
         let mut rt = runtime(1440.0);
         crate::captain_brief_demo(&mut rt.state);
-        rt.state.show_activity = true;
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
         assert!(
-            rt.presented("close-brief").is_some(),
-            "the drawer's own control"
+            rt.presented("right-panel-close").is_some(),
+            "the Inspector's own control"
         );
         assert!(
             rt.presented("open-brief").is_none(),
@@ -22391,6 +21997,8 @@ pub(crate) mod tests {
         }
         assert!(checked > 0, "no routine rows on screen");
         // The memory controls overlay the row instead of reserving width at rest.
+        press(&mut rt, "right-panel-segment-context");
+        rt.frame(0.5);
         let mut memories = 0;
         for element in rt.elements() {
             let Some(key) = element.key.as_deref() else {
@@ -22411,12 +22019,15 @@ pub(crate) mod tests {
             memories += 1;
         }
         assert!(memories > 0, "no memory rows on screen");
-        rt.state.show_activity = false;
-        rt.invalidate();
+        press(&mut rt, "right-panel-close");
         rt.frame(1.0);
         assert!(
-            rt.presented("open-brief").is_some(),
-            "closed, the header opens it"
+            rt.presented("right-panel").is_none(),
+            "closed, the Inspector leaves the pane"
+        );
+        assert!(
+            rt.presented("header-right-panel").is_some(),
+            "the header opens it"
         );
     }
 
@@ -25461,7 +25072,7 @@ pub(crate) mod tests {
         let (rect, _) = rt.presented("composer").unwrap();
         assert!(rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5);
         assert!(rect[2] > 200.0);
-        for key in ["open-session-panel", "thread-actions", "leave-example"] {
+        for key in ["thread-actions", "leave-example"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
                 rect[0] >= 0.0 && rect[0] + rect[2] <= 620.5,
@@ -26266,7 +25877,7 @@ pub(crate) mod tests {
         assert!(rt.presented("tool-output-1-0").is_some());
         assert!(rt.presented("tool-output-1-1").is_none());
         assert!(
-            !rt.state.show_activity,
+            !rt.state.right_panel().open,
             "tool output never opens a side panel"
         );
     }
@@ -26301,7 +25912,7 @@ pub(crate) mod tests {
                 "{key} is not inside the title strip: {rect:?}"
             );
         }
-        for key in ["thread-actions", "open-session-panel"] {
+        for key in ["thread-actions", "header-right-panel"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(
                 rect[1] >= strip[1] + strip[3],
@@ -26309,22 +25920,20 @@ pub(crate) mod tests {
             );
         }
         assert!(rt.find("toggle-activity").is_none());
-        press(&mut rt, "open-session-panel");
+        press(&mut rt, "header-right-panel");
         rt.frame(2.0);
-        assert!(rt.state.show_activity);
-        let (panel, _) = rt.presented("session-panel").unwrap();
-        for key in ["expand-session-panel", "close-session-panel"] {
+        assert!(rt.state.right_panel().open);
+        let (panel, _) = rt.presented("right-panel").unwrap();
+        for key in ["right-panel-maximize", "right-panel-close"] {
             let (rect, _) = rt.presented(key).unwrap();
             assert!(rect[0] >= panel[0] && rect[0] + rect[2] <= panel[0] + panel[2] + 0.5);
         }
-        press(&mut rt, "expand-session-panel");
+        press(&mut rt, "right-panel-maximize");
         rt.frame(4.0);
-        assert!(rt.state.activity_full);
-        assert!(rt.presented("composer").is_none());
-        press(&mut rt, "close-session-panel");
+        assert!(rt.state.right_panel().maximized);
+        press(&mut rt, "right-panel-close");
         rt.frame(6.0);
-        assert!(!rt.state.show_activity && !rt.state.activity_full);
-        assert!(rt.presented("composer").is_some());
+        assert!(!rt.state.right_panel().open);
         press(&mut rt, "sidebar-toggle");
         rt.frame(8.0);
         let (toggle, _) = rt.presented("sidebar-toggle").unwrap();
@@ -26396,10 +26005,13 @@ pub(crate) mod tests {
         let mut rt = runtime(620.0);
         rt.state.populate_demo();
         rt.frame(0.0);
-        press(&mut rt, "open-session-panel");
+        let key = rt.state.panel_key();
+        rt.state
+            .right_panels
+            .open(&key, crate::right_panel::SingletonKind::Overview);
         rt.frame(2.0);
         assert!(rt.presented("session-panel").is_some());
-        press(&mut rt, "close-session-panel");
+        press(&mut rt, "right-panel-close");
         rt.frame(4.0);
         assert!(rt.presented("composer").is_some());
     }
@@ -29625,16 +29237,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_session_drawer_header_has_a_rule_on_the_chat_headers_line() {
+    fn the_inspector_strip_has_a_rule_under_it() {
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
-        rt.state.show_activity = true;
+        let key = rt.state.panel_key();
+        rt.state
+            .right_panels
+            .open(&key, crate::right_panel::SingletonKind::Overview);
         rt.invalidate();
         rt.frame(0.0);
         rt.frame(1.0);
-        let (rule, _) = rt.presented("session-header-rule").unwrap();
-        let (chat, _) = rt.presented("chat-header-rule").unwrap();
-        assert!((rule[1] - chat[1]).abs() < 1.0, "{rule:?} {chat:?}");
+        let (strip, _) = rt.presented("right-panel-strip").unwrap();
+        let (rule, _) = rt.presented("right-panel-strip-rule").unwrap();
+        assert!((strip[3] - 36.0).abs() < 1.0, "{strip:?}");
+        assert!(
+            (rule[1] - (strip[1] + strip[3])).abs() < 1.0,
+            "{rule:?} {strip:?}"
+        );
     }
 
     #[test]
@@ -32482,12 +32101,13 @@ pub(crate) mod tests {
             );
             assert!(rt.state.current().draft.marks().is_empty());
 
-            let panel_before = rt.state.show_activity;
+            let panel_before = rt.state.right_panel().open;
             rt.key(cmd_ev('b', true));
             rt.frame(0.0);
             assert_eq!(
-                rt.state.show_activity, !panel_before,
-                "Mod+Shift+B toggles threadPanel"
+                rt.state.right_panel().open,
+                !panel_before,
+                "Mod+Shift+B toggles the Inspector on Overview"
             );
             assert!(rt.state.current().draft.marks().is_empty());
 
@@ -32595,10 +32215,10 @@ pub(crate) mod tests {
 
             // Clear bold, keep selection, test Mod+Shift+B.
             rt.state.current_mut().draft.toggle_mark(rune::Mark::Bold);
-            let panel_before = rt.state.show_activity;
+            let panel_before = rt.state.right_panel().open;
             rt.key(cmd_ev('b', true));
             rt.frame(0.0);
-            assert_eq!(rt.state.show_activity, !panel_before);
+            assert_eq!(rt.state.right_panel().open, !panel_before);
             assert!(!rt.state.current().draft.has_mark(&rune::Mark::Bold));
 
             // Mod+I and Mod+Shift+I toggle Italic on selection.
@@ -32665,10 +32285,10 @@ pub(crate) mod tests {
             assert_eq!(rt.state.sidebar, !sidebar_before);
             assert!(rt.state.current().draft.marks().is_empty());
 
-            let panel_before = rt.state.show_activity;
+            let panel_before = rt.state.right_panel().open;
             rt.key(cmd_ev('b', true));
             rt.frame(0.0);
-            assert_eq!(rt.state.show_activity, !panel_before);
+            assert_eq!(rt.state.right_panel().open, !panel_before);
             assert!(rt.state.current().draft.marks().is_empty());
 
             for (ch, shift) in [('i', false), ('i', true), ('e', false)] {
@@ -32728,7 +32348,7 @@ pub(crate) mod tests {
             rt.key(cmd_ev('b', true));
             rt.frame(0.0);
             assert!(rt.state.current().draft.has_mark(&rune::Mark::Bold));
-            assert!(!rt.state.show_activity);
+            assert!(!rt.state.right_panel().open);
         }
     }
 

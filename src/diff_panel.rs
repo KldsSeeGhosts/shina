@@ -1111,7 +1111,6 @@ pub(crate) fn reveal_file(state: &mut State, panel_key: &str, path: &str) {
     // Timeline file changes are working-tree changes, so the tab opens on
     // Uncommitted — the one scope whose files the timeline can name.
     if state.panel_key() == panel_key {
-        state.close_side_region();
         state.diff_set_scope(Scope::Uncommitted);
     }
     let Some(diff) = state.diffs.get_mut(panel_key) else {

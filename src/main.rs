@@ -320,12 +320,7 @@ fn dispatch_global_command(
             {
                 return false;
             }
-            state.show_activity = !state.show_activity;
-            if !state.show_activity {
-                state.activity_full = false;
-            } else {
-                state.close_right_panel_for_drawer();
-            }
+            state.right_panel_toggle_overview();
             state.checkpoint();
         }
         "rightPanel.toggle" => state.right_panel_toggle(),
@@ -1075,8 +1070,10 @@ fn captain_brief_demo(state: &mut State) {
         routines_paused_while_away: true,
         ..Default::default()
     });
-    state.show_activity = true;
-    state.close_right_panel_for_drawer();
+    let key = state.panel_key();
+    state
+        .right_panels
+        .open(&key, crate::right_panel::SingletonKind::Overview);
 }
 
 /// Confirmation examples use only the demo's records and a read-only preview.
@@ -1392,8 +1389,10 @@ fn main() {
             ("session-details", |state| {
                 state.populate_demo();
                 state.dark = true;
-                state.show_activity = true;
-                state.close_right_panel_for_drawer();
+                let key = state.panel_key();
+                state
+                    .right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Overview);
             }),
             // A five paragraph draft that wraps past the composer's 200 pt text window.
             ("composer-long-draft", long_draft_demo),
