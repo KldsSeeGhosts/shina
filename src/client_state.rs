@@ -2637,6 +2637,11 @@ impl State {
             let from = crate::right_panel::key(&self.machines.selected, *old_home);
             let to = crate::right_panel::key(&self.machines.selected, new_home);
             self.right_panels.carry_captain_documents(&from, &to);
+            if let Some(discard) = self.doc_discard.as_mut()
+                && discard.panel == from
+            {
+                discard.panel = to;
+            }
         }
         if first
             && let Some(drafts) = self.client_views["localUi"]["clientDrafts"]

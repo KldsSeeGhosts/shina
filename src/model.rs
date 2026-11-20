@@ -6209,19 +6209,12 @@ impl State {
     pub fn right_panel_close_active(&mut self) -> bool {
         let key = self.panel_key();
         let panel = self.right_panels.get(&key);
-        if panel.open
-            && panel.view == crate::right_panel::PanelView::Viewer
-            && panel.viewer.is_some()
-        {
+        if panel.viewer.is_some() {
             self.request_close_viewer(&key);
             return true;
         }
         if panel.open {
             self.right_panels.close(&key);
-            return true;
-        }
-        if panel.viewer.is_some() {
-            self.request_close_viewer(&key);
             return true;
         }
         false
@@ -6301,6 +6294,7 @@ impl State {
             self.threads[previous].cancel_questionnaire_advance();
         }
         self.active = index;
+        self.close_side_region();
         self.plan_menu = None;
         self.env_mode_picker = false;
         self.base_branch_picker = false;

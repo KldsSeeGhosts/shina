@@ -20153,7 +20153,11 @@ pub(crate) mod tests {
                 "{width}"
             );
 
-            // Close ends the panel and restores the conversation's full width.
+            // Close drops the viewer first, then ends the panel and restores the conversation's full width.
+            press(&mut rt, "right-panel-close");
+            rt.frame(0.5);
+            assert!(rt.state.right_panels.get(&key).viewer.is_none(), "{width}");
+            assert!(rt.presented("right-panel").is_some(), "{width}");
             press(&mut rt, "right-panel-close");
             rt.frame(0.5);
             assert!(rt.presented("right-panel").is_none(), "{width}");

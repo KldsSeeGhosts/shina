@@ -714,12 +714,12 @@ fn open_captain_document(s: &mut State, captain: usize, name: &str) {
             None => return,
         }
     };
+    s.open_captain_document(&key, captain, name);
     // Below the sheet fold the Brief and the panel cannot share the window, so the
     // document takes the region; on wide windows the Brief stays open as its index.
-    if s.viewport_width < SHEET_BELOW {
+    if s.viewport_width < SHEET_BELOW && s.doc_discard.is_none() {
         close_brief(s);
     }
-    s.open_captain_document(&key, captain, name);
 }
 
 /// Planning documents, in the row style of Shina's `earlier_section` entries: a pressable

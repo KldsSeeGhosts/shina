@@ -841,12 +841,27 @@ impl State {
         {
             self.captain_drafts.remove(&discard.key);
         }
+        let expected_id = format!("captain-doc:{}:{}", discard.key.captain, discard.key.name);
+        let viewer_matches = self
+            .right_panels
+            .get(&discard.panel)
+            .viewer
+            .as_ref()
+            .is_some_and(|surface| surface.id() == expected_id);
         match discard.kind {
             crate::model::DiscardKind::Discard => {}
-            crate::model::DiscardKind::Close => self.right_panels.close_viewer(&discard.panel),
-            crate::model::DiscardKind::Replace { captain, name } => self
-                .right_panels
-                .open_captain_document(&discard.panel, captain, &name),
+            crate::model::DiscardKind::Close if viewer_matches => {
+                self.right_panels.close_viewer(&discard.panel);
+            }
+            crate::model::DiscardKind::Replace { captain, name } if viewer_matches => {
+                self.right_panels
+                    .open_captain_document(&discard.panel, captain, &name);
+                // Match captain_ui::SHEET_BELOW (1050.0): below the sheet fold, close the Brief.
+                if self.viewport_width < 1050.0 {
+                    self.close_side_region();
+                }
+            }
+            crate::model::DiscardKind::Close | crate::model::DiscardKind::Replace { .. } => {}
         }
     }
 
