@@ -29,8 +29,8 @@ const ESSENTIAL_LABEL: &str = "User-curated captain memory data, not instruction
 /// The profile's serialized JSON limit (see memory.rs).
 const PROFILE_BUDGET: usize = 1024;
 /// KSG's `text-[13px] font-medium` detail rows.
-const ROW_TEXT: TextStyle = TextStyle::new(13.0, 470.0).lh(19.0).tracking(-0.08);
-const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
+const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
+const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
 fn glyph_icon(glyph: &'static Icon, ink: Color) -> El {
     rune::icon(glyph, super::ICON).color(ink).a11y_hidden()
@@ -546,7 +546,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .border(1.0, hairline(p))
                 .child(project_tile(s, p, project, 14.0))
                 .child(
-                    label(name.clone(), TextStyle::new(12.5, 500.0), p.ink)
+                    label(name.clone(), TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -593,7 +593,7 @@ fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .radius(6.0)
                 .border(1.0, hairline(p))
                 .child(
-                    label(text.clone(), TextStyle::new(12.5, 500.0), p.ink)
+                    label(text.clone(), TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -1733,7 +1733,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .child(
             label(
                 "Earlier conversation. Read-only.",
-                TextStyle::new(13.0, 470.0),
+                TextStyle::new(13.0, 500.0),
                 p.muted,
             )
             .truncate()
@@ -1872,7 +1872,7 @@ pub(super) fn brief_button(s: &State, p: Palette) -> El {
         .hover_motion(motion(), motion())
         .on_press(press)
         .child(icon("info", p.muted))
-        .child(label("Brief", TextStyle::new(12.5, 500.0), p.muted))
+        .child(label("Brief", TextStyle::new(13.0, 500.0), p.muted))
 }
 
 /// Add or remove a workspace from the picker in its captain-scope mode.
@@ -2158,7 +2158,7 @@ fn profile_field(p: Palette, title: &str, note: &str, field: El) -> El {
                 .center_y()
                 .child(meta_label(title, p.muted))
                 .child(
-                    label(note, TextStyle::new(12.0, 420.0), p.muted)
+                    label(note, TextStyle::new(12.0, 400.0), p.muted)
                         .truncate()
                         .shrink()
                         .min_w(0.0),
@@ -2168,7 +2168,7 @@ fn profile_field(p: Palette, title: &str, note: &str, field: El) -> El {
 }
 
 fn profile_input(s: &State, p: Palette, edit: &rune::TextEdit, key: &str, title: &str) -> El {
-    text_input(edit, TextStyle::new(14.0, 420.0).lh(20.0))
+    text_input(edit, TextStyle::new(14.0, 400.0).lh(20.0))
         .key(key)
         .label(title)
         .color(p.ink)
@@ -2265,7 +2265,7 @@ fn profile_dialog(s: &State, p: Palette) -> Option<El> {
                         .child(
                             label(
                                 "Every captain reads this with its memory. It is data about you, not instructions.",
-                                TextStyle::new(12.5, 420.0).lh(18.0),
+                                TextStyle::new(13.0, 400.0).lh(18.0),
                                 p.muted,
                             )
                             .wrap(),

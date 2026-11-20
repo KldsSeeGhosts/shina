@@ -660,6 +660,9 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
         .w_full()
         .gap(8.0)
         .max_h(260.0)
+        // The composer's 40% cap can shave the list; it keeps at least one message.
+        .min_h(48.0)
+        .shrink()
         .scroll(ScrollSpec {
             stick_bottom: false,
         });

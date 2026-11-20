@@ -54,7 +54,7 @@ pub(super) fn ghost_button(
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(action)
-        .child(label(title, TextStyle::new(12.5, 500.0), p.ink))
+        .child(label(title, TextStyle::new(13.0, 500.0), p.ink))
 }
 /// The one filled action in a group: Approve, Resume, Open to answer.
 pub(super) fn solid_button(
@@ -78,7 +78,7 @@ pub(super) fn solid_button(
             // Rune cannot move a button on press, so a pressed key darkens instead.
             .press(p.coral.alpha(0.9))
             .on_press(action)
-            .child(label(title, TextStyle::new(12.5, 600.0), p.on_coral)),
+            .child(label(title, TextStyle::new(13.0, 600.0), p.on_coral)),
         p,
     )
 }
@@ -454,7 +454,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .child(
             label(
                 &task.title,
-                TextStyle::new(14.0, 560.0).tracking(-0.12),
+                TextStyle::new(14.0, 600.0).tracking(-0.12),
                 p.ink,
             )
             .key(format!("task-title-{child}"))
@@ -883,7 +883,7 @@ pub(super) fn brief_block(
             label(
                 name,
                 TextStyle {
-                    weight: 560.0,
+                    weight: 600.0,
                     ..ACTIVITY
                 },
                 p.ink,
@@ -1083,11 +1083,17 @@ fn roster_row(s: &State, p: Palette, member: &RosterMember, key: String, menu: b
     row_
 }
 
+/// `crew_tray_shows` prices the tray in the composer's stack budget before it is built.
+pub(super) fn crew_tray_shows(s: &State) -> bool {
+    s.is_captain_home(s.current()) && s.current().captain.is_some()
+}
 /// The Crew Roster above a captain's composer, in the place KSG Code's `QueuedRunsControl`
 /// takes: a 28 px header with a chevron, the member count, the status summary and the Plan
 /// toggle, then — while expanded — one 30 px row per member, capped at five rows, and a
-/// footer with New crew thread and Recruit on a Full-access captain.
-pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32) -> Option<El> {
+/// footer with New crew thread and Recruit on a Full-access captain. `fit` collapses the
+/// member rows when the composer's 40% stack cap has no room for them; the header's count
+/// still reads.
+pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, fit: bool) -> Option<El> {
     let t = s.current();
     if !s.is_captain_home(t) {
         return None;
@@ -1095,7 +1101,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32) -> Option<El> {
     let captain = t.captain?;
     let members = roster_members(s, t.id, captain);
     let plan = super::plan_ui::plan_toggle(s, p);
-    let open = s.crew_roster_open(captain);
+    let open = s.crew_roster_open(captain) && fit;
     // One definition of working, shared with the chat header: running now. A worker waiting
     // on an approval needs you instead, and a queued one waits for a slot.
     // The summary counts only members with an active task, matching the tray's old
@@ -1247,6 +1253,17 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32) -> Option<El> {
     Some(roster)
 }
 
+/// Whether `needs_you` draws, so the composer's stack budget can price it before building.
+pub(super) fn needs_you_shows(s: &State) -> bool {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return false;
+    }
+    s.attention()
+        .into_iter()
+        .any(|item| needs_you_item(s, t.id, &item))
+        || super::crew_questions_ui::cards_shows(s)
+}
 /// Approvals and questions from this captain's crew, ported from KSG Code's
 /// `ChildThreadApprovals`: bordered `rounded-lg p-3` cards in a `max-h-80` scrolling stack.
 pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
@@ -1394,7 +1411,7 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
                             status_ink(Status::Waiting, p),
                         ))
                         .child(
-                            label(&item.short_title, TextStyle::new(13.0, 560.0), p.ink)
+                            label(&item.short_title, TextStyle::new(13.0, 600.0), p.ink)
                                 .truncate()
                                 .shrink()
                                 .min_w(0.0),
@@ -1426,6 +1443,10 @@ pub(super) fn needs_you(s: &State, p: Palette) -> Option<El> {
             .label("Needs you")
             // An open task plan shares the lane, so the stack gives it most of its height.
             .max_h(if s.plan_panel_open() { 120.0 } else { 320.0 })
+            // The composer's 40% cap shrinks the cards' scrolling region before the crew
+            // roster's; a card's header stays reachable at the floor.
+            .min_h(40.0)
+            .shrink()
             .scroll(ScrollSpec {
                 stick_bottom: false,
             })
@@ -1452,6 +1473,14 @@ pub(crate) fn needs_you_item(s: &State, home: usize, item: &AttentionItem) -> bo
 
 /// "Delegated by <captain>", "Runs on its own" and "Open captain" above a worker's composer, ported
 /// from KSG Code's `ProviderSubagentBar` (`min-h-12 rounded-2xl py-2 ps-5 pe-2 text-sm`).
+/// Whether `parent_bar` draws, so the composer's stack budget can price it before building.
+pub(super) fn parent_bar_shows(s: &State) -> bool {
+    let t = s.current();
+    t.peer_origin.is_some()
+        || t.delegated
+            && t.parent
+                .is_some_and(|id| s.threads.iter().any(|thread| thread.id == id))
+}
 pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     let t = s.current();
     // Ported from KSG Code's ThreadRelationshipsControl DelegatedFromRow.
@@ -1513,14 +1542,14 @@ pub(super) fn parent_bar(s: &State, p: Palette, lane: f32) -> Option<El> {
     ));
     who = match captain.and_then(|c| s.captains.get(c).map(|profile| (c, profile))) {
         Some((index, profile)) => who.child(avatar(s, p, index, 20.0, Status::Ready)).child(
-            label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+            label(&profile.name, TextStyle::new(14.0, 600.0), p.ink)
                 .key("parent-bar-name")
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         ),
         None => who.child(
-            label(&parent.title, TextStyle::new(14.0, 560.0), p.ink)
+            label(&parent.title, TextStyle::new(14.0, 600.0), p.ink)
                 .key("parent-bar-name")
                 .truncate()
                 .shrink()
@@ -1648,6 +1677,13 @@ fn with_placement(bar: El, placement: Option<El>, key: &str, name: String, p: Pa
     group
 }
 
+/// Whether `crew_bar` draws, so the composer's stack budget can price it before building.
+pub(super) fn crew_bar_shows(s: &State) -> bool {
+    let t = s.current();
+    !t.delegated
+        && t.peer_origin.is_none()
+        && t.crew_captain.is_some_and(|c| s.captains.get(c).is_some())
+}
 /// The independent crew root's bar: which captain's crew it belongs to, and a button back
 /// to that captain's home. Delegated workers keep `parent_bar` instead.
 pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
@@ -1669,7 +1705,7 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .child(label("In", TextStyle::new(14.0, 400.0), p.muted))
         .child(avatar(s, p, captain, 20.0, s.captain_status(captain)))
         .child(
-            label(&profile.name, TextStyle::new(14.0, 560.0), p.ink)
+            label(&profile.name, TextStyle::new(14.0, 600.0), p.ink)
                 .key("crew-bar-name")
                 .truncate()
                 .shrink()
@@ -1949,7 +1985,7 @@ pub(super) fn attention_menu(s: &State, p: Palette, pane: Option<(f32, f32)>) ->
                 })
                 .child(mark_slot(status, p))
                 .child(
-                    label(&item.short_title, TextStyle::new(13.0, 450.0), p.ink)
+                    label(&item.short_title, TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
                         .shrink()
                         .min_w(0.0),

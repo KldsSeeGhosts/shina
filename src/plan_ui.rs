@@ -21,8 +21,8 @@ const ROW_RADIUS: f32 = 4.0;
 const LIST_MAX: f32 = 300.0;
 /// Dependency and launch lines start under the title, past the checkbox and the badge gap.
 const LINE_INDENT: f32 = 26.0;
-const META: TextStyle = TextStyle::new(12.0, 420.0).lh(17.0);
-const FIELD: TextStyle = TextStyle::new(13.0, 430.0).lh(19.0);
+const META: TextStyle = TextStyle::new(12.0, 400.0).lh(17.0);
+const FIELD: TextStyle = TextStyle::new(13.0, 400.0).lh(19.0);
 
 /// The word and ink for a node's plan status.
 fn status_word(status: &str, p: Palette) -> (&'static str, Color) {
@@ -583,7 +583,7 @@ fn override_confirm(p: Palette, s: &State) -> El {
         .child(
             label(
                 "These nodes are not ready. Starting them records an override on the plan.",
-                TextStyle::new(13.0, 560.0),
+                TextStyle::new(13.0, 600.0),
                 p.ink,
             )
             .wrap()

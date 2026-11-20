@@ -1863,7 +1863,7 @@ fn new_keybinding_command_menu(s: &State, p: Palette) -> El {
                         };
                     }
                 })
-                .child(label(&title, TextStyle::new(13.0, 420.0), p.ink).truncate()),
+                .child(label(&title, TextStyle::new(13.0, 400.0), p.ink).truncate()),
         );
     }
     menu.anchored_fit(
@@ -2771,7 +2771,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
         .min_w(0.0)
         .gap(6.0);
     if global_query.is_empty() {
-        let search_field = text_input(&s.settings.shortcut_search, TextStyle::new(13.5, 400.0))
+        let search_field = text_input(&s.settings.shortcut_search, TextStyle::new(14.0, 400.0))
             .key("keybindings-search")
             .label("Search keybindings")
             .placeholder("Search keybindings", p.muted)
@@ -2991,14 +2991,14 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
             .child(when_trigger);
         if let Some(conflict_msg) = conflict_warning_description(&conflicts) {
             info_col = info_col.child(
-                label(conflict_msg, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
+                label(conflict_msg, TextStyle::new(13.0, 500.0).lh(17.0), p.danger)
                     .key("new-keybinding-conflict")
                     .wrap(),
             );
         }
         if let Some(err) = validation_err {
             info_col = info_col.child(
-                label(err, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
+                label(err, TextStyle::new(13.0, 500.0).lh(17.0), p.danger)
                     .key("new-keybinding-validation")
                     .wrap(),
             );
@@ -3111,7 +3111,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                 .child(when_trigger);
             if let Some(conflict_msg) = conflict_warning_description(&row_item.conflicts) {
                 info_col = info_col.child(
-                    label(conflict_msg, TextStyle::new(12.5, 450.0).lh(17.0), p.danger)
+                    label(conflict_msg, TextStyle::new(13.0, 500.0).lh(17.0), p.danger)
                         .key(format!("keybinding-conflict-{slug}"))
                         .wrap(),
                 );

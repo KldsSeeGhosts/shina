@@ -53,7 +53,7 @@ fn code_frame(code: El, language: &str, source: String, identity: &str, p: Palet
                 .center_y()
                 .child(label(
                     language.to_lowercase(),
-                    TextStyle::new(11.5, 400.0).family(rune::Family::SystemMono),
+                    TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
                     p.muted,
                 ))
                 .child(spacer())
