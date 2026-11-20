@@ -7046,14 +7046,6 @@ fn tab_frame(tab: El, active: bool, p: Palette) -> El {
     tab.fill(p.card).radius(8.0).border(1.0, p.line)
 }
 
-/// A menu item that cannot run: the title and icon sit dimmed and presses do nothing, as
-/// KSG's disabled dropdown items.
-fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
-    menu_item_in(key, title, glyph, p, p.faint, p.faint)
-        .cursor(rune::Cursor::Default)
-        .disabled(true)
-}
-
 /// The new-tab plus: a framed 24 px square.
 fn new_tab_button(p: Palette) -> El {
     framed(
