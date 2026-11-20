@@ -64,7 +64,7 @@ pub(super) fn more_menu(s: &State, p: Palette, captain: usize, thread_id: usize)
                     server: move_server.clone(),
                     thread: thread_id,
                     mode: MoveMode::Move { from: captain },
-                    anchor: format!("brief-crew-more-{thread_id}"),
+                    anchor: format!("crew-chip-{thread_id}"),
                 });
             },
         ))
@@ -534,7 +534,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
                         let result = s.captain_crew_command(&expected, captain, id, CrewKind::Join);
                         report_mutation(s, result);
                         s.brief.recruit = None;
-                        tx.focus("brief-crew-recruit", true);
+                        tx.focus("crew-roster-recruit", true);
                     })
             }),
     );
@@ -666,7 +666,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
                 .child(list),
         )
         .anchored_fit(
-            "brief-crew-recruit",
+            "crew-roster-recruit",
             rune::Side::Bottom,
             rune::Align::End,
             4.0,

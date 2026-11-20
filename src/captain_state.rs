@@ -2217,6 +2217,7 @@ mod tests {
         let home = state.captain_home(0).unwrap();
         let member = push_thread(&mut state);
         thread_mut(&mut state, member).life.latest_user_message_at = Some(1);
+        thread_mut(&mut state, member).title = "Crew member".into();
         state.captain_crew_join(0, member).unwrap();
         let sidebar = |state: &State| {
             state
@@ -2227,14 +2228,20 @@ mod tests {
         };
         assert!(!sidebar(&state).contains(&member));
         state.open_kept_tab(state.threads.iter().position(|t| t.id == home).unwrap());
+        // Workers never list in the thread list while a captain is open; a search for the
+        // member's title surfaces it as a flat row.
+        assert!(state.searched_workers().is_empty());
+        let title = thread(&state, member).title.clone();
+        state.search.replace_text(&title);
         assert_eq!(
             state
-                .visible_captain_workers(home)
+                .searched_workers()
                 .iter()
                 .map(|index| state.threads[*index].id)
                 .collect::<Vec<_>>(),
             vec![member]
         );
+        state.search.replace_text("");
         state.open_kept_tab(state.threads.iter().position(|t| t.id == member).unwrap());
         assert_eq!(state.selected_row(), home);
         state.captain_crew_release(0, member).unwrap();
@@ -2245,15 +2252,19 @@ mod tests {
         let new_home = state.captain_home(0).unwrap();
         assert_ne!(new_home, home);
         state.open_kept_tab(state.threads.iter().position(|t| t.id == new_home).unwrap());
-        assert!(state.visible_captain_workers(home).is_empty());
+        state.search.replace_text(&title);
         assert_eq!(
             state
-                .visible_captain_workers(new_home)
+                .searched_workers()
                 .iter()
                 .map(|index| state.threads[*index].id)
                 .collect::<Vec<_>>(),
             vec![member]
         );
+        // The old home no longer claims the member: search rows follow live membership.
+        let member_index = state.threads.iter().position(|t| t.id == member).unwrap();
+        assert!(!state.captain_worker(&state.threads[member_index], home));
+        assert!(state.captain_worker(&state.threads[member_index], new_home));
         std::fs::remove_dir_all(&state.data_dir).ok();
     }
 

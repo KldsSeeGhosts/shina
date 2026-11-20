@@ -23,7 +23,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
     let mut entries = Vec::new();
     let searching = !s.search.text.is_empty();
     let visible = s.visible_sidebar_threads();
-    for (captain, indices) in [(true, s.sidebar_captains()), (false, s.sidebar_threads())] {
+    let workers: std::collections::HashSet<usize> = s.searched_workers().into_iter().collect();
+    let mut ordinary = s.sidebar_threads();
+    ordinary.extend(workers.iter().copied());
+    for (captain, indices) in [(true, s.sidebar_captains()), (false, ordinary)] {
         for index in indices {
             let thread = &s.threads[index];
             let title_match = !searching || s.thread_title_search_matches(thread);
@@ -46,7 +49,10 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 projection: None,
                 view: null_view(),
                 children: Vec::new(),
-                visible: captain || searching || visible.contains(&index),
+                visible: captain
+                    || searching
+                    || visible.contains(&index)
+                    || workers.contains(&index),
                 title_match,
                 search_hit,
             });
@@ -119,10 +125,18 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 .as_u64()
                 .and_then(|parent| metadata.get(&(parent as usize)))
                 .is_some_and(|parent| parent["captainHome"] != true);
+            // Captain workers list flat during search and in the archive, like local ones.
+            let crew_worker = record["delegated"] == true
+                && !standalone_child
+                && record["parent"]
+                    .as_u64()
+                    .and_then(|parent| metadata.get(&(parent as usize)))
+                    .is_some_and(|parent| parent["captainHome"] == true)
+                && (!query.is_empty() || s.show_archive);
             // Workspace IDs are paired with their server, including filter selections.
             if life.archived_at.is_some() != s.show_archive
                 || !in_scope
-                || record["delegated"] == true && !standalone_child
+                || record["delegated"] == true && !standalone_child && !crew_worker
             {
                 continue;
             }
@@ -286,7 +300,7 @@ fn null_view() -> &'static crate::client_history::ThreadProjection {
 
 pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
     if let Some(index) = entry.local {
-        return thread_row(s, index, p, false);
+        return thread_row(s, index, p);
     }
     let record = entry.record.expect("remote record");
     let projection = entry.projection.expect("remote projection");
@@ -551,48 +565,75 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
                 .child(icon(if entry.draft { "edit" } else { "pin" }, p.muted)),
         );
     }
-    meta = meta
-        .child(project_tile(s, p, project_tile_data.as_ref(), 16.0))
-        .child(
-            rune::row()
-                .grow(1.0)
-                .min_w(0.0)
-                .gap(8.0)
-                .center_y()
-                .child(
-                    label(workspace, CARD_META, p.muted)
-                        .key(format!("machine-workspace-{}-{id}", entry.server))
-                        .truncate()
-                        .shrink()
-                        .beside_tag(
-                            true,
-                            sidebar_row_width(s) - 2.0 * ROW_INSET,
-                            16.0 + ICON + slot_width(age.as_deref()) + 32.0,
-                            workspace,
-                        )
-                        .min_w(workspace_floor(
+    // A remote worker carries its captain's portrait and name where the project tile sits.
+    let worker_captain = (!entry.captain && record["delegated"] == true)
+        .then(|| {
+            record["captain"]
+                .as_u64()
+                .and_then(|index| projection["index"]["captains"].get(index as usize))
+        })
+        .flatten();
+    let (meta_tile, meta_name) = match worker_captain {
+        Some(captain) => {
+            let name = captain["name"].as_str().unwrap_or("Crew").to_string();
+            let portrait = captain["portrait"].as_u64().unwrap_or(0) as usize;
+            let pixels = s.artwork.face_pixels(portrait, face_for(status), 16.0);
+            (
+                pixel_portrait(s, &pixels, 16.0, p)
+                    .key(format!("machine-captain-portrait-{}-{id}", entry.server))
+                    .a11y_hidden(),
+                name,
+            )
+        }
+        None => (
+            project_tile(s, p, project_tile_data.as_ref(), 16.0),
+            workspace.to_string(),
+        ),
+    };
+    meta = meta.child(meta_tile).child(
+        rune::row()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(8.0)
+            .center_y()
+            .child(
+                label(meta_name.clone(), CARD_META, p.muted)
+                    .key(format!("machine-workspace-{}-{id}", entry.server))
+                    .truncate()
+                    .shrink()
+                    .beside_tag(
+                        true,
+                        sidebar_row_width(s) - 2.0 * ROW_INSET,
+                        16.0 + ICON + slot_width(age.as_deref()) + 32.0,
+                        &meta_name,
+                    )
+                    .min_w(if worker_captain.is_some() {
+                        0.0
+                    } else {
+                        workspace_floor(
                             sidebar_row_width(s) - 2.0 * ROW_INSET,
                             // The project tile, the machine icon, the status or age text and
                             // the gaps between them.
                             16.0 + ICON + slot_width(age.as_deref()) + 32.0,
-                            workspace,
-                        )),
-                )
-                .child(machine_tag(
-                    s,
-                    p,
-                    entry.server,
-                    format!("machine-tag-{}-{id}", entry.server),
-                    CARD_META,
-                    room_for_machine_name(
-                        sidebar_row_width(s) - 2.0 * ROW_INSET,
-                        16.0 + ICON + slot_width(age.as_deref()) + 32.0,
-                        workspace,
-                    ),
-                ))
-                // The machine sits 8 px after the workspace; the free space comes after it.
-                .child(spacer()),
-        );
+                            &meta_name,
+                        )
+                    }),
+            )
+            .child(machine_tag(
+                s,
+                p,
+                entry.server,
+                format!("machine-tag-{}-{id}", entry.server),
+                CARD_META,
+                room_for_machine_name(
+                    sidebar_row_width(s) - 2.0 * ROW_INSET,
+                    16.0 + ICON + slot_width(age.as_deref()) + 32.0,
+                    workspace,
+                ),
+            ))
+            // The machine sits 8 px after the workspace; the free space comes after it.
+            .child(spacer()),
+    );
     if let Some(age) = age {
         let ink = if status == Status::Waiting {
             p.brass
