@@ -25319,6 +25319,16 @@ pub(crate) mod tests {
             mods: Default::default(),
         });
         rt.frame(0.0);
+        // Primary press opens the Inspector on Context (spec §4.4).
+        assert_eq!(
+            rt.state.right_panel_active_view(),
+            Some(crate::right_panel::PanelView::Context)
+        );
+        // Secondary press pins the hover popover (spec §4.4).
+        let (rx, ry) = rt.find("context-usage-ring").unwrap();
+        rt.secondary_down(rx, ry);
+        rt.secondary_up(rx, ry);
+        rt.frame(0.3);
         assert_eq!(
             rt.elements()
                 .into_iter()
@@ -25354,22 +25364,31 @@ pub(crate) mod tests {
             Some("context-usage-ring".to_owned()),
             "opening details keeps keyboard focus on the ring"
         );
+        // Escape closes the pinned popover; Space and primary press toggle the Context tab.
         rt.key(rune::KeyEvent {
-            key: rune::Key::Text(" ".into()),
+            key: rune::Key::Escape,
             mods: Default::default(),
         });
         rt.frame(0.5);
         assert!(
             rt.find("context-details").is_none(),
-            "Space toggles the same disclosure as a press"
+            "Escape closes the details popover"
         );
         assert!(!rt.state.current().context.details_open);
 
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Text(" ".into()),
+            mods: Default::default(),
+        });
+        rt.frame(0.3);
+        assert_eq!(rt.state.right_panel_active_view(), None);
+
         press(&mut rt, "context-usage-ring");
-        rt.frame(0.0);
-        assert!(
-            rt.state.current().context.details_open,
-            "pointer activation remains available too"
+        rt.frame(0.3);
+        assert_eq!(
+            rt.state.right_panel_active_view(),
+            Some(crate::right_panel::PanelView::Context),
+            "pointer activation toggles the Inspector on Context"
         );
     }
 
@@ -25416,7 +25435,10 @@ pub(crate) mod tests {
             "the unknown state keeps its dashed ring"
         );
 
-        press(&mut rt, "context-usage-ring");
+        // Secondary press pins the details popover (primary press toggles Context tab).
+        let (rx, ry) = rt.find("context-usage-ring").unwrap();
+        rt.secondary_down(rx, ry);
+        rt.secondary_up(rx, ry);
         rt.frame(0.5);
         let (details, _) = rt.presented("context-details").unwrap();
         assert!(
@@ -25568,10 +25590,27 @@ pub(crate) mod tests {
                 rt.frame(0.0);
             }
             assert_eq!(focused_key(&rt).as_deref(), Some("context-usage-ring"));
+            // Enter toggles the Inspector on Context (spec §4.4).
             rt.key(rune::KeyEvent {
                 key: rune::Key::Enter,
                 mods: Default::default(),
             });
+            rt.frame(0.3);
+            assert_eq!(
+                rt.state.right_panel_active_view(),
+                Some(crate::right_panel::PanelView::Context),
+                "{width}: Enter opens Context tab"
+            );
+            // Close the Inspector, then pin the hover popover via secondary press and close with Escape.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Enter,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+            rt.frame(1.0);
+            let (rx, ry) = rt.find("context-usage-ring").unwrap();
+            rt.secondary_down(rx, ry);
+            rt.secondary_up(rx, ry);
             rt.frame(0.3);
             assert!(rt.find("context-details").is_some(), "{width}: Enter");
             assert_eq!(rt.presented("composer").unwrap().0, composer, "{width}");
@@ -25920,10 +25959,9 @@ pub(crate) mod tests {
                 rt.frame(0.0);
             }
             assert_eq!(focused_key(&rt).as_deref(), Some("context-usage-ring"));
-            rt.key(rune::KeyEvent {
-                key: rune::Key::Enter,
-                mods: Default::default(),
-            });
+            let (rx, ry) = rt.find("context-usage-ring").unwrap();
+            rt.secondary_down(rx, ry);
+            rt.secondary_up(rx, ry);
             rt.frame(1.0);
 
             assert!(rt.presented("context-details-bar").is_none(), "{width}");

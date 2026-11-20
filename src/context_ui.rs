@@ -843,6 +843,7 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView, left_o
         .gap(6.0)
         .center_y()
         .radius(6.0)
+        .fill(Color::TRANSPARENT)
         .hover(hover_wash(s, p))
         .hover_motion(motion(), motion())
         .hover_group_focus();
@@ -851,60 +852,62 @@ fn memory_row(s: &State, p: Palette, captain: usize, memory: &MemoryView, left_o
         return row_;
     }
     let toggle_id = id.clone();
-    row_ = row_.child(captain_ui::switch(
-        s,
-        &format!("memory-pin-{id}"),
-        "Always in context",
-        essential,
-        p,
-        move |s: &mut State| {
-            let result = s.set_memory_essential(captain, &toggle_id, !essential);
-            report(s, result);
-        },
-    ));
     let edit_id = id.clone();
+    let delete_id = id.clone();
     let text_value = memory.text.clone();
     let wash = hover_wash(s, p);
     let backing = p.panel.mix(wash, wash.a);
-    row_.child(
-        row()
-            .key(format!("memory-actions-{id}"))
-            .pin(None, Some(4.0), Some(4.0), None)
-            .gap(2.0)
-            .px(2.0)
-            .radius(6.0)
-            .fill(backing)
-            .child(
-                captain_ui::icon_action(
-                    s,
-                    format!("memory-edit-{id}"),
-                    "Edit memory",
-                    icon("edit", p.muted),
-                    p,
-                    |_| {},
+    row_ = row_
+        .child(
+            row()
+                .key(format!("memory-actions-{id}"))
+                .gap(2.0)
+                .px(2.0)
+                .radius(6.0)
+                .fill(backing)
+                .child(
+                    captain_ui::icon_action(
+                        s,
+                        format!("memory-edit-{id}"),
+                        "Edit memory",
+                        icon("edit", p.muted),
+                        p,
+                        |_| {},
+                    )
+                    .on_press_tx(move |s: &mut State, tx| {
+                        s.brief.adding = false;
+                        s.brief.editing = Some(edit_id.clone());
+                        s.brief.edit = rune::TextEdit::default();
+                        s.brief.edit.replace_text(&text_value);
+                        s.brief.edit.focused = true;
+                        tx.scroll_into_view(format!("memory-input-{edit_id}-editor"));
+                    }),
                 )
-                .on_press_tx(move |s: &mut State, tx| {
-                    s.brief.adding = false;
-                    s.brief.editing = Some(edit_id.clone());
-                    s.brief.edit = rune::TextEdit::default();
-                    s.brief.edit.replace_text(&text_value);
-                    s.brief.edit.focused = true;
-                    tx.scroll_into_view(format!("memory-input-{edit_id}-editor"));
-                }),
-            )
-            .child(captain_ui::icon_action(
-                s,
-                format!("memory-delete-{id}"),
-                "Delete memory",
-                icon("trash", p.muted),
-                p,
-                move |s| {
-                    let result = s.delete_memory(captain, &id);
-                    report(s, result);
-                },
-            ))
-            .group_opacity(0.0, 1.0),
-    )
+                .child(captain_ui::icon_action(
+                    s,
+                    format!("memory-delete-{id}"),
+                    "Delete memory",
+                    icon("trash", p.muted),
+                    p,
+                    move |s| {
+                        let result = s.delete_memory(captain, &delete_id);
+                        report(s, result);
+                    },
+                ))
+                .group_opacity(0.0, 1.0),
+        )
+        .child(captain_ui::switch(
+            s,
+            &format!("memory-pin-{id}"),
+            "Always in context",
+            essential,
+            p,
+            move |s: &mut State| {
+                let result = s.set_memory_essential(captain, &toggle_id, !essential);
+                report(s, result);
+            },
+        ));
+    row_
 }
 
 /// The profile row inside the Memory section: `profile_item` with its byte
@@ -1657,7 +1660,7 @@ pub(super) fn tab(s: &State, p: Palette) -> El {
     let t = s.current();
     let captain = captain_ui::home_brief_captain(s);
     let crew_captain = t.crew_captain.filter(|captain| *captain < s.captains.len());
-    let mut body = col().key("context-tab").min_h(0.0).w_full().pb(8.0);
+    let mut body = col().min_h(0.0).w_full().pb(8.0);
     if let Some(error) = captain_ui::brief_error_banner(s, p) {
         body = body.child(error);
     }
@@ -1716,6 +1719,7 @@ pub(super) fn tab(s: &State, p: Palette) -> El {
         }
     }
     col()
+        .key("context-tab")
         .grow(1.0)
         .min_h(0.0)
         .w_full()
