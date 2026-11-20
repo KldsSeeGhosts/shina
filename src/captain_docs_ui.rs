@@ -16,7 +16,7 @@ use crate::model::{DiscardKind, DocDiscard, DocumentDraft, DocumentDraftKey, Dra
 /// The document's hard size cap, shared with the context budget a whole document can cost.
 const TEXT_CAP: usize = 64 * 1024;
 
-const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
+const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
 /// What each crew reads from the document every turn: the captain reads AGENTS.md and
 /// NOTES.md itself, CREW.md goes to crew threads, the digest is read on demand.
@@ -242,7 +242,7 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
                         "{captain_name} or another window changed {} after you started editing. Your draft is kept.",
                         document_title(&key.name)
                     ),
-                    TextStyle::new(11.5, 430.0),
+                    TextStyle::new(12.0, 500.0),
                     p.ink,
                 )
                 .wrap()
@@ -309,7 +309,7 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
                 )),
         );
     }
-    let source_style = TextStyle::new(12.0, 420.0)
+    let source_style = TextStyle::new(12.0, 400.0)
         .lh(18.0)
         .family(rune::Family::SystemMono);
     if saving {
@@ -524,7 +524,7 @@ fn error_row(key: &str, message: &str, p: Palette) -> El {
         .fill(p.danger.alpha(0.08))
         .child(icon("alert", p.danger))
         .child(
-            label(message, TextStyle::new(11.5, 430.0), p.danger)
+            label(message, TextStyle::new(12.0, 500.0), p.danger)
                 .wrap()
                 .grow(1.0)
                 .min_w(0.0),
@@ -559,7 +559,7 @@ pub(super) fn discard_dialog(s: &State, p: Palette) -> Option<El> {
         .child(
             label(
                 "Your draft has not been saved.",
-                TextStyle::new(12.5, 430.0),
+                TextStyle::new(13.0, 400.0),
                 p.muted,
             )
             .wrap(),

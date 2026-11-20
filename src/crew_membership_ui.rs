@@ -207,7 +207,7 @@ fn menu_row(
         .child(
             label(
                 title,
-                TextStyle::new(13.0, 450.0),
+                TextStyle::new(13.0, 500.0),
                 if disabled { p.faint } else { p.ink },
             )
             .grow(1.0)
@@ -225,7 +225,7 @@ fn menu_row(
     row_
 }
 
-const META_MENU: TextStyle = TextStyle::new(11.0, 430.0);
+const META_MENU: TextStyle = TextStyle::new(12.0, 500.0);
 
 /// Report a crew command's outcome on the Brief's error line; a pending id needs no banner.
 fn report_mutation(s: &mut State, result: Result<crate::model::CrewMutation, String>) {
@@ -319,7 +319,7 @@ pub(super) fn move_picker(s: &State, p: Palette) -> Option<El> {
                     .child(
                         label(
                             &name,
-                            TextStyle::new(13.0, 470.0),
+                            TextStyle::new(13.0, 500.0),
                             if reason.is_some() { p.faint } else { p.ink },
                         )
                         .truncate(),
@@ -456,7 +456,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
             .fill(field_fill(s, p))
             .child({
                 let picker_focus = "crew-recruit-search".to_string();
-                text_input(&picker.query, TextStyle::new(13.0, 430.0))
+                text_input(&picker.query, TextStyle::new(13.0, 400.0))
                     .placeholder("Search threads", p.faint)
                     .color(p.ink)
                     .w_full()
@@ -603,7 +603,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
                     })
                     .child(icon("thread", p.muted))
                     .child(
-                        label(title, TextStyle::new(13.0, 470.0), p.ink)
+                        label(title, TextStyle::new(13.0, 500.0), p.ink)
                             .truncate()
                             .grow(1.0)
                             .min_w(0.0),
@@ -645,7 +645,7 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<E
                         col()
                             .grow(1.0)
                             .min_w(0.0)
-                            .child(label(title, TextStyle::new(13.0, 470.0), p.faint).truncate())
+                            .child(label(title, TextStyle::new(13.0, 500.0), p.faint).truncate())
                             .child(
                                 label(reason, META_MENU, p.faint)
                                     .key(format!("crew-recruit-reason-{id}"))

@@ -18,9 +18,9 @@ use crate::model::{RecoveryMode, ReportPolicy};
 use serde_json::Value;
 
 /// KSG's `text-[13px] font-medium` detail rows, matching `captain_ui::ROW_TEXT`.
-const ROW_TEXT: TextStyle = TextStyle::new(13.0, 470.0).lh(19.0).tracking(-0.08);
+const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
 /// The quiet meta line under a row's title.
-const META: TextStyle = TextStyle::new(11.5, 430.0).lh(16.0);
+const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
 /// How many entries each group shows before its Show more button takes over:
 /// Needs you 3, What's new 2, In progress 3.

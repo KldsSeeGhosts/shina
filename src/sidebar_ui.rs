@@ -688,7 +688,7 @@ pub(super) fn row(s: &State, p: Palette, entry: &Entry<'_>) -> El {
         if shelved {
             LABEL
         } else {
-            TextStyle::new(14.0, 520.0)
+            TextStyle::new(14.0, 500.0)
         },
         p.ink,
     )

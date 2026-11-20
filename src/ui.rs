@@ -390,15 +390,15 @@ fn lane_width(pane_width: f32, wide: bool) -> f32 {
 /// Live timers and counts use tabular figures, so "12m 05s" never shifts as a digit changes.
 const TABULAR: &str = "'tnum' 1";
 const TIMER: TextStyle = META.features(TABULAR);
-const LABEL: TextStyle = TextStyle::new(14.0, 430.0).tracking(-0.10);
-const SMALL: TextStyle = TextStyle::new(12.0, 420.0);
+const LABEL: TextStyle = TextStyle::new(14.0, 400.0).tracking(-0.10);
+const SMALL: TextStyle = TextStyle::new(12.0, 400.0);
 /// The project line of a sidebar card.
-const CARD_META: TextStyle = TextStyle::new(12.5, 430.0);
+const CARD_META: TextStyle = TextStyle::new(13.0, 400.0);
 /// Sidebar rows sit 8 px in from the sidebar's edge, and their content 12 px inside that, so
 /// icons and text share one left edge with the title strip and footer.
 const ROW_INSET: f32 = 12.0;
 /// Tool, thinking and status lines in the transcript.
-const ACTIVITY: TextStyle = TextStyle::new(13.0, 420.0).tracking(-0.08);
+const ACTIVITY: TextStyle = TextStyle::new(13.0, 400.0).tracking(-0.08);
 /// A text field's focus look, shared by every field: KSG's 1 px `--input` border that turns the
 /// `--ring` blue while the field has focus. Put it on the box that draws the field's edge.
 trait FieldFocus {
@@ -512,7 +512,7 @@ fn meta_text(value: impl Into<String>, ink: Color) -> El {
     label(value, META, ink)
 }
 fn button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
-    button_in(key, title, TextStyle::new(12.0, 450.0), p, action)
+    button_in(key, title, TextStyle::new(12.0, 500.0), p, action)
 }
 /// A quiet button with a 12 px Inter label, for the rows of state under the composer.
 fn meta_button(key: &str, title: &str, p: Palette, action: impl Fn(&mut State) + 'static) -> El {
@@ -2072,7 +2072,7 @@ fn option_row_text(name: &str, value: &str, p: Palette) -> El {
         .grow(1.0)
         .min_w(0.0)
         .child(label(name, META, p.muted).truncate())
-        .child(label(value, TextStyle::new(13.0, 450.0), p.ink).truncate())
+        .child(label(value, TextStyle::new(13.0, 500.0), p.ink).truncate())
 }
 
 /// KSG's small `Switch`: a 28 x 16 track with a 12 pt knob.
@@ -2786,13 +2786,13 @@ fn effort_slider_with_levels(
         row()
             .child(label(
                 effort_name(&levels[0]),
-                TextStyle::new(11.0, 450.0),
+                TextStyle::new(12.0, 500.0),
                 p.muted,
             ))
             .child(spacer())
             .child(label(
                 effort_name(&levels[count - 1]),
-                TextStyle::new(11.0, 450.0),
+                TextStyle::new(12.0, 500.0),
                 p.muted,
             )),
     )
@@ -3073,7 +3073,7 @@ fn model_list(
     let snap = picker_snapshot(s);
     let show_sidebar = !snap.is_searching && !snap.sidebar_entries.is_empty();
 
-    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 420.0))
+    let mut search_field = text_input(&s.model_search, TextStyle::new(13.0, 400.0))
         .key("model-search")
         .label("Search models")
         .placeholder("Search models...", p.muted)
@@ -3311,7 +3311,7 @@ fn model_list(
 
         // KSG's `ModelListRow`: the name with a check when selected, then its badges.
         let mut name_row = row().center_y().gap(6.0).min_w(0.0).child(
-            label(&display_name, TextStyle::new(13.0, 450.0), p.ink)
+            label(&display_name, TextStyle::new(13.0, 500.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
@@ -3486,7 +3486,7 @@ fn model_list(
                 })
                 .child(label(
                     if *expanded { "Show less" } else { "Show more" },
-                    TextStyle::new(13.0, 450.0),
+                    TextStyle::new(13.0, 500.0),
                     p.muted,
                 )),
         );
@@ -3675,6 +3675,21 @@ fn model_list(
     card.child(body)
 }
 
+/// A harness's display name: "Pi", "Codex", "Claude" for the built-ins, the registry's
+/// configured name for ACP agents, or a generic "agent" when the id is unknown.
+fn harness_name<'a>(s: &'a State, id: &'a str) -> &'a str {
+    match id {
+        "pi" => "Pi",
+        "codex" => "Codex",
+        "claude" => "Claude",
+        id => s
+            .harnesses
+            .agents
+            .iter()
+            .find(|agent| agent.id == id)
+            .map_or("agent", |agent| agent.name.as_str()),
+    }
+}
 /// A harness row's mark, as KSG Code's `ProviderInstanceIcon` draws an ACP agent: the vendor's
 /// mark when the agent names one, Pi's own glyph, or a generic agent glyph.
 fn harness_icon(s: &State, p: Palette, id: &str, name: &str) -> El {
@@ -3918,7 +3933,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .px(ROW_INSET)
                     .gap(8.0)
                     .center_y()
-                    .radius(6.0)
+                    .radius(8.0)
                     .grow(1.0)
                     .min_w(0.0)
                     // A field: a 1 px `line` border, and a 2 px coral border while focused.
@@ -4023,7 +4038,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(icon("archive", p.muted))
-                .child(label("Archive", TextStyle::new(13.0, 560.0), p.ink))
+                .child(label("Archive", TextStyle::new(13.0, 600.0), p.ink))
                 .child(spacer())
                 .child(
                     label("Back", SMALL, p.muted)
@@ -4423,7 +4438,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .press(p.selected)
                 .on_press(|s: &mut State| s.undo_thread_action())
                 .child(
-                    label(title, TextStyle::new(12.0, 450.0), p.ink)
+                    label(title, TextStyle::new(12.0, 500.0), p.ink)
                         .truncate()
                         .grow(1.0)
                         .min_w(0.0),
@@ -4526,7 +4541,7 @@ fn menu_item_in(
         .autofocus()
         .child(el().size(ICON, ICON).center().child(icon(glyph, icon_ink)))
         .child(
-            label(title, TextStyle::new(13.0, 450.0), ink)
+            label(title, TextStyle::new(13.0, 500.0), ink)
                 .grow(1.0)
                 .min_w(0.0)
                 .truncate(),
@@ -4772,7 +4787,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                     .radius(12.0)
                     .fill(p.sea_bg)
                     .child(icon("send", p.sea))
-                    .child(label(title, TextStyle::new(12.5, 520.0), p.sea)),
+                    .child(label(title, TextStyle::new(13.0, 500.0), p.sea)),
             )
         }
         Status::Ready { update } => {
@@ -4796,7 +4811,7 @@ fn update_row(s: &State, p: Palette) -> Option<El> {
                 .disabled(blocker.is_some())
                 .a11y_value(description.unwrap_or_default())
                 .child(icon("send", p.sea))
-                .child(label(title, TextStyle::new(12.5, 520.0), p.sea));
+                .child(label(title, TextStyle::new(13.0, 500.0), p.sea));
             if blocker.is_none() {
                 button = button
                     .focusable(true)
@@ -4828,7 +4843,7 @@ fn update_everything_button(summary: &str, p: Palette) -> El {
         .hover(p.selected)
         .on_press(|s: &mut State| s.open_fleet())
         .child(icon("send", p.sea))
-        .child(label(summary, TextStyle::new(12.5, 520.0), p.sea))
+        .child(label(summary, TextStyle::new(13.0, 500.0), p.sea))
 }
 
 /// The run capsule that replaces the footer control, KSG `SidebarUpdateCapsule`.
@@ -5188,8 +5203,8 @@ const BADGE_SLOT: f32 = 28.0;
 const CAPTAIN_TEXT_INSET: f32 = 6.0 + CAPTAIN_SLOT + 10.0 + 8.0;
 /// Room for "59m 59s" at the end of the status line.
 const TIMER_SLOT: f32 = 48.0;
-const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 560.0).tracking(-0.15);
-const CAPTAIN_STATUS: TextStyle = TextStyle::new(12.5, 460.0);
+const CAPTAIN_NAME: TextStyle = TextStyle::new(14.0, 600.0).tracking(-0.15);
+const CAPTAIN_STATUS: TextStyle = TextStyle::new(13.0, 500.0);
 
 /// A sidebar portrait. It plays its status's animation strip through the shared stage in
 /// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
@@ -5802,7 +5817,7 @@ fn thread_row(s: &State, index: usize, p: Palette) -> El {
         if shelved {
             LABEL
         } else {
-            TextStyle::new(14.0, 520.0).tracking(-0.10)
+            TextStyle::new(14.0, 500.0).tracking(-0.10)
         },
         // Settled and snoozed rows recede.
         if quiet && shelved { p.muted } else { p.ink },
@@ -6184,7 +6199,7 @@ fn slot_width(text: Option<&str>) -> f32 {
     text.map_or(14.0, |text| text.chars().count() as f32 * 6.6)
 }
 
-/// About how wide `text` is at the sidebar's 12.5 px.
+/// About how wide `text` is at the sidebar's 13 px.
 pub(super) fn text_width(text: &str) -> f32 {
     text.chars().count() as f32 * 6.2
 }
@@ -6371,7 +6386,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
             .min_w(0.0)
             .child(icon("search", p.muted))
             .child(
-                text_input(&s.captain_picker_query, TextStyle::new(13.0, 420.0))
+                text_input(&s.captain_picker_query, TextStyle::new(13.0, 400.0))
                     .key("captain-search")
                     .label("Search captains")
                     .placeholder("Search captains", p.muted)
@@ -6442,7 +6457,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         })
         .child(icon("user", p.muted).size(16.0, 16.0))
         .child(
-            label("No captain", TextStyle::new(13.5, 450.0), p.ink)
+            label("No captain", TextStyle::new(14.0, 500.0), p.ink)
                 .truncate()
                 .grow(1.0)
                 .min_w(0.0),
@@ -6494,7 +6509,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
                     .grow(1.0)
                     .min_w(0.0)
                     .child(
-                        label(&profile.name, TextStyle::new(13.5, 500.0), p.ink)
+                        label(&profile.name, TextStyle::new(14.0, 500.0), p.ink)
                             .truncate()
                             .min_w(0.0),
                     )
@@ -6547,7 +6562,7 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .focus_fill(p.selected)
         .on_press(|s: &mut State| s.begin_new_captain())
         .child(icon("plus", p.muted))
-        .child(label("New captain", TextStyle::new(13.5, 450.0), p.ink));
+        .child(label("New captain", TextStyle::new(14.0, 500.0), p.ink));
     card = card.child(col().py(4.0).child(new_captain));
 
     card.anchored_fit(
@@ -7002,20 +7017,36 @@ const TAB_GAP: f32 = 4.0;
 /// A tab is 32 pt tall, so in the 40 pt top strip its bottom frame sits 4 pt above the chat
 /// pane's top rule, the same distance as its top edge sits below the window edge.
 const TAB_HEIGHT: f32 = 32.0;
-/// Below this a tab drops its workspace prefix and keeps the title.
+/// Below this a tab drops its leading icon and keeps the title.
 const TAB_PREFIX_WIDTH: f32 = 170.0;
 /// The narrowest a tab gets before the strip scrolls.
 const TAB_MIN_WIDTH: f32 = 120.0;
 /// Tabs are packed from the left and stop growing here, so a few tabs do not sit in wide empty
 /// slots.
 const TAB_MAX_WIDTH: f32 = 260.0;
-/// Inter 13/520, the title in a tab.
-const TAB_TITLE: TextStyle = TextStyle::new(13.0, 520.0);
+/// Inter 13/500, the title in a tab.
+const TAB_TITLE: TextStyle = TextStyle::new(13.0, 500.0);
+/// The 16 px leading icon in a tab, KSG `PaneTabs`' `ProjectFavicon`. Captain homes and
+/// captain workers show the captain's face instead of the project tile, matching the
+/// portrait the sidebar's captain rows lead with.
+fn tab_icon(s: &State, p: Palette, thread: &Thread) -> El {
+    let captain = if s.is_captain_home(thread) {
+        thread.captain
+    } else {
+        thread.crew_captain
+    };
+    if let Some(captain) = captain {
+        return avatar(s, p, captain, 16.0, s.captain_status(captain)).a11y_hidden();
+    }
+    project_tile(s, p, s.project(thread.project), 16.0)
+}
 /// A tab's look, as KSG's chat tabs: the active tab is a `card` with a hairline and 8 px
 /// corners. Others have no fill.
 fn tab_frame(tab: El, active: bool, p: Palette) -> El {
     if !active {
-        return tab.hover(p.selected);
+        // The hover block matches the active tab's 8 px corners, so a tab's fill
+        // never shifts shape as it activates.
+        return tab.hover(p.selected).radius(8.0);
     }
     tab.fill(p.card).radius(8.0).border(1.0, p.line)
 }
@@ -7080,7 +7111,7 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
                 .pl(8.0)
                 .pr(if s.tabs.len() > 1 { 2.0 } else { 8.0 })
                 .h(TAB_HEIGHT)
-                .radius(6.0)
+                .radius(8.0)
                 .w(tab_width)
                 .min_w(tab_width)
                 .hover_group()
@@ -7103,7 +7134,9 @@ fn header(s: &State, p: Palette, narrow: bool, tabs_width: f32) -> El {
             p,
         )
         .child(if tab_width >= TAB_PREFIX_WIDTH {
-            meta_text(project, p.muted).max_w(85.0).truncate()
+            // KSG's `PaneTabs` leads with the project favicon; captain homes and
+            // their workers show the captain's face instead.
+            tab_icon(s, p, thread)
         } else {
             // A tab at its minimum gives the width to the title.
             el()
@@ -8847,7 +8880,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                         .child(icon("search", p.muted)),
                 )
                 .child(
-                    rune::text_input(&s.picker_query, TextStyle::new(15.0, 420.0).tracking(-0.15))
+                    rune::text_input(&s.picker_query, TextStyle::new(15.0, 400.0).tracking(-0.15))
                         .key("picker-search")
                         .label(placeholder)
                         .placeholder(placeholder, p.muted)
@@ -9013,7 +9046,7 @@ fn project_picker(s: &State, p: Palette) -> El {
                 _ => project_tile(s, p, project, 16.0),
             })
             .child(
-                label(name.as_str(), TextStyle::new(14.0, 480.0), p.ink)
+                label(name.as_str(), TextStyle::new(14.0, 500.0), p.ink)
                     .truncate()
                     .shrink()
                     .min_w(0.0),
@@ -9282,7 +9315,7 @@ fn palette_row(key: String, glyph: &str, title: &str, detail: &str, lit: bool, p
                 .gap(1.0)
                 .grow(1.0)
                 .min_w(0.0)
-                .child(label(title, TextStyle::new(14.0, 480.0), p.ink).truncate());
+                .child(label(title, TextStyle::new(14.0, 500.0), p.ink).truncate());
             if detail.is_empty() {
                 text
             } else {
@@ -9348,9 +9381,9 @@ fn add_project_palette(s: &State, p: Palette) -> El {
             rune::text_input(
                 &s.picker_query,
                 if browsing {
-                    TextStyle::new(15.0, 420.0).family(rune::Family::SystemMono)
+                    TextStyle::new(15.0, 400.0).family(rune::Family::SystemMono)
                 } else {
-                    TextStyle::new(15.0, 420.0).tracking(-0.15)
+                    TextStyle::new(15.0, 400.0).tracking(-0.15)
                 },
             )
             .key("picker-search")
@@ -9449,7 +9482,7 @@ fn add_project_palette(s: &State, p: Palette) -> El {
                 .hover(p.selected)
                 .disabled(s.client.is_some() && !s.machine_connected(&s.machines.selected))
                 .on_press(|s: &mut State| s.add_browsed_project())
-                .child(label(submit, TextStyle::new(12.5, 560.0), p.ink).key(
+                .child(label(submit, TextStyle::new(13.0, 600.0), p.ink).key(
                     if s.machines.selected == "local" {
                         "local-project-add"
                     } else {
@@ -13624,7 +13657,7 @@ fn draft_headline(s: &State, p: Palette, pane_width: f32) -> El {
                     .child(icon("plus", p.on_coral))
                     .child(label(
                         "Add workspace",
-                        TextStyle::new(13.0, 560.0),
+                        TextStyle::new(13.0, 600.0),
                         p.on_coral,
                     )),
                 p,
@@ -14565,7 +14598,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
     }
     let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
     let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
-    let action_style = TextStyle::new(12.0, 450.0);
+    let action_style = TextStyle::new(12.0, 500.0);
     let mut stack = col().key("composer-notices").w_full().gap(0.0);
     for (index, notice) in notices.iter().enumerate() {
         let top = index == 0;
@@ -15575,6 +15608,45 @@ fn composer_decorations(
     (spans, strikes)
 }
 
+/// What the above-composer stack needs besides the crew roster's member rows: each part's
+/// floor, plus the 8 px gaps. Heights are estimates of what keeps a part usable, matching
+/// the floors the parts themselves declare (the roster's header and footer, one needs-you
+/// card's chrome, the plan panel's header, list cap and footer, one queued message, one
+/// delegation bar).
+fn above_composer_others(s: &State) -> f32 {
+    let t = s.current();
+    let mut others = 0.0;
+    if crew_ui::parent_bar_shows(s) || crew_ui::crew_bar_shows(s) {
+        others += 68.0;
+    }
+    if crew_ui::needs_you_shows(s) {
+        others += 40.0;
+    }
+    if crew_ui::crew_tray_shows(s) {
+        others += 58.0;
+    }
+    if s.plan_panel_open() {
+        // The panel's header and footer plus the list's cap.
+        others += 68.0 + (s.viewport_height * 0.2).clamp(120.0, 300.0);
+    }
+    let queued = t.native.queue.len() + t.native.steering.len() + t.native.follow_ups.len();
+    if queued > 0 {
+        others += 48.0;
+    }
+    others + 40.0
+}
+/// Whether the crew roster can stay open under the composer's 40% viewport cap. The roster
+/// is the first part to collapse: it folds when its 150 pt of rows would push the stack
+/// past the cap, and opens again when the room comes back.
+fn roster_budget(s: &State, cap: f32) -> bool {
+    above_composer_others(s) + 150.0 <= cap
+}
+/// The height `above-composer-stack` needs when every part keeps what it cannot lose. The
+/// stack caps at 40% of the viewport, but never below this floor: a plan editor's controls
+/// or the last bar must stay usable no matter how short the window is.
+fn above_composer_floor(s: &State, fit: bool) -> f32 {
+    above_composer_others(s) + if fit { 150.0 } else { 0.0 }
+}
 /// Actions ported from KSG Code's ComposerPrimaryActions and useComposerResume.
 fn composer(
     s: &State,
@@ -15868,20 +15940,37 @@ fn composer(
         || t.native.operating() && t.queued_edit.is_none()
         || t.request.is_some();
     // Delegation context sits above the composer, nearest first: who sent this worker, then
-    // what the crew needs from the user, then what it is doing.
+    // what the crew needs from the user, then what it is doing. The stack caps at 40% of the
+    // viewport, and the crew roster gives room first: when an open roster would push the
+    // stack past the cap it draws collapsed (its header's count still reads), as the
+    // toggle's closed state does.
+    let cap = (s.viewport_height * 0.4).max(120.0);
+    let fit = roster_budget(s, cap);
+    // The stack never exceeds 40% of the viewport unless its parts' floors cannot meet that;
+    // then the cap yields to the floors rather than hiding controls.
+    let cap = cap.max(above_composer_floor(s, fit));
+    let needs_you_part = crew_ui::needs_you(s, p);
+    let tray = crew_ui::crew_tray(s, p, lane, fit);
+    let mut stack = col()
+        .key("above-composer-stack")
+        .w_full()
+        .gap(8.0)
+        .min_h(0.0)
+        .max_h(cap);
     for part in [
         crew_ui::parent_bar(s, p, lane),
         crew_ui::crew_bar(s, p, lane),
-        crew_ui::needs_you(s, p),
-        crew_ui::crew_tray(s, p, lane),
+        needs_you_part,
+        tray,
         plan_ui::plan_panel(s, p, lane),
     ]
     .into_iter()
     .flatten()
     {
-        area = area.child(part);
+        stack = stack.child(part);
     }
-    area = area.child(pi_ui::queued_messages(s, p));
+    stack = stack.child(pi_ui::queued_messages(s, p));
+    area = area.child(stack);
     // KSG Code's `ComposerSurface.Main`: a 15 px card with a hairline outline. A composer that
     // cannot send drops its shadow and its frame takes the lighter `line` colour.
     // The resting row and the prompt body swap at once, so a press right after expanding
@@ -15949,20 +16038,7 @@ fn composer(
         composer_style,
     )
     .key("composer-input")
-    .label(format!(
-        "Message {}",
-        match t.harness.as_str() {
-            "pi" => "Pi",
-            "codex" => "Codex",
-            "claude" => "Claude",
-            id => s
-                .harnesses
-                .agents
-                .iter()
-                .find(|agent| agent.id == id)
-                .map_or("agent", |agent| agent.name.as_str()),
-        }
-    ))
+    .label(format!("Message {}", harness_name(s, &t.harness)))
     .placeholder(
         if s.demo {
             "Open a real workspace to send messages".to_string()
@@ -16915,7 +16991,7 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         let title = env_mode_title(s, mode);
         let selected = active == mode;
         let disabled = force_worktree && mode == crate::model::ThreadEnvMode::Local;
-        let name = label(title, TextStyle::new(13.0, 450.0), p.ink)
+        let name = label(title, TextStyle::new(13.0, 500.0), p.ink)
             .truncate()
             .min_w(0.0);
         let mut item = row()
@@ -17012,7 +17088,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
             .min_w(0.0)
             .child(icon("search", p.muted))
             .child(
-                text_input(&s.base_branch_query, TextStyle::new(13.0, 420.0))
+                text_input(&s.base_branch_query, TextStyle::new(13.0, 400.0))
                     .key("base-branch-search")
                     .label("Search refs")
                     .placeholder("Search refs...", p.muted)
@@ -17117,7 +17193,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
                         s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
                     })
                     .child(
-                        label(&r.name, TextStyle::new(13.0, 450.0), p.ink)
+                        label(&r.name, TextStyle::new(13.0, 500.0), p.ink)
                             .truncate()
                             .grow(1.0)
                             .min_w(0.0),
@@ -17645,7 +17721,7 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
     let mut details = col()
         .padding(16.0)
         .gap(16.0)
-        .child(label(&t.title, TextStyle::new(14.0, 560.0), p.ink).wrap())
+        .child(label(&t.title, TextStyle::new(14.0, 600.0), p.ink).wrap())
         .child(status(t.status, p))
         .child(rule(p))
         .child(
@@ -17660,9 +17736,9 @@ fn activity(s: &State, p: Palette, narrow: bool) -> El {
                 .child(meta_label("Conversation", p.muted))
                 .child(label(
                     if t.session.is_some() {
-                        "Saved locally by Pi"
+                        format!("Saved locally by {}", harness_name(s, &t.harness))
                     } else {
-                        "No saved session yet"
+                        "No saved session yet".to_string()
                     },
                     LABEL,
                     p.ink,
@@ -22009,7 +22085,7 @@ pub(crate) mod tests {
                 continue;
             };
             if key.starts_with("routine-schedule-") {
-                // "Weekdays at 9:00" is 16 cells of about 6 pt at 11.5 px.
+                // "Weekdays at 9:00" is 16 cells of about 6 pt at 12 px.
                 let text = element.text.clone().unwrap_or_default();
                 assert!(
                     element.rect[2] >= text.chars().count() as f32 * 5.0,
