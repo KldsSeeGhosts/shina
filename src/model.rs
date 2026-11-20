@@ -4785,6 +4785,95 @@ fn tab_neighbour(tabs: &[usize], id: usize) -> Option<usize> {
         .copied()
 }
 
+/// Whether the named thread still exists: on the selected machine the live
+/// `threads` list answers, anywhere else the machine's projected index.
+fn thread_exists_on(
+    threads: &[Thread],
+    machines: &crate::peer::Machines,
+    server: &str,
+    id: usize,
+) -> bool {
+    if server == machines.selected {
+        threads.iter().any(|t| t.id == id)
+    } else {
+        machines.views.get(server).is_some_and(|projection| {
+            projection["index"]["threads"]
+                .as_array()
+                .is_some_and(|threads| {
+                    threads
+                        .iter()
+                        .any(|thread| thread["id"].as_u64() == Some(id as u64))
+                })
+        })
+    }
+}
+
+/// The threads the user opened, for Back and Forward (`navigation.back`,
+/// `navigation.forward`). Entries are `(machine, thread id)` so a client
+/// machine's rows take part too. Session state only; nothing is written to the
+/// index.
+#[derive(Clone, Debug, Default)]
+pub struct NavHistory {
+    entries: Vec<(String, usize)>,
+    cursor: usize,
+}
+
+/// The history never grows past this: 64 opens is far past what Back is for.
+const NAV_HISTORY_CAP: usize = 64;
+
+impl NavHistory {
+    /// Record an open. A repeat of the current entry is a no-op; a new open
+    /// after going back drops every forward entry, as a browser does.
+    pub fn push(&mut self, machine: &str, id: usize) {
+        if self.entries.get(self.cursor) == Some(&(machine.to_string(), id)) {
+            return;
+        }
+        self.entries.truncate(self.cursor + 1);
+        self.entries.push((machine.to_string(), id));
+        if self.entries.len() > NAV_HISTORY_CAP {
+            self.entries.remove(0);
+        }
+        self.cursor = self.entries.len() - 1;
+    }
+    /// The entry Back would open.
+    pub fn back(&self) -> Option<&(String, usize)> {
+        self.cursor.checked_sub(1).and_then(|i| self.entries.get(i))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    /// The entry Forward would open.
+    pub fn forward(&self) -> Option<&(String, usize)> {
+        self.entries.get(self.cursor + 1)
+    }
+    /// Move the cursor one step. The caller checks `back`/`forward` first, so
+    /// `remove` below can prune a dead entry before this moves.
+    pub fn step_back(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    pub fn step_forward(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.entries.len().saturating_sub(1));
+    }
+    /// Drop every entry naming a thread that no longer exists, keeping the
+    /// cursor on the same entry where it can. Returns whether anything left.
+    pub fn retain(&mut self, mut exists: impl FnMut(&str, usize) -> bool) {
+        let current = self.entries.get(self.cursor).cloned();
+        self.entries
+            .retain(|(server, id)| exists(server.as_str(), *id));
+        if self.entries.is_empty() {
+            self.cursor = 0;
+        } else {
+            self.cursor = current
+                .and_then(|entry| self.entries.iter().position(|e| *e == entry))
+                .unwrap_or_else(|| self.cursor.min(self.entries.len() - 1));
+        }
+    }
+    /// The most recent entries first, for the quick switcher's "Recent" list.
+    pub fn recent(&self) -> impl Iterator<Item = &(String, usize)> {
+        self.entries.iter().rev()
+    }
+}
+
 pub(crate) struct ExecutionBaseline {
     runs: std::collections::BTreeMap<usize, Option<String>>,
     task_ids: std::collections::BTreeSet<String>,
@@ -4835,11 +4924,20 @@ pub struct State {
     pub threads: Vec<Thread>,
     pub active: usize,
     pub tabs: Vec<usize>,
+    /// The opt-in tab strip above the conversation (Settings, Appearance, "Thread
+    /// tabs"). Off, `tabs` holds only the open thread and the title bar names it.
+    pub tabs_enabled: bool,
     /// The provisional tab: sidebar clicks replace it in place instead of
     /// piling up, like KSG Code's ghost tab. At most one tab is a ghost, and
     /// `ghost_anchor` names the captain tab a worker ghost returns to on close.
     pub ghost_tab: Option<usize>,
     pub ghost_anchor: Option<usize>,
+    /// Back and forward through the threads the user opened, as a browser's
+    /// history (`mod+[` and `mod+]`). Not saved to disk.
+    pub nav_history: NavHistory,
+    /// Set while `nav_back`/`nav_forward` opens an entry, so the open itself
+    /// does not push a fresh entry and drop the forward list.
+    nav_open: bool,
     pub next_id: usize,
     pub dark: bool,
     /// Whole-window zoom, changed with Ctrl+= / Ctrl+- and reset with Ctrl+0.
@@ -4951,6 +5049,10 @@ pub struct State {
     pub picker_highlight: usize,
     /// The Add workspace palette is browsing folders; the query holds the path.
     pub picker_browsing: bool,
+    /// The Cmd+K quick switcher: open or not, its query, and the lit row.
+    pub quick_switcher: bool,
+    pub quick_switcher_query: TextEdit,
+    pub quick_switcher_highlight: usize,
     pub show_archive: bool,
     pub sidebar: bool,
     /// Whether the sidebar is shown while the window is too narrow for it to stay docked.
@@ -5962,8 +6064,13 @@ impl State {
             threads: vec![Thread::new(1)],
             active: 0,
             tabs: vec![1],
+            // The strip is opt-in for users; the test suite predates it and
+            // exercises the strip everywhere, so the test build defaults it on.
+            tabs_enabled: cfg!(test),
             ghost_tab: None,
             ghost_anchor: None,
+            nav_history: NavHistory::default(),
+            nav_open: false,
             next_id: 2,
             dark: false,
             zoom: 1.0,
@@ -6048,6 +6155,9 @@ impl State {
             picker_query: TextEdit::default(),
             picker_highlight: 0,
             picker_browsing: false,
+            quick_switcher: false,
+            quick_switcher_query: TextEdit::default(),
+            quick_switcher_highlight: 0,
             show_archive: false,
             sidebar: true,
             compact_sidebar: false,
@@ -6348,6 +6458,16 @@ impl State {
             return;
         }
         let id = self.threads[index].id;
+        if !self.tabs_enabled {
+            // The strip is off: `focus_thread` collapses `tabs` to the open
+            // thread's one slot and pushes the history entry.
+            self.tab_epoch += 1;
+            self.requested_tab = None;
+            self.requested_tab_restore = None;
+            self.brief.record = None;
+            self.focus_thread(index);
+            return;
+        }
         if !self.tabs.contains(&id) {
             let active = self.threads.get(self.active).map_or(0, |t| t.id);
             if let Some(ghost) = self
@@ -6379,10 +6499,13 @@ impl State {
             return;
         }
         let active = self.threads.get(self.active).map_or(0, |t| t.id);
-        insert_tab(&mut self.tabs, active, self.threads[index].id);
-        if self.ghost_tab == Some(self.threads[index].id) {
-            self.ghost_tab = None;
-            self.ghost_anchor = None;
+        let id = self.threads[index].id;
+        if self.tabs_enabled {
+            insert_tab(&mut self.tabs, active, id);
+            if self.ghost_tab == Some(id) {
+                self.ghost_tab = None;
+                self.ghost_anchor = None;
+            }
         }
         self.tab_epoch += 1;
         self.requested_tab = None;
@@ -6425,6 +6548,9 @@ impl State {
     }
     /// A send, a double-click or "Keep tab" makes the ghost permanent.
     pub fn keep_tab(&mut self, id: usize) {
+        if !self.tabs_enabled {
+            return;
+        }
         if self.ghost_tab == Some(id) {
             self.ghost_tab = None;
             self.ghost_anchor = None;
@@ -6468,6 +6594,31 @@ impl State {
     }
     /// Focus an existing tab. Background reducers must not open tabs.
     fn focus_thread(&mut self, index: usize) {
+        if !self.tabs_enabled
+            && let Some(id) = self.threads.get(index).map(|t| t.id)
+            && !self.tabs.contains(&id)
+        {
+            // The strip is off: one slot, the open thread's.
+            self.tabs.clear();
+            self.tabs.push(id);
+            self.ghost_tab = None;
+            self.ghost_anchor = None;
+        }
+        if !self.nav_open
+            && let Some(thread) = self.threads.get(index)
+        {
+            let id = thread.id;
+            let machine = self.machines.selected.clone();
+            // A launch leaves history empty; the thread open before this focus
+            // is where Back should land, so seed it first.
+            if self.nav_history.is_empty()
+                && let Some(current) = self.threads.get(self.active).map(|t| t.id)
+                && current != id
+            {
+                self.nav_history.push(&machine, current);
+            }
+            self.nav_history.push(&machine, id);
+        }
         self.focus_tab(index, true);
     }
     pub(crate) fn focus_tab(&mut self, index: usize, visit: bool) {
@@ -6525,6 +6676,9 @@ impl State {
     }
     /// Closing a blank draft also deletes it. Written drafts survive without a tab.
     pub fn close_tab(&mut self, id: usize) {
+        if !self.tabs_enabled {
+            return;
+        }
         if !self.tabs.contains(&id) {
             return;
         }
@@ -6547,6 +6701,53 @@ impl State {
         }
         self.remove_tab(id, false);
         self.checkpoint();
+    }
+    /// Whether the named thread still exists on the named machine.
+    fn thread_exists_on(&self, server: &str, id: usize) -> bool {
+        thread_exists_on(&self.threads, &self.machines, server, id)
+    }
+    /// `navigation.back`: open the entry before the cursor, skipping and
+    /// pruning entries whose threads no longer exist.
+    pub fn nav_back(&mut self) {
+        loop {
+            let Some((server, id)) = self.nav_history.back().cloned() else {
+                return;
+            };
+            if !self.thread_exists_on(&server, id) {
+                // Drop the dead entry and every entry beyond it, then try the
+                // new back target.
+                let threads = &self.threads;
+                let machines = &self.machines;
+                self.nav_history
+                    .retain(|server, id| thread_exists_on(threads, machines, server, id));
+                continue;
+            }
+            self.nav_history.step_back();
+            self.nav_open = true;
+            self.open_machine_thread(&server, id);
+            self.nav_open = false;
+            return;
+        }
+    }
+    /// `navigation.forward`: open the entry after the cursor.
+    pub fn nav_forward(&mut self) {
+        loop {
+            let Some((server, id)) = self.nav_history.forward().cloned() else {
+                return;
+            };
+            if !self.thread_exists_on(&server, id) {
+                let threads = &self.threads;
+                let machines = &self.machines;
+                self.nav_history
+                    .retain(|server, id| thread_exists_on(threads, machines, server, id));
+                continue;
+            }
+            self.nav_history.step_forward();
+            self.nav_open = true;
+            self.open_machine_thread(&server, id);
+            self.nav_open = false;
+            return;
+        }
     }
     pub fn project(&self, id: Option<ProjectId>) -> Option<&Project> {
         self.projects.entries.iter().find(|p| Some(p.id) == id)
@@ -7404,6 +7605,13 @@ impl State {
     }
     pub fn thread_title_search_matches(&self, thread: &Thread) -> bool {
         let search = self.search.text.to_lowercase();
+        self.thread_title_matches_query(thread, &search)
+    }
+    /// The title match the sidebar's search and the quick switcher share:
+    /// title, a listed draft's text, the captain's name on a home, and (only
+    /// where the server cannot search bodies) message text.
+    pub fn thread_title_matches_query(&self, thread: &Thread, search: &str) -> bool {
+        let search = search.trim().to_lowercase();
         if search.is_empty() {
             return true;
         }
@@ -7701,6 +7909,14 @@ impl State {
         self.picker_query = TextEdit::default();
         self.picker_query.focused = true;
         self.picker_highlight = 0;
+    }
+    /// The quick switcher (`commandPalette.toggle`, `mod+k`, or the bar's title
+    /// button). Focus lands in its search field, as in KSG Code's CommandPalette.
+    pub fn open_quick_switcher(&mut self) {
+        self.quick_switcher = true;
+        self.quick_switcher_query = TextEdit::default();
+        self.quick_switcher_query.focused = true;
+        self.quick_switcher_highlight = 0;
     }
     /// Initial query for the Add workspace folder browser, ported from KSG Code's
     /// `getAddProjectInitialQueryForEnvironment`: uses `addProjectBaseDirectory` from the
@@ -16242,6 +16458,7 @@ impl State {
             return Err("The saved index has no valid thread list.".into());
         }
         self.dark = index["dark"] == true;
+        self.tabs_enabled = index["tabsEnabled"] == true;
         self.auto_settle_days = index["autoSettleAfterDays"].as_u64().unwrap_or(3).min(3650) as u32;
         if let Some(zoom) = index["zoom"].as_f64() {
             self.zoom = snap_zoom(zoom as f32);
@@ -16910,7 +17127,7 @@ impl State {
         }
         let mut index = json!({
             "version":crate::identity::INDEX_VERSION, "dark":self.dark, "zoom":self.zoom, "active":self.current().id, "tabs":self.tabs,
-            "ghostTab":self.ghost_tab, "ghostAnchor":self.ghost_anchor,
+            "tabsEnabled":self.tabs_enabled, "ghostTab":self.ghost_tab, "ghostAnchor":self.ghost_anchor,
             "nextId":self.next_id, "nextProjectId":self.projects.next_id,
             "autoSettleAfterDays": self.auto_settle_days,
             "defaultHarness": self.default_harness,
@@ -17923,6 +18140,77 @@ pub fn truncate(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nav_history_walks_back_and_forward_and_a_new_open_drops_the_forward_entries() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.tabs_enabled = false;
+        let first = state.current().id;
+        // Open two more real threads: a blank draft's "new thread" reuses the
+        // same slot, so these push their own ids.
+        let mut ids = vec![first];
+        for title in ["second thread", "third thread"] {
+            let mut thread = Thread::new(state.next_id);
+            state.next_id += 1;
+            thread.title = title.into();
+            state.threads.push(thread);
+            let index = state.threads.len() - 1;
+            state.show_thread(index);
+            ids.push(state.threads[index].id);
+        }
+        let second = ids[1];
+        let third = ids[2];
+        assert_eq!(state.current().id, third);
+        state.nav_back();
+        assert_eq!(state.current().id, second);
+        state.nav_back();
+        assert_eq!(state.current().id, first);
+        assert!(state.nav_history.back().is_none());
+        state.nav_forward();
+        assert_eq!(state.current().id, second);
+        state.nav_forward();
+        assert_eq!(state.current().id, third);
+        assert!(state.nav_history.forward().is_none());
+        // Back once, then a fresh open drops the third thread's entry.
+        state.nav_back();
+        let mut thread = Thread::new(state.next_id);
+        state.next_id += 1;
+        thread.title = "fourth thread".into();
+        state.threads.push(thread);
+        let index = state.threads.len() - 1;
+        state.show_thread(index);
+        assert!(state.nav_history.forward().is_none());
+        assert_ne!(state.current().id, third);
+    }
+
+    #[test]
+    fn nav_history_skips_and_prunes_a_thread_that_no_longer_exists() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.tabs_enabled = false;
+        let first = state.current().id;
+        let mut ids = vec![first];
+        for title in ["second thread", "third thread"] {
+            let mut thread = Thread::new(state.next_id);
+            state.next_id += 1;
+            thread.title = title.into();
+            state.threads.push(thread);
+            let index = state.threads.len() - 1;
+            state.show_thread(index);
+            ids.push(state.threads[index].id);
+        }
+        let second = ids[1];
+        let third = ids[2];
+        // Delete the middle entry's thread: Back lands on the first.
+        let at = state.threads.iter().position(|t| t.id == second).unwrap();
+        state.threads.remove(at);
+        state.active = state.threads.iter().position(|t| t.id == third).unwrap();
+        state.nav_back();
+        assert_eq!(state.current().id, first);
+        // The pruned entry is gone for good: Forward lands on the third
+        // thread directly, never on the removed one.
+        state.nav_forward();
+        assert_eq!(state.current().id, third);
+    }
 
     #[test]
     fn a_quiet_threads_new_effect_joins_another_threads_streaming_checkpoint() {

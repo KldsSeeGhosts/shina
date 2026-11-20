@@ -197,6 +197,8 @@ pub const STATIC_COMMANDS: &[&str] = &[
     "view.reopenClosed",
     "pullRequest.copyNumber",
     "diff.toggle",
+    "inspector.crew",
+    "inspector.context",
     "preview.toggle",
     "preview.refresh",
     "preview.focusUrl",
@@ -322,6 +324,8 @@ pub fn default_keybinding_rules() -> Vec<KeybindingRule> {
         rule("mod+w", "rightPanel.close", Some("!terminalFocus")),
         rule("mod+shift+t", "view.reopenClosed", None),
         rule("mod+d", "diff.toggle", Some("!terminalFocus")),
+        rule("mod+alt+c", "inspector.crew", Some("!terminalFocus")),
+        rule("mod+alt+x", "inspector.context", Some("!terminalFocus")),
         rule("mod+shift+j", "preview.toggle", None),
         rule("mod+r", "preview.refresh", Some("previewFocus")),
         rule("mod+l", "preview.focusUrl", Some("previewFocus")),
@@ -1463,6 +1467,7 @@ const KEYBINDING_GROUPS: &[(&str, &str, &[&str])] = &[
         &[
             "sidebar",
             "rightPanel",
+            "inspector",
             "commandPalette",
             "filePicker",
             "projectSearch",
@@ -2611,8 +2616,8 @@ mod tests {
             ),
             &mut tx
         ));
-        assert!(state.search.focused);
-        state.search.focused = false;
+        assert!(state.quick_switcher);
+        state.quick_switcher = false;
 
         let was_pinned = state.current().pinned();
         assert!(crate::key(

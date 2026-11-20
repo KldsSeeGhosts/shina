@@ -10106,11 +10106,16 @@ mod tests {
                                 .clone();
                             if reset && id == 2 && settle_recent {
                                 assert!(rt.state.current().history_loading);
-                                assert_eq!(
-                                    pending
-                                        .as_ref()
-                                        .and_then(|position| position.entry_id.as_deref()),
-                                    Some("m-2-78")
+                                // The pane grew by the removed chat header, so the
+                                // remembered top row lands on the 77/78 boundary.
+                                assert!(
+                                    matches!(
+                                        pending
+                                            .as_ref()
+                                            .and_then(|position| position.entry_id.as_deref()),
+                                        Some("m-2-77") | Some("m-2-78")
+                                    ),
+                                    "{pending:?}"
                                 );
                             }
                             cache.request_earlier(

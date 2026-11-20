@@ -2088,6 +2088,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             "Keep working in the background",
             "Keep awake",
             "Theme",
+            "Thread tabs",
             "Send shortcut",
             "Panel animations",
             "Confirm before archiving a thread",
@@ -2154,6 +2155,33 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                     p,
                     |s| {
                         s.dark = !s.dark;
+                        s.checkpoint();
+                    },
+                ),
+                p,
+            );
+            pane = add(
+                pane,
+                s,
+                "settings-thread-tabs",
+                "Thread tabs",
+                "Keep several threads open in a strip above the conversation.",
+                captain_ui::switch(
+                    s,
+                    "thread-tabs-toggle",
+                    "Thread tabs",
+                    s.tabs_enabled,
+                    p,
+                    |s| {
+                        s.tabs_enabled = !s.tabs_enabled;
+                        if !s.tabs_enabled {
+                            // Back to one slot: the open thread's.
+                            let id = s.current().id;
+                            s.tabs.clear();
+                            s.tabs.push(id);
+                            s.ghost_tab = None;
+                            s.ghost_anchor = None;
+                        }
                         s.checkpoint();
                     },
                 ),

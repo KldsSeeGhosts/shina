@@ -54,6 +54,7 @@ Already ported:
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
 | `inspector_ui::view` (right-panel shell, `right-panel-strip`, four segments) | `chat/ChatRightPanel.tsx`, `chat/RightPanelTabs.tsx` (fixed four-tab strip instead of KSG's scrollable list; Shina-only Overview/Crew/Context/Diff set) |
+| `top_bar::bar`, `quick_switcher::view` | `chat/CommandPalette.tsx`, `chat/CommandPaletteResults.tsx` (row metrics for the switcher; the single 40 pt title bar with nav buttons and the breadcrumb title is a Shina-only design) |
 
 The model picker and the reasoning menu are separate popovers, as in KSG Code. Model rows have no checkboxes: a click picks the model and Shift+click adds it to a multi-model send. The reasoning menu keeps the effort slider below instead of KSG's list of levels, at the user's request.
 
