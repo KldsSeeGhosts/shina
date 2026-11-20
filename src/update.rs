@@ -2799,7 +2799,7 @@ pub fn coordinated_helper() -> Result<(), String> {
         step = "Prepare restart";
         let live = crate::server_lock::Owner::acquire(&directory).is_err();
         let prepared = if live {
-            crate::maintenance::rpc(&directory, "server.prepareRestart", serde_json::json!({}))?
+            crate::maintenance::prepare_restart(&directory)?
         } else {
             serde_json::json!({"clientPids":[]})
         };

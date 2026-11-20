@@ -890,7 +890,7 @@ impl Worker {
         }
         // Maintenance can wait for a claimed send; it must never see one start
         // after the fence drops. Local bookkeeping above has already run.
-        let _dispatch = match self.database.claim_dispatch()? {
+        let _dispatch = match self.database.claim_dispatch("mobile push delivery")? {
             Some(dispatch) => dispatch,
             None => return Ok(CycleReport { idle: false }),
         };

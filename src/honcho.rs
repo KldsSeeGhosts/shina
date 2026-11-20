@@ -422,7 +422,10 @@ impl Honcho {
                     break;
                 }
                 let database = crate::database::for_path(&path);
-                let dispatch = database.as_ref().map(|db| db.claim_dispatch()).transpose();
+                let dispatch = database
+                    .as_ref()
+                    .map(|db| db.claim_dispatch("Honcho background memory sync"))
+                    .transpose();
                 // Includes health requests. No network dispatch starts during a drain.
                 if matches!(dispatch, Ok(Some(None))) {
                     let _ = receiver.recv_timeout(Duration::from_millis(100));
@@ -514,10 +517,13 @@ impl Honcho {
         Ok(backend)
     }
 
-    fn claim_dispatch(&self) -> Result<Option<crate::database::Dispatch>, String> {
+    fn claim_dispatch(
+        &self,
+        kind: &'static str,
+    ) -> Result<Option<crate::database::Dispatch>, String> {
         crate::database::for_path(&self.path)
             .map(|db| {
-                db.claim_dispatch()?.ok_or(
+                db.claim_dispatch(kind)?.ok_or(
                     "Server is draining. Retry memory requests after cancellation or restart."
                         .into(),
                 )
@@ -565,7 +571,7 @@ impl MemoryBackend for Honcho {
 
     fn recall(&self, peer: &str) -> Result<String, String> {
         self.read_health((|| {
-            let _dispatch = self.claim_dispatch()?;
+            let _dispatch = self.claim_dispatch("Honcho memory recall")?;
             let deadline = Instant::now() + Duration::from_millis(self.api.config.recall_timeout_ms);
             self.api.ensure(peer, None, false, deadline)?;
             let context = self.api.request(Method::GET,
@@ -583,7 +589,7 @@ impl MemoryBackend for Honcho {
 
     fn search(&self, peer: &str, query: &str) -> Result<Vec<MemoryView>, String> {
         self.read_health((|| {
-            let _dispatch = self.claim_dispatch()?;
+            let _dispatch = self.claim_dispatch("Honcho memory search")?;
             let deadline = Instant::now() + Duration::from_millis(1500);
             self.api.ensure(peer, None, false, deadline)?;
             let results = self.api.request(
@@ -611,7 +617,7 @@ impl MemoryBackend for Honcho {
 
     fn ask(&self, peer: &str, query: &str) -> Result<String, String> {
         self.read_health((|| {
-            let _dispatch = self.claim_dispatch()?;
+            let _dispatch = self.claim_dispatch("Honcho memory chat")?;
             if query.trim().is_empty() || query.chars().count() > 10000 {
                 return Err("query must contain 1 to 10000 characters.".into());
             }

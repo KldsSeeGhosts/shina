@@ -702,23 +702,21 @@ impl RuntimeState {
                 if self.validation_hold {
                     Err("Restart validation is still pending.".into())
                 } else if !self.pending_effects.is_empty() {
-                    Err(
-                        "Waiting for committed harness effects to settle. Retry preparation."
-                            .into(),
-                    )
+                    Err(crate::maintenance::PENDING_HARNESS_EFFECTS.into())
                 } else if let Some(reason) = self.state.update_restart_blocker() {
                     Err(reason.into())
-                } else if self
+                } else if let Some(active) = self
                     .database
                     .as_ref()
-                    .is_some_and(|db| db.fence_dispatch(true) != 0)
+                    .map(|db| db.fence_dispatch(true))
+                    .filter(|active| !active.is_empty())
                 {
                     // Do not silently interrupt an already claimed asynchronous effect.
-                    self.database
-                        .as_ref()
-                        .expect("database")
-                        .fence_dispatch(false);
-                    Err("An external effect is still dispatching. Drain cancelled; retry after it settles.".into())
+                    Err(format!(
+                        "{} Waiting on: {}. Drain cancelled; retry after it settles.",
+                        crate::maintenance::ACTIVE_EXTERNAL_EFFECT,
+                        active.join(", ")
+                    ))
                 } else {
                     match self.state.checkpoint_and_flush() {
                         Ok(()) => self.maintenance.prepare(None, clients, now),
@@ -2756,7 +2754,7 @@ mod tests {
             )
             .unwrap();
         let database = rt.database.clone().unwrap();
-        assert!(database.claim_dispatch().unwrap().is_none());
+        assert!(database.claim_dispatch("test effect").unwrap().is_none());
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         database.begin().unwrap();
         let capture = crate::outbox::Capture::begin();
@@ -2779,7 +2777,9 @@ mod tests {
     fn claimed_effect_cancels_preparation_until_it_settles() {
         let mut rt = durable();
         let database = rt.database.clone().unwrap();
-        let dispatch = database.claim_dispatch().unwrap().unwrap();
+        let dispatch = database.claim_dispatch("test effect").unwrap().unwrap();
+        let other = database.claim_dispatch("test effect").unwrap().unwrap();
+        drop(other);
         let error = rt
             .command(
                 "maintainer",
@@ -2787,6 +2787,7 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.contains("Drain cancelled"));
+        assert!(error.contains("Waiting on: test effect."));
         assert!(!rt.maintenance.fenced());
         drop(dispatch);
         rt.command(
@@ -2794,7 +2795,7 @@ mod tests {
             Command::new("server.prepareRestart", json!({})),
         )
         .unwrap();
-        assert!(database.claim_dispatch().unwrap().is_none());
+        assert!(database.claim_dispatch("test effect").unwrap().is_none());
     }
     #[test]
     fn unknown_and_revoked_devices_cannot_drain_or_stop() {
@@ -2833,7 +2834,7 @@ mod tests {
         let capture = crate::outbox::Capture::begin();
         crate::outbox::send(&sender, json!({"type":"prompt", "id":"validated"})).unwrap();
         rt.persist(None, capture.finish()).unwrap();
-        assert!(database.claim_dispatch().unwrap().is_none());
+        assert!(database.claim_dispatch("test effect").unwrap().is_none());
         assert!(receiver.try_recv().is_err());
         rt.command(
             "maintainer",

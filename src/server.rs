@@ -1177,7 +1177,7 @@ async fn connection(mut socket: WebSocket, shared: Shared, device: String, token
                     // Host maintenance only. A peer-delegate credential can never link onward.
                     let args = params.get("args").unwrap_or(params);
                     let dispatch=if method=="peer.list" {Ok(None)} else {
-                        shared.database.claim_dispatch().and_then(|dispatch|dispatch.map(Some).ok_or("Server is draining. Retry peer linking after maintenance.".into()))
+                        shared.database.claim_dispatch("peer linking").and_then(|dispatch|dispatch.map(Some).ok_or("Server is draining. Retry peer linking after maintenance.".into()))
                     };
                     match dispatch {
                         Err(error)=>Err(error),
