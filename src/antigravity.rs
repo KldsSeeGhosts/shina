@@ -896,12 +896,14 @@ pub fn cli_available() -> bool {
 /// Version for `client_info`/file-read gating; unknown stays None like KSG's path installs.
 pub fn cli_version() -> Option<String> {
     let (executable, _) = crate::harness::executable("agy").ok()?;
-    let out = std::process::Command::new(executable)
+    let mut command = std::process::Command::new(executable);
+    command
         .arg("--version")
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .output()
-        .ok()?;
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    // Discovery runs in the background, so use the owned no-window launcher.
+    let out =
+        crate::process::output(&mut command, std::time::Duration::from_secs(5), 16 * 1024).ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let found = text
         .split_whitespace()

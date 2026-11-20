@@ -17,7 +17,18 @@ args.add_argument("--discovery", action="store_true")
 args.add_argument("--delay-seconds", type=float, default=0)
 args.add_argument("--no-history", action="store_true")
 args.add_argument("--no-mcp", action="store_true")
+args.add_argument("--record-launch", action="store_true")
 opts = args.parse_args()
+
+if opts.record_launch and sys.platform == "win32":
+    import ctypes
+
+    console_window = ctypes.windll.kernel32.GetConsoleWindow
+    console_window.restype = ctypes.c_void_p
+    launch = {"pid": os.getpid(), "consoleWindow": console_window()}
+    with open(opts.log, "a", encoding="utf8") as log:
+        log.write(json.dumps({"fixtureLaunch": launch}) + "\n")
+
 session = "fixture-session"
 pending = None
 permission_prompt = None
