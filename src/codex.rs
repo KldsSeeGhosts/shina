@@ -86,14 +86,17 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
     start_process(process()?, start, wake)
 }
 
-pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Result<Pi, String> {
-    let command = process()?;
+pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Pi {
     let start = Start::discovery("codex", workspace);
-    Ok(Pi::worker(
+    Pi::worker(
         wake,
         start.owner.clone(),
         None,
         move |input, events, wake, stopped, owner| {
+            let command = process()?;
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
             run_mode(
                 command,
                 start,
@@ -105,7 +108,7 @@ pub fn discover(workspace: PathBuf, wake: Waker, models: bool) -> Result<Pi, Str
                 Some(models),
             )
         },
-    ))
+    )
 }
 
 fn start_process(command: Command, start: Start, wake: Waker) -> Result<Pi, String> {

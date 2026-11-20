@@ -1,6 +1,73 @@
 //! Harness settings and delegation metadata, kept outside the shared model reducer.
 use super::*;
 
+#[derive(Default)]
+pub(super) struct NativeModelMetadata {
+    models: Vec<AgentModel>,
+    update_required_models: Vec<crate::model_picker::UpdateRequiredModel>,
+}
+
+#[derive(Default)]
+enum ModelRefs<'a> {
+    #[default]
+    Empty,
+    Slice(&'a [AgentModel]),
+    Combined(Vec<&'a AgentModel>),
+}
+
+impl<'a> ModelRefs<'a> {
+    fn iter(&self) -> impl Iterator<Item = &'a AgentModel> + Clone {
+        let (models, combined) = match self {
+            Self::Empty => (&[][..], &[][..]),
+            Self::Slice(models) => (*models, &[][..]),
+            Self::Combined(combined) => (&[][..], combined.as_slice()),
+        };
+        models.iter().chain(combined.iter().copied())
+    }
+}
+
+#[derive(Default)]
+struct PickerModelRefs<'a> {
+    models: ModelRefs<'a>,
+    default: Option<AgentModel>,
+    retained: Option<AgentModel>,
+}
+
+impl PickerModelRefs<'_> {
+    fn iter(&self) -> impl Iterator<Item = &AgentModel> + Clone {
+        self.models
+            .iter()
+            .chain(&self.default)
+            .chain(&self.retained)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PICKER_MAP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn picker_option(model: &AgentModel) -> crate::model_picker::PickerModelOption {
+    crate::model_picker::PickerModelOption {
+        slug: model.id.clone(),
+        name: model.name.clone(),
+        short_name: model.short_name.clone(),
+        sub_provider: model.sub_provider.clone(),
+        aliases: model.aliases.clone(),
+        badge: model.badge.clone(),
+        is_default: model.is_default,
+        is_custom: model.is_custom,
+        is_legacy: model.is_legacy,
+        is_unavailable: model.is_unavailable,
+    }
+}
+
+fn antigravity_manifest_models() -> &'static [AgentModel] {
+    static MODELS: std::sync::LazyLock<Vec<AgentModel>> =
+        std::sync::LazyLock::new(crate::antigravity::manifest_models);
+    &MODELS
+}
+
 impl Thread {
     pub fn set_service_tier(&mut self, tier: String) {
         if self.forward("thread.configure", json!({"serviceTier":tier})) {
@@ -165,6 +232,30 @@ impl Thread {
 }
 
 impl State {
+    pub(super) fn update_projected_native_models(&mut self, next: &Value) {
+        for harness in ["codex", "claude", "antigravity", "cursor"] {
+            let previous = &self.client_views["nativeCatalogs"][harness];
+            let next = &next["nativeCatalogs"][harness];
+            let models_changed = previous["models"] != next["models"];
+            let updates_changed = previous["updateRequiredModels"] != next["updateRequiredModels"];
+            if models_changed || updates_changed {
+                let cached = self
+                    .projected_native_catalogs
+                    .entry(harness.into())
+                    .or_default();
+                if models_changed {
+                    cached.models =
+                        serde_json::from_value(next["models"].clone()).unwrap_or_default();
+                }
+                if updates_changed {
+                    cached.update_required_models =
+                        serde_json::from_value(next["updateRequiredModels"].clone())
+                            .unwrap_or_default();
+                }
+            }
+        }
+    }
+
     pub(crate) fn pi_catalog_status(&self) -> (bool, Option<&str>) {
         if self.client.is_some() {
             let catalog = &self.client_views["catalog"];
@@ -191,45 +282,111 @@ impl State {
         };
         (catalog.loading(), catalog.error.as_deref())
     }
-    pub(super) fn refresh_native_catalogs(&mut self, force: bool) {
-        if self.demo || !self.runtime_enabled || self.client.is_some() {
-            return;
+    pub(super) fn refresh_provider_availability(&mut self, force: bool) {
+        if !self.demo && (self.runtime_enabled || self.client.is_some()) {
+            self.provider_availability.refresh(self.wake.clone(), force);
         }
+    }
+
+    pub(super) fn poll_provider_availability(&mut self) -> bool {
+        let changed = self.provider_availability.poll(&mut self.harnesses);
+        self.refresh_provider_availability(false);
+        changed
+    }
+
+    fn builtin_cli_available(&self, id: &str) -> bool {
+        if self.client.is_some() {
+            // Prefer the selected server's current discovery, including removals.
+            if let Some(ids) = self.client_views["harnessIds"].as_array() {
+                return ids.iter().any(|value| value == id);
+            }
+            if self.machines.selected != "local" {
+                return self.client_views["nativeCatalogs"][id]["installed"] == true;
+            }
+        }
+        self.provider_availability
+            .last
+            .as_ref()
+            .is_some_and(|state| match id {
+                "claude" => state.claude,
+                "antigravity" => state.antigravity,
+                "cursor" => state.cursor,
+                _ => false,
+            })
+    }
+
+    pub(super) fn refresh_native_catalogs(&mut self, force: bool) -> bool {
+        if self.demo || !self.runtime_enabled || self.client.is_some() {
+            return false;
+        }
+        // An explicit refresh must include a CLI that has just been installed.
+        self.refresh_optional_catalogs |= force;
+        let optional_force = !self.provider_availability.loading()
+            && std::mem::take(&mut self.refresh_optional_catalogs);
         let cwd = self.working_directory();
+        let wake = &self.wake;
+        let mut changed = false;
         if !self.provider_update_drivers.contains("codex") {
-            self.codex_catalog
-                .refresh("codex", cwd.clone(), self.wake.clone(), force);
+            changed |= self
+                .codex_catalog
+                .refresh("codex", &cwd, wake.clone(), force);
         }
         if !self.provider_update_drivers.contains("claude") {
-            self.claude_catalog
-                .refresh("claude", cwd.clone(), self.wake.clone(), force);
+            changed |= self
+                .claude_catalog
+                .refresh("claude", &cwd, wake.clone(), force);
         }
-        if crate::antigravity::cli_available()
+        if !self.refresh_optional_catalogs
+            && self.builtin_cli_available("antigravity")
             && !self.provider_update_drivers.contains("antigravity")
         {
-            self.antigravity_catalog
-                .refresh("antigravity", cwd.clone(), self.wake.clone(), force);
+            changed |=
+                self.antigravity_catalog
+                    .refresh("antigravity", &cwd, wake.clone(), optional_force);
         }
-        if crate::cursor::cli_available() && !self.provider_update_drivers.contains("cursor") {
-            self.cursor_catalog
-                .refresh("cursor", cwd, self.wake.clone(), force);
+        if !self.refresh_optional_catalogs
+            && self.builtin_cli_available("cursor")
+            && !self.provider_update_drivers.contains("cursor")
+        {
+            changed |= self
+                .cursor_catalog
+                .refresh("cursor", &cwd, wake.clone(), optional_force);
         }
-        self.apply_native_catalogs();
+        if changed {
+            self.apply_native_catalogs();
+        }
+        changed
     }
 
     pub(super) fn apply_native_catalogs(&mut self) {
         if self.client.is_some() {
             for harness in ["codex", "claude", "antigravity", "cursor"] {
+                if !self
+                    .threads
+                    .iter()
+                    .any(|thread| thread.client_draft && thread.harness == harness)
+                {
+                    continue;
+                }
                 let catalog = &self.client_views["nativeCatalogs"][harness];
-                let models = self.harness_models(harness);
+                let refs = self.harness_model_refs(harness);
+                let models = (refs.iter().next().is_some()
+                    && self.threads.iter().any(|thread| {
+                        thread.client_draft
+                            && thread.harness == harness
+                            && !thread.models.iter().eq(refs.iter())
+                    }))
+                .then(|| refs.iter().cloned().collect::<Vec<_>>());
                 let projects = &self.projects.entries;
                 for thread in self
                     .threads
                     .iter_mut()
                     .filter(|thread| thread.client_draft && thread.harness == harness)
                 {
-                    if !models.is_empty() {
-                        thread.models = models.clone();
+                    if let Some(models) = &models
+                        && thread.models != *models
+                    {
+                        thread.models.clone_from(models);
                     }
                     thread.refresh_thinking_levels();
                     thread.harness_state["codexNativeExtensions"] = catalog["extensions"].clone();
@@ -294,7 +451,9 @@ impl State {
                 thread.native.skills.clear();
             }
             if !catalog.models.is_empty() {
-                thread.models = catalog.models.clone();
+                if thread.models != catalog.models {
+                    thread.models.clone_from(&catalog.models);
+                }
                 thread.refresh_thinking_levels();
             }
             if catalog.commands_ready() && directories[index] == catalog.cwd {
@@ -325,60 +484,86 @@ impl State {
             && !self.harnesses.agents.iter().any(|agent| agent.id == id)
         {
             // Built-in ACP providers validate against their CLI, not the registry.
-            if id == "cursor" {
-                crate::cursor::process().map(drop)
-            } else {
-                crate::antigravity::cli_available()
-                    .then_some(())
-                    .ok_or_else(|| "Antigravity is unavailable. Put `agy` on PATH.".into())
-            }
+            self.builtin_cli_available(id).then_some(()).ok_or_else(|| {
+                if id == "cursor" {
+                    crate::cursor::MISSING.into()
+                } else {
+                    "Antigravity is unavailable. Put `agy` on PATH.".into()
+                }
+            })
         } else {
             self.harnesses.find(id).map(drop)
         }
     }
 
-    pub(super) fn harness_models(&self, harness: &str) -> Vec<AgentModel> {
-        let mut models = vec![];
+    fn harness_model_refs(&self, harness: &str) -> ModelRefs<'_> {
         let provider = if harness == "pi" { "cpa" } else { harness };
-        if self.client.is_some() && matches!(harness, "codex" | "claude" | "antigravity" | "cursor")
+        let projected = self
+            .projected_native_catalogs
+            .get(harness)
+            .map_or(&[][..], |c| c.models.as_slice());
+        let catalog = match harness {
+            "pi" => self.catalog.models.as_slice(),
+            "codex" => self.codex_catalog.models.as_slice(),
+            "claude" => self.claude_catalog.models.as_slice(),
+            "antigravity" => self.antigravity_catalog.models.as_slice(),
+            "cursor" => self.cursor_catalog.models.as_slice(),
+            _ => &[],
+        };
+        let default = self
+            .catalog
+            .default_model
+            .as_ref()
+            .filter(|default| harness == "pi" && !catalog.iter().any(|m| m.id == default.id));
+        let mut thread_models = self
+            .threads
+            .iter()
+            .filter(|t| t.harness == harness && !t.models.is_empty())
+            .peekable();
+        if (projected.is_empty() || catalog.is_empty())
+            && default.is_none()
+            && thread_models.peek().is_none()
         {
-            models.extend(
-                serde_json::from_value::<Vec<AgentModel>>(
-                    self.client_views["nativeCatalogs"][harness]["models"].clone(),
-                )
-                .unwrap_or_default(),
-            );
-        }
-        if harness == "pi" {
-            models.extend(self.catalog.models.iter().cloned());
-            if let Some(default) = &self.catalog.default_model
-                && !models.iter().any(|m| m.id == default.id)
-            {
-                models.push(default.clone());
+            if projected.is_empty() && catalog.is_empty() && harness == "antigravity" {
+                return ModelRefs::Slice(antigravity_manifest_models());
             }
+            return ModelRefs::Slice(if projected.is_empty() {
+                catalog
+            } else {
+                projected
+            });
         }
-        if harness == "codex" {
-            models.extend(self.codex_catalog.models.iter().cloned());
-        } else if harness == "claude" {
-            models.extend(self.claude_catalog.models.iter().cloned());
-        } else if harness == "antigravity" {
-            models.extend(self.antigravity_catalog.models.iter().cloned());
-        } else if harness == "cursor" {
-            models.extend(self.cursor_catalog.models.iter().cloned());
-        }
-        for thread in self.threads.iter().filter(|t| t.harness == harness) {
+        let mut models: Vec<_> = projected.iter().chain(catalog).chain(default).collect();
+        let mut seen: std::collections::HashSet<&str> =
+            models.iter().map(|model| model.id.as_str()).collect();
+        for thread in thread_models {
             for model in &thread.models {
-                if model.provider == provider
-                    && !models.iter().any(|m: &AgentModel| m.id == model.id)
-                {
-                    models.push(model.clone());
+                if model.provider == provider && seen.insert(&model.id) {
+                    models.push(model);
                 }
             }
         }
         if harness == "antigravity" && models.is_empty() {
-            models.extend(crate::antigravity::manifest_models());
+            return ModelRefs::Slice(antigravity_manifest_models());
         }
-        models
+        ModelRefs::Combined(models)
+    }
+
+    pub(super) fn harness_models(&self, harness: &str) -> Vec<AgentModel> {
+        self.harness_model_refs(harness).iter().cloned().collect()
+    }
+
+    pub(super) fn default_harness_model(&self, harness: &str) -> Option<&AgentModel> {
+        let refs = self.harness_model_refs(harness);
+        refs.iter()
+            .find(|model| model.is_default)
+            .or_else(|| refs.iter().next())
+    }
+
+    pub(super) fn harness_model(&self, harness: &str, model_id: &str) -> Option<&AgentModel> {
+        self.harness_model_refs(harness)
+            .iter()
+            .find(|model| model.id == model_id)
     }
 
     pub(super) fn add_harness_capabilities(&self, capabilities: &mut Value) {
@@ -439,7 +624,7 @@ impl State {
     /// Harness ids a thread can use: built-ins, then registered ACP agents.
     pub(crate) fn harness_ids(&self) -> Vec<String> {
         let mut ids = vec!["pi".to_string(), "codex".to_string(), "claude".to_string()];
-        if crate::antigravity::cli_available()
+        if self.builtin_cli_available("antigravity")
             && !self
                 .harnesses
                 .agents
@@ -448,7 +633,7 @@ impl State {
         {
             ids.push("antigravity".to_string());
         }
-        if crate::cursor::cli_available()
+        if self.builtin_cli_available("cursor")
             && !self
                 .harnesses
                 .agents
@@ -617,9 +802,11 @@ impl State {
                             ProviderAuthStatus::Unknown
                         }
                     });
-                let updates: Vec<crate::model_picker::UpdateRequiredModel> =
-                    serde_json::from_value(snap["updateRequiredModels"].clone())
-                        .unwrap_or_default();
+                let updates = self
+                    .projected_native_catalogs
+                    .get(id)
+                    .map(|catalog| catalog.update_required_models.clone())
+                    .unwrap_or_default();
                 let message = snap["providerMessage"].as_str().map(str::to_owned);
                 (installed, err, auth, updates, !models_empty, message)
             } else {
@@ -629,7 +816,7 @@ impl State {
                     &self.claude_catalog
                 };
                 let installed = if id == "claude" {
-                    catalog.installed || crate::claude::process().is_ok()
+                    catalog.installed || self.builtin_cli_available("claude")
                 } else {
                     true
                 };
@@ -701,7 +888,7 @@ impl State {
         }
 
         // Built-in Antigravity (KSG provider instance): `agy` on PATH, no ACP tag.
-        if crate::antigravity::cli_available()
+        if self.builtin_cli_available("antigravity")
             && !self
                 .harnesses
                 .agents
@@ -727,14 +914,14 @@ impl State {
         }
 
         // Built-in Cursor (`agent acp`): `cursor-agent`/`agent` resolved from env or PATH.
-        if crate::cursor::cli_available()
+        if self.builtin_cli_available("cursor")
             && !self
                 .harnesses
                 .agents
                 .iter()
                 .any(|agent| agent.id == "cursor")
         {
-            let error = self.cursor_catalog.error.clone();
+            let error = self.native_catalog_status("cursor").1.map(str::to_owned);
             entries.push(ProviderInstanceEntry {
                 instance_id: "cursor".into(),
                 driver_kind: "cursor".into(),
@@ -789,69 +976,90 @@ impl State {
     pub fn picker_models_by_instance(
         &self,
     ) -> std::collections::BTreeMap<String, Vec<crate::model_picker::PickerModelOption>> {
-        use crate::model_picker::PickerModelOption;
+        self.picker_models_for_entries(&self.provider_instance_entries())
+    }
+
+    pub(crate) fn picker_models_for_entries(
+        &self,
+        entries: &[crate::model_picker::ProviderInstanceEntry],
+    ) -> std::collections::BTreeMap<String, Vec<crate::model_picker::PickerModelOption>> {
+        #[cfg(test)]
+        PICKER_MAP_BUILDS.with(|count| count.set(count.get() + 1));
+        entries
+            .iter()
+            .map(|entry| {
+                let models = self.picker_model_refs(entry);
+                (
+                    entry.instance_id.clone(),
+                    models.iter().map(picker_option).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn composer_model_refs(&self, instance: &str) -> ModelRefs<'_> {
         let t = self.current();
-        let mut map = std::collections::BTreeMap::new();
-        for entry in self.provider_instance_entries() {
-            let mut models = if entry.instance_id == t.harness && !t.models.is_empty() {
-                t.models.clone()
-            } else {
-                self.harness_models(&entry.instance_id)
-            };
-            if entry.is_acp && models.is_empty() {
-                models.push(AgentModel {
-                    provider: entry.instance_id.clone(),
-                    id: "default".into(),
-                    name: "Default".into(),
-                    is_default: true,
-                    ..Default::default()
-                });
-            }
-            // Retain active thread's model if unavailable / uncatalogued. Aliases
-            // count as catalogued: a saved `opus` selects Claude Opus 5.5's row.
-            if entry.instance_id == t.harness
-                && !t.model_id.is_empty()
-                && !models.iter().any(|m| {
-                    m.id == t.model_id
-                        || m.aliases
-                            .iter()
-                            .any(|a| a.eq_ignore_ascii_case(&t.model_id))
-                })
-            {
-                models.push(AgentModel {
-                    provider: if t.harness == "pi" {
-                        "cpa".into()
-                    } else {
-                        t.harness.clone()
-                    },
-                    id: t.model_id.clone(),
-                    name: if t.model.is_empty() {
-                        t.model_id.clone()
-                    } else {
-                        t.model.clone()
-                    },
-                    is_unavailable: true,
-                    ..Default::default()
-                });
-            }
-            let options = models
-                .into_iter()
-                .map(|m| PickerModelOption {
-                    slug: m.id,
-                    name: m.name,
-                    short_name: m.short_name,
-                    sub_provider: m.sub_provider,
-                    aliases: m.aliases,
-                    badge: m.badge,
-                    is_default: m.is_default,
-                    is_custom: m.is_custom,
-                    is_legacy: m.is_legacy,
-                    is_unavailable: m.is_unavailable,
-                })
-                .collect();
-            map.insert(entry.instance_id, options);
+        if instance == t.harness && !t.models.is_empty() {
+            ModelRefs::Slice(&t.models)
+        } else {
+            self.harness_model_refs(instance)
         }
-        map
+    }
+
+    fn picker_model_refs(
+        &self,
+        entry: &crate::model_picker::ProviderInstanceEntry,
+    ) -> PickerModelRefs<'_> {
+        let t = self.current();
+        let models = self.composer_model_refs(&entry.instance_id);
+        let default = (entry.is_acp && models.iter().next().is_none()).then(|| AgentModel {
+            provider: entry.instance_id.clone(),
+            id: "default".into(),
+            name: "Default".into(),
+            is_default: true,
+            ..Default::default()
+        });
+        // Retain active thread's model if unavailable / uncatalogued. Aliases
+        // count as catalogued: a saved `opus` selects Claude Opus 5.5's row.
+        let retained = (entry.instance_id == t.harness
+            && !t.model_id.is_empty()
+            && !models.iter().chain(&default).any(|m| {
+                m.id == t.model_id
+                    || m.aliases
+                        .iter()
+                        .any(|a| a.eq_ignore_ascii_case(&t.model_id))
+            }))
+        .then(|| AgentModel {
+            provider: if t.harness == "pi" {
+                "cpa".into()
+            } else {
+                t.harness.clone()
+            },
+            id: t.model_id.clone(),
+            name: if t.model.is_empty() {
+                t.model_id.clone()
+            } else {
+                t.model.clone()
+            },
+            is_unavailable: true,
+            ..Default::default()
+        });
+        PickerModelRefs {
+            models,
+            default,
+            retained,
+        }
+    }
+
+    pub(crate) fn picker_model_option(
+        &self,
+        entry: &crate::model_picker::ProviderInstanceEntry,
+        id: &str,
+    ) -> Option<crate::model_picker::PickerModelOption> {
+        self.picker_model_refs(entry)
+            .iter()
+            .find(|m| m.id == id)
+            .map(picker_option)
     }
 
     pub fn open_model_picker(&mut self, picker: SettingsPicker) {
@@ -861,7 +1069,7 @@ impl State {
         if picker == SettingsPicker::Model {
             self.model_search.replace_text("");
             let entries = self.provider_instance_entries();
-            let options_by_instance = self.picker_models_by_instance();
+            let options_by_instance = self.picker_models_for_entries(&entries);
             let favorites = self.effective_model_favorites().to_vec();
             let t = self.current();
             let active_instance = t.harness.clone();
@@ -927,9 +1135,18 @@ impl State {
         String,
         Vec<crate::model_selection::ProviderOptionSelection>,
     ) {
+        self.resolve_composer_model(&self.provider_instance_entries())
+    }
+
+    pub(crate) fn resolve_composer_model(
+        &self,
+        entries: &[crate::model_picker::ProviderInstanceEntry],
+    ) -> (
+        String,
+        String,
+        Vec<crate::model_selection::ProviderOptionSelection>,
+    ) {
         let t = self.current();
-        let entries = self.provider_instance_entries();
-        let models_by_instance = self.picker_models_by_instance();
         let locked_provider = self.locked_provider_for_current();
         let thread_sel = t.thread_model_selection();
         let project_sel = self.project_default_model_selection(&t.harness);
@@ -938,7 +1155,7 @@ impl State {
         let thread_id = thread_sel.as_ref().map(|s| s.instance_id.as_str());
         let project_id = project_sel.as_ref().map(|s| s.instance_id.as_str());
         let resolved_prov = crate::model_selection::resolve_composer_provider_selection(
-            &entries,
+            entries,
             &[draft_active, runtime_id, thread_id, project_id],
             locked_provider.as_deref(),
             runtime_id.or(thread_id),
@@ -947,10 +1164,41 @@ impl State {
             .selected_instance_id
             .clone()
             .unwrap_or_else(|| t.harness.clone());
+        let options_for = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.instance_id == id)
+                .map(|entry| self.picker_model_refs(entry))
+                .unwrap_or_default()
+        };
+        let selected = options_for(&selected_instance_id);
+        let requested = resolved_prov
+            .requested_instance_id
+            .as_deref()
+            .filter(|id| *id != selected_instance_id)
+            .map(options_for)
+            .unwrap_or_default();
+        let empty = PickerModelRefs::default();
         let eff = crate::model_selection::derive_effective_composer_model_state(
             Some(&t.draft_model_state),
-            &entries,
-            &models_by_instance,
+            entries,
+            |id| {
+                (if id == Some(selected_instance_id.as_str()) {
+                    &selected
+                } else if id.is_some() && id == resolved_prov.requested_instance_id.as_deref() {
+                    &requested
+                } else {
+                    &empty
+                })
+                .iter()
+                .map(|model| crate::model_selection::ModelOptionRef {
+                    slug: &model.id,
+                    name: &model.name,
+                    aliases: &model.aliases,
+                    is_default: model.is_default,
+                    is_custom: model.is_custom,
+                })
+            },
             &resolved_prov.requested_driver_kind,
             Some(&selected_instance_id),
             resolved_prov.requested_instance_id.as_deref(),
@@ -1004,7 +1252,7 @@ impl State {
 
     pub fn select_model_from_picker(&mut self, instance_id: &str, model_id: &str) {
         let entries = self.provider_instance_entries();
-        let models_by_instance = self.picker_models_by_instance();
+        let models_by_instance = self.picker_models_for_entries(&entries);
         let mut draft_state = self.current().draft_model_state.clone();
         let mut sticky = self.preferences.sticky_composer.clone();
         let Some(next) = crate::model_selection::select_model_from_picker(
@@ -1063,11 +1311,17 @@ impl State {
 
     pub fn multi_model_selections(&self) -> Vec<crate::model_selection::ModelSelection> {
         let (instance_id, model, options) = self.resolved_composer_model_selection();
-        let primary = crate::model_selection::ModelSelection {
+        self.multi_model_selections_from(crate::model_selection::ModelSelection {
             instance_id,
             model,
             options,
-        };
+        })
+    }
+
+    pub(crate) fn multi_model_selections_from(
+        &self,
+        primary: crate::model_selection::ModelSelection,
+    ) -> Vec<crate::model_selection::ModelSelection> {
         if !self.is_multi_model_active() {
             return vec![primary];
         }
@@ -1089,7 +1343,7 @@ impl State {
             options: primary_options,
         };
         let entries = self.provider_instance_entries();
-        let models_by_instance = self.picker_models_by_instance();
+        let models_by_instance = self.picker_models_for_entries(&entries);
         let additional = self.current().draft_model_state.additional_models.clone();
         match crate::model_selection::toggle_multi_model_selection(
             &primary,
@@ -1261,21 +1515,26 @@ impl State {
     }
 
     pub fn active_model_descriptors(&self) -> Vec<crate::descriptors::ProviderOptionDescriptor> {
-        let t = self.current();
         let (resolved_instance, resolved_model_id, resolved_opts) =
             self.resolved_composer_model_selection();
+        self.model_descriptors(&resolved_instance, &resolved_model_id, &resolved_opts)
+    }
+
+    pub(crate) fn model_descriptors(
+        &self,
+        resolved_instance: &str,
+        resolved_model_id: &str,
+        resolved_opts: &[crate::model_selection::ProviderOptionSelection],
+    ) -> Vec<crate::descriptors::ProviderOptionDescriptor> {
+        let t = self.current();
         let provider = if resolved_instance == "pi" {
             "cpa"
         } else {
-            resolved_instance.as_str()
+            resolved_instance
         };
-        let mut models = if resolved_instance == t.harness && !t.models.is_empty() {
-            t.models.clone()
-        } else {
-            self.harness_models(&resolved_instance)
-        };
-        let mut caps = models
-            .iter_mut()
+        let mut caps = self
+            .composer_model_refs(resolved_instance)
+            .iter()
             .find(|m| m.provider == provider && m.id == resolved_model_id)
             .map(|m| m.capabilities.clone())
             .unwrap_or_default();
@@ -1304,7 +1563,7 @@ impl State {
             }
         }
         let mut selections =
-            crate::descriptors::with_implicit_fast_mode_default(&caps, Some(&resolved_opts));
+            crate::descriptors::with_implicit_fast_mode_default(&caps, Some(resolved_opts));
         for opt in &t.model_options {
             if !selections.iter().any(|s| s.id == opt.id) {
                 selections.push(opt.clone());
@@ -1415,6 +1674,59 @@ mod tests {
                 "a local CLI must not override remote installation status"
             );
         }
+    }
+
+    #[test]
+    fn native_client_models_are_reused_until_the_owning_catalog_changes() {
+        let mut state = State::new(PathBuf::new(), false);
+        let (client, _) = crate::client::Client::test_connected(state.data_dir.clone());
+        state.client = Some(client);
+        state.machines.selected = "peer".into();
+        state.provider_availability.last = Some(crate::harness::Availability {
+            antigravity: true,
+            ..Default::default()
+        });
+        state.current_mut().harness = "cursor".into();
+        state.current_mut().model_id = "alias".into();
+        let projected = |id: &str| {
+            json!({
+                "harnessIds":["pi","codex","claude","cursor"],
+                "nativeCatalogs":{"cursor":{"installed":true, "models":[AgentModel {
+                    provider: "cursor".into(),
+                    id: id.into(),
+                    name: "Fixture".into(),
+                    aliases: vec!["alias".into()],
+                    ..Default::default()
+                }]}}
+            })
+        };
+        let first = projected("before");
+        state.update_projected_native_models(&first);
+        state.client_views = first;
+        assert_eq!(state.resolved_composer_model_selection().1, "before");
+        let models = state.projected_native_catalogs["cursor"].models.as_ptr();
+        assert!(!state.builtin_cli_available("antigravity"));
+
+        let mut same_models = state.client_views.clone();
+        same_models["nativeCatalogs"]["cursor"]["loading"] = json!(true);
+        state.update_projected_native_models(&same_models);
+        state.client_views = same_models;
+        assert_eq!(
+            state.projected_native_catalogs["cursor"].models.as_ptr(),
+            models
+        );
+
+        let refreshed = projected("after");
+        state.update_projected_native_models(&refreshed);
+        state.client_views = refreshed;
+        assert_eq!(state.resolved_composer_model_selection().1, "after");
+        let mut removed = state.client_views.clone();
+        removed["harnessIds"] = json!(["pi", "codex", "claude"]);
+        state.client_views = removed;
+        assert!(
+            !state.builtin_cli_available("cursor"),
+            "stale catalog is not proof of a current install"
+        );
     }
 
     #[test]

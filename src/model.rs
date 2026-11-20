@@ -212,6 +212,8 @@ pub use scope::RemoteProject;
 mod capabilities;
 #[path = "codex_model.rs"]
 mod codex_model;
+#[cfg(test)]
+pub(crate) use codex_model::PICKER_MAP_BUILDS;
 #[path = "placement.rs"]
 pub(crate) mod placement;
 #[cfg(test)]
@@ -4804,6 +4806,7 @@ pub struct State {
     server_seq: u64,
     persist_transcripts: bool,
     client_views: Value,
+    projected_native_catalogs: std::collections::BTreeMap<String, codex_model::NativeModelMetadata>,
     /// Which emitted thread records the last projections actually applied.
     pub(crate) apply_stats: client_state::ApplyStats,
     next_client_draft: usize,
@@ -5093,6 +5096,8 @@ pub struct State {
     pub antigravity_catalog: crate::session::NativeCatalog,
     pub cursor_catalog: crate::session::NativeCatalog,
     pub harnesses: crate::harness::Registry,
+    provider_availability: crate::harness::AvailabilityProbe,
+    refresh_optional_catalogs: bool,
     pub managed_policy: Option<ManagedPolicy>,
     pub(crate) runtime_enabled: bool,
     /// True only when this reducer runs under the durable server batch (or a
@@ -5921,6 +5926,7 @@ impl State {
             persist_transcripts: false,
             dismissed_prompt_suggestions: Default::default(),
             client_views: json!({}),
+            projected_native_catalogs: Default::default(),
             apply_stats: Default::default(),
             next_client_draft: usize::MAX,
             tab_epoch: 0,
@@ -6140,6 +6146,8 @@ impl State {
             antigravity_catalog: Default::default(),
             cursor_catalog: Default::default(),
             harnesses: crate::harness::Registry::read(),
+            provider_availability: Default::default(),
+            refresh_optional_catalogs: false,
             managed_policy: if cfg!(test) {
                 None
             } else {
@@ -13723,11 +13731,8 @@ impl State {
                 options,
             });
         }
-        let models = self.harness_models(harness);
-        let model = models
-            .iter()
-            .find(|m| m.is_default)
-            .or_else(|| models.first())
+        let model = self
+            .default_harness_model(harness)
             .map(|m| m.id.clone())
             .unwrap_or_else(|| {
                 crate::model_selection::default_model_by_provider(harness).to_owned()
@@ -13798,10 +13803,8 @@ impl State {
         {
             return m.name.clone();
         }
-        self.harness_models(harness)
-            .into_iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.name)
+        self.harness_model(harness, model_id)
+            .map(|m| m.name.clone())
             .unwrap_or_else(|| model_id.to_owned())
     }
 
@@ -14840,10 +14843,10 @@ impl State {
     }
 
     pub fn refresh_catalog(&mut self) {
+        self.refresh_provider_availability(true);
         if self.forward("catalog.refresh", json!({})) {
             return;
         }
-        self.harnesses = crate::harness::Registry::read();
         self.refresh_native_catalogs(true);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_some()
@@ -14873,6 +14876,7 @@ impl State {
     /// Ported from KSG Code's `ProviderModelPicker.tsx`: opening the picker refreshes the model
     /// catalog through the capability-gated `modelCatalogOnly` path, throttled by 5 minutes.
     pub fn refresh_catalog_on_open(&mut self) {
+        self.refresh_provider_availability(false);
         if self.client.is_some() {
             if !self.supports_model_catalog_refresh() {
                 return;
@@ -14880,24 +14884,20 @@ impl State {
             self.forward("catalog.refresh", json!({"modelCatalogOnly": true}));
             return;
         }
-        self.harnesses = crate::harness::Registry::read();
         self.refresh_native_catalogs(false);
         if !self.demo && self.runtime_enabled {
             self.catalog
                 .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
-        }
-        if !self.catalog.models.is_empty() {
-            self.apply_catalog();
         }
     }
 
     /// Explicit retry button bypasses the on-demand throttle and retry backoff.
     pub fn force_refresh_catalog(&mut self) {
         self.catalog.error = None;
+        self.refresh_provider_availability(true);
         if self.forward("catalog.refresh", json!({"force": true})) {
             return;
         }
-        self.harnesses = crate::harness::Registry::read();
         self.refresh_native_catalogs(true);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_some()
@@ -14995,7 +14995,9 @@ impl State {
             if thread.harness != "pi" {
                 continue;
             }
-            thread.models = self.catalog.models.clone();
+            if thread.models != self.catalog.models {
+                thread.models.clone_from(&self.catalog.models);
+            }
             if thread.model_id.is_empty()
                 && thread.session.is_none()
                 && let Some(model) = &self.catalog.default_model
@@ -16942,10 +16944,12 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
         return browsing | composer_changed;
     }
+    let availability_changed = state.poll_provider_availability();
     if state.client.is_some() {
         return state.poll_client(tx)
             | crate::ui::diff_panel::tick(state, tx)
             | browsing
+            | availability_changed
             | composer_changed;
     }
     let browsing = browsing | state.poll_fleet();
@@ -16965,6 +16969,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     let mut changed = browsing
         | composer_changed
+        | availability_changed
         | background_changed
         | state.updater.poll(Instant::now(), state.wake.clone());
     if let Some(remaining) = state.updater.remaining(Instant::now()) {
@@ -16983,7 +16988,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(remaining) = state.catalog.remaining() {
         tx.wake_after(remaining);
     }
-    state.refresh_native_catalogs(false);
+    changed |= state.refresh_native_catalogs(false);
     if state.codex_catalog.poll("codex")
         | state.claude_catalog.poll("claude")
         | state.antigravity_catalog.poll("antigravity")

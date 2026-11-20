@@ -8,7 +8,8 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, mpsc},
+    time::{Duration, Instant},
 };
 
 pub use crate::backend::Pi as Session;
@@ -51,7 +52,7 @@ impl Start {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Agent {
     pub id: String,
@@ -64,10 +65,169 @@ pub struct Agent {
     pub env: Vec<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 pub struct Registry {
     pub agents: Vec<Agent>,
     pub error: Option<String>,
+}
+
+#[derive(Default, PartialEq, Eq)]
+pub(crate) struct Availability {
+    pub claude: bool,
+    pub antigravity: bool,
+    pub cursor: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct AvailabilityProbe {
+    pub last: Option<Availability>,
+    pending: Option<mpsc::Receiver<(Registry, Availability)>>,
+    started: Option<Instant>,
+}
+
+impl AvailabilityProbe {
+    pub(crate) fn loading(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    pub(crate) fn refresh(&mut self, wake: Waker, force: bool) {
+        // Capture the profile before crossing threads. Tests keep an isolated profile
+        // per test thread; the worker must read the launching profile.
+        let directory = crate::store::directory();
+        self.refresh_with(Instant::now(), wake, force, move || {
+            let registry = Registry::read_at(directory.as_deref());
+            let availability = Availability {
+                claude: crate::claude::process().is_ok(),
+                antigravity: crate::antigravity::cli_available(),
+                cursor: crate::cursor::cli_available(),
+            };
+            (registry, availability)
+        });
+    }
+
+    fn refresh_with(
+        &mut self,
+        now: Instant,
+        wake: Waker,
+        force: bool,
+        probe: impl FnOnce() -> (Registry, Availability) + Send + 'static,
+    ) {
+        if self.pending.is_some()
+            || (!force
+                && self.started.is_some_and(|at| {
+                    now.saturating_duration_since(at) < Duration::from_secs(5 * 60)
+                }))
+        {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        self.pending = Some(receive);
+        self.started = Some(now);
+        std::thread::spawn(move || {
+            let _ = send.send(probe());
+            wake();
+        });
+    }
+
+    pub(crate) fn poll(&mut self, registry: &mut Registry) -> bool {
+        let Some(pending) = &self.pending else {
+            return false;
+        };
+        match pending.try_recv() {
+            Ok((next_registry, next)) => {
+                self.pending = None;
+                let changed = self.last.as_ref() != Some(&next) || *registry != next_registry;
+                if changed {
+                    *registry = next_registry;
+                    self.last = Some(next);
+                }
+                changed
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending = None;
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn availability_probes_coalesce_throttle_and_publish_only_changes() {
+        let now = Instant::now();
+        let mut probe = AvailabilityProbe::default();
+        let mut registry = Registry::default();
+        let (release, wait) = mpsc::channel();
+        let (done, wakeups) = mpsc::channel();
+        let wake: Waker = Arc::new(move || done.send(()).unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let caller = std::thread::current().id();
+        let first = attempts.clone();
+        probe.refresh_with(now, wake.clone(), false, move || {
+            assert_ne!(std::thread::current().id(), caller);
+            first.fetch_add(1, Ordering::Relaxed);
+            wait.recv().unwrap();
+            (
+                Registry::default(),
+                Availability {
+                    claude: true,
+                    ..Default::default()
+                },
+            )
+        });
+        for _ in 0..16 {
+            probe.refresh_with(now, wake.clone(), false, || {
+                unreachable!("probe still running")
+            });
+            probe.refresh_with(now, wake.clone(), true, || {
+                unreachable!("probe still running")
+            });
+            assert!(!probe.poll(&mut registry));
+        }
+        release.send(()).unwrap();
+        wakeups.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(probe.poll(&mut registry));
+        assert!(probe.last.as_ref().unwrap().claude);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        probe.refresh_with(now, wake.clone(), false, || unreachable!("warm cache"));
+        assert!(!probe.loading());
+        probe.refresh_with(now, wake.clone(), true, || {
+            (
+                Registry::default(),
+                Availability {
+                    claude: true,
+                    ..Default::default()
+                },
+            )
+        });
+        wakeups.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            !probe.poll(&mut registry),
+            "identical results do not cause a redraw"
+        );
+        probe.refresh_with(now + Duration::from_secs(5 * 60), wake, false, || {
+            (
+                Registry {
+                    error: Some("fixture registry error".into()),
+                    ..Default::default()
+                },
+                Availability {
+                    cursor: true,
+                    ..Default::default()
+                },
+            )
+        });
+        wakeups.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(probe.poll(&mut registry));
+        assert!(probe.last.as_ref().unwrap().cursor);
+        assert!(!probe.last.as_ref().unwrap().claude);
+        assert_eq!(registry.error.as_deref(), Some("fixture registry error"));
+    }
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -80,13 +240,17 @@ pub fn valid_id(id: &str) -> bool {
 
 impl Registry {
     pub fn read() -> Self {
-        let Some(directory) = crate::store::directory() else {
+        Self::read_at(crate::store::directory().as_deref())
+    }
+
+    fn read_at(directory: Option<&Path>) -> Self {
+        let Some(directory) = directory else {
             return Self {
                 error: Some("Could not locate harnesses.json.".into()),
                 ..Self::default()
             };
         };
-        Self::read_in(&directory)
+        Self::read_in(directory)
     }
 
     fn read_in(directory: &Path) -> Self {
@@ -184,7 +348,8 @@ impl Registry {
     }
 }
 
-/// No shell is used. Resolve npm Windows shims to their JavaScript entry points.
+/// Blocking filesystem lookup. Resolve npm Windows shims without running a shell.
+/// Background discovery publishes availability separately from launch-time resolution.
 pub(crate) fn executable(command: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
     let path = Path::new(command);
     let candidates = if path.is_absolute() || path.components().count() > 1 {
