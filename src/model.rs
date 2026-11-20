@@ -170,7 +170,12 @@ mod captain_policy_client;
 pub use captain_policy_client::CaptainPolicyChange;
 #[path = "captain_digest.rs"]
 mod captain_digest;
+#[allow(unused_imports)]
 pub use captain_state::{CaptainAccess, CaptainDocument, CaptainDocumentMeta};
+#[allow(unused_imports)]
+pub(crate) use captain_state::{
+    CREW_CONTEXT_MAX_BYTES, NOTES_CONTEXT_MAX_BYTES, RULES_CONTEXT_MAX_BYTES,
+};
 #[path = "captain_lifecycle.rs"]
 mod captain_lifecycle;
 pub use captain_lifecycle::CaptainPhase;
@@ -207,6 +212,8 @@ mod run_control_tests;
 mod scope;
 #[allow(unused_imports)]
 pub use memory::{MemoryBackendStatus, MemoryView, UserProfile};
+#[allow(unused_imports)]
+pub(crate) use memory::{ESSENTIAL_BUDGET, PROFILE_BUDGET};
 pub use scope::RemoteProject;
 #[path = "capabilities.rs"]
 mod capabilities;
@@ -5052,6 +5059,13 @@ pub struct State {
     pub crew_questions_captain_open: bool,
     /// A dirty-draft close parked behind the discard confirmation.
     pub doc_discard: Option<DocDiscard>,
+    /// The audience the Context tab's document and memory figures describe:
+    /// `true` previews what crew threads receive. UI-only, never persisted.
+    pub context_audience_crew: bool,
+    /// The Context tab's "N more, found by search" fold is open. UI-only.
+    pub context_memories_expanded: bool,
+    /// The Context tab's "Earlier conversations" fold is open. UI-only.
+    pub context_earlier_expanded: bool,
     /// Crew change rejections per machine: an error from one host must not render on another.
     pub crew_errors: std::collections::BTreeMap<String, String>,
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
@@ -6127,6 +6141,9 @@ impl State {
             crew_question_drafts: Default::default(),
             crew_questions_captain_open: false,
             doc_discard: None,
+            context_audience_crew: false,
+            context_memories_expanded: false,
+            context_earlier_expanded: false,
             crew_errors: Default::default(),
             memory: Arc::default(),
             captain_editor: None,

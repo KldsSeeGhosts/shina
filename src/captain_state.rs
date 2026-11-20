@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 
 pub const DOCUMENT_NAMES: [&str; 4] = ["AGENTS.md", "CREW.md", "NOTES.md", "DIGEST.md"];
 pub const DOCUMENT_MAX_BYTES: usize = 65536;
-const RULES_CONTEXT_MAX_BYTES: usize = 8192;
-const NOTES_CONTEXT_MAX_BYTES: usize = 8192;
-const CREW_CONTEXT_MAX_BYTES: usize = 8192;
+pub(crate) const RULES_CONTEXT_MAX_BYTES: usize = 8192;
+pub(crate) const NOTES_CONTEXT_MAX_BYTES: usize = 8192;
+pub(crate) const CREW_CONTEXT_MAX_BYTES: usize = 8192;
 pub(super) const CONTEXT_TRUNCATION: &str =
     "\n[Content truncated. Use captain_document_read to read the complete document.]";
 const CONTEXT_TRUNCATION_NO_READ: &str = "\n[Content truncated at the context limit. The complete document is not readable from this worker.]";

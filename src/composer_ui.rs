@@ -1013,7 +1013,7 @@ pub(super) fn controls(
             controls = controls.child(effort);
         }
         if context_ring_shown(t) {
-            controls = controls.child(context_ring(t, p));
+            controls = controls.child(context_ring(s, t, p, width));
         }
     }
     if visible > 2 {

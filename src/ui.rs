@@ -14185,7 +14185,9 @@ fn pick_attachment(s: &mut State, tx: &mut Tx, folder: bool) {
     }
 }
 
-const CONTEXT_RING_SIZE: f32 = 28.0;
+/// The pill's ring is smaller than the popover era's: 16 pt inside a 24 pt row
+/// (spec §4.4).
+const CONTEXT_PILL_RING: f32 = 16.0;
 
 fn context_limit(t: &Thread) -> Option<u64> {
     t.context.usage.limit(t.context_window)
@@ -14251,9 +14253,9 @@ fn arc_points(
 
 /// A real circular progress ring drawn with Rune's vector canvas. The track stays visible when
 /// usage is unknown, so looking full is never implied by empty data.
-fn context_ring_shape(context: &ContextMeter, p: Palette) -> Shape {
-    let center = CONTEXT_RING_SIZE / 2.0;
-    let radius = 7.5;
+fn context_ring_shape(context: &ContextMeter, p: Palette, size: f32) -> Shape {
+    let center = size / 2.0;
+    let radius = size / 2.0 - 2.5;
     let width = 2.0;
     let track = if context.phase == ContextPhase::Compacting {
         p.brass.alpha(0.65)
@@ -14328,10 +14330,43 @@ fn context_toggle(s: &mut State) {
     }
 }
 
-/// The composer's context meter, ported from KSG Code's `ContextWindowMeter` trigger: a
-/// `size-7` ghost button that opens the usage popover on hover (150 ms in, 150 ms out), and on
-/// a press, Enter or Space. The popover itself is drawn at the root by `context_popover`.
-fn context_ring(t: &Thread, p: Palette) -> El {
+/// The context pill's sources count for the label and accessible text: captain
+/// homes count the `sent` sources plus the essential memories that fit; a
+/// plain thread counts its attached files.
+fn context_pill_counts(s: &State) -> (Option<usize>, usize, usize) {
+    let t = s.current();
+    if let Some(captain) = captain_ui::home_brief_captain(s) {
+        let list = context_ui::sources(s, captain, context_ui::Audience::Captain);
+        let sent = list
+            .iter()
+            .filter(|source| source.sent > 0)
+            .count();
+        let truncated = list
+            .iter()
+            .filter(|source| source.delivery == context_ui::Delivery::Truncated)
+            .count();
+        let memories = s.memories(captain);
+        let (fit, left_out) = context_ui::essential_fit(&memories);
+        return (Some(sent + fit), truncated, left_out);
+    }
+    if t.crew_captain.is_none() {
+        let files = tray_attachments(t).len()
+            + t.messages
+                .iter()
+                .map(|message| message.images.len())
+                .sum::<usize>();
+        if files > 0 {
+            return (Some(files), 0, 0);
+        }
+    }
+    (None, 0, 0)
+}
+
+/// The composer's context pill, spec §4.4: a 16 pt ring, the percentage, then
+/// either a sources count or a brass warning. A primary press toggles the
+/// Inspector on its Context tab; the popover's click-to-pin lives on the
+/// secondary press, and the hover popover stays as it was.
+fn context_ring(s: &State, t: &Thread, p: Palette, lane: f32) -> El {
     let limit = context_limit(t);
     let open = t.context.popover_open();
     let first_legend_key = open
@@ -14339,21 +14374,55 @@ fn context_ring(t: &Thread, p: Palette) -> El {
         .flatten()
         .and_then(|legend| breakdown_keys(&legend).into_iter().next())
         .map(|(_, legend_key)| legend_key);
-    el().key("context-usage-ring")
+    let (sources, truncated, left_out) = context_pill_counts(s);
+    let warning = truncated + left_out;
+    let mut a11y = t.context.accessible_label(limit);
+    if let Some(count) = sources {
+        a11y.push_str(&format!(". {count} sources sent each turn"));
+    }
+    if truncated > 0 {
+        a11y.push_str(&format!(
+            ". {truncated} document{} truncated",
+            if truncated == 1 { "" } else { "s" }
+        ));
+    }
+    if left_out > 0 {
+        a11y.push_str(&format!(
+            ". {left_out} essential {} left out",
+            if left_out == 1 { "memory" } else { "memories" }
+        ));
+    }
+    // Under 480 pt the pill keeps only the ring and percent; under 400 pt only
+    // the ring, with a brass corner dot while a warning applies.
+    let compact = lane < 480.0;
+    let minimal = lane < 400.0;
+    let mut pill = row()
+        .key("context-usage-ring")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(t.context_harness_text(&t.context.accessible_label(limit)))
+        .label(t.context_harness_text(&a11y))
         .focusable(true)
         .expanded(open)
-        .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
-        .center()
-        .radius(CONTEXT_RING_SIZE / 2.0)
+        .h(24.0)
+        .pl(4.0)
+        .pr(if minimal { 4.0 } else { 8.0 })
+        .gap(6.0)
+        .center_y()
+        .radius(6.0)
         .fill(if open { p.selected } else { Color::TRANSPARENT })
         .hover(p.selected)
-        .on_press(context_toggle)
+        .press(p.selected)
+        .on_press(|s: &mut State| {
+            let key = s.panel_key();
+            s.right_panels
+                .toggle(&key, crate::right_panel::SingletonKind::Context);
+        })
+        .on_secondary_press(|s: &mut State, _, _| context_toggle(s))
         .on_key(move |s: &mut State, event, tx| {
             if event.key == rune::Key::Enter {
-                context_toggle(s);
+                let key = s.panel_key();
+                s.right_panels
+                    .toggle(&key, crate::right_panel::SingletonKind::Context);
                 return true;
             }
             if event.key == rune::Key::Tab
@@ -14368,11 +14437,58 @@ fn context_ring(t: &Thread, p: Palette) -> El {
         })
         .on_hover_change(|s: &mut State, inside, _| s.current_mut().context.hover(true, inside))
         .hover_delays(CONTEXT_HOVER_DELAY, CONTEXT_HOVER_DELAY)
-        .child(
-            canvas(context_ring_shape(&t.context, p))
-                .size(CONTEXT_RING_SIZE, CONTEXT_RING_SIZE)
-                .a11y_hidden(),
-        )
+        .child({
+            let ring = canvas(context_ring_shape(&t.context, p, CONTEXT_PILL_RING))
+                .size(CONTEXT_PILL_RING, CONTEXT_PILL_RING)
+                .a11y_hidden();
+            if minimal && warning > 0 {
+                el().size(CONTEXT_PILL_RING, CONTEXT_PILL_RING)
+                    .child(ring)
+                    .child(
+                        el().size(6.0, 6.0)
+                            .fill(p.brass)
+                            .radius(3.0)
+                            .border(1.0, p.tray)
+                            .pin(None, Some(-2.0), Some(-2.0), None)
+                            .a11y_hidden(),
+                    )
+            } else {
+                el().size(CONTEXT_PILL_RING, CONTEXT_PILL_RING).child(ring)
+            }
+        });
+    if !minimal
+        && let Some(percent) = t.context.usage.percent
+    {
+        pill = pill.child(
+            label(context_percent_text(percent), TIMER, context_ink(percent, p))
+                .key("context-pill-percent"),
+        );
+    }
+    if !compact {
+        if warning > 0 {
+            let text = match (truncated > 0, left_out > 0) {
+                (true, false) => format!("{truncated} truncated"),
+                (false, true) => format!("{left_out} left out"),
+                _ => format!("{warning} issues"),
+            };
+            pill = pill.child(
+                row()
+                    .gap(5.0)
+                    .center_y()
+                    .child(el().size(6.0, 6.0).fill(p.brass).radius(3.0).a11y_hidden())
+                    .child(label(text, META, p.brass).key("context-pill-warning")),
+            );
+        } else if let Some(count) = sources {
+            let is_captain = captain_ui::home_brief_captain(s).is_some();
+            let text = if is_captain {
+                format!("{count} sources")
+            } else {
+                format!("{count} files")
+            };
+            pill = pill.child(label(text, META, p.muted).key("context-pill-sources"));
+        }
+    }
+    pill
 }
 
 /// KSG Code's `formatPercentage`: one decimal under 10 %, whole numbers above.
@@ -16176,7 +16292,7 @@ fn composer(
         }
         preview = preview.child(attach_control(attach_locked, p));
         if context_ring_shown(t) {
-            preview = preview.child(context_ring(t, p));
+            preview = preview.child(context_ring(s, t, p, lane));
         }
         preview = preview.child(action);
         let controls = composer_ui::controls(s, model, p, lane - 32.0, true, locked);

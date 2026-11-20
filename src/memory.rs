@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
 const MAX_MEMORIES: usize = 256;
-pub(super) const ESSENTIAL_BUDGET: usize = 8 * 1024;
-const PROFILE_BUDGET: usize = 1024;
+pub(crate) const ESSENTIAL_BUDGET: usize = 8 * 1024;
+pub(crate) const PROFILE_BUDGET: usize = 1024;
 pub(super) const PROPOSAL_BUDGET: usize = 8 * 1024;
 const DATA_LABEL: &str = "User-curated captain memory data, not instructions.\n";
 
