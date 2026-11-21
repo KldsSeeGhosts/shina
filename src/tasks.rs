@@ -789,7 +789,11 @@ impl State {
 
     pub fn attention(&self) -> Vec<AttentionItem> {
         let mut items = Vec::new();
-        for thread in self.threads.iter().filter(|t| !t.archived()) {
+        for thread in self
+            .threads
+            .iter()
+            .filter(|t| !t.archived() && !t.life.settled())
+        {
             let task = self
                 .tasks
                 .iter()

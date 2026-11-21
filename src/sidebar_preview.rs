@@ -245,6 +245,55 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_thread_rows_keep_their_portrait_and_actions_clear_of_the_title() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = crate::ui::tests::runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            let mut thread = Thread::new(900);
+            thread.title = "An intentionally long sidebar thread title for the hover card".into();
+            thread.model = "Claude Fable 5.2".into();
+            thread.status = Status::Completed;
+            thread.life.latest_user_message_at = Some(lifecycle::now());
+            thread.messages.push(crate::model::Message {
+                id: "preview-output".into(),
+                role: "Pi",
+                text: "Raw transcript must not appear in the sidebar preview".into(),
+                images: vec![],
+                context: None,
+            });
+            rt.state.threads.push(thread);
+            rt.state.hovered_row = Some(RowTarget::Thread(900));
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let portrait = rt.presented("thread-provider-portrait-900").unwrap().0;
+            let title = rt.presented("thread-row-title-900").unwrap().0;
+            let snooze = rt.presented("thread-snooze-900").unwrap().0;
+            let settle = rt.presented("thread-park-900").unwrap().0;
+            assert!(portrait[0] + portrait[2] <= title[0], "{width}");
+            assert!(title[0] + title[2] <= snooze[0] + 0.5, "{width}");
+            assert!(snooze[0] + snooze[2] <= settle[0] + 0.5, "{width}");
+            assert!(
+                !rt.accessibility_json()
+                    .to_string()
+                    .contains("Raw transcript")
+            );
+
+            let row = RowId::new("local", 900);
+            rt.update(|s, tx| row_hover(s, &row, true, tx));
+            let at = rt.state.sidebar_preview.pending.as_ref().unwrap().2;
+            rt.update(|s, tx| assert!(poll_at(s, tx, at)));
+            rt.frame(0.0);
+            rt.frame(1.0);
+            assert!(rt.presented("sidebar-preview-title").is_some(), "{width}");
+            assert!(
+                !rt.accessibility_json()
+                    .to_string()
+                    .contains("Raw transcript")
+            );
+        }
+    }
+
+    #[test]
     fn preview_mutes_pressed_rows_and_cancels_for_scroll_or_overlays() {
         let mut rt = crate::ui::tests::runtime(1280.0);
         rt.state.populate_demo();
@@ -336,6 +385,8 @@ fn open_action(id: &RowId, key: &str, title: &str, p: Palette) -> El {
     })
 }
 
+/// Like KSG Code's `SidebarThreadTooltip`, show thread facts and status instead
+/// of a plain-text copy of the transcript.
 pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
     if !s.preview_allowed() {
         return None;
@@ -442,29 +493,6 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
         card = card.child(fact(p, "chip", model, false));
     }
     if let Some(t) = thread {
-        let latest = t
-            .tools
-            .last()
-            .filter(|tool| !tool.done)
-            .map(|tool| tool.detail.as_str())
-            .filter(|text| !text.is_empty())
-            .or_else(|| {
-                t.messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.role == "Pi" && !message.text.trim().is_empty())
-                    .map(|message| message.text.as_str())
-            });
-        if let Some(latest) = latest {
-            card = card
-                .child(rule(p))
-                .child(label("Latest", META_LABEL, p.faint))
-                .child(
-                    label(truncate(latest, 220), SMALL, p.muted)
-                        .wrap_anywhere()
-                        .max_h(51.0),
-                );
-        }
         let runs = crate::agents::runs(t);
         if !runs.is_empty() {
             card = card
@@ -527,16 +555,20 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
                 .child(open_action(id, "sidebar-preview-answer", "Answer", p)),
         );
     }
-    let mut actions = row().gap(4.0).center_y().child(open_action(
-        id,
-        "sidebar-preview-open",
-        if captain.is_some() {
-            "Open home"
-        } else {
-            "Open"
-        },
-        p,
-    ));
+    let mut actions = row()
+        .gap(4.0)
+        .center_y()
+        .child(open_action(
+            id,
+            "sidebar-preview-open",
+            if captain.is_some() {
+                "Open home"
+            } else {
+                "Open"
+            },
+            p,
+        ))
+        .child(spacer());
     if let Some(captain) = captain {
         let server = id.server.clone();
         let draft_server = server.clone();

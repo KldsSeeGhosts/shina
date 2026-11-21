@@ -1697,12 +1697,6 @@ fn attention_status(kind: AttentionKind) -> Status {
 /// rests. The strip has a fixed height, so the pill arriving never moves a sidebar row.
 pub(super) const ATTENTION_ANCHOR: &str = "attention-anchor";
 
-/// The brass badge fill darkened by `amount` toward black, for its hover and pressed states.
-/// The count keeps its colour, so the text contrast has to hold on these fills too.
-pub(super) fn brass_darkened(p: Palette, amount: f32) -> Color {
-    p.brass.mix(Color::BLACK, amount)
-}
-
 /// "N need you" at the top of the sidebar, shown only while something needs the user. It is
 /// one 28 px pill whatever the count, laid over the title strip beside Shina's name, so it
 /// slides and fades in without moving anything. A narrow sidebar shows the count alone.
@@ -1712,8 +1706,8 @@ pub(super) fn attention_row(s: &State, p: Palette) -> Option<El> {
         return None;
     }
     let open = s.attention_menu;
-    // A framed brass badge with the count, in its own slot beside the wordmark.
-    let pill = framed(
+    // Shina-only aggregate. Use the warning treatment from KSG's notification rows.
+    let pill = outlined(
         row()
             .key("attention-row")
             .role("button")
@@ -1726,19 +1720,15 @@ pub(super) fn attention_row(s: &State, p: Palette) -> Option<El> {
             .px(4.0)
             .center()
             .radius(6.0)
-            .fill(if open {
-                brass_darkened(p, 0.2)
-            } else {
-                p.brass
-            })
-            .hover(brass_darkened(p, 0.2))
-            .press(brass_darkened(p, 0.32))
+            .fill(if open { p.selected } else { p.brass_bg })
+            .hover(p.selected)
+            .press(p.selected)
             .hover_motion(motion(), motion())
             .transition(Transition::offset(6.0, 0.0).combined(Transition::opacity()))
             .anchored_fit(ATTENTION_ANCHOR, rune::Side::Left, rune::Align::Center, 0.0)
             .on_press(|s: &mut State| s.attention_menu = !s.attention_menu)
             .child(
-                label(count.to_string(), META.features(TABULAR), p.on_brass).key("attention-count"),
+                label(count.to_string(), META.features(TABULAR), p.brass).key("attention-count"),
             ),
         p,
     );
@@ -1769,7 +1759,14 @@ pub(super) fn attention_menu(s: &State, p: Palette, pane: Option<(f32, f32)>) ->
             .w((s.viewport_width - 16.0).min(ATTENTION_MENU_WIDTH))
             .anchored_fit("attention-row", rune::Side::Bottom, rune::Align::Start, 6.0),
     };
-    let mut menu = menu.modal(true, |s: &mut State| s.attention_menu = false);
+    let mut menu = menu
+        .modal(true, |s: &mut State| s.attention_menu = false)
+        .child(
+            label("Needs you", META_LABEL, p.muted)
+                .key("attention-heading")
+                .px(8.0)
+                .py(6.0),
+        );
     for item in s.attention() {
         let id = item.thread_id;
         let status = attention_status(item.kind);

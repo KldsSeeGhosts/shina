@@ -121,7 +121,6 @@ fn render_local(
     let machine = multiple_machines(s).then(|| machine_caption(s, entry.server));
     let draft = entry.draft;
     let shelved = matches!(section, Section::Snoozed | Section::Settled);
-    let project = s.project(thread.project);
     if entry.captain {
         let captain = thread.captain.unwrap_or(0);
         let profile = s.captains.get(captain);
@@ -210,10 +209,11 @@ fn render_local(
             );
         }
         avatar
-    } else if s.sidebar_grouped() && !shelved {
-        lead_mark(state, thread.pinned(), draft, p)
+    } else if !draft && !thread.model.is_empty() {
+        thread_avatar(s, p, &thread.model, status, thread.pinned())
+            .key(format!("thread-provider-portrait-{suffix}"))
     } else {
-        status_badge(p, project_tile(s, p, project, 16.0), 16.0, status)
+        lead_mark(state, thread.pinned(), draft, p)
     };
     let snippet = entry.search_hit.as_ref().map(|hit| {
         search_snippet_el(
@@ -230,11 +230,8 @@ fn render_local(
     } else {
         &thread.title
     };
-    let actions = if s.hovered_row == Some(target) && thread.machine == "local" {
-        row_actions(s, p, thread, section, draft)
-    } else {
-        el().absolute(0.0, 0.0)
-    };
+    let actions = (s.hovered_row == Some(target) && thread.machine == "local")
+        .then(|| row_actions(s, p, thread, section, draft));
     thread_row_el(
         s,
         p,
@@ -315,14 +312,24 @@ fn lead_mark(status: RowStatus, pinned: bool, draft: bool, p: Palette) -> El {
     }
 }
 
+fn thread_avatar(s: &State, p: Palette, model: &str, status: Status, pinned: bool) -> El {
+    let avatar = crewmate_avatar(s, p, model, status, 16.0);
+    if !pinned {
+        return avatar;
+    }
+    el().size(16.0, 16.0).child(avatar).child(
+        icon("pin", p.ink)
+            .size(9.0, 9.0)
+            .pin(None, Some(-2.0), Some(-2.0), None)
+            .radius(3.0)
+            .fill(p.card),
+    )
+}
+
+/// KSG Code's `SidebarThreadRow` uses the trailing slot for hover actions.
 fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: bool) -> El {
     let id = thread.id;
-    let mut actions = super::row()
-        .pin(Some(4.0), Some(4.0), None, None)
-        .center_y()
-        .gap(2.0)
-        .radius(6.0)
-        .fill(p.row);
+    let mut actions = super::row().center_y().gap(2.0);
     if draft || !thread.draft.text.is_empty() {
         actions = actions.child(
             icon_button(
@@ -332,7 +339,7 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
                 p,
                 move |s| s.discard_draft(id),
             )
-            .size(24.0, 24.0),
+            .size(20.0, 20.0),
         );
     }
     if !draft {
@@ -345,7 +352,7 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
                     p,
                     move |s| s.open_snooze(id),
                 )
-                .size(24.0, 24.0)
+                .size(20.0, 20.0)
                 .blocked(
                     s.snooze_blocker(id),
                     &format!("thread-snooze-{id}"),
@@ -367,7 +374,7 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
                     s.settle_thread(id);
                 }
             })
-            .size(24.0, 24.0)
+            .size(20.0, 20.0)
             .blocked(
                 if section == Section::Snoozed {
                     None
@@ -1561,10 +1568,11 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
     let lead = if worker {
         crewmate_avatar(s, p, model.unwrap_or_default(), status, 16.0)
             .key(format!("crewmate-{}-{id}", entry.server))
-    } else if s.sidebar_grouped() && !shelved {
-        lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
+    } else if let Some(model) = model.filter(|model| !model.is_empty() && !entry.draft) {
+        thread_avatar(s, p, model, status, entry.life.pinned_at.is_some())
+            .key(format!("thread-provider-portrait-{suffix}"))
     } else {
-        status_badge(p, project_tile(s, p, project.as_ref(), 16.0), 16.0, status)
+        lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
     };
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
@@ -1620,7 +1628,7 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             draft: entry.draft,
             snippet,
         },
-        el().absolute(0.0, 0.0),
+        None,
     )
 }
 

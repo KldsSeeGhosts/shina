@@ -132,7 +132,7 @@ pub(super) fn thread_row_el(
     p: Palette,
     item: El,
     m: ThreadRowModel<'_>,
-    actions: El,
+    actions: Option<El>,
 ) -> El {
     let id = m.id;
     let width = sidebar_row_width(s);
@@ -204,19 +204,25 @@ pub(super) fn thread_row_el(
     )
     .key(format!("thread-row-title-{id}"))
     .truncate()
-    .help_when_truncated(m.title)
     .grow(1.0)
     .min_w(0.0);
     let lead = el().size(16.0, 16.0).center().child(m.lead);
-    let line = row()
+    let mut line = row()
         .h(if slim { SLIM_HEIGHT } else { 20.0 })
         .center_y()
         .gap(8.0)
         .child(lead)
         .child(title);
+    let showing_actions = actions.is_some();
+    if let Some(actions) = actions {
+        line = line.child(actions);
+    }
     let mut content = col().grow(1.0).min_w(0.0).pl(ROW_INSET).pr(8.0);
     if slim {
-        content = content.child(line.child(state)).child(actions);
+        if !showing_actions {
+            line = line.child(state);
+        }
+        content = content.child(line);
     } else {
         let agents = (m.agents_active > 0)
             .then(|| agents_ui::chip(&format!("thread-agents-{id}"), m.agents_active, p));
@@ -288,13 +294,12 @@ pub(super) fn thread_row_el(
                 );
             }
         }
-        content = content.pt(7.0).child(line).child(metadata).child(actions);
+        content = content.pt(7.0).child(line).child(metadata);
     }
     select_bar(
         item.h(if slim { SLIM_HEIGHT } else { THREAD_HEIGHT })
             .label(&description)
             .description("Preview available")
-            .help(description)
             .hover_motion(MOTION_FAST, MOTION_FAST),
         m.selected,
         s.dark,
