@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Generate Shina Wave 3 anime portraits (12 Captains + 8 Provider Crewmates)
+"""Generate the historical Wave 3 anime portrait proposal (12 Captains and 8 crewmates)
 using OpenAI's gpt-image-2.6-sunburst model, then downsample and crop to the
-exact sizes Shina expects (512x512 full bust, 256x256 tight head crop).
+sizes Shina expects (512x512 full bust, 256x256 tight head crop). This does not
+replace the shipped painted cel portraits.
 
 Usage:
   py tools/generate_wave3_art.py --key-file <path> --stage anchor
   py tools/generate_wave3_art.py --key-file <path> --stage captains
   py tools/generate_wave3_art.py --key-file <path> --stage mascots
   py tools/generate_wave3_art.py --key-file <path> --stage expressions
-  py tools/generate_wave3_art.py --stage install   # writes 512/256 PNGs + sheets
+  py tools/generate_wave3_art.py --stage install   # stages PNGs in artifacts, plus sheets
 """
 
 from __future__ import annotations
@@ -34,8 +35,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = Path(__file__).resolve().parent.parent
 MASTERS_DIR = ROOT / "artifacts" / "ai-masters"
-CREW_DIR = ROOT / "assets" / "crew"
-MASCOT_DIR = ROOT / "assets" / "providers" / "crew"
+STAGED_ASSETS = ROOT / "artifacts" / "wave3-sunburst-assets"
+CREW_DIR = STAGED_ASSETS / "crew"
+MASCOT_DIR = STAGED_ASSETS / "providers" / "crew"
 
 DEFAULT_MODEL = "gpt-image-2.6-sunburst"
 DEFAULT_QUALITY = "high"
@@ -721,7 +723,7 @@ def build_expressions_sheet(out_path: Path) -> None:
 
 
 def install_all() -> None:
-    # Install 12 Captains into assets/crew/<key>/
+    # Stage captain PNGs without changing shipping assets.
     captain_items = []
     for c in CAPTAINS:
         master_dir = MASTERS_DIR / "captains" / c.key
@@ -746,7 +748,7 @@ def install_all() -> None:
         shutil.copyfile(dest_dir / "Dizzy.small.png", dest_dir / "Sad.small.png")
         captain_items.append((c.name, c.role, dest_dir / "Normal.png", dest_dir / "Normal.small.png"))
 
-    # Install 8 Provider Mascots into assets/providers/crew/
+    # Stage provider PNGs beside the captain set.
     mascot_items = []
     for m in MASCOTS:
         master = MASTERS_DIR / "mascots" / f"{m.key}.png"
@@ -789,7 +791,7 @@ def main() -> int:
 
     if args.stage == "install":
         install_all()
-        print("Installed assets and generated contact sheets.", flush=True)
+        print(f"Staged assets in {STAGED_ASSETS} and generated contact sheets.", flush=True)
         return 0
 
     api_key = read_api_key(args.key_file)

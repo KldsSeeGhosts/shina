@@ -1,10 +1,10 @@
 # Shina crew portraits
 
-The twelve captains ship as illustrated modern anime portraits (`512x512` full bust and `256x256` head crop) generated with OpenAI `gpt-image-2.6-sunburst` (`quality: "high"`, using Sable as the style-and-framing anchor) via [`tools/generate_wave3_art.py`](../../tools/generate_wave3_art.py), following [Wave 3 spec §4](../../docs/ui/wave3-overhaul-spec.md). Each PNG is quantized to 256 colours without dithering for crisp flat cel shading and small embedded binary size.
+The twelve captains ship as painted anime cels generated with OpenAI `gpt-image-2`. The original Sable portrait is the style reference for the set. These are still portraits, with the same image used for every status. The surrounding halo or badge shows changes in status and respects Reduce Motion.
 
 | Folder | Captain | Signal colour | Look |
 | --- | --- | --- | --- |
-| `ember` | Ember, Platform | `#e0793a` | messy copper hair, brass goggles on forehead, olive work jacket |
+| `ember` | Ember, Platform | `#e0793a` | woman with short copper hair, brass goggles on forehead, olive work jacket |
 | `juniper` | Juniper, Release | `#45c49b` | long mint hair with blunt fringe, gold star clip, cream cardigan |
 | `sable` | Sable, Support | `#8b84f0` | indigo chin-length bob, coral headphones, slate-grey hoodie |
 | `pip` | Pip, Research | `#d9b23a` | white-blonde curls in top bun, round wire glasses, deep green coat |
@@ -12,16 +12,16 @@ The twelve captains ship as illustrated modern anime portraits (`512x512` full b
 | `wren` | Wren, Interface | `#b97ad0` | chestnut bob, freckles, mustard pompom beanie, plum-and-cream striped scarf |
 | `rook` | Rook, Security | `#93a84c` | raised indigo hood, dark fringe, gold eyes, silver clasp |
 | `nia` | Nia, Data | `#f0685c` | centre-parted braids with gold cuffs, yellow headband, teal turtleneck |
-| `jett` | Jett, Performance | `#ee5fa0` | hot-pink mohawk, shaved sides, leather jacket, cheek plaster |
+| `jett` | Jett, Performance | `#ee5fa0` | woman with a dusty pink mohawk, shaved sides, leather jacket, cheek bandage |
 | `otto` | Otto, Review | `#a3acba` | bald, white beard and brows, round glasses, burgundy cardigan |
 | `bolt` | Bolt, Automation | `#38bdf8` | cobalt metal robot head with antenna, ear bolts and glowing cyan screen eyes |
-| `kit` | Kit, Testing | `#5fbf62` | spiky russet hair, cream-tipped fox ears, cream hoodie, blue neckerchief |
+| `kit` | Kit, Testing | `#5fbf62` | human with spiky russet hair, cream hoodie, blue neckerchief |
 
-Each captain folder contains `Normal`, `Happy`, `Determined`, `Surprised`, `Dizzy`, and `Sad` (which reuses `Dizzy`), plus `.small.png` head crops (`18%..82%` width, `6%..70%` height of the `1024x1024` master) for avatars below 30 pt.
+Each captain folder contains `Normal.png` at 512 × 512 and `Normal.small.png` at 256 × 256. The small crop is for avatars below 30 pt. The approved masters are 1024 × 1024. Use FFmpeg's `scale=512:512:flags=lanczos` for the full tile and `crop=896:896:64:0,scale=256:256:flags=lanczos` for the crop. Encode both as RGB PNGs to retain the brush texture.
 
 ## Provider crewmates
 
-Eight matching anime provider crewmate portraits ship in [`assets/providers/crew/`](../providers/crew/) (`openai`, `anthropic`, `google`, `deepseek`, `glm`, `qwen`, `grok`, `default`), each as `512x512` (`<key>.png`) and `256x256` (`<key>.small.png`), generated with the same Sable style anchor.
+Eight matching provider crewmates ship in [`assets/providers/crew/`](../providers/crew/): `openai`, `anthropic`, `google`, `deepseek`, `glm`, `qwen`, `grok`, and `default`. Their `<key>.png` and `<key>.small.png` use the same dimensions and crop as the captains.
 
 ## Legacy pixel-art fallback
 

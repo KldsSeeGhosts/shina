@@ -464,15 +464,13 @@ cargo run --example export-icons -- assets
 
 ## Crew artwork
 
-The twelve captain portraits are original characters drawn as 40x40 pixel art by [`tools/crew_originals.py`](tools/crew_originals.py), framed like a Pokémon Mystery Dungeon bust and presented on the square crew tiles Capy uses. See [the artwork notes](assets/crew/README.md).
+Shina embeds twelve painted captain portraits and eight AI crewmate portraits. The art is still. Captain status marks and the working halo show the live state, and the halo stops moving with Reduce Motion. See [the artwork notes](assets/crew/README.md).
 
-Captains are the sidebar's first section. Each captain row shows a 36 px portrait, or 44 px for the open captain (otherwise the most urgent one), its name, and one status line such as "Working · 2 threads" or "Needs you · approval". The portrait slot, badge slot and timer slot have fixed sizes, so a status change never moves the row or its neighbors.
-
-Sidebar portraits are animated from short sprite strips: Ready breathes and blinks, Working types and nods, Needs you hops once every six seconds, and Done hops once. Failed and every portrait outside the sidebar stay static. The animation does not re-run the view or lay anything out. [`src/portraits.rs`](src/portraits.rs) swaps frames in a shared `rune::Pixels` per portrait and clip, and the app's poll asks Rune to wake it only when the next frame is due. All rows that share a portrait and clip use one swap. One idle captain costs about one repaint a second, and a working captain about four. Frames play only for rows on screen while the window has focus, and not under the system's reduced-motion setting. A minimized or background window, a collapsed sidebar or a captain-free sidebar schedules no frames at all.
+The original animated pixel-art captains remain available in [`assets/crew-pixel`](assets/crew-pixel). Point `SHINA_SPRITES` at that folder to use them. [`src/portraits.rs`](src/portraits.rs) plays their sprite strips only while the row is visible, the window has focus, and Reduce Motion is off.
 
 ### Drop-in portrait sets
 
-Shina can load a different set without a rebuild. Point `SHINA_SPRITES` at a folder containing six PNGs per captain, or put the folder at `<workspace>/assets/crew`:
+Shina can load a different set without a rebuild. Point `SHINA_SPRITES` at a folder with one subfolder per captain, or use `<workspace>/assets/crew`. A set needs only `Normal.png`. Add `Normal.small.png` for small avatars or add any of the five optional expressions:
 
 ```text
 assets/crew/ember/Normal.png
@@ -481,9 +479,9 @@ assets/crew/ember/Determined.png
 assets/crew/ember/Surprised.png
 assets/crew/ember/Dizzy.png
 assets/crew/ember/Sad.png
-...same six for juniper, sable, pip, bram, wren, rook, nia, jett, otto, bolt and kit
+...repeat for any other captain to override
 ```
 
-A numeric folder (`assets/crew/0/Normal.png`, up to `11`) also works. `SHINA_SPRITES` wins over the workspace folder. All six faces must exist for a captain to use the override; otherwise that captain keeps the embedded artwork. A set made for the original four therefore still works: the eight later captains have no folder in it and keep their embedded art. The loader accepts any square PNG size and the app scales it into tiles from 20 px to 48 px.
+A numeric folder (`assets/crew/0/Normal.png`, up to `11`) also works. `SHINA_SPRITES` wins over the workspace folder. A missing expression uses that captain's `Normal` face. If a captain has no valid `Normal.png`, Shina uses the embedded portrait for that captain.
 
-A drop-in set with only the six faces keeps static portraits. To animate it, add all four strips beside the faces: `Idle.strip.png` (4 frames), `Working.strip.png` (4), `Attention.strip.png` (4) and `Happy.strip.png` (3). A strip is square frames side by side, and frame 0 should match the static face. The frame order is described in [the artwork notes](assets/crew/README.md). A missing strip or a strip with the wrong frame count leaves that captain static.
+Only pixel-art sets can animate. Add all four strips beside the faces: `Idle.strip.png` (4 frames), `Working.strip.png` (4), `Attention.strip.png` (4) and `Happy.strip.png` (3). A strip is square frames side by side, and frame 0 should match the corresponding static face. A missing or invalid strip leaves that captain static.

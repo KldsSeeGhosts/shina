@@ -1,6 +1,6 @@
 """Generate Shina's original crew portraits.
 
-Usage: py -I tools/crew_originals.py [output-dir]   (default: assets/crew)
+Usage: py -I tools/crew_originals.py [output-dir]   (default: assets/crew-pixel)
        py -I tools/crew_originals.py --sheet out.png   (a review sheet of every captain)
 
 Twelve original captains drawn as 40x40 busts in the style of Pokemon Mystery Dungeon
@@ -899,7 +899,7 @@ def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--sheet":
         review_sheet(sys.argv[2])
         return
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else "assets/crew")
+    out = Path(sys.argv[1] if len(sys.argv) > 1 else "assets/crew-pixel")
     for name, draw, extra, tile, colors in CREW:
         (out / name).mkdir(parents=True, exist_ok=True)
         for face in FACES:
