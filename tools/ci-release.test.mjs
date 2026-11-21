@@ -100,10 +100,13 @@ test("checksums require all architectures and reject unexpected, empty or linked
   }
 });
 
+// These assertions check workflow layout, not the checkout's line endings.
+const sourceText = (path) => readFileSync(new URL(path, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+
 test("parallel checks and builds cannot publish until every required gate passes", () => {
-  const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
-  const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
-  const publish = readFileSync(new URL("../.github/workflows/publish-update.yml", import.meta.url), "utf8");
+  const updates = sourceText("../.github/workflows/updates.yml");
+  const platform = sourceText("../.github/workflows/platform-update.yml");
+  const publish = sourceText("../.github/workflows/publish-update.yml");
 
   assert.match(updates, /\n  core:\n    name: Core gate\n    needs: \[checks, rust, rust-tests\]\n    if: always\(\)/);
   assert.match(updates, /test "\$CHECKS_RESULT" = success && test "\$BUILD_RESULT" = success && test "\$TESTS_RESULT" = success/);
@@ -141,9 +144,9 @@ test("parallel checks and builds cannot publish until every required gate passes
 });
 
 test("the Intel Mac runner builds and packages the explicit Apple-silicon target", () => {
-  const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
-  const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
-  const packaging = readFileSync(new URL("./package-macos.sh", import.meta.url), "utf8");
+  const updates = sourceText("../.github/workflows/updates.yml");
+  const platform = sourceText("../.github/workflows/platform-update.yml");
+  const packaging = sourceText("./package-macos.sh");
   assert.match(updates, /runner: macos-15-intel\n      target: aarch64-apple-darwin/);
   assert.match(platform, /rustup target add "\$BUILD_TARGET"/);
   assert.match(platform, /args\+=\(--target "\$BUILD_TARGET"\)/);
@@ -194,8 +197,8 @@ test("Mac packaging follows the executable architecture and rejects a mismatched
 });
 
 test("core cache survives failures without PR snapshots evicting main, and reruns reuse commit keys", () => {
-  const updates = readFileSync(new URL("../.github/workflows/updates.yml", import.meta.url), "utf8");
-  const platform = readFileSync(new URL("../.github/workflows/platform-update.yml", import.meta.url), "utf8");
+  const updates = sourceText("../.github/workflows/updates.yml");
+  const platform = sourceText("../.github/workflows/platform-update.yml");
   assert.match(updates, /actions\/cache\/restore@[\da-f]+\s+#.*\n        id: core-cache/);
   assert.match(updates, /Save compiled core dependencies even when a test fails\n        if: \$\{\{ !cancelled\(\) && github\.ref == 'refs\/heads\/main' && steps\.core-cache\.outcome == 'success' && steps\.core-cache\.outputs\.cache-hit != 'true' \}\}/);
   assert.match(updates, /actions\/cache\/save@[\da-f]+/);

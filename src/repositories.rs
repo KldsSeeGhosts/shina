@@ -407,7 +407,15 @@ pub(crate) fn checkout_target(data_dir: &Path, id: &str, _name: &str) -> PathBuf
         .canonicalize()
         .map(|path| crate::projects::clean_path(&path))
         .unwrap_or_else(|_| data_dir.to_path_buf());
-    base.join("checkouts").join(key)
+    let checkouts = base.join("checkouts");
+    let original = checkouts.join(&key);
+    if cfg!(windows) && !original.exists() {
+        // Keep 160 bits of the full-ID hash. Git for Windows limits the path
+        // to the worktree's .git file separately from core.longpaths.
+        checkouts.join(&key[.."repo-".len() + 40])
+    } else {
+        original
+    }
 }
 
 fn remote_at(path: &Path) -> Option<String> {
@@ -471,14 +479,12 @@ pub(crate) fn provision_checkout(job: &CheckoutJob) -> Result<PathBuf, String> {
     let parent = target.parent().ok_or("Invalid checkout target.")?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
-    let name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("checkout");
     // Never infer ownership from a deterministic name. A crash can leave a
     // staging folder for manual recovery; later attempts do not remove it.
+    // Keep the sibling name short: Git's pack helpers can impose their own
+    // path limits even when Git for Windows has long paths enabled.
     let staging = loop {
-        let candidate = parent.join(format!("{name}.clone-tmp-{}", uuid::Uuid::new_v4()));
+        let candidate = parent.join(format!(".shina-clone-{}", uuid::Uuid::new_v4().simple()));
         match std::fs::create_dir(&candidate) {
             Ok(()) => break candidate,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1748,6 +1754,21 @@ mod tests {
         let other = checkout_target(&state.data_dir, "repo-12345678-second", "same-name");
         assert_eq!(first, renamed);
         assert_ne!(first, other);
+        std::fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checkout_target_keeps_an_existing_windows_checkout_with_the_original_name() {
+        use sha2::Digest;
+        let state = state();
+        let id = "repo-existing-fixture";
+        let checkouts =
+            crate::projects::clean_path(&state.data_dir.canonicalize().unwrap()).join("checkouts");
+        let full = checkouts.join(format!("repo-{:x}", sha2::Sha256::digest(id.as_bytes())));
+        assert_ne!(checkout_target(&state.data_dir, id, "repo"), full);
+        std::fs::create_dir_all(&full).unwrap();
+        assert_eq!(checkout_target(&state.data_dir, id, "repo"), full);
         std::fs::remove_dir_all(state.data_dir).unwrap();
     }
 

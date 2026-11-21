@@ -64,10 +64,15 @@ impl GitDaemon {
             "catalog default branch\n",
         )
         .unwrap();
+        let setup = if cfg!(windows) {
+            "Add-Content -Encoding UTF8 -Path catalog-setup-runs.txt -Value setup"
+        } else {
+            "echo setup >> catalog-setup-runs.txt"
+        };
         fs::write(
             repository.join("t3.json"),
             json!({"scripts":[{
-                "name":"repository setup","command":"echo setup >> catalog-setup-runs.txt",
+                "name":"repository setup","command":setup,
                 "runOnWorktreeCreate":true
             }]})
             .to_string(),
@@ -249,7 +254,7 @@ fn remote_only_repository_clones_on_two_executors_and_replays_after_restart() {
         );
         assert_eq!(git(&checkout, &["rev-parse", "HEAD"]).trim(), base);
         assert_eq!(
-            fs::read_to_string(checkout.join("release-only.txt")).unwrap(),
+            read_checkout_text(checkout.join("release-only.txt")),
             "catalog default branch\n"
         );
         assert_eq!(

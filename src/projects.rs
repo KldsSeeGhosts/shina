@@ -533,6 +533,10 @@ pub fn clone_command(source: &Source, target: &Path) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    // Also reaches the Git process spawned by `gh repo clone`. Staging paths
+    // have a temporary suffix and can exceed MAX_PATH before checkout starts.
+    #[cfg(windows)]
+    crate::vcs::git_config_overrides(&mut command, &[("core.longpaths", "true")]);
     hidden(&mut command);
     command
 }

@@ -292,11 +292,10 @@ impl Service {
         }
     }
     fn run(&self, program: &str, args: &[&str]) -> Result<String, String> {
-        // Tests point this at stub systemctl/launchctl binaries: the login-shell PATH
-        // reconciliation in main() would otherwise hide them behind the real tools.
+        // An explicitly supplied fixture directory must not fall back to the
+        // machine's real service manager if an override is missing.
         let program = std::env::var_os("SHINA_SERVICE_BIN_DIR")
             .map(|dir| PathBuf::from(dir).join(program))
-            .filter(|path| path.is_file())
             .unwrap_or_else(|| PathBuf::from(program));
         let output = crate::process::output(
             Command::new(&program).args(args).stdin(Stdio::null()),

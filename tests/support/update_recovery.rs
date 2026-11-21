@@ -1,34 +1,34 @@
 //! Update-watch recovery against the real `shina` binary. The platform service
-//! manager is faked by putting `launchctl`/`systemctl` stubs on the child's PATH;
+//! manager commands are confined to a fixture directory;
 //! every other piece (watch record, install lock, owner lock, outcome file) is real.
 use super::*;
 
-/// A directory whose `launchctl`/`systemctl` stubs log every call to `calls.log`
-/// and behave like the manager would: `launchctl print` reports "not loaded",
-/// everything else succeeds.
-fn fake_manager_bin(profile: &Profile) -> PathBuf {
+/// Unix stubs log each manager call; `launchctl print` reports "not loaded".
+/// On Windows the empty override directory keeps the real scheduler out of
+/// these tests. The native scheduler test in server_runtime is opt-in.
+fn fake_manager_bin(profile: &Profile) {
     let bin = profile.root.join("fake-bin");
     fs::create_dir_all(&bin).unwrap();
-    let log = profile
-        .root
-        .join("calls.log")
-        .to_string_lossy()
-        .into_owned();
-    let launchctl = format!(
-        "#!/bin/sh\necho \"launchctl $*\" >> '{}'\nif [ \"$1\" = print ]; then exit 1; fi\nexit 0\n",
-        log
-    );
-    let systemctl = format!("#!/bin/sh\necho \"systemctl $*\" >> '{}'\nexit 0\n", log);
-    for (name, body) in [("launchctl", launchctl), ("systemctl", systemctl)] {
-        let path = bin.join(name);
-        fs::write(&path, body).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (name, body) in [
+            ("id", "#!/bin/sh\nprintf '1000\\n'\n"),
+            (
+                "launchctl",
+                "#!/bin/sh\nprintf 'launchctl %s\\n' \"$*\" >> calls.log\n[ \"$1\" != print ]\n",
+            ),
+            (
+                "systemctl",
+                "#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> calls.log\n",
+            ),
+        ] {
+            let path = bin.join(name);
+            fs::write(&path, body).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
-    bin
 }
 
 fn write_service(profile: &Profile) {
@@ -82,6 +82,7 @@ fn recover(profile: &Profile, update_id: &str) -> std::process::Output {
     command.output().unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn recover_update_starts_a_stopped_service_and_keeps_the_watch() {
     let mut profile = Profile::new();
@@ -189,7 +190,7 @@ fn recover_update_runs_from_the_profile_argument_not_the_environment() {
     let mut profile = Profile::new();
     fake_manager_bin(&profile);
     write_service(&profile);
-    write_watch(&profile, "watch-pinned", unix_now());
+    write_watch(&profile, "watch-pinned", unix_now() - 46 * 60);
     // The generated job pins --profile: the environment may resolve a different,
     // even missing, data directory and the watch still finds its own record.
     let decoy = profile.root.join("decoy-profile");
@@ -214,18 +215,17 @@ fn recover_update_runs_from_the_profile_argument_not_the_environment() {
         command.creation_flags(0x08000000);
     }
     let output = command.output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Started");
     assert!(output.status.success(), "{output:?}");
-    let calls = fs::read_to_string(profile.root.join("calls.log")).unwrap();
-    let start = if cfg!(target_os = "macos") {
-        "launchctl bootstrap"
-    } else {
-        "systemctl --user start Shina-recovery-fixture.service"
-    };
-    assert!(calls.contains(start), "{calls}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "Expired");
+    let outcome: Value =
+        serde_json::from_slice(&fs::read(profile.root.join("Shina/updates/outcome.json")).unwrap())
+            .unwrap();
+    assert_eq!(outcome["updateId"], "watch-pinned");
+    assert!(!decoy.join("Shina/updates").exists());
     profile.stop();
 }
 
+#[cfg(target_os = "macos")]
 fn write_journal(profile: &Profile, update_id: &str, phase: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     let updates = profile.root.join("Shina/updates");
@@ -245,6 +245,7 @@ fn write_journal(profile: &Profile, update_id: &str, phase: &str) -> PathBuf {
     backup
 }
 
+#[cfg(target_os = "macos")]
 fn write_service_missing_bundle(profile: &Profile) -> (PathBuf, PathBuf) {
     // The installed app bundle is absent mid-swap; only the previous copy remains.
     let install = profile.root.join("install");
@@ -417,29 +418,12 @@ fn recover_update_waits_quietly_while_the_helper_holds_the_install_lock() {
     fake_manager_bin(&profile);
     write_service(&profile);
     write_watch(&profile, "watch-4", unix_now());
-    // flock on the install lock is the cross-process signal the helper holds.
+    // Hold the same file lock as the update helper while the child runs recovery.
     let updates = profile.root.join("Shina/updates");
-    let python = Command::new("python3")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    if !python {
-        eprintln!("skipping lock-held check: python3 unavailable");
-        return;
-    }
-    let mut holder = Command::new("python3")
-        .args([
-            "-c",
-            "import fcntl,sys,time; f=open(sys.argv[1],'w'); fcntl.flock(f,fcntl.LOCK_EX); time.sleep(30)",
-            updates.join("install.lock").to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    let lock = fs::File::create(updates.join("install.lock")).unwrap();
+    lock.lock().unwrap();
     let output = recover(&profile, "watch-4");
-    let _ = holder.kill();
-    let _ = holder.wait();
+    drop(lock);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
         "HelperWorking"
