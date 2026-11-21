@@ -1434,6 +1434,7 @@ fn main() {
                 state.populate_demo();
                 state.current_mut().work[0].expanded = false;
             }),
+            ("sidebar-cards", |state| state.populate_sidebar_cards_demo()),
             ("thinking-output", |state| {
                 state.populate_demo();
                 state.current_mut().thoughts[0].expanded = true;

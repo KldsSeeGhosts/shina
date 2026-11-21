@@ -280,9 +280,9 @@ mod tests {
             let title = rt.presented("thread-row-title-900").unwrap().0;
             let snooze = rt.presented("thread-snooze-900").unwrap().0;
             let settle = rt.presented("thread-park-900").unwrap().0;
-            assert!(idle_title[2] > title[2], "{width}");
-            assert!(portrait[0] + portrait[2] <= title[0], "{width}");
-            assert!(title[0] + title[2] <= snooze[0] + 0.5, "{width}");
+            assert_eq!(idle_title, title, "{width}");
+            assert!(portrait[0] + portrait[2] <= snooze[0], "{width}");
+            assert!(snooze[1] + snooze[3] <= title[1], "{width}");
             assert!(snooze[0] + snooze[2] <= settle[0] + 0.5, "{width}");
             assert!(
                 !rt.accessibility_json()

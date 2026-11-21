@@ -21,7 +21,8 @@ use std::{
 pub const DEFAULT_MODEL: &str = "Default model";
 pub const SIDEBAR_MIN: f32 = 220.0;
 pub const SIDEBAR_MAX: f32 = 420.0;
-pub const DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 336.0;
+const PREVIOUS_DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
 pub(crate) const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 struct ContextAssetDownload {
@@ -17023,6 +17024,7 @@ impl State {
             "preferences": prefs_value,
             "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
+            "sidebarWidthDefault":DEFAULT_SIDEBAR_WIDTH,
             "rightPanelWidth":self.right_panel_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -17101,6 +17103,13 @@ impl State {
             })
             .transpose()?
             .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
+        // Give profiles still on the old default the wider cards. A width saved by the
+        // new layout, including a deliberately chosen 288 pt, stays as the user left it.
+        if ui.get("sidebarWidthDefault").is_none()
+            && self.sidebar_width == PREVIOUS_DEFAULT_SIDEBAR_WIDTH
+        {
+            self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+        }
         // Panel state itself is session-only; the width is the one saved value.
         self.right_panel_width = ui
             .get("rightPanelWidth")
@@ -17803,6 +17812,35 @@ impl State {
                 .map(|routine| routine.id),
         )
     }
+    pub(crate) fn populate_sidebar_cards_demo(&mut self) {
+        self.populate_demo();
+        self.dark = true;
+        let thread = &mut self.threads[0];
+        thread.title = "Intermittent Thread Stoppages".into();
+        thread.branch = Some("work/sable-dogfood".into());
+        self.captain_reports.push(crew_reports::CrewReport {
+            id: "demo-sidebar-pr".into(),
+            captain: 0,
+            thread_id: thread.id,
+            run_id: "demo-sidebar-run".into(),
+            title: thread.title.clone(),
+            outcome: crew_reports::CrewOutcome::Completed,
+            policy: Default::default(),
+            summary: "Example pull request reference.".into(),
+            error: String::new(),
+            created_at: lifecycle::now(),
+            request_id: None,
+            question: None,
+            artifacts: vec![crew_reports::CrewArtifact {
+                kind: crew_reports::ArtifactKind::PullRequest,
+                label: "Example pull request".into(),
+                reference: "https://github.com/example/shina/pull/84".into(),
+            }],
+            delivered: true,
+            hold_delivery: false,
+        });
+    }
+
     pub fn populate_demo(&mut self) {
         self.demo = true;
         self.captains = Captain::presets();
@@ -19616,6 +19654,22 @@ mod tests {
         assert!(state.store.is_none());
         state.checkpoint();
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn wider_sidebar_default_migrates_without_overwriting_saved_widths() {
+        let mut state = State::new(".".into(), false);
+        let mut ui = state.ui_snapshot();
+        ui.as_object_mut().unwrap().remove("sidebarWidthDefault");
+        ui["sidebarWidth"] = json!(288);
+        state.restore_ui(&ui).unwrap();
+        assert_eq!(state.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        ui["sidebarWidth"] = json!(300);
+        state.restore_ui(&ui).unwrap();
+        assert_eq!(state.sidebar_width, 300.0);
+        state.sidebar_width = 288.0;
+        state.restore_ui(&state.ui_snapshot()).unwrap();
+        assert_eq!(state.sidebar_width, 288.0);
     }
     #[test]
     fn blank_drafts_never_hold_a_sidebar_row_or_accumulate() {

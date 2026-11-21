@@ -47,11 +47,13 @@ struct Relations {
     crew: HashMap<usize, Vec<usize>>,
     remote: HashMap<String, HashMap<usize, usize>>,
     remote_children: HashMap<RowId, Vec<usize>>,
+    pull_requests: HashMap<RowId, u64>,
 }
 
 impl Relations {
     fn build(s: &State) -> Self {
         let mut result = Self::default();
+        result.add_pull_requests(&s.machines.selected, local_pull_references(s));
         for (index, thread) in s.threads.iter().enumerate() {
             result.local.insert(thread.id, index);
             if thread
@@ -70,6 +72,7 @@ impl Relations {
             if server == &s.machines.selected {
                 continue;
             }
+            result.add_pull_requests(server, remote_pull_references(projection));
             let mut rows = HashMap::new();
             let homes = &projection["index"]["captainHomes"];
             for (index, record) in projection["index"]["threads"]
@@ -98,16 +101,23 @@ impl Relations {
         }
         result
     }
+
+    fn add_pull_requests<'a>(
+        &mut self,
+        server: &str,
+        references: impl Iterator<Item = (usize, &'a str)>,
+    ) {
+        for (thread, reference) in references {
+            if let Some(number) = pull_request_number(reference) {
+                // Reports are ordered by capture. Prefer the latest reported PR.
+                self.pull_requests
+                    .insert(RowId::new(server, thread), number);
+            }
+        }
+    }
 }
 
-fn render_local(
-    s: &State,
-    p: Palette,
-    entry: &Entry<'_>,
-    item: El,
-    grouped: bool,
-    rel: &Relations,
-) -> El {
+fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relations) -> El {
     let thread = &s.threads[entry.local.expect("local row")];
     let row_id = RowId::new(entry.server, entry.id);
     let id = row_id.thread;
@@ -304,6 +314,8 @@ fn render_local(
             sidebar_preview::row_actions_open(s, &row_id),
         )
     });
+    let machine =
+        machine.or_else(|| (!shelved && !draft).then(|| machine_caption(s, entry.server)));
     thread_row_el(
         s,
         p,
@@ -321,20 +333,105 @@ fn render_local(
             }),
             age: row_age(&thread.life, section, thread.updated, now),
             workspace: workspace.as_deref(),
-            branch: thread.branch.as_deref(),
+            branch: local_row_branch(s, thread),
+            pull_request: rel.pull_requests.get(&row_id).copied(),
+            diff: row_diff(s, &row_id),
             machine: machine.as_deref(),
             harness: Some(&thread.harness),
             model: Some(&thread.model),
             agents_active: crate::agents::active_count(thread),
             lead,
+            project_lead: (!worker)
+                .then(|| s.project(thread.project))
+                .flatten()
+                .map(|project| project_tile(s, p, Some(project), 16.0)),
             selected: entry.selected(s),
-            grouped,
             shelved,
             draft,
             snippet,
         },
         actions,
     )
+}
+
+fn local_row_branch<'a>(s: &'a State, thread: &'a Thread) -> Option<&'a str> {
+    thread.branch.as_deref().or_else(|| {
+        if thread.worktree_path.is_some() || s.vcs_branches.is_empty() {
+            return None;
+        }
+        let key = s.thread_vcs_repo_key(thread)?;
+        s.vcs_branches
+            .get(&key)?
+            .refs
+            .iter()
+            .find(|branch| branch.current)
+            .map(|branch| branch.name.as_str())
+    })
+}
+
+// Reports contain evidence links, not GitHub state. Only display a number for a real
+// GitHub pull request URL and do not infer open/closed status from a report.
+fn pull_request_number(reference: &str) -> Option<u64> {
+    let url = url::Url::parse(reference).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let (owner, repo, kind, number) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    if owner.is_empty()
+        || repo.is_empty()
+        || kind != "pull"
+        || segments.any(|segment| !segment.is_empty())
+    {
+        return None;
+    }
+    number.parse::<u64>().ok().filter(|number| *number > 0)
+}
+
+fn local_pull_references(s: &State) -> impl Iterator<Item = (usize, &str)> {
+    s.crew_reports().iter().flat_map(|report| {
+        report
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.kind == crate::model::crew_reports::ArtifactKind::PullRequest
+            })
+            .map(|artifact| (report.thread_id, artifact.reference.as_str()))
+    })
+}
+
+fn remote_pull_references(
+    projection: &crate::client_history::Projection,
+) -> impl Iterator<Item = (usize, &str)> {
+    projection["index"]["captainReports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|report| {
+            Some((
+                usize::try_from(report["threadId"].as_u64()?).ok()?,
+                report["artifacts"].as_array()?,
+            ))
+        })
+        .flat_map(|(id, artifacts)| {
+            artifacts
+                .iter()
+                .filter(|artifact| artifact["kind"] == "pull_request")
+                .filter_map(move |artifact| Some((id, artifact["reference"].as_str()?)))
+        })
+}
+
+fn row_diff(s: &State, id: &RowId) -> Option<(u32, u32)> {
+    let diff = s
+        .diffs
+        .get(&crate::right_panel::key(&id.server, id.thread))?
+        .ready()?;
+    (diff.additions > 0 || diff.deletions > 0).then_some((diff.additions, diff.deletions))
 }
 
 fn local_status(s: &State, thread: &Thread, rel: &Relations) -> (Status, bool) {
@@ -1092,7 +1189,6 @@ struct IndexedRow {
     captain: bool,
     draft: bool,
     title_match: bool,
-    grouped: bool,
 }
 
 enum Node {
@@ -1262,6 +1358,17 @@ fn relations_signature(s: &State, structure: u64) -> u64 {
             t.id.hash(&mut hash);
         }
     }
+    for reference in local_pull_references(s) {
+        reference.hash(&mut hash);
+    }
+    for (server, projection) in &s.machines.views {
+        if server != &s.machines.selected {
+            server.hash(&mut hash);
+            for reference in remote_pull_references(projection) {
+                reference.hash(&mut hash);
+            }
+        }
+    }
     hash.finish()
 }
 
@@ -1292,7 +1399,6 @@ impl IndexedRow {
             captain: row.captain,
             draft: row.draft,
             title_match: row.title_match,
-            grouped: false,
         }
     }
 }
@@ -1305,11 +1411,7 @@ impl Plan {
         self.nodes.push((key.into(), node));
     }
     fn thread(&mut self, s: &State, entry: &Entry<'_>) {
-        self.thread_in(s, entry, false);
-    }
-    fn thread_in(&mut self, s: &State, entry: &Entry<'_>, grouped: bool) {
-        let mut row = IndexedRow::new(entry);
-        row.grouped = grouped;
+        let row = IndexedRow::new(entry);
         let key = if row.captain {
             if s.client.is_some() {
                 format!("crew-{}-{}", row.id.server, row.id.thread)
@@ -1418,7 +1520,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
                 .into_iter()
                 .filter(|row| !collapsed || row.selected(s))
             {
-                plan.thread_in(s, row, true);
+                plan.thread(s, row);
             }
         }
     }
@@ -1600,14 +1702,7 @@ fn remote_record<'a>(
     projection["index"]["threads"].get(*rel.remote.get(server)?.get(&id)?)
 }
 
-fn render_remote(
-    s: &State,
-    p: Palette,
-    entry: &Entry<'_>,
-    item: El,
-    grouped: bool,
-    rel: &Relations,
-) -> El {
+fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relations) -> El {
     let projection = entry.projection.expect("remote projection");
     let record = entry.record.expect("remote record");
     let view = entry.view;
@@ -1789,6 +1884,8 @@ fn render_remote(
             branch: view.record["branch"]
                 .as_str()
                 .or_else(|| record["branch"].as_str()),
+            pull_request: rel.pull_requests.get(&row_id).copied(),
+            diff: row_diff(s, &row_id),
             machine: Some(&machine),
             harness: view.record["harness"]
                 .as_str()
@@ -1799,8 +1896,11 @@ fn render_remote(
                 .or_else(|| record["agentsActive"].as_u64())
                 .unwrap_or_default() as usize,
             lead,
+            project_lead: project
+                .as_ref()
+                .filter(|_| !worker)
+                .map(|project| project_tile(s, p, Some(project), 16.0)),
             selected: entry.selected(s),
-            grouped,
             shelved,
             draft: entry.draft,
             snippet,
@@ -1905,8 +2005,9 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
         {
             item = item
                 .on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag))
-                .on_drawn_layout(move |s: &mut State, rect| {
+                .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                     s.drop_rects.insert(drop_key.clone(), rect);
+                    tx.live_only();
                 })
                 .on_visible(move |s: &mut State, visible, tx| {
                     if !visible {
@@ -1917,9 +2018,9 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
         }
     }
     let built = if local {
-        render_local(s, p, &entry, item, row.grouped, rel)
+        render_local(s, p, &entry, item, rel)
     } else {
-        render_remote(s, p, &entry, item, row.grouped, rel)
+        render_remote(s, p, &entry, item, rel)
     };
     if entry.captain {
         col().child(built)
@@ -2141,8 +2242,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                 .px(8.0)
                 .center_y()
                 .fill(if selected { p.coral_bg } else { p.selected })
-                .on_drawn_layout(move |s: &mut State, rect| {
+                .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                     s.drop_rects.insert(key.clone(), rect);
+                    tx.live_only();
                 })
                 .child(meta_label(&format!("{section:?}"), p.muted))
         }
@@ -2181,8 +2283,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         .center_y()
                         .gap(6.0)
                         .hover(p.selected)
-                        .on_drawn_layout(move |s: &mut State, rect| {
+                        .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                             s.drop_rects.insert(key.clone(), rect);
+                            tx.live_only();
                         })
                         .on_press(move |s: &mut State| {
                             s.shelves[index] = !s.shelves[index];
@@ -2228,7 +2331,7 @@ fn windowed(
         .growth(rune::GrowthSpec::default())
         .virtual_rows(
             end.saturating_sub(start),
-            48.0,
+            64.0,
             move |_: &State, index| keys.nodes[start + index].0.clone().into(),
             move |s: &State, index| {
                 let (key, node) = &build.nodes[start + index];
@@ -2331,7 +2434,7 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
     row.captain.hash(&mut hash);
     row.draft.hash(&mut hash);
     row.title_match.hash(&mut hash);
-    row.grouped.hash(&mut hash);
+    rel.pull_requests.get(&row.id).hash(&mut hash);
     s.dark.hash(&mut hash);
     s.artwork.device_scale().to_bits().hash(&mut hash);
     s.portraits.motion_allowed().hash(&mut hash);
@@ -2354,7 +2457,8 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
         thread.title.hash(&mut hash);
         thread.model.hash(&mut hash);
         thread.harness.hash(&mut hash);
-        thread.branch.hash(&mut hash);
+        local_row_branch(s, thread).hash(&mut hash);
+        row_diff(s, &row.id).hash(&mut hash);
         thread.updated.hash(&mut hash);
         thread.unread().hash(&mut hash);
         thread.life.woke(now).hash(&mut hash);
@@ -2431,6 +2535,7 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
             }
         }
     } else if let Some(projection) = s.machines.views.get(server) {
+        row_diff(s, &row.id).hash(&mut hash);
         let record = remote_record(projection, rel, server, id);
         record.hash(&mut hash);
         projection["index"]["projects"].hash(&mut hash);

@@ -886,13 +886,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let narrow = layout_width < 1050.0;
     // Below this width the sidebar stops docking and opens on demand instead.
     let compact = layout_width < 760.0;
-    let sidebar_width = if compact {
-        s.sidebar_width.min(layout_width - 56.0)
-    } else if narrow {
-        s.sidebar_width.min(248.0)
-    } else {
-        s.sidebar_width
-    };
+    let sidebar_width = sidebar_width_at(s.sidebar_width, layout_width);
     let docked = (s.sidebar && !compact) || (compact && s.compact_sidebar);
     // The chat column's width from the last layout. The first frame guesses from the window,
     // less the gutters and a docked sidebar, so it already lays out close to its final lane.
@@ -963,7 +957,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if docked && !compact {
         workspace = workspace.child(sidebar(s, p, sidebar_width));
         if !compact {
-            let max_width = (s.viewport_width - 480.0).clamp(220.0, 420.0);
+            let max_width = sidebar_max_width(layout_width);
             workspace = workspace.child(
                 el().key("sidebar-resize")
                     .role("separator")
@@ -983,7 +977,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                         if drag.cancelled() {
                             s.sidebar_width = drag.data;
                         } else {
-                            s.sidebar_width = (drag.data + drag.dx / zoom).clamp(220.0, max_width);
+                            s.sidebar_width = (drag.data.min(max_width) + drag.dx / zoom)
+                                .clamp(crate::model::SIDEBAR_MIN, max_width);
                         }
                         if drag.phase == rune::Phase::Up {
                             s.checkpoint();
@@ -995,7 +990,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                             rune::Key::Right => 10.0,
                             _ => return false,
                         };
-                        s.sidebar_width = (s.sidebar_width + step).clamp(220.0, max_width);
+                        s.sidebar_width =
+                            (sidebar_width + step).clamp(crate::model::SIDEBAR_MIN, max_width);
                         s.checkpoint();
                         true
                     }),
@@ -5165,14 +5161,21 @@ fn multiple_machines(s: &State) -> bool {
 
 /// A sidebar row's width in points, from the sidebar setting and the last window width.
 fn sidebar_row_width(s: &State) -> f32 {
-    let sidebar = if s.viewport_width < 760.0 {
-        s.sidebar_width.min(s.viewport_width - 56.0)
-    } else if s.viewport_width < 1050.0 {
-        s.sidebar_width.min(248.0)
+    sidebar_width_at(s.sidebar_width, s.viewport_width) - 16.0
+}
+
+fn sidebar_max_width(viewport: f32) -> f32 {
+    (viewport - 480.0).clamp(crate::model::SIDEBAR_MIN, crate::model::SIDEBAR_MAX)
+}
+
+fn sidebar_width_at(preferred: f32, viewport: f32) -> f32 {
+    if viewport < 760.0 {
+        // The compact drawer sits in front of the chat rather than beside it.
+        // Widen the docked sidebar without covering more of a small conversation.
+        preferred.min(288.0).min((viewport - 56.0).max(0.0))
     } else {
-        s.sidebar_width
-    };
-    sidebar - 16.0
+        preferred.min(sidebar_max_width(viewport))
+    }
 }
 
 /// About how wide `text` is at the sidebar's 13 px.
@@ -27957,10 +27960,18 @@ pub(crate) mod tests {
             let mut thread = Thread::new(2);
             thread.title = "One workshop thread".into();
             thread.model = crate::model::DEFAULT_MODEL.into();
+            thread.project = Some(1);
             thread.branch = Some("work/sidebar".into());
             thread.status = Status::Failed;
             thread.life.latest_user_message_at = Some(lifecycle::now());
             rt.state.threads.push(thread);
+            rt.state
+                .projects
+                .entries
+                .push(crate::projects::Project::new(
+                    1,
+                    std::path::PathBuf::from("/demo/workshop"),
+                ));
             settle(&mut rt);
             let rect = |rt: &Runtime<State>, key: &str| {
                 rt.presented(key)
@@ -27968,18 +27979,31 @@ pub(crate) mod tests {
                     .0
             };
             let row = rect(&rt, "thread-2");
-            assert_eq!(row[3], 36.0, "{width}");
-            assert!((rect(&rt, "thread-row-title-2")[0] - row[0] - 36.0).abs() <= 1.0);
+            assert_eq!(row[3], 78.0, "{width}");
+            assert_eq!(
+                element_text(&rt, "thread-where-2").as_deref(),
+                Some("work/sidebar")
+            );
+            let title = rect(&rt, "thread-row-title-2");
+            let status = rect(&rt, "thread-status-slot-2");
+            assert!(title[1] >= status[1] + status[3], "{width}");
+            assert!(title[2] >= row[2] - 22.0, "{width}: {row:?} {title:?}");
+            let expected = if width == 960.0 {
+                336.0
+            } else {
+                sidebar_width_at(336.0, width)
+            };
+            assert_eq!(rect(&rt, "sidebar")[2], expected, "{width}");
             assert_eq!(
                 element_text(&rt, "thread-state-2").as_deref(),
                 Some("Failed")
             );
             let server = rt.state.machines.selected.clone();
-            rt.update(|s, _| s.toggle_sidebar_group(server.clone(), None));
+            rt.update(|s, _| s.toggle_sidebar_group(server.clone(), Some(1)));
             settle(&mut rt);
             assert!(rt.find("thread-2").is_none(), "{width}");
             assert!(
-                rt.find(&format!("sidebar-group-attention-{server}-none"))
+                rt.find(&format!("sidebar-group-attention-{server}-1"))
                     .is_some(),
                 "{width}"
             );
@@ -27989,6 +28013,35 @@ pub(crate) mod tests {
             rt.update(|s, _| s.threads[1].branch = None);
             settle(&mut rt);
             assert_eq!(rect(&rt, "thread-2")[3], 60.0, "{width}");
+        }
+    }
+
+    #[test]
+    fn sidebar_cards_keep_the_branch_and_pr_visible_below_the_title() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_sidebar_cards_demo();
+            rt.state.compact_sidebar = width < 760.0;
+            settle(&mut rt);
+            let title = rt.presented("thread-row-title-1").unwrap().0;
+            let branch = rt.presented("thread-where-1").unwrap().0;
+            let pr = rt.presented("thread-pr-1").unwrap().0;
+            let machine = rt.presented("thread-machine-1").unwrap().0;
+            let provider = rt.presented("thread-harness-1").unwrap().0;
+            assert!(title[1] + title[3] <= branch[1], "{width}");
+            assert!(branch[0] + branch[2] <= pr[0], "{width}");
+            assert!(
+                pr[0] + pr[2] <= machine[0] && machine[0] + machine[2] <= provider[0],
+                "{width}"
+            );
+            assert_eq!(
+                element_text(&rt, "thread-where-1").as_deref(),
+                Some("work/sable-dogfood")
+            );
+            assert_eq!(
+                element_text(&rt, "thread-pr-1").as_deref(),
+                Some("Pull request 84")
+            );
         }
     }
 
@@ -30408,7 +30461,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sidebar_rows_follow_compact_grouped_hierarchy_at_all_widths() {
+    fn sidebar_rows_keep_their_cards_when_grouped_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.populate_demo();
@@ -30416,7 +30469,7 @@ pub(crate) mod tests {
             rt.frame(0.0);
             rt.frame(1.0);
 
-            // Captain rows stay 56 pt tall while folder rows follow KSG's 36 pt layout.
+            // Captain rows stay 56 pt tall; active threads stay cards in workspace groups.
             let mut prev_bottom = 0.0f32;
             for i in rt.state.sidebar_captains() {
                 let id = rt.state.threads[i].id;
@@ -30443,7 +30496,7 @@ pub(crate) mod tests {
             let group_rect = rect(&rt, &group_key);
             let active_rect = rect(&rt, &format!("thread-{active_id}"));
             assert!(
-                (active_rect[3] - 36.0).abs() < 0.5,
+                (active_rect[3] - 60.0).abs() < 0.5,
                 "{width}: thread row height {active_rect:?}"
             );
             assert!(

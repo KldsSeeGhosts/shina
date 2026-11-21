@@ -103,13 +103,15 @@ pub(super) struct ThreadRowModel<'a> {
     pub age: Option<String>,
     pub workspace: Option<&'a str>,
     pub branch: Option<&'a str>,
+    pub pull_request: Option<u64>,
+    pub diff: Option<(u32, u32)>,
     pub machine: Option<&'a str>,
     pub harness: Option<&'a str>,
     pub model: Option<&'a str>,
     pub agents_active: usize,
     pub lead: El,
+    pub project_lead: Option<El>,
     pub selected: bool,
-    pub grouped: bool,
     pub shelved: bool,
     pub draft: bool,
     pub snippet: Option<El>,
@@ -130,8 +132,8 @@ pub(super) struct CaptainRowModel<'a> {
     pub selected: bool,
 }
 
-/// Ported from KSG Code's `SidebarThreadRow`: compact folder and shelf rows,
-/// plus a workspace header and optional metadata line for ungrouped cards.
+/// Ported from KSG Code's `SidebarThreadRow` card. Keep the workspace/status,
+/// title, and branch/metadata on separate lines, including inside groups.
 pub(super) fn thread_row_el(
     s: &State,
     p: Palette,
@@ -140,7 +142,7 @@ pub(super) fn thread_row_el(
     actions: Option<(El, f32, bool)>,
 ) -> El {
     let id = m.id;
-    let compact = (m.grouped || m.draft || m.shelved) && m.snippet.is_none();
+    let compact = (m.draft || m.shelved) && m.snippet.is_none();
     let quiet = !m.selected && (m.shelved || m.status == RowStatus::Working);
     let details = if m.status == RowStatus::Idle {
         m.age.unwrap_or_default()
@@ -162,6 +164,12 @@ pub(super) fn thread_row_el(
     }
     if let Some(branch) = m.branch {
         description.push(format!("branch {branch}"));
+    }
+    if let Some(pr) = m.pull_request {
+        description.push(format!("pull request {pr}"));
+    }
+    if let Some((added, removed)) = m.diff {
+        description.push(format!("{added} additions, {removed} deletions"));
     }
     if m.agents_active > 0 {
         description.push(format!("{} agents working", m.agents_active));
@@ -248,12 +256,18 @@ pub(super) fn thread_row_el(
         }
         (COMPACT_HEIGHT, line.child(slot))
     } else {
-        let has_meta = m.branch.is_some() || m.snippet.is_some();
+        let scratch_machine = m.machine.filter(|_| m.workspace.is_none());
+        let has_meta = m.branch.is_some()
+            || m.pull_request.is_some()
+            || m.diff.is_some()
+            || m.agents_active > 0
+            || m.snippet.is_some()
+            || scratch_machine.is_some();
         let header = row()
             .h(20.0)
             .center_y()
             .gap(6.0)
-            .child(lead)
+            .child(m.project_lead.unwrap_or(lead))
             .child(
                 label(m.workspace.unwrap_or_default(), SMALL, p.muted)
                     .truncate()
@@ -261,27 +275,66 @@ pub(super) fn thread_row_el(
                     .min_w(0.0),
             )
             .child(slot);
-        let mut title_line = row().h(20.0).mt(4.0).center_y().gap(4.0).child(title);
-        if m.agents_active > 0 {
-            title_line = title_line.child(agents_ui::chip(
-                &format!("thread-agents-{id}"),
-                m.agents_active,
-                p,
-            ));
-        }
-        let mut metadata = row().h(16.0).mt(2.0).gap(4.0).center_y().min_w(0.0);
+        let mut title_line = row().h(20.0).mt(4.0).center_y().gap(6.0).child(title);
+        let mut metadata = row().h(16.0).mt(2.0).gap(6.0).center_y().min_w(0.0);
         if let Some(snippet) = m.snippet {
             metadata = metadata.child(snippet.grow(1.0));
         } else if let Some(branch) = m.branch {
             metadata = metadata.child(
-                label(branch, MONO_META, p.muted)
+                label(branch, SMALL, p.muted)
                     .key(format!("thread-where-{id}"))
                     .truncate_middle()
                     .grow(1.0)
                     .min_w(0.0),
             );
+        } else if let Some(machine) = scratch_machine {
+            metadata = metadata.child(
+                label(machine, SMALL, p.muted)
+                    .truncate()
+                    .grow(1.0)
+                    .min_w(0.0),
+            );
+        } else {
+            metadata = metadata.child(spacer());
+        }
+        if let Some(pr) = m.pull_request {
+            metadata = metadata.child(
+                row()
+                    .key(format!("thread-pr-{id}"))
+                    .center_y()
+                    .gap(3.0)
+                    .label(format!("Pull request {pr}"))
+                    .help(format!("Pull request {pr}"))
+                    .child(icon("pull-request", p.muted).size(13.0, 13.0))
+                    .child(label(pr.to_string(), SMALL, p.muted)),
+            );
+        }
+        if let Some((added, removed)) = m.diff {
+            metadata = metadata.child(
+                row()
+                    .key(format!("thread-diff-{id}"))
+                    .center_y()
+                    .gap(4.0)
+                    .child(label(
+                        format!("+{}", diff_panel::format_compact_diff_count(added)),
+                        MONO_META,
+                        p.ok,
+                    ))
+                    .child(label(
+                        format!("−{}", diff_panel::format_compact_diff_count(removed)),
+                        MONO_META,
+                        p.danger,
+                    )),
+            );
         }
         let mut identity = row().center_y().gap(4.0);
+        if m.agents_active > 0 {
+            identity = identity.child(agents_ui::chip(
+                &format!("thread-agents-{id}"),
+                m.agents_active,
+                p,
+            ));
+        }
         if let Some(machine) = machine() {
             identity = identity.child(machine);
         }
@@ -309,6 +362,7 @@ pub(super) fn thread_row_el(
     };
     select_bar(
         item.h(height)
+            .my(if compact { 0.0 } else { 2.0 })
             .hover_group_focus()
             .label(description.join(", "))
             .description("Preview available")
