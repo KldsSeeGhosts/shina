@@ -284,6 +284,15 @@ fn permission_mode(access: &str) -> &'static str {
     }
 }
 
+fn cli_version(value: &Value) -> Option<&str> {
+    let version = value.as_str()?;
+    let core = version.split(['-', '+']).next()?;
+    // The shared catalog parser pads missing components, including an empty core.
+    (core.bytes().any(|byte| byte.is_ascii_digit())
+        && crate::model_catalog::parse_semver(version).is_some())
+    .then_some(version)
+}
+
 fn read_tool(name: &str) -> bool {
     matches!(
         name,
@@ -747,10 +756,7 @@ impl Client {
         // `system`/`init`; 2.1.330+ emits no `init` frame until the first prompt.
         // A valid handshake version settles the init gate so catalog publication
         // does not wait out the grace, and so versioned manifest rows list.
-        if let Some(version) = data["claude_code_version"]
-            .as_str()
-            .filter(|version| crate::model_catalog::parse_semver(version).is_some())
-        {
+        if let Some(version) = cli_version(&data["claude_code_version"]) {
             self.version = Some(version.to_owned());
             self.init_seen = true;
         }
@@ -1216,8 +1222,7 @@ impl Client {
                     // handshake already validated, and an unparseable frame never
                     // counts as a source.
                     if self.version.is_none()
-                        && let Some(version) = record["claude_code_version"].as_str()
-                        && crate::model_catalog::parse_semver(version).is_some()
+                        && let Some(version) = cli_version(&record["claude_code_version"])
                     {
                         self.version = Some(version.to_owned());
                     }

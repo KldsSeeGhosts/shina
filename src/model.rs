@@ -2947,6 +2947,14 @@ impl Thread {
         delivery
     }
 
+    pub(crate) fn pending_local_attempt(&self) -> Option<&str> {
+        if self.delegated && self.peer_origin.is_none() {
+            self.next_execution.as_ref()?.attempt_id.as_deref()
+        } else {
+            None
+        }
+    }
+
     fn flush_injection(&mut self) -> bool {
         if self.offline_blocked
             || self.provider_update_held
@@ -2995,6 +3003,32 @@ impl Thread {
                 Some("Choose a CPA model before Shina can deliver queued messages.".into());
             return false;
         }
+        let prepared_local_attempt = self.pending_local_attempt().is_some();
+        if let Some(attempt) = self.pending_local_attempt() {
+            // Startup can report Running before an admitted brief has started.
+            // Never send this brief into a different turn that actually began.
+            if self.status.busy()
+                && self.started.is_some()
+                && self.run_id.is_some()
+                && self.provider_terminal_run != self.run_id
+            {
+                return false;
+            }
+            let Some(index) = self.pending_injections.iter().position(|input| {
+                input.peer_input.is_none() && tasks::delivery_id(&input.text) == Some(attempt)
+            }) else {
+                return false;
+            };
+            // Other messages (including reports from this worker's own crew)
+            // must not take the run identity reserved for the new brief.
+            if index > 0 {
+                let brief = self
+                    .pending_injections
+                    .remove(index)
+                    .expect("located brief");
+                self.pending_injections.push_front(brief);
+            }
+        }
         let text = self.pending_injections[0].text.clone();
         let peer_input = self.pending_injections[0].peer_input;
         let peer_execution = peer_input
@@ -3024,7 +3058,8 @@ impl Thread {
             .as_ref()
             .filter(|run| self.status.busy() && Some(*run) == self.run_id.as_ref())
             .is_some();
-        if !self.status.busy()
+        if prepared_local_attempt
+            || !self.status.busy()
             || self.run_id.is_none()
             || peer_execution.is_some() && self.provider_terminal_run == self.run_id
         {
@@ -4947,14 +4982,13 @@ impl NavHistory {
 
 pub(crate) struct ExecutionBaseline {
     runs: std::collections::BTreeMap<usize, Option<String>>,
-    task_ids: std::collections::BTreeSet<String>,
-    attempts: std::collections::BTreeMap<String, String>,
     tasks: std::collections::BTreeMap<String, (uuid::Uuid, Option<uuid::Uuid>, Option<usize>)>,
 }
 
 pub struct State {
     /// None means a command/global change. A poll records only changed threads.
     pub(crate) persistence_scope: Option<std::collections::HashSet<usize>>,
+    pub(crate) execution_command_device: Option<String>,
     /// The durable admission scheduler shared by delegated tasks, crew
     /// members and peer-launched workers. Persisted with the index.
     pub(crate) scheduler: admission::Scheduler,
@@ -5345,12 +5379,6 @@ impl State {
                 .iter()
                 .map(|thread| (thread.id, thread.run_id.clone()))
                 .collect(),
-            task_ids: self.tasks.iter().map(|task| task.id.clone()).collect(),
-            attempts: self
-                .tasks
-                .iter()
-                .map(|task| (task.id.clone(), task.attempt_id.clone()))
-                .collect(),
             tasks: self
                 .tasks
                 .iter()
@@ -5413,32 +5441,6 @@ impl State {
             .collect();
         for (id, queues) in changed_threads {
             self.allocate_local_execution(id, device, queues)?;
-        }
-
-        let local_tasks: Vec<usize> = self
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, task)| {
-                task.remote.is_none()
-                    && matches!(
-                        task.state,
-                        TaskState::Queued | TaskState::Starting | TaskState::Running
-                    )
-                    && (!baseline.task_ids.contains(&task.id)
-                        || baseline.attempts.get(&task.id) != Some(&task.attempt_id))
-                    && self
-                        .threads
-                        .iter()
-                        .find(|thread| thread.id == task.child_thread_id)
-                        .is_some_and(|thread| {
-                            !matches!(thread.status, Status::Completed | Status::Failed)
-                        })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in local_tasks {
-            self.allocate_local_task_execution(index, device)?;
         }
 
         let task_ids: Vec<String> = self.tasks.iter().map(|task| task.id.clone()).collect();
@@ -5677,15 +5679,28 @@ impl State {
         Ok(lease)
     }
 
+    fn prepared_local_attempt(
+        &self,
+        task: &Task,
+        thread: &Thread,
+    ) -> Option<&crate::execution::Lease> {
+        let binding = thread.next_execution.as_ref()?;
+        let lease = self.execution.get(&binding.lease_id)?;
+        (lease.phase == crate::execution::Phase::Prepared
+            && lease.executor_id == self.identity.executor_id
+            && lease.executor_thread_alias == Some(thread.id as u64)
+            && lease.attempt_id.as_deref() == Some(task.attempt_id.as_str())
+            && lease.delivery_id.as_deref() == Some(task.delivery_id.as_str())
+            && lease.binding() == *binding)
+            .then_some(lease)
+    }
+
     fn allocate_local_task_execution(
         &mut self,
         task_index: usize,
-        device: &str,
-    ) -> Result<crate::execution::Lease, String> {
+        initiating_device: &str,
+    ) -> Result<(), String> {
         let task = self.tasks.get(task_index).ok_or("Unknown local task.")?;
-        let initiating_device = self
-            .execution_initiator_for_thread(task.parent_thread_id)
-            .unwrap_or_else(|| device.to_owned());
         let thread_id = task.child_thread_id;
         let identity = self.snapshot_identity();
         let thread = self
@@ -5693,13 +5708,16 @@ impl State {
             .iter()
             .find(|thread| thread.id == thread_id)
             .ok_or("Local task has no child thread.")?;
+        if self.prepared_local_attempt(task, thread).is_some() {
+            return Ok(());
+        }
         let logical_thread_uid = identity
             .thread_uid(thread_id)
             .ok_or("Local task thread has no logical identity.")?
             .to_owned();
         let executor = self.identity.executor_id.clone();
         let (lease, _) = self.execution.prepare(crate::execution::Prepare {
-            scope: self.execution_scope(&initiating_device, &executor),
+            scope: self.execution_scope(initiating_device, &executor),
             logical_captain_uid: thread
                 .captain
                 .and_then(|captain| identity.captain_uid(captain).map(str::to_owned)),
@@ -5720,7 +5738,7 @@ impl State {
         {
             thread.next_execution = Some(lease.binding());
         }
-        Ok(lease)
+        Ok(())
     }
 
     /// Move persisted provider observations into the lease book. A queued peer
@@ -6404,6 +6422,7 @@ impl State {
                 &crate::store::directory().unwrap_or_default(),
             ),
             execution: crate::execution::Book::default(),
+            execution_command_device: None,
             task_operations: Vec::new(),
             peer_task_intents: Vec::new(),
             recovery_notice: None,

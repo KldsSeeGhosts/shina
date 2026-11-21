@@ -2191,26 +2191,32 @@ fn version_sources_wait_fallback_and_conflict() {
     assert!(client.ready);
     assert_eq!(client.version.as_deref(), Some("2.1.330"));
 
-    // Invalid handshake version: not a source, init fallback still applies.
-    let mut client = Client::new(spec(SessionSource::New, "full-access"));
-    client
-        .initialized(&json!({
-            "hook_on_failure_supported": true,
-            "hooks_applied": true,
-            "commands": [],
-            "claude_code_version": "not-semver",
-            "models": []
-        }))
-        .unwrap();
-    assert!(!client.init_seen, "invalid version keeps the gate open");
-    client
-        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"bogus"}))
-        .unwrap();
-    assert_eq!(client.version, None);
-    client
-        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"2.1.330"}))
-        .unwrap();
-    assert_eq!(client.version.as_deref(), Some("2.1.330"));
+    for invalid in ["not-semver", "", " ", "v", ".", "+build.1", "-rc.1"] {
+        let mut client = Client::new(spec(SessionSource::New, "full-access"));
+        client
+            .initialized(&json!({
+                "hook_on_failure_supported": true,
+                "hooks_applied": true,
+                "commands": [],
+                "claude_code_version": invalid,
+                "models": []
+            }))
+            .unwrap();
+        settings_response_without_init(&mut client, json!({"effective":{},"sources":[]}));
+        assert!(!client.ready, "invalid handshake settled init: {invalid:?}");
+        assert_eq!(client.version, None);
+        client
+            .incoming(json!({"type":"system","subtype":"init","claude_code_version":"2.1.330"}))
+            .unwrap();
+        assert_eq!(client.version.as_deref(), Some("2.1.330"));
+        assert!(client.ready);
+        assert!(client.models.iter().any(|model| {
+            model["id"] == "claude-fable-5-2"
+                && model["thinkingLevels"]
+                    .as_array()
+                    .is_some_and(|levels| levels.contains(&json!("medium")))
+        }));
+    }
 
     // Handshake wins a conflict: a later init cannot re-gate published rows.
     let mut client = Client::new(spec(SessionSource::New, "full-access"));

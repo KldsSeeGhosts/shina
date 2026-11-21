@@ -430,7 +430,10 @@ impl RuntimeState {
                     .and_then(|id| database.revoke(id))
                     .map(|_| json!({}))
             } else {
-                self.state.execute_command(&command)
+                self.state.execution_command_device = Some(device.to_owned());
+                let result = self.state.execute_command(&command);
+                self.state.execution_command_device = None;
+                result
             };
             let mut execution_failed = false;
             match result {
@@ -924,6 +927,16 @@ impl RuntimeState {
                 .iter()
                 .find(|thread| thread.id == thread_id)
         {
+            if thread.pending_local_attempt().is_some()
+                && matches!(
+                    command.method.as_str(),
+                    "thread.send" | "captain.crew.send" | "queue.sendNow"
+                )
+            {
+                return Err(
+                    "Wait for the delegated brief to start before sending more input.".into(),
+                );
+            }
             let mut replacement = matches!(
                 command.method.as_str(),
                 "thread.resume" | "thread.retry" | "task.resume"
