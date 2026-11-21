@@ -98,3 +98,4 @@ Removed at the user's request. Do not add them back:
 
 - Prefer releases over local builds so Windows and macOS stay in sync without drift.
 - After checks pass, commit and push your changes rather than leaving them only as local working-tree edits or local builds.
+- For PRs that change the UI, embed labeled Before and After screenshots in the PR description. Capture the base revision and the PR revision with matching demo data, platform, viewport, scale, theme, and UI state. Prefer Shina's `--demo --snap` mode and never use a personal profile. Attach the images to the PR or link durable copies outside the code branch. If a matching Before screenshot is impossible, say why.
