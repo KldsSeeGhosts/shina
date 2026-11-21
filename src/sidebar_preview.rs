@@ -22,6 +22,7 @@ pub(crate) struct SidebarPreview {
     pending: Option<(RowId, Source, Instant)>,
     open: Option<(RowId, Source)>,
     hot: Option<RowId>,
+    keyboard_actions: Option<usize>,
     card_hot: bool,
     muted: Option<RowId>,
     leave: Option<Instant>,
@@ -29,6 +30,12 @@ pub(crate) struct SidebarPreview {
     at_scroll: f32,
     pub(super) scroll: Arc<AtomicU32>,
     pub(super) watching_scroll: Arc<AtomicBool>,
+}
+
+pub(super) fn row_actions_open(s: &State, id: &RowId) -> bool {
+    s.sidebar_preview.hot.as_ref() == Some(id)
+        || (id.server == s.machines.selected
+            && s.sidebar_preview.keyboard_actions == Some(id.thread))
 }
 
 pub(crate) fn dismiss(s: &mut State, mute: bool) -> bool {
@@ -104,19 +111,20 @@ pub(super) fn after_tab(s: &mut State, tx: &mut rune::Tx) {
     tx.wake_after(Duration::ZERO);
 }
 
-pub(super) fn focus_actions(s: &State, tx: &mut rune::Tx) -> bool {
-    let Some((id, Source::Focus)) = &s.sidebar_preview.open else {
-        return false;
-    };
-    if tx.focused() != Some(id.key(s).as_str()) {
-        return false;
-    }
-    tx.focus("sidebar-preview-open", true);
-    true
-}
-
 pub(crate) fn poll(s: &mut State, tx: &mut rune::Tx) -> bool {
-    poll_at(s, tx, Instant::now())
+    let keyboard_actions = tx.focused().filter(|_| tx.focus_visible()).and_then(|key| {
+        [
+            "thread-",
+            "thread-park-",
+            "thread-snooze-",
+            "thread-discard-",
+        ]
+        .into_iter()
+        .find_map(|prefix| key.strip_prefix(prefix)?.parse::<usize>().ok())
+    });
+    let changed = keyboard_actions != s.sidebar_preview.keyboard_actions;
+    s.sidebar_preview.keyboard_actions = keyboard_actions;
+    poll_at(s, tx, Instant::now()) || changed
 }
 
 fn poll_at(s: &mut State, tx: &mut rune::Tx, now: Instant) -> bool {
@@ -134,10 +142,7 @@ fn poll_at(s: &mut State, tx: &mut rune::Tx, now: Instant) -> bool {
                 changed = dismiss(s, false);
             }
             keyboard(s, target, tx);
-        } else if !tx
-            .focused()
-            .is_some_and(|key| key.starts_with("sidebar-preview-"))
-        {
+        } else {
             changed = dismiss(s, false);
         }
     }
@@ -149,10 +154,7 @@ fn poll_at(s: &mut State, tx: &mut rune::Tx, now: Instant) -> bool {
     }
     if preview.open.as_ref().is_some_and(|(id, source)| {
         !sidebar_ui::indexed(s, id)
-            || *source == Source::Focus
-                && !tx
-                    .focused()
-                    .is_some_and(|key| key == id.key(s) || key.starts_with("sidebar-preview-"))
+            || *source == Source::Focus && tx.focused() != Some(id.key(s).as_str())
     }) {
         return dismiss(s, false) || changed;
     }
@@ -262,13 +264,23 @@ mod tests {
                 context: None,
             });
             rt.state.threads.push(thread);
-            rt.state.hovered_row = Some(RowTarget::Thread(900));
             rt.frame(0.0);
+            rt.frame(1.0);
+            let idle_title = rt.presented("thread-row-title-900").unwrap().0;
+            assert!(rt.presented("thread-park-900").unwrap().1 < 0.01, "{width}");
+            rt.update(|_, tx| tx.focus("thread-900", true));
+            rt.frame(1.0);
+            rt.update(|s, tx| assert!(poll(s, tx)));
+            rt.frame(1.0);
+            assert!(rt.presented("thread-park-900").unwrap().1 > 0.99, "{width}");
+            let (x, y) = rt.find("thread-900").unwrap();
+            rt.pointer_move(x, y);
             rt.frame(1.0);
             let portrait = rt.presented("thread-provider-portrait-900").unwrap().0;
             let title = rt.presented("thread-row-title-900").unwrap().0;
             let snooze = rt.presented("thread-snooze-900").unwrap().0;
             let settle = rt.presented("thread-park-900").unwrap().0;
+            assert!(idle_title[2] > title[2], "{width}");
             assert!(portrait[0] + portrait[2] <= title[0], "{width}");
             assert!(title[0] + title[2] <= snooze[0] + 0.5, "{width}");
             assert!(snooze[0] + snooze[2] <= settle[0] + 0.5, "{width}");
@@ -377,16 +389,8 @@ fn fact(p: Palette, glyph: &str, title: &str, mono: bool) -> El {
         )
 }
 
-fn open_action(id: &RowId, key: &str, title: &str, p: Palette) -> El {
-    let id = id.clone();
-    button(key, title, p, move |s| {
-        dismiss(s, true);
-        s.open_machine_thread(&id.server, id.thread);
-    })
-}
-
-/// Like KSG Code's `SidebarThreadTooltip`, show thread facts and status instead
-/// of a plain-text copy of the transcript.
+/// Ported from KSG Code's `ThreadHoverCardPopup`. Show facts and status;
+/// actions stay on the row or in the conversation.
 pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
     if !s.preview_allowed() {
         return None;
@@ -420,7 +424,11 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
         .or_else(|| remote.map(|(_, v)| &v.record["request"]))
         .filter(|request| !request.is_null());
     let state = RowStatus::of(
-        status,
+        if request.is_some() {
+            Status::Waiting
+        } else {
+            status
+        },
         request.is_some_and(|request| request["method"] == "confirm"),
         thread.is_some_and(Thread::unread),
         false,
@@ -527,12 +535,14 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
                     .child(rule(p))
                     .child(label("Crew", META_LABEL, p.faint));
                 for member in crew.iter().take(4) {
-                    card = card.child(open_action(
-                        &RowId::new(&id.server, member.thread_id),
-                        &format!("sidebar-preview-crew-{}", member.thread_id),
-                        &format!("{} · {}", member.title, member.word),
-                        p,
-                    ));
+                    card = card.child(
+                        label(
+                            format!("{} · {}", member.title, member.word),
+                            SMALL,
+                            p.muted,
+                        )
+                        .truncate(),
+                    );
                 }
                 if crew.len() > 4 {
                     card = card.child(label(format!("{} more", crew.len() - 4), SMALL, p.faint));
@@ -551,105 +561,31 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
                 .gap(4.0)
                 .radius(8.0)
                 .fill(p.brass_bg)
-                .child(label(truncate(summary, 140), SMALL, p.brass).wrap())
-                .child(open_action(id, "sidebar-preview-answer", "Answer", p)),
+                .child(label(truncate(summary, 140), SMALL, p.brass).wrap()),
         );
     }
-    let mut actions = row()
-        .gap(4.0)
-        .center_y()
-        .child(open_action(
-            id,
-            "sidebar-preview-open",
-            if captain.is_some() {
-                "Open home"
-            } else {
-                "Open"
-            },
-            p,
-        ))
-        .child(spacer());
-    if let Some(captain) = captain {
-        let server = id.server.clone();
-        let draft_server = server.clone();
-        let reason = s.crew_creation_unavailable(&server, captain);
-        actions = actions
-            .child(button("sidebar-preview-brief", "Brief", p, move |s| {
-                dismiss(s, true);
-                s.brief.record = Some((server.clone(), captain));
-            }))
-            .child(
-                button("sidebar-preview-new-task", "New task", p, move |s| {
-                    dismiss(s, true);
-                    if let Err(error) = s.begin_crew_draft(&draft_server, captain) {
-                        s.brief.error = Some(error);
-                    }
-                })
-                .blocked(reason, "sidebar-preview-new-task", p, false),
-            );
-    } else if let Some(thread) = thread {
-        let tid = id.thread;
-        for (key, title, glyph, reason, action) in [
-            (
-                "sidebar-preview-pin",
-                "Pin",
-                "pin",
-                s.lifecycle_blocker(tid),
-                State::pin_thread as fn(&mut State, usize),
-            ),
-            (
-                "sidebar-preview-snooze",
-                "Snooze",
-                "clock",
-                s.snooze_blocker(tid),
-                State::open_snooze,
-            ),
-            (
-                "sidebar-preview-settle",
-                "Settle",
-                "check",
-                s.lifecycle_blocker(tid),
-                State::settle_thread,
-            ),
-        ] {
-            actions = actions.child(
-                icon_button(key, title, glyph, p, move |s| {
-                    dismiss(s, true);
-                    action(s, tid);
-                })
-                .blocked(reason, key, p, false),
-            );
-        }
-        let press_key = id.key(s);
-        let _ = thread;
-        actions = actions.child(
-            icon_button(
-                "sidebar-preview-more",
-                "More actions",
-                "more",
-                p,
-                move |s| {
-                    dismiss(s, true);
-                    s.row_menu = Some(RowTarget::Thread(tid));
-                    s.row_menu_at = None;
-                },
-            )
-            .description(press_key),
+    if status == Status::Failed
+        && let Some(error) = thread
+            .and_then(|t| t.error.as_deref())
+            .or_else(|| remote?.1.record["error"].as_str())
+    {
+        card = card.child(
+            label(truncate(error, 140), SMALL, p.danger)
+                .key("sidebar-preview-error")
+                .wrap(),
         );
     }
-    let side = if s.viewport_width >= 760.0 && s.viewport_width - sidebar_width - 16.0 >= 336.0 {
+    let side = if s.viewport_width - sidebar_width - 16.0 >= 304.0 {
         rune::Side::Right
     } else {
         rune::Side::Bottom
     };
     Some(
-        card.child(rule(p))
-            .child(actions)
-            .key("sidebar-preview")
-            .role("dialog")
+        card.key("sidebar-preview")
+            .role("tooltip")
             .label(format!("Preview of {name}"))
             .padding(14.0)
-            .w((s.viewport_width - 16.0).min(320.0))
+            .w((s.viewport_width - 16.0).min(300.0))
             .max_h((s.viewport_height - 32.0).min(520.0))
             .scroll(ScrollSpec {
                 stick_bottom: false,
@@ -658,7 +594,7 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
             .fill(p.card)
             .border(1.0, p.frame)
             .box_shadow(soft_shadow(p))
-            .anchored_fit(id.key(s), side, rune::Align::Start, 8.0)
+            .anchored_fit(id.key(s), side, rune::Align::Start, 4.0)
             .opacity_motion(MOTION_BASE)
             .offset_motion(MOTION_BASE)
             .transition(if s.portraits.reduced_motion() {

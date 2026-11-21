@@ -666,7 +666,6 @@ pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
         && s.row_menu.is_none()
         && s.snooze_menu.is_none()
         && !s.custom_snooze_open
-        && !s.attention_menu
         && !s.compact_sidebar
         && !s.machines.picker
         && !s.machines.dialog

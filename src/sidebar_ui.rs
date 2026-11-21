@@ -105,7 +105,7 @@ fn render_local(
     p: Palette,
     entry: &Entry<'_>,
     item: El,
-    target: RowTarget,
+    grouped: bool,
     rel: &Relations,
 ) -> El {
     let thread = &s.threads[entry.local.expect("local row")];
@@ -116,8 +116,18 @@ fn render_local(
     let section = s.thread_section(thread, now);
     let worker = thread.crew_captain.is_some();
     let (status, approval) = local_status(s, thread, rel);
-    let state = RowStatus::of(status, approval, thread.unread(), thread.life.woke(now));
-    let workspace = row_workspace(s, thread);
+    let mut state = RowStatus::of(
+        status,
+        approval,
+        !thread.life.settled() && thread.unread(),
+        thread.life.woke(now),
+    );
+    let workspace = if entry.captain {
+        row_workspace(s, thread)
+    } else {
+        s.project(thread.project)
+            .map(|project| project.name.clone())
+    };
     let machine = multiple_machines(s).then(|| machine_caption(s, entry.server));
     let draft = entry.draft;
     let shelved = matches!(section, Section::Snoozed | Section::Settled);
@@ -134,8 +144,64 @@ fn render_local(
             .map(|&i| &s.threads[i])
             .filter(|t| t.archived() == s.show_archive);
         let family = || std::iter::once(thread).chain(crew.clone());
-        let requests = family().filter(|thread| thread.request.is_some()).count();
-        let unread = family().filter(|thread| thread.unread()).count();
+        let tasks = s.tasks_for(id);
+        let mut attention = family()
+            .filter(|thread| !thread.life.settled())
+            .filter_map(|member| {
+                let task = tasks.iter().find(|task| task.child_id == member.id);
+                let mark = if let Some(request) = &member.request {
+                    if request["method"] == "confirm" {
+                        RowStatus::Approval
+                    } else {
+                        RowStatus::Input
+                    }
+                } else if task
+                    .is_some_and(|task| task.state == crate::model::TaskState::Interrupted)
+                {
+                    RowStatus::Interrupted
+                } else if member.status == Status::Failed
+                    || task.is_some_and(|task| task.state == crate::model::TaskState::Failed)
+                {
+                    RowStatus::Failed
+                } else {
+                    return None;
+                };
+                Some((mark, member.title.as_str()))
+            })
+            .collect::<Vec<_>>();
+        attention.sort_by_key(|(mark, _)| match mark {
+            RowStatus::Approval => 0,
+            RowStatus::Input => 1,
+            RowStatus::Interrupted => 2,
+            _ => 3,
+        });
+        let attention_count = attention.len();
+        let status = if let Some((mark, _)) = attention.first() {
+            if *mark == RowStatus::Failed {
+                Status::Failed
+            } else {
+                Status::Waiting
+            }
+        } else {
+            family()
+                .filter(|member| !member.life.settled())
+                .map(|member| member.status)
+                .max_by_key(|status| status.urgency())
+                .unwrap_or(Status::Ready)
+        };
+        let state = attention.first().map_or_else(
+            || RowStatus::of(status, approval, thread.unread(), thread.life.woke(now)),
+            |(mark, _)| {
+                if attention.iter().all(|(other, _)| other == mark) {
+                    *mark
+                } else {
+                    RowStatus::Attention
+                }
+            },
+        );
+        let unread = family()
+            .filter(|thread| !thread.life.settled() && thread.unread())
+            .count();
         let timer = if status == Status::Running {
             family()
                 .filter(|thread| thread.status == Status::Running)
@@ -151,11 +217,8 @@ fn render_local(
         };
         let activity = if thread.archived() {
             "Archived".into()
-        } else if requests > 0 {
-            format!(
-                "{requests} {}",
-                if requests == 1 { "request" } else { "requests" }
-            )
+        } else if let Some((mark, title)) = attention.first() {
+            format!("{}: {title}", mark.word())
         } else if let Some(worker) = crew
             .clone()
             .filter(|thread| thread.status == Status::Running)
@@ -188,7 +251,7 @@ fn render_local(
                 workspace: workspace.as_deref(),
                 machine: machine.as_deref(),
                 crew: crew.count(),
-                requests,
+                attention_count,
                 unread,
                 selected: entry.selected(s),
             },
@@ -196,6 +259,9 @@ fn render_local(
     }
     let lead = if worker {
         let task = crew_ui::worker_task_mark(s, thread);
+        if !thread.life.settled() && thread.request.is_none() && task == Some(Status::Waiting) {
+            state = RowStatus::Interrupted;
+        }
         let mark = task.unwrap_or(status);
         let mut avatar = crewmate_avatar(s, p, &thread.model, mark, 16.0)
             .key(format!("worker-captain-portrait-{id}"));
@@ -230,8 +296,14 @@ fn render_local(
     } else {
         &thread.title
     };
-    let actions = (s.hovered_row == Some(target) && thread.machine == "local")
-        .then(|| row_actions(s, p, thread, section, draft));
+    let actions = (thread.machine == "local").then(|| {
+        let (controls, width) = row_actions(s, p, thread, section, draft);
+        (
+            controls,
+            width,
+            sidebar_preview::row_actions_open(s, &row_id),
+        )
+    });
     thread_row_el(
         s,
         p,
@@ -256,6 +328,7 @@ fn render_local(
             agents_active: crate::agents::active_count(thread),
             lead,
             selected: entry.selected(s),
+            grouped,
             shelved,
             draft,
             snippet,
@@ -282,6 +355,11 @@ fn local_status(s: &State, thread: &Thread, rel: &Relations) -> (Status, bool) {
         Status::Running
     } else {
         thread.status
+    };
+    let status = if status == Status::Failed && thread.life.settled() {
+        Status::Ready
+    } else {
+        status
     };
     (status, approval)
 }
@@ -327,10 +405,12 @@ fn thread_avatar(s: &State, p: Palette, model: &str, status: Status, pinned: boo
 }
 
 /// KSG Code's `SidebarThreadRow` uses the trailing slot for hover actions.
-fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: bool) -> El {
+fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: bool) -> (El, f32) {
     let id = thread.id;
-    let mut actions = super::row().center_y().gap(2.0);
+    let mut actions = super::row().h(20.0).center_y().gap(2.0);
+    let mut width = 0.0;
     if draft || !thread.draft.text.is_empty() {
+        width += 22.0;
         actions = actions.child(
             icon_button(
                 &format!("thread-discard-{id}"),
@@ -344,6 +424,7 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
     }
     if !draft {
         if !matches!(section, Section::Snoozed | Section::Settled) {
+            width += 22.0;
             actions = actions.child(
                 icon_button(
                     &format!("thread-snooze-{id}"),
@@ -366,28 +447,50 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
             Section::Settled => ("Un-settle", "check"),
             _ => ("Settle", "check"),
         };
-        actions = actions.child(
-            icon_button(&format!("thread-park-{id}"), title, glyph, p, move |s| {
-                if section == Section::Snoozed {
-                    s.unsnooze_thread(id);
-                } else {
-                    s.settle_thread(id);
-                }
-            })
-            .size(20.0, 20.0)
-            .blocked(
-                if section == Section::Snoozed {
-                    None
-                } else {
-                    s.lifecycle_blocker(id)
-                },
-                &format!("thread-park-{id}"),
-                p,
-                false,
-            ),
-        );
+        let action = move |s: &mut State| {
+            if section == Section::Snoozed {
+                s.unsnooze_thread(id);
+            } else {
+                s.settle_thread(id);
+            }
+        };
+        let key = format!("thread-park-{id}");
+        let control = if title == "Settle" {
+            width += 62.0;
+            row()
+                .key(&key)
+                .size(62.0, 20.0)
+                .role("button")
+                .label(title)
+                .focusable(true)
+                .focus_ring(1.0, 1.0, p.ring)
+                .cursor(rune::Cursor::Pointer)
+                .radius(6.0)
+                .hover(p.selected)
+                .center()
+                .gap(4.0)
+                .on_press(action)
+                .child(icon(glyph, p.muted).size(14.0, 14.0))
+                .child(label(title, SMALL, p.muted))
+        } else {
+            width += 20.0;
+            icon_button(&key, title, glyph, p, action).size(20.0, 20.0)
+        };
+        actions = actions.child(control.blocked(
+            if section == Section::Snoozed {
+                None
+            } else {
+                s.lifecycle_blocker(id)
+            },
+            &key,
+            p,
+            false,
+        ));
     }
-    actions
+    if draft {
+        width -= 2.0;
+    }
+    (actions.w(width), width)
 }
 
 pub(super) struct Entry<'a> {
@@ -464,6 +567,15 @@ impl<'a> Entry<'a> {
         }
     }
 
+    fn failed(&self, s: &State, rel: &Relations) -> bool {
+        !self.life.settled()
+            && if let Some(index) = self.local {
+                local_status(s, &s.threads[index], rel).0 == Status::Failed
+            } else {
+                status_of_view(self.view) == Status::Failed
+            }
+    }
+
     fn recent_rank(&self, s: &State) -> u64 {
         // `updated` is in Unix seconds; lifecycle timestamps are in Unix milliseconds.
         // Convert `updated` to ms before comparing, and exclude `pinned_at` so pinning
@@ -538,7 +650,7 @@ fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: bool, rel: 
     let project = group.project;
     let new_server = server.clone();
     let name = group.name.clone();
-    let needs_you = group.rows.iter().any(|e| e.needs_you(s, rel));
+    let attention = aggregate_attention(s, p, group.rows.iter().copied(), rel);
     let working = group.rows.iter().any(|e| e.working(s, rel));
     let lead = if group.project.is_some() {
         project_tile(s, p, group.project_data.as_ref(), 16.0)
@@ -581,8 +693,12 @@ fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: bool, rel: 
             sidebar_row_width(s) >= 232.0,
         ));
     }
-    if needs_you {
-        header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.brass).a11y_hidden());
+    if let Some((ink, word)) = attention {
+        header = header.child(attention_dot(
+            format!("sidebar-group-attention-{}-{project_key}", group.server),
+            ink,
+            word,
+        ));
     } else if working {
         header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
     }
@@ -618,6 +734,31 @@ fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: bool, rel: 
             )
             .size(12.0, 12.0),
         )
+}
+
+fn aggregate_attention<'a>(
+    s: &State,
+    p: Palette,
+    rows: impl Iterator<Item = &'a Entry<'a>>,
+    rel: &Relations,
+) -> Option<(Color, &'static str)> {
+    let mut failed = false;
+    for entry in rows {
+        if entry.needs_you(s, rel) {
+            return Some((p.brass, "Needs input"));
+        }
+        failed |= entry.failed(s, rel);
+    }
+    failed.then_some((p.danger, "Failed"))
+}
+
+fn attention_dot(key: String, ink: Color, word: &str) -> El {
+    el().key(key)
+        .size(6.0, 6.0)
+        .radius(3.0)
+        .fill(ink)
+        .help(word)
+        .label(word)
 }
 
 pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
@@ -951,6 +1092,7 @@ struct IndexedRow {
     captain: bool,
     draft: bool,
     title_match: bool,
+    grouped: bool,
 }
 
 enum Node {
@@ -969,7 +1111,7 @@ enum Node {
     },
     Shelf {
         section: Section,
-        count: usize,
+        rows: Vec<IndexedRow>,
         index: usize,
         inset: f32,
     },
@@ -1150,6 +1292,7 @@ impl IndexedRow {
             captain: row.captain,
             draft: row.draft,
             title_match: row.title_match,
+            grouped: false,
         }
     }
 }
@@ -1162,7 +1305,11 @@ impl Plan {
         self.nodes.push((key.into(), node));
     }
     fn thread(&mut self, s: &State, entry: &Entry<'_>) {
-        let row = IndexedRow::new(entry);
+        self.thread_in(s, entry, false);
+    }
+    fn thread_in(&mut self, s: &State, entry: &Entry<'_>, grouped: bool) {
+        let mut row = IndexedRow::new(entry);
+        row.grouped = grouped;
         let key = if row.captain {
             if s.client.is_some() {
                 format!("crew-{}-{}", row.id.server, row.id.thread)
@@ -1271,7 +1418,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
                 .into_iter()
                 .filter(|row| !collapsed || row.selected(s))
             {
-                plan.thread(s, row);
+                plan.thread_in(s, row, true);
             }
         }
     }
@@ -1298,7 +1445,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
                 format!("shelf-block-{section:?}"),
                 Node::Shelf {
                     section,
-                    count: rows.len(),
+                    rows: rows.iter().map(|row| IndexedRow::new(row)).collect(),
                     index: usize::from(section == Section::Settled),
                     inset: if section == Section::Snoozed && (settled_exists || dragging) {
                         SHELF_HEADING
@@ -1453,7 +1600,14 @@ fn remote_record<'a>(
     projection["index"]["threads"].get(*rel.remote.get(server)?.get(&id)?)
 }
 
-fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relations) -> El {
+fn render_remote(
+    s: &State,
+    p: Palette,
+    entry: &Entry<'_>,
+    item: El,
+    grouped: bool,
+    rel: &Relations,
+) -> El {
     let projection = entry.projection.expect("remote projection");
     let record = entry.record.expect("remote record");
     let view = entry.view;
@@ -1464,10 +1618,14 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
         .as_str()
         .or_else(|| record["model"].as_str());
     let mut status = status_of_view(view);
+    if status == Status::Failed && entry.life.settled() {
+        status = Status::Ready;
+    }
     let mut approval = view.record["request"]["method"] == "confirm";
     let mut elapsed = view_running_seconds(view);
     let mut requests = usize::from(!view.record["request"].is_null());
-    let mut unread = usize::from(entry.life.unread());
+    let mut failures = usize::from(status == Status::Failed);
+    let mut unread = usize::from(!entry.life.settled() && entry.life.unread());
     let mut crew = 0;
     for child in rel.remote_children.get(&row_id).into_iter().flatten() {
         let child_view = projection
@@ -1475,8 +1633,8 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             .get(&(*child as u64))
             .map(std::sync::Arc::as_ref)
             .unwrap_or(null_view());
-        approval |= child_view.record["request"]["method"] == "confirm";
         if !entry.captain {
+            approval |= child_view.record["request"]["method"] == "confirm";
             continue;
         }
         let Some(child_record) = remote_record(projection, rel, entry.server, *child) else {
@@ -1489,9 +1647,14 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             continue;
         }
         crew += 1;
+        if life.settled() {
+            continue;
+        }
+        approval |= child_view.record["request"]["method"] == "confirm";
         requests += usize::from(!child_view.record["request"].is_null());
         unread += usize::from(life.unread());
         let state = status_of_view(child_view);
+        failures += usize::from(state == Status::Failed && child_view.record["request"].is_null());
         if state == Status::Running {
             elapsed = elapsed.max(view_running_seconds(child_view));
         }
@@ -1506,11 +1669,15 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
     let state = RowStatus::of(status, approval, unread > 0, entry.life.woke(now));
     let title = record["title"].as_str().unwrap_or("Thread");
     let project = entry.project_data(s);
-    let workspace = (!workspace_named_by_filter(s, entry.server, entry.project(s))).then(|| {
-        project
-            .as_ref()
-            .map_or("No workspace", |project| project.name.as_str())
-    });
+    let workspace = if entry.captain {
+        (!workspace_named_by_filter(s, entry.server, entry.project(s))).then(|| {
+            project
+                .as_ref()
+                .map_or("No workspace", |project| project.name.as_str())
+        })
+    } else {
+        project.as_ref().map(|project| project.name.as_str())
+    };
     let machine = machine_caption(s, entry.server);
     if entry.captain {
         let captain = record["captain"]
@@ -1523,7 +1690,12 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             .and_then(|cap| cap["portrait"].as_u64())
             .unwrap_or_default() as usize;
         let activity = if requests > 0 {
-            format!("{requests} requests")
+            format!(
+                "{requests} {}",
+                if requests == 1 { "request" } else { "requests" }
+            )
+        } else if failures > 0 {
+            format!("{failures} failed")
         } else if status == Status::Running {
             "Working".into()
         } else {
@@ -1546,13 +1718,17 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
                     36.0,
                     status,
                 ),
-                status: state,
+                status: if requests > 0 && failures > 0 {
+                    RowStatus::Attention
+                } else {
+                    state
+                },
                 timer: elapsed.filter(|_| status == Status::Running),
                 activity: &activity,
                 workspace,
                 machine: Some(&machine),
                 crew,
-                requests,
+                attention_count: requests + failures,
                 unread,
                 selected: entry.selected(s),
             },
@@ -1624,6 +1800,7 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
                 .unwrap_or_default() as usize,
             lead,
             selected: entry.selected(s),
+            grouped,
             shelved,
             draft: entry.draft,
             snippet,
@@ -1681,11 +1858,6 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
             }
         })
         .on_hover_change(move |s: &mut State, hovered, tx| {
-            if local && hovered {
-                s.hovered_row = Some(target);
-            } else if s.hovered_row == Some(target) {
-                s.hovered_row = None;
-            }
             super::sidebar_preview::row_hover(s, &hover_id, hovered, tx);
         })
         .on_key(move |s: &mut State, ev, tx| match ev.key {
@@ -1745,9 +1917,9 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
         }
     }
     let built = if local {
-        render_local(s, p, &entry, item, target, rel)
+        render_local(s, p, &entry, item, row.grouped, rel)
     } else {
-        render_remote(s, p, &entry, item, rel)
+        render_remote(s, p, &entry, item, row.grouped, rel)
     };
     if entry.captain {
         col().child(built)
@@ -1916,7 +2088,7 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                     workspace: None,
                     machine: None,
                     crew: 0,
-                    requests: 0,
+                    attention_count: 0,
                     unread: 0,
                     selected: false,
                 },
@@ -1976,11 +2148,19 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
         }
         Node::Shelf {
             section,
-            count,
+            rows,
             index,
             inset,
         } => {
             let index = *index;
+            let count = rows.len();
+            let attention = (!s.shelves[index])
+                .then(|| {
+                    let entries: Vec<_> =
+                        rows.iter().filter_map(|row| resolve(s, row, rel)).collect();
+                    aggregate_attention(s, p, entries.iter(), rel)
+                })
+                .flatten();
             let title = format!("{section:?}");
             let key = format!("drop-{section:?}");
             col()
@@ -2010,6 +2190,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         })
                         .child(meta_label(&title, p.faint))
                         .child(spacer())
+                        .child(attention.map_or_else(el, |(ink, word)| {
+                            attention_dot(format!("shelf-attention-{section:?}"), ink, word)
+                        }))
                         .child(label(count.to_string(), TIMER, p.faint))
                         .child(
                             icon(
@@ -2148,6 +2331,7 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
     row.captain.hash(&mut hash);
     row.draft.hash(&mut hash);
     row.title_match.hash(&mut hash);
+    row.grouped.hash(&mut hash);
     s.dark.hash(&mut hash);
     s.artwork.device_scale().to_bits().hash(&mut hash);
     s.portraits.motion_allowed().hash(&mut hash);
@@ -2187,13 +2371,18 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
         }
         crate::agents::active_count(thread).hash(&mut hash);
         (s.selected_row() == id || s.selected_threads.contains(&id)).hash(&mut hash);
-        (s.hovered_row == Some(RowTarget::Thread(id))).hash(&mut hash);
         workspace_named_by_filter(s, server, thread.project).hash(&mut hash);
         if let Some(project) = s.project(thread.project) {
             project.name.hash(&mut hash);
             project.icon.hash(&mut hash);
         }
         (s.thread_section(thread, now) as u8).hash(&mut hash);
+        if !row.captain && thread.machine == "local" {
+            sidebar_preview::row_actions_open(s, &row.id).hash(&mut hash);
+            s.lifecycle_busy(id).hash(&mut hash);
+            s.row_pending(thread).hash(&mut hash);
+            thread.queued().hash(&mut hash);
+        }
         thread.pinned().hash(&mut hash);
         if row.draft {
             thread.draft.text.lines().next().hash(&mut hash);
@@ -2222,6 +2411,12 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                 child.unread().hash(&mut hash);
                 child.archived().hash(&mut hash);
                 child.request.is_some().hash(&mut hash);
+                child
+                    .request
+                    .as_ref()
+                    .map(|request| request["method"].as_str())
+                    .hash(&mut hash);
+                child.life.settled().hash(&mut hash);
                 if child.status == Status::Running {
                     child
                         .started
@@ -2229,6 +2424,10 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                         .or(child.elapsed)
                         .hash(&mut hash);
                 }
+            }
+            for task in s.tasks_for(id) {
+                task.child_id.hash(&mut hash);
+                task.state.id().hash(&mut hash);
             }
         }
     } else if let Some(projection) = s.machines.views.get(server) {
@@ -2251,6 +2450,7 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                     "request",
                     "elapsed",
                     "agentsActive",
+                    "branch",
                     "model",
                     "harness",
                 ] {

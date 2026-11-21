@@ -616,6 +616,16 @@ pub enum SettingsPicker {
     Thinking,
 }
 
+/// One in-flight gesture on the effort slider: where the thumb is held and which control
+/// the gesture belongs to. `key` hashes the thread, model, option id and levels the press
+/// began on, so a stale release after a thread, model or option change cannot commit a
+/// level into a context the user never aimed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThinkingDrag {
+    pub frac: f32,
+    pub key: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowTarget {
     Thread(usize),
@@ -2034,15 +2044,76 @@ impl Thread {
             self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
             return;
         }
-        if self.status.busy() || self.configuring {
+        if !self.can_choose_thinking() {
             return;
         }
         self.selected_thinking = Some(level.clone());
+        if self.configuring {
+            // An earlier configure is still awaiting its response. The wanted level is
+            // recorded; the acknowledgement path reconciles it in order instead of
+            // sending a second, concurrent change.
+            return;
+        }
         if self.pi.is_none() || self.initializing {
             self.thinking = level;
         } else if self.command("set_thinking_level", json!({"level":level})) {
             self.configuring = true;
             self.pending_thinking = Some(level);
+        }
+    }
+
+    /// A second effort pick can queue behind the first. A pending model change still locks
+    /// effort because its available levels can change with the model.
+    pub fn can_choose_thinking(&self) -> bool {
+        !self.status.busy() && (!self.configuring || self.pending_thinking.is_some())
+    }
+
+    /// After a configure response clears `configuring`, send the reasoning level the user
+    /// last chose when it still differs from what the provider applied. Runs serialized,
+    /// one command at a time, so rapid picks during an in-flight acknowledgement land in
+    /// order instead of racing or being lost.
+    fn reconcile_thinking(&mut self) {
+        if self.pi.is_none() || self.initializing || self.status.busy() || self.configuring {
+            return;
+        }
+        let Some(level) = self.selected_thinking.clone() else {
+            return;
+        };
+        if level == self.thinking {
+            return;
+        }
+        if self.command("set_thinking_level", json!({"level": level})) {
+            self.configuring = true;
+            self.pending_thinking = Some(level);
+        }
+    }
+
+    /// A refused `set_thinking_level` leaves no trace of the level the provider would not
+    /// run: `model_options` and the draft's pinned selections revert to `self.thinking`,
+    /// so the reasoning menu and the next composer render what is actually in effect.
+    fn revert_rejected_thinking(&mut self) {
+        let rejected = self.pending_thinking.clone();
+        let applied = self.thinking.clone();
+        let revert_option = |option: &mut crate::model_selection::ProviderOptionSelection| {
+            if matches!(
+                option.id.as_str(),
+                "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
+            ) && option.value.as_str() == rejected.as_deref()
+            {
+                option.value = crate::model_selection::OptionValue::Str(applied.clone());
+            }
+        };
+        for option in &mut self.model_options {
+            revert_option(option);
+        }
+        for selection in self
+            .draft_model_state
+            .model_selection_by_provider
+            .values_mut()
+        {
+            for option in &mut selection.options {
+                revert_option(option);
+            }
         }
     }
 
@@ -3738,8 +3809,20 @@ impl Thread {
                         return;
                     }
                     if matches!(command, "set_model" | "set_thinking_level") {
+                        if command == "set_thinking_level"
+                            && self.pending_thinking.is_some()
+                            && self.selected_thinking == self.pending_thinking
+                        {
+                            // The rejected level must not stay selected: drop the pin and
+                            // every recorded choice of it back to what the provider runs.
+                            self.selected_thinking = None;
+                            self.revert_rejected_thinking();
+                        }
                         self.configuring = false;
                         self.pending_thinking = None;
+                        if command == "set_thinking_level" {
+                            self.reconcile_thinking();
+                        }
                     }
                     if command == "prompt"
                         && self
@@ -3868,6 +3951,7 @@ impl Thread {
                                 &confirmed,
                             );
                         }
+                        self.reconcile_thinking();
                     }
                     "get_messages" if record["id"] == "history" => {
                         // `history_loaded` also covers the optimistic server
@@ -5062,11 +5146,8 @@ pub struct State {
     pub keybindings_watcher: crate::keybindings::KeybindingsWatcher,
     pub thread_defaults: crate::ui::settings_ui::ThreadDefaults,
     pub fleet: crate::fleet_update::Fleet,
-    /// The sidebar's "N need you" popover is open.
-    pub attention_menu: bool,
     /// Where a right-click opened the row menu, in window points.
     pub row_menu_at: Option<(f32, f32)>,
-    pub hovered_row: Option<RowTarget>,
     pub rename_thread: Option<usize>,
     pub rename_edit: TextEdit,
     pub delete_thread: Option<usize>,
@@ -5284,8 +5365,8 @@ pub struct State {
     pub model_favorites: Option<Vec<crate::model_picker::ModelFavorite>>,
     model_favorites_migrated: bool,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
-    /// (highest). The level is chosen on release.
-    pub thinking_drag: Option<f32>,
+    /// (highest), and which gesture context it belongs to. The level is chosen on release.
+    pub thinking_drag: Option<ThinkingDrag>,
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
@@ -6197,9 +6278,7 @@ impl State {
             keybindings_watcher: Default::default(),
             thread_defaults: Default::default(),
             fleet: Default::default(),
-            attention_menu: false,
             row_menu_at: None,
-            hovered_row: None,
             rename_thread: None,
             rename_edit: TextEdit::default(),
             delete_thread: None,
@@ -6509,7 +6588,6 @@ impl State {
             && self.code_picker.open.is_none()
             && self.attachment_preview.is_none()
             && self.transcript_preview.is_none()
-            && !self.attention_menu
             && self.citation_comment.is_none()
             && !self.brief.confirm_reset
             && !self.brief.profile_open

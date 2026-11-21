@@ -56,7 +56,7 @@ Already ported:
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
 | `inspector_ui::view`, `agents_ui::view` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`, `chat/ProviderSubagentBar.tsx` (fixed Overview/Agents/Crew/Context/Diff strip; Agents is thread-scoped) |
-| `sidebar_ui::content`, `sidebar_row::{thread_row_el,captain_row_el}`, `sidebar_preview::view` | `SidebarThreadRow`, `Sidebar.logic.ts`, `SidebarProjectFolderHeader`; two-line rows and the delayed preview follow the Shina Wave 3 spec |
+| `sidebar_ui::content`, `sidebar_row::{thread_row_el,captain_row_el}`, `sidebar_preview::view` | `SidebarThreadRow`, `Sidebar.logic.ts`, `SidebarProjectFolderHeader`; compact folder and shelf rows, ungrouped cards, and the delayed preview. Captain rows keep their portraits and crew attention count. |
 | `pi_ui::access_picker`, `updates_ui::footer`, `updates_ui::popover` | `chat/ComposerPermissionsSection.tsx` and `sidebar/SidebarUpdatePill.tsx`, adapted to the Wave 3 access radio group and quiet footer |
 | `top_bar::bar`, `quick_switcher::view` | `chat/CommandPalette.tsx`, `chat/CommandPaletteResults.tsx` (row metrics for the switcher; the single 40 pt title bar with nav buttons and the breadcrumb title is a Shina-only design) |
 

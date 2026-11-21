@@ -934,8 +934,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // Keep tabs aligned with the pane while reserving native controls inside
         // the sidebar header. At small zoom levels, keep actions and omit the logo.
         let padding = (leading - 8.0).max(8.0);
-        // The header runs to the sidebar's edge, so the attention badge, which sits at its end,
-        // has room beside the 22 px wordmark in a 232 px sidebar, even with the traffic lights.
+        // The header runs to the sidebar's edge, so the compose button at its end has room
+        // beside the wordmark in a 232 px sidebar, even with the traffic lights.
         let line = sidebar_width - padding - HEADER_TAB_GAP;
         // The wordmark's size depends on the sidebar's width, not on the platform: a title strip
         // without window buttons still sizes it as if 72 pt were reserved, so a 216 px sidebar
@@ -1130,9 +1130,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 return true;
             }
             if ev.key == rune::Key::Tab {
-                if !ev.mods.shift && sidebar_preview::focus_actions(s, tx) {
-                    return true;
-                }
                 sidebar_preview::after_tab(s, tx);
             }
             if ev.key == rune::Key::Escape
@@ -1334,23 +1331,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(menu) = crew_membership_ui::move_picker(s, p) {
         root = root.child(menu);
     }
-    if let Some(pill) = crew_ui::attention_row(s, p) {
-        root = root.child(pill);
-    }
     if !s.toasts.is_empty() {
         root = root.child(toast_stack(s, p, chrome.height.max(40.0 * zoom) / zoom));
-    }
-    if s.attention_menu && !s.attention().is_empty() {
-        // The pane's top left corner, worked out rather than read from the last layout, so the
-        // popover is in place on its first frame: the workspace's 8 pt inset, the sidebar and
-        // its 4 pt resize handle, under the top strip.
-        let pane = (docked && !compact).then(|| {
-            (
-                8.0 + sidebar_width + 4.0,
-                chrome.height.max(40.0 * zoom) / zoom,
-            )
-        });
-        root = root.child(crew_ui::attention_menu(s, p, pane));
     }
     root = root.child(composer_ui::measurement_probes(s, &composer_model, p));
     root = match frame {
@@ -1880,6 +1862,7 @@ fn composer_popover(card: El) -> El {
         .modal(true, |s: &mut State| {
             s.settings_picker = None;
             s.open_option_menu = None;
+            s.thinking_drag = None;
             s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
         })
 }
@@ -2401,14 +2384,18 @@ fn effort_body(
     controls: &crate::descriptors::ColumnControls,
 ) -> El {
     let t = s.current();
-    let prompt_ultrathink = crate::descriptors::read_prompt_ultrathink(&t.draft.text);
-    let ultrathink_in_body = controls.effort.as_ref().is_some_and(|d| match d {
+    // The drag handler re-checks the lock live, since "ultrathink" can land in the draft
+    // mid-gesture. `locks_when_body` is the descriptor half of the predicate.
+    let locks_when_body = controls.effort.as_ref().is_some_and(|d| match d {
         crate::descriptors::ProviderOptionDescriptor::Select {
             prompt_injected_values,
             ..
         } => !prompt_injected_values.is_empty(),
         _ => false,
-    }) && prompt_ultrathink == crate::descriptors::PromptUltrathink::Body;
+    });
+    let ultrathink_in_body = locks_when_body
+        && crate::descriptors::read_prompt_ultrathink(&t.draft.text)
+            == crate::descriptors::PromptUltrathink::Body;
 
     let mut body = col().key("model-picker-effort").w_full();
     match &controls.effort {
@@ -2423,9 +2410,17 @@ fn effort_body(
             } else {
                 choices.into_iter().map(|c| c.id).collect()
             };
-            let current = current_value
+            // One consistent value renders the level: the pinned pick when the user just
+            // chose, else the descriptor's current value, else what the provider runs.
+            let current = t
+                .selected_thinking
                 .clone()
                 .filter(|v| levels.iter().any(|l| l == v))
+                .or_else(|| {
+                    current_value
+                        .clone()
+                        .filter(|v| levels.iter().any(|l| l == v))
+                })
                 .unwrap_or_else(|| t.thinking.clone());
             if ultrathink_in_body {
                 body = body.child(
@@ -2441,8 +2436,10 @@ fn effort_body(
                 &current,
                 s.thinking_drag,
                 p,
-                can_choose && !ultrathink_in_body,
+                t.can_choose_thinking() && !ultrathink_in_body,
                 id.clone(),
+                format!("{}:{}:{}", t.id, t.harness, t.model_id),
+                locks_when_body,
             ))
         }
         Some(crate::descriptors::ProviderOptionDescriptor::Boolean {
@@ -2491,11 +2488,13 @@ fn effort_body(
             };
             body.child(effort_slider_with_levels(
                 &t.thinking_levels,
-                &t.thinking,
+                t.selected_thinking.as_deref().unwrap_or(&t.thinking),
                 s.thinking_drag,
                 p,
-                can_choose,
+                t.can_choose_thinking(),
                 fallback_id.into(),
+                format!("{}:{}:{}", t.id, t.harness, t.model_id),
+                false,
             ))
         }
         None => body.child(
@@ -2803,19 +2802,39 @@ fn slider_curve(dragging: bool) -> rune::Curve {
     }
 }
 
+/// Which control an effort drag belongs to: the thread, model, option id and levels the
+/// press started on. A remounted slider reuses the same element key, so this hash is how a
+/// held gesture knows its release still lands on the control it began in.
+fn effort_drag_key(context: &str, option_id: &str, levels: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    context.hash(&mut hasher);
+    option_id.hash(&mut hasher);
+    levels.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn effort_slider_with_levels(
     levels: &[String],
     active_level: &str,
-    dragging: Option<f32>,
+    dragging: Option<crate::model::ThinkingDrag>,
     p: Palette,
     can_choose: bool,
     option_id: String,
+    context: String,
+    locks_when_body: bool,
 ) -> El {
     let levels = levels.to_vec();
     let count = levels.len();
     let current = levels.iter().position(|level| *level == active_level);
+    // The gesture signature: the thread, model, option and levels this slider was built
+    // for. A drag whose stored key differs belongs to a control that has since been
+    // rebuilt for another context, and its events are stale.
+    let gesture_key = effort_drag_key(&context, &option_id, &levels);
     // While held, the thumb follows the pointer and the title names the nearest level.
-    let held = dragging.filter(|_| count > 1).map(|f| f.clamp(0.0, 1.0));
+    let held = dragging
+        .filter(|d| d.key == gesture_key && count > 1)
+        .map(|d| d.frac.clamp(0.0, 1.0));
     let shown = held
         .map(|f| (f * (count - 1) as f32).round() as usize)
         .or(current);
@@ -2865,6 +2884,7 @@ fn effort_slider_with_levels(
         .role("slider")
         .label("Reasoning effort")
         .a11y_value(effort_name(active_level))
+        .opacity(if can_choose { 1.0 } else { 0.5 })
         .h(SLIDER_H)
         .w_full()
         .motion(rune::Spring::new(0.3, 0.0))
@@ -2956,111 +2976,159 @@ fn effort_slider_with_levels(
                 .child(el().key("effort-thumb-after").w(0.0).grow(1.0 - frac)),
         );
     }
-    let choice_option_id = option_id.clone();
-    if can_choose {
+    {
         let keyed = levels.clone();
         let dragged = levels.clone();
         let ends = levels.clone();
         let oid_step = option_id.clone();
         let oid_limit = option_id.clone();
         let oid_drag = option_id;
-        slider = slider
-            // Rune's NSSlider keyboard: arrows and pages step, Home and End jump.
-            .on_step(move |s: &mut State, delta, tx| {
-                let last = keyed.len() as i32 - 1;
-                let at = keyed
-                    .iter()
-                    .position(|l| *l == s.current().thinking)
-                    .unwrap_or(0) as i32;
-                let next = (at + delta).clamp(0, last) as usize;
-                if next as i32 != at {
-                    tx.motion_curve(MOTION_SLOW);
-                    s.set_composer_option_sticky(
-                        oid_step.clone(),
-                        crate::model_selection::OptionValue::Str(keyed[next].clone()),
-                    );
-                }
-            })
-            .on_step_limit(move |s: &mut State, max, tx| {
-                let level = if max { ends.last() } else { ends.first() };
-                if let Some(level) = level.cloned()
-                    && level != s.current().thinking
-                {
-                    tx.motion_curve(MOTION_SLOW);
-                    s.set_composer_option_sticky(
-                        oid_limit.clone(),
-                        crate::model_selection::OptionValue::Str(level),
-                    );
-                }
-            })
-            .on_drag(move |s: &mut State, drag, tx| {
-                // Where the pointer is between the end caps' centres, as Codex measures it.
-                let along = ((drag.x - cap) / (drag.w - 2.0 * cap).max(1.0)).clamp(0.0, 1.0);
-                let index = (along * (dragged.len() - 1) as f32).round() as usize;
-                tx.animated();
-                if drag.cancelled() {
-                    tx.motion_curve(MOTION_SLOW);
-                    s.thinking_drag = None;
-                } else if drag.phase == rune::Phase::Up {
-                    // Release glides onto the nearest level.
-                    tx.motion_curve(MOTION_SLOW);
-                    s.thinking_drag = None;
-                    if dragged[index] != s.current().thinking {
-                        s.set_composer_option_sticky(
-                            oid_drag.clone(),
-                            crate::model_selection::OptionValue::Str(dragged[index].clone()),
-                        );
-                    }
-                } else {
-                    tx.motion_curve(slider_curve(drag.phase == rune::Phase::Move));
-                    s.thinking_drag = Some(along);
-                }
-            });
-    }
-    // KSG's `ComposerReasoningPicker` allows an exact choice by name. Keep the
-    // Codex slider and offer the same direct choices underneath it.
-    let mut labels = row().w_full().gap(2.0).flex_wrap();
-    for (index, level) in levels.into_iter().enumerate() {
-        let name = effort_name(&level);
-        let level_selected = Some(index) == shown;
-        let choice_width = rune::text::measure(&name, &[], META, None).0.ceil() + 8.0;
-        let mut choice = el()
-            .key(format!("effort-level-{index}"))
-            .grow(1.0)
-            .min_w(choice_width)
-            .h(24.0)
-            .radius(6.0)
-            .center()
-            .px(2.0)
-            .child(label(
-                &name,
-                META,
-                if level_selected { p.sea } else { p.muted },
-            ));
+        // Use the same stop the thumb renders, including a descriptor's current value.
+        let effective_at = move |s: &State, levels: &[String]| {
+            s.current()
+                .selected_thinking
+                .as_ref()
+                .and_then(|level| levels.iter().position(|l| l == level))
+                .or(current)
+        };
+        let can_pick = move |s: &State| {
+            let t = s.current();
+            t.can_choose_thinking()
+                && !(locks_when_body
+                    && crate::descriptors::read_prompt_ultrathink(&t.draft.text)
+                        == crate::descriptors::PromptUltrathink::Body)
+        };
         if can_choose {
-            let option_id = choice_option_id.clone();
-            choice = choice
-                .role("button")
-                .label(if current == Some(index) {
-                    format!("{name}, selected")
-                } else {
-                    name.clone()
-                })
-                .help(name)
-                .focusable(true)
-                .cursor(rune::Cursor::Pointer)
-                .hover(p.selected)
-                .on_press_tx(move |s: &mut State, tx| {
-                    if s.current().thinking != level {
+            slider = slider
+                // Rune's NSSlider keyboard: arrows and pages step, Home and End jump.
+                .on_step(move |s: &mut State, delta, tx| {
+                    if !can_pick(s) {
+                        return;
+                    }
+                    let last = keyed.len() as i32 - 1;
+                    let at = effective_at(s, &keyed).unwrap_or(0) as i32;
+                    let next = (at + delta).clamp(0, last) as usize;
+                    if next as i32 != at {
                         tx.motion_curve(MOTION_SLOW);
                         s.set_composer_option_sticky(
-                            option_id.clone(),
-                            crate::model_selection::OptionValue::Str(level.clone()),
+                            oid_step.clone(),
+                            crate::model_selection::OptionValue::Str(keyed[next].clone()),
+                        );
+                    }
+                })
+                .on_step_limit(move |s: &mut State, max, tx| {
+                    let index = if max { ends.len() - 1 } else { 0 };
+                    if can_pick(s) && effective_at(s, &ends) != Some(index) {
+                        tx.motion_curve(MOTION_SLOW);
+                        s.set_composer_option_sticky(
+                            oid_limit.clone(),
+                            crate::model_selection::OptionValue::Str(ends[index].clone()),
                         );
                     }
                 });
         }
-        labels = labels.child(choice);
+        // The drag handler stays mounted while `can_choose` flips, so a press that began
+        // while the control was enabled still hears its Up or cancel even if a turn
+        // started meanwhile.
+        slider = slider.on_drag(move |s: &mut State, drag, tx| {
+            // The position a pointer x maps to between the end caps' centres, minus the
+            // grab offset a knob press saved in `drag.data`.
+            let along_at = |x: f32, grab: f32| {
+                ((x - grab - cap) / (drag.w - 2.0 * cap).max(1.0)).clamp(0.0, 1.0)
+            };
+            let held_key = s.thinking_drag.map(|d| d.key);
+            let stale = held_key.is_some_and(|key| key != gesture_key);
+            tx.animated();
+            if drag.cancelled() {
+                if !stale {
+                    tx.motion_curve(MOTION_SLOW);
+                }
+                s.thinking_drag = None;
+                return;
+            }
+            if drag.phase == rune::Phase::Down {
+                // A press only begins a gesture while the control answers choices. When
+                // the turn itself is running the press previews nothing and commits
+                // nothing. A configure in flight still accepts the pick: the model
+                // serializes it behind the pending acknowledgement. An ultrathink in the
+                // draft body locks the control the same way.
+                s.thinking_drag = None;
+                if !can_pick(s) || dragged.len() < 2 {
+                    return;
+                }
+                // Where the thumb centre sits for the effective level, so a knob press
+                // keeps the grab offset instead of snapping the centre to the pointer.
+                let last = (dragged.len() - 1).max(1) as f32;
+                let at = effective_at(s, &dragged).unwrap_or(0);
+                let thumb_x =
+                    cap + (at as f32 / last).clamp(0.0, 1.0) * (drag.w - 2.0 * cap).max(0.0);
+                let on_knob = (drag.x - thumb_x).abs() <= cap;
+                drag.data = if on_knob { drag.x - thumb_x } else { 0.0 };
+                // A track press glides the thumb to the pointer's nearest stop; a knob
+                // press starts from where the thumb already is.
+                let along = if on_knob {
+                    at as f32 / last
+                } else {
+                    along_at(drag.x, 0.0)
+                };
+                tx.motion_curve(MOTION_SLOW);
+                s.thinking_drag = Some(crate::model::ThinkingDrag {
+                    frac: along.clamp(0.0, 1.0),
+                    key: gesture_key,
+                });
+                return;
+            }
+            if stale || !can_pick(s) {
+                // The slider was rebuilt for another thread, model or option mid-gesture.
+                // The release or move still clears the stale hold but commits nothing.
+                if drag.phase == rune::Phase::Up {
+                    s.thinking_drag = None;
+                }
+                return;
+            }
+            if s.thinking_drag.is_none() {
+                return;
+            }
+            let along = along_at(drag.x, drag.data);
+            let index = (along * (dragged.len() - 1) as f32).round() as usize;
+            if drag.phase == rune::Phase::Up {
+                // Release glides onto the nearest level.
+                tx.motion_curve(MOTION_SLOW);
+                s.thinking_drag = None;
+                if effective_at(s, &dragged) != Some(index) {
+                    s.set_composer_option_sticky(
+                        oid_drag.clone(),
+                        crate::model_selection::OptionValue::Str(dragged[index].clone()),
+                    );
+                }
+            } else {
+                tx.motion_curve(slider_curve(true));
+                s.thinking_drag = Some(crate::model::ThinkingDrag {
+                    frac: along,
+                    key: gesture_key,
+                });
+            }
+        });
+    }
+    // Codex ends its track with the first and last level names, so the endpoints read as
+    // named stops rather than bare caps. A single level gets one label.
+    let mut labels = row().key("effort-ends").w_full().child(
+        label(
+            effort_name(&levels[0]),
+            TextStyle::new(12.0, 500.0),
+            p.muted,
+        )
+        .key("effort-end-low"),
+    );
+    if count > 1 {
+        labels = labels.child(spacer()).child(
+            label(
+                effort_name(&levels[count - 1]),
+                TextStyle::new(12.0, 500.0),
+                p.muted,
+            )
+            .key("effort-end-high"),
+        );
     }
     section.child(slider).child(labels)
 }
@@ -4051,32 +4119,25 @@ fn empty_list(s: &State, p: Palette, key: &str, text: &str) -> El {
 }
 
 /// The wordmark's size in points, for a header `line` points wide after the native controls
-/// and the gap before the tabs: Inter 14/600 whenever it clears the attention badge, 12 in a
-/// narrow sidebar, and none in a truly narrow one.
+/// and the gap before the tabs: Inter 14/600 when it fits, 12 in a narrow sidebar, and none
+/// in a truly narrow one.
 /// Width a macOS title strip reserves for the window buttons, which every platform assumes when
 /// it sizes the wordmark.
 const TITLE_CONTROLS: f32 = 72.0;
 
-fn wordmark_size(line: f32, badge: bool) -> Option<f32> {
-    let badge = if badge {
-        BADGE_CLEARANCE + HEADER_BADGE
-    } else {
-        0.0
-    };
-    // The compose button and its 2 pt gap follow the badge, so the wordmark
+fn wordmark_size(line: f32) -> Option<f32> {
+    // The compose button and its 2 pt gap follow the wordmark's slot, so the wordmark
     // reserves 26 pt for it: the mark drops out earlier on a 200 pt sidebar.
     let before = HEADER_TOGGLE + HEADER_MARK + 26.0;
-    if line >= before + wordmark_gap(14.0) + WORDMARK_WIDTH + badge {
+    if line >= before + wordmark_gap(14.0) + WORDMARK_WIDTH {
         Some(14.0)
-    } else if line >= before + wordmark_gap(12.0) + WORDMARK_WIDTH * 0.8 + badge {
+    } else if line >= before + wordmark_gap(12.0) + WORDMARK_WIDTH * 0.8 {
         Some(12.0)
     } else {
         None
     }
 }
-/// The space between the mark and the wordmark: 6 pt at 22 px, 4 pt at 11 px. A 200 pt sidebar
-/// under macOS's real 76 pt traffic-light inset leaves 112 pt, and the 11 px wordmark with the
-/// badge then takes 111.
+/// The space between the mark and the wordmark: 6 pt at 22 px, 4 pt at 11 px.
 fn wordmark_gap(size: f32) -> f32 {
     if size < 15.0 { 4.0 } else { WORDMARK_GAP }
 }
@@ -4087,7 +4148,7 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
     let mut header = row().h(36.0).center_y().child(sidebar_toggle(p, compact));
     if line >= HEADER_TOGGLE + HEADER_MARK {
         header = header.child(shina_mark(s, p));
-        if let Some(size) = wordmark_size(wordmark_line, !s.attention().is_empty()) {
+        if let Some(size) = wordmark_size(wordmark_line) {
             header = header.child(
                 label(
                     "Shina",
@@ -4101,33 +4162,25 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
             );
         }
     }
-    header
-        .child(spacer())
-        .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
-        .child(
-            icon_button("new-thread", "New thread", "compose", p, |_| {})
-                .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
-                .help(if s.projects.entries.iter().all(|project| project.hidden) {
-                    "New thread"
-                } else {
-                    "New thread. Shift-click: in the current workspace"
-                }),
-        )
+    header.child(spacer()).child(
+        icon_button("new-thread", "New thread", "compose", p, |_| {})
+            .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
+            .help(if s.projects.entries.iter().all(|project| project.hidden) {
+                "New thread"
+            } else {
+                "New thread. Shift-click: in the current workspace"
+            }),
+    )
 }
 
 /// The title strip's left end when the sidebar is not docked: the toggle, the 24 px mark and
-/// the attention badge, then the gap before the tabs. The wordmark waits for the sidebar.
+/// the compose button, then the gap before the tabs. The wordmark waits for the sidebar.
 fn undocked_header(s: &State, p: Palette, compact: bool) -> El {
-    let mut header = row()
+    row()
         .h(36.0)
         .center_y()
         .child(sidebar_toggle(p, compact))
-        .child(shina_mark(s, p));
-    if !s.attention().is_empty() {
-        header = header.child(el().w(BADGE_CLEARANCE + 28.0).h(1.0));
-    }
-    header
-        .child(el().key(crew_ui::ATTENTION_ANCHOR).size(0.0, 28.0))
+        .child(shina_mark(s, p))
         .child(
             icon_button("new-thread", "New thread", "compose", p, |_| {})
                 .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
@@ -4139,16 +4192,12 @@ fn undocked_header(s: &State, p: Palette, compact: bool) -> El {
         )
         .pr(HEADER_TAB_GAP)
 }
-/// The space between the attention badge, at the header's end, and the first tab.
+/// The space between the compose button, at the header's end, and the first tab.
 const HEADER_TAB_GAP: f32 = 12.0;
 /// The space between the mark and the 22 px wordmark. The toggle and the mark touch their boxes.
 const WORDMARK_GAP: f32 = 6.0;
-/// The least space between the wordmark (or the mark) and the attention badge.
-const BADGE_CLEARANCE: f32 = 4.0;
 const HEADER_TOGGLE: f32 = 24.0;
 const HEADER_MARK: f32 = 24.0;
-/// The attention badge's width.
-const HEADER_BADGE: f32 = 20.0;
 /// "Shina" in Inter 15/600.
 const WORDMARK_WIDTH: f32 = 40.0;
 
@@ -4826,35 +4875,6 @@ fn sidebar_portrait(
         tx.live_only();
         tx.wake_after(std::time::Duration::ZERO);
     })
-}
-
-/// What a count badge counts. Brass is for what needs you, and the neutral card fill with ink
-/// digits for what is unread. Coral stays for the one primary action. The crew line counts its
-/// states as status squares with pixel labels, not badges.
-#[derive(Clone, Copy)]
-pub(crate) enum CountKind {
-    NeedsYou,
-}
-
-fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
-    let text = if count > 9 {
-        "9+".into()
-    } else {
-        count.to_string()
-    };
-    let (fill, ink, frame) = match kind {
-        CountKind::NeedsYou => (p.brass, p.on_brass, p.frame),
-    };
-    // A square with Inter digits and a 1 px frame, no shadow.
-    row()
-        .h(18.0)
-        .min_w(18.0)
-        .px(3.0)
-        .radius(4.0)
-        .fill(fill)
-        .border(1.0, frame)
-        .center()
-        .child(label(text, META, ink))
 }
 
 /// The corner mark that shows a portrait's status in pickers and headers.
@@ -12058,7 +12078,6 @@ fn assistant_selection_toolbar(s: &State, p: Palette, cx: &Cx<State>) -> Option<
         || s.base_branch_picker
         || s.machines.picker
         || s.settings.archive.is_some()
-        || s.attention_menu
     {
         return None;
     }
@@ -17051,7 +17070,6 @@ pub(crate) mod tests {
                 |s| s.rename_thread = Some(s.current().id),
                 |s| s.delete_thread = Some(s.current().id),
                 |s| s.thread_menu = true,
-                |s| s.attention_menu = true,
                 |s| s.machines.picker = true,
                 |s| s.machines.dialog = true,
                 |s| s.projects.clone_open = true,
@@ -17869,16 +17887,6 @@ pub(crate) mod tests {
             rt.frame(1.0);
             assert_eq!(focused(&rt).key.as_deref(), Some("model-search"));
             walk_menu(&mut rt, "model-list", true, &at("model list"));
-
-            let mut rt = runtime(width);
-            crate::captain_workspace_demo(&mut rt.state);
-            rt.state.compact_sidebar = true;
-            rt.state.demo_stop(19);
-            rt.state.attention_menu = true;
-            rt.invalidate();
-            rt.frame(0.0);
-            rt.frame(1.0);
-            walk_menu(&mut rt, "attention-menu", true, &at("attention menu"));
 
             // A palette with a search field keeps its highlight in state; Home and End reach
             // its ends as well.
@@ -27874,18 +27882,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn attention_row_keeps_one_height_and_opens_threads_from_its_popover() {
-        for width in [960.0, 1280.0, 1920.0] {
+    fn actionable_status_lives_on_sidebar_rows_not_a_global_badge() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = crew_runtime(width);
-            let (row, _) = rt.presented("attention-row").unwrap();
-            assert_eq!(row[3], 24.0);
-            assert_inside(&mut rt, width, &["attention-row", "attention-count"]);
-            press(&mut rt, "attention-row");
-            assert!(rt.state.attention_menu);
-            assert_inside(&mut rt, width, &["attention-menu", "attention-item-18"]);
-            press(&mut rt, "attention-item-18");
-            assert_eq!(rt.state.current().id, 18);
-            assert!(!rt.state.attention_menu);
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.demo_stop(19);
+            rt.invalidate();
+            settle(&mut rt);
+            // The Captain's row carries the worker's request count. Its conversation
+            // still offers the actual approval controls.
+            assert!(rt.find("attention-row").is_none(), "{width}");
+            assert!(rt.find("attention-menu").is_none(), "{width}");
+            assert_inside(&mut rt, width, &["captain-attention-7", "approve-2"]);
+            assert_eq!(
+                element_text(&rt, "captain-attention-7").as_deref(),
+                Some("Attention 3"),
+                "{width}"
+            );
         }
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
@@ -27898,32 +27911,84 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         assert!(rt.state.attention().is_empty());
-        assert!(rt.presented("attention-row").is_none());
         let keys = ["workspace-context", "thread-search-field", "sidebar"];
         let before: Vec<_> = keys.iter().map(|k| rt.presented(k).unwrap().0).collect();
         rt.state.threads[0].request = Some(json!({"method":"confirm"}));
         rt.invalidate();
         rt.frame(1.0);
-        assert!(rt.presented("attention-row").is_some());
+        // The request lands on the thread's row without moving the sidebar's frame.
         let after: Vec<_> = keys.iter().map(|k| rt.presented(k).unwrap().0).collect();
-        assert_eq!(before, after, "the attention pill never moves the sidebar");
+        assert_eq!(before, after, "a request never moves the sidebar");
     }
 
     #[test]
-    fn a_settled_failure_stays_out_of_attention_until_reopened() {
+    fn a_settled_failure_stays_quiet_until_reopened() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
-            let t = rt.state.current_mut();
-            t.status = Status::Failed;
-            t.life.settle(lifecycle::now());
+            rt.state.populate_demo();
+            rt.state.compact_sidebar = width < 760.0;
+            rt.state.shelves[1] = true;
+            rt.state.current_mut().status = Status::Failed;
+            rt.state.current_mut().life.settle(lifecycle::now());
+            let id = rt.state.current().id;
             settle(&mut rt);
-            assert!(rt.state.attention().is_empty(), "{width}");
-            assert!(rt.presented("attention-row").is_none(), "{width}");
+            assert!(rt.find("attention-row").is_none(), "{width}");
+            assert!(rt.presented(&format!("thread-{id}")).is_some(), "{width}");
+            let key = format!("thread-state-{id}");
+            assert!(rt.find(&key).is_none(), "{width}");
             rt.update(|s, _| s.current_mut().life.unsettle(lifecycle::now(), true));
             settle(&mut rt);
-            assert!(rt.presented("attention-row").is_some(), "{width}");
-            press(&mut rt, "attention-row");
-            assert_inside(&mut rt, width, &["attention-heading", "attention-item-1"]);
+            // Reopening a failed thread puts its status back on its own sidebar row.
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|node| node.key.as_deref() == Some(&key)
+                        && node.text.as_deref() == Some("Failed")),
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn ksg_sidebar_row_variants_keep_their_geometry_and_attention() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.state.compact_sidebar = width < 760.0;
+            let mut thread = Thread::new(2);
+            thread.title = "One workshop thread".into();
+            thread.model = crate::model::DEFAULT_MODEL.into();
+            thread.branch = Some("work/sidebar".into());
+            thread.status = Status::Failed;
+            thread.life.latest_user_message_at = Some(lifecycle::now());
+            rt.state.threads.push(thread);
+            settle(&mut rt);
+            let rect = |rt: &Runtime<State>, key: &str| {
+                rt.presented(key)
+                    .unwrap_or_else(|| panic!("{width}: missing {key}"))
+                    .0
+            };
+            let row = rect(&rt, "thread-2");
+            assert_eq!(row[3], 36.0, "{width}");
+            assert!((rect(&rt, "thread-row-title-2")[0] - row[0] - 36.0).abs() <= 1.0);
+            assert_eq!(
+                element_text(&rt, "thread-state-2").as_deref(),
+                Some("Failed")
+            );
+            let server = rt.state.machines.selected.clone();
+            rt.update(|s, _| s.toggle_sidebar_group(server.clone(), None));
+            settle(&mut rt);
+            assert!(rt.find("thread-2").is_none(), "{width}");
+            assert!(
+                rt.find(&format!("sidebar-group-attention-{server}-none"))
+                    .is_some(),
+                "{width}"
+            );
+            rt.update(|s, _| s.toggle_sidebar_grouping());
+            settle(&mut rt);
+            assert_eq!(rect(&rt, "thread-2")[3], 78.0, "{width}");
+            rt.update(|s, _| s.threads[1].branch = None);
+            settle(&mut rt);
+            assert_eq!(rect(&rt, "thread-2")[3], 60.0, "{width}");
         }
     }
 
@@ -28003,7 +28068,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_narrow_scene_docks_the_compact_sidebar_and_drops_the_wordmark() {
+    fn the_narrow_scene_docks_the_compact_sidebar_with_compose_clear_of_the_wordmark() {
         let mut rt = runtime(620.0);
         crate::captain_workspace_demo(&mut rt.state);
         rt.state.compact_sidebar = true;
@@ -28013,10 +28078,9 @@ pub(crate) mod tests {
         rt.frame(1.0);
         let (side, _) = rt.presented("sidebar").expect("the sidebar is docked");
         assert!(side[2] <= 216.5, "{side:?}");
-        // The compose button's reservation leaves the wordmark no room beside
-        // the attention badge on a 200 pt sidebar.
-        assert!(rt.presented("shina-wordmark").is_none());
-        assert!(rt.presented("new-thread").is_some());
+        let compose = rt.presented("new-thread").unwrap().0;
+        let wordmark = rt.presented("shina-wordmark").unwrap().0;
+        assert!(wordmark[0] + wordmark[2] <= compose[0] + 0.5);
     }
 
     #[test]
@@ -28374,16 +28438,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_wordmark_stays_beside_the_attention_badge_in_a_docked_sidebar() {
+    fn the_wordmark_stays_beside_the_compose_button_in_a_docked_sidebar() {
         for width in [1280.0, 1920.0] {
             let rt = crew_runtime(width);
             let (word, _) = rt.presented("shina-wordmark").unwrap_or_else(|| {
-                panic!("{width}: the wordmark is missing beside the attention badge")
+                panic!("{width}: the wordmark is missing beside the compose button")
             });
-            let (badge, _) = rt.presented("attention-row").unwrap();
+            let (compose, _) = rt.presented("new-thread").unwrap();
             assert!(
-                word[0] + word[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
-                "{width}: the badge crowds the wordmark {word:?} {badge:?}"
+                word[0] + word[2] <= compose[0] + 0.5,
+                "{width}: the compose button crowds the wordmark {word:?} {compose:?}"
             );
             // At 14 px Inter semibold "Shina" is about 38 pt wide; the narrow fallback is 12 px.
             assert!(
@@ -28394,87 +28458,23 @@ pub(crate) mod tests {
         // The 248 pt narrow sidebar leaves room at 960.
         let rt = crew_runtime(960.0);
         if let Some((word, _)) = rt.presented("shina-wordmark") {
-            let (badge, _) = rt.presented("attention-row").unwrap();
-            assert!(word[0] + word[2] + BADGE_CLEARANCE <= badge[0] + 0.5);
+            let (compose, _) = rt.presented("new-thread").unwrap();
+            assert!(word[0] + word[2] <= compose[0] + 0.5);
         }
     }
 
     #[test]
-    fn the_attention_popover_is_340_wide_keeps_its_reasons_and_sits_under_its_badge() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = runtime(width);
-            crate::captain_workspace_demo(&mut rt.state);
-            rt.state.compact_sidebar = true;
-            rt.state.demo_stop(19);
-            rt.state.recovery_notice = Some("Two tasks stopped.".into());
-            rt.state.brief.demo_status = Some(crate::model::BackgroundStatus {
-                hidden_to_tray: true,
-                working: 2,
-                ..Default::default()
-            });
-            rt.state.attention_menu = true;
-            rt.invalidate();
-            rt.frame(0.0);
-            rt.frame(1.0);
-            let (menu, _) = rt.presented("attention-menu").unwrap();
-            assert!(
-                (menu[2] - 340.0f32.min(width - 16.0)).abs() < 0.5,
-                "{width}: {menu:?}"
-            );
-            // With the sidebar docked, the popover hangs from the top bar with its left edge on
-            // the chat pane's, so it covers neither the sidebar nor the recovery banner's dismiss
-            // control at the lane's right. Closed, it opens 6 px under its badge.
-            let (pane, _) = rt.presented("chat-pane").unwrap();
-            let (sidebar, _) = rt.presented("sidebar").unwrap();
-            if width < 760.0 {
-                let (badge, _) = rt.presented("attention-row").unwrap();
-                assert!(menu[1] >= badge[1] + badge[3] && menu[0] + menu[2] <= width + 0.5);
-                continue;
-            }
-            assert!(
-                (menu[0] - pane[0]).abs() < 0.5 && (menu[1] - pane[1]).abs() < 0.5,
-                "{width}: {menu:?} {pane:?}"
-            );
-            assert!(
-                menu[0] >= sidebar[0] + sidebar[2],
-                "{width}: over the sidebar"
-            );
-            let (dismiss, _) = rt.presented("dismiss-recovery").unwrap();
-            let apart = menu[0] + menu[2] <= dismiss[0]
-                || dismiss[0] + dismiss[2] <= menu[0]
-                || menu[1] + menu[3] <= dismiss[1]
-                || dismiss[1] + dismiss[3] <= menu[1];
-            assert!(
-                apart,
-                "{width}: {menu:?} covers the dismiss control {dismiss:?}"
-            );
-            assert!(
-                menu[0] >= 0.0 && menu[0] + menu[2] <= width + 0.5,
-                "{width}: {menu:?}"
-            );
-            for item in rt.state.attention() {
-                let (reason, _) = rt
-                    .presented(&format!("attention-reason-{}", item.thread_id))
-                    .unwrap();
-                assert!(reason[2] >= 80.0 - 0.5, "{width}: {reason:?}");
-                assert!(reason[0] + reason[2] <= menu[0] + menu[2], "{width}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_wordmark_keeps_14_px_in_a_normal_sidebar_with_the_traffic_lights_and_a_badge() {
+    fn the_wordmark_keeps_14_px_in_a_normal_sidebar_with_the_traffic_lights() {
         // A macOS title strip reserves about 72 pt for the window buttons on the left, and the
         // header keeps HEADER_TAB_GAP at its end.
         let line = |sidebar: f32| sidebar - TITLE_CONTROLS - HEADER_TAB_GAP;
-        assert_eq!(wordmark_size(line(232.0), true), Some(14.0));
-        assert_eq!(wordmark_size(line(232.0), false), Some(14.0));
-        assert!(wordmark_size(line(216.0), false).is_some());
-        assert_eq!(wordmark_size(line(120.0), true), None);
+        assert_eq!(wordmark_size(line(232.0)), Some(14.0));
+        assert!(wordmark_size(line(216.0)).is_some());
+        assert_eq!(wordmark_size(line(120.0)), None);
     }
 
     #[test]
-    fn a_narrow_sidebar_shows_a_small_wordmark_under_the_real_traffic_light_inset() {
+    fn a_narrow_sidebar_keeps_the_wordmark_clear_of_the_compose_button() {
         // macOS reports a 76 pt leading inset; Windows and Linux report none.
         for leading in [76.0, 0.0] {
             for sidebar in [200.0, 208.0, 216.0] {
@@ -28487,24 +28487,24 @@ pub(crate) mod tests {
                 rt.frame(0.0);
                 rt.frame(0.5);
                 let at = format!("leading {leading}, sidebar {sidebar}");
-                // The compose button's reservation drops the wordmark under a
-                // badge on a narrow sidebar, so the badge itself stays clear.
-                assert!(
-                    rt.presented("shina-wordmark").is_none(),
-                    "{at}: the wordmark did not drop out"
-                );
-                let (badge, _) = rt.presented("attention-row").unwrap();
+                let (compose, _) = rt.presented("new-thread").unwrap();
                 let (logo, _) = rt.presented("shina-logo").unwrap();
                 assert!(
-                    logo[0] + logo[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
-                    "{at}: mark {logo:?} runs into the badge {badge:?}"
+                    logo[0] + logo[2] <= compose[0] + 0.5,
+                    "{at}: mark {logo:?} runs into the compose button {compose:?}"
                 );
+                if let Some((word, _)) = rt.presented("shina-wordmark") {
+                    assert!(
+                        word[0] + word[2] <= compose[0] + 0.5,
+                        "{at}: wordmark {word:?} runs into the compose button {compose:?}"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn an_undocked_sidebar_keeps_the_mark_and_the_attention_badge_in_the_top_bar() {
+    fn an_undocked_sidebar_keeps_the_mark_and_the_compose_button_in_the_top_bar() {
         for width in [620.0, 960.0] {
             let mut rt = runtime(width);
             crate::captain_workspace_demo(&mut rt.state);
@@ -28517,27 +28517,20 @@ pub(crate) mod tests {
             let (logo, _) = rt.presented("shina-logo").unwrap();
             assert_eq!((logo[2], logo[3]), (24.0, 24.0));
             assert!(logo[0] >= toggle[0] + toggle[2] - 0.5, "{width}");
-            let (badge, _) = rt
-                .presented("attention-row")
-                .unwrap_or_else(|| panic!("{width}: the attention badge is missing"));
-            assert!(
-                badge[0] >= logo[0] + logo[2] + BADGE_CLEARANCE - 0.5,
-                "{width}"
-            );
             // The compose button ends the undocked header, then the gap, then
             // the nav cluster and the tabs.
             let (compose, _) = rt.presented("new-thread").unwrap();
-            assert!(compose[0] >= badge[0] + badge[2] - 0.5, "{width}");
+            assert!(compose[0] >= logo[0] + logo[2] - 0.5, "{width}");
             let (tab, _) = rt.presented("active-tab").unwrap();
             assert!(
                 tab[0] >= compose[0] + compose[2] - 0.5,
-                "{width}: {badge:?} {tab:?}"
+                "{width}: {compose:?} {tab:?}"
             );
         }
     }
 
     #[test]
-    fn the_narrowest_docked_sidebar_keeps_the_mark_the_badge_and_the_tab_apart() {
+    fn the_narrowest_docked_sidebar_keeps_the_mark_the_compose_button_and_the_tab_apart() {
         let mut rt = runtime(1280.0);
         crate::captain_workspace_demo(&mut rt.state);
         rt.state.sidebar_width = 200.0;
@@ -28547,30 +28540,31 @@ pub(crate) mod tests {
         let (sidebar, _) = rt.presented("sidebar").unwrap();
         assert_eq!(sidebar[2], 200.0);
         let (logo, _) = rt.presented("shina-logo").unwrap();
-        let (badge, _) = rt.presented("attention-row").unwrap();
+        let (compose, _) = rt.presented("new-thread").unwrap();
         let (tab, _) = rt.presented("active-tab").unwrap();
-        assert!(logo[0] + logo[2] <= badge[0] + 0.5, "{logo:?} {badge:?}");
+        assert!(
+            logo[0] + logo[2] <= compose[0] + 0.5,
+            "{logo:?} {compose:?}"
+        );
         if let Some((word, _)) = rt.presented("shina-wordmark") {
             assert!(
-                word[0] + word[2] + BADGE_CLEARANCE <= badge[0] + 0.5,
-                "{word:?} {badge:?}"
+                word[0] + word[2] <= compose[0] + 0.5,
+                "{word:?} {compose:?}"
             );
         }
-        let (compose, _) = rt.presented("new-thread").unwrap();
-        assert!(compose[0] >= badge[0] + badge[2] - 0.5);
         assert!(tab[0] >= compose[0] + compose[2] - 0.5);
     }
 
     #[test]
-    fn the_first_tab_clears_the_badge_by_12_and_the_pane_rule_by_4() {
+    fn the_first_tab_clears_the_compose_button_by_12_and_the_pane_rule_by_4() {
         for width in [960.0, 1280.0, 1920.0] {
             let rt = crew_runtime(width);
-            let (badge, _) = rt.presented("attention-row").unwrap();
+            let (compose, _) = rt.presented("new-thread").unwrap();
             let (tab, _) = rt.presented("active-tab").unwrap();
             assert!(
-                tab[0] >= badge[0] + badge[2] + HEADER_TAB_GAP - 0.5,
-                "{width}: the badge sits {} pt before the first tab",
-                tab[0] - (badge[0] + badge[2])
+                tab[0] >= compose[0] + compose[2] + HEADER_TAB_GAP - 0.5,
+                "{width}: the compose button sits {} pt before the first tab",
+                tab[0] - (compose[0] + compose[2])
             );
             let (pane, _) = rt.presented("chat-pane").unwrap();
             assert!(
@@ -29600,8 +29594,8 @@ pub(crate) mod tests {
         rt.frame(3.5);
         let held = rt.state.thinking_drag.expect("the drag holds the thumb");
         assert!(
-            (0.2..0.4).contains(&held),
-            "the thumb follows the pointer, not the nearest stop: {held}"
+            (0.2..0.4).contains(&held.frac),
+            "the thumb follows the pointer, not the nearest stop: {held:?}"
         );
         rt.pointer_move(track[0] + track[2] - 4.0, y);
         rt.pointer_up(track[0] + track[2] - 4.0, y);
@@ -29612,7 +29606,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn effort_labels_select_an_exact_level_at_all_widths() {
+    fn effort_slider_names_its_end_levels_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             with_levels(&mut rt);
@@ -29620,12 +29614,395 @@ pub(crate) mod tests {
             settle(&mut rt);
             press(&mut rt, "composer-effort");
             settle(&mut rt);
+            // The endpoint labels carry the first and last level names under the track.
+            let nodes = rt.accessibility_json();
+            assert_eq!(
+                find(&nodes, "effort-end-low").and_then(|n| n["name"].as_str()),
+                Some("Off"),
+                "{width}"
+            );
+            assert_eq!(
+                find(&nodes, "effort-end-high").and_then(|n| n["name"].as_str()),
+                Some("High"),
+                "{width}"
+            );
+            assert_inside(&mut rt, width, &["effort-ends", "effort-slider"]);
+        }
+    }
+
+    /// The thumb's centre x for a level index inside the slider's rect.
+    fn thumb_center(track: [f32; 4], count: usize, index: usize) -> f32 {
+        let cap = SLIDER_H / 2.0;
+        track[0] + cap + (index as f32 / (count - 1) as f32) * (track[2] - 2.0 * cap)
+    }
+
+    /// A track x for a fraction between the end caps' centres.
+    fn track_at(track: [f32; 4], frac: f32) -> f32 {
+        let cap = SLIDER_H / 2.0;
+        track[0] + cap + frac * (track[2] - 2.0 * cap)
+    }
+
+    #[test]
+    fn effort_slider_keeps_a_knob_grab_offset_and_snaps_on_release() {
+        let mut rt = runtime(1280.0);
+        with_levels(&mut rt);
+        rt.frame(0.0);
+        press(&mut rt, "composer-effort");
+        settle(&mut rt);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let y = track[1] + track[3] / 2.0;
+        // Levels off/low/medium/high; medium is index 2. Grab the knob 5 pt off centre.
+        let knob = thumb_center(track, 4, 2);
+        rt.pointer_down(knob + 5.0, y);
+        rt.frame(0.05);
+        let held = rt
+            .state
+            .thinking_drag
+            .expect("the knob press starts a drag");
+        assert!(
+            (held.frac - 2.0 / 3.0).abs() < 0.02,
+            "a knob press holds where the thumb already is, not under the pointer: {held:?}"
+        );
+        // The same pointer x on the track would map differently: the offset stays.
+        rt.pointer_move(track_at(track, 0.5) + 5.0, y);
+        rt.frame(0.1);
+        let held = rt.state.thinking_drag.unwrap();
+        assert!(
+            (held.frac - 0.5).abs() < 0.02,
+            "the grab offset travels with the pointer: {held:?}"
+        );
+        // Release halfway between medium and high snaps to the nearer stop.
+        rt.pointer_up(track_at(track, 0.72), y);
+        rt.frame(0.5);
+        assert_eq!(rt.state.thinking_drag, None);
+        assert_eq!(rt.state.current().thinking, "medium");
+    }
+
+    #[test]
+    fn effort_slider_track_press_jumps_to_the_nearest_stop_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            with_levels(&mut rt);
+            rt.state.composer_ui.force_expanded = true;
+            settle(&mut rt);
+            press(&mut rt, "composer-effort");
+            settle(&mut rt);
+            let (track, _) = rt.presented("effort-slider").unwrap();
+            let y = track[1] + track[3] / 2.0;
             for (index, name) in ["off", "low", "medium", "high"].into_iter().enumerate() {
-                let key = format!("effort-level-{index}");
-                assert_inside(&mut rt, width, &[&key]);
-                press(&mut rt, &key);
+                let x = thumb_center(track, 4, index);
+                rt.pointer_down(x, y);
+                rt.pointer_up(x, y);
+                rt.frame(0.5);
                 assert_eq!(rt.state.current().thinking, name, "{width}");
+                assert_eq!(rt.state.thinking_drag, None, "{width}");
             }
+        }
+    }
+
+    #[test]
+    fn effort_slider_clamps_past_the_caps_and_ignores_a_cancel() {
+        let mut rt = runtime(1280.0);
+        with_levels(&mut rt);
+        rt.frame(0.0);
+        press(&mut rt, "composer-effort");
+        settle(&mut rt);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let y = track[1] + track[3] / 2.0;
+        // Drag well past both caps: the thumb clamps inside the track.
+        rt.pointer_down(track[0] + 2.0, y);
+        rt.pointer_move(track[0] - 120.0, y);
+        rt.frame(0.05);
+        assert_eq!(
+            rt.state.thinking_drag.map(|d| d.frac),
+            Some(0.0),
+            "past the left cap clamps to 0"
+        );
+        rt.pointer_move(track[0] + track[2] + 120.0, y);
+        rt.frame(0.05);
+        assert_eq!(
+            rt.state.thinking_drag.map(|d| d.frac),
+            Some(1.0),
+            "past the right cap clamps to 1"
+        );
+        rt.pointer_up(track[0] + track[2] + 120.0, y);
+        rt.frame(0.5);
+        assert_eq!(rt.state.current().thinking, "high");
+
+        // A cancelled gesture restores, commits nothing and clears the hold.
+        rt.state.current_mut().thinking = "medium".into();
+        rt.invalidate();
+        rt.frame(0.0);
+        let knob = thumb_center(track, 4, 2);
+        rt.pointer_down(knob, y);
+        rt.pointer_move(track_at(track, 0.9), y);
+        rt.frame(0.05);
+        assert!(rt.state.thinking_drag.is_some());
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(0.5);
+        assert_eq!(rt.state.thinking_drag, None);
+        assert_eq!(
+            rt.state.current().thinking,
+            "medium",
+            "a cancelled gesture commits nothing"
+        );
+    }
+
+    #[test]
+    fn effort_slider_rejects_a_busy_press_and_a_stale_release() {
+        let mut rt = runtime(1280.0);
+        with_levels(&mut rt);
+        rt.frame(0.0);
+        press(&mut rt, "composer-effort");
+        settle(&mut rt);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let y = track[1] + track[3] / 2.0;
+        // While the turn runs, a press previews nothing and commits nothing.
+        rt.state.current_mut().status = Status::Running;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.pointer_down(track_at(track, 0.0), y);
+        rt.pointer_move(track_at(track, 1.0), y);
+        rt.pointer_up(track_at(track, 1.0), y);
+        rt.frame(0.5);
+        assert_eq!(rt.state.thinking_drag, None);
+        assert_eq!(
+            rt.state.current().thinking,
+            "medium",
+            "busy commits nothing"
+        );
+        rt.state.current_mut().status = Status::Ready;
+        rt.pointer_down(track_at(track, 0.0), y);
+        rt.pointer_move(track_at(track, 1.0), y);
+        rt.frame(0.05);
+        assert!(rt.state.thinking_drag.is_some());
+        rt.state.current_mut().status = Status::Running;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.pointer_up(track_at(track, 1.0), y);
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.thinking_drag, None,
+            "release clears a hold even after lock"
+        );
+        assert_eq!(rt.state.current().thinking, "medium");
+
+        rt.state.current_mut().status = Status::Ready;
+        // A drag that survives a model switch commits nothing into the new context.
+        rt.pointer_down(track_at(track, 0.0), y);
+        rt.pointer_move(track_at(track, 1.0), y);
+        rt.frame(0.05);
+        assert!(rt.state.thinking_drag.is_some());
+        let t = rt.state.current_mut();
+        t.model_id = "other-model".into();
+        t.model = "Other".into();
+        t.thinking_levels = vec!["low".into(), "max".into()];
+        rt.invalidate();
+        rt.frame(0.1);
+        rt.pointer_up(track_at(track, 1.0), y);
+        rt.frame(0.5);
+        assert_eq!(rt.state.thinking_drag, None, "the stale hold is cleared");
+        assert_eq!(
+            rt.state.current().thinking,
+            "medium",
+            "a stale release commits nothing into the rebuilt slider"
+        );
+    }
+
+    /// A pick made while a configure acknowledgement is still out is not dropped and
+    /// does not race a second command: the latest wanted level renders at once, and the
+    /// acknowledgement sends it in order.
+    #[test]
+    fn effort_picks_during_an_in_flight_ack_reconcile_in_order() {
+        let mut rt = runtime(1280.0);
+        let (pi, commands, _events) = crate::backend::Pi::test_connection();
+        rt.state.current_mut().harness = "pi".into();
+        rt.state.current_mut().pi = Some(pi);
+        rt.state.current_mut().status = Status::Ready;
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
+            {"provider":"cpa","id":"model-a","name":"Model A","reasoning":true,
+             "thinkingLevelMap":{"off":null,"low":null,"medium":null,"high":null}}
+        ]}}));
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","low","medium","high"]}}));
+        rt.state.current_mut().model_id = "model-a".into();
+        rt.state.current_mut().model_provider = "cpa".into();
+        rt.state.current_mut().thinking = "low".into();
+        rt.frame(0.0);
+        press(&mut rt, "composer-effort");
+        settle(&mut rt);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let y = track[1] + track[3] / 2.0;
+
+        // First pick: medium, goes out at once.
+        let x = thumb_center(track, 4, 2);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.2);
+        let first = commands.try_recv().unwrap();
+        assert_eq!(first["type"], "set_thinking_level");
+        assert_eq!(first["level"], "medium");
+        assert!(
+            rt.state.current().configuring,
+            "the first pick is in flight"
+        );
+        // The picked level renders before the provider confirms it.
+        assert_eq!(
+            find(&rt.accessibility_json(), "effort-title").and_then(|n| n["name"].as_str()),
+            Some("Medium")
+        );
+
+        // A second pick during the ack sends no concurrent command.
+        let x = thumb_center(track, 4, 3);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.2);
+        assert!(
+            commands.try_recv().is_err(),
+            "no second set_thinking_level while the first is out"
+        );
+        // Still the newest pick renders, not the in-flight one.
+        assert_eq!(
+            find(&rt.accessibility_json(), "effort-title").and_then(|n| n["name"].as_str()),
+            Some("High")
+        );
+        rt.update(|_, tx| tx.focus("effort-slider", true));
+        for (key, name) in [(rune::Key::Home, "Off"), (rune::Key::End, "High")] {
+            rt.key(rune::KeyEvent {
+                key,
+                mods: Default::default(),
+            });
+            rt.frame(0.2);
+            assert_eq!(
+                find(&rt.accessibility_json(), "effort-title").and_then(|n| n["name"].as_str()),
+                Some(name)
+            );
+        }
+        assert!(commands.try_recv().is_err());
+
+        // The ack applies medium, then the reconcile sends the wanted high in order.
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        assert_eq!(rt.state.current().thinking, "medium");
+        let mut drain = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            drain.push(command);
+        }
+        assert!(
+            drain.iter().any(|command| command["type"] == "get_state"),
+            "the ack verifies state: {drain:?}"
+        );
+        let follow = drain
+            .iter()
+            .find(|command| command["type"] == "set_thinking_level")
+            .expect("the reconcile sends the wanted level in order");
+        assert_eq!(
+            follow["level"], "high",
+            "the reconcile sends the latest wanted level"
+        );
+        // Nothing else goes out while the follow-up is itself in flight.
+        assert!(commands.try_recv().is_err(), "{drain:?}");
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        assert_eq!(rt.state.current().thinking, "high");
+    }
+
+    /// A rejected effort level drops its pin instead of staying selected, and a newer
+    /// pick made during the same flight still lands after the rejection.
+    #[test]
+    fn a_rejected_effort_level_does_not_stay_selected() {
+        let mut rt = runtime(1280.0);
+        let (pi, commands, _events) = crate::backend::Pi::test_connection();
+        rt.state.current_mut().harness = "pi".into();
+        rt.state.current_mut().pi = Some(pi);
+        rt.state.current_mut().status = Status::Ready;
+        rt.state.current_mut().apply(json!({"type":"response","command":"get_available_thinking_levels","success":true,"data":{"levels":["off","low","medium","high"]}}));
+        rt.state.current_mut().model_id = "model-a".into();
+        rt.state.current_mut().model_provider = "cpa".into();
+        rt.state.current_mut().thinking = "low".into();
+        rt.frame(0.0);
+        press(&mut rt, "composer-effort");
+        settle(&mut rt);
+        let (track, _) = rt.presented("effort-slider").unwrap();
+        let y = track[1] + track[3] / 2.0;
+
+        let x = thumb_center(track, 4, 2);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.2);
+        assert_eq!(commands.try_recv().unwrap()["level"], "medium");
+        // Rejected: the pin clears, the slider shows what the provider still runs.
+        rt.state.current_mut().apply(
+            json!({"type":"response","command":"set_thinking_level","success":false,"error":"Unsupported level"}),
+        );
+        rt.invalidate();
+        rt.frame(0.2);
+        assert_eq!(rt.state.current().selected_thinking, None);
+        assert_eq!(rt.state.current().thinking, "low");
+        assert_eq!(
+            find(&rt.accessibility_json(), "effort-title").and_then(|n| n["name"].as_str()),
+            Some("Low")
+        );
+
+        // A pick during the next flight, followed by a rejection of the older one, still
+        // reconciles the newer wanted level.
+        let x = thumb_center(track, 4, 2);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.2);
+        assert_eq!(commands.try_recv().unwrap()["level"], "medium");
+        let x = thumb_center(track, 4, 3);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.2);
+        assert!(
+            commands.try_recv().is_err(),
+            "the second pick waits for the first ack"
+        );
+        rt.state.current_mut().apply(
+            json!({"type":"response","command":"set_thinking_level","success":false,"error":"Unsupported level"}),
+        );
+        rt.frame(0.2);
+        let mut drain = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            drain.push(command);
+        }
+        let follow = drain
+            .iter()
+            .find(|command| command["type"] == "set_thinking_level")
+            .expect("the newer pick survives the older one's rejection");
+        assert_eq!(follow["level"], "high", "{drain:?}");
+        rt.state
+            .current_mut()
+            .apply(json!({"type":"response","command":"set_thinking_level","success":true}));
+        assert_eq!(rt.state.current().thinking, "high");
+    }
+
+    #[test]
+    fn effort_slider_drag_maps_in_points_at_any_zoom() {
+        for zoom in [0.8, 1.0, 1.5] {
+            let mut rt = runtime(1280.0);
+            with_levels(&mut rt);
+            rt.state.zoom = zoom;
+            rt.invalidate();
+            rt.frame(0.0);
+            press(&mut rt, "composer-effort");
+            settle(&mut rt);
+            let (track, _) = rt.presented("effort-slider").unwrap();
+            let y = track[1] + track[3] / 2.0;
+            rt.pointer_down(track_at(track, 0.98), y);
+            rt.pointer_up(track_at(track, 0.98), y);
+            rt.frame(0.5);
+            assert_eq!(rt.state.current().thinking, "high", "zoom {zoom}");
+            let x = thumb_center(track, 4, 1);
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+            rt.frame(0.5);
+            assert_eq!(rt.state.current().thinking, "low", "zoom {zoom}");
         }
     }
 
@@ -30022,7 +30399,10 @@ pub(crate) mod tests {
                 row[0] + row[2] <= side[0] + side[2] + 0.5,
                 "{width}: {row:?}"
             );
-            let label = rt.accessibility_json().to_string().contains("50m 0s");
+            let label = rt
+                .accessibility_json()
+                .to_string()
+                .contains("Working for 50m");
             assert!(label, "{width}: the running timer is shown");
         }
     }
@@ -30036,7 +30416,7 @@ pub(crate) mod tests {
             rt.frame(0.0);
             rt.frame(1.0);
 
-            // Captain rows are 56 pt tall; active rows are 52 pt tall.
+            // Captain rows stay 56 pt tall while folder rows follow KSG's 36 pt layout.
             let mut prev_bottom = 0.0f32;
             for i in rt.state.sidebar_captains() {
                 let id = rt.state.threads[i].id;
@@ -30063,7 +30443,7 @@ pub(crate) mod tests {
             let group_rect = rect(&rt, &group_key);
             let active_rect = rect(&rt, &format!("thread-{active_id}"));
             assert!(
-                (active_rect[3] - 52.0).abs() < 0.5,
+                (active_rect[3] - 36.0).abs() < 0.5,
                 "{width}: thread row height {active_rect:?}"
             );
             assert!(
