@@ -17858,8 +17858,15 @@ pub(crate) mod tests {
             for zoom in [0.9, 1.0, 1.1, 1.25, 1.5] {
                 for scene in ["captain", "empty", "example"] {
                     for width in [960.0, 1280.0] {
+                        let mut state = State::new(".".into(), false);
+                        let pixel_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("assets/crew-pixel");
+                        *state.artwork = crate::visuals::Artwork::load_sprite_dir(&pixel_root);
+                        *state.portraits = crate::portraits::Portraits::new(std::sync::Arc::clone(
+                            &*state.artwork,
+                        ));
                         let mut rt = Runtime::with_text(
-                            State::new(".".into(), false),
+                            state,
                             view,
                             (width, 800.0),
                             Env::new(false, scale),
@@ -30048,6 +30055,10 @@ pub(crate) mod tests {
     #[test]
     fn sidebar_portraits_play_only_while_shown_focused_and_allowed_to_move() {
         let mut rt = runtime(1280.0);
+        let pixel_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel");
+        *rt.state.artwork = crate::visuals::Artwork::load_sprite_dir(&pixel_root);
+        *rt.state.portraits =
+            crate::portraits::Portraits::new(std::sync::Arc::clone(&*rt.state.artwork));
         rt.state.populate_demo();
         rt.frame(0.0);
         rt.frame(0.1);

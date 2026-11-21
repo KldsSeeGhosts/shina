@@ -338,9 +338,26 @@ pub fn provider_mascot_for(model_or_provider: &str) -> ProviderMascot {
     Default
 }
 
-// Packaged assets can supply bytes here once the mascot set ships.
-fn embedded_mascot(_mascot: ProviderMascot, _small: bool) -> Option<&'static [u8]> {
-    None
+fn embedded_mascot(mascot: ProviderMascot, small: bool) -> Option<&'static [u8]> {
+    macro_rules! pair {
+        ($name:literal) => {
+            if small {
+                include_bytes!(concat!("../assets/providers/crew/", $name, ".small.png")).as_slice()
+            } else {
+                include_bytes!(concat!("../assets/providers/crew/", $name, ".png")).as_slice()
+            }
+        };
+    }
+    Some(match mascot {
+        ProviderMascot::OpenAi => pair!("openai"),
+        ProviderMascot::Anthropic => pair!("anthropic"),
+        ProviderMascot::Google => pair!("google"),
+        ProviderMascot::DeepSeek => pair!("deepseek"),
+        ProviderMascot::Glm => pair!("glm"),
+        ProviderMascot::Qwen => pair!("qwen"),
+        ProviderMascot::Grok => pair!("grok"),
+        ProviderMascot::Default => pair!("default"),
+    })
 }
 
 /// The upper-bust window, in cells of the 40 cell bust: x 8..32 and y 4..28. It keeps what makes
@@ -388,9 +405,17 @@ const SCALED_CAP: usize = 256;
 
 impl Artwork {
     pub fn load(workspace: &Path) -> Arc<Self> {
+        Self::load_with_root(workspace, sprite_root(workspace))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_sprite_dir(root: &Path) -> Arc<Self> {
+        Self::load_with_root(root, Some(root.to_path_buf()))
+    }
+
+    fn load_with_root(workspace: &Path, root: Option<PathBuf>) -> Arc<Self> {
         let wake: Waker = Arc::new(|| {});
         let cache = ImageCache::new(wake);
-        let root = sprite_root(workspace);
         let mascot_root = workspace.join("assets/providers/crew");
         let mut mascots = HashMap::new();
         for mascot in ProviderMascot::ALL {
@@ -660,11 +685,22 @@ fn embedded_motion_pngs(captain: usize) -> [&'static [u8]; 4] {
     macro_rules! strips {
         ($name:literal) => {
             [
-                include_bytes!(concat!("../assets/crew/", $name, "/Idle.strip.png")).as_slice(),
-                include_bytes!(concat!("../assets/crew/", $name, "/Working.strip.png")).as_slice(),
-                include_bytes!(concat!("../assets/crew/", $name, "/Attention.strip.png"))
+                include_bytes!(concat!("../assets/crew-pixel/", $name, "/Idle.strip.png"))
                     .as_slice(),
-                include_bytes!(concat!("../assets/crew/", $name, "/Happy.strip.png")).as_slice(),
+                include_bytes!(concat!(
+                    "../assets/crew-pixel/",
+                    $name,
+                    "/Working.strip.png"
+                ))
+                .as_slice(),
+                include_bytes!(concat!(
+                    "../assets/crew-pixel/",
+                    $name,
+                    "/Attention.strip.png"
+                ))
+                .as_slice(),
+                include_bytes!(concat!("../assets/crew-pixel/", $name, "/Happy.strip.png"))
+                    .as_slice(),
             ]
         };
     }
@@ -779,8 +815,9 @@ fn embedded_faces(captain: usize) -> (Set, Set) {
                     Art::new(
                         include_bytes!(concat!("../assets/crew/", $name, "/Dizzy.png")).as_slice(),
                     ),
+                    // Per Wave 3 spec §4.3, Sad reuses Dizzy without duplicating embedded bytes.
                     Art::new(
-                        include_bytes!(concat!("../assets/crew/", $name, "/Sad.png")).as_slice(),
+                        include_bytes!(concat!("../assets/crew/", $name, "/Dizzy.png")).as_slice(),
                     ),
                 ],
                 [
@@ -805,7 +842,7 @@ fn embedded_faces(captain: usize) -> (Set, Set) {
                             .as_slice(),
                     ),
                     Art::new(
-                        include_bytes!(concat!("../assets/crew/", $name, "/Sad.small.png"))
+                        include_bytes!(concat!("../assets/crew/", $name, "/Dizzy.small.png"))
                             .as_slice(),
                     ),
                 ],
@@ -917,15 +954,48 @@ mod tests {
     }
 
     #[test]
+    fn all_embedded_captains_and_provider_mascots_ship_as_illustrated_sets() {
+        let art = Artwork::load(Path::new(""));
+        for captain in 0..PORTRAITS {
+            assert!(
+                !art.is_pixel_art(captain),
+                "captain {captain} should be illustrated"
+            );
+            assert!(
+                art.motion(captain).is_none(),
+                "illustrated captain {captain} should not play pixel strips"
+            );
+            for face in 0..Face::COUNT {
+                let full = art.crew[captain][face].decoded().expect("full face PNG");
+                let small = art.small[captain][face].decoded().expect("small face PNG");
+                assert_eq!((full.width, full.height), (512, 512));
+                assert_eq!((small.width, small.height), (256, 256));
+            }
+        }
+        for mascot in ProviderMascot::ALL {
+            let full = art
+                .mascot_art(mascot, false)
+                .and_then(Art::decoded)
+                .expect("embedded mascot 512");
+            let small = art
+                .mascot_art(mascot, true)
+                .and_then(Art::decoded)
+                .expect("embedded mascot 256");
+            assert_eq!((full.width, full.height), (512, 512));
+            assert_eq!((small.width, small.height), (256, 256));
+            assert!(art.mascot_pixels(mascot, 36.0).is_some());
+            assert!(art.mascot_pixels(mascot, 20.0).is_some());
+        }
+    }
+
+    #[test]
     fn embedded_decodes_are_shared_but_window_scale_and_buffers_are_not() {
         let first = Artwork::load(Path::new(""));
         let second = Artwork::load(Path::new(""));
         assert!(!Arc::ptr_eq(&first, &second));
         for captain in 0..PORTRAITS {
-            assert!(Arc::ptr_eq(
-                first.motion[captain].as_ref().unwrap(),
-                second.motion[captain].as_ref().unwrap()
-            ));
+            assert!(first.motion[captain].is_none());
+            assert!(second.motion[captain].is_none());
             for face in 0..Face::COUNT {
                 assert!(Arc::ptr_eq(
                     &first.crew[captain][face].decoded,
@@ -936,6 +1006,15 @@ mod tests {
                     &second.small[captain][face].decoded
                 ));
             }
+        }
+        let pixel_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel");
+        let pixel_first = Artwork::load_sprite_dir(&pixel_root);
+        let pixel_second = Artwork::load_sprite_dir(&pixel_root);
+        for captain in 0..PORTRAITS {
+            assert!(Arc::ptr_eq(
+                pixel_first.motion[captain].as_ref().unwrap(),
+                pixel_second.motion[captain].as_ref().unwrap()
+            ));
         }
         first.set_scale(2.0);
         first.face_pixels(0, Face::Normal, 40.0);
@@ -1023,7 +1102,9 @@ mod tests {
 
     #[test]
     fn the_upper_bust_lands_on_whole_device_pixels_at_one_and_two_x() {
-        let art = Artwork::load(Path::new(""));
+        let pixel_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel");
+        let art = Artwork::load_sprite_dir(&pixel_root);
+        assert!(art.is_pixel_art(0));
         let decoded = art.crew[0][Face::Normal.index()].decoded().unwrap();
         let (rgba, w, h) = cut_cells(&decoded.rgba, decoded.width, decoded.cell, BUST_WINDOW);
         assert_eq!((w, h), (24 * decoded.cell, 24 * decoded.cell));
@@ -1095,6 +1176,7 @@ mod tests {
         art.face_pixels(0, Face::Normal, 40.0);
         assert_eq!(art.cached(), 1);
         // Many sizes at one scale never pass the cap.
+        art.set_scale(0.25);
         for points in 20..20 + 2 * SCALED_CAP as u32 {
             art.face_pixels(0, Face::Normal, points as f32);
             assert!(art.cached() <= SCALED_CAP, "{points} pt");
@@ -1103,8 +1185,9 @@ mod tests {
 
     #[test]
     fn strip_frames_scale_without_blending_colours() {
-        let art = Artwork::load(Path::new(""));
-        let strip = &art.motion(0).expect("embedded strips")[Clip::Idle.index()];
+        let pixel_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel");
+        let art = Artwork::load_sprite_dir(&pixel_root);
+        let strip = &art.motion(0).expect("pixel fallback strips")[Clip::Idle.index()];
         assert_eq!(strip.cell, 6, "the strips ship at six pixels a cell");
         let whole = strip.scaled(0, 80);
         let source: std::collections::HashSet<[u8; 4]> = strip.frames[0]
