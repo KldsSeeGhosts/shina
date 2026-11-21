@@ -33,6 +33,34 @@ glyph!(
 );
 glyph!(CHEVRON_LEFT, r#"<path d="m15 18-6-6 6-6"/>"#);
 glyph!(CHEVRON_RIGHT, r#"<path d="m9 18 6-6-6-6"/>"#);
+glyph!(
+    AGENTS,
+    r#"<path d="M12 8V4H8"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2m16 0h2m-13-1v2m6-2v2"/>"#
+);
+glyph!(
+    ARROW_UP_CIRCLE,
+    r#"<circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4m4-4v8"/>"#
+);
+glyph!(
+    LOCK_OPEN,
+    r#"<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>"#
+);
+glyph!(
+    CORNER_DOWN_LEFT,
+    r#"<path d="m9 10-5 5 5 5m11-16v7a4 4 0 0 1-4 4H4"/>"#
+);
+glyph!(
+    EXTERNAL_LINK,
+    r#"<path d="M15 3h6v6m0-6-9 9m6 1v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#
+);
+glyph!(
+    PULL_REQUEST,
+    r#"<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 9v6m12 0V9a3 3 0 0 0-3-3h-2m2-3-3 3 3 3"/>"#
+);
+glyph!(
+    REFRESH,
+    r#"<path d="M20 7v5h-5M4 17v-5h5m-5 0a8 8 0 0 1 13.7-5.7L20 9m0 3a8 8 0 0 1-13.7 5.7L4 15"/>"#
+);
 glyph!(CHEVRON_DOWN, r#"<path d="m6 9 6 6 6-6"/>"#);
 glyph!(CHEVRON_UP, r#"<path d="m18 15-6-6-6 6"/>"#);
 glyph!(
@@ -300,6 +328,13 @@ pub(super) const NAMES: &[&str] = &[
     "trash",
     "calendar",
     "clock",
+    "agents",
+    "arrow-up-circle",
+    "lock-open",
+    "corner-down-left",
+    "external-link",
+    "pull-request",
+    "refresh",
     "more",
     "list",
     "branch",
@@ -377,6 +412,13 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "trash" => &TRASH,
         "calendar" => &CALENDAR,
         "clock" => &CLOCK,
+        "agents" | "bot" => &AGENTS,
+        "arrow-up-circle" => &ARROW_UP_CIRCLE,
+        "lock-open" => &LOCK_OPEN,
+        "corner-down-left" => &CORNER_DOWN_LEFT,
+        "external-link" => &EXTERNAL_LINK,
+        "pull-request" => &PULL_REQUEST,
+        "refresh" => &REFRESH,
         "more" => &MORE,
         "list" => &LIST,
         "branch" => &BRANCH,

@@ -240,17 +240,22 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
         .pb(12.0)
         .gap(12.0)
         .center_y()
-        .child(avatar(
-            s,
-            p,
-            captain,
-            40.0,
-            if record {
-                crate::model::Status::Ready
-            } else {
-                shown_status(s)
-            },
-        ))
+        .child(
+            el().size(48.0, 48.0)
+                .center()
+                .child(captain_wash(s.dark, profile.portrait, 72.0, 64.0).absolute(-12.0, -8.0))
+                .child(avatar(
+                    s,
+                    p,
+                    captain,
+                    48.0,
+                    if record {
+                        crate::model::Status::Ready
+                    } else {
+                        shown_status(s)
+                    },
+                )),
+        )
         .child(
             col()
                 .grow(1.0)
@@ -1773,6 +1778,7 @@ mod tests {
             // The reset selects a fresh home, so open the Inspector on Context for it.
             open_tab(&mut rt, crate::right_panel::SingletonKind::Context);
             rt.frame(0.5);
+            reveal_in(&mut rt, "context-tab", "context-earlier-toggle");
             press(&mut rt, "context-earlier-toggle");
             rt.frame(0.5);
             reveal_in(&mut rt, "context-tab", &format!("earlier-{old}"));

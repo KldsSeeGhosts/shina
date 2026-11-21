@@ -504,6 +504,7 @@ pub(super) fn measurement_probes(s: &State, model: &ComposerModelDisplay, p: Pal
         .child(row().child(access_trigger(
             "measure-access",
             s.current().native.access.label(),
+            pi_ui::access_glyph(s.current().native.access),
             p,
         )))
         .child(row().child(machine_selector(s, p, true).key("measure-machine-icon")))
@@ -734,6 +735,7 @@ pub(super) fn changed(s: &mut State) {
     t.typing_guard.on_type(std::time::Instant::now());
     t.update_submission_error();
     s.ensure_composer_commands();
+    s.mark_device_ui_dirty();
 }
 
 pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx) {
@@ -1017,17 +1019,20 @@ pub(super) fn controls(
         }
     }
     if visible > 2 {
+        let glyph = pi_ui::access_glyph(display_access);
         let mut access_control = if resting || icon_only(2) {
-            icon_button("access-mode", display_access.label(), "shield", p, |s| {
+            icon_button("access-mode", display_access.label(), glyph, p, |s| {
                 s.begin_composer_menu();
                 s.open_access_picker();
             })
             .size(28.0, 24.0)
         } else {
-            access_trigger("access-mode", display_access.label(), p).on_press(|s: &mut State| {
-                s.begin_composer_menu();
-                s.open_access_picker();
-            })
+            access_trigger("access-mode", display_access.label(), glyph, p).on_press(
+                |s: &mut State| {
+                    s.begin_composer_menu();
+                    s.open_access_picker();
+                },
+            )
         };
         access_control = access_control
             .preserve_focus_on_press(true)
@@ -1101,7 +1106,7 @@ pub(super) fn strip_fixed(s: &State, display: &ComposerModelDisplay, width: f32)
 }
 
 /// KSG's access mode control in the context strip: a shield and the mode, muted.
-fn access_trigger(key: &str, title: &str, p: Palette) -> El {
+fn access_trigger(key: &str, title: &str, glyph: &str, p: Palette) -> El {
     row()
         .key(key)
         .role("button")
@@ -1115,7 +1120,7 @@ fn access_trigger(key: &str, title: &str, p: Palette) -> El {
         .radius(6.0)
         .hover(p.selected)
         .press(p.selected)
-        .child(icon("shield", p.muted).size(14.0, 14.0))
+        .child(icon(glyph, p.muted).size(14.0, 14.0))
         .child(label(title, SMALL, p.muted).truncate().shrink())
 }
 

@@ -373,7 +373,7 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
         .press(active_wash(s, p))
         .hover_motion(motion(), motion())
         .on_press(move |s: &mut State| open_thread(s, child))
-        .child(mark_slot(status, p))
+        .child(crewmate_avatar(s, p, &task.model_label, status, 20.0))
         .child(
             label(
                 &task.title,
@@ -406,20 +406,13 @@ pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
             &placement_machine(s, child, placement),
         ));
     }
-    row_ = row_
-        .child(provider_icon(
-            s,
-            p,
-            model_vendor(&task.model_label, &task.model_label),
-            12.0,
-        ))
-        .child(
-            label(meta, SMALL, tertiary)
-                .key(format!("task-meta-{child}"))
-                .truncate()
-                .grow(1.0)
-                .min_w(0.0),
-        );
+    row_ = row_.child(
+        label(meta, SMALL, tertiary)
+            .key(format!("task-meta-{child}"))
+            .truncate()
+            .grow(1.0)
+            .min_w(0.0),
+    );
     if task.state == TaskState::Interrupted {
         // Resume and Dismiss replace the clock on an interrupted row.
         let (resume, dismiss) = (task.id.clone(), task.id.clone());
@@ -804,6 +797,7 @@ pub(super) fn brief_block(
 pub(super) struct RosterMember {
     pub(super) thread_id: usize,
     pub(super) title: String,
+    pub(super) model: String,
     pub(super) status: Status,
     pub(super) word: String,
     pub(super) clock: String,
@@ -888,6 +882,10 @@ pub(super) fn roster_members(s: &State, home: usize, captain: usize) -> Vec<Rost
                     title.to_string()
                 }
             }),
+            model: task
+                .map(|task| task.model_label.clone())
+                .or_else(|| thread.map(|thread| thread.model.clone()))
+                .unwrap_or_default(),
             status,
             word,
             clock,
@@ -945,6 +943,7 @@ pub(super) fn peer_sibling_members(
                 } else {
                     thread.title.clone()
                 },
+                model: thread.model.clone(),
                 status,
                 clock: word.clone(),
                 word,
@@ -962,7 +961,7 @@ pub(super) fn peer_sibling_members(
     members
 }
 
-/// A 30 px roster row: status mark, title, machine tag when remote, clock or status word.
+/// KSG's `ProviderSubagentBar` identity and context on two lines.
 /// Click opens the worker; a secondary press opens the member's More menu. `key` keeps the
 /// roster's `crew-chip-{id}` keys and lets the siblings menu reuse the builder with its own.
 pub(super) fn roster_row(
@@ -992,7 +991,7 @@ pub(super) fn roster_row(
         .focusable(true)
         .center_y()
         .gap(7.0)
-        .h(30.0)
+        .h(52.0)
         .pl(8.0)
         .pr(6.0)
         .radius(ROW_RADIUS)
@@ -1026,12 +1025,25 @@ pub(super) fn roster_row(
             }
             open_thread(s, child);
         })
-        .child(mark_slot(member.status, p))
+        .child(crewmate_avatar(s, p, &member.model, member.status, 32.0))
         .child(
-            label(&member.title, TextStyle::new(13.0, 500.0), p.ink)
-                .truncate()
+            col()
                 .grow(1.0)
-                .min_w(0.0),
+                .min_w(0.0)
+                .gap(1.0)
+                .child(label(&member.title, TITLE, p.ink).truncate())
+                .child(
+                    label(
+                        if member.model.is_empty() {
+                            member.word.clone()
+                        } else {
+                            format!("{} · {}", member.word, member.model)
+                        },
+                        SMALL,
+                        p.muted,
+                    )
+                    .truncate(),
+                ),
         )
         .child(
             member

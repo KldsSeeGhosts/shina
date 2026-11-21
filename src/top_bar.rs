@@ -63,7 +63,26 @@ pub(super) fn bar(s: &State, p: Palette, narrow: bool, compact: bool, tabs_width
     };
     // `chat-status` sits right after the title at intrinsic width. Ready draws
     // nothing, so there is no empty slot holding space.
-    if !s.demo && !(text.is_none() && matches!(t.status, Status::Ready | Status::Completed)) {
+    let active = crate::agents::active_count(t);
+    if !s.demo && active > 0 {
+        let words = text.as_deref().unwrap_or("Working");
+        bar = bar.child(
+            row()
+                .key("chat-status")
+                .center_y()
+                .gap(5.0)
+                .role("button")
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .label(format!("{words}, {active} agents working"))
+                .radius(6.0)
+                .hover(p.selected)
+                .on_press(agents_ui::open)
+                .child(label(words, TIMER, p.sea).truncate())
+                .child(agents_ui::chip("chat-status-agents", active, p)),
+        );
+    } else if !s.demo && !(text.is_none() && matches!(t.status, Status::Ready | Status::Completed))
+    {
         bar = bar.child(status_slot("chat-status", t.status, text, p));
     }
     bar = bar
@@ -80,6 +99,7 @@ fn thread_title(s: &State, p: Palette, _narrow: bool, compact: bool) -> El {
     let t = s.current();
     let mut first: Option<El> = None;
     let mut first_label = String::new();
+    let mut collapsed = None;
     // A crew worker's first segment opens its captain's home, as the spec moves
     // `open-captain` out of the parent bar. A plain child keeps
     // `breadcrumb-parent` for its parent thread.
@@ -143,6 +163,19 @@ fn thread_title(s: &State, p: Palette, _narrow: bool, compact: bool) -> El {
             && let Some(profile) = s.captains.get(captain)
         {
             first_label = profile.name.clone();
+            let role = if profile.role.trim().is_empty() {
+                crate::visuals::CAPTAIN_ROLES[profile
+                    .portrait
+                    .min(crate::visuals::CAPTAIN_ROLES.len() - 1)]
+            } else {
+                profile.role.as_str()
+            };
+            let same_name = !t.renamed
+                || t.title.trim().is_empty()
+                || t.title.trim().eq_ignore_ascii_case(profile.name.trim());
+            if same_name {
+                collapsed = Some(role);
+            }
             first = Some(
                 row()
                     .key("thread-title-captain")
@@ -150,12 +183,20 @@ fn thread_title(s: &State, p: Palette, _narrow: bool, compact: bool) -> El {
                     .gap(6.0)
                     .shrink()
                     .min_w(0.0)
-                    .child(avatar(s, p, captain, 16.0, s.captain_status(captain)).a11y_hidden())
+                    .child(avatar(s, p, captain, 20.0, s.captain_status(captain)).a11y_hidden())
                     .child(
-                        label(&profile.name, ROW_QUIET, p.muted)
-                            .key("thread-title-project")
-                            .truncate()
-                            .max_w(160.0),
+                        label(
+                            &profile.name,
+                            if same_name { TITLE } else { ROW_QUIET },
+                            if same_name { p.ink } else { p.muted },
+                        )
+                        .key(if same_name {
+                            "thread-title-text"
+                        } else {
+                            "thread-title-project"
+                        })
+                        .truncate()
+                        .max_w(160.0),
                     ),
             );
         }
@@ -184,7 +225,9 @@ fn thread_title(s: &State, p: Palette, _narrow: bool, compact: bool) -> El {
         .role("button")
         .cursor(rune::Cursor::Pointer)
         .label({
-            let whole = if first_label.is_empty() {
+            let whole = if let Some(role) = collapsed {
+                format!("{first_label}, {role} captain")
+            } else if first_label.is_empty() {
                 t.title.clone()
             } else {
                 format!("{first_label} / {}", t.title)
@@ -229,19 +272,26 @@ fn thread_title(s: &State, p: Palette, _narrow: bool, compact: bool) -> El {
         title = title.child(tab_icon(s, p, t).a11y_hidden());
     }
     if let Some(first) = first {
-        title = title.child(first).child(
-            icon("chevron-right", p.faint)
-                .size(12.0, 12.0)
-                .a11y_hidden(),
+        title = title.child(first);
+        if collapsed.is_none() {
+            title = title.child(
+                icon("chevron-right", p.faint)
+                    .size(12.0, 12.0)
+                    .a11y_hidden(),
+            );
+        }
+    }
+    if let Some(role) = collapsed {
+        title = title.child(label(role, SMALL, p.faint).truncate());
+    } else {
+        title = title.child(
+            label(&t.title, TITLE, p.ink)
+                .key("thread-title-text")
+                .truncate()
+                .grow(1.0)
+                .min_w(0.0),
         );
     }
-    title = title.child(
-        label(&t.title, TITLE, p.ink)
-            .key("thread-title-text")
-            .truncate()
-            .grow(1.0)
-            .min_w(0.0),
-    );
     if let Some(machine) = machine {
         let _ = machine;
         title = title.child(machine_tag(
@@ -375,11 +425,12 @@ fn actions(
         p,
         |s: &mut State| s.right_panel_toggle(),
     );
-    if !panel_open && crew_ui::needs_you_shows(s) {
+    let needs_you = crew_ui::needs_you_shows(s);
+    if !panel_open && (needs_you || crate::agents::active_count(s.current()) > 0) {
         panel = panel.child(
             el().size(6.0, 6.0)
                 .radius(3.0)
-                .fill(p.brass)
+                .fill(if needs_you { p.brass } else { p.sea })
                 .a11y_hidden()
                 .pin(None, Some(2.0), Some(2.0), None),
         );

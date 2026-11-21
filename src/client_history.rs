@@ -10,7 +10,7 @@ fn next_revision() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static REVISION: AtomicU64 = AtomicU64::new(0);
     REVISION
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .expect("Transcript revision exhausted")

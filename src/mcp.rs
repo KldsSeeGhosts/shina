@@ -992,12 +992,32 @@ fn respond(
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
     stream.write_all(text.as_bytes())?;
-    stream.flush()
+    stream.flush()?;
+    // Closing a local handle does not send FIN while a duplicate is still open.
+    // Each request gets one response, regardless of how Windows closes its handles.
+    stream.shutdown(std::net::Shutdown::Write)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_finishes_even_while_a_socket_handle_is_still_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let duplicate = server.try_clone().unwrap();
+        respond(&mut server, 200, None, &json!({"ok":true})).unwrap();
+        drop(server);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.ends_with("\r\n\r\n{\"ok\":true}"));
+        drop(duplicate);
+    }
 
     #[test]
     fn the_shina_tool_allowlist_accepts_exact_advertised_names_only() {

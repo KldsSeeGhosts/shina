@@ -325,17 +325,14 @@ pub(crate) fn configure_git_command(cmd: &mut Command, cwd: &Path, ctx: &GitCont
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LANGUAGE", "C");
-    // Suppress any configured credential helper without altering git's argv.
-    let existing_count = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-    cmd.env("GIT_CONFIG_COUNT", (existing_count + 1).to_string())
-        .env(
-            format!("GIT_CONFIG_KEY_{existing_count}"),
-            "credential.helper",
-        )
-        .env(format!("GIT_CONFIG_VALUE_{existing_count}"), "");
+    git_config_overrides(
+        cmd,
+        &[
+            ("credential.helper", ""),
+            #[cfg(windows)]
+            ("core.longpaths", "true"),
+        ],
+    );
     if let Some(path) = &ctx.git_config_global {
         cmd.env("GIT_CONFIG_GLOBAL", path);
     }
@@ -346,6 +343,19 @@ pub(crate) fn configure_git_command(cmd: &mut Command, cwd: &Path, ctx: &GitCont
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
+    }
+}
+
+/// Add Git options for this subprocess only, preserving inherited overrides.
+pub(crate) fn git_config_overrides(cmd: &mut Command, entries: &[(&str, &str)]) {
+    let offset = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    cmd.env("GIT_CONFIG_COUNT", (offset + entries.len()).to_string());
+    for (index, (key, value)) in (offset..).zip(entries) {
+        cmd.env(format!("GIT_CONFIG_KEY_{index}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{index}"), value);
     }
 }
 

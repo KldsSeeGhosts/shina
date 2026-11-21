@@ -391,9 +391,132 @@ impl PiSession {
 }
 
 impl Tool {
+    pub(super) fn seed_subagents(&mut self) {
+        if self.name != "subagent" || !self.subagents.is_empty() {
+            return;
+        }
+        if let Some(tasks) = self.input["tasks"].as_array() {
+            self.subagents = tasks
+                .iter()
+                .take(32)
+                .filter_map(|task| {
+                    Some(
+                        json!({"name":truncate(task["agent"].as_str()?,120), "task":truncate(task["task"].as_str()?,2000),
+                    "model":task["model"], "providerId":task["providerId"],"keyByIndex":task["providerId"].is_null(),"status":"Queued"}),
+                    )
+                })
+                .collect();
+        } else if let (Some(agent), Some(task)) =
+            (self.input["agent"].as_str(), self.input["task"].as_str())
+        {
+            self.subagents.push(
+                json!({"name":truncate(agent,120),"task":truncate(task,2000),"model":self.input["model"],
+                    "providerId":self.input["providerId"],"keyByIndex":self.input["providerId"].is_null(),"status":"Working"}),
+            );
+        } else if let Some(task) = self.input["prompt"].as_str()
+            && self.input["type"].is_null()
+        {
+            // Claude normalizes Task/Agent to subagent but keeps the native input.
+            self.subagents.push(
+                json!({"name":self.input["subagent_type"].as_str().unwrap_or("Claude"),
+                "task":truncate(task,2000),"status":"Working","keyByIndex":true}),
+            );
+        }
+    }
+
+    pub(super) fn accept_subagents(&mut self, results: &Value) {
+        let mut used = [false; 32];
+        for agent in results.as_array().into_iter().flatten().take(32) {
+            let provider_id = agent["providerId"]
+                .as_str()
+                .or_else(|| agent["agentId"].as_str());
+            let name = agent["agent"].as_str();
+            let task = agent["task"].as_str();
+            let position = provider_id
+                .and_then(|id| {
+                    self.subagents
+                        .iter()
+                        .take(32)
+                        .enumerate()
+                        .position(|(i, current)| !used[i] && current["providerId"] == id)
+                })
+                .or_else(|| {
+                    self.subagents
+                        .iter()
+                        .take(32)
+                        .enumerate()
+                        .position(|(i, current)| {
+                            !used[i]
+                                && current["providerId"].is_null()
+                                && name.is_some_and(|name| current["name"] == truncate(name, 120))
+                                && task.is_some_and(|task| current["task"] == truncate(task, 2000))
+                        })
+                });
+            let current = position.and_then(|i| self.subagents.get(i));
+            let Some(name) = name
+                .or_else(|| current.and_then(|c| c["name"].as_str()))
+                .or(provider_id)
+            else {
+                continue;
+            };
+            let task = task
+                .or_else(|| current.and_then(|c| c["task"].as_str()))
+                .unwrap_or("");
+            let finished = agent["finished"].as_bool().unwrap_or(self.done);
+            let status = if !finished {
+                if agent["queued"] == true {
+                    "Queued"
+                } else {
+                    "Working"
+                }
+            } else if agent["stopReason"] == "aborted" {
+                "Stopped"
+            } else if agent["exitCode"].as_i64().unwrap_or(0) != 0 || agent["stopReason"] == "error"
+            {
+                "Failed"
+            } else {
+                "Done"
+            };
+            let text = if matches!(status, "Failed" | "Stopped") {
+                agent["errorMessage"]
+                    .as_str()
+                    .or_else(|| agent["stderr"].as_str())
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+            .or_else(|| {
+                agent["messages"]
+                    .as_array()?
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "assistant")
+                    .map(|m| content_text(&m["content"]))
+            });
+            let next = json!({"name":truncate(name,120),"task":truncate(task,2000),
+                "providerId":provider_id.or_else(|| current.and_then(|c| c["providerId"].as_str())),
+                "keyByIndex":current.map_or(provider_id.is_none(), |prior| prior["keyByIndex"] == true),
+                "model":agent["model"].as_str().or_else(|| current.and_then(|c| c["model"].as_str())).map(|m| truncate(m,120)),
+                "activity":agent["activity"].as_str().or_else(|| current.and_then(|c| c["activity"].as_str())).map(|text| truncate(text,500)),
+                "durationMs":agent["durationMs"].as_u64().or_else(|| current.and_then(|c| c["durationMs"].as_u64())),
+                "status":status,"output":truncate(text.as_deref().or_else(|| current.and_then(|c| c["output"].as_str())).unwrap_or(""),10000)});
+            if let Some(position) = position {
+                self.subagents[position] = next;
+                used[position] = true;
+            } else if self.subagents.len() < used.len() {
+                used[self.subagents.len()] = true;
+                self.subagents.push(next);
+            }
+        }
+    }
+
     pub(super) fn accept_result(&mut self, result: &Value) {
         self.output = truncate(&content_text(&result["content"]), 50_000);
         self.images = content_images(&result["content"]);
+        let count = result["details"]["agentCount"]
+            .as_u64()
+            .or_else(|| result["details"]["count"].as_u64())
+            .or_else(|| self.structured["agentCount"].as_u64());
         let data = json!({"structuredContent":result["structuredContent"],"details":result["details"],"nestedCalls":result["nestedCalls"]});
         self.structured = if data.to_string().len() <= 256 * 1024 {
             data
@@ -401,17 +524,10 @@ impl Tool {
             json!({"notice":"Structured output exceeds the 256 KiB display limit. The full result remains in Pi's session."})
         };
         if self.name == "subagent" {
-            self.subagents = result["details"]["results"].as_array().into_iter().flatten().take(32).filter_map(|agent| {
-                let name = agent["agent"].as_str()?;
-                let task = agent["task"].as_str()?;
-                let finished = agent["finished"].as_bool().unwrap_or(self.done);
-                let status = if !finished { "Working" } else if agent["stopReason"] == "aborted" { "Stopped" }
-                    else if agent["exitCode"].as_i64().unwrap_or(0) != 0 || agent["stopReason"] == "error" { "Failed" } else { "Done" };
-                let text = if status == "Failed" || status == "Stopped" {
-                    agent["errorMessage"].as_str().or_else(||agent["stderr"].as_str()).map(str::to_owned)
-                } else { None }.or_else(|| agent["messages"].as_array()?.iter().rev().find(|m|m["role"]=="assistant").map(|m|content_text(&m["content"]))).unwrap_or_default();
-                Some(json!({"name":truncate(name,120),"task":truncate(task,2000),"model":agent["model"].as_str().map(|m|truncate(m,120)),"status":status,"output":truncate(&text,10000)}))
-            }).collect();
+            self.accept_subagents(&result["details"]["results"]);
+            if let Some(count) = count {
+                self.structured["agentCount"] = json!(count);
+            }
         }
         self.exit_code = result["structuredContent"]["exit_code"]
             .as_i64()
@@ -2319,14 +2435,14 @@ impl State {
     }
 
     pub fn conversation_points(&mut self, mode: ConversationMode) {
+        if self.rewind_blocker(self.current()).is_some() {
+            return;
+        }
         if self.forward(
             "thread.forkPoints",
             json!({"threadId":self.current().id,"rewind":mode == ConversationMode::Rewind}),
         ) {
             self.current_mut().native.conversation = Some(mode);
-            return;
-        }
-        if self.demo || self.current().archived() {
             return;
         }
         self.current_mut().request_fork_points(mode);
@@ -2337,22 +2453,18 @@ impl State {
 
     /// Fork in a separate process, as KSG does, so the source session and its owner never move.
     pub fn fork_conversation(&mut self, entry: Option<String>) {
+        let blocker = if entry.is_some() {
+            self.rewind_blocker(self.current())
+        } else {
+            self.conversation_blocker(self.current())
+        };
+        if blocker.is_some() {
+            return;
+        }
         if self.forward(
             "thread.fork",
             json!({"threadId":self.current().id,"entry":entry}),
         ) {
-            return;
-        }
-        if !self.current().can_change_conversation() {
-            self.current_mut().error =
-                Some("This harness has no verified conversation fork protocol.".into());
-            return;
-        }
-        if self.demo
-            || self.current().archived()
-            || self.current().status.busy()
-            || self.current().configuring
-        {
             return;
         }
         let source = self.current();

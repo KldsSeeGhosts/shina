@@ -1969,14 +1969,8 @@ impl Client {
         if self.tools.insert(id.into(), tool.clone()).is_none() && emit {
             self.events.push(json!({"type":"tool_execution_start","toolCallId":id,
                 "toolName":tool["name"],"args":tool["arguments"],"parentToolCallId":tool["parentToolCallId"]}));
-            if tool["name"] == "subagent" {
-                self.events
-                    .push(json!({"type":"tool_execution_update","toolCallId":id,
-                    "partialResult":{"content":[],"details":{"results":[{
-                        "agent":args["subagent_type"].as_str().unwrap_or("Claude"),
-                        "task":args["prompt"].as_str().unwrap_or(""),"finished":false,"messages":[]
-                    }]}}}));
-            }
+            // Task/Agent arguments seed the model on start. The same parent ID
+            // on nested calls keeps their activity attached to that Task.
         }
         if name == "TodoWrite" {
             let plan: Vec<_> = args["todos"].as_array().into_iter().flatten().map(|todo| json!({

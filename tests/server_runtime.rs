@@ -1195,7 +1195,7 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
         let checkout = PathBuf::from(placement["checkout"].as_str().unwrap());
         assert_ne!(checkout, repository);
         assert_eq!(
-            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            read_checkout_text(checkout.join("README.md")),
             "committed base\n"
         );
         assert!(!checkout.join("parent-only.txt").exists());
@@ -1278,7 +1278,7 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
         placement["checkout"]
     );
     assert_eq!(
-        fs::read_to_string(picked.join("README.md")).unwrap(),
+        read_checkout_text(picked.join("README.md")),
         "committed base\n"
     );
     assert!(!picked.join("parent-only.txt").exists());
@@ -1374,7 +1374,7 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
         upstream_head
     );
     assert_eq!(
-        fs::read_to_string(PathBuf::from(dependent_checkout).join("upstream-result.txt")).unwrap(),
+        read_checkout_text(PathBuf::from(dependent_checkout).join("upstream-result.txt")),
         "upstream-only result\n"
     );
     owner.until(|state| {
@@ -1399,6 +1399,11 @@ fn delegated_peer_writers_use_distinct_git_worktrees_over_the_live_transport() {
     drop(executor);
     home.stop();
     target.stop();
+}
+
+// Git may check out ordinary text files with CRLF under the host's configuration.
+fn read_checkout_text(path: impl AsRef<std::path::Path>) -> String {
+    fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
 #[cfg(unix)]
@@ -5673,13 +5678,9 @@ fn offline_cancel_stays_uncertain_until_target_settlement_and_never_stops_newer_
         &target_discovery,
     );
     let child = delegated["result"]["result"]["thread_id"].clone();
-    client.until(|state| {
-        state["index"]["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["state"] == "running")
-    });
+    // The controller can mark a task running before the first provider input.
+    // This scenario cancels a live writer, not a not-yet-dispatched assignment.
+    client.until(|state| state["index"]["tasks"][0]["remote"]["execution"]["phase"] == "running");
     let attempt_a = client.snapshot["index"]["tasks"][0]["attempt_id"].clone();
     fs::remove_file(&gate).unwrap();
     let cancel_args = json!({"thread_id":child,"client_request_id":"offline-cancel",

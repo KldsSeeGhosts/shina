@@ -758,28 +758,32 @@ pub trait Transport: Send + Sync {
 
 /// The only production transport: fixed Expo endpoints, no proxies, no
 /// redirects, short timeouts and a bounded response read.
-struct ExpoTransport {
-    client: reqwest::blocking::Client,
-}
+struct ExpoTransport;
 
 impl ExpoTransport {
-    fn new() -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
-        Self { client }
+    fn client() -> Result<&'static reqwest::blocking::Client, PostError> {
+        // Only the blocking cycle calls post. A blocking client cannot be
+        // constructed on Tokio's async workers, and idle profiles need no client.
+        static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, reqwest::Error>> =
+            std::sync::OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(15))
+                    .build()
+            })
+            .as_ref()
+            .map_err(|_| PostError::Transient("transport"))
     }
 }
 
 impl Transport for ExpoTransport {
     fn post(&self, url: &str, body: &Value) -> Result<Value, PostError> {
         use std::io::Read;
-        let response = self
-            .client
+        let response = Self::client()?
             .post(url)
             .json(body)
             .send()
@@ -972,13 +976,7 @@ pub async fn run(
     if uuid::Uuid::parse_str(&server_id).is_err() {
         return;
     }
-    run_with(
-        database,
-        server_id,
-        Arc::new(ExpoTransport::new()),
-        shutdown,
-    )
-    .await;
+    run_with(database, server_id, Arc::new(ExpoTransport), shutdown).await;
 }
 
 pub(crate) async fn run_with(

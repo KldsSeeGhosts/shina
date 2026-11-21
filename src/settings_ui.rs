@@ -2693,12 +2693,23 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
             );
         }
         5 => {
+            let summary = s.update_summary();
+            if matches(s, "Updates") || matches(s, &summary.headline) {
+                pane = pane.child(
+                    updates_ui::content(s, p, &summary, true)
+                        .key("settings-update-status")
+                        .padding(12.0)
+                        .radius(12.0)
+                        .fill(p.card)
+                        .border(1.0, p.frame),
+                );
+            }
             if matches(s, "Current version") {
                 pane = pane.child(info(
                     "settings-version",
                     "Current version",
                     "This desktop build.",
-                    env!("CARGO_PKG_VERSION"),
+                    summary.version,
                     p,
                 ));
             }
@@ -2707,28 +2718,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                     "settings-last-check",
                     "Last check",
                     "Release checks use the host's existing gh login.",
-                    s.updater.last_check_label(),
-                    p,
-                ));
-            }
-            if let Some((tag, reason)) = s.updater.failed_release_detail() {
-                pane = add(
-                    pane,
-                    s,
-                    "settings-failed-release",
-                    "Failed release",
-                    &format!("{tag}: {reason}"),
-                    settings_button("settings-retry-update", "Retry", p, |s| {
-                        s.settings.notice = s.updater.retry_failed_release().err();
-                    }),
-                    p,
-                );
-            } else if matches(s, "Failed release") {
-                pane = pane.child(info(
-                    "settings-failed-release",
-                    "Failed release",
-                    "No release is blocked after a failed update.",
-                    "None",
+                    &summary.last_check,
                     p,
                 ));
             }
@@ -2738,12 +2728,15 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 "settings-check-now",
                 "Check now",
                 "Check the latest release without installing it.",
-                settings_button("settings-update-check", "Check now", p, |s| {
-                    s.updater.retry()
-                })
+                settings_button(
+                    "settings-update-check",
+                    "Check now",
+                    p,
+                    State::check_for_updates,
+                )
                 .disabled(matches!(
-                    s.updater.status(),
-                    crate::update::Status::Disabled
+                    summary.phase,
+                    crate::update_status::UpdatePhase::Disabled
                 )),
                 p,
             );
@@ -2772,7 +2765,7 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                 s,
                 "settings-licences",
                 "Licences",
-                "Shina: MIT. Lucide: ISC. Inter: SIL OFL. Source Serif 4: SIL OFL.",
+                "Shina: MIT. Lucide: ISC. Inter: SIL OFL.",
                 settings_button("settings-show-licences", "View licences", p, |s| {
                     s.settings.licences = !s.settings.licences
                 }),
@@ -2783,10 +2776,6 @@ fn section_content(s: &State, p: Palette, section: usize) -> (El, bool) {
                     ("Shina", include_str!("../LICENSE")),
                     ("Lucide", include_str!("../assets/icons-LICENSE.txt")),
                     ("Inter", include_str!("../assets/fonts/Inter-LICENSE.txt")),
-                    (
-                        "Source Serif 4",
-                        include_str!("../assets/fonts/SourceSerif4-LICENSE.txt"),
-                    ),
                 ] {
                     pane = pane
                         .child(meta_label(name, p.muted).pt(12.0))

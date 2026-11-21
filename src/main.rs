@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod acp;
+mod agents;
 mod antigravity;
 mod approval;
 mod assistant_citation;
@@ -94,6 +95,7 @@ mod timeline_position;
 mod tray;
 mod ui;
 mod update;
+mod update_status;
 mod usage_limits;
 mod vcs;
 mod visuals;
@@ -284,6 +286,12 @@ fn dispatch_global_command(
                     (i + 1) % order.len()
                 };
                 let (server, id) = &order[next];
+                if let Some(tx) = tx {
+                    tx.scroll_into_view_in(
+                        "sidebar-scroll",
+                        ui::sidebar_target_key(state, server, *id),
+                    );
+                }
                 if state.client.is_some() {
                     state.open_machine_thread(server, *id);
                 } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id)

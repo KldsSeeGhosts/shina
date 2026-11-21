@@ -2736,7 +2736,10 @@ mod tests {
             },
         )
         .unwrap();
-        runtime.updates.poll(&directory);
+        runtime.updates.poll_at(
+            &directory,
+            std::time::Instant::now() + crate::fleet_update::PROBE_INTERVAL,
+        );
         assert_eq!(runtime.updates.phase, "idle");
         assert_eq!(runtime.updates.id.as_deref(), Some(new_id.as_str()));
         assert!(runtime.updates.outcome.as_ref().unwrap().success);

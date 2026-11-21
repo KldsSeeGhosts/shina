@@ -15,15 +15,15 @@ use super::*;
 /// all four; a plain thread has no Crew tab.
 pub(super) fn tabs(s: &State) -> Vec<crate::right_panel::PanelView> {
     use crate::right_panel::PanelView;
-    if s.inspector_has_crew_tab() {
-        return vec![
-            PanelView::Overview,
-            PanelView::Crew,
-            PanelView::Context,
-            PanelView::Diff,
-        ];
+    let mut views = vec![PanelView::Overview];
+    if s.inspector_has_agents_tab() {
+        views.push(PanelView::Agents);
     }
-    vec![PanelView::Overview, PanelView::Context, PanelView::Diff]
+    if s.inspector_has_crew_tab() {
+        views.push(PanelView::Crew);
+    }
+    views.extend([PanelView::Context, PanelView::Diff]);
+    views
 }
 
 /// The tab the shell actually draws: a stored view the thread does not have
@@ -41,12 +41,15 @@ fn segment(
     title: &str,
     badge: Option<String>,
     on: bool,
+    glyph_only: bool,
     action: impl Fn(&mut State) + 'static,
 ) -> El {
     let mut content = row()
         .key(key.to_string())
         .role("tab")
         .label(title.to_string())
+        .help(title.to_string())
+        .focus_selected(on)
         .focusable(true)
         .cursor(rune::Cursor::Pointer)
         .h(24.0)
@@ -59,8 +62,9 @@ fn segment(
         .hover(p.selected)
         .press(p.selected)
         .on_press(action)
-        .child(icon(glyph, if on { p.ink } else { p.muted }).size(12.0, 12.0))
-        .child(
+        .child(icon(glyph, if on { p.ink } else { p.muted }).size(12.0, 12.0));
+    if !glyph_only {
+        content = content.child(
             label(
                 title.to_string(),
                 TextStyle::new(12.0, 500.0),
@@ -68,8 +72,13 @@ fn segment(
             )
             .truncate(),
         );
+    }
     if let Some(badge) = badge {
-        content = content.child(label(badge, TIMER, p.faint));
+        content = content.child(label(
+            badge,
+            TIMER,
+            if glyph == "agents" { p.sea } else { p.faint },
+        ));
     }
     content
 }
@@ -101,22 +110,31 @@ fn crew_working_count(s: &State) -> Option<String> {
 /// The strip atop the panel: the four-segment control, then the maximize and
 /// close controls. Fixed at 36 pt, since nothing else in the pane shares its
 /// line now.
-fn strip(s: &State, p: Palette) -> El {
+fn strip(s: &State, p: Palette, width: f32) -> El {
     let panel = s.right_panel();
     let view = resolved_view(s);
     let mut segments = row()
         .key("right-panel-tabs")
+        .role("tablist")
         .grow(1.0)
         .min_w(0.0)
         .center_y()
         .gap(2.0);
-    for tab in tabs(s) {
+    let tabs = tabs(s);
+    let compact = tabs.len() == 5 && width < 420.0;
+    for tab in tabs {
         let (key, glyph, title, kind) = match tab {
             crate::right_panel::PanelView::Overview => (
                 "right-panel-segment-overview",
                 "info",
                 "Overview",
                 crate::right_panel::SingletonKind::Overview,
+            ),
+            crate::right_panel::PanelView::Agents => (
+                "right-panel-segment-agents",
+                "agents",
+                "Agents",
+                crate::right_panel::SingletonKind::Agents,
             ),
             crate::right_panel::PanelView::Crew => (
                 "right-panel-segment-crew",
@@ -139,13 +157,26 @@ fn strip(s: &State, p: Palette) -> El {
         };
         let badge = match tab {
             crate::right_panel::PanelView::Crew => crew_working_count(s),
+            crate::right_panel::PanelView::Agents => {
+                let count = crate::agents::active_count(s.current());
+                (count > 0).then(|| count.to_string())
+            }
             _ => None,
         };
         let on = view == tab;
-        segments = segments.child(segment(p, key, glyph, title, badge, on, move |s| {
-            let key = s.panel_key();
-            s.right_panels.open(&key, kind);
-        }));
+        segments = segments.child(segment(
+            p,
+            key,
+            glyph,
+            title,
+            badge,
+            on,
+            compact && !on,
+            move |s| {
+                let key = s.panel_key();
+                s.right_panels.open(&key, kind);
+            },
+        ));
     }
     row()
         .key("right-panel-strip")
@@ -249,58 +280,194 @@ fn session_body(s: &State, p: Palette) -> El {
     let t = s.current();
     let mut details = col()
         .padding(16.0)
-        .gap(16.0)
-        .child(label(&t.title, TextStyle::new(14.0, 600.0), p.ink).wrap())
-        .child(status(t.status, p))
-        .child(rule(p))
+        .gap(8.0)
+        .child(label(&t.title, CARD_TITLE, p.ink).wrap())
         .child(
-            col()
-                .gap(5.0)
-                .child(meta_label("Model", p.muted))
-                .child(label(&t.model, LABEL, p.ink).wrap()),
+            row()
+                .center_y()
+                .gap(6.0)
+                .child(status_mark(t.status, p, 8.0))
+                .child(label(
+                    t.started
+                        .filter(|_| t.status == Status::Running)
+                        .map_or_else(
+                            || t.status.label().into(),
+                            |at| format!("Working for {}", timer_label(at.elapsed().as_secs())),
+                        ),
+                    META,
+                    status_ink(t.status, p),
+                )),
         )
-        .child(
-            col()
-                .gap(5.0)
-                .child(meta_label("Conversation", p.muted))
-                .child(
-                    label(
-                        if t.session.is_some() {
-                            format!("Saved locally by {}", harness_name(s, &t.harness))
-                        } else {
-                            "No saved session yet".to_string()
-                        },
-                        LABEL,
-                        p.ink,
-                    )
-                    .wrap(),
-                ),
-        );
+        .child(rule(p));
+    let fact = |key: &str, glyph: &str, title: &str, value: &str, style| {
+        row()
+            .key(key)
+            .min_h(28.0)
+            .gap(8.0)
+            .center_y()
+            .child(icon(glyph, p.faint).size(14.0, 14.0))
+            .child(label(title, META, p.faint).w(66.0))
+            .child(
+                label(value, style, p.ink)
+                    .wrap_anywhere()
+                    .grow(1.0)
+                    .min_w(0.0),
+            )
+    };
+    let model = if t.thinking.is_empty() || t.thinking == "off" {
+        t.model.clone()
+    } else {
+        format!("{} · {}", t.model, effort_name(&t.thinking))
+    };
+    details = details
+        .child(fact("overview-model", "chip", "Model", &model, SMALL))
+        .child(fact(
+            "overview-access",
+            "shield",
+            "Access",
+            t.native.access.label(),
+            SMALL,
+        ));
+    if let Some(project) = s.project(t.project) {
+        details = details.child(fact(
+            "overview-workspace",
+            "folder",
+            "Workspace",
+            &project.name,
+            SMALL,
+        ));
+    }
+    if let Some(branch) = &t.branch {
+        details = details.child(fact(
+            "overview-branch",
+            "branch",
+            "Branch",
+            branch,
+            MONO_META,
+        ));
+    }
+    details = details
+        .child(fact(
+            "overview-machine",
+            "monitor",
+            "Machine",
+            &s.machine_label(&s.machines.selected),
+            SMALL,
+        ))
+        .child(fact(
+            "overview-harness",
+            "terminal",
+            "Harness",
+            &harness_name(s, &t.harness),
+            SMALL,
+        ));
+    if let Some(percent) = t.context.usage.percent {
+        let amount = (percent as f32 / 100.0).clamp(0.0, 1.0);
+        details = details
+            .child(fact(
+                "overview-context",
+                "gauge",
+                "Context",
+                &format!("{percent}% used"),
+                SMALL,
+            ))
+            .child(
+                row()
+                    .h(4.0)
+                    .ml(88.0)
+                    .radius(2.0)
+                    .fill(p.line)
+                    .child(el().grow(amount).h_full().radius(2.0).fill(p.sea))
+                    .child(el().grow(1.0 - amount)),
+            );
+    }
+    if let Some(start) = t.started {
+        let time =
+            chrono::Local::now() - chrono::Duration::seconds(start.elapsed().as_secs() as i64);
+        details = details.child(fact(
+            "overview-started",
+            "clock",
+            "Started",
+            &time.format("%H:%M").to_string(),
+            SMALL,
+        ));
+    }
+    if let Some(updated) = relative_time(t.updated) {
+        details = details.child(fact(
+            "overview-updated",
+            "clock",
+            "Updated",
+            &updated,
+            SMALL,
+        ));
+    }
+    details = details.child(rule(p)).child(
+        col()
+            .gap(5.0)
+            .child(meta_label("Conversation", p.muted))
+            .child(
+                label(
+                    if t.session.is_some() {
+                        format!("Saved locally by {}", harness_name(s, &t.harness))
+                    } else {
+                        "No saved session yet".to_string()
+                    },
+                    LABEL,
+                    p.ink,
+                )
+                .wrap(),
+            ),
+    );
     if let Some(session) = &t.session {
+        let copy = session.clone();
         details = details.child(
-            label(session, SMALL, p.muted)
-                .wrap_anywhere()
-                .selectable(true),
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    label(session, MONO_META, p.muted)
+                        .wrap_anywhere()
+                        .selectable(true)
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(
+                    icon_button(
+                        "overview-session-copy",
+                        "Copy session ID",
+                        "copy",
+                        p,
+                        |_| {},
+                    )
+                    .on_press_tx(move |_: &mut State, tx| tx.copy(copy.clone())),
+                ),
         );
     }
     if !t.diagnostics.is_empty() {
-        details = details
-            .child(rule(p))
-            .child(label("Session notices", LABEL, p.ink));
-    }
-    for diagnostic in &t.diagnostics {
-        details = details.child(
-            label(truncate(diagnostic, 600), SMALL, p.muted)
-                .wrap_anywhere()
-                .selectable(true),
+        let key = s.panel_key();
+        let expanded = s.session_notices.contains(&key);
+        details = details.child(rule(p)).child(
+            button(
+                "overview-session-notices",
+                &format!("Session notices ({})", t.diagnostics.len()),
+                p,
+                move |s| {
+                    if !s.session_notices.remove(&key) {
+                        s.session_notices.insert(key.clone());
+                    }
+                },
+            )
+            .expanded(expanded),
         );
-    }
-    for diagnostic in s.updater.diagnostics() {
-        details = details.child(
-            label(diagnostic, SMALL, p.muted)
-                .wrap_anywhere()
-                .selectable(true),
-        );
+        if expanded {
+            for diagnostic in &t.diagnostics {
+                details = details.child(
+                    label(truncate(diagnostic, 600), SMALL, p.muted)
+                        .wrap_anywhere()
+                        .selectable(true),
+                );
+            }
+        }
     }
     col().key("session-panel").min_h(0.0).w_full().child(
         col()
@@ -344,9 +511,7 @@ fn worker_overview_body(s: &State, p: Palette) -> El {
         .pb(12.0)
         .gap(12.0)
         .center_y();
-    if let Some(captain) = captain {
-        identity = identity.child(avatar(s, p, captain, 40.0, shown_status(s)));
-    }
+    identity = identity.child(crewmate_avatar(s, p, &t.model, shown_status(s), 36.0));
     identity = identity.child(
         col()
             .grow(1.0)
@@ -529,6 +694,7 @@ fn peer_crew_body(s: &State, p: Palette) -> El {
     let mut rows = col().gap(2.0).pt(8.0).child(cap_head);
     // The open worker's own row leads the siblings, filled (spec §3.5).
     let own_member = crew_ui::RosterMember {
+        model: t.model.clone(),
         thread_id: t.id,
         title: if t.title.is_empty() {
             "Untitled".into()
@@ -606,6 +772,9 @@ fn body(s: &State, p: Palette) -> (String, El) {
         crate::right_panel::PanelView::Overview => {
             ("right-panel-body-overview".into(), overview_body(s, p))
         }
+        crate::right_panel::PanelView::Agents => {
+            ("right-panel-body-agents".into(), agents_ui::view(s, p))
+        }
         crate::right_panel::PanelView::Crew => ("right-panel-body-crew".into(), crew_body(s, p)),
         crate::right_panel::PanelView::Context => context_ui::view(s, p),
         crate::right_panel::PanelView::Diff => ("right-panel-body-diff".into(), diff_body(s, p)),
@@ -630,7 +799,13 @@ pub(super) fn view(s: &State, p: Palette, zoom: f32, resize_max: Option<f32>) ->
                 .grow(1.0)
                 .min_w(0.0)
                 .min_h(0.0)
-                .child(strip(s, p))
+                .child(strip(
+                    s,
+                    p,
+                    resize_max.map_or(s.viewport_width, |max| {
+                        crate::right_panel::clamp_width(s.right_panel_width, max)
+                    }),
+                ))
                 .child(rule(p).key("right-panel-strip-rule"))
                 .child(el().key(key).grow(1.0).min_h(0.0).min_w(0.0).child(body)),
         );

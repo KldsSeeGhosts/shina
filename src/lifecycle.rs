@@ -220,48 +220,52 @@ pub fn section(life: &Lifecycle, now: u64) -> Section {
     }
 }
 
-pub fn compare(section: Section, a: &Lifecycle, b: &Lifecycle) -> Ordering {
-    let newest = |a: u64, b: u64| b.cmp(&a);
+/// Reusable, owned ordering key for the sidebar index.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Rank {
+    Pin(String),
+    OldPin(std::cmp::Reverse<u64>),
+    Active(std::cmp::Reverse<u64>),
+    Snoozed(Option<u64>),
+    Settled(std::cmp::Reverse<u64>),
+}
+
+pub(crate) fn rank(section: Section, life: &Lifecycle) -> Rank {
+    use std::cmp::Reverse;
     match section {
-        Section::Pinned => match (&a.pin_order_key, &b.pin_order_key) {
-            (Some(a), Some(b)) => a.cmp(b),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            _ => newest(a.created_at, b.created_at),
-        },
-        Section::Active => {
-            let stamp = |l: &Lifecycle| {
-                [
-                    l.created_at,
-                    l.unsettled_at.unwrap_or(0),
-                    l.last_requested_at.unwrap_or(0),
-                    l.last_completed_at.unwrap_or(0),
-                ]
-                .into_iter()
-                .max()
-                .unwrap()
-            };
-            newest(stamp(a), stamp(b))
-        }
-        Section::Snoozed => a.snoozed_until.cmp(&b.snoozed_until),
-        Section::Settled => {
-            let stamp = |l: &Lifecycle| {
-                l.settled_at.unwrap_or_else(|| {
-                    [
-                        l.latest_user_message_at,
-                        l.last_requested_at,
-                        l.last_started_at,
-                        l.last_completed_at,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .max()
-                    .unwrap_or(l.updated_at)
-                })
-            };
-            newest(stamp(a), stamp(b))
-        }
+        Section::Pinned => life.pin_order_key.as_ref().map_or_else(
+            || Rank::OldPin(Reverse(life.created_at)),
+            |key| Rank::Pin(key.clone()),
+        ),
+        Section::Active => Rank::Active(Reverse(
+            [
+                life.created_at,
+                life.unsettled_at.unwrap_or(0),
+                life.last_requested_at.unwrap_or(0),
+                life.last_completed_at.unwrap_or(0),
+            ]
+            .into_iter()
+            .max()
+            .unwrap(),
+        )),
+        Section::Snoozed => Rank::Snoozed(life.snoozed_until),
+        Section::Settled => Rank::Settled(Reverse(life.settled_at.unwrap_or_else(|| {
+            [
+                life.latest_user_message_at,
+                life.last_requested_at,
+                life.last_started_at,
+                life.last_completed_at,
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(life.updated_at)
+        }))),
     }
+}
+
+pub fn compare(section: Section, a: &Lifecycle, b: &Lifecycle) -> Ordering {
+    rank(section, a).cmp(&rank(section, b))
 }
 
 /// Rune supplies pointer drags on Windows. The timed Snoozed shelf rejects drops.

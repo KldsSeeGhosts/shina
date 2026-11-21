@@ -1,59 +1,28 @@
 # Shina crew portraits
 
-The twelve captains are original characters drawn as 40x40 pixel-art busts by
-[`tools/crew_originals.py`](../../tools/crew_originals.py). The framing follows
-Pokémon Mystery Dungeon portraits: a tight bust crop, outlines tinted by the region
-they border, three-tone shading, and six expressions per character. Each is
-presented on a flat, saturated square tile like the crew avatars in Capy.
+The twelve captains ship as painted anime cels generated with OpenAI `gpt-image-2`. The original Sable portrait is the style reference for the set. These are still portraits, with the same image used for every status. The surrounding halo or badge shows changes in status and respects Reduce Motion.
 
-| Folder | Captain | Look |
-|---|---|---|
-| `ember` | Ember, Platform | messy copper hair, goggles on the forehead, olive work jacket, slate tile |
-| `juniper` | Juniper, Release | long mint hair with a blunt fringe, star clip, cream cardigan, rose tile |
-| `sable` | Sable, Support | indigo bob, coral headphones, grey hoodie, ochre tile |
-| `pip` | Pip, Research | white-blonde curls in a top bun, round glasses, green coat, teal tile |
-| `bram` | Bram, Operations | white captain's cap, grey moustache, navy peacoat with brass buttons, teal tile |
-| `wren` | Wren, Interface | mustard beanie with a pompom, chestnut bob, freckles, striped scarf, plum tile |
-| `rook` | Rook, Security | indigo hood, dark fringe, gold eyes, silver clasp, olive tile |
-| `nia` | Nia, Data | centre-parted braids with gold cuffs, yellow headband, teal turtleneck, coral tile |
-| `jett` | Jett, Performance | pink mohawk, shaved sides, leather jacket, cheek plaster, mustard tile |
-| `otto` | Otto, Review | bald, white beard and brows, round glasses, burgundy cardigan, grey tile |
-| `bolt` | Bolt, Automation | robot with an antenna, ear bolts and a glowing screen face, cobalt tile |
-| `kit` | Kit, Testing | fox ears, spiky russet hair, cream hoodie, blue neckerchief, green tile |
+| Folder | Captain | Signal colour | Look |
+| --- | --- | --- | --- |
+| `ember` | Ember, Platform | `#e0793a` | woman with short copper hair, brass goggles on forehead, olive work jacket |
+| `juniper` | Juniper, Release | `#45c49b` | long mint hair with blunt fringe, gold star clip, cream cardigan |
+| `sable` | Sable, Support | `#8b84f0` | indigo chin-length bob, coral headphones, slate-grey hoodie |
+| `pip` | Pip, Research | `#d9b23a` | white-blonde curls in top bun, round wire glasses, deep green coat |
+| `bram` | Bram, Operations | `#5b8fd6` | white captain's cap, full grey moustache, navy peacoat with brass buttons |
+| `wren` | Wren, Interface | `#b97ad0` | chestnut bob, freckles, mustard pompom beanie, plum-and-cream striped scarf |
+| `rook` | Rook, Security | `#93a84c` | raised indigo hood, dark fringe, gold eyes, silver clasp |
+| `nia` | Nia, Data | `#f0685c` | centre-parted braids with gold cuffs, yellow headband, teal turtleneck |
+| `jett` | Jett, Performance | `#ee5fa0` | woman with a dusty pink mohawk, shaved sides, leather jacket, cheek bandage |
+| `otto` | Otto, Review | `#a3acba` | bald, white beard and brows, round glasses, burgundy cardigan |
+| `bolt` | Bolt, Automation | `#38bdf8` | cobalt metal robot head with antenna, ear bolts and glowing cyan screen eyes |
+| `kit` | Kit, Testing | `#5fbf62` | human with spiky russet hair, cream hoodie, blue neckerchief |
 
-The folder order is the portrait index saved in captain profiles, so new captains are only
-ever appended. The first four must stay byte-identical when the set is regenerated.
+Each captain folder contains `Normal.png` at 512 × 512 and `Normal.small.png` at 256 × 256. The small crop is for avatars below 30 pt. The approved masters are 1024 × 1024. Use FFmpeg's `scale=512:512:flags=lanczos` for the full tile and `crop=896:896:64:0,scale=256:256:flags=lanczos` for the crop. Encode both as RGB PNGs to retain the brush texture.
 
-## Animation strips
+## Provider crewmates
 
-Each captain also has four sprite strips that the sidebar plays. Every frame is a full
-40x40 bust at the same 6x scale, laid side by side. Frame 0 is always the matching static
-face, so a paused portrait or one under reduced motion looks exactly like the static set.
-Corner marks stay fixed to the tile while the character moves.
+Eight matching provider crewmates ship in [`assets/providers/crew/`](../providers/crew/): `openai`, `anthropic`, `google`, `deepseek`, `glm`, `qwen`, `grok`, and `default`. Their `<key>.png` and `<key>.small.png` use the same dimensions and crop as the captains.
 
-| Strip | Built on | Frames |
-|---|---|---|
-| `Idle.strip.png` | Normal | rest, head settled 1 px (breathing), eyes half shut, eyes shut |
-| `Working.strip.png` | Determined | rest with three dots, one dot lit, two dots lit with a 1 px nod, blink |
-| `Attention.strip.png` | Surprised | rest, 2 px hop with "!", 1 px hop with "!", rest with "!" |
-| `Happy.strip.png` | Happy | rest, 2 px hop with a sparkle, 1 px hop with a sparkle |
+## Legacy pixel-art fallback
 
-The timing lives in `Clip::timeline` in [`src/visuals.rs`](../../src/visuals.rs): Idle
-breathes about every three seconds and blinks once per seven-second loop, Working steps about
-four times a second, Attention hops twice and then holds for about five seconds, and Happy
-hops twice and stops. Keep the frame order in the generator and the timeline in step.
-
-Regenerate the set with:
-
-```powershell
-python -I tools/crew_originals.py assets/crew
-```
-
-To review the whole crew, write a sheet with every face at 80 px and the Normal face at the
-sidebar's 44, 36 and 24 px sizes into the ignored `artifacts` folder:
-
-```powershell
-python -I tools/crew_originals.py --sheet artifacts/crew-sheet.png
-```
-
-To use a different set, see the drop-in instructions in the main README.
+The original 40x40 pixel-art busts and animation strips generated by [`tools/crew_originals.py`](../../tools/crew_originals.py) remain in [`assets/crew-pixel/`](../crew-pixel/) and can still be loaded at runtime by pointing `SHINA_SPRITES` at `assets/crew-pixel`.

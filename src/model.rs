@@ -19,7 +19,9 @@ use std::{
 
 /// The label shown when a thread uses whatever model Pi is configured with.
 pub const DEFAULT_MODEL: &str = "Default model";
-pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
+pub const SIDEBAR_MIN: f32 = 220.0;
+pub const SIDEBAR_MAX: f32 = 420.0;
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
 pub(crate) const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 struct ContextAssetDownload {
@@ -573,6 +575,9 @@ pub struct ThreadFindState {
 
 #[derive(Default)]
 pub struct SidebarSearchState {
+    input_text: String,
+    folded_query: String,
+    pub pending: bool,
     pub last_typed: String,
     pub debounce_until: Option<Instant>,
     pub request_seq: u64,
@@ -584,6 +589,25 @@ pub struct SidebarSearchState {
     pub visible_matches:
         std::collections::HashMap<(String, usize), crate::thread_search::ThreadSearchHit>,
     pub shown_order: Vec<(String, usize)>,
+}
+
+#[allow(dead_code, reason = "The preview overlay lands in Slice B.")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewSource {
+    #[default]
+    Hover,
+    Focus,
+}
+
+#[allow(dead_code, reason = "The preview overlay lands in Slice B.")]
+#[derive(Default)]
+pub struct SidebarPreview {
+    pub target: Option<(String, usize)>,
+    pub source: PreviewSource,
+    pub row_hot: bool,
+    pub card_hot: bool,
+    pub muted_row: Option<(String, usize)>,
+    pub opened_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1054,6 +1078,8 @@ pub struct Thread {
     provider_update_held: bool,
     pub messages: Vec<Message>,
     pub tools: Vec<Tool>,
+    pub(crate) agent_index: crate::agents::AgentIndex,
+    pub(crate) projected_agent_counts: Option<(usize, usize)>,
     pub thoughts: Vec<Thought>,
     pub work: Vec<AssistantWork>,
     /// Item lists keyed by the last applied projection's stable source ids.
@@ -1706,6 +1732,8 @@ impl Thread {
             provider_update_held: false,
             messages: vec![],
             tools: vec![],
+            agent_index: Default::default(),
+            projected_agent_counts: None,
             thoughts: vec![],
             work: vec![],
             transcript_fields: std::collections::HashMap::new(),
@@ -3480,6 +3508,8 @@ impl Thread {
                         tool.failed = true;
                         tool.output = "No saved result for this tool call.".into();
                     }
+                    tool.seed_subagents();
+                    self.agent_index.observe(self.tools.len(), &tool);
                     self.tools.push(tool);
                 }
             } else if block["type"] == "thinking" {
@@ -4128,6 +4158,7 @@ impl Thread {
                                 prefix_compactions.append(&mut self.native.compactions);
                                 self.native.compactions = prefix_compactions;
                             }
+                            self.agent_index = crate::agents::AgentIndex::rebuild(&self.tools);
                             // A process can accept a prompt before its response reaches us.
                             // Do not replay it if its unique delivery marker is already saved.
                             self.pending_injections.retain_mut(|injection| {
@@ -4314,11 +4345,13 @@ impl Thread {
             "tool_execution_start" => {
                 self.phase = format!("Running {}", string(&record, "toolName"));
                 let id = string(&record, "toolCallId");
-                if let Some(tool) = self.tools.iter_mut().rev().find(|tool| tool.id == id) {
+                if let Some(index) = self.tools.iter().rposition(|tool| tool.id == id) {
+                    let tool = &mut self.tools[index];
                     tool.started.get_or_insert_with(Instant::now);
                     if let Some(parent) = record["parentToolCallId"].as_str() {
                         tool.parent_call = Some(parent.into());
                     }
+                    self.agent_index.observe(index, tool);
                 } else {
                     self.assistant();
                     let anchor = ToolAnchor {
@@ -4331,6 +4364,8 @@ impl Thread {
                     tool.order = self.next_work_order();
                     tool.started = Some(Instant::now());
                     tool.parent_call = record["parentToolCallId"].as_str().map(str::to_owned);
+                    tool.seed_subagents();
+                    self.agent_index.observe(self.tools.len(), &tool);
                     self.tools.push(tool);
                 }
             }
@@ -4375,12 +4410,12 @@ impl Thread {
             "thinking_level_changed" => self.thinking = string(&record, "level").into(),
             "tool_execution_update" | "tool_execution_end" => {
                 let ending = record["type"] == "tool_execution_end";
-                if let Some(tool) = self
+                if let Some(index) = self
                     .tools
-                    .iter_mut()
-                    .rev()
-                    .find(|tool| tool.id == string(&record, "toolCallId"))
+                    .iter()
+                    .rposition(|tool| tool.id == string(&record, "toolCallId"))
                 {
+                    let tool = &mut self.tools[index];
                     tool.done = ending;
                     tool.failed = record["isError"] == true;
                     if ending {
@@ -4393,6 +4428,18 @@ impl Thread {
                     } else {
                         &record["partialResult"]
                     });
+                    self.agent_index.observe(index, tool);
+                }
+            }
+            "subagent_activity_update" => {
+                if let Some(index) = self
+                    .tools
+                    .iter()
+                    .rposition(|tool| tool.id == string(&record, "toolCallId"))
+                {
+                    let tool = &mut self.tools[index];
+                    tool.accept_subagents(&record["results"]);
+                    self.agent_index.observe(index, tool);
                 }
             }
             "extension_ui_request" => {
@@ -4549,6 +4596,7 @@ impl Thread {
             );
             tool.kind = Some(crate::work::ToolKind::Plan);
             tool.order = self.next_work_order();
+            self.agent_index.observe(self.tools.len(), &tool);
             self.tools.push(tool);
             self.tools.len() - 1
         };
@@ -4912,6 +4960,8 @@ pub struct State {
     pub(crate) scheduler: admission::Scheduler,
     pub(crate) provider_update_drivers: std::collections::BTreeSet<String>,
     pub client: Option<crate::client::Client>,
+    device_ui_dirty: bool,
+    device_draft_cache: client_state::DeviceDraftCache,
     pub machines: crate::peer::Machines,
     pub peers: Vec<crate::peer::Peer>,
     peer_runtime: remote_tasks::PeerRuntime,
@@ -5044,7 +5094,10 @@ pub struct State {
     /// The resize handle is mid-drag: the edge line turns coral.
     pub right_panel_resizing: bool,
     /// Per-thread diff panel state, keyed like right_panels. Session only.
-    pub(crate) diffs: std::collections::HashMap<String, crate::ui::diff_panel::ThreadDiff>,
+    pub(crate) diffs: crate::ui::diff_panel::DiffCache,
+    pub diff_blockers: std::collections::HashMap<String, crate::review::DiffBlocker>,
+    pub diff_details: Option<String>,
+    pub session_notices: std::collections::HashSet<String>,
     /// App-wide "hide test files" switch for the diff panel; saved in the UI snapshot
     /// only when on.
     pub diff_hide_tests: bool,
@@ -5202,6 +5255,17 @@ pub struct State {
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
+    pub(crate) sidebar_index: std::cell::RefCell<crate::ui::sidebar_ui::SidebarIndex>,
+    pub(crate) sidebar_preview: crate::ui::sidebar_preview::SidebarPreview,
+    #[allow(dead_code, reason = "Read by the Slice B preview overlay.")]
+    pub preview: SidebarPreview,
+    pub flash_tool: Option<(String, Instant)>,
+    pending_tool_reveal: Option<String>,
+    #[allow(dead_code, reason = "Read by the Slice B Agents panel.")]
+    pub agents_filter: crate::agents::AgentsFilter,
+    #[allow(dead_code, reason = "Read by the Slice B Agents panel.")]
+    pub agents_expanded:
+        std::collections::HashSet<(String, usize, String, crate::agents::AgentRunId)>,
     pub mention_search: crate::ui::composer_menu::MentionSearch,
     /// Sequence for `mention:preview:{seq}` workspace.readFile calls.
     pub(crate) file_preview_seq: u64,
@@ -5213,6 +5277,8 @@ pub struct State {
     pub timeline_at_bottom: std::collections::HashMap<(String, usize), bool>,
     pub timeline_positions: std::cell::RefCell<crate::timeline_position::Positions>,
     pub updater: crate::update::Updater,
+    pub update_popover: bool,
+    pub update_details: bool,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
     /// The explicit restart has saved and recorded its update for the pending quit.
@@ -6170,6 +6236,9 @@ impl State {
             right_panels: Default::default(),
             right_panel_resizing: false,
             diffs: Default::default(),
+            diff_blockers: Default::default(),
+            diff_details: None,
+            session_notices: Default::default(),
             diff_hide_tests: false,
             diff_tree_open: false,
             diff_tree_width: None,
@@ -6284,6 +6353,15 @@ impl State {
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
+            sidebar_index: Default::default(),
+            sidebar_preview: Default::default(),
+            device_ui_dirty: false,
+            device_draft_cache: Default::default(),
+            preview: SidebarPreview::default(),
+            flash_tool: None,
+            pending_tool_reveal: None,
+            agents_filter: Default::default(),
+            agents_expanded: Default::default(),
             mention_search: crate::ui::composer_menu::MentionSearch::default(),
             file_preview_seq: 0,
             pending_open_urls: Vec::new(),
@@ -6294,6 +6372,8 @@ impl State {
             timeline_at_bottom: std::collections::HashMap::new(),
             timeline_positions: std::cell::RefCell::default(),
             updater: Default::default(),
+            update_popover: false,
+            update_details: false,
             restart_for_update: false,
             restart_approved: false,
             restart_notice: None,
@@ -6373,11 +6453,100 @@ impl State {
             || t.delegated
             || t.peer_origin.is_some()
     }
+    pub fn inspector_has_agents_tab(&self) -> bool {
+        crate::agents::has_agents(self.current())
+    }
+
+    pub fn preview_allowed(&self) -> bool {
+        self.drag_thread.is_none()
+            && self.row_menu.is_none()
+            && !self.thread_menu
+            && self.tab_menu.is_none()
+            && !self.quick_switcher
+            && self.rename_thread.is_none()
+            && self.delete_thread.is_none()
+            && self.confirm_remove_attachment.is_none()
+            && self.project_picker.is_none()
+            && self.captain_editor.is_none()
+            && self.settings_picker.is_none()
+            && !self.captain_picker
+            && !self.projects.clone_open
+            && !self.current().native.access_picker
+            && self.current().native.conversation.is_none()
+            && self.plan_menu.is_none()
+            && self.plan_save_dialog.is_none()
+            && self.snooze_menu.is_none()
+            && !self.settings_menu
+            && self.settings.archive.is_none()
+            && !self.machines.picker
+            && !self.machines.dialog
+            && !self.fleet.open
+            && !self.fleet.popover
+            && !self.update_popover
+            && !self.env_mode_picker
+            && !self.base_branch_picker
+            && !self.stash_menu
+            && !self.composer_ui.overflow.get()
+            && self.code_picker.open.is_none()
+            && self.attachment_preview.is_none()
+            && self.transcript_preview.is_none()
+            && !self.attention_menu
+            && self.citation_comment.is_none()
+            && !self.brief.confirm_reset
+            && !self.brief.profile_open
+            && self.brief.recruit.is_none()
+            && self.brief.moving.is_none()
+            && self.brief.more.is_none()
+            && self.brief.lifecycle.is_none()
+            && self.doc_discard.is_none()
+    }
+
+    /// Expand the originating tool and its containing work fold, then reveal the turn.
+    pub fn reveal_tool(&mut self, tool_id: String) {
+        let t = self.current_mut();
+        let Some(index) = t.tools.iter().position(|tool| tool.id == tool_id) else {
+            return;
+        };
+        let message = t.tools[index].anchor.message.min(t.messages.len());
+        let start = t.messages[..message]
+            .iter()
+            .rposition(|m| m.role != "Pi")
+            .map_or(0, |i| i + 1);
+        t.tools[index].expanded = true;
+        for tool in &mut t.tools[..=index] {
+            if tool.anchor.message >= start {
+                tool.group_expanded = true;
+            }
+        }
+        if let Some(work) = t.work.iter_mut().find(|w| w.start == start) {
+            work.expanded = true;
+        } else {
+            t.work.push(AssistantWork {
+                start,
+                stopped: false,
+                stopped_order: 0,
+                expanded: true,
+                elapsed: None,
+                outcome: None,
+            });
+        }
+        t.timeline_cache.get_mut().touch_message(message);
+        let row = crate::ui::timeline_tool_row(t, index).unwrap_or_else(|| {
+            t.messages.get(start).map_or_else(
+                || format!("turn-live-{}", t.id),
+                |message| format!("turn-{}-{}", t.id, message.id),
+            )
+        });
+        self.pending_tool_reveal = Some(row);
+        self.flash_tool = Some((tool_id, Instant::now()));
+    }
     /// The Inspector tab actually shown for the current thread (resolving an unoffered
     /// stored view such as Crew on a released/plain thread to Overview).
     pub fn right_panel_resolved_view(&self) -> crate::right_panel::PanelView {
         let view = self.right_panel().view;
-        if view == crate::right_panel::PanelView::Crew && !self.inspector_has_crew_tab() {
+        if view == crate::right_panel::PanelView::Crew && !self.inspector_has_crew_tab()
+            || view == crate::right_panel::PanelView::Agents && !self.inspector_has_agents_tab()
+        {
             crate::right_panel::PanelView::Overview
         } else {
             view
@@ -7368,28 +7537,47 @@ impl State {
         });
         projects.into_iter().map(|p| p.id).collect()
     }
-    pub fn sidebar_threads(&self) -> Vec<usize> {
-        let mut threads: Vec<_> = self
+    pub(crate) fn hash_sidebar_coordinators(&self, hash: &mut impl std::hash::Hasher) {
+        use std::hash::Hash as _;
+        for task in self
+            .tasks
+            .iter()
+            .filter(|task| task.coordinator_captain.is_some())
+        {
+            task.child_thread_id.hash(hash);
+        }
+    }
+
+    pub(crate) fn sidebar_thread_candidates(&self) -> impl Iterator<Item = (usize, &Thread)> {
+        let standalone: std::collections::HashSet<_> = self
             .threads
             .iter()
+            .filter(|thread| !thread.captain_home)
+            .map(|thread| thread.id)
+            .collect();
+        let coordinated: std::collections::HashSet<_> = self
+            .tasks
+            .iter()
+            .filter(|task| task.coordinator_captain.is_some())
+            .map(|task| task.child_thread_id)
+            .collect();
+        self.threads
+            .iter()
             .enumerate()
-            .filter(|(_, t)| {
+            .filter(move |(_, t)| {
                 t.archived() == self.show_archive
                     && t.crew_captain.is_none()
                     && (!t.delegated
-                        || t.parent.is_some_and(|id| {
-                            self.threads
-                                .iter()
-                                .any(|parent| parent.id == id && !parent.captain_home)
-                        })
-                        || self.tasks.iter().any(|task| {
-                            task.child_thread_id == t.id && task.coordinator_captain.is_some()
-                        }))
+                        || t.parent.is_some_and(|id| standalone.contains(&id))
+                        || coordinated.contains(&t.id))
                     && !self.is_captain_home(t)
                     && (!t.is_draft() || self.draft_listed(t))
             })
             .filter(|(_, t)| self.in_scope(t))
-            .collect();
+    }
+
+    pub fn sidebar_threads(&self) -> Vec<usize> {
+        let mut threads: Vec<_> = self.sidebar_thread_candidates().collect();
         let at = lifecycle::now();
         threads.sort_by(|(_, a), (_, b)| {
             let sa = self.thread_section(a, at);
@@ -7443,6 +7631,12 @@ impl State {
             .collect()
     }
     pub fn sync_sidebar_search_input(&mut self) -> bool {
+        // Rune exposes text edits by value, not a content revision. Compare the
+        // original input before trimming or folding it on a background tick.
+        if self.search.text == self.sidebar_search.input_text {
+            return false;
+        }
+        self.sidebar_search.input_text.clone_from(&self.search.text);
         let clipped: String = self
             .search
             .text
@@ -7455,16 +7649,19 @@ impl State {
             return false;
         }
         self.sidebar_search.last_typed = trimmed.clone();
+        self.sidebar_search.folded_query = trimmed.to_lowercase();
+        self.sidebar_search.request_seq += 1;
+        self.sidebar_search.pending_servers.clear();
+        self.sidebar_search.unsupported_servers.clear();
+        self.sidebar_search.matches.clear();
+        self.sidebar_search.settled_query.clear();
+        self.sidebar_search.visible_query.clear();
+        self.sidebar_search.visible_matches.clear();
+        self.sidebar_search.shown_order.clear();
         let tokens = crate::thread_search::message_search_tokens(&trimmed);
+        self.sidebar_search.pending = self.client.is_some() && !tokens.long.is_empty();
         if tokens.long.is_empty() {
             self.sidebar_search.debounce_until = None;
-            self.sidebar_search.pending_servers.clear();
-            self.sidebar_search.unsupported_servers.clear();
-            self.sidebar_search.matches.clear();
-            self.sidebar_search.settled_query.clear();
-            self.sidebar_search.visible_query.clear();
-            self.sidebar_search.visible_matches.clear();
-            self.sidebar_search.shown_order.clear();
             return true;
         }
         if self.client.is_some() {
@@ -7530,17 +7727,7 @@ impl State {
                 json!({"query": query, "limit": 50}),
             );
         }
-        // Clear unrelated cached matches if query neither refines nor widens prior query.
-        let cur = crate::thread_search::fold_for_title(query);
-        let prev = crate::thread_search::fold_for_title(&self.sidebar_search.visible_query);
-        if !(!cur.is_empty()
-            && !prev.is_empty()
-            && (cur.starts_with(&prev) || prev.starts_with(&cur)))
-        {
-            self.sidebar_search.visible_query.clear();
-            self.sidebar_search.visible_matches.clear();
-            self.sidebar_search.shown_order.clear();
-        }
+        self.sidebar_search.pending = !self.sidebar_search.pending_servers.is_empty();
     }
     pub fn apply_sidebar_search_result(
         &mut self,
@@ -7548,10 +7735,14 @@ impl State {
         server: &str,
         result: Result<Vec<crate::thread_search::ThreadSearchHit>, String>,
     ) {
-        if seq != self.sidebar_search.request_seq {
+        self.sync_sidebar_search_input();
+        if seq != self.sidebar_search.request_seq
+            || self.sidebar_search.settled_query != self.sidebar_search.last_typed
+            || !self.sidebar_search.pending_servers.remove(server)
+        {
             return;
         }
-        self.sidebar_search.pending_servers.remove(server);
+        self.sidebar_search.pending = !self.sidebar_search.pending_servers.is_empty();
         if let Ok(hits) = result {
             self.sidebar_search.matches.insert(server.to_owned(), hits);
             // Rank across all responding environments and preserve shown order (KSG nextShownOrder).
@@ -7636,22 +7827,27 @@ impl State {
         }
     }
     pub fn thread_title_search_matches(&self, thread: &Thread) -> bool {
-        let search = self.search.text.to_lowercase();
-        self.thread_title_matches_query(thread, &search)
+        if self.search.text == self.sidebar_search.input_text {
+            return self.thread_title_matches_folded(thread, &self.sidebar_search.folded_query);
+        }
+        self.thread_title_matches_query(thread, &self.search.text)
     }
     /// The title match the sidebar's search and the quick switcher share:
     /// title, a listed draft's text, the captain's name on a home, and (only
     /// where the server cannot search bodies) message text.
     pub fn thread_title_matches_query(&self, thread: &Thread, search: &str) -> bool {
         let search = search.trim().to_lowercase();
+        self.thread_title_matches_folded(thread, &search)
+    }
+    fn thread_title_matches_folded(&self, thread: &Thread, search: &str) -> bool {
         if search.is_empty() {
             return true;
         }
-        let title_or_draft = thread.title.to_lowercase().contains(&search)
-            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(&search)
+        let title_or_draft = thread.title.to_lowercase().contains(search)
+            || self.draft_listed(thread) && thread.draft.text.to_lowercase().contains(search)
             || self.is_captain_home(thread)
                 && thread.captain.is_some_and(|captain| {
-                    self.captains[captain].name.to_lowercase().contains(&search)
+                    self.captains[captain].name.to_lowercase().contains(search)
                 });
         if title_or_draft {
             return true;
@@ -7668,7 +7864,7 @@ impl State {
             return thread
                 .messages
                 .iter()
-                .any(|message| message.text.to_lowercase().contains(&search));
+                .any(|message| message.text.to_lowercase().contains(search));
         }
         false
     }
@@ -7702,6 +7898,7 @@ impl State {
             .collect()
     }
     /// Live or archived workers, matching the current view, whether shown or not.
+    #[cfg(test)]
     pub fn captain_worker_count(&self, home: usize) -> usize {
         self.threads
             .iter()
@@ -7711,6 +7908,7 @@ impl State {
             .count()
     }
     /// Keyboard traversal follows the rows that the sidebar actually displays.
+    #[cfg(test)]
     pub fn sidebar_navigation(&self) -> Vec<usize> {
         let mut rows: Vec<usize> = self.sidebar_captains();
         // Crew workers list flat during search and in the archive. The sidebar's
@@ -8062,6 +8260,7 @@ impl State {
             None => self.open_picker(ProjectPicker::NewThread),
         }
     }
+    #[cfg(test)]
     pub fn click_thread(&mut self, index: usize, mods: rune::Mods) {
         let visible_ids: Vec<usize> = self
             .visible_sidebar_threads()
@@ -8145,6 +8344,7 @@ impl State {
             .map(|parent| self.effective_home(parent))
             .unwrap_or(current.id)
     }
+    #[cfg(test)]
     pub fn visible_sidebar_threads(&self) -> Vec<usize> {
         let mut settled = 0;
         self.sidebar_threads()
@@ -8184,36 +8384,7 @@ impl State {
         }
         if self.drag_thread == Some(id) {
             let [x, y] = drag.window_point();
-            self.drag_target = None;
-            for i in self.visible_sidebar_threads() {
-                let t = &self.threads[i];
-                if t.id == id {
-                    continue;
-                }
-                if let Some([rx, ry, rw, rh]) =
-                    self.drop_rects.get(&format!("thread-{}", t.id)).copied()
-                    && x >= rx
-                    && x <= rx + rw
-                    && y >= ry
-                    && y <= ry + rh
-                {
-                    let section = self.thread_section(t, lifecycle::now());
-                    let before = if y < ry + rh / 2.0 {
-                        Some(t.id)
-                    } else {
-                        self.sidebar_threads()
-                            .into_iter()
-                            .skip_while(|j| *j != i)
-                            .skip(1)
-                            .find(|j| {
-                                self.thread_section(&self.threads[*j], lifecycle::now()) == section
-                            })
-                            .map(|j| self.threads[j].id)
-                    };
-                    self.drag_target = Some((section, before));
-                    break;
-                }
-            }
+            self.drag_target = crate::ui::sidebar_ui::drag_row_at(self, id, [x, y]);
             for section in [Section::Pinned, Section::Active, Section::Settled] {
                 if let Some([rx, ry, rw, rh]) =
                     self.drop_rects.get(&format!("drop-{section:?}")).copied()
@@ -8565,6 +8736,9 @@ impl State {
         self.checkpoint();
     }
     pub fn pin_thread(&mut self, id: usize) {
+        if self.lifecycle_blocker(id).is_some() {
+            return;
+        }
         if self.forward("thread.lifecycle", json!({"threadId":id,"action":"pin"})) {
             return;
         }
@@ -8692,6 +8866,88 @@ impl State {
                     && (t.status.busy() || t.request.is_some() || t.configuring || t.queued())
             })
     }
+    pub fn conversation_blocker(&self, thread: &Thread) -> Option<String> {
+        if self.demo {
+            Some("Demo data".into())
+        } else if thread.archived() {
+            Some("Archived".into())
+        } else if thread.configuring || thread.initializing {
+            Some("Still starting".into())
+        } else if thread.status.busy() {
+            Some("While working".into())
+        } else if !thread.can_change_conversation() {
+            Some(if thread.harness == "codex" {
+                "Not supported by Codex".into()
+            } else {
+                "Not supported by this provider".into()
+            })
+        } else if thread.session.is_none() {
+            Some("No earlier message yet".into())
+        } else {
+            None
+        }
+    }
+
+    pub fn rewind_blocker(&self, thread: &Thread) -> Option<String> {
+        self.conversation_blocker(thread).or_else(|| {
+            if !thread.can_rewind_conversation() {
+                Some("Not supported by Codex".into())
+            } else if !thread
+                .messages
+                .iter()
+                .any(|message| message.role == "Shina")
+                && thread.life.latest_user_message_at.is_none()
+            {
+                Some("No earlier message yet".into())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn lifecycle_blocker(&self, id: usize) -> Option<String> {
+        let Some(t) = self.threads.iter().find(|t| t.id == id) else {
+            return Some("Thread unavailable".into());
+        };
+        if t.machine != "local" {
+            Some("Remote thread".into())
+        } else if self.is_captain_home(t) {
+            Some("Captain home".into())
+        } else if !t.life.settled() && self.lifecycle_busy(id) {
+            Some("While working".into())
+        } else {
+            None
+        }
+    }
+
+    pub fn snooze_blocker(&self, id: usize) -> Option<String> {
+        let Some(t) = self.threads.iter().find(|t| t.id == id) else {
+            return Some("Thread unavailable".into());
+        };
+        if t.machine != "local" {
+            Some("Remote thread".into())
+        } else if t.life.snoozed(lifecycle::now()) {
+            Some("Already snoozed".into())
+        } else if self.row_pending(t) {
+            Some("Needs your reply first".into())
+        } else if self.is_captain_home(t) {
+            Some("Captain home".into())
+        } else if t.archived() {
+            Some("Archived".into())
+        } else if t.queued() {
+            Some("While working".into())
+        } else {
+            None
+        }
+    }
+
+    pub fn unread_blocker(&self, thread: &Thread) -> Option<String> {
+        thread
+            .life
+            .last_completed_at
+            .is_none()
+            .then(|| "No finished reply yet".into())
+    }
     fn invalidate_undo(&mut self, id: usize) {
         if let Some(notice) = &mut self.undo {
             notice.entries.retain(|e| e.id != id);
@@ -8720,6 +8976,10 @@ impl State {
         UndoNotice::push(&mut self.undo, action, t.id, steps, lifecycle::now());
     }
     pub fn settle_thread(&mut self, id: usize) {
+        if let Some(reason) = self.lifecycle_blocker(id) {
+            self.lifecycle_error = Some(reason);
+            return;
+        }
         if self.forward("thread.lifecycle", json!({"threadId":id,"action":"settle"})) {
             return;
         }
@@ -8741,11 +9001,6 @@ impl State {
             self.invalidate_undo(id);
             self.threads[i].life.unsettle(lifecycle::now(), true);
         } else {
-            if self.lifecycle_busy(id) {
-                self.lifecycle_error =
-                    Some("Stop this thread and answer pending requests before settling.".into());
-                return;
-            }
             self.remember(Action::Settle, i);
             self.threads[i].life.settle(lifecycle::now());
             self.threads[i].disconnect();
@@ -8821,15 +9076,12 @@ impl State {
             )
     }
     pub fn can_snooze(&self, id: usize) -> bool {
-        self.threads.iter().find(|t| t.id == id).is_some_and(|t| {
-            t.machine == "local"
-                && !self.is_captain_home(t)
-                && !t.archived()
-                && !self.row_pending(t)
-                && !t.queued()
-        })
+        self.snooze_blocker(id).is_none()
     }
     pub fn open_snooze(&mut self, id: usize) {
+        if self.snooze_blocker(id).is_some() {
+            return;
+        }
         self.row_menu = None;
         self.thread_menu = false;
         self.snooze_menu = Some((
@@ -16127,6 +16379,11 @@ impl State {
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned);
+                    if !restore_session {
+                        thread.projected_agent_counts = record["agentCount"].as_u64()
+                            .zip(record["activeAgentCount"].as_u64())
+                            .and_then(|(total, active)| Some((usize::try_from(active).ok()?, usize::try_from(total).ok()?)));
+                    }
                     thread.scratch_directory = match record.get("scratchDirectory") {
                         None => None,
                         Some(value) => {
@@ -16623,6 +16880,24 @@ impl State {
     }
 
     pub(crate) fn ui_snapshot(&self) -> Value {
+        let drafts = self
+            .threads
+            .iter()
+            .map(|t| (t.id.to_string(), t.encode_device_draft()))
+            .collect();
+        let pending = self
+            .threads
+            .iter()
+            .map(|t| (t.id.to_string(), t.pending_inputs_value()))
+            .collect();
+        self.ui_snapshot_parts(drafts, pending)
+    }
+
+    fn ui_snapshot_parts(
+        &self,
+        drafts: serde_json::Map<String, Value>,
+        pending: serde_json::Map<String, Value>,
+    ) -> Value {
         let mut prefs_value = serde_json::to_value(&self.preferences).unwrap_or_else(|_| json!({}));
         if let Some(map) = prefs_value.as_object_mut() {
             map.remove("keybindings");
@@ -16657,45 +16932,8 @@ impl State {
             "scopeAdditional":self.scope_additional,
             "scopeServer":self.machines.scope_server,
             "scopeRemote":self.machines.scope_remote,
-            "pendingMessages":self.threads.iter().map(|t| (t.id.to_string(),t.pending_inputs_value())).collect::<serde_json::Map<_,_>>(),
-            "drafts":self.threads.iter().map(|t| {
-                let (draft, images, context, reply_to) = t.queued_edit.as_ref().map_or(
-                    (&t.draft, &t.draft_images, &t.draft_context, &t.draft_reply_to),
-                    |edit| (&edit.ordinary, &edit.ordinary_images, &edit.ordinary_context, &edit.ordinary_reply_to),
-                );
-                let collapsed_holder;
-                let draft = if crate::composer_source::has_shown_source(draft) {
-                    collapsed_holder = crate::composer_source::collapsed_copy(draft).0;
-                    &collapsed_holder
-                } else {
-                    draft
-                };
-                let value = if images.is_empty()
-                    && context.is_empty()
-                    && reply_to.is_none()
-                    && !crate::composer_rich::has_format(draft)
-                    && draft.pills().next().is_none()
-                    && t.fresh_session_arm.is_none()
-                {
-                    json!(draft.text)
-                } else {
-                    let mut obj = json!({
-                        "text": draft.text,
-                        "richHtml": draft.to_html(),
-                        "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
-                        "context": if context.is_empty() { Value::Null } else { json!({ "version": 1, "records": context }) },
-                    });
-                    if let Some(reply) = reply_to {
-                        obj["replyTo"] = json!(reply);
-                    }
-                    if let Some(arm) = t.fresh_session_arm {
-                        obj["freshSession"] = json!(true);
-                        obj["freshSessionArm"] = json!(arm);
-                    }
-                    obj
-                };
-                (t.id.to_string(), value)
-            }).collect::<serde_json::Map<_,_>>(),
+            "pendingMessages":pending,
+            "drafts":drafts,
         });
         // Off is the default, so only the on state is saved.
         if self.diff_hide_tests {
@@ -16761,7 +16999,7 @@ impl State {
             .map(|v| {
                 v.as_f64()
                     .filter(|n| n.is_finite())
-                    .map(|n| n.clamp(200.0, 400.0) as f32)
+                    .map(|n| n.clamp(SIDEBAR_MIN as f64, SIDEBAR_MAX as f64) as f32)
                     .ok_or("Invalid sidebar width.")
             })
             .transpose()?
@@ -17025,8 +17263,233 @@ impl State {
         index.and(drafts).and(memory)
     }
 
-    /// Why a restart to update must wait, or `None` when nothing is active. It checks every
-    /// thread, including delegated, settled and archived ones.
+    /// Display copy and available actions shared by the update control and Settings.
+    pub fn update_summary(&self) -> crate::update_status::UpdateSummary {
+        use crate::fleet_update::PillTone;
+        use crate::update::Status;
+        use crate::update_status::{MachineUpdate, UpdateAction, UpdatePhase::*, UpdateSummary};
+
+        let last_check = self.updater.last_check_label().to_owned();
+        if self.demo
+            || !self.updater.self_update_enabled() && self.updater.status() == &Status::Disabled
+        {
+            return UpdateSummary::from_phase(
+                Disabled,
+                None,
+                vec![],
+                vec![],
+                last_check,
+                None,
+                false,
+            );
+        }
+        let mut raw: Vec<String> = self.updater.diagnostics().cloned().collect();
+        let failure = self.updater.failed_release_detail();
+        let notice = self.updater.notice();
+        let fleet_failure = self
+            .fleet
+            .result_notice
+            .as_ref()
+            .filter(|notice| !notice.success);
+        let pill_failure = self
+            .fleet
+            .pill
+            .as_ref()
+            .filter(|pill| matches!(pill.tone, PillTone::Warning | PillTone::Error));
+        raw.extend(failure.iter().map(|(_, reason)| reason.clone()));
+        if let Some(notice) = notice
+            && !raw.iter().any(|line| line == notice)
+        {
+            raw.push(notice.into());
+        }
+        raw.extend(
+            fleet_failure
+                .into_iter()
+                .flat_map(|notice| notice.lines.iter().cloned()),
+        );
+        raw.extend(pill_failure.into_iter().map(|pill| pill.title.clone()));
+        for row in self
+            .fleet
+            .rows
+            .iter()
+            .filter(|row| row.result == Some(false))
+        {
+            raw.extend(row.provider_failure.iter().cloned());
+            raw.extend(row.state.strip_prefix("failed: ").map(str::to_owned));
+        }
+
+        let running = self.fleet.running || self.fleet_run_visible();
+        let provider_offers = self.all_provider_candidates();
+        let server_offers = self.server_update_offers();
+        let mut machines: Vec<_> = self
+            .fleet
+            .rows
+            .iter()
+            .map(|row| MachineUpdate {
+                is_app: false,
+                server: row.server.clone(),
+                name: row.name.clone(),
+                status: if running {
+                    crate::fleet_update::status_word(self.run_status(row)).into()
+                } else {
+                    row.state.clone()
+                },
+                current_version: (!row.current.is_empty()).then(|| row.current.clone()),
+                target_version: (!row.target.is_empty()).then(|| row.target.clone()),
+                action: (!running && row.eligible)
+                    .then(|| UpdateAction::UpdateMachine(row.server.clone())),
+            })
+            .collect();
+        let known: std::collections::BTreeSet<&String> = self
+            .client
+            .iter()
+            .flat_map(|client| client.linked.keys())
+            .chain(server_offers.keys())
+            .chain(provider_offers.iter().map(|(server, _, _, _)| server))
+            .collect();
+        for server in known {
+            if machines.iter().any(|machine| machine.server == *server) {
+                continue;
+            }
+            let target = server_offers.get(server).cloned();
+            let can_update =
+                target.is_some() || provider_offers.iter().any(|(host, _, _, _)| host == server);
+            machines.push(MachineUpdate {
+                is_app: false,
+                name: self.machine_label(server),
+                status: if can_update {
+                    "Update available"
+                } else if self.machine_connected(server) {
+                    "Up to date"
+                } else {
+                    "Offline"
+                }
+                .into(),
+                current_version: self
+                    .machines
+                    .views
+                    .get(server)
+                    .and_then(|view| view["updateStatus"]["runningVersion"].as_str())
+                    .map(str::to_owned),
+                target_version: target,
+                action: (!running && can_update)
+                    .then(|| UpdateAction::UpdateMachine(server.clone())),
+                server: server.clone(),
+            });
+        }
+
+        let mut detail = None;
+        let phase = if running {
+            let capsule = self.describe_capsule();
+            detail = Some(if let Some(elapsed) = capsule.elapsed {
+                format!("{} · {elapsed}", capsule.label)
+            } else {
+                capsule.label
+            });
+            let include_app = self.fleet.local_version.is_some()
+                && !self.fleet.rows.iter().any(|row| row.server == "local");
+            FleetRunning {
+                done: self
+                    .fleet
+                    .rows
+                    .iter()
+                    .filter(|row| self.run_status(row) == "done")
+                    .count(),
+                total: self.fleet.rows.len() + usize::from(include_app),
+            }
+        } else {
+            match self.updater.status() {
+                Status::Ready { update } => Ready {
+                    tag: update.tag.clone(),
+                    blocker: self.update_restart_blocker().map(str::to_owned),
+                },
+                Status::Downloading { tag } => Downloading {
+                    tag: tag.clone(),
+                    progress: None,
+                },
+                Status::Checking => Checking,
+                _ if failure.is_some()
+                    || notice.is_some()
+                    || fleet_failure.is_some()
+                    || pill_failure.is_some() =>
+                {
+                    Failed {
+                        tag: failure.map(|(tag, _)| tag),
+                    }
+                }
+                _ if !server_offers.is_empty() || !provider_offers.is_empty() => {
+                    detail = self.update_everything_summary();
+                    let tag = server_offers
+                        .values()
+                        .next()
+                        .cloned()
+                        .or_else(|| provider_offers.first().map(|(_, _, _, tag)| tag.clone()))
+                        .unwrap_or_default();
+                    Available {
+                        tag,
+                        targets: server_offers.len() + provider_offers.len(),
+                    }
+                }
+                _ if self.updater.success_up_to_date(Instant::now()) => UpToDate,
+                _ => Idle,
+            }
+        };
+        let retry_at = self.updater.retry_at();
+        let mut summary = UpdateSummary::from_phase(
+            phase,
+            detail,
+            raw,
+            machines,
+            last_check,
+            retry_at.as_deref(),
+            retry_at.is_none(),
+        );
+        if !summary.machines.is_empty() {
+            summary.machines.insert(
+                0,
+                MachineUpdate {
+                    is_app: true,
+                    server: "local".into(),
+                    name: "This app".into(),
+                    status: self
+                        .capsule_local_status()
+                        .unwrap_or_else(|| summary.headline.clone()),
+                    current_version: Some(summary.version.into()),
+                    target_version: match &summary.phase {
+                        Ready { tag, .. } | Downloading { tag, .. } => Some(tag.clone()),
+                        _ => self.fleet.local_version.clone(),
+                    },
+                    action: summary
+                        .action
+                        .clone()
+                        .filter(|action| !matches!(action, UpdateAction::UpdateEverything)),
+                },
+            );
+        }
+        if self.fleet.postponed_local && matches!(summary.phase, Ready { blocker: None, .. }) {
+            summary.action = Some(UpdateAction::RestartPostponed);
+        }
+        if self.fleet.phase == crate::fleet_update::RunPhase::Countdown {
+            summary.action = Some(UpdateAction::Postpone);
+        }
+        summary.dismissible = self.fleet.result_notice.is_some()
+            || self
+                .fleet
+                .pill
+                .as_ref()
+                .is_some_and(|pill| pill.dismissible);
+        if matches!(summary.phase, Idle | UpToDate)
+            && let Some(notice) = self
+                .fleet
+                .result_notice
+                .as_ref()
+                .filter(|notice| notice.success)
+        {
+            summary.detail.push_str(&format!(" {}", notice.title));
+        }
+        summary
+    }
+
     pub fn update_restart_blocker(&self) -> Option<&str> {
         if !self.provider_update_drivers.is_empty() {
             return Some("A provider is updating. Restart when it finishes.");
@@ -17435,6 +17898,7 @@ impl Thread {
         let mut record = json!({
             "id":self.id, "title":self.title, "renamed":self.renamed, "session":self.session, "lifecycle":self.life,
             "harness":self.harness, "harnessContextSent":self.harness_context_sent,
+            "agentCount":crate::agents::total_count(self),"activeAgentCount":crate::agents::active_count(self),
             "runId":self.run_id,"resumableRunId":self.resumable_run_id,"continuationOfRunId":self.continuation_of_run_id,
             "execution":self.execution,"nextExecution":self.next_execution,
             "peerInputExecutions":self.peer_input_executions,
@@ -17552,7 +18016,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     let keybindings_changed = !state.headless && state.poll_keybindings();
-    let browsing = state.poll_folder_browser()
+    let mut browsing = state.poll_folder_browser()
         | state.poll_settings()
         | state.poll_thread_find(tx)
         | state.poll_sidebar_search(tx)
@@ -17560,6 +18024,38 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | html_changed
         | attachment_changed
         | keybindings_changed;
+    browsing |= crate::ui::sidebar_preview::poll(state, tx);
+    if let Some(error) = state.lifecycle_error.take() {
+        state.push_toast(
+            ToastKind::Error,
+            "Could not change the thread",
+            Some(error),
+            None,
+            Some(5_000),
+        );
+        browsing = true;
+    }
+    if let Some(row) = state.pending_tool_reveal.take() {
+        tx.scroll_center_in_instant(format!("conversation-{}", state.current().id), row);
+        browsing = true;
+    }
+    if let Some((_, started)) = &state.flash_tool {
+        let remaining = Duration::from_secs(2).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            if let Some((id, _)) = state.flash_tool.take() {
+                let thread = state.current_mut();
+                if let Some(tool) = thread.tools.iter().find(|tool| tool.id == id) {
+                    thread
+                        .timeline_cache
+                        .get_mut()
+                        .touch_message(tool.anchor.message);
+                }
+            }
+            browsing = true;
+        } else {
+            tx.wake_after(remaining);
+        }
+    }
     // Linked-machine examples are offline fixtures. Animate their artwork, but
     // never run native provider maintenance or client commands for those records.
     if state.demo && state.client.is_some() {
@@ -17769,10 +18265,11 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         .threads
         .iter()
         .map(|t| {
-            state.row_pending(t)
-                || t.life
-                    .failed_at
-                    .is_some_and(|failed| failed > t.life.snoozed_at.unwrap_or(u64::MAX))
+            t.life.snoozed(at)
+                && (state.row_pending(t)
+                    || t.life
+                        .failed_at
+                        .is_some_and(|failed| failed > t.life.snoozed_at.unwrap_or(u64::MAX)))
         })
         .collect();
     for (i, t) in state.threads.iter_mut().enumerate() {
@@ -18496,6 +18993,45 @@ mod tests {
         events.send(Event::Exited).unwrap();
         poll(&mut state, 0.0, &mut Tx::default());
         assert_eq!(state.threads[0].error.as_deref(), Some("Pi was not found."));
+    }
+
+    #[test]
+    fn editing_sidebar_search_clears_old_hits_and_rejects_a_late_reply() {
+        let mut state = State::headless(crate::store::directory().unwrap());
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        state.current_mut().title = "Zebra notes".into();
+        state.search.replace_text("fix");
+        state.sync_sidebar_search_input();
+        let old_seq = state.sidebar_search.request_seq;
+        state.sidebar_search.settled_query = "fix".into();
+        state.sidebar_search.pending_servers.insert("local".into());
+        let hit = crate::thread_search::ThreadSearchHit {
+            thread_id: state.current().id,
+            project_id: None,
+            entry_id: "old".into(),
+            source: "user".into(),
+            snippet: "fix".into(),
+            quality: 1.0,
+            hits: 1,
+            updated: 0,
+        };
+        state.apply_sidebar_search_result(old_seq, "local", Ok(vec![hit.clone()]));
+        assert_eq!(state.sidebar_search.visible_query, "fix");
+
+        state.search.replace_text("Zebra");
+        assert!(state.sync_sidebar_search_input());
+        assert!(state.sidebar_search.pending);
+        assert!(state.thread_title_search_matches(state.current()));
+        assert!(state.sidebar_search.visible_matches.is_empty());
+        assert!(state.sidebar_search.shown_order.is_empty());
+        assert!(state.sidebar_search.visible_query.is_empty());
+        state.apply_sidebar_search_result(old_seq, "local", Ok(vec![hit.clone()]));
+        assert!(state.sidebar_search.visible_matches.is_empty());
+
+        state.search.replace_text("");
+        state.apply_sidebar_search_result(old_seq, "local", Ok(vec![hit]));
+        assert!(!state.sidebar_search.pending);
+        assert!(state.sidebar_search.visible_query.is_empty());
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub struct Store {
     sender: Option<mpsc::Sender<Message>>,
     pub errors: mpsc::Receiver<String>,
     last: String,
+    pending_device_ui: std::sync::Mutex<Option<DeviceUiSlot>>,
     worker: Option<thread::JoinHandle<()>>,
     healthy: Arc<AtomicBool>,
 }
@@ -115,7 +116,15 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 /// A queued write, or a barrier that is acknowledged after every earlier write finished.
 enum Message {
     Save(String),
+    SaveDeviceUi(DeviceUiSlot),
     Flush(mpsc::Sender<Result<(), String>>),
+}
+
+type DeviceUiSlot = Arc<std::sync::Mutex<Option<Value>>>;
+
+enum Snapshot {
+    Encoded(String),
+    DeviceUi(Value),
 }
 
 #[cfg(not(test))]
@@ -539,6 +548,7 @@ impl Store {
                 sender: None,
                 errors,
                 last: String::new(),
+                pending_device_ui: Default::default(),
                 worker: None,
                 healthy: Arc::new(AtomicBool::new(true)),
             };
@@ -561,7 +571,13 @@ impl Store {
                 };
                 let mut barrier = None;
                 let mut snapshot = match message {
-                    Message::Save(snapshot) => snapshot,
+                    Message::Save(snapshot) => Snapshot::Encoded(snapshot),
+                    Message::SaveDeviceUi(slot) => Snapshot::DeviceUi(
+                        slot.lock()
+                            .expect("device UI snapshot")
+                            .take()
+                            .expect("queued snapshot"),
+                    ),
                     Message::Flush(ack) => {
                         if last.is_ok() {
                             let _ = ack.send(last.clone());
@@ -570,21 +586,42 @@ impl Store {
                         // Retry the latest failed snapshot even when the caller's state has
                         // not changed. A flush is not just a replay of the previous error.
                         barrier = Some(ack);
-                        latest.clone().expect("failed snapshot")
+                        Snapshot::Encoded(latest.clone().expect("failed snapshot"))
                     }
                 };
                 // Coalesce newer writes, but never across a barrier.
-                while barrier.is_none() {
+                for _ in 0..64 {
+                    if barrier.is_some() {
+                        break;
+                    }
                     let Ok(newer) = receiver.try_recv() else {
                         break;
                     };
                     match newer {
-                        Message::Save(newer) => snapshot = newer,
+                        Message::Save(newer) => snapshot = Snapshot::Encoded(newer),
+                        Message::SaveDeviceUi(slot) => {
+                            snapshot = Snapshot::DeviceUi(
+                                slot.lock()
+                                    .expect("device UI snapshot")
+                                    .take()
+                                    .expect("queued snapshot"),
+                            );
+                        }
                         Message::Flush(ack) => {
                             barrier = Some(ack);
                             break;
                         }
                     }
+                }
+                let snapshot = match snapshot {
+                    Snapshot::Encoded(snapshot) => snapshot,
+                    Snapshot::DeviceUi(snapshot) => snapshot.to_string(),
+                };
+                if last.is_ok() && latest.as_ref() == Some(&snapshot) {
+                    if let Some(ack) = barrier {
+                        let _ = ack.send(Ok(()));
+                    }
+                    continue;
                 }
                 latest = Some(snapshot.clone());
                 let result = write_atomic(&path, snapshot.as_bytes());
@@ -618,6 +655,7 @@ impl Store {
             sender: Some(sender),
             errors: error_receiver,
             last: String::new(),
+            pending_device_ui: Default::default(),
             worker: Some(worker),
             healthy,
         }
@@ -638,6 +676,13 @@ impl Store {
             return;
         }
         let serialized = value.to_string();
+        if self.last != serialized {
+            // A regular save is ordered after the current device generation.
+            self.pending_device_ui
+                .get_mut()
+                .expect("device UI slot")
+                .take();
+        }
         if self.last != serialized
             && self
                 .sender
@@ -645,6 +690,28 @@ impl Store {
                 .is_some_and(|sender| sender.send(Message::Save(serialized.clone())).is_ok())
         {
             self.last = serialized;
+        }
+    }
+
+    /// The device snapshot is already coherent. Coalesce before encoding it,
+    /// and preserve flush ordering with every other queued write.
+    pub(crate) fn save_device_ui(&mut self, value: Value) {
+        if self.database.is_some() {
+            self.save(value);
+        } else if let Some(sender) = &self.sender {
+            self.last.clear();
+            let slot = self.pending_device_ui.get_mut().expect("device UI slot");
+            if let Some(current) = slot {
+                let mut pending = current.lock().expect("device UI snapshot");
+                if pending.is_some() {
+                    *pending = Some(value);
+                    return;
+                }
+            }
+            let pending = Arc::new(std::sync::Mutex::new(Some(value)));
+            if sender.send(Message::SaveDeviceUi(pending.clone())).is_ok() {
+                *slot = Some(pending);
+            }
         }
     }
 
@@ -660,6 +727,11 @@ impl Store {
         let Some(sender) = &self.sender else {
             return Err("The store is no longer running.".into());
         };
+        // Seal this generation before enqueuing the barrier.
+        self.pending_device_ui
+            .lock()
+            .expect("device UI slot")
+            .take();
         let (ack, result) = mpsc::channel();
         sender
             .send(Message::Flush(ack))

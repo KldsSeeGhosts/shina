@@ -9,7 +9,7 @@ use std::{
 
 const HANDOFF_GRACE: Duration = Duration::from_secs(30);
 const HANDOFF_GRACE_MS: i64 = 30_000;
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,6 +308,10 @@ impl ServerUpdates {
         });
     }
     pub fn poll(&mut self, directory: &Path) -> bool {
+        self.poll_at(directory, Instant::now())
+    }
+
+    pub(crate) fn poll_at(&mut self, directory: &Path, now: Instant) -> bool {
         let before = self.status(None, &Value::Null);
         let release_changed = self.release.poll();
         let mut disconnected = false;
@@ -344,6 +348,13 @@ impl ServerUpdates {
                 self.phase = "restarting".into();
             }
         }
+        if self
+            .last_probe
+            .is_some_and(|probed| now.saturating_duration_since(probed) < PROBE_INTERVAL)
+        {
+            return release_changed || before != self.status(None, &Value::Null);
+        }
+        self.last_probe = Some(now);
         if let Some(outcome) = read_outcome(directory)
             && (!self.active() || self.id.is_some())
             && self.id.as_deref().is_none_or(|id| id == outcome.update_id)
@@ -352,14 +363,7 @@ impl ServerUpdates {
             self.outcome = Some(outcome);
             self.diagnostic = None;
         }
-        let probe_due = self
-            .last_probe
-            .is_none_or(|probed| probed.elapsed() >= PROBE_INTERVAL);
-        if !probe_due {
-            return release_changed || before != self.status(None, &Value::Null);
-        }
         if self.phase == "checking" && self.id.is_none() {
-            self.last_probe = Some(Instant::now());
             match request_file(&directory.join("updates/request.json")) {
                 Ok(Some(request)) => {
                     if let Some(id) = request["updateId"].as_str() {
@@ -380,7 +384,7 @@ impl ServerUpdates {
                 }
             }
         } else {
-            self.reconcile(directory, Instant::now());
+            self.reconcile(directory, now);
         }
         if !self.active() && self.host.is_none() {
             self.host = Some(Box::new(InstalledHost));
@@ -895,8 +899,8 @@ impl crate::model::State {
     }
     /// Machines whose server this run can move to the target release (KSG
     /// `collectServerUpdateTargets` on the client side).
-    fn server_update_targets(&self) -> usize {
-        let mut counted: std::collections::HashSet<String> = Default::default();
+    pub(crate) fn server_update_offers(&self) -> std::collections::BTreeMap<String, String> {
+        let mut offers = std::collections::BTreeMap::new();
         if let Some(client) = &self.client {
             for (id, remote) in &client.linked {
                 let current = remote.version().unwrap_or_else(|| {
@@ -922,7 +926,7 @@ impl crate::model::State {
                 }
                 let online = remote.commands.connected();
                 if skip_reason(online, &hello, &status, &target).is_none() {
-                    counted.insert(id.clone());
+                    offers.insert(id.clone(), target);
                 }
             }
         }
@@ -938,7 +942,7 @@ impl crate::model::State {
             .discovered_target(local_status)
             .ok()
             .flatten()
-            .is_some_and(|target| {
+            .filter(|target| {
                 !crate::update::is_newer(&target, env!("CARGO_PKG_VERSION"))
                     && local_status["runningVersion"]
                         .as_str()
@@ -953,13 +957,16 @@ impl crate::model::State {
                         .is_none()
                     })
             });
-        counted.len() + usize::from(local_service)
+        if let Some(target) = local_service {
+            offers.insert("local".into(), target);
+        }
+        offers
     }
     /// KSG `describeUpdateEverything`'s button summary, or None when nothing updates:
     /// "Update this app, 2 servers and 3 providers".
     pub fn update_everything_summary(&self) -> Option<String> {
         let local = self.updater.prepared_update().is_some();
-        let servers = self.server_update_targets();
+        let servers = self.server_update_offers().len();
         let providers = self.all_provider_candidates().len();
         let mut parts = Vec::new();
         if local {
@@ -1924,7 +1931,7 @@ impl crate::model::State {
             _ => "waiting",
         }
     }
-    /// The capsule label, tone and action, KSG `describeUpdateCapsule`.
+    /// The fleet progress label and action, based on KSG `describeUpdateCapsule`.
     pub fn describe_capsule(&self) -> CapsuleView {
         let now = Instant::now();
         if self.fleet.phase == RunPhase::Countdown
@@ -1932,7 +1939,6 @@ impl crate::model::State {
         {
             let seconds = (at.saturating_duration_since(now).as_secs() + 1).min(5);
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: format!("Restart in {seconds}s"),
                 elapsed: None,
                 action: CapsuleAction::Later,
@@ -1940,7 +1946,6 @@ impl crate::model::State {
         }
         if self.fleet.phase == RunPhase::Installing {
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: "Restarting...".into(),
                 elapsed: None,
                 action: CapsuleAction::None,
@@ -1963,7 +1968,6 @@ impl crate::model::State {
             .filter(|(row, _)| now.duration_since(row.started_at) >= Duration::from_secs(180))
         {
             return CapsuleView {
-                tone: CapsuleTone::Slow,
                 label: row.name.clone(),
                 elapsed: Some(format_update_elapsed(now.duration_since(row.started_at))),
                 action: CapsuleAction::None,
@@ -1978,7 +1982,6 @@ impl crate::model::State {
             .any(|(_, status)| !matches!(*status, "done" | "failed"))
         {
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: format!("{done} of {} updated", self.fleet.rows.len()),
                 elapsed: None,
                 action: CapsuleAction::None,
@@ -1990,7 +1993,6 @@ impl crate::model::State {
             // The updater exposes no real progress, so the capsule says only
             // "Downloading" rather than an invented percentage.
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: "Downloading".into(),
                 elapsed: None,
                 action: CapsuleAction::None,
@@ -2008,7 +2010,6 @@ impl crate::model::State {
                 format!("{} failed", failed.len())
             };
             return CapsuleView {
-                tone: CapsuleTone::Failed,
                 label,
                 elapsed: None,
                 action: if failed
@@ -2022,7 +2023,6 @@ impl crate::model::State {
             };
         }
         CapsuleView {
-            tone: CapsuleTone::Default,
             label: format!("{done} of {} updated", self.fleet.rows.len()),
             elapsed: None,
             action: CapsuleAction::None,
@@ -3133,17 +3133,10 @@ fn result_notice(
 
 /// What the capsule's left side and action show, KSG `UpdateCapsuleView`.
 pub struct CapsuleView {
-    pub tone: CapsuleTone,
     pub label: String,
     /// "4m"-style elapsed after the label once a machine is slow (3 minutes).
     pub elapsed: Option<String>,
     pub action: CapsuleAction,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapsuleTone {
-    Default,
-    Slow,
-    Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapsuleAction {
@@ -4364,7 +4357,6 @@ mod tests {
             Some("studio Codex: Update command exited with code 1: EACCES")
         );
         let capsule = state.describe_capsule();
-        assert_eq!(capsule.tone, CapsuleTone::Failed);
         assert_eq!(capsule.label, "studio failed");
         // Provider failures retry from Settings, so the capsule offers only Dismiss.
         assert_eq!(capsule.action, CapsuleAction::Dismiss);
@@ -4587,7 +4579,6 @@ mod tests {
         assert_eq!(state.describe_capsule().label, "1 of 2 updated");
         state.fleet.rows[0].started_at = Instant::now() - Duration::from_secs(240);
         let slow = state.describe_capsule();
-        assert_eq!(slow.tone, CapsuleTone::Slow);
         assert_eq!(slow.label, "alpha");
         assert_eq!(slow.elapsed.as_deref(), Some("4m"));
     }

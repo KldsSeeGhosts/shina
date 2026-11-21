@@ -9,6 +9,126 @@ use crate::protocol::{Command, Receipt};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+type DraftContext = crate::composer_context::ComposerContextRecord;
+
+#[derive(Default)]
+pub(crate) struct DeviceDraftCache {
+    machines: HashMap<String, HashMap<usize, CachedDraft>>,
+    #[cfg(test)]
+    encodes: usize,
+}
+
+struct CachedDraft {
+    editor: TextEdit,
+    images: Vec<Attachment>,
+    context: Vec<DraftContext>,
+    reply: Option<DraftContext>,
+    fresh: Option<u64>,
+    encoded: Value,
+}
+
+impl Thread {
+    fn device_draft(
+        &self,
+    ) -> (
+        &TextEdit,
+        &[Attachment],
+        &[DraftContext],
+        Option<&DraftContext>,
+    ) {
+        self.queued_edit.as_ref().map_or(
+            (
+                &self.draft,
+                &self.draft_images[..],
+                &self.draft_context[..],
+                self.draft_reply_to.as_ref(),
+            ),
+            |edit| {
+                (
+                    &edit.ordinary,
+                    &edit.ordinary_images,
+                    &edit.ordinary_context,
+                    edit.ordinary_reply_to.as_ref(),
+                )
+            },
+        )
+    }
+
+    pub(super) fn encode_device_draft(&self) -> Value {
+        let (editor, images, context, reply) = self.device_draft();
+        let collapsed;
+        let editor = if crate::composer_source::has_shown_source(editor) {
+            collapsed = crate::composer_source::collapsed_copy(editor).0;
+            &collapsed
+        } else {
+            editor
+        };
+        if images.is_empty()
+            && context.is_empty()
+            && reply.is_none()
+            && !crate::composer_rich::has_format(editor)
+            && editor.pills().next().is_none()
+            && self.fresh_session_arm.is_none()
+        {
+            return json!(editor.text);
+        }
+        let mut value = json!({
+            "text": editor.text,
+            "richHtml": editor.to_html(),
+            "images": images.iter().map(Attachment::to_value).collect::<Vec<_>>(),
+            "context": if context.is_empty() { Value::Null } else { json!({ "version": 1, "records": context }) },
+        });
+        if let Some(reply) = reply {
+            value["replyTo"] = json!(reply);
+        }
+        if let Some(arm) = self.fresh_session_arm {
+            value["freshSession"] = json!(true);
+            value["freshSessionArm"] = json!(arm);
+        }
+        value
+    }
+}
+
+impl DeviceDraftCache {
+    fn snapshot(&mut self, server: &str, threads: &[Thread]) -> serde_json::Map<String, Value> {
+        let records = self.machines.entry(server.into()).or_default();
+        let mut previous = std::mem::take(records);
+        threads
+            .iter()
+            .map(|thread| {
+                let (editor, images, context, reply) = thread.device_draft();
+                let fresh = thread.fresh_session_arm;
+                let record = previous
+                    .remove(&thread.id)
+                    .filter(|record| {
+                        record.editor == *editor
+                            && record.images == images
+                            && record.context == context
+                            && record.reply.as_ref() == reply
+                            && record.fresh == fresh
+                    })
+                    .unwrap_or_else(|| {
+                        #[cfg(test)]
+                        {
+                            self.encodes += 1;
+                        }
+                        CachedDraft {
+                            editor: editor.clone(),
+                            images: images.to_vec(),
+                            context: context.to_vec(),
+                            reply: reply.cloned(),
+                            fresh,
+                            encoded: thread.encode_device_draft(),
+                        }
+                    });
+                let value = record.encoded.clone();
+                records.insert(thread.id, record);
+                (thread.id.to_string(), value)
+            })
+            .collect()
+    }
+}
+
 /// Where a draft machine change can land without blocking on more data.
 enum RouteTarget {
     /// A matching logical project on the target machine.
@@ -817,8 +937,22 @@ impl ThreadView {
                 .collect::<Result<_, String>>()?
         };
         let tool_started_at = std::mem::take(&mut self.tool_started_at);
+        let previous_tools = thread.transcript_fields.get("tools").cloned();
+        let incoming_tools = view.and_then(|view| view.fields.get("tools"));
+        let same_tools = previous_tools
+            .as_ref()
+            .zip(incoming_tools)
+            .is_some_and(|(old, new)| Arc::ptr_eq(old, new));
+        let same_tool_order = previous_tools
+            .as_ref()
+            .zip(incoming_tools)
+            .is_some_and(|(old, new)| old.ids.is_some() && old.ids == new.ids);
+        let changed_tools = std::cell::RefCell::new(Vec::new());
         let deser_tool = |index: usize, raw: &Value| -> Result<Tool, String> {
             let mut tool: Tool = serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
+            if same_tool_order {
+                changed_tools.borrow_mut().push(index);
+            }
             thread.timeline_cache.borrow_mut().touch_tool(index, &tool);
             if !tool.done {
                 tool.started = tool_started_at
@@ -881,6 +1015,15 @@ impl ThreadView {
             }
             tools
         };
+        if !same_tools {
+            if same_tool_order {
+                for index in changed_tools.into_inner() {
+                    thread.agent_index.observe(index, &thread.tools[index]);
+                }
+            } else {
+                thread.agent_index = crate::agents::AgentIndex::rebuild(&thread.tools);
+            }
+        }
         let thought_clocks = std::mem::take(&mut self.thought_clocks);
         let thought_started_at = std::mem::take(&mut self.thought_started_at);
         let deser_thought = |index: usize, raw: &Value| -> Result<Thought, String> {
@@ -1872,8 +2015,19 @@ impl State {
         self.client.as_mut().expect("client").start(wake);
     }
 
+    pub(crate) fn mark_device_ui_dirty(&mut self) {
+        if self.client.is_some() && !self.device_ui_dirty {
+            self.device_ui_dirty = true;
+            (self.wake)();
+        }
+    }
+
     pub(super) fn checkpoint_client(&mut self) {
-        let mut ui = self.ui_snapshot();
+        self.device_ui_dirty = false;
+        let drafts = self
+            .device_draft_cache
+            .snapshot(&self.machines.selected, &self.threads);
+        let mut ui = self.ui_snapshot_parts(drafts, Default::default());
         ui["clientDrafts"] = json!(
             self.threads
                 .iter()
@@ -1903,7 +2057,6 @@ impl State {
                 })
                 .collect::<Vec<_>>()
         );
-        ui["pendingMessages"] = json!({});
         ui["active"] = json!(self.current().id);
         ui["tabs"] = json!(self.tabs);
         ui["ghostTab"] = json!(self.ghost_tab);
@@ -1939,7 +2092,7 @@ impl State {
         }
         saved["machineUi"] = self.machines.ui.clone();
         if let Some(store) = &mut self.ui_store {
-            store.save(saved);
+            store.save_device_ui(saved);
         }
     }
 
@@ -1956,7 +2109,10 @@ impl State {
             .as_ref()
             .map(|client| client.snapshots())
             .unwrap_or_default();
-        let mut changed = changed || !projections.is_empty() || self.poll_context_imports();
+        let imported = self.poll_context_imports();
+        self.device_ui_dirty |= imported;
+        // `changed` requests a view. Only device-owned mutations request a save.
+        let mut changed = changed || !projections.is_empty() || imported;
         for (server, projection) in projections {
             if !self.machine_enabled(&server) {
                 continue;
@@ -1964,10 +2120,24 @@ impl State {
             self.machines
                 .views
                 .insert(server.clone(), projection.clone().into());
-            if server == self.machines.selected
-                && let Err(error) = self.apply_projection(projection)
-            {
-                self.storage_error = Some(error);
+            if server == self.machines.selected {
+                let before = (
+                    self.current().id,
+                    self.tabs.clone(),
+                    self.ghost_tab,
+                    self.ghost_anchor,
+                );
+                if let Err(error) = self.apply_projection(projection) {
+                    self.storage_error = Some(error);
+                } else {
+                    self.device_ui_dirty |= before
+                        != (
+                            self.current().id,
+                            self.tabs.clone(),
+                            self.ghost_tab,
+                            self.ghost_anchor,
+                        );
+                }
             }
         }
         changed |= crate::ui::restore_timeline_position(self, tx, true);
@@ -2051,6 +2221,13 @@ impl State {
                         })
                     }) {
                         thread.finish_remote_send(command.command_id, accepted);
+                        if server == self.machines.selected {
+                            self.device_ui_dirty = true;
+                        } else {
+                            self.machines.ui[&server]["drafts"][thread.id.to_string()] =
+                                thread.encode_device_draft();
+                            self.device_ui_dirty = true;
+                        }
                         if accepted {
                             cleared_keep_id = Some(thread.id);
                         }
@@ -2361,6 +2538,7 @@ impl State {
                                 ));
                             }
                             thread.native.follow_up = true;
+                            self.device_ui_dirty = true;
                         }
                     } else {
                         if let Some(id) = command.params["clientDraft"].as_u64()
@@ -2514,7 +2692,7 @@ impl State {
         if self.approval_sends_pending() {
             tx.wake_after(Duration::from_millis(16));
         }
-        if changed {
+        if self.device_ui_dirty {
             self.checkpoint_client();
         }
         // Fleet decisions must see this poll's projections, and precede the local
@@ -2599,6 +2777,7 @@ impl State {
                 local.session = thread.session;
                 local.never_sent = thread.never_sent;
                 local.harness = thread.harness;
+                local.projected_agent_counts = thread.projected_agent_counts;
                 local.harness_context_sent = thread.harness_context_sent;
                 local.project = thread.project;
                 local.worktree_path = thread.worktree_path;
@@ -2756,6 +2935,7 @@ impl State {
                 continue;
             }
             let thread = &mut self.threads[index];
+            let might_restore_draft = thread.remote_bootstrap_snapshot.is_some();
             let meta_raw: &Value = match projection.views.get(&id) {
                 Some(view) => {
                     // The compact meta record deserializes cheaply; transcript
@@ -2784,6 +2964,8 @@ impl State {
                 thread.deferred_work = meta["deferredWork"].as_array().cloned().unwrap_or_default();
                 thread.deferred_work_supported = meta["workLoading"] == "deferred";
             }
+            self.device_ui_dirty |=
+                might_restore_draft && thread.remote_bootstrap_snapshot.is_none();
         }
         self.active = self
             .threads
@@ -4118,6 +4300,18 @@ impl State {
             }
         };
         if let Outcome::Failed(bg, draft_id, error) = outcome {
+            if server == self.machines.selected {
+                self.device_ui_dirty = true;
+            } else if let Some(thread) = self
+                .machines
+                .threads
+                .get(server)
+                .and_then(|threads| threads.iter().find(|thread| thread.id == draft_id))
+            {
+                self.machines.ui[server]["drafts"][draft_id.to_string()] =
+                    thread.encode_device_draft();
+                self.device_ui_dirty = true;
+            }
             if let Some(bg_server) = bg {
                 self.notify_background_failure(&bg_server, draft_id, error);
             } else {
@@ -4323,18 +4517,30 @@ impl State {
     }
 
     pub(crate) fn can_continue_captain_draft(&self) -> bool {
+        self.continue_blocker().is_none()
+    }
+
+    pub fn continue_blocker(&self) -> Option<String> {
         let home = self.current();
-        !home.status.busy()
-            && !home.configuring
-            && !home.queued()
-            && !home.archived()
-            && home.request.is_none()
-            && home.remote_send.is_none()
-            && !home.draft.text.trim().is_empty()
-            && home.draft.pills().next().is_none()
-            && home.draft_images.is_empty()
-            && home.draft_context.is_empty()
-            && home.draft_reply_to.is_none()
+        if home.status.busy() || home.queued() || home.remote_send.is_some() {
+            Some("While working".into())
+        } else if home.configuring {
+            Some("Still starting".into())
+        } else if home.archived() {
+            Some("Archived".into())
+        } else if home.request.is_some() {
+            Some("Needs your reply first".into())
+        } else if home.draft.text.trim().is_empty() {
+            Some("Write a message first".into())
+        } else if home.draft.pills().next().is_some()
+            || !home.draft_images.is_empty()
+            || !home.draft_context.is_empty()
+            || home.draft_reply_to.is_some()
+        {
+            Some("Remove attachments and references first".into())
+        } else {
+            None
+        }
     }
 
     pub(crate) fn continue_captain_draft(&mut self, server: &str, project: usize) {
@@ -4350,6 +4556,7 @@ impl State {
                 let home = self.current_mut();
                 home.remote_send = Some((command, snapshot));
                 home.draft.replace_text("");
+                self.mark_device_ui_dirty();
             }
             Some(Err(error)) => self.current_mut().error = Some(error),
             None => {
@@ -7494,6 +7701,53 @@ mod tests {
         assert_eq!(restored.current().id, id);
         assert!(restored.current().client_draft);
         assert_eq!(restored.current().draft.text, "Persist this unsent draft");
+    }
+
+    #[test]
+    fn unrelated_stream_updates_do_not_encode_device_drafts() {
+        let (mut state, mut server, _) = tab_client();
+        let directory = crate::store::directory()
+            .unwrap()
+            .join("device-draft-stream");
+        let path = directory.join("device-ui.json");
+        state.ui_store = Some(crate::store::Store::new(path.clone(), state.wake.clone()));
+        state.current_mut().draft.paste_html(
+            "<p><strong>Keep</strong> <em>this draft</em></p>",
+            "Keep this draft",
+        );
+        let expected = state.current().draft.to_html();
+        let id = state.current().id;
+        state.mark_device_ui_dirty();
+        state.poll_client(&mut Tx::default());
+        let encodes = state.device_draft_cache.encodes;
+        assert!(encodes > 0);
+        for token in 0..100 {
+            server.threads[0].status = Status::Running;
+            server.threads[0].apply(json!({"type":"message_update","assistantMessageEvent":{
+                "type":"text_delta","delta":format!("token-{token} ")
+            }}));
+            state
+                .client
+                .as_ref()
+                .unwrap()
+                .test_snapshot(server.projection());
+            state.poll_client(&mut Tx::default());
+        }
+        assert_eq!(state.device_draft_cache.encodes, encodes);
+        state.ui_store.as_ref().unwrap().flush().unwrap();
+        let saved = crate::store::load(&path).unwrap().unwrap();
+        let mut restored = State::new(directory, false);
+        restored.client = Some(crate::client::Client::new(restored.data_dir.clone()));
+        restored.client_views["localUi"] = saved["machineUi"]["local"].clone();
+        restored.apply_projection(server.projection()).unwrap();
+        let draft = &restored
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .unwrap()
+            .draft;
+        assert_eq!(draft.text, "Keep this draft");
+        assert_eq!(draft.to_html(), expected);
     }
 
     #[test]

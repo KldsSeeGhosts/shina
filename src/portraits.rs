@@ -113,6 +113,10 @@ impl Portraits {
         self.reduced.get()
     }
 
+    pub fn motion_allowed(&self) -> bool {
+        self.focused && !self.reduced.get()
+    }
+
     /// Advances every stage to `now` for the sidebar's portraits, given as (row, portrait,
     /// face). Returns how long until the next frame is due, or None when nothing plays.
     pub fn tick(
@@ -192,8 +196,14 @@ fn position(clip: Clip, elapsed: u64) -> (usize, Option<Duration>) {
 mod tests {
     use super::*;
 
+    fn pixel_artwork() -> Arc<Artwork> {
+        Artwork::load_sprite_dir(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel"),
+        )
+    }
+
     fn portraits() -> Portraits {
-        Portraits::new(Artwork::load(std::path::Path::new("")))
+        Portraits::new(pixel_artwork())
     }
 
     /// Steps the clock frame by frame, as the poll would, and counts the wakes.
@@ -213,10 +223,23 @@ mod tests {
     }
 
     #[test]
-    fn every_embedded_captain_has_all_clips_and_frame_zero_is_the_static_face() {
+    fn illustrated_embedded_captains_stay_static_without_pixel_strips() {
         let art = Artwork::load(std::path::Path::new(""));
         for portrait in 0..CAPTAIN_NAMES.len() {
-            let motion = art.motion(portrait).expect("embedded strips");
+            assert!(!art.is_pixel_art(portrait));
+            assert!(art.motion(portrait).is_none());
+        }
+        let mut p = Portraits::new(art);
+        p.set_visible(1, true);
+        assert!(p.pixels(0, Face::Normal, 36.0).is_none());
+        assert_eq!(p.tick(Instant::now(), [(1, 0, Face::Normal)]), None);
+    }
+
+    #[test]
+    fn every_pixel_fallback_captain_has_all_clips_and_frame_zero_is_the_static_face() {
+        let art = pixel_artwork();
+        for portrait in 0..CAPTAIN_NAMES.len() {
+            let motion = art.motion(portrait).expect("pixel fallback strips");
             for clip in Clip::ALL {
                 let strip = &motion[clip.index()];
                 assert_eq!(strip.frames.len(), clip.frames());
@@ -314,8 +337,9 @@ mod tests {
     #[test]
     fn a_drop_in_set_without_strips_stays_static() {
         let root = std::env::temp_dir().join(format!("shina-static-set-{}", std::process::id()));
-        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew/ember");
-        let folder = root.join("assets/crew/ember");
+        let source =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel/ember");
+        let folder = root.join("ember");
         std::fs::create_dir_all(&folder).unwrap();
         for face in ["Normal", "Happy", "Determined", "Surprised", "Dizzy", "Sad"] {
             std::fs::copy(
@@ -324,15 +348,18 @@ mod tests {
             )
             .unwrap();
         }
-        let art = Artwork::load(&root);
-        assert!(art.motion(0).is_none(), "the drop-in Ember has no strips");
-        assert!(art.motion(1).is_some(), "the embedded Juniper keeps hers");
-        for portrait in 4..CAPTAIN_NAMES.len() {
-            assert!(
-                art.motion(portrait).is_some(),
-                "captain {portrait} has no drop-in folder and keeps the embedded art"
-            );
+        // Copy Juniper with strips to confirm a sibling pixel captain keeps playing strips.
+        let juniper_src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/crew-pixel/juniper");
+        let juniper_dst = root.join("juniper");
+        std::fs::create_dir_all(&juniper_dst).unwrap();
+        for entry in std::fs::read_dir(&juniper_src).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), juniper_dst.join(entry.file_name())).unwrap();
         }
+        let art = Artwork::load_sprite_dir(&root);
+        assert!(art.motion(0).is_none(), "the drop-in Ember has no strips");
+        assert!(art.motion(1).is_some(), "the pixel Juniper keeps hers");
         let mut p = Portraits::new(art);
         p.set_visible(1, true);
         assert!(p.pixels(0, Face::Normal, 40.0).is_none());

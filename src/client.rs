@@ -1291,7 +1291,11 @@ async fn supervise(
                             if let Some(id) = value["id"].as_str()
                                 && let Some(tag) = pending_rpcs.remove(id)
                             {
-                                let result = if let Some(msg) = value["error"]["message"].as_str() {
+                                let result = if tag.starts_with("diff:")
+                                    && let Ok(blocker) = serde_json::from_value::<crate::review::DiffBlocker>(value["error"]["data"]["diffBlocker"].clone())
+                                {
+                                    Err(blocker.wire_error())
+                                } else if let Some(msg) = value["error"]["message"].as_str() {
                                     Err(msg.to_owned())
                                 } else {
                                     Ok(value["result"].clone())

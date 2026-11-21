@@ -1718,39 +1718,91 @@ fn get_diff_file_contents_impl(
 /// KSG `ReviewService.assertWorkspaceBoundCwd`: the canonicalized `cwd` must sit
 /// inside a known project root or a worktree registered to one. `resolve_cwd`'s
 /// project-root check runs first so its basic path errors survive.
-pub fn resolve_workspace_cwd(cwd: &str, project_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    if let Ok(cwd) = crate::workspace_search::resolve_cwd(cwd, project_roots) {
-        return Ok(cwd);
+pub fn resolve_workspace_cwd(cwd: &str, project_roots: &[PathBuf]) -> Result<PathBuf, DiffBlocker> {
+    crate::workspace_search::resolve_cwd(cwd, project_roots)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DiffBlocker {
+    NotARepository {
+        path: String,
+    },
+    OutsideProjects {
+        path: String,
+        server: String,
+    },
+    WorktreeMissing {
+        path: String,
+        branch: Option<String>,
+    },
+    MachineOffline {
+        machine: String,
+    },
+    GitFailed {
+        path: String,
+        detail: String,
+    },
+}
+
+impl DiffBlocker {
+    const WIRE_PREFIX: &'static str = "\u{1e}diff-blocker:";
+
+    pub(crate) fn wire_error(self) -> String {
+        format!(
+            "{}{}",
+            Self::WIRE_PREFIX,
+            serde_json::to_string(&self).expect("diff blocker")
+        )
     }
-    let trimmed = cwd.trim();
-    let path = Path::new(trimmed);
-    if trimmed.is_empty() || !path.is_absolute() {
-        return Err("Workspace path must be absolute.".into());
+
+    pub(crate) fn from_wire_error(error: &str) -> Option<Self> {
+        serde_json::from_str(error.strip_prefix(Self::WIRE_PREFIX)?).ok()
     }
-    if !path.is_dir() {
-        return Err("Workspace path is not a directory.".into());
-    }
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| "Workspace path could not be resolved.".to_string())?;
-    for root in project_roots {
-        let Ok(listed) = crate::vcs::list_worktrees(&crate::vcs::VcsListWorktreesInput {
-            cwd: root.to_string_lossy().into_owned(),
-        }) else {
-            continue;
-        };
-        if !listed.is_repo {
-            continue;
+
+    pub(crate) fn on_server(mut self, server_id: &str) -> Self {
+        if let Self::OutsideProjects { server, .. } = &mut self {
+            *server = server_id.into();
         }
-        let inside = listed.worktrees.iter().any(|entry| {
-            let worktree = crate::vcs::real_location(Path::new(&entry.path));
-            canonical == worktree || canonical.starts_with(&worktree)
+        self
+    }
+}
+
+impl std::fmt::Display for DiffBlocker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotARepository { path } => write!(f, "{path} is not a Git repository."),
+            Self::OutsideProjects { path, .. } => write!(
+                f,
+                "Workspace path is not inside a project on this server. Path: {path}"
+            ),
+            Self::WorktreeMissing { path, .. } => write!(f, "The worktree folder is gone: {path}"),
+            Self::MachineOffline { machine } => write!(f, "{machine} is offline."),
+            Self::GitFailed { path, detail } => write!(f, "{detail} Path: {path}"),
+        }
+    }
+}
+
+pub(crate) fn blocked_diff_preview(
+    input: &ReviewDiffPreviewInput,
+    ctx: &GitContext,
+) -> Result<ReviewDiffPreviewResult, DiffBlocker> {
+    if !Path::new(&input.cwd).is_dir() {
+        return Err(DiffBlocker::WorktreeMissing {
+            path: input.cwd.clone(),
+            branch: None,
         });
-        if inside {
-            return Ok(canonical);
-        }
     }
-    Err("Workspace path is not inside a project on this server.".into())
+    let result = get_diff_preview(input, ctx).map_err(|detail| DiffBlocker::GitFailed {
+        path: input.cwd.clone(),
+        detail,
+    })?;
+    if result.sources.is_empty() {
+        return Err(DiffBlocker::NotARepository {
+            path: input.cwd.clone(),
+        });
+    }
+    Ok(result)
 }
 
 pub fn get_branch_commits(

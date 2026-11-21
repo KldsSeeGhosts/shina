@@ -145,26 +145,64 @@ fn score_entry(entry: &Indexed, query: &str) -> Option<usize> {
 }
 
 /// `cwd` must be an existing absolute directory that is a known project root or inside one.
-pub fn resolve_cwd(cwd: &str, project_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    if cwd.trim().is_empty() || !Path::new(cwd).is_absolute() {
-        return Err("Workspace path must be absolute.".into());
+pub fn resolve_cwd(
+    cwd: &str,
+    project_roots: &[PathBuf],
+) -> Result<PathBuf, crate::review::DiffBlocker> {
+    use crate::review::DiffBlocker;
+    let path = Path::new(cwd.trim());
+    let outside = || DiffBlocker::OutsideProjects {
+        path: cwd.into(),
+        server: "local".into(),
+    };
+    if !path.is_absolute() {
+        return Err(outside());
     }
-    let path = Path::new(cwd);
-    if !path.is_dir() {
-        return Err("Workspace path is not a directory.".into());
+    let canonical = path.canonicalize().ok().filter(|path| path.is_dir());
+    let missing = canonical.is_none().then(|| crate::vcs::real_location(path));
+    for root in project_roots {
+        if let Some(path) = &canonical
+            && root.canonicalize().is_ok_and(|root| path.starts_with(root))
+        {
+            return Ok(path.clone());
+        }
     }
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| "Workspace path could not be resolved.".to_string())?;
-    let inside = project_roots.iter().any(|root| {
-        root.canonicalize()
-            .is_ok_and(|root| canonical == root || canonical.starts_with(&root))
-    });
-    if inside {
-        Ok(canonical)
-    } else {
-        Err("Workspace path is not inside a project on this server.".into())
+    for root in project_roots {
+        let Ok(listed) = crate::vcs::list_worktrees(&crate::vcs::VcsListWorktreesInput {
+            cwd: root.to_string_lossy().into_owned(),
+        }) else {
+            continue;
+        };
+        // A registered project can be a subdirectory inside the main checkout.
+        // Its Git worktrees are allowed, but that does not grant the main checkout.
+        for (index, entry) in listed.worktrees.into_iter().enumerate() {
+            if index == 0 {
+                continue;
+            }
+            let worktree = Path::new(&entry.path);
+            if let Some(path) = &canonical
+                && !entry.prunable
+                && worktree
+                    .canonicalize()
+                    .is_ok_and(|root| path.starts_with(root))
+            {
+                return Ok(path.clone());
+            }
+            if !worktree.is_dir()
+                && missing
+                    .as_ref()
+                    .is_some_and(|path| path.starts_with(crate::vcs::real_location(worktree)))
+            {
+                return Err(DiffBlocker::WorktreeMissing {
+                    path: cwd.into(),
+                    branch: entry
+                        .ref_name
+                        .map(|name| name.trim_start_matches("refs/heads/").into()),
+                });
+            }
+        }
     }
+    Err(outside())
 }
 
 /// `workspace.readFile` path rule: after following symlinks, the file must land
@@ -181,15 +219,17 @@ pub fn resolve_read(
     let joined = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
-        resolve_cwd(cwd, project_roots)?.join(raw)
+        resolve_cwd(cwd, project_roots)
+            .map_err(|error| error.to_string())?
+            .join(raw)
     };
     let canonical = joined
         .canonicalize()
         .map_err(|_| "Workspace file could not be resolved.".to_string())?;
-    let inside = project_roots.iter().any(|root| {
-        root.canonicalize()
-            .is_ok_and(|root| canonical == root || canonical.starts_with(&root))
-    });
+    let inside = canonical
+        .parent()
+        .and_then(Path::to_str)
+        .is_some_and(|parent| resolve_cwd(parent, project_roots).is_ok());
     if inside {
         return Ok(canonical);
     }

@@ -27,6 +27,7 @@ const FILES: [&str; 6] = [
     "honcho-outbox.json",
 ];
 type Registry = HashMap<PathBuf, Weak<Mutex<Inner>>>;
+pub(crate) const SCHEMA_VERSION: u32 = 11;
 static OPEN: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct Inner {
@@ -42,6 +43,7 @@ struct Inner {
     dispatch_fenced: bool,
     claimed_dispatches: BTreeMap<&'static str, usize>,
     history_events: Vec<Value>,
+    replay_bounds_checked: bool,
     document_revision: u64,
 }
 
@@ -138,7 +140,7 @@ impl Database {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(error)?;
-        if version > 10 {
+        if version > SCHEMA_VERSION {
             return Err(error("This schema requires a newer Shina binary."));
         }
         // Check the authoritative saved format before any schema migration.
@@ -234,6 +236,15 @@ impl Database {
                 .map_err(error)?;
             tx.commit().map_err(error)?;
         }
+        if version < 11 {
+            if version == 10 {
+                crate::maintenance::backup_state(directory)?;
+            }
+            let tx = connection.transaction().map_err(error)?;
+            tx.execute_batch(include_str!("migrations/011.sql"))
+                .map_err(error)?;
+            tx.commit().map_err(error)?;
+        }
         let imported: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='legacy-import-v1')",
@@ -294,6 +305,7 @@ impl Database {
             dispatch_fenced: false,
             claimed_dispatches: BTreeMap::new(),
             history_events: Vec::new(),
+            replay_bounds_checked: false,
             document_revision: 0,
         })));
         if !imported {
@@ -523,6 +535,7 @@ impl Database {
         let task_operations = std::mem::take(&mut inner.staged_task_operations);
         let task_input_intents = std::mem::take(&mut inner.staged_task_input_intents);
         let history_events = std::mem::take(&mut inner.history_events);
+        let check_replay_bounds = !inner.replay_bounds_checked || !history_events.is_empty();
         let metrics_path = if cfg!(debug_assertions) {
             std::env::var_os("SHINA_TEST_STORAGE_METRICS").map(PathBuf::from)
         } else {
@@ -710,7 +723,8 @@ impl Database {
                 [seq.saturating_sub(1024) as i64],
             )
             .map_err(error)?;
-            tx.execute("DELETE FROM thread_events WHERE (thread_id,seq) IN (
+            if check_replay_bounds {
+                tx.execute("DELETE FROM thread_events WHERE (thread_id,seq) IN (
                 SELECT thread_id,seq FROM (
                     SELECT thread_id,seq,
                         SUM(length(CAST(payload AS BLOB))) OVER (ORDER BY seq DESC,thread_id DESC) AS retained_bytes,
@@ -718,6 +732,7 @@ impl Database {
                     FROM thread_events
                 ) WHERE retained_bytes > ?1 OR retained_count > 1024
             )",[4_i64*1024*1024]).map_err(error)?;
+            }
             let mut projection = projection.clone();
             if let Some(index) = projection.as_object_mut().unwrap().remove("index") {
                 crate::projection_store::write(&tx, "workspace-index", &index)?;
@@ -741,6 +756,9 @@ impl Database {
             tx.commit().map_err(error)
         })();
         inner.batch = None;
+        if result.is_ok() {
+            inner.replay_bounds_checked = true;
+        }
         if result.is_ok()
             && let Some(path) = metrics_path
         {
@@ -1808,6 +1826,33 @@ impl Database {
             .collect()
     }
 
+    /// Read the committed registry without materializing thread views or history.
+    pub fn committed_projects(&self) -> Result<Value, String> {
+        let inner = self.0.lock().expect("database");
+        if let Some(failure) = &inner.failure {
+            return Err(failure.clone());
+        }
+        let row: Option<(String, u32)> = inner
+            .connection
+            .query_row(
+                "SELECT payload,schema FROM projection_records
+                 WHERE document='workspace-index' AND scope='$' AND key='projects'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(error)?;
+        match row {
+            Some((payload, 1)) => serde_json::from_str(&payload).map_err(error),
+            Some(_) => Err("Project registry requires a newer Shina binary.".into()),
+            None => Ok(self
+                .read_projection_legacy(&inner.connection)?
+                .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+                .and_then(|mut value| value["index"].get_mut("projects").map(Value::take))
+                .unwrap_or_else(|| json!([]))),
+        }
+    }
+
     pub fn committed_snapshot(&self) -> Result<Value, String> {
         let inner = self.0.lock().expect("database");
         let state = self
@@ -2031,6 +2076,63 @@ mod tests {
             .commit(2, &json!({}), &json!([]), None, &[])
             .unwrap();
         assert_eq!(database.history_events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_indexes_replay_and_zero_insert_commits_still_expire_the_horizon() {
+        let directory = directory("replay-index");
+        let database = Database::open(&directory).unwrap();
+        {
+            database
+                .0
+                .lock()
+                .unwrap()
+                .connection
+                .execute_batch("DROP INDEX thread_events_seq_thread_idx; PRAGMA user_version=10;")
+                .unwrap();
+        }
+        drop(database);
+
+        let database = Database::open(&directory).unwrap();
+        {
+            let inner = database.0.lock().unwrap();
+            let plan: String = inner.connection.query_row(
+                "EXPLAIN QUERY PLAN SELECT payload FROM thread_events WHERE seq > 0 ORDER BY seq,thread_id",
+                [], |r| r.get(3)
+            ).unwrap();
+            assert!(plan.contains("thread_events_seq_thread_idx"), "{plan}");
+        }
+        database.begin().unwrap();
+        database.stage_history(
+            (1..=1025)
+                .rev()
+                .map(|id| json!({"threadId":id,"sequence":1,"events":[]}))
+                .collect(),
+        );
+        database
+            .commit(1, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        let replay = database.history_events().unwrap();
+        assert_eq!(replay.len(), 1024);
+        assert_eq!(replay[0]["threadId"], 2);
+        assert_eq!(replay[1023]["threadId"], 1025);
+        assert!(database.0.lock().unwrap().replay_bounds_checked);
+        database
+            .commit(1024, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        assert_eq!(database.history_events().unwrap(), replay);
+        database
+            .commit(1025, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        assert!(database.history_events().unwrap().is_empty());
+
+        drop(database);
+        let database = Database::open(&directory).unwrap();
+        assert!(database.history_events().unwrap().is_empty());
+        database
+            .commit(1026, &json!({}), &json!([]), None, &[])
+            .unwrap();
+        assert!(database.0.lock().unwrap().replay_bounds_checked);
     }
     use crate::{
         outbox,
@@ -2469,7 +2571,7 @@ mod tests {
             .connection
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, SCHEMA_VERSION);
         database
             .commit(
                 1,

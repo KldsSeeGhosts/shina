@@ -128,10 +128,6 @@ pub(super) fn render_with_find(
     } else {
         Cow::Borrowed(source)
     };
-    // KSG's diff rows: a quiet wash of the destructive red and the success green over the
-    // code fill, mixed in sRGB as a browser blends `color-mix`. Rune's `mix` works in linear
-    // light and would give much brighter washes.
-    let (added, removed) = diff_washes(dark, p);
     let style = MarkdownStyle::neutral(dark)
         .syntax_theme(syntax_theme(dark, p))
         .text(p.ink)
@@ -172,7 +168,7 @@ pub(super) fn render_with_find(
         .highlight_current_ring(Some((p.ring, 1.5)))
         // The header frame owns the visible border. Rune's inner card has none.
         .code_block(p.code_bg, Color::TRANSPARENT)
-        .diff(added, removed)
+        .diff(p.ok_bg, p.danger_bg)
         .code_block_font(
             TextStyle::new(12.0, 400.0)
                 .family(rune::Family::SystemMono)
@@ -345,16 +341,6 @@ pub(super) fn syntax_theme(dark: bool, p: Palette) -> SyntaxTheme {
     theme
 }
 
-/// The added and removed row fills: 14% of KSG's success green and destructive red over the
-/// code fill.
-fn diff_washes(dark: bool, p: Palette) -> (Color, Color) {
-    let green = if dark { "#3fb950" } else { "#1a7f37" };
-    (
-        mix_srgb(p.code_bg, color(green), 0.14),
-        mix_srgb(p.code_bg, p.danger, 0.14),
-    )
-}
-
 /// `t` of the way from `a` to `b`, mixed in sRGB-encoded space.
 fn mix_srgb(a: Color, b: Color, t: f32) -> Color {
     use rune::color::{srgb_decode, srgb_encode};
@@ -416,8 +402,28 @@ mod tests {
                 Status::Paused,
             ] {
                 let ink = status_ink(status, p);
-                for under in [p.bg, p.panel, p.card, selected_row] {
+                for under in [
+                    p.bg,
+                    p.panel,
+                    p.card,
+                    p.lift,
+                    selected_row,
+                    p.bg.mix(p.selected, p.selected.a),
+                    p.panel.mix(p.selected, p.selected.a),
+                    p.card.mix(p.selected, p.selected.a),
+                ] {
                     pairs.push(("status", ink, under));
+                }
+            }
+            for (name, ink, under) in [
+                ("done", p.ok, p.ok_bg),
+                ("attention", p.brass, p.brass_bg),
+                ("failed", p.danger, p.danger_bg),
+                ("working", p.sea, p.sea_bg),
+            ] {
+                pairs.push((name, ink, under));
+                for text in [p.ink, p.muted, p.faint] {
+                    pairs.push((name, text, under));
                 }
             }
             for (name, ink, under) in pairs {
@@ -431,7 +437,7 @@ mod tests {
     fn diff_rows_are_quiet_red_and_green_washes() {
         for dark in [true, false] {
             let p = palette(dark);
-            let (added, removed) = diff_washes(dark, p);
+            let (added, removed) = (p.ok_bg, p.danger_bg);
             for (wash, name) in [(added, "added"), (removed, "removed")] {
                 // A wash, not a loud fill: code text keeps 4.5:1 on it.
                 assert!(contrast(p.ink, wash) >= 4.5, "{name} dark={dark}");

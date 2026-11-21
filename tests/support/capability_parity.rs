@@ -527,7 +527,7 @@ fn task_plan_pins_a_real_stacked_worktree_and_replays_its_launch_after_restart()
         upstream_commit
     );
     assert_eq!(
-        fs::read_to_string(downstream_checkout.join("stack-output.txt")).unwrap(),
+        read_checkout_text(downstream_checkout.join("stack-output.txt")),
         "committed upstream output\n"
     );
     let prompt_log = downstream_checkout.join("fixture-prompts.jsonl");
