@@ -1,8 +1,4 @@
 //! Provider-owned agent runs stay inside the originating thread's tools.
-#![allow(
-    dead_code,
-    reason = "The Wave 3 Inspector and row renderers land in Slice B."
-)]
 
 use crate::model::{Thread, Tool};
 use serde_json::Value;
@@ -76,6 +72,7 @@ pub enum AgentRunId {
 
 pub struct AgentRun<'a> {
     pub tool_id: &'a str,
+    pub tool_position: usize,
     pub anchor: ToolAnchor,
     pub index: usize,
     pub provider_id: Option<&'a str>,
@@ -225,66 +222,86 @@ pub fn runs(thread: &Thread) -> Vec<AgentRun<'_>> {
     let mut runs = Vec::new();
     let fallback = thread.agent_index.fallback(&thread.tools);
     let index_data = fallback.as_ref().unwrap_or(&thread.agent_index);
-    for &index in index_data.tools.keys().rev() {
-        let tool = &thread.tools[index];
-        let activity = index_data
-            .latest_nested
-            .get(&tool.id)
-            .and_then(|&index| thread.tools.get(index))
-            .map(|nested| {
-                if nested.detail.is_empty() {
-                    nested.name.as_str()
-                } else {
-                    nested.detail.as_str()
-                }
-            });
-        if tool.subagents.is_empty() {
-            let count = aggregate(tool);
-            runs.push(AgentRun {
-                tool_id: &tool.id,
-                anchor: tool.anchor,
-                index: 0,
-                provider_id: None,
-                name: format!("{count} agents").into(),
-                brief: "",
-                model: None,
-                state: AgentState::for_tool(tool),
-                started: tool.started,
-                duration_ms: tool.duration_ms,
-                activity,
-                output: &tool.output,
-                count,
-                key_by_index: true,
-            });
-            continue;
-        }
-        for (index, agent) in tool.subagents.iter().enumerate() {
-            let state = AgentState::for_result(agent, tool);
-            runs.push(AgentRun {
-                tool_id: &tool.id,
-                anchor: tool.anchor,
-                index,
-                provider_id: agent["providerId"].as_str(),
-                name: agent["name"]
-                    .as_str()
-                    .filter(|name| !name.is_empty())
-                    .map_or_else(|| format!("Agent {}", index + 1).into(), Cow::Borrowed),
-                brief: agent["task"].as_str().unwrap_or(""),
-                model: agent["model"].as_str(),
-                state,
-                started: tool.started,
-                duration_ms: agent["durationMs"].as_u64().or(tool.duration_ms),
-                activity: state
-                    .active()
-                    .then(|| agent["activity"].as_str().or(activity))
-                    .flatten(),
-                output: agent["output"].as_str().unwrap_or(""),
-                count: 1,
-                key_by_index: agent["keyByIndex"] == true,
-            });
-        }
+    for &tool in index_data.tools.keys().rev() {
+        let len = thread.tools[tool].subagents.len().max(1);
+        runs.extend((0..len).filter_map(|position| run_at(thread, index_data, tool, position)));
     }
     runs
+}
+
+pub fn run(thread: &Thread, tool: usize, position: usize) -> Option<AgentRun<'_>> {
+    let fallback = thread.agent_index.fallback(&thread.tools);
+    run_at(
+        thread,
+        fallback.as_ref().unwrap_or(&thread.agent_index),
+        tool,
+        position,
+    )
+}
+
+fn run_at<'a>(
+    thread: &'a Thread,
+    data: &AgentIndex,
+    tool_position: usize,
+    index: usize,
+) -> Option<AgentRun<'a>> {
+    let tool = thread.tools.get(tool_position)?;
+    let activity = data
+        .latest_nested
+        .get(&tool.id)
+        .and_then(|&i| thread.tools.get(i))
+        .map(|nested| {
+            if nested.detail.is_empty() {
+                nested.name.as_str()
+            } else {
+                nested.detail.as_str()
+            }
+        });
+    if tool.subagents.is_empty() {
+        let count = aggregate(tool);
+        return (count > 0).then(|| AgentRun {
+            tool_id: &tool.id,
+            tool_position,
+            anchor: tool.anchor,
+            index: 0,
+            provider_id: None,
+            name: format!("{count} agents").into(),
+            brief: "",
+            model: None,
+            state: AgentState::for_tool(tool),
+            started: tool.started,
+            duration_ms: tool.duration_ms,
+            activity,
+            output: &tool.output,
+            count,
+            key_by_index: true,
+        });
+    }
+    let agent = tool.subagents.get(index)?;
+    let state = AgentState::for_result(agent, tool);
+    Some(AgentRun {
+        tool_id: &tool.id,
+        tool_position,
+        anchor: tool.anchor,
+        index,
+        provider_id: agent["providerId"].as_str(),
+        name: agent["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| format!("Agent {}", index + 1).into(), Cow::Borrowed),
+        brief: agent["task"].as_str().unwrap_or(""),
+        model: agent["model"].as_str(),
+        state,
+        started: tool.started,
+        duration_ms: agent["durationMs"].as_u64().or(tool.duration_ms),
+        activity: state
+            .active()
+            .then(|| agent["activity"].as_str().or(activity))
+            .flatten(),
+        output: agent["output"].as_str().unwrap_or(""),
+        count: 1,
+        key_by_index: agent["keyByIndex"] == true,
+    })
 }
 
 #[cfg(test)]

@@ -149,7 +149,7 @@ pub enum Done {
     /// The owning machine lacks `review-diff-v1`; the name is its label.
     Unsupported(String),
     Blocked(DiffBlocker),
-    Failed(String),
+    Failed,
 }
 
 /// Match panel keys at the UI boundary, then look up by machine and thread.
@@ -703,11 +703,7 @@ impl State {
             .iter()
             .position(|t| owner == Some((t.machine.as_str(), t.id)))
         else {
-            self.diff_apply_done(
-                panel_key,
-                request,
-                Done::Failed("Thread does not exist.".into()),
-            );
+            self.diff_apply_done(panel_key, request, Done::Failed);
             return;
         };
         diff.seen_completed_at = self.threads[index].life.last_completed_at;
@@ -724,8 +720,8 @@ impl State {
         }
         let cwd = match self.thread_directory(index) {
             Ok(dir) => dir.to_string_lossy().into_owned(),
-            Err(error) => {
-                self.diff_apply_done(panel_key, request, Done::Failed(error));
+            Err(_) => {
+                self.diff_apply_done(panel_key, request, Done::Failed);
                 return;
             }
         };
@@ -764,11 +760,7 @@ impl State {
                     );
                     target.call_rpc(format!("diff:{request}"), "review.getDiffPreview", params);
                 }
-                Err(error) => self.diff_apply_done(
-                    panel_key,
-                    request,
-                    Done::Failed(format!("Invalid diff request: {error}")),
-                ),
+                Err(_) => self.diff_apply_done(panel_key, request, Done::Failed),
             }
             return;
         }
@@ -1461,7 +1453,7 @@ const GUTTER_W: f32 = 100.0;
 /// mapped to `Palette` (add = sea, delete = danger, modify/rename = muted).
 fn status_mark(change: &ChangeKind, p: Palette) -> (&'static str, Color) {
     match change {
-        ChangeKind::Added | ChangeKind::Copied => ("A", p.sea),
+        ChangeKind::Added | ChangeKind::Copied => ("A", p.ok),
         ChangeKind::Deleted => ("D", p.danger),
         ChangeKind::Modified | ChangeKind::Renamed => (
             if matches!(change, ChangeKind::Renamed) {
@@ -1504,7 +1496,7 @@ pub(super) fn diff_stat_label(key: &str, additions: u32, deletions: u32, p: Pale
         .center_y()
         .gap(8.0)
         .child(
-            meta_text(format!("+{}", format_compact_diff_count(additions)), p.sea)
+            meta_text(format!("+{}", format_compact_diff_count(additions)), p.ok)
                 .align(rune::Align::End)
                 .w(28.0),
         )
@@ -1748,6 +1740,101 @@ fn centered_state(text: impl Into<String>, p: Palette, retry: bool) -> El {
     body
 }
 
+fn blocked_state(s: &State, p: Palette, blocker: &DiffBlocker) -> El {
+    let (key, glyph, ink, title, path, detail, action) = match blocker {
+        DiffBlocker::NotARepository { path } => ("not-repo", "folder", p.faint,
+            "This workspace is not a Git repository".into(), path.clone(),
+            "Run git init there, or choose a workspace that is a repository.".into(), "Change workspace"),
+        DiffBlocker::OutsideProjects { path, server } => ("outside", "alert", p.brass,
+            format!("This folder is not a workspace on {server}"), path.clone(),
+            "Shina only reviews registered workspaces. Add this folder to review it.".into(), "Add as workspace"),
+        DiffBlocker::WorktreeMissing { path, branch } => ("worktree", "alert", p.brass,
+            "The worktree folder is gone".into(), path.clone(),
+            branch.as_ref().map_or_else(|| "Choose an existing checkout to review changes.".into(),
+                |branch| format!("The configured branch is {branch}. Choose an existing checkout to review changes.")),
+            "Change workspace"),
+        DiffBlocker::MachineOffline { machine } => ("offline", "cloud", p.faint,
+            format!("{machine} is offline"), s.thread_directory(s.active)
+                .map(|path| path.display().to_string()).unwrap_or_default(),
+            "The diff loads when this machine reconnects.".into(), "Reconnect"),
+        DiffBlocker::GitFailed { path, .. } => ("git", "alert", p.danger,
+            "Git could not read this repository".into(), path.clone(),
+            "Check that Git can read the workspace, then retry.".into(), "Retry"),
+    };
+    let action_path = path.clone();
+    let copy_path = path.clone();
+    let machine = s.current().machine.clone();
+    let scope = s
+        .diffs
+        .get(&s.panel_key())
+        .map(|diff| diff.scope)
+        .unwrap_or_default();
+    let mut card = col()
+        .key(format!("diff-state-{key}"))
+        .w_full()
+        .max_w(420.0)
+        .px(16.0)
+        .gap(8.0)
+        .child(icon(glyph, ink))
+        .child(label(title, CARD_TITLE, p.ink).wrap())
+        .child(
+            label(path, MONO_META, p.ink)
+                .key("diff-state-path")
+                .wrap_anywhere()
+                .selectable(true)
+                .fill(p.code_bg)
+                .radius(6.0)
+                .padding(8.0),
+        )
+        .child(label(detail, SMALL, p.muted).wrap())
+        .child(button("diff-state-action", action, p, move |s| match key {
+            "outside" => {
+                s.open_picker(ProjectPicker::AddProject);
+                s.picker_query.replace_text(&action_path);
+            }
+            "offline" => s.retry_machine(&machine),
+            "git" => {
+                s.diff_details = None;
+                s.diff_request();
+            }
+            _ => s.open_picker(ProjectPicker::Scope),
+        }));
+    if matches!(blocker, DiffBlocker::OutsideProjects { .. }) {
+        card = card.child(button("diff-state-retry", "Retry", p, |s| s.diff_request()));
+    }
+    if matches!(blocker, DiffBlocker::NotARepository { .. }) {
+        card = card.child(
+            button("diff-state-copy-path", "Copy path", p, |_| {})
+                .on_press_tx(move |_: &mut State, tx| tx.copy(copy_path.clone())),
+        );
+    }
+    if let DiffBlocker::GitFailed { detail, .. } = blocker {
+        let panel = format!("{}:{scope:?}", s.panel_key());
+        let expanded = s.diff_details.as_ref() == Some(&panel);
+        card = card.child(
+            button("diff-state-details", "Details", p, move |s| {
+                s.diff_details = if expanded { None } else { Some(panel.clone()) };
+            })
+            .expanded(expanded),
+        );
+        if expanded {
+            card = card.child(
+                col()
+                    .max_h(120.0)
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    })
+                    .child(
+                        label(detail, MONO_META, p.muted)
+                            .wrap_anywhere()
+                            .selectable(true),
+                    ),
+            );
+        }
+    }
+    card
+}
+
 /// The status mark of a file header, then the path with the directory part in
 /// `p.muted` and the name in `p.ink` — `old → new` for a rename.
 fn file_title(entry: &FileEntry, p: Palette) -> El {
@@ -1836,7 +1923,7 @@ fn diff_stat_inline(additions: u32, deletions: u32, p: Palette) -> El {
         .center_y()
         .gap(8.0)
         .child(
-            meta_text(format!("+{}", format_compact_diff_count(additions)), p.sea)
+            meta_text(format!("+{}", format_compact_diff_count(additions)), p.ok)
                 .align(rune::Align::End)
                 .w(28.0),
         )
@@ -1891,8 +1978,8 @@ fn line_row(
     dark: bool,
 ) -> El {
     let (bg, marker, marker_ink, text_ink) = match kind {
-        LineKind::Added => (p.sea_bg, "+", p.sea, p.ink),
-        LineKind::Deleted => (p.coral_bg, "-", p.danger, p.ink),
+        LineKind::Added => (p.ok_bg, "+", p.ok, p.ink),
+        LineKind::Deleted => (p.danger_bg, "-", p.danger, p.ink),
         LineKind::Context => (p.panel, "", p.faint, p.ink),
     };
     let spans: Vec<rune::text::Span> = language
@@ -2197,8 +2284,10 @@ pub(super) fn body(s: &State, p: Palette) -> El {
             false,
         )
         .into(),
-        Some(Done::Failed(error)) => centered_state(error.clone(), p, true).into(),
-        Some(Done::Blocked(blocker)) => centered_state(blocker.to_string(), p, true).into(),
+        Some(Done::Failed) => {
+            centered_state("Could not read changes. Retry the diff.", p, true).into()
+        }
+        Some(Done::Blocked(blocker)) => blocked_state(s, p, blocker),
         Some(Done::Empty) => centered_state(EMPTY_TEXT, p, false).into(),
         Some(Done::Missing) => centered_state(MISSING_TEXT, p, false).into(),
         Some(Done::Ready(ready)) => ready_body(s, p, &panel_key, ready).into(),

@@ -5096,6 +5096,8 @@ pub struct State {
     /// Per-thread diff panel state, keyed like right_panels. Session only.
     pub(crate) diffs: crate::ui::diff_panel::DiffCache,
     pub diff_blockers: std::collections::HashMap<String, crate::review::DiffBlocker>,
+    pub diff_details: Option<String>,
+    pub session_notices: std::collections::HashSet<String>,
     /// App-wide "hide test files" switch for the diff panel; saved in the UI snapshot
     /// only when on.
     pub diff_hide_tests: bool,
@@ -5253,6 +5255,8 @@ pub struct State {
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
+    pub(crate) sidebar_index: std::cell::RefCell<crate::ui::sidebar_ui::SidebarIndex>,
+    pub(crate) sidebar_preview: crate::ui::sidebar_preview::SidebarPreview,
     #[allow(dead_code, reason = "Read by the Slice B preview overlay.")]
     pub preview: SidebarPreview,
     pub flash_tool: Option<(String, Instant)>,
@@ -5274,6 +5278,7 @@ pub struct State {
     pub timeline_positions: std::cell::RefCell<crate::timeline_position::Positions>,
     pub updater: crate::update::Updater,
     pub update_popover: bool,
+    pub update_details: bool,
     /// Set by "Restart to update". The restart only happens on a quit that saves cleanly.
     pub restart_for_update: bool,
     /// The explicit restart has saved and recorded its update for the pending quit.
@@ -6232,6 +6237,8 @@ impl State {
             right_panel_resizing: false,
             diffs: Default::default(),
             diff_blockers: Default::default(),
+            diff_details: None,
+            session_notices: Default::default(),
             diff_hide_tests: false,
             diff_tree_open: false,
             diff_tree_width: None,
@@ -6346,6 +6353,8 @@ impl State {
             model_search: TextEdit::default(),
             thread_find: ThreadFindState::default(),
             sidebar_search: SidebarSearchState::default(),
+            sidebar_index: Default::default(),
+            sidebar_preview: Default::default(),
             device_ui_dirty: false,
             device_draft_cache: Default::default(),
             preview: SidebarPreview::default(),
@@ -6364,6 +6373,7 @@ impl State {
             timeline_positions: std::cell::RefCell::default(),
             updater: Default::default(),
             update_popover: false,
+            update_details: false,
             restart_for_update: false,
             restart_approved: false,
             restart_notice: None,
@@ -6447,7 +6457,6 @@ impl State {
         crate::agents::has_agents(self.current())
     }
 
-    #[allow(dead_code, reason = "Called by the Slice B preview overlay.")]
     pub fn preview_allowed(&self) -> bool {
         self.drag_thread.is_none()
             && self.row_menu.is_none()
@@ -6493,7 +6502,6 @@ impl State {
     }
 
     /// Expand the originating tool and its containing work fold, then reveal the turn.
-    #[allow(dead_code, reason = "Called by the Slice B Agents panel.")]
     pub fn reveal_tool(&mut self, tool_id: String) {
         let t = self.current_mut();
         let Some(index) = t.tools.iter().position(|tool| tool.id == tool_id) else {
@@ -7529,28 +7537,47 @@ impl State {
         });
         projects.into_iter().map(|p| p.id).collect()
     }
-    pub fn sidebar_threads(&self) -> Vec<usize> {
-        let mut threads: Vec<_> = self
+    pub(crate) fn hash_sidebar_coordinators(&self, hash: &mut impl std::hash::Hasher) {
+        use std::hash::Hash as _;
+        for task in self
+            .tasks
+            .iter()
+            .filter(|task| task.coordinator_captain.is_some())
+        {
+            task.child_thread_id.hash(hash);
+        }
+    }
+
+    pub(crate) fn sidebar_thread_candidates(&self) -> impl Iterator<Item = (usize, &Thread)> {
+        let standalone: std::collections::HashSet<_> = self
             .threads
             .iter()
+            .filter(|thread| !thread.captain_home)
+            .map(|thread| thread.id)
+            .collect();
+        let coordinated: std::collections::HashSet<_> = self
+            .tasks
+            .iter()
+            .filter(|task| task.coordinator_captain.is_some())
+            .map(|task| task.child_thread_id)
+            .collect();
+        self.threads
+            .iter()
             .enumerate()
-            .filter(|(_, t)| {
+            .filter(move |(_, t)| {
                 t.archived() == self.show_archive
                     && t.crew_captain.is_none()
                     && (!t.delegated
-                        || t.parent.is_some_and(|id| {
-                            self.threads
-                                .iter()
-                                .any(|parent| parent.id == id && !parent.captain_home)
-                        })
-                        || self.tasks.iter().any(|task| {
-                            task.child_thread_id == t.id && task.coordinator_captain.is_some()
-                        }))
+                        || t.parent.is_some_and(|id| standalone.contains(&id))
+                        || coordinated.contains(&t.id))
                     && !self.is_captain_home(t)
                     && (!t.is_draft() || self.draft_listed(t))
             })
             .filter(|(_, t)| self.in_scope(t))
-            .collect();
+    }
+
+    pub fn sidebar_threads(&self) -> Vec<usize> {
+        let mut threads: Vec<_> = self.sidebar_thread_candidates().collect();
         let at = lifecycle::now();
         threads.sort_by(|(_, a), (_, b)| {
             let sa = self.thread_section(a, at);
@@ -7871,6 +7898,7 @@ impl State {
             .collect()
     }
     /// Live or archived workers, matching the current view, whether shown or not.
+    #[cfg(test)]
     pub fn captain_worker_count(&self, home: usize) -> usize {
         self.threads
             .iter()
@@ -8316,6 +8344,7 @@ impl State {
             .map(|parent| self.effective_home(parent))
             .unwrap_or(current.id)
     }
+    #[cfg(test)]
     pub fn visible_sidebar_threads(&self) -> Vec<usize> {
         let mut settled = 0;
         self.sidebar_threads()
@@ -8355,36 +8384,7 @@ impl State {
         }
         if self.drag_thread == Some(id) {
             let [x, y] = drag.window_point();
-            self.drag_target = None;
-            for i in self.visible_sidebar_threads() {
-                let t = &self.threads[i];
-                if t.id == id {
-                    continue;
-                }
-                if let Some([rx, ry, rw, rh]) =
-                    self.drop_rects.get(&format!("thread-{}", t.id)).copied()
-                    && x >= rx
-                    && x <= rx + rw
-                    && y >= ry
-                    && y <= ry + rh
-                {
-                    let section = self.thread_section(t, lifecycle::now());
-                    let before = if y < ry + rh / 2.0 {
-                        Some(t.id)
-                    } else {
-                        self.sidebar_threads()
-                            .into_iter()
-                            .skip_while(|j| *j != i)
-                            .skip(1)
-                            .find(|j| {
-                                self.thread_section(&self.threads[*j], lifecycle::now()) == section
-                            })
-                            .map(|j| self.threads[j].id)
-                    };
-                    self.drag_target = Some((section, before));
-                    break;
-                }
-            }
+            self.drag_target = crate::ui::sidebar_ui::drag_row_at(self, id, [x, y]);
             for section in [Section::Pinned, Section::Active, Section::Settled] {
                 if let Some([rx, ry, rw, rh]) =
                     self.drop_rects.get(&format!("drop-{section:?}")).copied()
@@ -8941,7 +8941,6 @@ impl State {
         }
     }
 
-    #[allow(dead_code, reason = "Called by Slice B menu actions.")]
     pub fn unread_blocker(&self, thread: &Thread) -> Option<String> {
         thread
             .life
@@ -17264,19 +17263,16 @@ impl State {
         index.and(drafts).and(memory)
     }
 
-    /// Why a restart to update must wait, or `None` when nothing is active. It checks every
-    /// thread, including delegated, settled and archived ones.
-    #[allow(
-        dead_code,
-        reason = "The Wave 3 footer and Settings readers land in Slice B."
-    )]
+    /// Display copy and available actions shared by the update control and Settings.
     pub fn update_summary(&self) -> crate::update_status::UpdateSummary {
         use crate::fleet_update::PillTone;
         use crate::update::Status;
         use crate::update_status::{MachineUpdate, UpdateAction, UpdatePhase::*, UpdateSummary};
 
         let last_check = self.updater.last_check_label().to_owned();
-        if self.demo || self.updater.status() == &Status::Disabled {
+        if self.demo
+            || !self.updater.self_update_enabled() && self.updater.status() == &Status::Disabled
+        {
             return UpdateSummary::from_phase(
                 Disabled,
                 None,
@@ -17312,6 +17308,15 @@ impl State {
                 .flat_map(|notice| notice.lines.iter().cloned()),
         );
         raw.extend(pill_failure.into_iter().map(|pill| pill.title.clone()));
+        for row in self
+            .fleet
+            .rows
+            .iter()
+            .filter(|row| row.result == Some(false))
+        {
+            raw.extend(row.provider_failure.iter().cloned());
+            raw.extend(row.state.strip_prefix("failed: ").map(str::to_owned));
+        }
 
         let running = self.fleet.running || self.fleet_run_visible();
         let provider_offers = self.all_provider_candidates();
@@ -17325,7 +17330,7 @@ impl State {
                 server: row.server.clone(),
                 name: row.name.clone(),
                 status: if running {
-                    self.run_status(row).into()
+                    crate::fleet_update::status_word(self.run_status(row)).into()
                 } else {
                     row.state.clone()
                 },
@@ -17375,7 +17380,12 @@ impl State {
 
         let mut detail = None;
         let phase = if running {
-            detail = Some(self.describe_capsule().label);
+            let capsule = self.describe_capsule();
+            detail = Some(if let Some(elapsed) = capsule.elapsed {
+                format!("{} · {elapsed}", capsule.label)
+            } else {
+                capsule.label
+            });
             let include_app = self.fleet.local_version.is_some()
                 && !self.fleet.rows.iter().any(|row| row.server == "local");
             FleetRunning {
@@ -17441,7 +17451,9 @@ impl State {
                     is_app: true,
                     server: "local".into(),
                     name: "This app".into(),
-                    status: summary.headline.clone(),
+                    status: self
+                        .capsule_local_status()
+                        .unwrap_or_else(|| summary.headline.clone()),
                     current_version: Some(summary.version.into()),
                     target_version: match &summary.phase {
                         Ready { tag, .. } | Downloading { tag, .. } => Some(tag.clone()),
@@ -17453,6 +17465,27 @@ impl State {
                         .filter(|action| !matches!(action, UpdateAction::UpdateEverything)),
                 },
             );
+        }
+        if self.fleet.postponed_local && matches!(summary.phase, Ready { blocker: None, .. }) {
+            summary.action = Some(UpdateAction::RestartPostponed);
+        }
+        if self.fleet.phase == crate::fleet_update::RunPhase::Countdown {
+            summary.action = Some(UpdateAction::Postpone);
+        }
+        summary.dismissible = self.fleet.result_notice.is_some()
+            || self
+                .fleet
+                .pill
+                .as_ref()
+                .is_some_and(|pill| pill.dismissible);
+        if matches!(summary.phase, Idle | UpToDate)
+            && let Some(notice) = self
+                .fleet
+                .result_notice
+                .as_ref()
+                .filter(|notice| notice.success)
+        {
+            summary.detail.push_str(&format!(" {}", notice.title));
         }
         summary
     }
@@ -17991,6 +18024,17 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         | html_changed
         | attachment_changed
         | keybindings_changed;
+    browsing |= crate::ui::sidebar_preview::poll(state, tx);
+    if let Some(error) = state.lifecycle_error.take() {
+        state.push_toast(
+            ToastKind::Error,
+            "Could not change the thread",
+            Some(error),
+            None,
+            Some(5_000),
+        );
+        browsing = true;
+    }
     if let Some(row) = state.pending_tool_reveal.take() {
         tx.scroll_center_in_instant(format!("conversation-{}", state.current().id), row);
         browsing = true;
@@ -17998,7 +18042,15 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some((_, started)) = &state.flash_tool {
         let remaining = Duration::from_secs(2).saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            state.flash_tool = None;
+            if let Some((id, _)) = state.flash_tool.take() {
+                let thread = state.current_mut();
+                if let Some(tool) = thread.tools.iter().find(|tool| tool.id == id) {
+                    thread
+                        .timeline_cache
+                        .get_mut()
+                        .touch_message(tool.anchor.message);
+                }
+            }
             browsing = true;
         } else {
             tx.wake_after(remaining);

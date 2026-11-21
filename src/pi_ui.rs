@@ -788,7 +788,8 @@ pub(super) fn queued_messages(s: &State, p: Palette) -> El {
 
 /// Ported from KSG Code's TimelineV2EventRow/V2SubagentGroup and provider-pi result parsing.
 /// These are extension-owned tasks, not Shina crew threads, so they have no invented thread links.
-pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
+pub(super) fn subagent_results(s: &State, tool: &Tool, p: Palette) -> El {
+    let anchor = format!("agents-group-{}", tool.id);
     let mut group = col()
         .key(format!("pi-subagents-{}", tool.id))
         .gap(6.0)
@@ -796,7 +797,19 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
             format!("{} Pi subagents", tool.subagents.len()),
             SMALL,
             p.muted,
-        ));
+        ))
+        .child(
+            button(
+                &format!("pi-subagents-open-{}", tool.id),
+                "Open in Agents",
+                p,
+                agents_ui::open,
+            )
+            .on_press_tx(move |s: &mut State, tx| {
+                agents_ui::open(s);
+                tx.scroll_into_view(anchor.clone());
+            }),
+        );
     if tool.expanded {
         for (i, agent) in tool.subagents.iter().enumerate() {
             let mut card = col()
@@ -809,7 +822,18 @@ pub(super) fn subagent_results(tool: &Tool, p: Palette) -> El {
                     row()
                         .gap(8.0)
                         .center_y()
-                        .child(icon("thread", p.muted))
+                        .child(crewmate_avatar(
+                            s,
+                            p,
+                            agent["model"].as_str().unwrap_or(&s.current().model),
+                            match agent["status"].as_str() {
+                                Some("Failed") => Status::Failed,
+                                Some("Working") => Status::Running,
+                                Some("Done") => Status::Completed,
+                                _ => Status::Ready,
+                            },
+                            20.0,
+                        ))
                         .child(
                             label(crate::model::string(agent, "name"), SMALL, p.ink)
                                 .truncate()
@@ -1042,46 +1066,118 @@ pub(super) fn conversation_picker(s: &State, p: Palette) -> El {
 }
 
 /// Ported from KSG Code's ComposerFooterModeControls and runtimeModeConfig permission menu.
-pub(super) fn access_picker(s: &State, p: Palette) -> El {
+pub(super) fn access_glyph(mode: crate::model::AccessMode) -> &'static str {
+    use crate::model::AccessMode::*;
+    match mode {
+        ReadOnly => "eye",
+        Supervised => "shield",
+        Edits => "pencil",
+        Auto => "bolt",
+        Full => "lock-open",
+    }
+}
+
+/// The active radio and access glyph follow KSG Code's `ComposerPermissionsSection`.
+pub(super) fn access_picker(s: &State, p: Palette, anchor: &str) -> El {
     let t = s.current();
-    let (modes, _) = crate::model::resolve_compatible_access_mode(
+    let (modes, active) = crate::model::resolve_compatible_access_mode(
         t.native.access,
         crate::model::supported_access_modes(&t.harness),
     );
     let mut card = col()
         .key("access-picker")
-        .w((s.viewport_width - 32.0).clamp(280.0, 400.0))
-        .padding(8.0)
+        .role("radiogroup")
+        .label("Access mode")
+        .focus_group()
+        .w((s.viewport_width - 16.0).min(340.0))
+        .max_h((s.viewport_height - 24.0).max(320.0))
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .padding(6.0)
         .gap(4.0)
         .radius(12.0)
         .fill(p.card)
         .border(1.0, p.frame)
         .box_shadow(soft_shadow(p));
+    let mut group = None;
     for mode in modes {
+        let asks = !matches!(
+            mode,
+            crate::model::AccessMode::Auto | crate::model::AccessMode::Full
+        );
+        let glyph = access_glyph(mode);
+        if group != Some(asks) {
+            group = Some(asks);
+            card = card.child(
+                meta_label(
+                    if asks {
+                        "Asks first"
+                    } else {
+                        "Runs on its own"
+                    },
+                    p.faint,
+                )
+                .key(if asks {
+                    "access-group-asks"
+                } else {
+                    "access-group-runs"
+                })
+                .px(8.0),
+            );
+        }
         let description = mode.description();
         let denial = crate::model::managed_access_mode_denial(s.managed_policy.as_ref(), mode);
         let disabled = denial.is_some();
-        let mut row = col()
-            .key(format!("access-{}", mode.id()))
-            .role("button")
-            .label(mode.label())
-            .disabled(disabled)
-            .padding(8.0)
-            .gap(4.0)
-            .radius(6.0)
+        let checked = mode == active;
+        let full = glyph == "lock-open";
+        let mut words = col()
+            .grow(1.0)
+            .min_w(0.0)
+            .gap(2.0)
             .child(label(
                 mode.label(),
-                LABEL,
-                if disabled { p.muted } else { p.ink },
+                TITLE,
+                if disabled { p.faint } else { p.ink },
             ))
             .child(label(description, SMALL, p.muted).wrap());
-        if let Some(reason) = denial {
-            row = row.child(
-                label(&reason, SMALL, p.muted)
+        if let Some(reason) = &denial {
+            words = words.child(
+                label(reason, SMALL, p.faint)
                     .key(format!("access-{}-denial", mode.id()))
                     .wrap(),
             );
-        } else {
+        }
+        let mut row = super::row()
+            .key(format!("access-{}", mode.id()))
+            .role("radio")
+            .label(mode.label())
+            .description(denial.as_deref().unwrap_or(description))
+            .checked(checked)
+            .disabled(disabled)
+            .min_h(52.0)
+            .padding(8.0)
+            .gap(10.0)
+            .center_y()
+            .radius(8.0)
+            .fill(if checked { p.lift } else { Color::TRANSPARENT })
+            .border(1.0, if checked { p.frame } else { Color::TRANSPARENT })
+            .child(
+                el().size(28.0, 28.0)
+                    .center()
+                    .radius(8.0)
+                    .fill(if full { p.brass_bg } else { p.tray })
+                    .child(icon(glyph, if full { p.brass } else { p.muted })),
+            )
+            .child(words)
+            .child(el().size(16.0, 16.0).child(if disabled {
+                icon("lock", p.faint)
+            } else if checked {
+                icon("check", p.ink).key(format!("access-{}-check", mode.id()))
+            } else {
+                el()
+            }));
+        if !disabled {
             row = row
                 .focusable(true)
                 .cursor(rune::Cursor::Pointer)
@@ -1090,19 +1186,29 @@ pub(super) fn access_picker(s: &State, p: Palette) -> El {
                     s.set_access_mode(mode);
                     s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
                 });
+            if checked {
+                row = row.autofocus().focus_selected(true);
+            }
         }
         card = card.child(row);
     }
-    card = card.child(label("Tool approvals do not sandbox the process. Trusted extensions retain your account's permissions.",SMALL,p.muted).wrap().padding(8.0));
-    modal_frame(
-        "access-modal",
-        s,
-        |s| {
+    el().key("access-modal")
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .modal(true, |s: &mut State| {
             s.current_mut().native.access_picker = false;
             s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-        },
-        card,
-    )
+        })
+        .child(
+            card.child(rule(p)).child(
+                label(
+                    "Approvals are not a sandbox. Extensions keep your account's permissions.",
+                    SMALL,
+                    p.faint,
+                )
+                .wrap()
+                .padding(8.0),
+            ),
+        )
 }
 
 #[cfg(test)]

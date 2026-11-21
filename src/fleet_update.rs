@@ -1931,7 +1931,7 @@ impl crate::model::State {
             _ => "waiting",
         }
     }
-    /// The capsule label, tone and action, KSG `describeUpdateCapsule`.
+    /// The fleet progress label and action, based on KSG `describeUpdateCapsule`.
     pub fn describe_capsule(&self) -> CapsuleView {
         let now = Instant::now();
         if self.fleet.phase == RunPhase::Countdown
@@ -1939,7 +1939,6 @@ impl crate::model::State {
         {
             let seconds = (at.saturating_duration_since(now).as_secs() + 1).min(5);
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: format!("Restart in {seconds}s"),
                 elapsed: None,
                 action: CapsuleAction::Later,
@@ -1947,7 +1946,6 @@ impl crate::model::State {
         }
         if self.fleet.phase == RunPhase::Installing {
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: "Restarting...".into(),
                 elapsed: None,
                 action: CapsuleAction::None,
@@ -1970,7 +1968,6 @@ impl crate::model::State {
             .filter(|(row, _)| now.duration_since(row.started_at) >= Duration::from_secs(180))
         {
             return CapsuleView {
-                tone: CapsuleTone::Slow,
                 label: row.name.clone(),
                 elapsed: Some(format_update_elapsed(now.duration_since(row.started_at))),
                 action: CapsuleAction::None,
@@ -1985,7 +1982,6 @@ impl crate::model::State {
             .any(|(_, status)| !matches!(*status, "done" | "failed"))
         {
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: format!("{done} of {} updated", self.fleet.rows.len()),
                 elapsed: None,
                 action: CapsuleAction::None,
@@ -1997,7 +1993,6 @@ impl crate::model::State {
             // The updater exposes no real progress, so the capsule says only
             // "Downloading" rather than an invented percentage.
             return CapsuleView {
-                tone: CapsuleTone::Default,
                 label: "Downloading".into(),
                 elapsed: None,
                 action: CapsuleAction::None,
@@ -2015,7 +2010,6 @@ impl crate::model::State {
                 format!("{} failed", failed.len())
             };
             return CapsuleView {
-                tone: CapsuleTone::Failed,
                 label,
                 elapsed: None,
                 action: if failed
@@ -2029,7 +2023,6 @@ impl crate::model::State {
             };
         }
         CapsuleView {
-            tone: CapsuleTone::Default,
             label: format!("{done} of {} updated", self.fleet.rows.len()),
             elapsed: None,
             action: CapsuleAction::None,
@@ -3140,17 +3133,10 @@ fn result_notice(
 
 /// What the capsule's left side and action show, KSG `UpdateCapsuleView`.
 pub struct CapsuleView {
-    pub tone: CapsuleTone,
     pub label: String,
     /// "4m"-style elapsed after the label once a machine is slow (3 minutes).
     pub elapsed: Option<String>,
     pub action: CapsuleAction,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapsuleTone {
-    Default,
-    Slow,
-    Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapsuleAction {
@@ -4371,7 +4357,6 @@ mod tests {
             Some("studio Codex: Update command exited with code 1: EACCES")
         );
         let capsule = state.describe_capsule();
-        assert_eq!(capsule.tone, CapsuleTone::Failed);
         assert_eq!(capsule.label, "studio failed");
         // Provider failures retry from Settings, so the capsule offers only Dismiss.
         assert_eq!(capsule.action, CapsuleAction::Dismiss);
@@ -4594,7 +4579,6 @@ mod tests {
         assert_eq!(state.describe_capsule().label, "1 of 2 updated");
         state.fleet.rows[0].started_at = Instant::now() - Duration::from_secs(240);
         let slow = state.describe_capsule();
-        assert_eq!(slow.tone, CapsuleTone::Slow);
         assert_eq!(slow.label, "alpha");
         assert_eq!(slow.elapsed.as_deref(), Some("4m"));
     }

@@ -286,6 +286,12 @@ fn dispatch_global_command(
                     (i + 1) % order.len()
                 };
                 let (server, id) = &order[next];
+                if let Some(tx) = tx {
+                    tx.scroll_into_view_in(
+                        "sidebar-scroll",
+                        ui::sidebar_target_key(state, server, *id),
+                    );
+                }
                 if state.client.is_some() {
                     state.open_machine_thread(server, *id);
                 } else if let Some(index) = state.threads.iter().position(|thread| thread.id == *id)

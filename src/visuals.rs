@@ -278,6 +278,69 @@ enum Shown {
     /// The upper bust: a `BUST_WINDOW` square of cells cut from the full bust.
     Window(usize, usize),
     Mark(bool),
+    Mascot(ProviderMascot, bool),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProviderMascot {
+    OpenAi,
+    Anthropic,
+    Google,
+    DeepSeek,
+    Glm,
+    Qwen,
+    Grok,
+    Default,
+}
+
+impl ProviderMascot {
+    const ALL: [Self; 8] = [
+        Self::OpenAi,
+        Self::Anthropic,
+        Self::Google,
+        Self::DeepSeek,
+        Self::Glm,
+        Self::Qwen,
+        Self::Grok,
+        Self::Default,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Google => "google",
+            Self::DeepSeek => "deepseek",
+            Self::Glm => "glm",
+            Self::Qwen => "qwen",
+            Self::Grok => "grok",
+            Self::Default => "default",
+        }
+    }
+}
+
+pub fn provider_mascot_for(model_or_provider: &str) -> ProviderMascot {
+    use ProviderMascot::*;
+    let name = model_or_provider.to_ascii_lowercase();
+    for (mascot, names) in [
+        (Anthropic, &["anthropic", "claude"][..]),
+        (Google, &["google", "gemini", "antigravity"]),
+        (DeepSeek, &["deepseek"]),
+        (Glm, &["glm", "zhipu", "z.ai"]),
+        (Qwen, &["qwen", "alibaba"]),
+        (Grok, &["grok", "x.ai", "xai"]),
+        (OpenAi, &["openai", "codex", "gpt-"]),
+    ] {
+        if names.iter().any(|alias| name.contains(alias)) {
+            return mascot;
+        }
+    }
+    Default
+}
+
+// Packaged assets can supply bytes here once the mascot set ships.
+fn embedded_mascot(_mascot: ProviderMascot, _small: bool) -> Option<&'static [u8]> {
+    None
 }
 
 /// The upper-bust window, in cells of the 40 cell bust: x 8..32 and y 4..28. It keeps what makes
@@ -303,6 +366,8 @@ fn cut_cells(
 
 pub struct Artwork {
     crew: [Set; PORTRAITS],
+    pixel_art: [bool; PORTRAITS],
+    mascots: HashMap<ProviderMascot, [Option<Art>; 2]>,
     /// Head crops for tiles of 24 px and below, where the full bust is too small to read.
     small: [Set; PORTRAITS],
     /// Animation strips for full busts. A captain without all four stays static.
@@ -326,11 +391,28 @@ impl Artwork {
         let wake: Waker = Arc::new(|| {});
         let cache = ImageCache::new(wake);
         let root = sprite_root(workspace);
+        let mascot_root = workspace.join("assets/providers/crew");
+        let mut mascots = HashMap::new();
+        for mascot in ProviderMascot::ALL {
+            let variants = [false, true].map(|small| {
+                let file = format!("{}{}.png", mascot.key(), if small { ".small" } else { "" });
+                root.iter()
+                    .flat_map(|root| [root.join("providers/crew"), root.join("../providers/crew")])
+                    .chain([mascot_root.clone()])
+                    .find_map(|root| std::fs::read(root.join(&file)).ok().map(Art::new))
+                    .or_else(|| embedded_mascot(mascot, small).map(Art::new))
+            });
+            if variants.iter().any(Option::is_some) {
+                mascots.insert(mascot, variants);
+            }
+        }
         let mut crew = Vec::with_capacity(PORTRAITS);
         let mut small = Vec::with_capacity(PORTRAITS);
         let mut motion = Vec::with_capacity(PORTRAITS);
-        for captain in 0..PORTRAITS {
-            let (set, crop, strips) = portraits(captain, root.as_deref());
+        let mut pixel_art = [true; PORTRAITS];
+        for (captain, pixel) in pixel_art.iter_mut().enumerate() {
+            let (set, crop, strips, is_pixel) = portraits(captain, root.as_deref());
+            *pixel = is_pixel;
             crew.push(set);
             small.push(crop);
             motion.push(strips);
@@ -350,6 +432,8 @@ impl Artwork {
         antigravity.wait().expect("valid provider mark");
         Arc::new(Self {
             crew,
+            pixel_art,
+            mascots,
             small,
             motion,
             antigravity,
@@ -407,7 +491,13 @@ impl Artwork {
                     Shown::Face(captain, face, head) => {
                         let set = if head { &self.small } else { &self.crew };
                         set[captain][face].decoded().map(|art| {
-                            crate::crisp::fit(&art.rgba, art.width, art.height, art.cell, target)
+                            if self.is_pixel_art(captain) {
+                                crate::crisp::fit(
+                                    &art.rgba, art.width, art.height, art.cell, target,
+                                )
+                            } else {
+                                crate::crisp::smooth(&art.rgba, art.width, art.height, target)
+                            }
                         })
                     }
                     Shown::Window(captain, face) => self.crew[captain][face].decoded().map(|art| {
@@ -424,6 +514,10 @@ impl Artwork {
                             target,
                         ))
                     }
+                    Shown::Mascot(mascot, small) => self
+                        .mascot_art(mascot, small)
+                        .and_then(Art::decoded)
+                        .map(|art| crate::crisp::smooth(&art.rgba, art.width, art.height, target)),
                 };
                 // A face that failed to decode shows nothing rather than failing the view.
                 pixels.set(
@@ -450,6 +544,9 @@ impl Artwork {
     /// `points` times the scale is a multiple of 24.
     pub fn bust_window_pixels(&self, captain: usize, face: Face, points: f32) -> Pixels {
         let captain = captain.min(PORTRAITS - 1);
+        if !self.is_pixel_art(captain) {
+            return self.face_pixels(captain, face, points);
+        }
         self.pixels_for(
             Shown::Window(captain, face.index()),
             self.device_size(points),
@@ -465,6 +562,24 @@ impl Artwork {
     pub fn motion(&self, captain: usize) -> Option<&Motion> {
         self.motion.get(captain)?.as_deref()
     }
+
+    pub fn is_pixel_art(&self, captain: usize) -> bool {
+        self.pixel_art[captain.min(PORTRAITS - 1)]
+    }
+
+    fn mascot_art(&self, mascot: ProviderMascot, small: bool) -> Option<&Art> {
+        let variants = self.mascots.get(&mascot)?;
+        [usize::from(small), usize::from(!small)]
+            .into_iter()
+            .filter_map(|index| variants[index].as_ref())
+            .find(|art| art.decoded().is_some())
+    }
+
+    pub fn mascot_pixels(&self, mascot: ProviderMascot, points: f32) -> Option<Pixels> {
+        let small = points < 30.0;
+        self.mascot_art(mascot, small)?;
+        Some(self.pixels_for(Shown::Mascot(mascot, small), self.device_size(points)))
+    }
 }
 
 /// An explicit drop-in folder wins over the workspace folder. Neither is required.
@@ -476,15 +591,40 @@ fn sprite_root(workspace: &Path) -> Option<PathBuf> {
             let local = workspace.join("assets").join("crew");
             local.is_dir().then_some(local)
         })
+        .or_else(|| {
+            let packaged = PathBuf::from("assets/crew");
+            packaged.is_dir().then_some(packaged)
+        })
 }
 
-fn portraits(captain: usize, root: Option<&Path>) -> (Set, Set, Option<Arc<Motion>>) {
+fn pixel_set(set: &Set) -> bool {
+    set[Face::Normal.index()].decoded().is_some_and(|art| {
+        art.width == art.height
+            && (art.width == 40
+                || art.width == 240
+                    && crate::crisp::nearest_grid(art.width, art.height, &art.rgba, 6))
+    })
+}
+
+fn portraits(captain: usize, root: Option<&Path>) -> (Set, Set, Option<Arc<Motion>>, bool) {
     if let Some((set, small, folder)) = root.and_then(|root| load_set(root, captain)) {
         // User-provided files must be read again for each new app state.
-        return (set, small, load_motion(&folder, captain));
+        let pixel = pixel_set(&set);
+        return (
+            set,
+            small,
+            pixel.then(|| load_motion(&folder, captain)).flatten(),
+            pixel,
+        );
     }
     let (set, small) = embedded(captain);
-    (set, small, embedded_motion(captain))
+    let pixel = pixel_set(&set);
+    (
+        set,
+        small,
+        pixel.then(|| embedded_motion(captain)).flatten(),
+        pixel,
+    )
 }
 
 /// All four strips from a drop-in folder, or none: a partial set would animate some states
@@ -553,8 +693,7 @@ fn decode_motion<'a>(pngs: impl IntoIterator<Item = &'a [u8]>) -> Option<Motion>
     Motion::try_from(strips).ok()
 }
 
-/// A set is either the named folder or the numeric captain index. All six faces must
-/// decode as files before the whole set is accepted.
+/// A named or numeric drop-in set needs only that captain's Normal face.
 fn load_set(root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
     let folders = [
         root.join(CAPTAIN_KEYS[captain]),
@@ -564,35 +703,49 @@ fn load_set(root: &Path, captain: usize) -> Option<(Set, Set, PathBuf)> {
         if !folder.is_dir() {
             continue;
         }
-        let mut images = Vec::with_capacity(Face::COUNT);
-        let mut crops = Vec::with_capacity(Face::COUNT);
         let (embedded_faces, embedded_crops) = embedded(captain);
-        for (face, name) in FACE_FILES.iter().enumerate() {
-            let bytes = std::fs::read(folder.join(format!("{name}.png"))).ok()?;
-            let image = if bytes.as_slice() == embedded_faces[face].png.as_ref() {
-                embedded_faces[face].clone()
+        let load = |face: usize, small: bool| {
+            let suffix = if small { ".small.png" } else { ".png" };
+            let bytes = std::fs::read(folder.join(format!("{}{suffix}", FACE_FILES[face]))).ok()?;
+            let embedded = if small {
+                &embedded_crops[face]
+            } else {
+                &embedded_faces[face]
+            };
+            let art = if bytes.as_slice() == embedded.png.as_ref() {
+                embedded.clone()
             } else {
                 Art::new(bytes)
             };
-            image.decoded()?;
-            // An optional `<Face>.small.png` head crop; otherwise small tiles use the bust.
-            let crop = std::fs::read(folder.join(format!("{name}.small.png")))
-                .ok()
-                .map(|bytes| {
-                    if bytes.as_slice() == embedded_crops[face].png.as_ref() {
-                        embedded_crops[face].clone()
-                    } else {
-                        Art::new(bytes)
-                    }
-                })
-                .filter(|crop| crop.decoded().is_some())
-                .unwrap_or_else(|| image.clone());
-            images.push(image);
-            crops.push(crop);
-        }
-        if let (Ok(set), Ok(small)) = (Set::try_from(images), Set::try_from(crops)) {
-            return Some((set, small, folder));
-        }
+            art.decoded()?;
+            Some(art)
+        };
+        let normal_index = Face::Normal.index();
+        let Some(normal) = load(normal_index, false) else {
+            continue;
+        };
+        let normal_small = load(normal_index, true).unwrap_or_else(|| normal.clone());
+        let faces: [Option<Art>; Face::COUNT] = std::array::from_fn(|face| {
+            if face == normal_index {
+                Some(normal.clone())
+            } else {
+                load(face, false)
+            }
+        });
+        let small = std::array::from_fn(|face| {
+            if face == normal_index {
+                normal_small.clone()
+            } else {
+                load(face, true)
+                    .or_else(|| faces[face].clone())
+                    .unwrap_or_else(|| normal_small.clone())
+            }
+        });
+        return Some((
+            faces.map(|face| face.unwrap_or_else(|| normal.clone())),
+            small,
+            folder,
+        ));
     }
     None
 }
@@ -714,6 +867,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_missing_expression_falls_back_to_the_same_captains_normal() {
+        let workspace = crate::store::directory().unwrap();
+        let folder = workspace.join("assets/crew/ember");
+        std::fs::create_dir_all(&folder).unwrap();
+        image::RgbaImage::from_fn(512, 512, |x, y| image::Rgba([x as u8, y as u8, 150, 255]))
+            .save(folder.join("Normal.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(256, 256, image::Rgba([0, 129, 201, 255]))
+            .save(folder.join("Normal.small.png"))
+            .unwrap();
+        let (faces, crops, motion, pixel) = portraits(0, folder.parent());
+        assert!(!pixel);
+        assert!(motion.is_none());
+        assert!(Arc::ptr_eq(
+            &faces[Face::Happy.index()].png,
+            &faces[Face::Normal.index()].png
+        ));
+        assert!(Arc::ptr_eq(
+            &crops[Face::Happy.index()].png,
+            &crops[Face::Normal.index()].png
+        ));
+        let art = Artwork::load(&workspace);
+        assert!(!art.is_pixel_art(0));
+        art.set_scale(1.25);
+        for size in [16.0, 24.0, 36.0, 48.0, 96.0, 160.0] {
+            art.face_pixels(0, Face::Happy, size);
+            assert!(art.scaled.lock().unwrap().contains_key(&(
+                Shown::Face(0, Face::Happy.index(), size < 30.0),
+                art.device_size(size)
+            )));
+        }
+    }
+
+    #[test]
+    fn provider_mascot_aliases_follow_the_model_not_its_transport() {
+        for (name, provider) in [
+            ("openrouter/DeepSeek-R1", ProviderMascot::DeepSeek),
+            ("gpt-6.2-sol", ProviderMascot::OpenAi),
+            ("Anthropic Claude", ProviderMascot::Anthropic),
+            ("gemini-4-neon", ProviderMascot::Google),
+            ("z.ai/glm-5.3", ProviderMascot::Glm),
+            ("Qwen-Coder", ProviderMascot::Qwen),
+            ("cursor-grok-4.6", ProviderMascot::Grok),
+            ("custom-local", ProviderMascot::Default),
+        ] {
+            assert_eq!(provider_mascot_for(name), provider);
+        }
+    }
+
+    #[test]
     fn embedded_decodes_are_shared_but_window_scale_and_buffers_are_not() {
         let first = Artwork::load(Path::new(""));
         let second = Artwork::load(Path::new(""));
@@ -780,9 +983,9 @@ mod tests {
         for (name, face) in FACE_FILES.iter().zip(&faces) {
             std::fs::write(folder.join(format!("{name}.png")), &face.png).unwrap();
         }
-        let (before, _, _) = portraits(0, Some(&root));
+        let (before, _, _, _) = portraits(0, Some(&root));
         std::fs::write(folder.join("Normal.png"), &faces[Face::Happy.index()].png).unwrap();
-        let (after, _, _) = portraits(0, Some(&root));
+        let (after, _, _, _) = portraits(0, Some(&root));
         assert_eq!(before[0].png, faces[0].png);
         assert_eq!(after[0].png, faces[Face::Happy.index()].png);
         assert!(!Arc::ptr_eq(&before[0].decoded, &after[0].decoded));

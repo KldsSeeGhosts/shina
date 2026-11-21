@@ -113,6 +113,10 @@ impl Portraits {
         self.reduced.get()
     }
 
+    pub fn motion_allowed(&self) -> bool {
+        self.focused && !self.reduced.get()
+    }
+
     /// Advances every stage to `now` for the sidebar's portraits, given as (row, portrait,
     /// face). Returns how long until the next frame is due, or None when nothing plays.
     pub fn tick(

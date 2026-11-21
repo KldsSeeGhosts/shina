@@ -57,43 +57,42 @@ fn rows_with_recent(s: &State) -> (Vec<Row>, usize) {
     };
     let mut out: Vec<Row> = Vec::new();
     let mut recent = 0;
+    let current = (s.machines.selected.clone(), s.current().id);
+    let mut nav_seen = std::collections::HashSet::from([current.clone()]);
     if query.is_empty() {
         // Recent first, from the history's newest entries, minus the open one.
-        let current = s.current().id;
-        let machine = s.machines.selected.clone();
-        let mut seen: std::collections::HashSet<(String, usize)> = Default::default();
         for (server, id) in s.nav_history.recent().take(12) {
-            if recent >= 6 {
+            if recent >= 5 {
                 break;
             }
-            if server == &machine {
-                if *id == current || !seen.insert((server.clone(), *id)) {
-                    continue;
-                }
+            if nav_seen.contains(&(server.clone(), *id)) {
+                continue;
+            }
+            if server == &current.0 {
                 if let Some(index) = s.threads.iter().position(|t| t.id == *id) {
                     out.push(Row::Local(index));
+                    nav_seen.insert((server.clone(), *id));
                     recent += 1;
                 }
-            } else if seen.insert((server.clone(), *id))
-                && let Some((title, captain, workspace, updated)) =
-                    s.machines.views.get(server).and_then(|projection| {
-                        let record = projection["index"]["threads"]
-                            .as_array()?
-                            .iter()
-                            .find(|t| t["id"].as_u64() == Some(*id as u64))?;
-                        let title = record["title"].as_str()?.to_string();
-                        let captain = record["captainHome"] == true;
-                        let workspace = projection["index"]["projects"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .find(|p| !record["project"].is_null() && p["id"] == record["project"])
-                            .and_then(|p| p["name"].as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let updated = record["updated"].as_u64().unwrap_or(0);
-                        Some((title, captain, workspace, updated))
-                    })
+            } else if let Some((title, captain, workspace, updated)) =
+                s.machines.views.get(server).and_then(|projection| {
+                    let record = projection["index"]["threads"]
+                        .as_array()?
+                        .iter()
+                        .find(|t| t["id"].as_u64() == Some(*id as u64))?;
+                    let title = record["title"].as_str()?.to_string();
+                    let captain = record["captainHome"] == true;
+                    let workspace = projection["index"]["projects"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|p| !record["project"].is_null() && p["id"] == record["project"])
+                        .and_then(|p| p["name"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let updated = record["updated"].as_u64().unwrap_or(0);
+                    Some((title, captain, workspace, updated))
+                })
             {
                 out.push(Row::Machine {
                     server: server.clone(),
@@ -104,12 +103,12 @@ fn rows_with_recent(s: &State) -> (Vec<Row>, usize) {
                     updated,
                     status: None,
                 });
+                nav_seen.insert((server.clone(), *id));
                 recent += 1;
             }
         }
     }
     // Walk every machine in the sidebar's own order (grouped when Workspace grouping is on).
-    let mut nav_seen: std::collections::HashSet<(String, usize)> = Default::default();
     for (server, id) in sidebar_navigation(s) {
         if !nav_seen.insert((server.clone(), id)) {
             continue;
@@ -206,9 +205,18 @@ fn rows_with_recent(s: &State) -> (Vec<Row>, usize) {
             }
         }
     }
+    if query.is_empty() {
+        out[recent..].sort_by_key(|row| !row_is_captain(s, row));
+    }
     (out, recent)
 }
 
+fn row_title<'a>(s: &'a State, row: &'a Row) -> &'a str {
+    match row {
+        Row::Local(i) => &s.threads[*i].title,
+        Row::Machine { title, .. } => title,
+    }
+}
 /// The card and its scrim. `modal(true)` swallows outside presses; Escape
 /// closes through the input's `on_input_key`.
 pub(super) fn view(s: &State, p: Palette) -> El {
@@ -247,6 +255,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
     let highlight = s.quick_switcher_highlight.min(all.len().saturating_sub(1));
     let mut list = col()
         .key("quick-switcher-list")
+        .role("listbox")
         .max_h(360.0)
         .min_h(0.0)
         .shrink()
@@ -273,22 +282,52 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         }
     }
     if all.is_empty() {
-        list = list.child(
-            label("Nothing matches", SMALL, p.muted)
-                .key("quick-switcher-empty")
-                .px(8.0)
-                .py(10.0),
-        );
+        list = list
+            .child(
+                label(format!("No threads match \"{query}\""), SMALL, p.muted)
+                    .key("quick-switcher-empty")
+                    .px(8.0)
+                    .py(10.0),
+            )
+            .child(button(
+                "quick-switcher-search-messages",
+                "Search message text in the sidebar",
+                p,
+                |s| {
+                    s.search.replace_text(&s.quick_switcher_query.text);
+                    s.sync_sidebar_search_input();
+                    s.quick_switcher = false;
+                    s.sidebar = true;
+                    s.compact_sidebar = s.viewport_width < 760.0;
+                },
+            ));
     }
+    let mut footer = row()
+        .key("quick-switcher-footer")
+        .h(32.0)
+        .px(12.0)
+        .gap(12.0)
+        .center_y();
+    if !all.is_empty() {
+        footer = footer
+            .child(keycap("↑↓", "Navigate", p))
+            .child(keycap("Enter", "Open", p).key("quick-switcher-hint-open"));
+        if s.tabs_enabled {
+            footer = footer.child(keycap("Ctrl+Enter", "Open in tab", p));
+        }
+    }
+    footer = footer.child(keycap("Esc", "Close", p));
     let card = col()
         .key("quick-switcher")
         .role("dialog")
         .label("Quick switcher")
-        .w((s.viewport_width - 32.0).min(640.0).max(200.0))
+        .w_full()
+        .max_w(640.0)
+        .min_w(200.0)
         .radius(12.0)
         .fill(p.card)
         .border(1.0, p.frame)
-        .box_shadow(soft_shadow(p))
+        .box_shadow(dialog_shadow(p))
         .on_press(|_: &mut State| {})
         .child(
             row()
@@ -301,6 +340,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                     rune::text_input(&s.quick_switcher_query, BODY)
                         .key("quick-switcher-input")
                         .label("Search threads")
+                        .a11y_value(all.get(highlight).map_or("", |entry| row_title(s, entry)))
                         .autofocus()
                         .placeholder("Search threads", p.muted)
                         .color(p.ink)
@@ -311,6 +351,15 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                         .on_input_key(|s: &mut State, event, tx| {
                             if edits_text(event) {
                                 s.quick_switcher_highlight = 0;
+                            }
+                            if !matches!(
+                                event.key,
+                                rune::Key::Down
+                                    | rune::Key::Up
+                                    | rune::Key::Enter
+                                    | rune::Key::Escape
+                            ) {
+                                return s.undo_key(event, true);
                             }
                             let all_rows = rows(s);
                             let count = all_rows.len();
@@ -337,10 +386,19 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                                     true
                                 }
                                 rune::Key::Enter => {
-                                    if let Some(row) = rows(s).get(at).cloned() {
-                                        open_row(s, &row);
+                                    if let Some(row) = all_rows.get(at) {
+                                        if s.tabs_enabled && (event.mods.ctrl || event.mods.cmd) {
+                                            match row {
+                                                Row::Local(index) => s.open_kept_tab(*index),
+                                                Row::Machine { server, id, .. } => {
+                                                    s.open_machine_thread_kept(server, *id)
+                                                }
+                                            }
+                                        } else {
+                                            open_row(s, row);
+                                        }
+                                        s.quick_switcher = false;
                                     }
-                                    s.quick_switcher = false;
                                     true
                                 }
                                 rune::Key::Escape => {
@@ -354,22 +412,16 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         )
         .child(rule(p))
         .child(list)
-        .child(
-            row()
-                .h(32.0)
-                .px(12.0)
-                .gap(12.0)
-                .center_y()
-                .child(keycap("Enter", "Open", p))
-                .child(keycap("Esc", "Close", p)),
-        );
-    el().key("quick-switcher-backdrop")
+        .child(footer);
+    col()
+        .key("quick-switcher-backdrop")
         .instant_changes()
         .absolute(0.0, 0.0)
         .w_full()
         .h_full()
         .items_center()
-        .pt(96.0)
+        .px(16.0)
+        .pt((s.viewport_height * 0.14).clamp(48.0, 120.0))
         .fill(Color::BLACK.alpha(if s.dark { 0.45 } else { 0.22 }))
         .modal(false, |s: &mut State| s.quick_switcher = false)
         .on_press(|s: &mut State| s.quick_switcher = false)
@@ -384,16 +436,22 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
     let key = row_key(s, entry);
     let mut built = row()
         .key(key)
-        .role("menuitem")
+        .role("option")
+        .focus_selected(lit)
         .cursor(rune::Cursor::Pointer)
         .focusable(true)
-        .h(36.0)
-        .px(8.0)
+        .h(40.0)
+        .px(10.0)
         .gap(10.0)
         .center_y()
-        .radius(6.0)
-        .fill(if lit { p.selected } else { Color::TRANSPARENT })
-        .hover(p.selected)
+        .radius(8.0)
+        .fill(if lit { p.lift } else { Color::TRANSPARENT })
+        .border(1.0, if lit { p.frame } else { Color::TRANSPARENT })
+        .on_hover_change(move |s: &mut State, hot, _| {
+            if hot {
+                s.quick_switcher_highlight = index;
+            }
+        })
         .on_press(move |s: &mut State| {
             let row = rows(s).get(index).cloned();
             if let Some(row) = row {
@@ -430,7 +488,9 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
                         .max_w(160.0),
                 );
             }
-            built = built.child(status_mark(t.status, p, 7.0));
+            if !lit && matches!(t.status, Status::Running | Status::Waiting | Status::Failed) {
+                built = built.child(status_mark(t.status, p, 8.0));
+            }
         }
         Row::Machine {
             server,
@@ -471,12 +531,18 @@ fn switcher_row(s: &State, p: Palette, entry: &Row, index: usize, lit: bool) -> 
                         .max_w(160.0),
                 );
             }
-            if let Some(status) = status {
+            if let Some(status @ (Status::Running | Status::Waiting | Status::Failed)) = status
+                && !lit
+            {
                 built = built.child(status_mark(*status, p, 7.0));
             }
         }
     }
-    built
+    if lit {
+        built.child(keycap_chip("↵", p))
+    } else {
+        built
+    }
 }
 
 /// Open the row's thread: a local index goes through `show_thread`, a machine

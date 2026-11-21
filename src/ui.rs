@@ -41,6 +41,8 @@ fn timeline_count(f: impl FnOnce(&mut TimelineCounts)) {
 fn take_timeline_counts() -> TimelineCounts {
     TIMELINE_COUNTS.with(|cell| cell.replace(TimelineCounts::default()))
 }
+#[path = "agents_ui.rs"]
+mod agents_ui;
 #[path = "attachment_archive_preview.rs"]
 mod attachment_archive_preview;
 #[path = "attachment_notebook_preview.rs"]
@@ -101,12 +103,21 @@ mod plan_ui;
 mod quick_switcher;
 #[path = "settings_ui.rs"]
 pub(crate) mod settings_ui;
+#[path = "sidebar_preview.rs"]
+pub(crate) mod sidebar_preview;
+#[path = "sidebar_row.rs"]
+mod sidebar_row;
 #[path = "sidebar_ui.rs"]
-mod sidebar_ui;
+pub(crate) mod sidebar_ui;
 #[path = "top_bar.rs"]
 mod top_bar;
 #[path = "transcript_context.rs"]
 pub(crate) mod transcript_context;
+#[path = "updates_ui.rs"]
+mod updates_ui;
+#[cfg(test)]
+#[path = "wave3_tests.rs"]
+mod wave3_tests;
 #[path = "work_ui.rs"]
 mod work_ui;
 use composer_code_picker::CodeLanguageHeaders;
@@ -114,72 +125,11 @@ pub(crate) use pi_ui::questionnaire_key;
 
 /// Keyboard navigation uses the same server-scoped order as the unified sidebar.
 pub(crate) fn sidebar_navigation(s: &State) -> Vec<(String, usize)> {
-    let entries = sidebar_ui::entries(s);
-    let mut rows = Vec::new();
-    for entry in entries.iter().filter(|e| e.captain) {
-        rows.push((entry.server.to_owned(), entry.id));
-    }
-    let ordinary: Vec<_> = entries.iter().filter(|e| !e.captain).collect();
-    for entry in ordinary.iter().copied().filter(|e| e.draft && e.visible) {
-        rows.push((entry.server.to_owned(), entry.id));
-    }
-    let now = lifecycle::now();
-    if !s.search.text.is_empty() {
-        for entry in ordinary.iter().copied().filter(|e| !e.draft && e.visible) {
-            rows.push((entry.server.to_owned(), entry.id));
-        }
-        return rows;
-    }
-    if s.sidebar_grouped() {
-        let active_rows: Vec<_> = ordinary
-            .iter()
-            .copied()
-            .filter(|e| {
-                !e.draft
-                    && e.visible
-                    && matches!(
-                        lifecycle::section(&e.life, now),
-                        Section::Pinned | Section::Active
-                    )
-            })
-            .collect();
-        for group in sidebar_ui::groups(s, &active_rows) {
-            let collapsed = s.sidebar_group_collapsed(group.server, group.project);
-            for entry in group.rows {
-                if collapsed && !entry.selected(s) {
-                    continue;
-                }
-                rows.push((entry.server.to_owned(), entry.id));
-            }
-        }
-        for section in [Section::Snoozed, Section::Settled] {
-            let limit = if section == Section::Settled {
-                s.settled_visible
-            } else {
-                usize::MAX
-            };
-            for entry in ordinary
-                .iter()
-                .copied()
-                .filter(|e| !e.draft && e.visible && lifecycle::section(&e.life, now) == section)
-                .take(limit)
-            {
-                rows.push((entry.server.to_owned(), entry.id));
-            }
-        }
-        return rows;
-    }
-    let mut settled = 0;
-    for entry in ordinary.iter().copied().filter(|e| !e.draft && e.visible) {
-        if lifecycle::section(&entry.life, now) == Section::Settled {
-            settled += 1;
-            if settled > s.settled_visible {
-                continue;
-            }
-        }
-        rows.push((entry.server.to_owned(), entry.id));
-    }
-    rows
+    sidebar_ui::navigation(s)
+}
+
+pub(crate) fn sidebar_target_key(s: &State, server: &str, id: usize) -> String {
+    sidebar_ui::target_key(s, server, id)
 }
 
 // KSG Code's default theme (`apps/web/src/index.css`, the dark and light palettes after the
@@ -192,6 +142,7 @@ struct Palette {
     bg: Color,
     panel: Color,
     card: Color,
+    lift: Color,
     /// KSG's `surface-tray`: the composer shell around the card and the context strip.
     tray: Color,
     line: Color,
@@ -208,10 +159,14 @@ struct Palette {
     coral_bg: Color,
     on_coral: Color,
     brass: Color,
+    brass_bg: Color,
     on_brass: Color,
     sea: Color,
     sea_bg: Color,
     danger: Color,
+    danger_bg: Color,
+    ok: Color,
+    ok_bg: Color,
     /// A control's 1 px border.
     frame: Color,
     /// The outline of portraits and project tiles.
@@ -233,22 +188,27 @@ fn palette(dark: bool) -> Palette {
             bg: color("#0e0f12"),
             panel: color("#151619"),
             card: color("#1e1f23"),
+            lift: color("#2a2b31"),
             tray: color("#191a1e"),
             line: color("#ffffff").alpha(0.08),
             ink: color("#e6e7ea"),
             muted: color("#b2b7bf"),
-            faint: color("#9ca2ac"),
+            faint: color("#969ca7"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
-            selected: color("#ffffff").alpha(0.02),
+            selected: color("#ffffff").alpha(0.006),
             row: color("#1e1f23"),
             coral: color("#eceef2"),
             coral_bg: color("#8aa4ff").alpha(0.16),
             on_coral: color("#111215"),
-            brass: color("#d29922"),
+            brass: color("#d9a02a"),
+            brass_bg: color("#2a2213"),
             on_brass: color("#111215"),
             sea: color("#8aa4ff"),
             sea_bg: color("#1d2338"),
-            danger: color("#f85149"),
+            danger: color("#ff6b63"),
+            danger_bg: color("#2e1a1b"),
+            ok: color("#4cc35f"),
+            ok_bg: color("#16281b"),
             frame: color("#ffffff").alpha(0.11),
             portrait_frame: color("#ffffff").alpha(0.11),
             shadow: color("#000000").alpha(0.45),
@@ -262,21 +222,26 @@ fn palette(dark: bool) -> Palette {
             bg: color("#e8e8ea"),
             panel: color("#f5f5f6"),
             card: color("#ffffff"),
+            lift: color("#ececef"),
             tray: color("#efeff1"),
             line: color("#000000").alpha(0.08),
             ink: color("#1c1d20"),
-            muted: color("#5e626a"),
+            muted: color("#55595f"),
             faint: color("#62666e"),
             selected: color("#000000").alpha(0.045),
             row: color("#ffffff"),
             coral: color("#141518"),
             coral_bg: color("#1d4ed8").alpha(0.10),
             on_coral: color("#f7f7f8"),
-            brass: color("#8a5a00"),
+            brass: color("#7d5200"),
+            brass_bg: color("#f6ecd6"),
             on_brass: color("#ffffff"),
             sea: color("#1d4ed8"),
             sea_bg: color("#e3e9fb"),
             danger: color("#b42318"),
+            danger_bg: color("#fbe7e4"),
+            ok: color("#176f31"),
+            ok_bg: color("#ddf3e3"),
             frame: color("#000000").alpha(0.11),
             portrait_frame: color("#000000").alpha(0.11),
             shadow: color("#000000").alpha(0.10),
@@ -332,12 +297,12 @@ pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
         ("accent-surface-foreground", p.ink),
         ("destructive", p.danger),
         ("destructive-foreground", p.danger),
-        ("destructive-surface", p.coral_bg),
+        ("destructive-surface", p.danger_bg),
         ("warning", p.brass),
         ("warning-foreground", p.brass),
-        ("warning-surface", p.card),
-        ("success", p.sea),
-        ("success-foreground", p.sea),
+        ("warning-surface", p.brass_bg),
+        ("success", p.ok),
+        ("success-foreground", p.ok),
         ("info", p.sea),
         ("info-foreground", p.sea),
         ("code-background", p.code_bg),
@@ -363,10 +328,7 @@ pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
     serde_json::json!({"appearance":if dark {"dark"} else {"light"},"variables":variables})
 }
 pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
-pub const FONTS: &[&[u8]] = &[
-    include_bytes!("../assets/fonts/InterVariable.ttf"),
-    include_bytes!("../assets/fonts/SourceSerif4Variable.ttf"),
-];
+pub const FONTS: &[&[u8]] = &[include_bytes!("../assets/fonts/InterVariable.ttf")];
 /// KSG Code's small UI text: Inter at `size`, weight 500, for section labels, counts, timers,
 /// status words, badges and the controls under the composer. The wordmark uses it at 15.
 const fn meta(size: f32) -> TextStyle {
@@ -382,6 +344,11 @@ const META_LABEL: TextStyle = meta(12.0).tracking(0.1);
 const TITLE: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
 /// Inter 13/400, quiet read sidebar rows and breadcrumb workspace names.
 const ROW_QUIET: TextStyle = TextStyle::new(13.0, 400.0).lh(19.0).tracking(-0.08);
+const ROW_STRONG: TextStyle = TextStyle::new(13.0, 600.0).lh(19.0).tracking(-0.08);
+const CARD_TITLE: TextStyle = TextStyle::new(14.0, 600.0).lh(20.0).tracking(-0.10);
+const MONO_META: TextStyle = TextStyle::new(12.0, 400.0)
+    .lh(17.0)
+    .family(rune::Family::SystemMono);
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
 /// Assistant answers use KSG Code's `.chat-markdown`: `text-sm leading-relaxed`, 14/22.5.
 const PROSE: TextStyle = TextStyle::new(14.0, 400.0).lh(22.5).tracking(-0.10);
@@ -392,11 +359,7 @@ const HEADING: TextStyle = TextStyle::new(30.0, 500.0)
     .lh(36.0)
     .tracking(-0.75)
     .family(rune::Family::Named("Inter Variable"));
-/// Dialog titles: Source Serif 4 at 20/600, tight.
-const DIALOG_TITLE: TextStyle = TextStyle::new(20.0, 600.0)
-    .lh(26.0)
-    .tracking(-0.2)
-    .family(rune::Family::Named("Source Serif 4"));
+const DIALOG_TITLE: TextStyle = IDENTITY;
 /// The captain's name in the Inspector's Overview (spec §0.1 `IDENTITY`): Inter 16/600,
 /// tight tracking. Replaces the old Source Serif treatment, per the all-Inter rule.
 const IDENTITY: TextStyle = TextStyle::new(16.0, 600.0)
@@ -502,6 +465,18 @@ fn soft_shadow(p: Palette) -> rune::Shadow {
         inset: false,
     }
 }
+fn dialog_shadow(p: Palette) -> rune::Shadow {
+    rune::Shadow {
+        y: 16.0,
+        blur: 48.0,
+        ..soft_shadow(p)
+    }
+}
+
+const MOTION_FAST: rune::Curve = rune::Curve::tween(0.12, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
+const MOTION_BASE: rune::Curve = rune::Curve::tween(0.18, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
+const MOTION_SLOW: rune::Curve =
+    rune::Curve::tween(0.30, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0));
 /// A raised surface you act on: KSG's 1 px `--border` and the soft control shadow.
 fn framed(el: El, p: Palette) -> El {
     el.border(1.0, p.frame).box_shadow(control_shadow(p))
@@ -534,8 +509,42 @@ fn pixel_portrait_framed(
     p: Palette,
     accent: Option<Color>,
 ) -> El {
-    let size = s.artwork.snap_points(size);
-    let radius = if size >= 30.0 { 8.0 } else { 6.0 };
+    portrait(pixels, s.artwork.snap_points(size), p, accent)
+}
+
+fn portrait_radius(size: f32) -> f32 {
+    (size * 0.25).round().clamp(5.0, 20.0)
+}
+
+fn captain_wash(dark: bool, slot: usize, width: f32, height: f32) -> El {
+    const SIGNALS: [(&str, &str); 12] = [
+        ("#e0793a", "#b4541a"),
+        ("#45c49b", "#167a5b"),
+        ("#8b84f0", "#5148c9"),
+        ("#d9b23a", "#8a6a00"),
+        ("#5b8fd6", "#2c5fae"),
+        ("#b97ad0", "#8a3fa6"),
+        ("#93a84c", "#5f7320"),
+        ("#f0685c", "#c2392e"),
+        ("#ee5fa0", "#c22a74"),
+        ("#a3acba", "#5d6675"),
+        ("#38bdf8", "#0b77ad"),
+        ("#5fbf62", "#2b7f2f"),
+    ];
+    let (night, day) = SIGNALS[slot.min(SIGNALS.len() - 1)];
+    let signal = color(if dark { night } else { day });
+    el().size(width, height).a11y_hidden().radial_gradient(
+        [0.5, 0.5],
+        [width / 2.0, height / 2.0],
+        [
+            (0.0, signal.alpha(if dark { 0.10 } else { 0.08 })),
+            (1.0, signal.alpha(0.0)),
+        ],
+    )
+}
+
+fn portrait(pixels: &rune::Pixels, size: f32, p: Palette, accent: Option<Color>) -> El {
+    let radius = portrait_radius(size);
     let edge = accent.unwrap_or(p.portrait_frame);
     el().size(size, size)
         .radius(radius)
@@ -543,13 +552,98 @@ fn pixel_portrait_framed(
             el().size(size, size)
                 .radius(radius)
                 .clip_rounded(radius)
-                .pixels(pixels),
+                .pixels_fit(pixels, rune::SurfaceFit::Fill),
         )
         .child(
             el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .radius(radius)
                 .border(if accent.is_some() { 2.0 } else { 1.0 }, edge),
         )
+}
+
+fn captain_face(
+    s: &State,
+    p: Palette,
+    captain: usize,
+    face: crate::visuals::Face,
+    size: f32,
+) -> El {
+    let pixels = s.artwork.face_pixels(captain, face, size);
+    if s.artwork.is_pixel_art(captain) {
+        pixel_portrait(s, &pixels, size, p)
+    } else {
+        portrait(&pixels, size, p, None)
+    }
+}
+
+fn haloed(s: &State, p: Palette, image: El, size: f32, status: Status) -> El {
+    if size < 30.0 {
+        return status_badge(p, image, size, status);
+    }
+    if matches!(status, Status::Running | Status::Waiting | Status::Failed) {
+        let mut frame = el()
+            .size(size, size)
+            .radius(portrait_radius(size))
+            .outline(1.5, 2.0, status_ink(status, p))
+            .child(image);
+        if status == Status::Running && s.portraits.motion_allowed() {
+            frame = frame.child(halo_sweep(size, p));
+        }
+        frame
+    } else {
+        image
+    }
+}
+
+// Native opacity cycles share a clock, so the highlight travels around the rounded
+// perimeter without a view rebuild or one timer per portrait.
+fn halo_sweep(size: f32, p: Palette) -> El {
+    const SEGMENTS: usize = 12;
+    let span = size + 5.5;
+    let radius = portrait_radius(size) + 2.75;
+    let edge = span - radius * 2.0;
+    let arc = radius * std::f32::consts::FRAC_PI_2;
+    let quarter = edge + arc;
+    let point = |position: f32| {
+        let distance = position.rem_euclid(1.0) * quarter * 4.0;
+        let corner = (distance / quarter).floor() as usize;
+        let distance = distance % quarter;
+        let [x, y] = if distance < edge {
+            [radius + distance, 0.0]
+        } else {
+            let angle = (distance - edge) / radius;
+            [
+                span - radius + radius * angle.sin(),
+                radius - radius * angle.cos(),
+            ]
+        };
+        match corner {
+            0 => [x, y],
+            1 => [span - y, x],
+            2 => [span - x, span - y],
+            _ => [y, span - x],
+        }
+    };
+    let mut sweep = el().absolute(-2.75, -2.75).size(span, span).a11y_hidden();
+    for i in 0..SEGMENTS {
+        let start = i as f32 / SEGMENTS as f32;
+        let points: Vec<_> = (0..=4)
+            .map(|j| point(start + j as f32 / (SEGMENTS as f32 * 4.0)))
+            .collect();
+        sweep = sweep.child(
+            el().absolute(0.0, 0.0)
+                .size(span, span)
+                .shape(rune::Shape::new().stroke(points, 1.5, p.sea.mix(p.ink, 0.72)))
+                .cycle(rune::Cycle {
+                    period: 1.6,
+                    phase: start,
+                    stops: &[(0.0, 0.0), (0.09, 1.0), (0.23, 0.0), (1.0, 0.0)],
+                    still: 0.0,
+                    fps: 30.0,
+                }),
+        );
+    }
+    sweep
 }
 /// A section label: Inter 12/500 in sentence case, as KSG's sidebar group headings.
 fn meta_label(value: &str, ink: Color) -> El {
@@ -704,37 +798,28 @@ fn status_ink(status: Status, p: Palette) -> Color {
     match status {
         Status::Failed => p.danger,
         Status::Waiting => p.brass,
-        // Working and done both read as sea, so Done never turns grey in one list and blue in
-        // the next. Every status word and mark takes its colour from this function.
-        Status::Running | Status::Completed => p.sea,
+        Status::Running => p.sea,
+        Status::Completed => p.ok,
         _ => p.muted,
     }
 }
-/// One status vocabulary everywhere, in dots: a filled one for working, a ring for needs you,
-/// a smaller filled one for failed, and a check for settled. Ready and offline get a faint dot.
+/// Status uses shape as well as colour, so it also reads in monochrome.
 fn status_mark(status: Status, p: Palette, size: f32) -> El {
     let ink = status_ink(status, p);
     let dot = |side: f32| el().size(side, side).radius(side / 2.0);
     match status {
         Status::Running => dot(size).fill(ink),
         Status::Waiting => dot(size).border(1.5, ink),
-        Status::Failed => dot(size - 2.0).fill(ink),
-        Status::Completed => icon("check", ink).size(size + 7.0, size + 7.0),
-        _ => dot(size).fill(ink.alpha(0.6)),
+        Status::Failed => el()
+            .size(6.0_f32.min(size), 6.0_f32.min(size))
+            .radius(1.0)
+            .rotate(std::f32::consts::FRAC_PI_4)
+            .fill(ink),
+        Status::Completed => icon("check", ink).size(12.0, 12.0),
+        Status::Ready => el(),
+        _ => dot(size).border(1.0, p.faint),
     }
     .a11y_hidden()
-}
-/// A status chip for states that need attention. A finished or idle thread shows nothing:
-/// the reply itself says it is done, and background completions use the unread badge.
-fn status(status: Status, p: Palette) -> El {
-    if matches!(status, Status::Ready | Status::Completed) {
-        return el();
-    }
-    row()
-        .center_y()
-        .gap(6.0)
-        .child(status_mark(status, p, 6.0))
-        .child(meta_text(status.label(), status_ink(status, p)))
 }
 /// A live status slot in the top bar, intrinsic width. The text sits in tabular
 /// figures and fades between values on Shina's motion curve, so a ticking timer
@@ -795,15 +880,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     cx.caption_color(p.muted);
     // The sidebar portraits' animation clock lives outside the view and needs this setting.
     s.portraits.set_reduced_motion(cx.is_reduced_motion());
-    let narrow = cx
-        .layout_with("workspace-root", |r| r[2] < 1050.0)
-        .unwrap_or(false);
+    let [layout_width, layout_height] = cx
+        .layout_with("workspace-root", |r| [r[2], r[3]])
+        .unwrap_or([s.viewport_width, s.viewport_height]);
+    let narrow = layout_width < 1050.0;
     // Below this width the sidebar stops docking and opens on demand instead.
-    let compact = cx
-        .layout_with("workspace-root", |r| r[2] < 760.0)
-        .unwrap_or(false);
-    let sidebar_width = if narrow {
-        s.sidebar_width.min(216.0)
+    let compact = layout_width < 760.0;
+    let sidebar_width = if compact {
+        s.sidebar_width.min(layout_width - 56.0)
+    } else if narrow {
+        s.sidebar_width.min(248.0)
     } else {
         s.sidebar_width
     };
@@ -811,7 +897,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // The chat column's width from the last layout. The first frame guesses from the window,
     // less the gutters and a docked sidebar, so it already lays out close to its final lane.
     let main_width = cx.layout_with("chat-main", |r| r[2]).unwrap_or_else(|| {
-        let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+        let sidebar = if docked && !compact {
+            sidebar_width + 4.0
+        } else {
+            0.0
+        };
         cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
             .unwrap_or(900.0)
     });
@@ -870,10 +960,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     // The pane and the sidebar's sea strip both run to the window's bottom edge, so the bottom
     // of the window is one edge, not a strip under the pane and another under the sidebar.
     let mut workspace = row().grow(1.0).min_h(0.0).px(8.0);
-    if docked {
+    if docked && !compact {
         workspace = workspace.child(sidebar(s, p, sidebar_width));
         if !compact {
-            let max_width = (s.viewport_width - 480.0).clamp(200.0, 400.0);
+            let max_width = (s.viewport_width - 480.0).clamp(220.0, 420.0);
             workspace = workspace.child(
                 el().key("sidebar-resize")
                     .role("separator")
@@ -893,7 +983,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                         if drag.cancelled() {
                             s.sidebar_width = drag.data;
                         } else {
-                            s.sidebar_width = (drag.data + drag.dx / zoom).clamp(200.0, max_width);
+                            s.sidebar_width = (drag.data + drag.dx / zoom).clamp(220.0, max_width);
                         }
                         if drag.phase == rune::Phase::Up {
                             s.checkpoint();
@@ -905,13 +995,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                             rune::Key::Right => 10.0,
                             _ => return false,
                         };
-                        s.sidebar_width = (s.sidebar_width + step).clamp(200.0, max_width);
+                        s.sidebar_width = (s.sidebar_width + step).clamp(220.0, max_width);
                         s.checkpoint();
                         true
                     }),
             );
         }
     }
+    let mut compact_inspector = None;
     let mut pane = col()
         .key("chat-pane")
         .grow(1.0)
@@ -982,14 +1073,20 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let panel = s.right_panel();
         let panel_open = panel.open;
         let body_width = cx.layout_with("chat-body", |r| r[2]).unwrap_or_else(|| {
-            let sidebar = if docked { sidebar_width + 4.0 } else { 0.0 };
+            let sidebar = if docked && !compact {
+                sidebar_width + 4.0
+            } else {
+                0.0
+            };
             cx.layout_with("workspace-root", move |r| r[2] - 16.0 - sidebar)
                 .unwrap_or(900.0)
         });
         let covering =
             panel_open && (panel.maximized || narrow || crate::right_panel::covers(body_width));
         let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
-        if covering {
+        if covering && compact {
+            compact_inspector = Some(inspector_ui::view(s, p, zoom, None));
+        } else if covering {
             main_wrap = main_wrap.child(inspector_ui::view(s, p, zoom, None).pin(
                 Some(0.0),
                 Some(0.0),
@@ -1015,12 +1112,29 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let mut root = col()
         .key("workspace-root")
         .focusable(false)
-        .on_press(|s: &mut State| s.composer_ui.scope_focused.set(false))
+        .on_press(|s: &mut State| {
+            s.composer_ui.scope_focused.set(false);
+            sidebar_preview::dismiss(s, true);
+        })
+        .on_window_focus(|s: &mut State, focused, _| {
+            if !focused {
+                sidebar_preview::dismiss(s, true);
+            }
+        })
         .on_layout(|s: &mut State, rect| {
             s.viewport_width = rect[2];
             s.viewport_height = rect[3];
         })
         .on_key(|s: &mut State, ev, tx| {
+            if ev.key == rune::Key::Escape && sidebar_preview::dismiss(s, true) {
+                return true;
+            }
+            if ev.key == rune::Key::Tab {
+                if !ev.mods.shift && sidebar_preview::focus_actions(s, tx) {
+                    return true;
+                }
+                sidebar_preview::after_tab(s, tx);
+            }
             if ev.key == rune::Key::Escape
                 && (s.assistant_selection.is_some() || s.citation_highlight.is_some())
             {
@@ -1034,6 +1148,34 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .fill(p.bg)
         .child(top)
         .child(workspace.child(pane));
+    if compact && docked {
+        let top = chrome.height.max(40.0 * zoom) / zoom;
+        root = root.child(
+            col()
+                .key("sidebar-overlay")
+                .absolute(8.0, top)
+                .size(sidebar_width, (layout_height - top).max(0.0))
+                .min_h(0.0)
+                .instant_changes()
+                .fill(p.bg)
+                .box_shadow(soft_shadow(p))
+                .child(sidebar(s, p, sidebar_width)),
+        );
+    }
+    if let Some(inspector) = compact_inspector {
+        let top = chrome.height.max(40.0 * zoom) / zoom;
+        root = root.child(
+            col()
+                .key("compact-inspector-sheet")
+                .absolute(8.0, top)
+                .size(
+                    (layout_width - 16.0).max(0.0),
+                    (layout_height - top).max(0.0),
+                )
+                .min_h(0.0)
+                .child(inspector.w_full()),
+        );
+    }
     // The context popover floats at the root, after the ring it anchors to, so the composer
     // never makes room for it and no clipping ancestor cuts it off.
     if let Some(toolbar) = assistant_selection_toolbar(s, p, cx) {
@@ -1044,6 +1186,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if context_ring_shown(s.current()) && s.current().context.popover_open() {
         root = root.child(context_popover(s, p));
+    }
+    if docked && s.update_popover {
+        root = root.child(updates_ui::popover(s, p));
+    }
+    if docked && let Some(preview) = sidebar_preview::view(s, p, sidebar_width) {
+        root = root.child(preview);
     }
     if let Some(notice) = s.composer_notices.open_details_notice() {
         root = root.child(composer_notice_details_popover(notice, p));
@@ -1086,7 +1234,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
     } else if s.current().native.access_picker {
-        root = root.child(pi_ui::access_picker(s, p));
+        let anchor = if cx.layout_with("access-mode", |_| ()).is_some() {
+            "access-mode"
+        } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+            "composer-overflow"
+        } else {
+            "composer"
+        };
+        root = root.child(pi_ui::access_picker(s, p, anchor));
     } else if s.current().native.conversation.is_some() {
         root = root.child(pi_ui::conversation_picker(s, p));
     } else if s.thread_menu {
@@ -1189,10 +1344,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // The pane's top left corner, worked out rather than read from the last layout, so the
         // popover is in place on its first frame: the workspace's 8 pt inset, the sidebar and
         // its 4 pt resize handle, under the top strip.
-        let pane = docked.then(|| {
-            let handle = if compact { 0.0 } else { 4.0 };
+        let pane = (docked && !compact).then(|| {
             (
-                8.0 + sidebar_width + handle,
+                8.0 + sidebar_width + 4.0,
                 chrome.height.max(40.0 * zoom) / zoom,
             )
         });
@@ -1281,6 +1435,35 @@ fn provider_icon(s: &State, p: Palette, vendor: Vendor, size: f32) -> El {
         Vendor::Anthropic => rune::icon(&CLAUDE_ICON, size).a11y_hidden(),
         Vendor::Other => rune::icon(&icons::CHIP, size).color(p.muted).a11y_hidden(),
     }
+}
+
+fn crewmate_avatar(
+    s: &State,
+    p: Palette,
+    model_or_provider: &str,
+    status: Status,
+    size: f32,
+) -> El {
+    use crate::visuals::ProviderMascot::*;
+    let mascot = crate::visuals::provider_mascot_for(model_or_provider);
+    let image = if let Some(pixels) = s.artwork.mascot_pixels(mascot, size) {
+        portrait(&pixels, size, p, None)
+    } else {
+        let (vendor, tint) = match mascot {
+            OpenAi => (Vendor::OpenAi, p.ok_bg),
+            Anthropic => (Vendor::Anthropic, p.brass_bg),
+            Google => (Vendor::Antigravity, p.sea_bg),
+            DeepSeek | Glm => (Vendor::Other, p.sea_bg),
+            Qwen | Grok | Default => (Vendor::Other, p.lift),
+        };
+        el().size(size, size)
+            .radius(portrait_radius(size))
+            .fill(tint)
+            .border(1.0, p.portrait_frame)
+            .center()
+            .child(provider_icon(s, p, vendor, (size * 0.6).min(20.0)))
+    };
+    haloed(s, p, image, size, status).a11y_hidden()
 }
 
 /// Pi's level ids in the slider's words: "xhigh" reads "XHigh", "medium" reads "Medium".
@@ -2613,10 +2796,11 @@ fn sparkles(p: Palette) -> El {
 /// thumb is dragged. Rune lands drag commits at once by default, so each drag phase asks for
 /// this curve explicitly; otherwise a release jumps to its level instead of gliding there.
 fn slider_curve(dragging: bool) -> rune::Curve {
-    rune::Curve::tween(
-        if dragging { 0.15 } else { 0.3 },
-        rune::Easing::cubic(0.23, 1.0, 0.32, 1.0),
-    )
+    if dragging {
+        rune::Curve::tween(0.15, rune::Easing::cubic(0.23, 1.0, 0.32, 1.0))
+    } else {
+        MOTION_SLOW
+    }
 }
 
 fn effort_slider_with_levels(
@@ -4046,29 +4230,24 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                             .min_w(0.0)
                             .on_edit(|s: &mut State| &mut s.search)
                             .on_input_change(|s: &mut State, tx| {
+                                s.sync_sidebar_search_input();
                                 s.poll_sidebar_search(tx);
+                            })
+                            .on_input_key(|s: &mut State, ev, tx| {
+                                if ev.key == rune::Key::Escape && !s.search.text.is_empty() {
+                                    s.search.replace_text("");
+                                    s.sync_sidebar_search_input();
+                                    s.poll_sidebar_search(tx);
+                                    true
+                                } else {
+                                    s.undo_key(ev, true)
+                                }
                             }),
                     )
+                    .child(sidebar_ui::search_clear(s, p))
                     .child(scope_button),
             ),
     );
-    if !s.search.text.is_empty() && !s.sidebar_search.unsupported_servers.is_empty() {
-        side = side.child(
-            label(
-                format!(
-                    "Titles only on {} (update required)",
-                    s.sidebar_search.unsupported_servers.join(", ")
-                ),
-                SMALL,
-                p.muted,
-            )
-            .key("sidebar-search-unsupported")
-            .help(crate::protocol::THREAD_SEARCH_UPDATE_REQUIRED)
-            .px(ROW_INSET)
-            .pb(4.0)
-            .truncate(),
-        );
-    }
     // A workspace filter names itself and clears in one click.
     if scoped {
         side = side.child(
@@ -4133,338 +4312,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 ),
         );
     }
-    // The content grows to fill the scroll area so the shelves sit at the bottom. Layout does
-    // that in the same pass that sizes the area, so no earlier frame's measurement (stale on the
-    // frame where zoom changes) can make it taller than the area. Its automatic minimum is its
-    // own content, so a long list still scrolls.
-    let mut content = col().key("sidebar-content").pb(2.0).gap(1.0).grow(1.0);
-    let entries = sidebar_ui::entries(s);
-    let captains: Vec<_> = entries.iter().filter(|entry| entry.captain).collect();
-    if !s.show_archive || !captains.is_empty() {
-        let mut heading = section_title("Captains", p);
-        if !captains.is_empty() {
-            heading = heading.child(
-                label(captains.len().to_string(), META.features(TABULAR), p.faint)
-                    .key("captain-count")
-                    .mr(6.0),
-            );
-        }
-        if !s.show_archive {
-            heading = heading.child(icon_button(
-                "assign-captain",
-                "New captain thread",
-                "plus",
-                p,
-                // Uses the same new-thread draft route, with the in-place captain selector open.
-                |s| s.open_captain_selector(),
-            ));
-        }
-        content = content.child(heading);
-        for entry in &captains {
-            let home = entry.id;
-            content = content.child(
-                col()
-                    .key(if s.client.is_some() {
-                        format!("crew-{}-{home}", entry.server)
-                    } else {
-                        format!("crew-{home}")
-                    })
-                    .gap(1.0)
-                    .child(sidebar_ui::row(s, p, entry)),
-            );
-        }
-    }
-    if s.show_archive {
-        let query = s.search.text.trim().to_lowercase();
-        let former: Vec<_> = s
-            .captains
-            .iter()
-            .enumerate()
-            .filter(|(captain, profile)| {
-                s.captain_phase(*captain) == crate::model::CaptainPhase::Retired
-                    && (query.is_empty() || profile.name.to_lowercase().contains(&query))
-            })
-            .collect();
-        if !former.is_empty() {
-            content = content.child(section_title("Former captains", p).key("former-captains"));
-            for (captain, profile) in former {
-                // KSG has no retired Captain record. Reuse its sidebar row layout, with
-                // Shina's resting portrait and a read-only Brief rather than a new thread.
-                let server = s.machines.selected.clone();
-                let pixels =
-                    s.artwork
-                        .face_pixels(profile.portrait, face_for(Status::Ready), CAPTAIN_FACE);
-                content = content.child(
-                    row()
-                        .key(format!("former-captain-{captain}"))
-                        .role("button")
-                        .label(format!("{}, former captain", profile.name))
-                        .focusable(true)
-                        .cursor(rune::Cursor::Pointer)
-                        .h(40.0)
-                        .px(8.0)
-                        .gap(10.0)
-                        .center_y()
-                        .radius(6.0)
-                        .hover(p.row)
-                        .child(pixel_portrait(s, &pixels, CAPTAIN_FACE, p))
-                        .child(
-                            label(&profile.name, CAPTAIN_NAME, p.ink)
-                                .truncate()
-                                .grow(1.0)
-                                .min_w(0.0),
-                        )
-                        .child(meta_text("Demoted", p.faint))
-                        .on_press(move |s: &mut State| {
-                            if s.machines.selected == server
-                                && s.captain_phase(captain) == crate::model::CaptainPhase::Retired
-                            {
-                                s.brief.record = Some((server.clone(), captain));
-                            }
-                        }),
-                );
-            }
-        }
-    }
-    let all: Vec<_> = entries.iter().filter(|entry| !entry.captain).collect();
-    let visible: Vec<_> = all.iter().copied().filter(|entry| entry.visible).collect();
-    let dragging = s.drag_thread.is_some();
-    if !s.show_archive {
-        let mut threads_head = section_title("Threads", p).key("threads-heading");
-        if !captains.is_empty() {
-            threads_head = threads_head.mt(8.0);
-        }
-        threads_head = threads_head.child(project_switcher(s, p).help("Add workspace"));
-        content = content.child(threads_head);
-    }
-    let drafts: Vec<_> = visible
-        .iter()
-        .copied()
-        .filter(|entry| entry.draft)
-        .collect();
-    if !drafts.is_empty() {
-        content = content.child(section_title("Drafts", p));
-        for entry in drafts {
-            content = content.child(sidebar_ui::row(s, p, entry));
-        }
-    }
-    let mut first_shelf = true;
-    if !s.search.text.is_empty() {
-        for entry in all
-            .iter()
-            .copied()
-            .filter(|entry| !entry.draft && entry.visible)
-        {
-            content = content.child(sidebar_ui::row(s, p, entry));
-        }
-    } else {
-        let grouped = s.sidebar_grouped() && !dragging;
-        if grouped {
-            let active_rows: Vec<_> = all
-                .iter()
-                .copied()
-                .filter(|entry| {
-                    !entry.draft
-                        && entry.visible
-                        && matches!(
-                            lifecycle::section(&entry.life, lifecycle::now()),
-                            Section::Pinned | Section::Active
-                        )
-                })
-                .collect();
-            for group in sidebar_ui::groups(s, &active_rows) {
-                let collapsed = s.sidebar_group_collapsed(group.server, group.project);
-                content = content.child(sidebar_ui::group_header(s, p, &group, collapsed));
-                for entry in group.rows {
-                    if collapsed && !entry.selected(s) {
-                        continue;
-                    }
-                    content = content.child(sidebar_ui::row(s, p, entry));
-                }
-            }
-        }
-        let sections: &[Section] = if grouped {
-            &[Section::Snoozed, Section::Settled]
-        } else {
-            &[
-                Section::Pinned,
-                Section::Active,
-                Section::Snoozed,
-                Section::Settled,
-            ]
-        };
-        for &section in sections {
-            let rows: Vec<_> = all
-                .iter()
-                .copied()
-                .filter(|entry| {
-                    !entry.draft && lifecycle::section(&entry.life, lifecycle::now()) == section
-                })
-                .collect();
-            let shelf = match section {
-                Section::Snoozed => Some(0),
-                Section::Settled => Some(1),
-                _ => None,
-            };
-            if let Some(shelf) = shelf {
-                // Settled stays visible as a drop target while dragging, even when empty.
-                if rows.is_empty() && !(section == Section::Settled && dragging) {
-                    continue;
-                }
-                // The first shelf takes the remaining height above it, so the shelves sit at the
-                // bottom of the sidebar as in T3 Code.
-                if first_shelf {
-                    content = content.child(spacer().min_h(12.0));
-                    content = content.child(rule(p).mx(ROW_INSET));
-                    first_shelf = false;
-                }
-                let key = format!("shelf-{section:?}");
-                let title = format!("{section:?}");
-                let marker = format!("drop-{section:?}");
-                let open = s.shelves[shelf];
-                // Each shelf heading sticks to the bottom of the scroll area, Snoozed one heading
-                // above Settled, so both stay whole above the footer when the list is longer than
-                // the area (as at 1.25x zoom). Scrolled into view, a heading sits in its own place.
-                // The block carries the sidebar fill, so rows never show through.
-                let settled_below = section == Section::Snoozed
-                    && (dragging
-                        || all.iter().any(|entry| {
-                            !entry.draft
-                                && lifecycle::section(&entry.life, lifecycle::now())
-                                    == Section::Settled
-                        }));
-                let inset = if settled_below { SHELF_HEADING } else { 0.0 };
-                content = content.child(
-                    col()
-                        .key(format!("shelf-block-{section:?}"))
-                        .h(SHELF_HEADING)
-                        .fill(p.bg)
-                        .sticky_bottom(inset)
-                        .child(
-                            row()
-                                .key(&key)
-                                .role("button")
-                                .cursor(rune::Cursor::Pointer)
-                                .label(format!("{title}, {} threads", rows.len()))
-                                .focusable(true)
-                                .h(SHELF_HEADING)
-                                .pl(ROW_INSET)
-                                .pr(4.0)
-                                .gap(6.0)
-                                .center_y()
-                                .radius(6.0)
-                                .hover(p.selected)
-                                .on_drawn_layout(move |s: &mut State, rect| {
-                                    s.drop_rects.insert(marker.clone(), rect);
-                                })
-                                .on_press(move |s: &mut State| {
-                                    s.shelves[shelf] = !s.shelves[shelf];
-                                    s.checkpoint();
-                                })
-                                .child(meta_label(&title, p.faint))
-                                .child(spacer())
-                                .child(label(
-                                    rows.len().to_string(),
-                                    META.features(TABULAR),
-                                    p.faint,
-                                ))
-                                .child(
-                                    icon(
-                                        if open {
-                                            "chevron-down"
-                                        } else {
-                                            "chevron-right"
-                                        },
-                                        p.faint,
-                                    )
-                                    .size(12.0, 12.0),
-                                ),
-                        ),
-                );
-            } else if dragging {
-                let marker = format!("drop-{section:?}");
-                let selected = s.drag_target.is_some_and(|(to, _)| to == section);
-                content = content.child(
-                    row()
-                        .key(&marker)
-                        .h(28.0)
-                        .px(8.0)
-                        .center_y()
-                        .fill(if selected { p.coral_bg } else { p.selected })
-                        .on_drawn_layout(move |s: &mut State, rect| {
-                            s.drop_rects.insert(marker.clone(), rect);
-                        })
-                        .child(meta_label(&format!("{section:?}"), p.muted)),
-                );
-            }
-            let limit = if section == Section::Settled && s.search.text.is_empty() {
-                s.settled_visible
-            } else {
-                usize::MAX
-            };
-            for entry in rows
-                .iter()
-                .copied()
-                .filter(|entry| entry.visible)
-                .take(limit)
-            {
-                content = content.child(sidebar_ui::row(s, p, entry));
-            }
-            if section == Section::Settled && s.shelves[1] && rows.len() > s.settled_visible {
-                content = content.child(button(
-                    "settled-more",
-                    &format!("Show {} more", (rows.len() - s.settled_visible).min(25)),
-                    p,
-                    |s| s.settled_visible += 25,
-                ));
-            }
-        }
-    }
-    if captains.is_empty() && (all.is_empty() || !s.search.text.is_empty() && visible.is_empty()) {
-        content = content.child(empty_list(
-            s,
-            p,
-            "sidebar-empty",
-            if s.search.text.is_empty() {
-                "No threads in this workspace yet"
-            } else {
-                "No matching conversations"
-            },
-        ));
-    }
-    side = side.child(
-        col()
-            .key("sidebar-scroll")
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(content),
-    );
-    // The provider pill sits above the footer control (KSG `SidebarProviderUpdatePill`).
-    if let Some(view) = &s.fleet.pill {
-        side = side.child(provider_pill(view, p));
-    }
-    if s.fleet_run_visible() {
-        let view = s.describe_capsule();
-        side = side.child(update_capsule(&view, p));
-        if s.fleet.popover {
-            side = side.child(capsule_popover(s, p));
-        }
-    } else if let Some(summary) = s.update_everything_summary() {
-        side = side.child(update_everything_button(&summary, p));
-    } else if let Some(row) = update_row(s, p) {
-        side = side.child(row);
-    } else if let Some(row) = check_updates_row(s, p) {
-        side = side.child(row);
-    }
-    if let Some(notice) = &s.fleet.result_notice {
-        side = side.child(update_result_notice(notice, p));
-    }
-    if let Some(error) = &s.lifecycle_error {
-        side = side.child(label(error, SMALL, p.danger).wrap().padding(8.0));
-    }
+    side = side.child(sidebar_ui::content(s, p));
     if let Some(notice) = &s.undo {
         let count = notice.entries.len();
         let title = if count > 1 {
@@ -4536,7 +4384,8 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 )
                 .help("Archive"),
             )
-            .child(spacer()),
+            .child(spacer())
+            .child(updates_ui::footer(s, p)),
     );
     side
 }
@@ -4564,6 +4413,65 @@ fn disabled_menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
     menu_item_in(key, title, glyph, p, p.faint, p.faint)
         .focusable(false)
         .cursor(rune::Cursor::Default)
+}
+trait BlockedAction {
+    fn blocked(self, reason: Option<String>, key: &str, p: Palette, inline: bool) -> El;
+}
+
+impl BlockedAction for El {
+    fn blocked(self, reason: Option<String>, key: &str, p: Palette, inline: bool) -> El {
+        let Some(reason) = reason else { return self };
+        let control = self
+            .disabled(true)
+            .focusable(false)
+            .cursor(rune::Cursor::Default)
+            .description(&reason)
+            .help(&reason);
+        if inline {
+            control.child(
+                label(reason, SMALL, p.faint)
+                    .key(format!("{key}-reason"))
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            )
+        } else {
+            control
+        }
+    }
+}
+
+fn gated_menu_item(key: &str, title: &str, glyph: &str, p: Palette, reason: Option<String>) -> El {
+    let Some(reason) = reason else {
+        return menu_item(key, title, glyph, p);
+    };
+    if reason.chars().count() <= 24 {
+        disabled_menu_item(key, title, glyph, p).blocked(Some(reason), key, p, true)
+    } else {
+        col()
+            .key(key)
+            .role("menuitem")
+            .label(title)
+            .disabled(true)
+            .help(&reason)
+            .description(&reason)
+            .h(44.0)
+            .px(8.0)
+            .justify_center()
+            .child(
+                row()
+                    .center_y()
+                    .gap(8.0)
+                    .child(icon(glyph, p.faint))
+                    .child(label(title, TITLE, p.faint).truncate()),
+            )
+            .child(
+                label(reason, SMALL, p.faint)
+                    .key(format!("{key}-reason"))
+                    .pl(24.0)
+                    .truncate(),
+            )
+    }
 }
 /// A menu item with a value at its right edge in pixel type, such as "3 days".
 fn menu_value_item(key: &str, title: &str, value: &str, glyph: &str, p: Palette) -> El {
@@ -4772,433 +4680,6 @@ fn clone_dialog(s: &State, p: Palette) -> El {
         .child(card)
 }
 
-/// Shown only while an update is on its way or waits for a restart. Downloading is passive;
-/// the only action is one restart, disabled while any thread still has work.
-/// Ported from KSG Code's sidebar/SidebarUpdatePill.tsx.
-fn update_row(s: &State, p: Palette) -> Option<El> {
-    use crate::update::Status;
-    match s.updater.status() {
-        Status::Idle if s.updater.notice().is_some() => {
-            let notice = s.updater.notice().unwrap();
-            Some(
-                col()
-                    .key("shina-update-notice")
-                    .mx(8.0)
-                    .mb(8.0)
-                    .gap(4.0)
-                    .child(label("Shina app updates", SMALL, p.muted))
-                    .child(label(truncate(notice, 300), SMALL, p.muted).wrap_anywhere())
-                    .child(
-                        button(
-                            "retry-update",
-                            if s.updater.rate_limited() {
-                                "Waiting for GitHub"
-                            } else {
-                                "Retry Shina update check"
-                            },
-                            p,
-                            |s| s.updater.retry(),
-                        )
-                        .disabled(s.updater.rate_limited()),
-                    ),
-            )
-        }
-        Status::Disabled | Status::Idle | Status::Checking => None,
-        Status::Downloading { tag } => {
-            let title = format!("Downloading update {tag}");
-
-            Some(
-                row()
-                    .key("update-progress")
-                    .role("status")
-                    .label(title.clone())
-                    .h(30.0)
-                    .mx(8.0)
-                    .mb(8.0)
-                    .px(10.0)
-                    .gap(8.0)
-                    .center_y()
-                    .radius(12.0)
-                    .fill(p.sea_bg)
-                    .child(icon("send", p.sea))
-                    .child(label(title, TextStyle::new(13.0, 500.0), p.sea)),
-            )
-        }
-        Status::Ready { update } => {
-            let title = format!("Restart to update to {}", update.tag);
-            let blocker = s.update_restart_blocker();
-            let description = blocker.or(s.restart_notice.as_deref()).map(str::to_owned);
-            let mut button = row()
-                .key("update-restart")
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label(title.clone())
-                .description(description.clone().unwrap_or_default())
-                .h(30.0)
-                .mx(8.0)
-                .mb(8.0)
-                .px(10.0)
-                .gap(8.0)
-                .center_y()
-                .radius(12.0)
-                .fill(p.sea_bg)
-                .disabled(blocker.is_some())
-                .a11y_value(description.unwrap_or_default())
-                .child(icon("send", p.sea))
-                .child(label(title, TextStyle::new(13.0, 500.0), p.sea));
-            if blocker.is_none() {
-                button = button
-                    .focusable(true)
-                    .hover(p.selected)
-                    .on_press(|s: &mut State| s.restart_for_update = true);
-            }
-            Some(button)
-        }
-    }
-}
-
-/// KSG `SidebarUpdatePill`'s idle state: the one-button "Check for updates"
-/// that probes the app release and every machine's providers and server. It
-/// only exists on builds that update themselves; dev runs and demos show
-/// nothing. A running check reads "Checking for updates" and takes no press.
-fn check_updates_row(s: &State, p: Palette) -> Option<El> {
-    use crate::update::Status;
-    if !s.updater.self_update_enabled() {
-        return None;
-    }
-    if matches!(s.updater.status(), Status::Checking) {
-        return Some(
-            row()
-                .key("check-updates")
-                .role("status")
-                .label("Checking for updates".to_owned())
-                .h(30.0)
-                .mx(8.0)
-                .mb(8.0)
-                .px(10.0)
-                .gap(8.0)
-                .center_y()
-                .radius(12.0)
-                .fill(p.card)
-                .child(icon("reload", p.muted))
-                .child(label(
-                    "Checking for updates",
-                    TextStyle::new(12.5, 520.0),
-                    p.muted,
-                )),
-        );
-    }
-    Some(
-        row()
-            .key("check-updates")
-            .role("button")
-            .cursor(rune::Cursor::Pointer)
-            .label("Check for updates".to_owned())
-            .h(30.0)
-            .mx(8.0)
-            .mb(8.0)
-            .px(10.0)
-            .gap(8.0)
-            .center_y()
-            .radius(12.0)
-            .fill(p.sea_bg)
-            .focusable(true)
-            .hover(p.selected)
-            .on_press(|s: &mut State| s.check_for_updates())
-            .child(icon("reload", p.sea))
-            .child(label(
-                "Check for updates",
-                TextStyle::new(12.5, 520.0),
-                p.sea,
-            )),
-    )
-}
-
-/// The single footer control while any server or provider can update, KSG
-/// `useUpdateEverything`'s trigger: 30 px, `sea_bg`, `sea` icon and summary.
-fn update_everything_button(summary: &str, p: Palette) -> El {
-    row()
-        .key("update-all-machines")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(summary.to_owned())
-        .h(30.0)
-        .mx(8.0)
-        .mb(8.0)
-        .px(10.0)
-        .gap(8.0)
-        .center_y()
-        .radius(12.0)
-        .fill(p.sea_bg)
-        .focusable(true)
-        .hover(p.selected)
-        .on_press(|s: &mut State| s.open_fleet())
-        .child(icon("send", p.sea))
-        .child(label(summary, TextStyle::new(13.0, 500.0), p.sea))
-}
-
-/// The run capsule that replaces the footer control, KSG `SidebarUpdateCapsule`.
-fn update_capsule(view: &crate::fleet_update::CapsuleView, p: Palette) -> El {
-    use crate::fleet_update::{CapsuleAction, CapsuleTone};
-    let border = match view.tone {
-        CapsuleTone::Slow => p.brass,
-        CapsuleTone::Failed => p.danger,
-        CapsuleTone::Default => p.line,
-    };
-    let label_color = match view.tone {
-        CapsuleTone::Failed => p.danger,
-        _ => p.ink,
-    };
-    let mut content = row()
-        .grow(1.0)
-        .min_w(0.0)
-        .center_y()
-        .gap(4.0)
-        .child(label(&view.label, TextStyle::new(12.0, 400.0), label_color).truncate());
-    if let Some(elapsed) = &view.elapsed {
-        content = content.child(meta_text(elapsed, p.brass));
-    }
-    let action = match view.action {
-        CapsuleAction::Later => Some("Later"),
-        CapsuleAction::Retry => Some("Retry"),
-        CapsuleAction::Dismiss => Some("Dismiss"),
-        CapsuleAction::None => None,
-    };
-    let mut capsule = row()
-        .key("update-capsule")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(
-            [Some(view.label.as_str()), view.elapsed.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
-        .h(32.0)
-        .mx(8.0)
-        .mb(8.0)
-        .pl(10.0)
-        .center_y()
-        .radius(6.0)
-        .fill(p.card)
-        .border(1.0, border)
-        .focusable(true)
-        .on_press(|s: &mut State| s.fleet.popover = !s.fleet.popover)
-        .child(content);
-    if let Some(title) = action {
-        capsule = capsule.child(
-            row()
-                .key("update-capsule-action")
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label(title.to_owned())
-                .h(32.0)
-                .px(8.0)
-                .center_y()
-                .focusable(true)
-                .on_press(|s: &mut State| s.capsule_action())
-                .child(label(title, TextStyle::new(12.0, 400.0), p.sea)),
-        );
-    } else {
-        capsule = capsule.child(el().size(32.0, 32.0).center().child(icon(
-            if view.tone == CapsuleTone::Failed {
-                "alert"
-            } else {
-                "send"
-            },
-            if view.tone == CapsuleTone::Failed {
-                p.danger
-            } else {
-                p.sea
-            },
-        )));
-    }
-    capsule
-}
-
-/// The capsule's popover, anchored above and end-aligned (KSG `updateEverythingRun`
-/// rows): This app first, then one row per machine with its status word.
-fn capsule_popover(s: &State, p: Palette) -> El {
-    let mut list = col().w(280.0).gap(0.0);
-    let local_status = s.capsule_local_status();
-    if local_status.is_some() || s.fleet.postponed_local {
-        let mut app_row = row().h(28.0).center_y().gap(8.0).child(
-            label("This app", TextStyle::new(12.0, 500.0), p.ink)
-                .grow(1.0)
-                .min_w(0.0)
-                .truncate(),
-        );
-        if s.fleet.postponed_local && s.fleet.local_version.is_none() {
-            app_row = app_row.child(secondary_button(
-                "capsule-restart",
-                "Restart to update",
-                p,
-                |s| s.restart_postponed_update(),
-            ));
-        } else if let Some(status) = &local_status {
-            app_row = app_row.child(meta_text(status, p.muted));
-        }
-        list = list.child(app_row);
-    }
-    let all_settled = s.fleet.rows.iter().all(|row| row.result.is_some());
-    let any_failure = s.fleet.rows.iter().any(|row| row.result == Some(false));
-    let any_server_failure =
-        s.fleet.rows.iter().any(|row| {
-            row.result == Some(false) && row.server_target.is_some() && !row.server_updated
-        });
-    for (index, machine) in s.fleet.rows.iter().enumerate() {
-        let status = s.run_status(machine);
-        let mut machine_row = row().h(28.0).center_y().gap(8.0).child(
-            label(&machine.name, TextStyle::new(12.0, 500.0), p.ink)
-                .grow(1.0)
-                .min_w(0.0)
-                .truncate(),
-        );
-        let word = crate::fleet_update::status_word(status);
-        if matches!(status, "providers" | "downloading" | "restarting") {
-            machine_row = machine_row.child(meta_text(
-                format!(
-                    "{word} {}",
-                    crate::fleet_update::format_update_elapsed(machine.started_at.elapsed())
-                ),
-                p.muted,
-            ));
-        } else {
-            machine_row = machine_row.child(meta_text(
-                word,
-                if status == "failed" {
-                    p.danger
-                } else {
-                    p.muted
-                },
-            ));
-        }
-        list = list.child(machine_row);
-        // A machine can carry both a provider failure and a server failure; show both.
-        let mut failures: Vec<String> = Vec::new();
-        if let Some(failure) = &machine.provider_failure {
-            failures.push(failure.clone());
-        }
-        if let Some(reason) = machine.state.strip_prefix("failed: ")
-            && Some(reason) != machine.provider_failure.as_deref()
-        {
-            failures.push(reason.to_owned());
-        }
-        for (failure_index, text) in failures.into_iter().enumerate() {
-            let key = if failure_index == 0 {
-                format!("capsule-failure-{index}")
-            } else {
-                format!("capsule-failure-{index}-{failure_index}")
-            };
-            list = list.child(
-                label(text, TextStyle::new(12.0, 400.0), p.muted)
-                    .wrap()
-                    .pb(4.0)
-                    .key(key),
-            );
-        }
-    }
-    if all_settled && any_failure {
-        let mut actions = row().gap(4.0).pt(4.0);
-        if any_server_failure {
-            actions = actions.child(secondary_button("capsule-retry", "Retry", p, |s| {
-                s.capsule_action()
-            }));
-        }
-        actions = actions.child(button("capsule-dismiss", "Dismiss", p, |s| {
-            s.dismiss_settled_machines()
-        }));
-        list = list.child(actions);
-    }
-    list.padding(4.0)
-        .key("update-capsule-popover")
-        .fill(p.card)
-        .border(1.0, p.frame)
-        .radius(6.0)
-        .box_shadow(soft_shadow(p))
-        .anchored_fit("update-capsule", rune::Side::Top, rune::Align::End, 4.0)
-}
-
-/// `provider-update-pill`: the local machine's provider update notice above the
-/// footer (KSG `SidebarProviderUpdatePill`).
-fn provider_pill(view: &crate::fleet_update::ProviderPillView, p: Palette) -> El {
-    use crate::fleet_update::PillTone;
-    let (border, text, status) = match view.tone {
-        PillTone::Loading | PillTone::Success => (p.line, p.ink, p.sea),
-        PillTone::Warning => (p.brass, p.brass, p.brass),
-        PillTone::Error => (p.danger, p.danger, p.danger),
-    };
-    let mut pill = row()
-        .key("provider-update-pill")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(view.title.clone())
-        .min_h(28.0)
-        .mx(8.0)
-        .mb(4.0)
-        .px(8.0)
-        .gap(6.0)
-        .center_y()
-        .radius(6.0)
-        .fill(p.card)
-        .border(1.0, border)
-        .focusable(true)
-        .on_press(|s: &mut State| {
-            s.open_settings();
-            s.settings.section = 2;
-        })
-        .child(el().size(8.0, 8.0).fill(status).a11y_hidden())
-        .child(
-            label(&view.title, TextStyle::new(12.0, 500.0), text)
-                .grow(1.0)
-                .min_w(0.0)
-                .truncate(),
-        );
-    if view.dismissible {
-        pill = pill.child(icon_button(
-            "dismiss-provider-pill",
-            "Dismiss provider update notice",
-            "close",
-            p,
-            |s| s.dismiss_provider_pill(),
-        ));
-    }
-    pill
-}
-
-/// `update-result`: the one notice after a run settles, KSG
-/// `getUpdateEverythingToastView`; dismissible.
-fn update_result_notice(notice: &crate::fleet_update::ResultNotice, p: Palette) -> El {
-    let color = if notice.success { p.sea } else { p.danger };
-    let mut card = col()
-        .gap(2.0)
-        .grow(1.0)
-        .min_w(0.0)
-        .child(label(&notice.title, SMALL, color).wrap());
-    for line in &notice.lines {
-        card = card.child(label(line, TextStyle::new(12.0, 400.0), p.muted).wrap());
-    }
-    row()
-        .key("update-result")
-        .gap(4.0)
-        .mx(8.0)
-        .mb(8.0)
-        .px(8.0)
-        .py(4.0)
-        .radius(6.0)
-        .fill(p.card)
-        .border(1.0, if notice.success { p.line } else { p.danger })
-        .child(card)
-        .child(icon_button(
-            "dismiss-update-result",
-            "Dismiss update result",
-            "close",
-            p,
-            |s| s.dismiss_result_notice(),
-        ))
-}
-
 /// A sidebar section label: Inter 12/500, sentence case, muted. Counts and buttons follow it.
 fn section_title(title: &str, p: Palette) -> El {
     row()
@@ -5260,31 +4741,23 @@ fn portrait_face(
 ) -> El {
     let captain = captain.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let pixels = s.artwork.face_pixels(captain, face_for(status), size);
-    let portrait = pixel_portrait_framed(s, &pixels, size, p, accent)
+    let fitted = if s.artwork.is_pixel_art(captain) {
+        s.artwork.snap_points(size)
+    } else {
+        size
+    };
+    let portrait = portrait(&pixels, fitted, p, accent)
         .key(format!("avatar-{captain}-{}", size as u32))
         .a11y_hidden();
-    status_badge(p, portrait, size, status)
+    haloed(s, p, portrait, size, status)
 }
 
 /// The portrait in the captain picker and the editor's grid. The head art is 40 cells, so 40
 /// points is a whole number of device pixels per cell at every integer window scale.
 const PICKER_PORTRAIT: f32 = 40.0;
 /// Every machine uses the same portrait size, including before a captain is selected.
-const CAPTAIN_SLOT: f32 = 28.0;
-/// A sidebar portrait is 28 px inside its 28 px slot (head crop below 30 pt).
-const CAPTAIN_FACE: f32 = 28.0;
-/// Room for one badge at the end of the name line, kept even when there is none, so a
-/// badge arriving never moves the name.
 /// The widest a machine name and its connection note grow beside a workspace or a detail.
 const MACHINE_CAP: f32 = 110.0;
-/// The least room left for a machine's name beside the workspace. Under it the tag is the icon
-/// alone, because a name cut to two letters and an ellipsis says nothing.
-const MACHINE_NAME_ROOM: f32 = 32.0;
-/// What a captain row spends beside its text: left padding, the portrait slot, the gap and the
-/// right padding.
-const CAPTAIN_TEXT_INSET: f32 = 8.0 + CAPTAIN_SLOT + 10.0 + 8.0;
-const CAPTAIN_NAME: TextStyle = TITLE;
-const CAPTAIN_STATUS: TextStyle = SMALL;
 
 /// A sidebar portrait. It plays its status's animation strip through the shared stage in
 /// `crate::portraits`, which also learns here whether the row is on screen. Under reduced
@@ -5293,25 +4766,34 @@ fn sidebar_portrait(
     s: &State,
     p: Palette,
     row: usize,
-    portrait: usize,
+    slot: usize,
     size: f32,
     status: Status,
 ) -> El {
-    let portrait = portrait.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
+    let slot = slot.min(crate::visuals::CAPTAIN_NAMES.len() - 1);
     let face = face_for(status);
     let pixels = s
         .portraits
-        .pixels(portrait, face, size)
-        .unwrap_or_else(|| s.artwork.face_pixels(portrait, face, size));
-    pixel_portrait(s, &pixels, size, p)
-        .key(format!("portrait-{row}"))
-        .a11y_hidden()
-        .on_visible(move |s: &mut State, on, tx| {
-            s.portraits.set_visible(row, on);
-            // The view doesn't read this; the next poll does.
-            tx.live_only();
-            tx.wake_after(std::time::Duration::ZERO);
-        })
+        .pixels(slot, face, size)
+        .unwrap_or_else(|| s.artwork.face_pixels(slot, face, size));
+    portrait(
+        &pixels,
+        if s.artwork.is_pixel_art(slot) {
+            s.artwork.snap_points(size)
+        } else {
+            size
+        },
+        p,
+        None,
+    )
+    .key(format!("portrait-{row}"))
+    .a11y_hidden()
+    .on_visible(move |s: &mut State, on, tx| {
+        s.portraits.set_visible(row, on);
+        // The view doesn't read this; the next poll does.
+        tx.live_only();
+        tx.wake_after(std::time::Duration::ZERO);
+    })
 }
 
 /// What a count badge counts. Brass is for what needs you, and the neutral card fill with ink
@@ -5341,186 +4823,6 @@ fn count_pill(count: usize, kind: CountKind, p: Palette) -> El {
         .border(1.0, frame)
         .center()
         .child(label(text, META, ink))
-}
-
-/// A row's hover and selection washes, after Grok Bot's bot list: ink at about 6% on hover
-/// and 8% when selected. Rune blends in linear light, so dark mode needs far less alpha.
-fn row_washes(_: &State, p: Palette) -> (Color, Color) {
-    (p.selected, p.row)
-}
-
-/// A captain in the sidebar, laid out like Grok Bot's bot rows: a larger portrait, the name,
-/// and one status line under it. Every part has a fixed place: the name truncates before
-/// anything else, the badge and timer keep reserved slots, and the status word never
-/// shrinks, so a status change never moves the name, the portrait or the rows around it.
-fn captain_row(
-    s: &State,
-    p: Palette,
-    thread: &Thread,
-    item: El,
-    status: Status,
-    approval: bool,
-    selected: bool,
-) -> El {
-    let id = thread.id;
-    let name = thread
-        .captain
-        .and_then(|c| s.captains.get(c))
-        .map(|c| c.name.as_str())
-        .unwrap_or(&thread.title);
-    let crew: Vec<&Thread> = s
-        .threads
-        .iter()
-        .filter(|t| {
-            t.crew_captain == thread.captain
-                && t.crew_captain.is_some()
-                && thread
-                    .captain
-                    .is_some_and(|captain| s.captain_home(captain) == Some(id))
-                && t.archived() == s.show_archive
-        })
-        .collect();
-    let family = || std::iter::once(thread).chain(crew.iter().copied());
-    let running: Vec<&Thread> = family().filter(|t| t.status == Status::Running).collect();
-    let requests = family().filter(|t| t.request.is_some()).count();
-    let unread = family().filter(|t| t.unread()).count();
-    let workspace = row_workspace(s, thread);
-    let crew_count = s.captain_worker_count(id);
-    let detail = if let Some(workspace) = &workspace {
-        workspace.clone()
-    } else if crew_count > 0 {
-        format!("{crew_count} crew")
-    } else {
-        String::new()
-    };
-    let timer = (status == Status::Running)
-        .then(|| running.iter().filter_map(|t| t.started).min())
-        .flatten();
-    let archived = thread
-        .captain
-        .is_some_and(|captain| s.captain_phase(captain) == crate::model::CaptainPhase::Archived);
-    let status_label = if archived { "Archived" } else { status.label() };
-    let mut trailing = row()
-        .key(format!("captain-status-{id}"))
-        .h(20.0)
-        .gap(6.0)
-        .center_y();
-    if requests > 0 || status == Status::Waiting {
-        trailing = trailing.child(
-            count_pill(requests.max(1), CountKind::NeedsYou, p)
-                .key(format!("captain-attention-{id}")),
-        );
-    } else if status == Status::Running {
-        trailing = trailing.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
-        if let Some(start) = timer {
-            trailing = trailing.child(
-                label(
-                    elapsed_label(start.elapsed().as_secs()),
-                    META.features(TABULAR),
-                    p.muted,
-                )
-                .key(format!("captain-timer-{id}")),
-            );
-        }
-    } else if status == Status::Failed {
-        trailing = trailing
-            .child(el().size(6.0, 6.0).radius(3.0).fill(p.danger).a11y_hidden())
-            .child(meta_text("Failed", p.danger));
-    } else if unread > 0 {
-        trailing = trailing.child(
-            el().key(format!("captain-unread-{id}"))
-                .size(6.0, 6.0)
-                .radius(3.0)
-                .fill(p.sea)
-                .a11y_hidden(),
-        );
-    }
-    let size = CAPTAIN_FACE;
-    let portrait = captain_portrait(s, thread.captain);
-    let portrait_el = sidebar_portrait(s, p, id, portrait, size, status);
-    let portrait_el = if requests > 0 || status == Status::Waiting {
-        status_badge(p, portrait_el, size, Status::Waiting)
-    } else {
-        portrait_el
-    };
-    let (hover, active) = row_washes(s, p);
-    let curve = |seconds| rune::Curve::tween(seconds, rune::Easing::cubic(0.2, 0.0, 0.0, 1.0));
-    let mut description = format!("{name}, {}", status_label.to_lowercase());
-    if requests > 0 && approval {
-        description.push_str(&format!(", {requests} approval"));
-    } else if requests > 0 {
-        description.push_str(&format!(", {requests} question"));
-    }
-    if !detail.is_empty() {
-        description.push_str(&format!(", {detail}"));
-    }
-    if multiple_machines(s) {
-        description.push_str(&format!(", {}", machine_caption(s, &s.machines.selected)));
-    }
-    if unread > 0 {
-        description.push_str(&format!(", {unread} unread"));
-    }
-    let show_detail = sidebar_row_width(s) >= 224.0 && !detail.is_empty();
-    let show_machine_name = sidebar_row_width(s) >= 232.0
-        && room_for_machine_name(
-            sidebar_row_width(s) - CAPTAIN_TEXT_INSET,
-            ICON + 48.0,
-            &detail,
-        );
-    let mut content = row()
-        .grow(1.0)
-        .min_w(0.0)
-        .h(40.0)
-        .pl(8.0)
-        .pr(8.0)
-        .gap(10.0)
-        .center_y()
-        .child(
-            el().key(format!("portrait-slot-{id}"))
-                .size(CAPTAIN_SLOT, CAPTAIN_SLOT)
-                .center()
-                .child(portrait_el),
-        )
-        .child(
-            label(name, CAPTAIN_NAME, p.ink)
-                .key(format!("captain-name-{id}"))
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    if show_detail {
-        content = content.child(
-            label(detail, CAPTAIN_STATUS, p.faint)
-                .key(format!("thread-workspace-{id}"))
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        );
-    }
-    if multiple_machines(s) {
-        content = content.child(machine_tag(
-            s,
-            p,
-            &s.machines.selected,
-            format!("captain-machine-{id}"),
-            CAPTAIN_STATUS,
-            show_machine_name,
-        ));
-    }
-    content = content.child(spacer()).child(trailing);
-    select_bar(
-        item.label(description.clone())
-            .help(description)
-            .radius(6.0)
-            .fill(Color::TRANSPARENT)
-            .hover(hover)
-            .press(active)
-            .hover_motion(curve(0.15), curve(0.2)),
-        selected,
-        s.dark,
-        p,
-    )
-    .child(content)
 }
 
 /// The corner mark that shows a portrait's status in pickers and headers.
@@ -5702,371 +5004,6 @@ pub(crate) fn tick_portraits(
     s.portraits.tick(now, rows)
 }
 
-fn thread_row(s: &State, index: usize, p: Palette) -> El {
-    let thread = &s.threads[index];
-    let id = thread.id;
-    let (row_status, approval) = row_status(s, thread);
-    let captain_home = s.is_captain_home(thread);
-    // A crew worker drawn in the ordinary thread list: only search and the archive put it
-    // there, and its meta line names its captain instead of a workspace tile.
-    let worker = thread.crew_captain.is_some();
-    let target = RowTarget::Thread(id);
-    // A captain row stands for its whole crew, so it stays selected while one of its
-    // workers is open; `selected_row` maps the open worker back to its home.
-    let selected = id == s.selected_row() || s.selected_threads.contains(&id);
-    let section = s.thread_section(thread, lifecycle::now());
-    let hovered = s.hovered_row == Some(target);
-    let draft = thread.is_draft();
-    let at = lifecycle::now();
-    let state_label = if approval {
-        "Approval"
-    } else if thread.request.is_some() {
-        "Input"
-    } else if row_status == Status::Running {
-        "Working"
-    } else if thread.status == Status::Waiting {
-        "Waiting"
-    } else if thread.status == Status::Failed {
-        "Failed"
-    } else if thread.life.woke(at) {
-        "Woke"
-    } else if thread.unread() {
-        "Done"
-    } else {
-        ""
-    };
-    let workspace = row_workspace(s, thread);
-    let mut item = row()
-        .key(if s.client.is_some() {
-            format!("machine-thread-{}-{id}", s.machines.selected)
-        } else {
-            format!("thread-{id}")
-        })
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!(
-            "{}{}{}, {}",
-            thread.title,
-            workspace
-                .as_ref()
-                .map(|w| format!(", {w}"))
-                .unwrap_or_default(),
-            if multiple_machines(s) {
-                format!(", {}", machine_caption(s, &s.machines.selected))
-            } else {
-                String::new()
-            },
-            if approval {
-                "needs approval"
-            } else if worker && (thread.request.is_some() || thread.status == Status::Waiting) {
-                "needs input"
-            } else if worker && thread.unread() && !thread.actionable() {
-                "unread result"
-            } else if state_label.is_empty() {
-                row_status.label()
-            } else {
-                state_label
-            },
-        ))
-        .focusable(true)
-        .w_full()
-        .radius(6.0)
-        .fill(Color::TRANSPARENT)
-        .hover(p.selected)
-        .pointer_buttons([rune::PointerButton::Middle])
-        .on_press_tx({
-            let content_match = !s.search.text.is_empty()
-                && !s.thread_title_search_matches(thread)
-                && s.sidebar_search
-                    .visible_matches
-                    .contains_key(&(s.machines.selected.clone(), id));
-            let server = s.machines.selected.clone();
-            move |s: &mut State, tx| {
-                // KSG: a middle click opens the thread as a kept tab.
-                if tx.button() == rune::PointerButton::Middle {
-                    if let Some(index) = s.threads.iter().position(|t| t.id == id) {
-                        s.open_kept_tab(index);
-                    }
-                } else if content_match {
-                    s.open_thread_at_search_match(&server, id);
-                } else {
-                    let order: Vec<usize> = sidebar_navigation(s)
-                        .into_iter()
-                        .filter(|(srv, _)| srv == &s.machines.selected)
-                        .map(|(_, tid)| tid)
-                        .filter(|tid| {
-                            s.threads
-                                .iter()
-                                .find(|t| t.id == *tid)
-                                .is_some_and(|t| !s.is_captain_home(t))
-                        })
-                        .collect();
-                    s.click_thread_in_order(index, tx.mods(), &order);
-                }
-            }
-        })
-        .on_double_press(move |s: &mut State| s.begin_rename(id))
-        .on_key(move |s: &mut State, ev, _| {
-            if ev.key == rune::Key::Function(2) {
-                s.begin_rename(id);
-                true
-            } else {
-                false
-            }
-        })
-        .on_drawn_layout(move |s: &mut State, rect| {
-            s.drop_rects.insert(format!("thread-{id}"), rect);
-        })
-        .on_secondary_press(move |s: &mut State, at, _| {
-            s.row_menu = Some(target);
-            s.row_menu_at = Some((at.x, at.y));
-        })
-        .on_hover_change(move |s: &mut State, hovered, _| {
-            if hovered {
-                s.hovered_row = Some(target);
-            } else if s.hovered_row == Some(target) {
-                s.hovered_row = None;
-            }
-        });
-    if !worker && !captain_home && thread.machine == "local" {
-        item = item.on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag));
-    }
-    if captain_home && !worker {
-        return captain_row(s, p, thread, item, row_status, approval, selected);
-    }
-    let item = select_bar(item, selected, s.dark, p);
-
-    let shelved = matches!(section, Section::Snoozed | Section::Settled) && !captain_home;
-    let grouped = s.sidebar_grouped() && !shelved && !worker;
-    let dot = |ink: Color| el().size(6.0, 6.0).radius(3.0).fill(ink);
-    let project = s.project(thread.project);
-    // Lead slot (16x16): in Workspace grouping, show only status/unread/pin/draft marks so
-    // titles align under the group name; in Recent grouping, search, shelves, or worker rows,
-    // show the 16 pt project tile or captain portrait with any status badge overlaid.
-    let lead_content = if grouped {
-        if approval || thread.request.is_some() || row_status == Status::Waiting {
-            Some(status_mark(Status::Waiting, p, 7.0).a11y_hidden())
-        } else if row_status == Status::Running || row_status == Status::Failed {
-            Some(status_mark(row_status, p, 7.0).a11y_hidden())
-        } else if thread.unread() || thread.life.woke(at) {
-            Some(dot(p.sea).a11y_hidden())
-        } else if thread.pinned() {
-            Some(icon("pin", p.faint).size(12.0, 12.0).a11y_hidden())
-        } else if draft {
-            Some(icon("edit", p.faint).size(12.0, 12.0).a11y_hidden())
-        } else {
-            None
-        }
-    } else if worker {
-        let captain = thread.crew_captain;
-        let portrait = captain_portrait(s, captain);
-        let face = face_for(row_status);
-        let pixels = s.artwork.face_pixels(portrait, face, 16.0);
-        let base = pixel_portrait(s, &pixels, 16.0, p)
-            .key(format!("worker-captain-portrait-{id}"))
-            .a11y_hidden();
-        let task_mark = crew_ui::worker_task_mark(s, thread);
-        let badge_status = task_mark.unwrap_or(row_status);
-        let mark_key = if thread.actionable() || thread.unread() {
-            Some(format!("worker-alert-{id}"))
-        } else if task_mark.is_some() {
-            Some(format!("worker-task-mark-{id}"))
-        } else {
-            None
-        };
-        Some(status_badge_keyed(p, base, 16.0, badge_status, mark_key))
-    } else {
-        let tile = project_tile(s, p, project, 16.0);
-        Some(status_badge(p, tile, 16.0, row_status))
-    };
-    let lead = el()
-        .size(16.0, 16.0)
-        .center()
-        .child(lead_content.unwrap_or_else(el));
-    let highlighted = selected
-        || row_status == Status::Running
-        || row_status == Status::Waiting
-        || approval
-        || thread.request.is_some()
-        || thread.life.woke(at)
-        || thread.unread();
-    let (title_style, title_ink) = if shelved {
-        (ROW_QUIET, p.faint)
-    } else if highlighted {
-        (TITLE, p.ink)
-    } else {
-        (ROW_QUIET, p.muted)
-    };
-    let title = label(
-        if draft && !thread.draft.text.trim().is_empty() {
-            thread.draft.text.lines().next().unwrap_or(&thread.title)
-        } else {
-            &thread.title
-        },
-        title_style,
-        title_ink,
-    )
-    .truncate()
-    .grow(1.0)
-    .shrink()
-    .min_w(0.0);
-
-    // The status slot: hover actions, then what needs attention, then how old the row is.
-    // Hover puts Snooze and Settle where the age sat; everything else is in the right-click menu.
-    let mut slot = row().gap(2.0).center_y().h(20.0);
-    if hovered && !captain_home && thread.machine == "local" {
-        if draft || !thread.draft.text.is_empty() {
-            slot = slot.child(icon_button(
-                &format!("thread-discard-{id}"),
-                "Discard draft",
-                "close",
-                p,
-                move |s| s.discard_draft(id),
-            ));
-        }
-        if !draft {
-            let text_action = |key: String, title: &str, glyph: &str| {
-                row()
-                    .key(key)
-                    .role("button")
-                    .cursor(rune::Cursor::Pointer)
-                    .label(title)
-                    .focusable(true)
-                    .h(22.0)
-                    .px(6.0)
-                    .gap(4.0)
-                    .center_y()
-                    .radius(6.0)
-                    .hover(p.line)
-                    .child(tool_icon(glyph, p.muted))
-                    .child(label(title, SMALL, p.muted))
-            };
-            match section {
-                Section::Snoozed => {
-                    slot = slot.child(
-                        text_action(format!("thread-park-{id}"), "Wake", "clock")
-                            .on_press(move |s: &mut State| s.unsnooze_thread(id)),
-                    )
-                }
-                Section::Settled => {
-                    slot = slot.child(
-                        text_action(format!("thread-park-{id}"), "Un-settle", "check")
-                            .on_press(move |s: &mut State| s.settle_thread(id))
-                            .disabled(s.lifecycle_busy(id)),
-                    )
-                }
-                _ => {
-                    slot = slot
-                        .child(
-                            icon_button(
-                                &format!("thread-snooze-{id}"),
-                                "Snooze",
-                                "clock",
-                                p,
-                                move |s| s.open_snooze(id),
-                            )
-                            .disabled(!s.can_snooze(id)),
-                        )
-                        .child(
-                            text_action(format!("thread-park-{id}"), "Settle", "check")
-                                .on_press(move |s: &mut State| s.settle_thread(id))
-                                .disabled(s.lifecycle_busy(id)),
-                        )
-                }
-            }
-        }
-    } else if thread.life.woke(at) {
-        slot = slot.child(
-            meta_text("Woke", p.sea)
-                .key(format!("thread-woke-{id}"))
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .focusable(true)
-                .on_press(move |s: &mut State| {
-                    s.threads[index].life.last_visited_at = Some(lifecycle::now());
-                    s.checkpoint();
-                }),
-        );
-    } else if matches!(
-        state_label,
-        "Approval" | "Input" | "Working" | "Waiting" | "Failed"
-    ) {
-        let ink = if approval || row_status == Status::Waiting {
-            p.brass
-        } else if thread.status == Status::Failed {
-            p.danger
-        } else {
-            p.sea
-        };
-        // Working shows the timer alone without the word "Working" (spec §2.7).
-        let text = if state_label == "Working" {
-            elapsed_label(
-                thread
-                    .started
-                    .map(|start| start.elapsed().as_secs())
-                    .or(thread.elapsed)
-                    .unwrap_or(0),
-            )
-        } else {
-            state_label.to_string()
-        };
-        slot = slot.child(label(text, META.features(TABULAR), ink));
-    } else {
-        let time = match section {
-            Section::Snoozed => Some(lifecycle::wake_label(
-                thread.life.snoozed_until.unwrap_or(0),
-                at,
-            )),
-            Section::Settled => relative_time(thread.life.settled_at.unwrap_or(0) / 1000),
-            _ => relative_time(thread.updated),
-        };
-        if let Some(time) = time {
-            slot = slot.child(
-                label(time, META.features(TABULAR), p.faint).key(format!("thread-age-{id}")),
-            );
-        }
-    }
-    if thread.machine != "local" {
-        slot = slot.child(icon("cloud", p.muted));
-    }
-
-    // One-line 32 pt slim row (KSG Code's `SidebarThreadRow` slim variant, spec §2.7).
-    let line = row()
-        .h(32.0)
-        .grow(1.0)
-        .min_w(0.0)
-        .pl(ROW_INSET)
-        .pr(8.0)
-        .gap(8.0)
-        .center_y()
-        .child(lead)
-        .child(title)
-        .child(if shelved {
-            slot.min_w(SHELF_SLOT).justify_end()
-        } else {
-            slot
-        });
-    if !s.search.text.is_empty()
-        && !s.thread_title_search_matches(thread)
-        && let Some(hit) = s
-            .sidebar_search
-            .visible_matches
-            .get(&(s.machines.selected.clone(), id))
-    {
-        return item.child(col().grow(1.0).min_w(0.0).pb(6.0).child(line).child(
-            el().pl(ROW_INSET + 24.0).pr(8.0).child(search_snippet_el(
-                &s.machines.selected,
-                id,
-                &hit.snippet,
-                &s.search.text,
-                p.muted,
-                p.brass,
-            )),
-        ));
-    }
-    item.child(line)
-}
-
 pub(super) fn search_snippet_el(
     server: &str,
     id: usize,
@@ -6090,8 +5027,6 @@ pub(super) fn search_snippet_el(
     lbl
 }
 
-/// The least width of a shelved row's status slot: room for "10m" and "1d".
-const SHELF_SLOT: f32 = 32.0;
 /// Tile colours for projects without an icon. Each project keeps one by its name.
 const PROJECT_HUES: [&str; 6] = [
     "#6E8FE8", "#4FA58A", "#9A7BDD", "#C99A32", "#CF6A8C", "#3E9DBF",
@@ -6176,33 +5111,21 @@ fn multiple_machines(s: &State) -> bool {
         .is_some_and(|client| !client.linked.is_empty())
 }
 
-/// The least width a workspace name keeps beside a status word: ten characters of 12 px text.
-const WORKSPACE_FLOOR: f32 = 64.0;
-
 /// A sidebar row's width in points, from the sidebar setting and the last window width.
 fn sidebar_row_width(s: &State) -> f32 {
-    let sidebar = if s.viewport_width < 1050.0 {
-        s.sidebar_width.min(216.0)
+    let sidebar = if s.viewport_width < 760.0 {
+        s.sidebar_width.min(s.viewport_width - 56.0)
+    } else if s.viewport_width < 1050.0 {
+        s.sidebar_width.min(248.0)
     } else {
         s.sidebar_width
     };
-    sidebar - 8.0
+    sidebar - 16.0
 }
 
 /// About how wide `text` is at the sidebar's 13 px.
 pub(super) fn text_width(text: &str) -> f32 {
     text.chars().count() as f32 * 6.2
-}
-
-/// The workspace floor for a row whose other items take `taken` of its `row` width: the full
-/// ten characters when the row allows, and only what is left in a narrow sidebar. A name that
-/// is shorter than the floor needs only its own width, so a short name leaves room for the
-/// machine's. Nothing is held back from the status word, the machine icon or the timer, so a
-/// row never overflows.
-fn workspace_floor(row: f32, taken: f32, workspace: &str) -> f32 {
-    (row - taken)
-        .clamp(0.0, WORKSPACE_FLOOR)
-        .min(text_width(workspace))
 }
 
 /// A linked machine on a row: its icon, then its name. The name gives way first and can drop
@@ -6221,8 +5144,7 @@ fn machine_tag(
         .role("img")
         .label(caption.clone())
         .help(caption)
-        // 4 px between the icon and the name. The name is left out when the row lacks room for
-        // it (see `room_for_machine_name`), so the 8 px between the row's groups never shrinks.
+        // Keep the icon visible when the machine name truncates.
         .gap(4.0)
         .center_y()
         .shrink()
@@ -6240,14 +5162,6 @@ fn machine_tag(
         );
     }
     tag
-}
-
-/// Whether a row has 36 points to spare for a machine name after its other items and the
-/// workspace, which takes its text (estimated at 6.2 points a character) or its floor,
-/// whichever is wider.
-fn room_for_machine_name(row: f32, taken: f32, workspace: &str) -> bool {
-    let text = text_width(workspace);
-    row - taken - text.max(workspace_floor(row, taken, workspace)) >= MACHINE_NAME_ROOM
 }
 
 fn relative_time(updated: u64) -> Option<String> {
@@ -7323,13 +6237,13 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
         // environment. Shina keeps the owner selected and sends one turn there.
         for (machine, project, label) in s.captain_continue_targets(id) {
             actions = actions.child(
-                menu_item(
+                gated_menu_item(
                     &format!("captain-continue-{machine}-{project}"),
                     &format!("Continue on {label}"),
                     "monitor",
                     p,
+                    s.continue_blocker(),
                 )
-                .disabled(!s.can_continue_captain_draft())
                 .on_press(move |s: &mut State| {
                     s.thread_menu = false;
                     s.row_menu = None;
@@ -7350,44 +6264,54 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
         );
     }
     if id == s.current().id && thread.session.is_some() {
-        let locked = s.demo
-            || thread.status.busy()
-            || thread.configuring
-            || thread.archived()
-            || !thread.can_change_conversation();
         actions = actions
             .child(
-                menu_item("menu-fork-conversation", "Fork conversation", "thread", p)
-                    .disabled(locked)
-                    .on_press(|s: &mut State| {
-                        s.thread_menu = false;
-                        s.row_menu = None;
-                        s.fork_conversation(None);
-                    }),
+                gated_menu_item(
+                    "menu-fork-conversation",
+                    "Fork conversation",
+                    "thread",
+                    p,
+                    s.conversation_blocker(thread),
+                )
+                .on_press(|s: &mut State| {
+                    s.thread_menu = false;
+                    s.row_menu = None;
+                    s.fork_conversation(None);
+                }),
             )
             .child(
-                menu_item("menu-fork-message", "Fork from message...", "thread", p)
-                    .disabled(locked || !thread.can_rewind_conversation())
-                    .on_press(|s: &mut State| {
-                        s.thread_menu = false;
-                        s.row_menu = None;
-                        s.conversation_points(crate::model::ConversationMode::Fork);
-                    }),
+                gated_menu_item(
+                    "menu-fork-message",
+                    "Fork from message...",
+                    "thread",
+                    p,
+                    s.rewind_blocker(thread),
+                )
+                .on_press(|s: &mut State| {
+                    s.thread_menu = false;
+                    s.row_menu = None;
+                    s.conversation_points(crate::model::ConversationMode::Fork);
+                }),
             )
             .child(
-                menu_item("menu-rewind", "Edit from here...", "edit", p)
-                    .disabled(locked || !thread.can_rewind_conversation())
-                    .on_press(|s: &mut State| {
-                        s.thread_menu = false;
-                        s.row_menu = None;
-                        s.conversation_points(crate::model::ConversationMode::Rewind);
-                    }),
+                gated_menu_item(
+                    "menu-rewind",
+                    "Edit from here...",
+                    "edit",
+                    p,
+                    s.rewind_blocker(thread),
+                )
+                .on_press(|s: &mut State| {
+                    s.thread_menu = false;
+                    s.row_menu = None;
+                    s.conversation_points(crate::model::ConversationMode::Rewind);
+                }),
             );
     }
     if !captain {
         actions = actions
             .child(
-                menu_item(
+                gated_menu_item(
                     "menu-pin-thread",
                     if thread.pinned() {
                         "Unpin thread"
@@ -7396,8 +6320,8 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                     },
                     "pin",
                     p,
+                    s.lifecycle_blocker(id),
                 )
-                .disabled(thread.machine != "local")
                 .on_press(move |s: &mut State| {
                     s.row_menu = None;
                     s.thread_menu = false;
@@ -7405,7 +6329,7 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                 }),
             )
             .child(
-                menu_item(
+                gated_menu_item(
                     "menu-settle-thread",
                     if thread.life.settled() {
                         "Un-settle thread"
@@ -7414,9 +6338,7 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                     },
                     "check",
                     p,
-                )
-                .disabled(
-                    thread.machine != "local" || !thread.life.settled() && s.lifecycle_busy(id),
+                    s.lifecycle_blocker(id),
                 )
                 .on_press(move |s: &mut State| {
                     s.row_menu = None;
@@ -7436,9 +6358,14 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
             );
         } else {
             actions = actions.child(
-                menu_item("menu-snooze-thread", "Snooze...", "clock", p)
-                    .disabled(!s.can_snooze(id))
-                    .on_press(move |s: &mut State| s.open_snooze(id)),
+                gated_menu_item(
+                    "menu-snooze-thread",
+                    "Snooze...",
+                    "clock",
+                    p,
+                    s.snooze_blocker(id),
+                )
+                .on_press(move |s: &mut State| s.open_snooze(id)),
             );
         }
     }
@@ -7450,13 +6377,13 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
     {
         let server = s.machines.selected.clone();
         let reason = s.captain_promotion_unavailable(&server, id);
-        let item = menu_item("menu-promote-captain", "Make this a captain...", "grid", p)
-            .disabled(reason.is_some());
-        let item = if let Some(reason) = reason {
-            item.description(reason)
-        } else {
-            item
-        };
+        let item = gated_menu_item(
+            "menu-promote-captain",
+            "Make this a captain...",
+            "grid",
+            p,
+            reason,
+        );
         actions = actions.child(item.on_press(move |s: &mut State| {
             s.row_menu = None;
             s.thread_menu = false;
@@ -7487,16 +6414,21 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
             .on_press(move |s: &mut State| s.begin_rename(id)),
         )
         .child(
-            menu_item("menu-mark-unread", "Mark unread", "thread", p)
-                .disabled(thread.life.last_completed_at.is_none())
-                .on_press(move |s: &mut State| {
-                    if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
-                        t.life.mark_unread();
-                    }
-                    s.row_menu = None;
-                    s.thread_menu = false;
-                    s.checkpoint();
-                }),
+            gated_menu_item(
+                "menu-mark-unread",
+                "Mark unread",
+                "thread",
+                p,
+                s.unread_blocker(thread),
+            )
+            .on_press(move |s: &mut State| {
+                if let Some(t) = s.threads.iter_mut().find(|t| t.id == id) {
+                    t.life.mark_unread();
+                }
+                s.row_menu = None;
+                s.thread_menu = false;
+                s.checkpoint();
+            }),
         );
     if !captain {
         let project = thread.project;
@@ -7655,17 +6587,13 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
             let join_anchor = anchor.to_string();
             let join_server = s.machines.selected.clone();
             actions = actions.child(
-                menu_item(
+                gated_menu_item(
                     "menu-crew-recruit",
                     "Add to a captain's crew...",
                     "switch",
                     p,
+                    reason,
                 )
-                .label(match &reason {
-                    Some(reason) => format!("Add to a captain's crew, {reason}"),
-                    None => "Add to a captain's crew".to_string(),
-                })
-                .disabled(reason.is_some())
                 .on_press(move |s: &mut State| {
                     if s.machines.selected != join_server {
                         return;
@@ -7750,7 +6678,15 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
         let grouped_archive = thread
             .crew_captain
             .filter(|&captain| s.captain_phase(captain) == crate::model::CaptainPhase::Archived);
-        let archive = menu_item(
+        let reason = grouped_archive
+            .map(|captain| {
+                format!(
+                    "Archived with {}. Unarchive the captain to restore it.",
+                    s.captains[captain].name
+                )
+            })
+            .or_else(|| s.lifecycle_blocker(id));
+        let archive = gated_menu_item(
             "menu-archive-thread",
             if thread.archived() {
                 "Restore thread"
@@ -7759,23 +6695,13 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
             },
             "archive",
             p,
+            reason,
         );
-        actions = actions.child(if let Some(captain) = grouped_archive {
-            archive.disabled(true).description(format!(
-                "Archived with {}. Unarchive the captain to restore it.",
-                s.captains[captain].name
-            ))
-        } else if s.lifecycle_busy(id) || thread.machine != "local" {
-            archive
-                .disabled(true)
-                .child(label("Working", SMALL, p.muted))
-        } else {
-            archive.on_press(move |s: &mut State| {
-                s.row_menu = None;
-                s.thread_menu = false;
-                s.archive_thread(id);
-            })
-        });
+        actions = actions.child(archive.on_press(move |s: &mut State| {
+            s.row_menu = None;
+            s.thread_menu = false;
+            s.archive_thread(id);
+        }));
     }
     if s.is_captain_home(thread)
         && let Some(captain) = thread.captain
@@ -7824,16 +6750,12 @@ fn captain_lifecycle_menu_item(
 ) -> El {
     let server = s.machines.selected.clone();
     let reason = s.captain_lifecycle_unavailable(&server, captain, action);
-    let item = if danger {
+    let item = if reason.is_some() {
+        gated_menu_item(key, title, glyph, p, reason)
+    } else if danger {
         danger_menu_item(key, title, glyph, p)
     } else {
         menu_item(key, title, glyph, p)
-    };
-    let item = item.disabled(reason.is_some());
-    let item = if let Some(reason) = reason {
-        item.description(reason)
-    } else {
-        item
     };
     item.on_press(move |s: &mut State| {
         s.row_menu = None;
@@ -9773,31 +8695,41 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
     let tool_id = tool.id.clone();
     let line_key = format!("inline-tool-{}-{index}", t.id);
     let press_key = line_key.clone();
-    let mut content = col().gap(4.0).child(
-        activity_line(
-            line_key,
-            format!(
-                "{} output for {title}",
-                if tool.expanded { "Hide" } else { "Show" }
-            ),
-            (tool_verb(tool), &tool.detail),
-            tool.failed,
-            tool.expanded,
-            work_ui::kind_icon(tool.resolved_kind()),
-            p,
-        )
-        .on_press_tx(move |s: &mut State, tx| {
-            tx.keep_on_screen(press_key.clone());
-            let thread = s.current_mut();
-            if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                tool.expanded = !tool.expanded;
-                let message = tool.anchor.message;
-                thread.timeline_cache.get_mut().touch_message(message);
-            }
-        }),
-    );
+    let flashing = s.flash_tool.as_ref().is_some_and(|(id, _)| id == &tool.id);
+    let mut content = col()
+        .key(format!("tool-{}", tool.id))
+        .gap(4.0)
+        .radius(6.0)
+        .fill(if flashing {
+            p.sea_bg
+        } else {
+            Color::TRANSPARENT
+        })
+        .child(
+            activity_line(
+                line_key,
+                format!(
+                    "{} output for {title}",
+                    if tool.expanded { "Hide" } else { "Show" }
+                ),
+                (tool_verb(tool), &tool.detail),
+                tool.failed,
+                tool.expanded,
+                work_ui::kind_icon(tool.resolved_kind()),
+                p,
+            )
+            .on_press_tx(move |s: &mut State, tx| {
+                tx.keep_on_screen(press_key.clone());
+                let thread = s.current_mut();
+                if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                    tool.expanded = !tool.expanded;
+                    let message = tool.anchor.message;
+                    thread.timeline_cache.get_mut().touch_message(message);
+                }
+            }),
+        );
     if !tool.subagents.is_empty() {
-        content = content.child(pi_ui::subagent_results(tool, p));
+        content = content.child(pi_ui::subagent_results(s, tool, p));
     }
     if tool.expanded {
         content = content.child(work_ui::expanded(s, p, index));
@@ -13127,7 +12059,7 @@ const TRANSCRIPT_CAP: f32 = 8.0;
 
 /// The sidebar portraits' animation stage also plays the captain hero, under this row id.
 pub(crate) const HERO_PORTRAIT_ROW: usize = usize::MAX;
-const HERO_PORTRAIT: f32 = 72.0;
+const HERO_PORTRAIT: f32 = 96.0;
 /// The captain hero with a one-line heading: portrait, heading, role and status.
 const CAPTAIN_HERO_HEIGHT: f32 = 210.0;
 
@@ -13141,18 +12073,28 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
     let status = shown_status(s);
     let face = face_for(status);
     let portrait_index = captain_portrait(s, Some(captain));
+    let size = HERO_PORTRAIT;
     let pixels = s
         .portraits
         .pixels(portrait_index, face, HERO_PORTRAIT)
         .unwrap_or_else(|| s.artwork.face_pixels(portrait_index, face, HERO_PORTRAIT));
-    let portrait = pixel_portrait(s, &pixels, HERO_PORTRAIT, p)
-        .key("captain-hero-portrait")
-        .a11y_hidden()
-        .on_visible(|s: &mut State, on, tx| {
-            s.portraits.set_visible(HERO_PORTRAIT_ROW, on);
-            tx.live_only();
-            tx.wake_after(std::time::Duration::ZERO);
-        });
+    let portrait = portrait(
+        &pixels,
+        if s.artwork.is_pixel_art(portrait_index) {
+            s.artwork.snap_points(size)
+        } else {
+            size
+        },
+        p,
+        None,
+    )
+    .key("captain-hero-portrait")
+    .a11y_hidden()
+    .on_visible(|s: &mut State, on, tx| {
+        s.portraits.set_visible(HERO_PORTRAIT_ROW, on);
+        tx.live_only();
+        tx.wake_after(std::time::Duration::ZERO);
+    });
     let heading = if s.is_captain_home(t) && t.renamed {
         t.title.clone()
     } else {
@@ -13197,18 +12139,21 @@ fn captain_hero(s: &State, p: Palette, captain: usize, pane_width: f32) -> El {
                 )),
         );
     }
-    let role = profile
-        .instructions
-        .lines()
-        .next()
-        .filter(|line| !line.trim().is_empty())
-        .map_or_else(|| profile.role.clone(), str::to_owned);
+    let role = &profile.role;
     col()
         .key("captain-hero")
         .w_full()
         .items_center()
         .gap(10.0)
-        .child(status_badge(p, portrait, HERO_PORTRAIT, status).mb(6.0))
+        .child(
+            el().size(pane_width.min(360.0), size + 6.0)
+                .center()
+                .child(
+                    captain_wash(s.dark, portrait_index, pane_width.min(360.0), size + 6.0)
+                        .absolute(0.0, 0.0),
+                )
+                .child(haloed(s, p, portrait, size, status)),
+        )
         .child(
             label(
                 heading,
@@ -19211,7 +18156,7 @@ pub(crate) mod tests {
             let mut checked = 0;
             for entry in sidebar_ui::entries(&rt.state)
                 .iter()
-                .filter(|entry| entry.captain)
+                .filter(|entry| entry.captain && entry.local.is_none())
             {
                 let Some((row, _)) =
                     rt.presented(&format!("machine-thread-{}-{}", entry.server, entry.id))
@@ -19219,7 +18164,7 @@ pub(crate) mod tests {
                     continue;
                 };
                 let Some((line, _)) =
-                    rt.presented(&format!("machine-status-{}-{}", entry.server, entry.id))
+                    rt.presented(&format!("captain-status-{}-{}", entry.server, entry.id))
                 else {
                     continue;
                 };
@@ -19230,88 +18175,6 @@ pub(crate) mod tests {
                 checked += 1;
             }
             assert!(checked > 0, "{width}: no remote captain rows");
-        }
-    }
-
-    #[test]
-    fn fleet_rows_keep_the_workspace_and_end_in_a_machine_tag_at_all_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            for sidebar_width in [crate::model::DEFAULT_SIDEBAR_WIDTH, 200.0] {
-                let mut rt = runtime(width);
-                crate::fleet_demo(&mut rt.state);
-                rt.state.sidebar_width = sidebar_width;
-                rt.state.compact_sidebar = width < 760.0;
-                rt.state.dark = false;
-                rt.frame(0.0);
-                rt.frame(1.0);
-                let mut checked = 0;
-                for entry in sidebar_ui::entries(&rt.state) {
-                    let key = |kind: &str| format!("{kind}-{}-{}", entry.server, entry.id);
-                    let Some((row, _)) = rt.presented(&key("machine-thread")) else {
-                        continue;
-                    };
-                    let workspace = rt
-                        .presented(&key(if entry.captain {
-                            "machine-detail"
-                        } else {
-                            "machine-workspace"
-                        }))
-                        .map(|found| found.0);
-                    let Some(workspace) = workspace else {
-                        continue;
-                    };
-                    let (tag, _) = rt.presented(&key("machine-tag")).expect("a machine tag");
-                    // Ten characters where the sidebar is its default width, or the whole name
-                    // when it is shorter; the narrowest sidebars give up some of that but
-                    // keep about four.
-                    let text = rt
-                        .elements()
-                        .into_iter()
-                        .find(|element| {
-                            element.key.as_deref()
-                                == Some(&format!(
-                                    "{}-{}-{}",
-                                    if entry.captain {
-                                        "machine-detail"
-                                    } else {
-                                        "machine-workspace"
-                                    },
-                                    entry.server,
-                                    entry.id
-                                ))
-                        })
-                        .and_then(|element| element.text)
-                        .unwrap_or_default();
-                    let floor = if sidebar_row_width(&rt.state) >= 240.0 {
-                        WORKSPACE_FLOOR.min(text_width(&text) * 0.9)
-                    } else {
-                        // A name shorter than that keeps its own width, with the tag 8 px later.
-                        24.0_f32.min(text_width(&text) * 0.9)
-                    };
-                    assert!(
-                        workspace[2] >= floor - 0.5,
-                        "{width}/{sidebar_width}: the workspace is only {} wide",
-                        workspace[2]
-                    );
-                    assert!(
-                        tag[0] + tag[2] <= row[0] + row[2] + 0.5 && tag[2] >= ICON - 0.5,
-                        "{width}/{sidebar_width}: the machine tag {tag:?} leaves its row {row:?}"
-                    );
-                    assert!(
-                        workspace[0] + workspace[2] <= tag[0] + 0.5,
-                        "{width}/{sidebar_width}: the workspace runs into the machine tag"
-                    );
-                    checked += 1;
-                }
-                // Detail labels hide below 224 pt of row width (spec §2.10), so only sidebars
-                // with room show workspace + machine pairs on captain rows.
-                if sidebar_row_width(&rt.state) >= 224.0 {
-                    assert!(
-                        checked > 0,
-                        "{width}/{sidebar_width}: no fleet captain rows"
-                    );
-                }
-            }
         }
     }
 
@@ -20039,7 +18902,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn remote_crew_members_list_flat_with_the_captains_portrait() {
+    fn remote_crew_members_list_flat_with_a_provider_avatar() {
         let mut rt = runtime(1280.0);
         let mut client = crate::client::Client::new(rt.state.data_dir.clone());
         let mut remote = crate::client::Client::new(rt.state.data_dir.clone());
@@ -20070,15 +18933,14 @@ pub(crate) mod tests {
             rt.find("machine-thread-fixture-server-3").is_none(),
             "a crew member must not list as an ordinary row"
         );
-        // Search lists it flat, carrying the captain's 16 px portrait and name.
+        // Search lists the worker with its provider avatar, rather than its captain's face.
         rt.state.search.replace_text("Recruited");
         rt.invalidate();
         rt.frame(0.0);
         assert!(rt.presented("machine-thread-fixture-server-3").is_some());
         assert!(
-            rt.presented("machine-captain-portrait-fixture-server-3")
-                .is_some(),
-            "crew rows carry the captain portrait"
+            rt.presented("crewmate-fixture-server-3").is_some(),
+            "crew rows carry a provider avatar"
         );
         // The archive lists it the same way without a query.
         rt.state.search.replace_text("");
@@ -20094,10 +18956,7 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         assert!(rt.presented("machine-thread-fixture-server-3").is_some());
-        assert!(
-            rt.presented("machine-captain-portrait-fixture-server-3")
-                .is_some()
-        );
+        assert!(rt.presented("crewmate-fixture-server-3").is_some());
     }
 
     #[test]
@@ -20164,6 +19023,7 @@ pub(crate) mod tests {
                 download: "download.exe".into(),
                 prepared: "prepared.exe".into(),
             });
+            rt.state.update_popover = true;
             rt.frame(0.0);
             let (notice, _) = rt
                 .presented("update-restart")
@@ -23057,172 +21917,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_update_row_offers_one_restart_and_a_passive_download() {
-        let mut rt = runtime(1280.0);
-        rt.frame(0.0);
-        // A development build shows nothing, and never a download button.
-        assert!(find(&rt.accessibility_json(), "update-restart").is_none());
-        assert!(find(&rt.accessibility_json(), "update-download").is_none());
-        rt.state.updater = crate::update::Updater::test_downloading("v9.0.0");
-        rt.invalidate();
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        let progress = match find(&tree, "update-progress") {
-            Some(node) => node,
-            None => panic!(
-                "a downloading row; status={:?} tree={}",
-                rt.state.updater.status(),
-                serde_json::to_string(&tree).unwrap()
-            ),
-        };
-        assert_eq!(progress["role"], "status");
-        assert_eq!(progress["name"], "Downloading update v9.0.0");
-        assert!(find(&tree, "update-restart").is_none());
-        assert!(find(&tree, "update-download").is_none());
-        rt.state.updater = crate::update::Updater::test_ready(crate::update::PreparedUpdate {
-            tag: "v9.1.0".into(),
-            target: crate::install::InstalledTarget::Windows {
-                exe: "shina.exe".into(),
-            },
-            asset: "shina.exe".into(),
-            size: 1,
-            sha256: "0".repeat(64),
-            download: "download.exe".into(),
-            prepared: "prepared.exe".into(),
-        });
-        rt.invalidate();
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        let restart = find(&tree, "update-restart").expect("one restart action");
-        assert_eq!(restart["name"], "Restart to update to v9.1.0");
-        assert!(
-            restart["actions"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|x| x == "click"))
-        );
-        press(&mut rt, "update-restart");
-        assert!(
-            rt.state.restart_for_update,
-            "the click only requests a restart"
-        );
-        // A running thread disables the button and says why.
-        rt.state.restart_for_update = false;
-        rt.state.threads[0].status = Status::Running;
-        rt.invalidate();
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        let restart = find(&tree, "update-restart").expect("the row stays");
-        assert!(
-            restart["states"]
-                .as_array()
-                .is_some_and(|s| s.iter().any(|x| x == "disabled")),
-            "a busy app cannot restart: {restart}"
-        );
-        // A disabled control takes no press: the click only requests a restart when ready.
-        rt.pointer_down(120.0, 640.0);
-        rt.pointer_up(120.0, 640.0);
-        rt.frame(0.0);
-        assert!(
-            !rt.state.restart_for_update,
-            "a disabled restart cannot be clicked"
-        );
-        rt.state.threads[0].status = Status::Ready;
-        rt.state.updater = crate::update::Updater::test_idle();
-        rt.invalidate();
-        rt.frame(0.0);
-        assert!(find(&rt.accessibility_json(), "update-restart").is_none());
-    }
-
-    #[test]
-    fn the_check_for_updates_row_is_one_button_at_all_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = runtime(width);
-            rt.state.compact_sidebar = width < 760.0;
-            // A development build shows nothing.
-            assert!(rt.find("check-updates").is_none(), "{width}");
-            rt.state.updater = crate::update::Updater::test_checkable();
-            rt.invalidate();
-            rt.frame(0.0);
-            let tree = rt.accessibility_json();
-            let button = find(&tree, "check-updates")
-                .unwrap_or_else(|| panic!("{width}: check-updates missing"));
-            assert_eq!(button["role"], "button", "{width}");
-            press(&mut rt, "check-updates");
-            rt.frame(0.0);
-        }
-        // A running check reads as a status, not a second button.
-        let mut rt = runtime(1280.0);
-        rt.state.updater = crate::update::Updater::test_checking();
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        let status = find(&tree, "check-updates").expect("checking row");
-        assert_eq!(status["role"], "status");
-    }
-
-    #[test]
-    fn an_update_authentication_failure_has_a_visible_manual_remedy_and_retry() {
-        let mut rt = runtime(1280.0);
-        rt.state.updater = crate::update::Updater::test_suspended();
-        rt.frame(0.0);
-        assert!(rt.find("retry-update").is_some());
-        assert!(rt.state.updater.notice().unwrap().contains("gh auth login"));
-        press(&mut rt, "retry-update");
-        assert!(rt.state.updater.suspended().is_none());
-    }
-
-    #[test]
-    fn github_rate_limit_is_labeled_as_app_updates_and_keeps_provider_success_separate() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = runtime(width);
-            rt.state.compact_sidebar = true;
-            rt.state.updater = crate::update::Updater::test_rate_limited();
-            rt.state.fleet.result_notice = Some(crate::fleet_update::ResultNotice {
-                success: true,
-                title: "Updated 1 provider".into(),
-                lines: vec![],
-            });
-            rt.frame(0.0);
-            let tree = rt.accessibility_json();
-            let text = tree.to_string();
-            assert!(text.contains("Shina app updates"));
-            assert!(text.contains("Updated 1 provider"));
-            assert!(!text.contains("API rate limit exceeded for"));
-            let button = find(&tree, "retry-update").unwrap();
-            assert!(
-                button["states"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|state| state == "disabled")
-            );
-            let (bounds, _) = rt.presented("shina-update-notice").unwrap();
-            assert!(bounds[0] >= 0.0 && bounds[0] + bounds[2] <= width + 0.5);
-            press(&mut rt, "retry-update");
-            assert!(rt.state.updater.rate_limited());
-            assert!(rt.state.fleet.result_notice.as_ref().unwrap().success);
-        }
-    }
-
-    #[test]
-    fn a_failed_update_uses_the_existing_notice_and_manual_retry_at_supported_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = runtime(width);
-            rt.state.compact_sidebar = true;
-            rt.state.updater = crate::update::Updater::test_failed_release();
-            rt.frame(0.0);
-            assert!(
-                rt.accessibility_json()
-                    .to_string()
-                    .contains("The new server never started.")
-            );
-            let (bounds, _) = rt.presented("retry-update").unwrap();
-            assert!(bounds[0] >= 0.0 && bounds[0] + bounds[2] <= width);
-            press(&mut rt, "retry-update");
-            assert!(rt.state.updater.notice().is_none());
-        }
-    }
-
-    #[test]
     fn image_heavy_transcripts_render_at_most_thirty_two_previews() {
         let mut rt = Runtime::with_text(
             State::new(".".into(), false),
@@ -23661,6 +22355,10 @@ pub(crate) mod tests {
             );
 
             // (d) Width change keeps the visible anchor in view at the same offset.
+            // Put this row at the viewport anchor: a different width can reflow rows
+            // between the topmost row and a row that was only centred in the viewport.
+            rt.update(|_, tx| tx.scroll_key_to("row-1-u-45", 0.0));
+            rt.frame(1.0);
             let before_resize = rt.presented("row-1-u-45").unwrap().0[1];
             rt.set_viewport((width + 160.0, 720.0), 1.0);
             for _ in 0..120 {
@@ -24122,7 +22820,7 @@ pub(crate) mod tests {
         let mut rt = runtime(width);
         rt.state.populate_demo();
         rt.state.demo = false;
-        rt.state.compact_sidebar = true;
+        rt.state.compact_sidebar = false;
         rt.state.zoom = zoom;
         rt.frame(0.0);
         rt.state.current_mut().draft = rune::TextEdit::new(LONG_DRAFT);
@@ -24230,6 +22928,17 @@ pub(crate) mod tests {
             let viewport = format!("conversation-{id}");
             rt.update(|_, tx| tx.scroll_to(viewport.clone(), 0.0, 0.0));
             rt.frame(0.5);
+            if width < 760.0 {
+                let (pane, _) = rt.presented("chat-pane").unwrap();
+                press(&mut rt, "sidebar-toggle");
+                rt.frame(1.0);
+                assert!(rt.presented("sidebar").is_none());
+                assert_eq!(
+                    rt.presented("chat-pane").unwrap().0,
+                    pane,
+                    "closing the compact sidebar must not resize the conversation"
+                );
+            }
             press(&mut rt, "composer-input");
             let (lane, _) = rt.presented("chat-lane").unwrap();
             let mut heights = Vec::new();
@@ -24352,12 +23061,11 @@ pub(crate) mod tests {
                     .find(|e| e.key.as_deref() == Some(key))
                     .unwrap_or_else(|| panic!("width {width}: no {key}"))
             };
-            let p = palette(false);
-            // Interrupted (18): a hollow brass square. Queued (19): a muted square.
+            // Interrupted and queued each have a marker on the provider avatar.
             let interrupted = fill(&rt, "worker-task-mark-18");
             assert_eq!(interrupted.fill.a, 0.0, "width {width}: hollow");
             let queued = fill(&rt, "worker-task-mark-19");
-            assert_eq!(queued.fill, p.muted.alpha(0.6), "width {width}");
+            assert_eq!(queued.rect[2], 16.0, "width {width}");
             assert!(rt.presented("worker-task-mark-18").is_some());
             // The finished worker (1) keeps an empty slot.
             assert!(
@@ -24432,97 +23140,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_machine_tag_follows_its_workspace_8_px_later_in_every_fleet_row() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            for sidebar in [200.0, 232.0, 320.0] {
-                let mut rt = runtime(width);
-                crate::fleet_demo(&mut rt.state);
-                rt.state.compact_sidebar = true;
-                rt.state.sidebar_width = sidebar;
-                rt.frame(0.0);
-                rt.frame(1.0);
-                let elements = rt.elements();
-                let rect = |key: &str| {
-                    elements
-                        .iter()
-                        .find(|e| e.key.as_deref() == Some(key))
-                        .map(|e| e.rect)
-                };
-                let mut pairs = 0;
-                for e in &elements {
-                    let Some(key) = e.key.as_deref() else {
-                        continue;
-                    };
-                    let tag = if let Some(rest) = key.strip_prefix("captain-detail-") {
-                        format!("captain-machine-{rest}")
-                    } else if let Some(rest) = key.strip_prefix("thread-workspace-") {
-                        format!("captain-machine-{rest}")
-                    } else if let Some(rest) = key.strip_prefix("machine-detail-") {
-                        format!("machine-tag-{rest}")
-                    } else if let Some(rest) = key.strip_prefix("machine-workspace-") {
-                        format!("machine-tag-{rest}")
-                    } else {
-                        continue;
-                    };
-                    let Some(tag) = rect(&tag) else { continue };
-                    let workspace = e.rect;
-                    let gap = tag[0] - (workspace[0] + workspace[2]);
-                    let at = format!("width {width}, sidebar {sidebar}, {key}");
-                    // Captain row uses 10 px gap between detail and machine tag.
-                    assert!(
-                        (gap - 10.0).abs() < 0.5,
-                        "{at}: {gap} px between {workspace:?} and {tag:?}"
-                    );
-                    pairs += 1;
-                }
-                if sidebar_row_width(&rt.state) >= 224.0 {
-                    assert!(pairs >= 1, "width {width}, sidebar {sidebar}: {pairs} rows");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_no_workspace_picker_reads_as_a_choice_to_make() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = runtime(width);
-            rt.state.populate_demo();
-            rt.state.compact_sidebar = true;
-            rt.state.new_thread_in(None);
-            rt.frame(0.0);
-            rt.frame(1.0);
-            let name = rt
-                .elements()
-                .into_iter()
-                .find(|e| e.key.as_deref() == Some("draft-project-name"))
-                .unwrap();
-            assert_eq!(name.text.as_deref(), Some("No workspace"));
-            assert_eq!(name.text_color, Some(palette(false).muted), "width {width}");
-            let (icon, _) = rt.presented("draft-project-icon").unwrap();
-            assert!(
-                icon[0] + icon[2] <= name.rect[0],
-                "width {width}: the icon comes first"
-            );
-            // A real project keeps the ink name and no icon.
-            let project = rt.state.projects.entries[0].id;
-            rt.state.new_thread_in(Some(project));
-            rt.invalidate();
-            rt.frame(0.0);
-            rt.frame(1.0);
-            assert!(
-                rt.presented("draft-project-icon").is_none(),
-                "width {width}"
-            );
-            let name = rt
-                .elements()
-                .into_iter()
-                .find(|e| e.key.as_deref() == Some("draft-project-name"))
-                .unwrap();
-            assert_eq!(name.text_color, Some(palette(false).ink), "width {width}");
-        }
-    }
-
-    #[test]
     fn the_shelf_headings_stay_whole_inside_the_sidebar_at_every_zoom() {
         // At 1.25x the demo list is taller than the scroll area, and the Snoozed and Settled
         // headings at its end were cut to slivers above the footer. They stick to the area's
@@ -24576,10 +23193,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn done_is_sea_everywhere_and_the_thread_menu_names_its_values() {
+    fn done_is_green_and_the_thread_menu_names_its_values() {
         for dark in [false, true] {
             let p = palette(dark);
-            assert_eq!(status_ink(Status::Completed, p), p.sea);
+            assert_eq!(status_ink(Status::Completed, p), p.ok);
             assert_eq!(status_ink(Status::Running, p), p.sea);
             assert_ne!(status_ink(Status::Ready, p), p.sea);
         }
@@ -24603,17 +23220,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_empty_search_shows_the_ship_mark_at_a_whole_multiple_of_its_cells() {
+    fn an_empty_search_offers_clear_and_hides_section_headings() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.compact_sidebar = width < 760.0;
             rt.state.search.replace_text("zzzz-no-such-thread");
             rt.frame(0.0);
             rt.frame(1.0);
-            let (mark, _) = rt.presented("sidebar-empty-mark").unwrap();
-            assert_eq!([mark[2], mark[3]], [32.0, 32.0], "{width}");
+            let (clear, _) = rt.presented("sidebar-search-clear").unwrap();
             let (note, _) = rt.presented("sidebar-empty").unwrap();
-            assert!(mark[1] >= note[1] && mark[1] + mark[3] <= note[1] + note[3]);
+            assert!(clear[1] >= note[1] && clear[1] + clear[3] <= note[1] + note[3]);
+            assert!(rt.find("captains-heading").is_none());
         }
     }
 
@@ -26646,6 +25263,10 @@ pub(crate) mod tests {
     fn expanded_long_turns_load_deferred_work_and_reveal_search_hits_in_place() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = long_turn_runtime(width, 1_000, false);
+            if width < 760.0 {
+                rt.update(|s, _| s.compact_sidebar = false);
+                settle(&mut rt);
+            }
             center_on(&mut rt, "turn-1-long-answer");
             // Collapse, then reopen with its work still loading: one row with a skeleton.
             press(&mut rt, "toggle-work-1-1");
@@ -27773,7 +26394,7 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("thread-7").is_none());
-        assert!(rt.find("assign-captain").is_some());
+        assert!(rt.find("assign-captain").is_none());
     }
 
     #[test]
@@ -27951,16 +26572,10 @@ pub(crate) mod tests {
         assert!(rt.find("crew-rail-1").is_none());
         rt.state.search.replace_text("Delegated");
         rt.frame(0.0);
-        // The matching worker lists flat under its own match with its captain's portrait.
+        // Search is flat and only matching conversations appear.
         assert!(rt.presented("thread-2").is_some());
         assert!(rt.presented("worker-captain-portrait-2").is_some());
-        let (parent, _) = rt.presented("thread-1").unwrap();
-        let (child, _) = rt.presented("thread-2").unwrap();
-        assert!(child[1] > parent[1]);
-        assert!(
-            rt.presented("thread-1").is_some(),
-            "matching workers retain their captain as context during search"
-        );
+        assert!(rt.presented("thread-1").is_none());
         press(&mut rt, "thread-2");
         assert_eq!(rt.state.current().id, 2);
         rt.state.search.replace_text("");
@@ -29647,10 +28262,12 @@ pub(crate) mod tests {
                 "{width}: {word:?}"
             );
         }
-        // The compose button's 26 pt makes the wordmark drop out earlier: at
-        // 960 the 216 pt sidebar and the badge leave it no room.
+        // The 248 pt narrow sidebar leaves room at 960.
         let rt = crew_runtime(960.0);
-        assert!(rt.presented("shina-wordmark").is_none());
+        if let Some((word, _)) = rt.presented("shina-wordmark") {
+            let (badge, _) = rt.presented("attention-row").unwrap();
+            assert!(word[0] + word[2] + BADGE_CLEARANCE <= badge[0] + 0.5);
+        }
     }
 
     #[test]
@@ -29680,6 +28297,11 @@ pub(crate) mod tests {
             // control at the lane's right. Closed, it opens 6 px under its badge.
             let (pane, _) = rt.presented("chat-pane").unwrap();
             let (sidebar, _) = rt.presented("sidebar").unwrap();
+            if width < 760.0 {
+                let (badge, _) = rt.presented("attention-row").unwrap();
+                assert!(menu[1] >= badge[1] + badge[3] && menu[0] + menu[2] <= width + 0.5);
+                continue;
+            }
             assert!(
                 (menu[0] - pane[0]).abs() < 0.5 && (menu[1] - pane[1]).abs() < 0.5,
                 "{width}: {menu:?} {pane:?}"
@@ -31143,7 +29765,7 @@ pub(crate) mod tests {
     #[test]
     fn captain_status_stays_inside_its_row_and_never_moves_siblings() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
-            for sidebar_width in [crate::model::DEFAULT_SIDEBAR_WIDTH, 200.0] {
+            for sidebar_width in [crate::model::DEFAULT_SIDEBAR_WIDTH, 220.0] {
                 let mut rt = runtime(width);
                 rt.state.populate_demo();
                 rt.state.sidebar_width = sidebar_width;
@@ -31191,7 +29813,7 @@ pub(crate) mod tests {
                     rt.frame(1.0);
                     let row = rect(&rt, &format!("thread-{first}"));
                     assert!(
-                        (row[3] - 40.0).abs() < 0.5,
+                        (row[3] - 56.0).abs() < 0.5,
                         "{width}/{sidebar_width}: {row:?}"
                     );
                     let mut parts = vec![format!("captain-name-{first}")];
@@ -31267,13 +29889,13 @@ pub(crate) mod tests {
             rt.frame(0.0);
             rt.frame(1.0);
 
-            // Captain rows are 40 pt tall; thread rows are 32 pt tall; no two overlap.
+            // Captain rows are 56 pt tall; active rows are 52 pt tall.
             let mut prev_bottom = 0.0f32;
             for i in rt.state.sidebar_captains() {
                 let id = rt.state.threads[i].id;
                 let r = rect(&rt, &format!("thread-{id}"));
                 assert!(
-                    (r[3] - 40.0).abs() < 0.5,
+                    (r[3] - 56.0).abs() < 0.5,
                     "{width}: captain {id} height {r:?}"
                 );
                 assert!(
@@ -31294,7 +29916,7 @@ pub(crate) mod tests {
             let group_rect = rect(&rt, &group_key);
             let active_rect = rect(&rt, &format!("thread-{active_id}"));
             assert!(
-                (active_rect[3] - 32.0).abs() < 0.5,
+                (active_rect[3] - 52.0).abs() < 0.5,
                 "{width}: thread row height {active_rect:?}"
             );
             assert!(
@@ -35123,141 +33745,6 @@ pub(crate) mod tests {
                     .iter()
                     .any(|sel| sel.model == slug);
                 assert_eq!(selected, idx < 3, "{width}: {slug} selection");
-            }
-        }
-    }
-
-    /// The one-button update surfaces: everything button, capsule (with Later),
-    /// provider pill and the result notice all stay inside the window at every
-    /// supported width (KSG `updateEverything` contract keys).
-    #[test]
-    fn the_everything_update_surfaces_fit_all_supported_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = runtime(width);
-            rt.state.compact_sidebar = width < 760.0;
-            let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
-            let (mut remote, _calls) =
-                crate::client::Client::test_connected(rt.state.data_dir.clone());
-            *remote.info.lock().unwrap() = serde_json::json!({
-                "binaryVersion": "0.1.0", "protocolMinor": 36, "canUpdate": true,
-                "capabilities": ["provider-updates-v1"]
-            });
-            remote.remote = Some(crate::peer::Link {
-                server_id: "remote".into(),
-                host: "studio".into(),
-                device_id: "fixture".into(),
-                token: "not-real".into(),
-                enabled: true,
-            });
-            client.linked.insert("remote".into(), remote);
-            rt.state.client = Some(client);
-            rt.state.machines.views.insert(
-                "remote".into(),
-                serde_json::json!({
-                    "updateStatus": {"runningVersion": "0.1.0", "state": "idle", "canSelfUpdate": true},
-                    "providers": [{
-                        "driver": "codex", "name": "Codex", "installed": true,
-                        "version": "0.48.0", "latestVersion": "0.50.0",
-                        "advisory": "behind", "strategy": "npm-global"
-                    }]
-                }).into());
-            rt.state.updater = crate::update::Updater::test_ready(crate::update::PreparedUpdate {
-                tag: "v99.0.0".into(),
-                target: crate::install::InstalledTarget::Windows {
-                    exe: "shina.exe".into(),
-                },
-                asset: "shina.exe".into(),
-                size: 1,
-                sha256: "0".repeat(64),
-                download: "download.exe".into(),
-                prepared: "prepared.exe".into(),
-            });
-            rt.state.fleet.pill = Some(crate::fleet_update::ProviderPillView {
-                key: "fixture".into(),
-                tone: crate::fleet_update::PillTone::Error,
-                title: "Codex v0.50.0 update failed".into(),
-                dismissible: true,
-            });
-            rt.state.fleet.result_notice = Some(crate::fleet_update::ResultNotice {
-                success: false,
-                title: "Update failed".into(),
-                lines: vec!["studio Codex: exit 1".into()],
-            });
-            rt.frame(0.0);
-            for key in [
-                "update-all-machines",
-                "provider-update-pill",
-                "update-result",
-            ] {
-                let (rect, _) = rt
-                    .presented(key)
-                    .unwrap_or_else(|| panic!("{width}: {key}"));
-                assert!(
-                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 0.5,
-                    "{width} {key}: {rect:?}"
-                );
-                assert!(
-                    rect[1] >= 0.0 && rect[1] + rect[3] <= 720.5,
-                    "{width} {key}: {rect:?}"
-                );
-            }
-            // A running countdown replaces the footer control with the capsule and
-            // its Later action.
-            rt.state.fleet.running = true;
-            rt.state.fleet.phase = crate::fleet_update::RunPhase::Countdown;
-            rt.state.fleet.restart_at =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
-            rt.state.fleet.rows.push(crate::fleet_update::Row {
-                server: "local".into(),
-                name: "Local".into(),
-                state: "restarting".into(),
-                ..Default::default()
-            });
-            rt.invalidate();
-            rt.frame(0.0);
-            for key in ["update-capsule", "update-capsule-action"] {
-                let (rect, _) = rt
-                    .presented(key)
-                    .unwrap_or_else(|| panic!("{width}: {key}"));
-                assert!(
-                    rect[0] >= 0.0
-                        && rect[0] + rect[2] <= width + 0.5
-                        && rect[1] >= 0.0
-                        && rect[1] + rect[3] <= 720.5,
-                    "{width} {key}: {rect:?}"
-                );
-            }
-            assert!(rt.presented("update-all-machines").is_none());
-            // The popover opens above the capsule and stays in the window, light
-            // and dark.
-            press(&mut rt, "update-capsule");
-            assert!(rt.state.fleet.popover);
-            for dark in [false, true] {
-                rt.state.dark = dark;
-                rt.invalidate();
-                rt.frame(0.0);
-                let (popover_rect, _) = rt
-                    .presented("update-capsule-popover")
-                    .unwrap_or_else(|| panic!("{width} dark={dark}: update-capsule-popover"));
-                assert!(
-                    popover_rect[0] >= -0.5
-                        && popover_rect[0] + popover_rect[2] <= width + 0.5
-                        && popover_rect[1] >= -0.5
-                        && popover_rect[1] + popover_rect[3] <= 720.5,
-                    "{width} dark={dark} popover: {popover_rect:?}"
-                );
-                // A machine carrying both a provider failure and a server failure
-                // lists both lines.
-                rt.state.fleet.rows[0].result = Some(false);
-                rt.state.fleet.rows[0].provider_failure = Some("studio Codex: exit 1".into());
-                rt.state.fleet.rows[0].state = "failed: connection lost".into();
-                rt.invalidate();
-                rt.frame(0.0);
-                assert!(
-                    rt.presented("capsule-failure-0").is_some()
-                        && rt.presented("capsule-failure-0-1").is_some(),
-                    "{width} dark={dark}: both failure lines"
-                );
             }
         }
     }

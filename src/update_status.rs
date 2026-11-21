@@ -1,8 +1,4 @@
 //! Shared update copy and actions for the footer and Settings.
-#![allow(
-    dead_code,
-    reason = "The Wave 3 footer and Settings readers land in Slice B."
-)]
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdatePhase {
@@ -34,8 +30,9 @@ pub enum UpdatePhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateAction {
     CheckNow,
-    Download,
     Restart,
+    RestartPostponed,
+    Postpone,
     Retry,
     UpdateEverything,
     UpdateMachine(String),
@@ -63,6 +60,7 @@ pub struct UpdateSummary {
     pub machines: Vec<MachineUpdate>,
     pub version: &'static str,
     pub last_check: String,
+    pub dismissible: bool,
 }
 
 impl UpdateSummary {
@@ -113,6 +111,7 @@ impl UpdateSummary {
             machines,
             version,
             last_check,
+            dismissible: false,
         }
     }
 }

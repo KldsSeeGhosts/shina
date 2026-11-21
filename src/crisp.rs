@@ -12,27 +12,44 @@
 /// The whole-number factor a source image was upscaled by, or 1. A factor counts only when every
 /// block of that size is one colour, so the art itself is never altered.
 pub fn upscale(width: u32, height: u32, rgba: &[u8]) -> u32 {
-    let (w, h) = (width as usize, height as usize);
-    if rgba.len() != w * h * 4 {
-        return 1;
+    [12, 10, 8, 6, 5, 4, 3, 2]
+        .into_iter()
+        .find(|&factor| nearest_grid(width, height, rgba, factor))
+        .unwrap_or(1)
+}
+
+pub fn nearest_grid(width: u32, height: u32, rgba: &[u8], factor: u32) -> bool {
+    let (w, h, k) = (width as usize, height as usize, factor as usize);
+    if k == 0 || w % k != 0 || h % k != 0 || rgba.len() != w * h * 4 {
+        return false;
     }
-    'factor: for k in [12usize, 10, 8, 6, 5, 4, 3, 2] {
-        if w % k != 0 || h % k != 0 {
-            continue;
-        }
-        for y in 0..h {
-            let first = (y / k * k * w) * 4;
-            for x in 0..w {
-                let at = (y * w + x) * 4;
-                let anchor = first + (x / k * k) * 4;
-                if rgba[at..at + 4] != rgba[anchor..anchor + 4] {
-                    continue 'factor;
-                }
+    for y in 0..h {
+        let first = (y / k * k * w) * 4;
+        for x in 0..w {
+            let at = (y * w + x) * 4;
+            let anchor = first + (x / k * k) * 4;
+            if rgba[at..at + 4] != rgba[anchor..anchor + 4] {
+                return false;
             }
         }
-        return k as u32;
     }
-    1
+    true
+}
+
+/// Illustrated art uses a filtered device-size bitmap instead of a cell grid.
+pub fn smooth(rgba: &[u8], width: u32, height: u32, target: u32) -> Vec<u8> {
+    let source = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, rgba)
+        .expect("decoded RGBA dimensions");
+    let side = width.min(height);
+    let square =
+        image::imageops::crop_imm(&source, (width - side) / 2, (height - side) / 2, side, side);
+    image::imageops::resize(
+        &*square,
+        target,
+        target,
+        image::imageops::FilterType::Lanczos3,
+    )
+    .into_raw()
 }
 
 /// The whole factor to draw `cells` art cells at in `target` device pixels. An exact multiple

@@ -112,35 +112,13 @@ fn menu_row(
     action: impl Fn(&mut State) + 'static,
 ) -> El {
     let disabled = reason.is_some();
-    let mut row_ = row()
-        .key(key)
-        .role("menuitem")
-        .cursor(if disabled {
-            rune::Cursor::Default
-        } else {
-            rune::Cursor::Pointer
-        })
-        .label(match reason {
-            Some(reason) => format!("{title}, {reason}"),
-            None => title.to_string(),
-        })
-        .h(28.0)
-        .px(8.0)
-        .gap(8.0)
-        .center_y()
-        .radius(6.0)
-        .disabled(disabled)
-        .child(
-            label(
-                title,
-                TextStyle::new(13.0, 500.0),
-                if disabled { p.faint } else { p.ink },
-            )
-            .grow(1.0)
-            .min_w(0.0)
-            .truncate(),
-        );
-    if reason.is_none() {
+    let glyph = match key {
+        "crew-menu-move" => "swap",
+        "crew-menu-release" => "user",
+        _ => "external-link",
+    };
+    let mut row_ = gated_menu_item(key, title, glyph, p, reason.map(str::to_owned));
+    if !disabled {
         row_ = row_
             .focusable(true)
             .focus_highlight(hover_wash(s, p))
