@@ -2079,8 +2079,6 @@ impl State {
             "sidebarWidth",
             "shelves",
             "tabsEnabled",
-            "sidebarGrouping",
-            "collapsedGroups",
             "background",
             "preferences",
             "scope",
@@ -3452,8 +3450,6 @@ impl State {
             self.sidebar_width,
             self.shelves,
             self.tabs_enabled,
-            self.sidebar_grouping,
-            self.collapsed_groups.clone(),
             self.background.settings.clone(),
             self.preferences.clone(),
         );
@@ -3549,8 +3545,6 @@ impl State {
             self.sidebar_width,
             self.shelves,
             self.tabs_enabled,
-            self.sidebar_grouping,
-            self.collapsed_groups,
             self.background.settings,
             self.preferences,
         ) = device;

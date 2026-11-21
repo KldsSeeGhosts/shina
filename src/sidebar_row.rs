@@ -106,11 +106,11 @@ pub(super) struct ThreadRowModel<'a> {
     pub pull_request: Option<u64>,
     pub diff: Option<(u32, u32)>,
     pub machine: Option<&'a str>,
+    pub machine_glyph: &'static str,
     pub harness: Option<&'a str>,
     pub model: Option<&'a str>,
     pub agents_active: usize,
     pub lead: El,
-    pub project_lead: Option<El>,
     pub selected: bool,
     pub shelved: bool,
     pub draft: bool,
@@ -133,7 +133,7 @@ pub(super) struct CaptainRowModel<'a> {
 }
 
 /// Ported from KSG Code's `SidebarThreadRow` card. Keep the workspace/status,
-/// title, and branch/metadata on separate lines, including inside groups.
+/// title, and branch/metadata on separate lines in the flat list.
 pub(super) fn thread_row_el(
     s: &State,
     p: Palette,
@@ -230,8 +230,10 @@ pub(super) fn thread_row_el(
     let lead = el().size(16.0, 16.0).center().child(m.lead);
     let machine = || {
         m.machine.map(|machine| {
-            icon("monitor", p.faint)
+            icon(m.machine_glyph, p.faint)
                 .size(14.0, 14.0)
+                .role("img")
+                .label(machine)
                 .help(machine)
                 .key(format!("thread-machine-{id}"))
         })
@@ -267,9 +269,10 @@ pub(super) fn thread_row_el(
             .h(20.0)
             .center_y()
             .gap(6.0)
-            .child(m.project_lead.unwrap_or(lead))
+            .child(lead)
             .child(
                 label(m.workspace.unwrap_or_default(), SMALL, p.muted)
+                    .key(format!("thread-workspace-{id}"))
                     .truncate()
                     .grow(1.0)
                     .min_w(0.0),

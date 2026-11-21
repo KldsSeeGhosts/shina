@@ -285,9 +285,16 @@ fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relati
             );
         }
         avatar
-    } else if !draft && !thread.model.is_empty() {
-        thread_avatar(s, p, &thread.model, status, thread.pinned())
-            .key(format!("thread-provider-portrait-{suffix}"))
+    } else if !draft {
+        thread_avatar(
+            s,
+            p,
+            &thread.model_id,
+            &thread.model,
+            status,
+            thread.pinned(),
+        )
+        .key(format!("thread-provider-portrait-{suffix}"))
     } else {
         lead_mark(state, thread.pinned(), draft, p)
     };
@@ -337,14 +344,11 @@ fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relati
             pull_request: rel.pull_requests.get(&row_id).copied(),
             diff: row_diff(s, &row_id),
             machine: machine.as_deref(),
+            machine_glyph: machine_glyph(s, entry.server),
             harness: Some(&thread.harness),
             model: Some(&thread.model),
             agents_active: crate::agents::active_count(thread),
             lead,
-            project_lead: (!worker)
-                .then(|| s.project(thread.project))
-                .flatten()
-                .map(|project| project_tile(s, p, Some(project), 16.0)),
             selected: entry.selected(s),
             shelved,
             draft,
@@ -487,8 +491,23 @@ fn lead_mark(status: RowStatus, pinned: bool, draft: bool, p: Palette) -> El {
     }
 }
 
-fn thread_avatar(s: &State, p: Palette, model: &str, status: Status, pinned: bool) -> El {
-    let avatar = crewmate_avatar(s, p, model, status, 16.0);
+pub(super) fn thread_mascot(model_id: &str, label: &str) -> crate::visuals::ProviderMascot {
+    use crate::visuals::{ProviderMascot, provider_mascot_for};
+    match provider_mascot_for(model_id) {
+        ProviderMascot::Default => provider_mascot_for(label),
+        mascot => mascot,
+    }
+}
+
+fn thread_avatar(
+    s: &State,
+    p: Palette,
+    model_id: &str,
+    label: &str,
+    status: Status,
+    pinned: bool,
+) -> El {
+    let avatar = mascot_avatar(s, p, thread_mascot(model_id, label), status, 16.0);
     if !pinned {
         return avatar;
     }
@@ -605,17 +624,6 @@ pub(super) struct Entry<'a> {
     pub search_hit: Option<crate::thread_search::ThreadSearchHit>,
 }
 
-/// One workspace group in the sidebar (ported from KSG Code's
-/// `SidebarProjectFolderHeader`). Groups sort by most recent row, pinned first
-/// inside each group, "Chats" (no workspace) last.
-pub(super) struct Group<'a> {
-    pub server: &'a str,
-    pub project: Option<usize>,
-    pub name: String,
-    pub project_data: Option<crate::projects::Project>,
-    pub rows: Vec<&'a Entry<'a>>,
-}
-
 impl<'a> Entry<'a> {
     pub(super) fn project(&self, s: &State) -> Option<usize> {
         if let Some(index) = self.local {
@@ -656,14 +664,6 @@ impl<'a> Entry<'a> {
         }
     }
 
-    fn working(&self, s: &State, rel: &Relations) -> bool {
-        if let Some(index) = self.local {
-            local_status(s, &s.threads[index], rel).0 == Status::Running
-        } else {
-            status_of_view(self.view) == Status::Running
-        }
-    }
-
     fn failed(&self, s: &State, rel: &Relations) -> bool {
         !self.life.settled()
             && if let Some(index) = self.local {
@@ -672,165 +672,6 @@ impl<'a> Entry<'a> {
                 status_of_view(self.view) == Status::Failed
             }
     }
-
-    fn recent_rank(&self, s: &State) -> u64 {
-        // `updated` is in Unix seconds; lifecycle timestamps are in Unix milliseconds.
-        // Convert `updated` to ms before comparing, and exclude `pinned_at` so pinning
-        // a single row keeps it first inside its group without reordering the whole workspace.
-        let updated_ms = if let Some(index) = self.local {
-            s.threads[index].updated
-        } else {
-            self.record.and_then(|r| r["updated"].as_u64()).unwrap_or(0)
-        }
-        .saturating_mul(1000);
-        let life_ts = self
-            .life
-            .latest_user_message_at
-            .max(self.life.last_completed_at)
-            .unwrap_or(0);
-        updated_ms.max(life_ts)
-    }
-}
-
-/// Group ordinary active/pinned sidebar rows by `(server, project)`.
-pub(super) fn groups<'a>(s: &'a State, rows: &[&'a Entry<'a>]) -> Vec<Group<'a>> {
-    let mut grouped: Vec<(Group<'a>, u64)> = Vec::new();
-    let mut group_index = HashMap::new();
-    for &entry in rows {
-        let project = entry.project(s);
-        let index = *group_index
-            .entry((entry.server, project))
-            .or_insert_with(|| {
-                let index = grouped.len();
-                let data = entry.project_data(s);
-                grouped.push((
-                    Group {
-                        server: entry.server,
-                        project,
-                        name: data
-                            .as_ref()
-                            .map_or_else(|| "Chats".into(), |p| p.name.clone()),
-                        project_data: data,
-                        rows: Vec::new(),
-                    },
-                    0,
-                ));
-                index
-            });
-        let (group, rank) = &mut grouped[index];
-        group.rows.push(entry);
-        *rank = (*rank).max(entry.recent_rank(s));
-    }
-    // Sort groups: "Chats" (no workspace) last, otherwise most recent row first.
-    // Rows inside each group already preserve pinned-first, lifecycle order.
-    grouped.sort_by_cached_key(|(group, rank)| {
-        (
-            group.project.is_none(),
-            std::cmp::Reverse(*rank),
-            group.name.to_lowercase(),
-            group.server,
-            group.project,
-        )
-    });
-    grouped.into_iter().map(|(group, _)| group).collect()
-}
-
-/// Workspace group header, ported from KSG Code's `SidebarProjectFolderHeader`.
-fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: bool, rel: &Relations) -> El {
-    let project_key = group
-        .project
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "none".into());
-    let key = format!("sidebar-group-{}-{project_key}", group.server);
-    let new_key = format!("new-thread-in-{}-{project_key}", group.server);
-    let server = group.server.to_string();
-    let project = group.project;
-    let new_server = server.clone();
-    let name = group.name.clone();
-    let attention = aggregate_attention(s, p, group.rows.iter().copied(), rel);
-    let working = group.rows.iter().any(|e| e.working(s, rel));
-    let lead = if group.project.is_some() {
-        project_tile(s, p, group.project_data.as_ref(), 16.0)
-    } else {
-        el().size(16.0, 16.0)
-            .center()
-            .a11y_hidden()
-            .child(icon("thread", p.muted).size(14.0, 14.0))
-    };
-    let mut header = rune::row()
-        .key(key)
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!(
-            "{}, {} threads, {}",
-            name,
-            group.rows.len(),
-            if collapsed { "collapsed" } else { "expanded" }
-        ))
-        .focusable(true)
-        .h(28.0)
-        .mt(4.0)
-        .pl(ROW_INSET)
-        .pr(4.0)
-        .gap(8.0)
-        .center_y()
-        .radius(6.0)
-        .hover(p.selected)
-        .hover_group()
-        .on_press(move |s: &mut State| s.toggle_sidebar_group(server.clone(), project))
-        .child(lead)
-        .child(label(&name, META, p.muted).truncate().grow(1.0).min_w(0.0));
-    if multiple_machines(s) {
-        header = header.child(machine_tag(
-            s,
-            p,
-            group.server,
-            format!("sidebar-group-machine-{}-{project_key}", group.server),
-            SMALL,
-            sidebar_row_width(s) >= 232.0,
-        ));
-    }
-    if let Some((ink, word)) = attention {
-        header = header.child(attention_dot(
-            format!("sidebar-group-attention-{}-{project_key}", group.server),
-            ink,
-            word,
-        ));
-    } else if working {
-        header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
-    }
-    if collapsed {
-        header = header.child(label(
-            group.rows.len().to_string(),
-            META.features(TABULAR),
-            p.faint,
-        ));
-    }
-    let new_label = format!("New thread in {name}");
-    header
-        .child(
-            icon_button(&new_key, &new_label, "plus", p, move |s| {
-                if new_server != s.machines.selected && s.machine_connected(&new_server) {
-                    s.select_machine_without_draft(&new_server);
-                }
-                if new_server == s.machines.selected {
-                    s.new_thread_in(project);
-                }
-            })
-            .group_opacity(0.0, 1.0)
-            .help(new_label),
-        )
-        .child(
-            icon(
-                if collapsed {
-                    "chevron-right"
-                } else {
-                    "chevron-down"
-                },
-                p.faint,
-            )
-            .size(12.0, 12.0),
-        )
 }
 
 fn aggregate_attention<'a>(
@@ -1200,11 +1041,6 @@ enum Node {
     SearchHeader(usize),
     Empty,
     Thread(IndexedRow),
-    Group {
-        server: String,
-        project: Option<usize>,
-        rows: Vec<IndexedRow>,
-    },
     Shelf {
         section: Section,
         rows: Vec<IndexedRow>,
@@ -1231,11 +1067,10 @@ fn structure_signature(s: &State, at: u64) -> u64 {
     s.machines.selected.hash(&mut hash);
     s.client.is_some().hash(&mut hash);
     s.show_archive.hash(&mut hash);
-    s.sidebar_grouped().hash(&mut hash);
     s.shelves.hash(&mut hash);
     s.settled_visible.hash(&mut hash);
     s.drag_thread.is_some().hash(&mut hash);
-    if s.sidebar_grouped() || s.shelves.contains(&false) {
+    if s.shelves.contains(&false) {
         s.selected_row().hash(&mut hash);
     }
     s.selected_threads.hash(&mut hash);
@@ -1248,11 +1083,7 @@ fn structure_signature(s: &State, at: u64) -> u64 {
     for project in &s.projects.entries {
         project.id.hash(&mut hash);
         project.name.hash(&mut hash);
-        s.sidebar_group_collapsed(&s.machines.selected, Some(project.id))
-            .hash(&mut hash);
     }
-    s.sidebar_group_collapsed(&s.machines.selected, None)
-        .hash(&mut hash);
     for t in &s.threads {
         t.id.hash(&mut hash);
         t.machine.hash(&mut hash);
@@ -1280,9 +1111,6 @@ fn structure_signature(s: &State, at: u64) -> u64 {
         life.latest_user_message_at.hash(&mut hash);
         life.last_completed_at.hash(&mut hash);
         life.created_at.hash(&mut hash);
-        if s.sidebar_grouped() {
-            t.updated.hash(&mut hash);
-        }
         if !s.search.text.is_empty() {
             t.title.hash(&mut hash);
             t.draft.text.hash(&mut hash);
@@ -1332,17 +1160,6 @@ fn structure_signature(s: &State, at: u64) -> u64 {
             projection["index"][key].hash(&mut hash);
         }
         s.machines.ui[server]["drafts"].hash(&mut hash);
-        s.sidebar_group_collapsed(server, None).hash(&mut hash);
-        for project in projection["index"]["projects"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if let Some(id) = project["id"].as_u64() {
-                s.sidebar_group_collapsed(server, Some(id as usize))
-                    .hash(&mut hash);
-            }
-        }
     }
     hash.finish()
 }
@@ -1484,46 +1301,6 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         }
     }
     let dragging = s.drag_thread.is_some();
-    let grouped = s.sidebar_grouped() && !dragging;
-    if grouped {
-        let active: Vec<_> = all
-            .iter()
-            .copied()
-            .filter(|row| {
-                !row.draft
-                    && row.visible
-                    && matches!(
-                        lifecycle::section(&row.life, at),
-                        Section::Pinned | Section::Active
-                    )
-            })
-            .collect();
-        for group in groups(s, &active) {
-            let key = format!(
-                "sidebar-group-{}-{}",
-                group.server,
-                group
-                    .project
-                    .map_or_else(|| "none".into(), |id| id.to_string())
-            );
-            let collapsed = s.sidebar_group_collapsed(group.server, group.project);
-            plan.add(
-                key,
-                Node::Group {
-                    server: group.server.into(),
-                    project: group.project,
-                    rows: group.rows.iter().map(|row| IndexedRow::new(row)).collect(),
-                },
-            );
-            for row in group
-                .rows
-                .into_iter()
-                .filter(|row| !collapsed || row.selected(s))
-            {
-                plan.thread(s, row);
-            }
-        }
-    }
     let settled_exists = all
         .iter()
         .any(|row| !row.draft && lifecycle::section(&row.life, at) == Section::Settled);
@@ -1533,7 +1310,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         Section::Snoozed,
         Section::Settled,
     ];
-    for section in sections.into_iter().skip(if grouped { 2 } else { 0 }) {
+    for section in sections {
         let rows: Vec<_> = all
             .iter()
             .copied()
@@ -1839,9 +1616,16 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
     let lead = if worker {
         crewmate_avatar(s, p, model.unwrap_or_default(), status, 16.0)
             .key(format!("crewmate-{}-{id}", entry.server))
-    } else if let Some(model) = model.filter(|model| !model.is_empty() && !entry.draft) {
-        thread_avatar(s, p, model, status, entry.life.pinned_at.is_some())
-            .key(format!("thread-provider-portrait-{suffix}"))
+    } else if !entry.draft {
+        thread_avatar(
+            s,
+            p,
+            view.record["model_id"].as_str().unwrap_or_default(),
+            model.unwrap_or_default(),
+            status,
+            entry.life.pinned_at.is_some(),
+        )
+        .key(format!("thread-provider-portrait-{suffix}"))
     } else {
         lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
     };
@@ -1887,6 +1671,7 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             pull_request: rel.pull_requests.get(&row_id).copied(),
             diff: row_diff(s, &row_id),
             machine: Some(&machine),
+            machine_glyph: machine_glyph(s, entry.server),
             harness: view.record["harness"]
                 .as_str()
                 .or_else(|| record["harness"].as_str()),
@@ -1896,10 +1681,6 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
                 .or_else(|| record["agentsActive"].as_u64())
                 .unwrap_or_default() as usize,
             lead,
-            project_lead: project
-                .as_ref()
-                .filter(|_| !worker)
-                .map(|project| project_tile(s, p, Some(project), 16.0)),
             selected: entry.selected(s),
             shelved,
             draft: entry.draft,
@@ -2195,30 +1976,6 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                 },
             )
         }
-        Node::Group {
-            server,
-            project,
-            rows,
-        } => {
-            let resolved: Vec<_> = rows.iter().filter_map(|row| resolve(s, row, rel)).collect();
-            let data = resolved.first().and_then(|row| row.project_data(s));
-            let group = Group {
-                server,
-                project: *project,
-                name: data
-                    .as_ref()
-                    .map_or_else(|| "Chats".into(), |project| project.name.clone()),
-                project_data: data,
-                rows: resolved.iter().collect(),
-            };
-            group_header(
-                s,
-                p,
-                &group,
-                s.sidebar_group_collapsed(server, *project),
-                rel,
-            )
-        }
         Node::SearchHeader(count) => section_title(
             &format!("Results for \"{}\"", s.search.text.trim()),
             p,
@@ -2438,7 +2195,6 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
     s.dark.hash(&mut hash);
     s.artwork.device_scale().to_bits().hash(&mut hash);
     s.portraits.motion_allowed().hash(&mut hash);
-    s.sidebar_grouped().hash(&mut hash);
     sidebar_row_width(s).to_bits().hash(&mut hash);
     s.search.text.hash(&mut hash);
     s.show_archive.hash(&mut hash);
@@ -2456,6 +2212,7 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
     if local && let Some(thread) = rel.local.get(&id).and_then(|&index| s.threads.get(index)) {
         thread.title.hash(&mut hash);
         thread.model.hash(&mut hash);
+        thread.model_id.hash(&mut hash);
         thread.harness.hash(&mut hash);
         local_row_branch(s, thread).hash(&mut hash);
         row_diff(s, &row.id).hash(&mut hash);
@@ -2478,7 +2235,6 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
         workspace_named_by_filter(s, server, thread.project).hash(&mut hash);
         if let Some(project) = s.project(thread.project) {
             project.name.hash(&mut hash);
-            project.icon.hash(&mut hash);
         }
         (s.thread_section(thread, now) as u8).hash(&mut hash);
         if !row.captain && thread.machine == "local" {
@@ -2557,6 +2313,7 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                     "agentsActive",
                     "branch",
                     "model",
+                    "model_id",
                     "harness",
                 ] {
                     view.record[key].hash(&mut hash);

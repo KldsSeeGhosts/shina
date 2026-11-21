@@ -1422,9 +1422,28 @@ fn crewmate_avatar(
     status: Status,
     size: f32,
 ) -> El {
+    mascot_avatar(
+        s,
+        p,
+        crate::visuals::provider_mascot_for(model_or_provider),
+        status,
+        size,
+    )
+}
+
+fn mascot_avatar(
+    s: &State,
+    p: Palette,
+    mascot: crate::visuals::ProviderMascot,
+    status: Status,
+    size: f32,
+) -> El {
     use crate::visuals::ProviderMascot::*;
-    let mascot = crate::visuals::provider_mascot_for(model_or_provider);
-    let image = if let Some(pixels) = s.artwork.mascot_pixels(mascot, size) {
+    let pixels = s
+        .artwork
+        .mascot_pixels(mascot, size)
+        .or_else(|| s.artwork.mascot_pixels(Default, size));
+    let image = if let Some(pixels) = pixels {
         portrait(&pixels, size, p, None)
     } else {
         let (vendor, tint) = match mascot {
@@ -5152,6 +5171,21 @@ fn machine_caption(s: &State, server: &str) -> String {
     s.machine_label(server)
 }
 
+/// KSG Code's EnvironmentMachineIcon distinguishes a desktop from a linked server.
+fn machine_glyph(s: &State, server: &str) -> &'static str {
+    if server == "local"
+        || s.machines
+            .views
+            .get("local")
+            .and_then(|view| view["serverId"].as_str())
+            == Some(server)
+    {
+        "monitor"
+    } else {
+        "server"
+    }
+}
+
 /// Whether more than one machine is linked, so rows say which machine they belong to.
 fn multiple_machines(s: &State) -> bool {
     s.client
@@ -5205,7 +5239,7 @@ fn machine_tag(
         .shrink()
         .min_w(ICON)
         .max_w(MACHINE_CAP)
-        .child(icon("monitor", p.faint));
+        .child(icon(machine_glyph(s, server), p.faint));
     // A name with no room would show as a bare ellipsis, so it is left out instead.
     if show_name {
         tag = tag.child(
@@ -7541,35 +7575,6 @@ fn project_picker(s: &State, p: Palette) -> El {
         )
         // No hairline under the search box: its own frame already ends the field.
         .child(el().h(4.0));
-    if mode == ProjectPicker::Scope {
-        let grouped = s.sidebar_grouping == crate::model::SidebarGrouping::Workspace;
-        card = card
-            .child(
-                row()
-                    .key("group-by-workspace")
-                    .role("switch")
-                    .checked(grouped)
-                    .label("Group by workspace")
-                    .cursor(rune::Cursor::Pointer)
-                    .focusable(true)
-                    .h(34.0)
-                    .mx(4.0)
-                    .pl(12.0)
-                    .pr(10.0)
-                    .gap(8.0)
-                    .center_y()
-                    .radius(6.0)
-                    .hover(p.selected)
-                    .on_press(|s: &mut State| s.toggle_sidebar_grouping())
-                    .child(
-                        label("Group by workspace", TITLE, p.ink)
-                            .grow(1.0)
-                            .min_w(0.0),
-                    )
-                    .child(switch_track(grouped, p)),
-            )
-            .child(rule(p).mx(8.0).my(2.0));
-    }
     let mut list = col().gap(1.0).min_h(0.0).shrink().scroll(ScrollSpec {
         stick_bottom: false,
     });
@@ -27998,18 +28003,6 @@ pub(crate) mod tests {
                 element_text(&rt, "thread-state-2").as_deref(),
                 Some("Failed")
             );
-            let server = rt.state.machines.selected.clone();
-            rt.update(|s, _| s.toggle_sidebar_group(server.clone(), Some(1)));
-            settle(&mut rt);
-            assert!(rt.find("thread-2").is_none(), "{width}");
-            assert!(
-                rt.find(&format!("sidebar-group-attention-{server}-1"))
-                    .is_some(),
-                "{width}"
-            );
-            rt.update(|s, _| s.toggle_sidebar_grouping());
-            settle(&mut rt);
-            assert_eq!(rect(&rt, "thread-2")[3], 78.0, "{width}");
             rt.update(|s, _| s.threads[1].branch = None);
             settle(&mut rt);
             assert_eq!(rect(&rt, "thread-2")[3], 60.0, "{width}");
@@ -28043,6 +28036,54 @@ pub(crate) mod tests {
                 Some("Pull request 84")
             );
         }
+    }
+
+    #[test]
+    fn standalone_sidebar_cards_show_model_avatars_and_machine_identity() {
+        use crate::visuals::ProviderMascot;
+
+        assert_eq!(
+            sidebar_ui::thread_mascot("gpt-6.2-sol", "Sol"),
+            ProviderMascot::OpenAi
+        );
+        assert_eq!(
+            sidebar_ui::thread_mascot("", "Claude Fable 5.2"),
+            ProviderMascot::Anthropic
+        );
+        assert_eq!(
+            sidebar_ui::thread_mascot("unmapped-model", "Custom model"),
+            ProviderMascot::Default
+        );
+        assert_eq!(sidebar_ui::thread_mascot("", ""), ProviderMascot::Default);
+
+        let mut rt = runtime(1280.0);
+        crate::fleet_demo(&mut rt.state);
+        rt.state.current_mut().model.clear();
+        rt.state.current_mut().model_id.clear();
+        settle(&mut rt);
+        let keys = [
+            ("1", "Local"),
+            ("example-studio-3", "Studio"),
+            ("example-laptop-2", "Laptop"),
+        ];
+        for (suffix, machine) in keys {
+            assert!(
+                rt.presented(&format!("thread-provider-portrait-{suffix}"))
+                    .is_some(),
+                "{suffix}"
+            );
+            assert_eq!(
+                element_text(&rt, &format!("thread-machine-{suffix}")).as_deref(),
+                Some(machine)
+            );
+        }
+        assert_eq!(machine_glyph(&rt.state, "local"), "monitor");
+        assert_eq!(machine_glyph(&rt.state, "example-studio"), "server");
+        assert!(rt.elements().iter().all(|e| {
+            !e.key
+                .as_deref()
+                .is_some_and(|key| key.starts_with("sidebar-group-"))
+        }));
     }
 
     #[test]
@@ -30461,7 +30502,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sidebar_rows_keep_their_cards_when_grouped_at_all_widths() {
+    fn sidebar_lists_pinned_and_active_cards_without_workspace_headers() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.state.populate_demo();
@@ -30469,7 +30510,7 @@ pub(crate) mod tests {
             rt.frame(0.0);
             rt.frame(1.0);
 
-            // Captain rows stay 56 pt tall; active threads stay cards in workspace groups.
+            // Captain rows stay 56 pt tall and separate from the flat thread list.
             let mut prev_bottom = 0.0f32;
             for i in rt.state.sidebar_captains() {
                 let id = rt.state.threads[i].id;
@@ -30485,80 +30526,36 @@ pub(crate) mod tests {
                 prev_bottom = r[1] + r[3];
             }
 
-            // Group headers precede their rows and collapse cleanly while keeping the selected row.
-            assert!(rt.presented("threads-heading").is_some(), "{width}");
-            let active_id = rt.state.current().id;
-            let active_proj = rt.state.current().project;
-            let proj_key = active_proj
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "none".into());
-            let group_key = format!("sidebar-group-local-{proj_key}");
-            let group_rect = rect(&rt, &group_key);
-            let active_rect = rect(&rt, &format!("thread-{active_id}"));
-            assert!(
-                (active_rect[3] - 60.0).abs() < 0.5,
-                "{width}: thread row height {active_rect:?}"
+            let heading = rect(&rt, "threads-heading");
+            let pinned = rect(&rt, "thread-3");
+            let active = rect(&rt, "thread-1");
+            assert!(heading[1] < pinned[1] && pinned[1] < active[1], "{width}");
+            assert_eq!(active[3], 60.0, "{width}");
+            assert!(rt.elements().iter().all(|e| {
+                !e.key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("sidebar-group-"))
+            }));
+            assert_eq!(
+                element_text(&rt, "thread-workspace-3").as_deref(),
+                Some("rune")
             );
-            assert!(
-                group_rect[1] < active_rect[1],
-                "{width}: group header {group_rect:?} must precede active row {active_rect:?}"
+            assert_eq!(
+                element_text(&rt, "thread-workspace-1").as_deref(),
+                Some("shina")
             );
-
-            // Collapse the group that has the active thread and another sibling:
-            // active stays visible, sibling hides and is skipped by sidebar_navigation.
-            let sibling = rt
-                .state
-                .threads
-                .iter()
-                .find(|t| {
-                    t.id != active_id
-                        && !rt.state.is_captain_home(t)
-                        && t.project == active_proj
-                        && rt.state.thread_section(t, lifecycle::now()) == Section::Active
-                })
-                .map(|t| t.id);
-            press(&mut rt, &group_key);
-            rt.frame(1.0);
+            rt.update(|s, _| s.set_project_scope(Some(1), false));
+            settle(&mut rt);
             assert!(
-                rt.presented(&format!("thread-{active_id}")).is_some(),
-                "{width}: selected row survives group collapse"
+                rt.find("thread-1").is_some() && rt.find("thread-3").is_none(),
+                "{width}"
             );
-            if let Some(sib) = sibling {
-                assert!(
-                    rt.presented(&format!("thread-{sib}")).is_none(),
-                    "{width}: unselected sibling hides when group collapses"
-                );
-                let nav = sidebar_navigation(&rt.state);
-                assert!(
-                    !nav.iter().any(|(_, id)| *id == sib),
-                    "{width}: sidebar_navigation must skip collapsed row {sib}"
-                );
-            }
-            // Re-expand and verify scoping hides group headers.
-            press(&mut rt, &group_key);
-            rt.frame(1.0);
-            if let Some(proj) = active_proj {
-                rt.state.set_project_scope(Some(proj), false);
-                rt.invalidate();
-                rt.frame(1.0);
-                assert!(
-                    rt.presented(&group_key).is_none(),
-                    "{width}: group header hides when scoped to one workspace"
-                );
-                // Multi-workspace filter keeps grouping on (spec §2.6).
-                if rt.state.projects.entries.len() >= 2 {
-                    let other = rt.state.projects.entries[1].id;
-                    if other != proj {
-                        rt.state.set_project_scope(Some(other), true);
-                        rt.invalidate();
-                        rt.frame(1.0);
-                        assert!(
-                            rt.state.sidebar_grouped(),
-                            "{width}: multi-workspace scope keeps grouping active"
-                        );
-                    }
-                }
-            }
+            rt.update(|s, _| s.set_project_scope(Some(2), true));
+            settle(&mut rt);
+            assert!(
+                rt.find("thread-1").is_some() && rt.find("thread-3").is_some(),
+                "{width}"
+            );
         }
         // Unread failed captain shows Failed (not unread blue dot), and needs-you captain
         // shows count pill without any visible "Needs you" status word.
@@ -30600,18 +30597,6 @@ pub(crate) mod tests {
         let status_text =
             element_text(&rt, &format!("captain-status-{}", homes[1])).unwrap_or_default();
         assert!(!status_text.contains("Needs you"), "{status_text}");
-
-        // Grouping and collapsed groups survive switching machines on a fleet client.
-        let mut fleet = runtime(1280.0);
-        crate::fleet_demo(&mut fleet.state);
-        fleet.state.toggle_sidebar_grouping();
-        fleet.state.toggle_sidebar_group("local".into(), Some(1));
-        fleet.state.open_machine_thread("example-studio", 2);
-        assert_eq!(
-            fleet.state.sidebar_grouping,
-            crate::model::SidebarGrouping::Recent
-        );
-        assert!(fleet.state.sidebar_group_collapsed("local", Some(1)));
 
         // Contrast check on bg and row in both themes for sidebar text tokens.
         for dark in [false, true] {

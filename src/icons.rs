@@ -68,6 +68,10 @@ glyph!(
     r#"<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>"#
 );
 glyph!(
+    SERVER,
+    r#"<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/>"#
+);
+glyph!(
     SIDEBAR,
     r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>"#
 );
@@ -310,6 +314,7 @@ pub(super) const NAMES: &[&str] = &[
     "paperclip",
     "back",
     "monitor",
+    "server",
     "sidebar",
     "compose",
     "edit",
@@ -397,6 +402,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "paperclip" => &PAPERCLIP,
         "back" | "chevron-left" => &CHEVRON_LEFT,
         "monitor" => &MONITOR,
+        "server" => &SERVER,
         "sidebar" => &SIDEBAR,
         "compose" => &COMPOSE,
         "edit" | "pencil" => &PENCIL,
