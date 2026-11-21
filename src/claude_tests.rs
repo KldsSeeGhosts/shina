@@ -2067,3 +2067,169 @@ fn cpa_and_custom_slugs_route_through_set_model() {
         .expect("rejection");
     assert_eq!(reply["success"], false);
 }
+
+/// Answers `get_settings` without a `system`/`init` frame first, the way Claude
+/// Code 2.1.330+ behaves: the `initialize` reply carries `claude_code_version`
+/// and no `init` arrives until the first prompt.
+fn settings_response_without_init(client: &mut Client, response: Value) {
+    let id = client
+        .pending
+        .iter()
+        .find(|(_, pending)| pending.request["subtype"] == "get_settings")
+        .map(|(id, _)| id.clone())
+        .expect("get_settings request");
+    client
+        .incoming(
+            json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":id,"response":response}}),
+        )
+        .unwrap();
+}
+
+/// The delegate regression: a Claude Code that reports its version in the
+/// `initialize` reply and sends no `system`/`init` before the first prompt must
+/// still publish gated manifest rows, so an exact `claude-fable-5-2` pick keeps
+/// its advertised effort levels and a Medium selection reaches the wire.
+#[test]
+fn initialize_reply_version_publishes_gated_rows_without_init() {
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "claude_code_version": "2.1.330",
+            "models": [{"value": "claude-fable-5-2", "displayName": "Claude Fable 5.2",
+                "supportsEffort": true,
+                "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]}]
+        }))
+        .unwrap();
+    assert!(client.init_seen, "handshake version settles the init gate");
+    settings_response_without_init(&mut client, json!({"effective":{},"sources":[]}));
+    assert!(client.ready, "no init deadline wait once version is known");
+    let fable = client
+        .models
+        .iter()
+        .find(|m| m["id"] == "claude-fable-5-2")
+        .expect("manifest row lists at a supported version");
+    assert!(
+        fable["thinkingLevels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("medium")),
+        "{fable}"
+    );
+    // The exact model pick routes its api id on the wire.
+    client
+        .command(json!({"type":"set_model","id":"pick","modelId":"claude-fable-5-2"}))
+        .unwrap();
+    let request = client
+        .wire
+        .iter()
+        .find(|record| {
+            record["type"] == "control_request" && record["request"]["subtype"] == "set_model"
+        })
+        .expect("set_model request")
+        .clone();
+    client
+        .incoming(json!({"type":"control_response","response":{
+            "subtype":"success","request_id":request["request_id"],"response":{}}}))
+        .unwrap();
+    assert_eq!(client.model["id"], "claude-fable-5-2");
+    // Medium is an advertised level: the effort ack applies, not a rejection.
+    client
+        .command(json!({"type":"set_thinking_level","id":"effort","level":"medium"}))
+        .unwrap();
+    let request = client
+        .wire
+        .iter()
+        .find(|record| {
+            record["type"] == "control_request"
+                && record["request"]["subtype"] == "apply_flag_settings"
+        })
+        .expect("apply_flag_settings request")
+        .clone();
+    assert_eq!(request["request"]["settings"]["effortLevel"], "medium");
+    client
+        .incoming(json!({"type":"control_response","response":{
+            "subtype":"success","request_id":request["request_id"],"response":{}}}))
+        .unwrap();
+    assert_eq!(client.effort, "medium");
+    // A non-advertised effort is still refused while idle.
+    client
+        .command(json!({"type":"set_thinking_level","id":"bad","level":"ultrathink"}))
+        .unwrap();
+    let reply = client
+        .events
+        .iter()
+        .find(|event| event["command"] == "set_thinking_level" && event["id"] == "bad")
+        .expect("rejection");
+    assert_eq!(reply["success"], false);
+}
+
+/// Old and odd version sources keep the previous behavior: a missing handshake
+/// version waits for `system`/`init`, an invalid handshake version does not
+/// count, and the handshake value wins over a conflicting init frame.
+#[test]
+fn version_sources_wait_fallback_and_conflict() {
+    // Missing handshake version: models wait for init or its deadline.
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "models": []
+        }))
+        .unwrap();
+    assert!(!client.init_seen);
+    settings_response_without_init(&mut client, json!({"effective":{},"sources":[]}));
+    assert!(!client.ready, "settings alone must not publish rows");
+    client
+        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"2.1.330"}))
+        .unwrap();
+    assert!(client.ready);
+    assert_eq!(client.version.as_deref(), Some("2.1.330"));
+
+    // Invalid handshake version: not a source, init fallback still applies.
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "claude_code_version": "not-semver",
+            "models": []
+        }))
+        .unwrap();
+    assert!(!client.init_seen, "invalid version keeps the gate open");
+    client
+        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"bogus"}))
+        .unwrap();
+    assert_eq!(client.version, None);
+    client
+        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"2.1.330"}))
+        .unwrap();
+    assert_eq!(client.version.as_deref(), Some("2.1.330"));
+
+    // Handshake wins a conflict: a later init cannot re-gate published rows.
+    let mut client = Client::new(spec(SessionSource::New, "full-access"));
+    client
+        .initialized(&json!({
+            "hook_on_failure_supported": true,
+            "hooks_applied": true,
+            "commands": [],
+            "claude_code_version": "2.1.330",
+            "models": []
+        }))
+        .unwrap();
+    client
+        .incoming(json!({"type":"system","subtype":"init","claude_code_version":"1.0.0"}))
+        .unwrap();
+    assert_eq!(client.version.as_deref(), Some("2.1.330"));
+    settings_response_without_init(&mut client, json!({"effective":{},"sources":[]}));
+    assert!(
+        client.models.iter().any(|m| m["id"] == "claude-fable-5-2"),
+        "handshake version keeps gated rows listed"
+    );
+}

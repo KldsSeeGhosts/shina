@@ -403,8 +403,9 @@ struct Client {
     model_options: Vec<crate::model_selection::ProviderOptionSelection>,
     /// Discovery probes emit catalog fields sessions do not need.
     probe: bool,
-    /// `system`/`init` arrived: it carries `claude_code_version`, like KSG's probe
-    /// awaiting the initialization result.
+    /// The init-version source is settled: `system`/`init` arrived or a valid
+    /// `claude_code_version` came with the `initialize` reply (2.1.330+ never
+    /// emits `init` before the first prompt). KSG's probe awaits the same event.
     init_seen: bool,
     /// `get_settings` resolved or was ruled out; model rows wait on it plus init.
     settings_done: bool,
@@ -742,9 +743,21 @@ impl Client {
             self.usage_account = acct;
             self.update("usageAccount", self.usage_account.clone());
         }
+        // Claude Code answers `initialize` with `claude_code_version` before any
+        // `system`/`init`; 2.1.330+ emits no `init` frame until the first prompt.
+        // A valid handshake version settles the init gate so catalog publication
+        // does not wait out the grace, and so versioned manifest rows list.
+        if let Some(version) = data["claude_code_version"]
+            .as_str()
+            .filter(|version| crate::model_catalog::parse_semver(version).is_some())
+        {
+            self.version = Some(version.to_owned());
+            self.init_seen = true;
+        }
         // Effort caps come from Claude Code's own settings. Older CLIs reject this
         // request; the error and timeout paths finish initialization without them.
-        // KSG's probe awaits `init` the same way for `claude_code_version`.
+        // CLIs that predate the handshake field still send `system`/`init`; the
+        // grace deadline covers CLIs that send neither.
         self.init_deadline = Some(Instant::now() + Duration::from_secs(5));
         self.request(
             json!({"subtype":"get_settings"}),
@@ -1198,9 +1211,13 @@ impl Client {
             "system" => match record["subtype"].as_str().unwrap_or("") {
                 "init" => {
                     // KSG reads `claude_code_version` from the init event; it gates
-                    // which manifest models this CLI can run.
+                    // which manifest models this CLI can run. The `initialize`
+                    // reply's version wins; a later `init` cannot unlist rows the
+                    // handshake already validated, and an unparseable frame never
+                    // counts as a source.
                     if self.version.is_none()
                         && let Some(version) = record["claude_code_version"].as_str()
+                        && crate::model_catalog::parse_semver(version).is_some()
                     {
                         self.version = Some(version.to_owned());
                     }
