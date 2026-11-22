@@ -148,10 +148,18 @@ struct Palette {
     /// the card's gradient in both themes.
     pill: Color,
     line: Color,
+    /// KSG's `--strong-foreground`: the selected sidebar row's title and other active labels.
+    strong: Color,
+    /// KSG's receding sidebar thread title: `--sidebar-thread-title-foreground` at 75% over
+    /// the chrome, premixed so it does not pick up Rune's linear-light blend.
+    recede: Color,
+    /// KSG's `--foreground`: prose, titles and values.
     ink: Color,
+    /// KSG's `--muted-foreground` (`--secondary-label`): tool rows, labels and meta text.
     muted: Color,
-    /// A quieter text colour for tool details, paths and machine names. Opaque, and 4.5:1 or
-    /// better on every surface text sits on, so it is never `muted` with an alpha.
+    /// KSG's `--placeholder`, the step between its muted and dim text: carets, timestamps,
+    /// counts and other text that can recede. It reads 3:1 or better on every surface, not
+    /// 4.5:1, so nothing a reader needs is drawn in it.
     faint: Color,
     /// Hover tint over any surface.
     selected: Color,
@@ -198,9 +206,11 @@ fn palette(dark: bool) -> Palette {
             tray: color("#191919"),
             pill: color("#0e0e0e"),
             line: color("#242424"),
-            ink: color("#e6e7ea"),
-            muted: color("#a8a8a8"),
-            faint: color("#949494"),
+            strong: color("#f0f0f0"),
+            recede: color("#b5b6b9"),
+            ink: color("#d4d4d4"),
+            muted: color("#8a8a8a"),
+            faint: color("#777777"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
             selected: color("#ffffff").alpha(0.006),
             row: color("#1e1e1e"),
@@ -235,9 +245,11 @@ fn palette(dark: bool) -> Palette {
             tray: color("#fafafa"),
             pill: color("#efefef"),
             line: color("#e6e6e6"),
-            ink: color("#1c1d20"),
-            muted: color("#55595f"),
-            faint: color("#626262"),
+            strong: color("#0f0f0f"),
+            recede: color("#4d4d4f"),
+            ink: color("#252525"),
+            muted: color("#636363"),
+            faint: color("#747474"),
             selected: color("#000000").alpha(0.045),
             row: color("#ffffff"),
             coral: color("#141518"),
@@ -403,10 +415,10 @@ fn prose_style(wide: bool) -> TextStyle {
     }
 }
 /// The chat lane's content width, ported from KSG Code's `.chat-content-lane`
-/// (`max-width: var(--chat-content-max-width)`, 45 rem). Wide panes get 54 rem for the larger
-/// text. Messages, tool rows, the queue and the composer all share it.
-fn measure(wide: bool) -> f32 {
-    if wide { 864.0 } else { 720.0 }
+/// (`max-width: var(--chat-content-max-width)`, 45 rem at every pane width). Messages, tool
+/// rows, the queue and the composer all share it.
+fn measure(_wide: bool) -> f32 {
+    720.0
 }
 /// The lane's side padding, from KSG Code's `.chat-composer-lane` and
 /// `.messages-timeline-scroll`: 0.75 rem below `sm` (640 px) and 3 rem from `sm` up. KSG reads
@@ -4594,7 +4606,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .child(
                 row()
                     .key("thread-search-field")
-                    .h(32.0)
+                    .h(28.0)
                     .pl(10.0)
                     .pr(4.0)
                     .gap(8.0)
@@ -4602,10 +4614,12 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .radius(8.0)
                     .grow(1.0)
                     .min_w(0.0)
-                    // A field: a 1 px `line` border, and a 2 px coral border while focused.
-                    .field_focus(&s.search, p)
-                    .hover(p.selected)
-                    .child(icon("search", p.muted))
+                    // KSG's `InputGroup size="sidebar"`: a 28 px `surface-well` (the raised
+                    // fill under a hairline rim) that takes the ring while focused.
+                    .fill(p.row)
+                    .caret(p.ink, p.coral_bg)
+                    .border(1.0, if s.search.focused { p.ring } else { p.frame })
+                    .child(icon("search", p.muted).size(13.0, 13.0))
                     .child(
                         text_input(&s.search, ROW_QUIET)
                             .key("thread-search")
@@ -8969,9 +8983,11 @@ fn quiet_inks(p: Palette) -> (Color, Color) {
     (p.muted, p.faint)
 }
 
-/// Ported from KSG Code's `WorkLogLine`, `WorkLogVerb`, and `WorkLogTarget`: a 24 px row with a
-/// 14 px glyph in a 24 px icon slot, medium foreground verb, faint detail, and an optional
-/// 12 px disclosure caret (shown on folded group headers only, never on individual rows).
+/// Ported from KSG Code's `WorkLogLine` and `TimelineWorkEntryRow`: a 24 px row with a 14 px
+/// glyph in a 24 px icon slot. The whole label, verb and target, is `text-secondary-label`
+/// (the palette's `muted`) at body weight, so tool rows read quieter than the prose around
+/// them. A failed row's verb is medium `danger`. The optional 12 px caret is `dim` and
+/// shows on folded group headers only, never on individual rows.
 #[allow(clippy::too_many_arguments)]
 fn activity_line(
     key: String,
@@ -9001,17 +9017,16 @@ fn activity_line(
         .child(
             el().size(24.0, 24.0)
                 .center()
-                .child(icon(glyph, if failed { p.danger } else { p.faint }).size(14.0, 14.0)),
+                .child(icon(glyph, if failed { p.danger } else { p.muted }).size(14.0, 14.0)),
         )
-        // KSG's `WorkLogVerb` is medium foreground (or danger on failure); `WorkLogTarget` is faint.
-        .child(label(
-            verb,
-            TextStyle::new(13.0, 500.0).tracking(-0.08),
-            if failed { p.danger } else { p.ink },
-        ));
+        .child(if failed {
+            label(verb, TextStyle::new(13.0, 500.0).tracking(-0.08), p.danger)
+        } else {
+            label(verb, ACTIVITY, p.muted)
+        });
     if !detail.is_empty() {
         line = line.child(
-            label(detail, ACTIVITY, p.faint)
+            label(detail, ACTIVITY, p.muted)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
@@ -9668,9 +9683,9 @@ fn shimmer_allowed(s: &State, t: &Thread) -> bool {
     t.request.is_none() && !s.portraits.reduced_motion()
 }
 
-/// The width a live row lays out at, for the shimmer's copy: the lane, less the work indent.
+/// The width a live row lays out at, for the shimmer's copy: the lane.
 fn live_row_width(s: &State) -> f32 {
-    (s.html_lane_width as f32 - WORK_INDENT).max(0.0)
+    (s.html_lane_width as f32).max(0.0)
 }
 
 /// KSG Code's `LiveActivityContent`: a 24 pt icon slot and one truncating label.
@@ -9854,10 +9869,6 @@ fn live_work(s: &State, p: Palette, parts: &[TranscriptPart], tail: LiveTail, st
         ))
         .on_press_tx(toggle(key))
 }
-
-/// How far a turn's tool rows and its live status words sit in from the prose lane's edge. The
-/// live status square is 6 px, and 8 px of gap puts its label on the same line.
-const WORK_INDENT: f32 = 14.0;
 
 fn assistant_turn(s: &State, p: Palette, wide: bool, start: usize, end: usize) -> El {
     assistant_turn_piece(s, p, wide, start, end, None)
@@ -10299,7 +10310,7 @@ fn find_occurrence_base(t: &Thread, parts: &[TranscriptPart], index: usize, quer
         .sum()
 }
 
-/// One work entry, indented as the work column indents it.
+/// One work entry of the work column.
 fn work_item(
     s: &State,
     p: Palette,
@@ -10311,27 +10322,19 @@ fn work_item(
     let t = s.current();
     let part = &parts[item.part()];
     match (part, item) {
-        (TranscriptPart::Work(entries), WorkItem::GroupHead(_)) => {
-            work_group_head(s, p, entries).ml(WORK_INDENT)
-        }
+        (TranscriptPart::Work(entries), WorkItem::GroupHead(_)) => work_group_head(s, p, entries),
         (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => col()
             .min_w(0.0)
-            .ml(WORK_INDENT)
             .pl(WORK_LIST_INDENT)
             .child(work_entry_row(s, p, entries[k])),
         (TranscriptPart::Work(entries), WorkItem::ThoughtHead(_)) => col()
             .min_w(0.0)
-            .ml(WORK_INDENT)
             .child(work_ui::thought_head(s, p, &entry_thoughts(entries))),
         (TranscriptPart::Work(entries), WorkItem::ThoughtBody(_, k)) => col()
             .min_w(0.0)
-            .ml(WORK_INDENT)
             .child(work_ui::thought_body(s, p, entry_thoughts(entries)[k])),
         (TranscriptPart::Work(_), WorkItem::Live(_)) => match live_tail(t, parts) {
-            Some(tail) => col()
-                .min_w(0.0)
-                .ml(WORK_INDENT)
-                .child(live_work(s, p, parts, tail, start)),
+            Some(tail) => col().min_w(0.0).child(live_work(s, p, parts, tail, start)),
             None => el(),
         },
         (part, _) => {
@@ -10343,10 +10346,8 @@ fn work_item(
             let row = transcript_part(s, p, wide, part, &mut base);
             if matches!(part, TranscriptPart::Text { .. }) {
                 row.py(6.0)
-            } else if is_lifted_card(t, part) {
-                row
             } else {
-                row.ml(WORK_INDENT)
+                row
             }
         }
     }
@@ -19905,9 +19906,19 @@ pub(crate) mod tests {
             .into_iter()
             .enumerate()
             {
+                // `faint` is KSG's `--placeholder`, for text that can recede (carets,
+                // timestamps); it has to clear 3:1. `muted` is KSG's `#8a8a8a`, which reads
+                // 4.38:1 on `lift`.
+                let floor = if foreground == p.faint {
+                    3.0
+                } else if foreground == p.muted {
+                    4.3
+                } else {
+                    4.5
+                };
                 let contrast = ratio(foreground, background);
                 assert!(
-                    contrast >= 4.5,
+                    contrast >= floor,
                     "text contrast {contrast:.2} in pair {index}, dark={dark}"
                 );
             }
@@ -23906,9 +23917,9 @@ pub(crate) mod tests {
         for dark in [false, true] {
             let p = palette(dark);
             for bg in [p.bg, p.row] {
-                for ink in [p.ink, p.muted, p.faint] {
+                for (ink, floor) in [(p.ink, 4.5), (p.muted, 4.3), (p.faint, 3.0)] {
                     let ratio = contrast(ink, bg);
-                    assert!(ratio >= 4.5, "dark {dark}: sidebar contrast {ratio:.2}:1");
+                    assert!(ratio >= floor, "dark {dark}: sidebar contrast {ratio:.2}:1");
                 }
             }
         }

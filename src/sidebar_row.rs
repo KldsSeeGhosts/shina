@@ -143,7 +143,10 @@ pub(super) fn thread_row_el(
 ) -> El {
     let id = m.id;
     let compact = (m.draft || m.shelved) && m.snippet.is_none();
-    let quiet = !m.selected && (m.shelved || m.status == RowStatus::Working);
+    // KSG's `shouldRecedeSidebarThread`: a row that is neither open nor asking for
+    // anything recedes, so the open thread and the ones that need the user stand out.
+    let quiet =
+        !m.selected && (m.shelved || matches!(m.status, RowStatus::Working | RowStatus::Idle));
     let details = if m.status == RowStatus::Idle {
         m.age.unwrap_or_default()
     } else if let Some(seconds) = m.elapsed.filter(|_| !compact) {
@@ -218,16 +221,26 @@ pub(super) fn thread_row_el(
             slot.child(actions.pin(None, Some(if compact { 2.0 } else { 0.0 }), Some(0.0), None))
         };
     }
-    let title = label(
+    // A receding title is regular weight at 75% and brightens on hover; the rest are medium
+    // in the title colour.
+    let mut title = label(
         m.title,
         if quiet { QUIET_TITLE } else { CARD_TITLE_STYLE },
-        if quiet { p.muted } else { p.ink },
+        if quiet { p.recede } else { p.strong },
     )
     .key(format!("thread-row-title-{id}"))
     .truncate()
     .grow(1.0)
     .min_w(0.0);
-    let lead = el().size(16.0, 16.0).center().child(m.lead);
+    if quiet {
+        title = title.group_color(p.strong);
+    }
+    // KSG dims the lead icon of every row but the open one (`dark:opacity-40`, 55% in light)
+    // and restores it on hover.
+    let mut lead = el().size(16.0, 16.0).center().child(m.lead);
+    if !m.selected {
+        lead = lead.group_opacity(if s.dark { 0.4 } else { 0.55 }, 1.0);
+    }
     let machine = || {
         m.machine.map(|machine| {
             icon(m.machine_glyph, p.faint)
@@ -349,6 +362,7 @@ pub(super) fn thread_row_el(
                     model_vendor(harness, m.model.unwrap_or(harness)),
                     14.0,
                 )
+                .opacity(0.6)
                 .key(format!("thread-harness-{id}")),
             );
         }
