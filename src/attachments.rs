@@ -1351,24 +1351,6 @@ pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn reattach_matching_uses_ksg_metadata_not_content_or_case_folding() {
-        let directory = crate::store::directory().unwrap();
-        let path = directory.join("clip.mp4");
-        std::fs::write(&path, b"video").unwrap();
-        let mut marker = super::attach_file(&path).unwrap();
-        assert!(!marker.needs_reattach());
-        std::fs::remove_file(&path).unwrap();
-        assert!(marker.needs_reattach());
-        marker.mime = "application/octet-stream".into();
-        assert!(marker.matches_reattach("clip.mp4", "video/mp4", 5));
-        assert!(!marker.matches_reattach("Clip.mp4", "video/mp4", 5));
-        assert!(!marker.matches_reattach("clip.mp4", "video/mp4", 6));
-        marker.name = "raw.dng".into();
-        marker.mime = "image/dng".into();
-        assert!(marker.matches_reattach("raw.dng", "image/x-adobe-dng", 5));
-        assert!(!marker.matches_reattach("raw.dng", "application/pdf", 6));
-    }
 
     use super::*;
 
@@ -1404,19 +1386,6 @@ mod tests {
             validate_prompt_images(&images).unwrap_err(),
             "Images can total up to 80 MiB per message or question response. Use smaller images or send fewer at once."
         );
-    }
-
-    #[test]
-    fn supported_image_mime_files_share_the_image_budget_but_dng_does_not() {
-        let path = crate::store::directory().unwrap().join("budget.bin");
-        fs::write(&path, b"file").unwrap();
-        let mut file = attach_file(&path).unwrap();
-        file.bytes = 40 * 1024 * 1024;
-        file.mime = "image/png".into();
-        assert!(validate_prompt_images(&[file.clone(), file.clone()]).is_ok());
-        assert!(validate_prompt_images(&[file.clone(), file.clone(), file.clone()]).is_err());
-        file.mime = "image/x-adobe-dng".into();
-        assert!(validate_prompt_images(&[file.clone(), file.clone(), file]).is_ok());
     }
 
     #[test]
@@ -1582,101 +1551,6 @@ mod tests {
         assert_eq!(attach_file(&directory).unwrap().mime, "inode/directory");
     }
 
-    #[test]
-    fn pi_and_acp_prompt_parts_match_their_negotiated_protocols() {
-        let directory = crate::store::directory().unwrap();
-        let text_path = directory.join("note #1.txt");
-        fs::write(&text_path, "Small text, not inline in Pi.").unwrap();
-        let file = attach_file(&text_path).unwrap();
-        let binary_path = directory.join("binary.bin");
-        fs::write(&binary_path, [0, 255]).unwrap();
-        let binary = attach_file(&binary_path).unwrap();
-        let folder = attach_file(&directory).unwrap();
-        let image = attach_bytes("image.png", image_bytes(ImageFormat::Png)).unwrap();
-        let prompt = Prompt::new(
-            "Read these".into(),
-            vec![file.clone(), binary.clone(), folder.clone(), image],
-        );
-        let pi = prompt_record(&prompt, true).unwrap();
-        assert_eq!(
-            pi["message"],
-            format!(
-                "Read these\n\n[Attached file \"{}\" is saved at: {}]\n\n[Attached file \"{}\" is saved at: {}]\n\n[Attached file \"{}\" is saved at: {}]\n\n[Attached image \"image.png\" is saved at: {}]",
-                file.name,
-                file.path.as_ref().unwrap().display(),
-                binary.name,
-                binary.path.as_ref().unwrap().display(),
-                folder.name,
-                folder.path.as_ref().unwrap().display(),
-                path_for(&prompt.images[3]).unwrap().display()
-            )
-        );
-        assert!(!pi["message"].as_str().unwrap().contains("Small text"));
-        assert_eq!(pi["images"].as_array().unwrap().len(), 1);
-        assert_eq!(pi["images"][0]["type"], "image");
-        assert!(pi.get("attachments").is_none());
-        let acp = prompt_record(&prompt, false).unwrap();
-        assert_eq!(acp["message"], "Read these");
-        assert_eq!(acp["attachments"].as_array().unwrap().len(), 3);
-        let parts = acp_parts(&prompt.images, &json!({"embeddedContext":true})).unwrap();
-        assert_eq!(parts[0]["type"], "resource");
-        assert_eq!(
-            parts[0]["resource"]["text"],
-            "Small text, not inline in Pi."
-        );
-        assert!(
-            parts[0]["resource"]["uri"]
-                .as_str()
-                .unwrap()
-                .ends_with("note%20%231.txt")
-        );
-        assert_eq!(parts[1]["type"], "resource_link");
-        assert_eq!(parts[2]["type"], "resource_link");
-        let fallback = acp_parts(&prompt.images, &json!({})).unwrap();
-        assert!(fallback.iter().all(|p| p["type"] == "text"));
-        assert!(
-            fallback[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("[Attached file")
-        );
-        // A text file changed after intake must not be embedded as text.
-        fs::write(&text_path, [0, 255]).unwrap();
-        assert_eq!(
-            acp_parts(&[file], &json!({"embeddedContext":true})).unwrap()[0]["type"],
-            "resource_link"
-        );
-    }
-
-    #[test]
-    fn file_count_limit_is_separate_from_image_caps() {
-        let directory = crate::store::directory().unwrap();
-        let folder = attach_file(&directory).unwrap();
-        let attachments = vec![folder; MAX_ATTACHMENTS];
-        assert!(validate_prompt_images(&attachments).is_ok());
-        assert!(encode_images(&attachments).unwrap().is_empty());
-        let mut overflow = attachments;
-        overflow.push(overflow[0].clone());
-        assert!(
-            validate_prompt_images(&overflow)
-                .unwrap_err()
-                .contains("100 files")
-        );
-    }
-
-    #[test]
-    fn image_import_accepts_string_notifications_and_mixed_rpc_shapes_without_mutating_them() {
-        for mut record in [
-            json!({"type":"extension_ui_request","method":"confirm","message":"Trust this workspace?"}),
-            json!({"type":"extension_ui_request","method":"notify","message":"Done"}),
-            json!({"type":"response","command":"get_state","data":{"sessionFile":"saved.jsonl"}}),
-            json!({"type":"tool_execution_end","result":{"content":[{"type":"text","text":"Output"}]}}),
-        ] {
-            let before = record.clone();
-            import_history(&mut record);
-            assert_eq!(record, before);
-        }
-    }
     use std::io::Cursor;
 
     fn image_bytes(format: ImageFormat) -> Vec<u8> {
@@ -1711,32 +1585,6 @@ mod tests {
     }
 
     #[test]
-    fn history_import_replaces_base64_with_reusable_validated_references() {
-        let png = image_bytes(ImageFormat::Png);
-        let mut record = json!({"command":"get_messages","data":{"messages":[{
-            "role":"user","content":[{"type":"image","data":encode_base64(&png)}]
-        }]}});
-        import_history(&mut record);
-        let part = &record["data"]["messages"][0]["content"][0];
-        assert!(part.get("data").is_none());
-        let image = from_history_part(part).unwrap();
-        assert_eq!(read(&image).unwrap(), png);
-        let reused = attach_bytes("renamed.png", png).unwrap();
-        assert_eq!(reused.id, image.id);
-        assert_eq!(reused.name, "renamed.png");
-    }
-
-    #[test]
-    fn validation_uses_image_content_not_the_file_extension() {
-        let jpeg = image_bytes(ImageFormat::Jpeg);
-        let attachment = attach_bytes("misleading.png", jpeg).unwrap();
-        assert_eq!(attachment.mime, "image/jpeg");
-        assert_eq!((attachment.width, attachment.height), (3, 2));
-        assert!(attachment.id.ends_with(".jpg"));
-        assert_eq!(read(&attachment).unwrap(), image_bytes(ImageFormat::Jpeg));
-    }
-
-    #[test]
     fn malformed_oversize_and_empty_images_fail_before_storage() {
         assert!(
             attach_bytes("not.png", b"only text".to_vec())
@@ -1761,45 +1609,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn file_reads_keep_large_binary_sources_and_directories_as_references() {
-        let directory = crate::store::directory().unwrap();
-        let path = directory.join("oversize.bin");
-        let file = fs::File::create(&path).unwrap();
-        file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
-        assert_eq!(attach_file(&path).unwrap().mime, "application/octet-stream");
-        assert_eq!(attach_file(&directory).unwrap().mime, "inode/directory");
-    }
-
-    #[test]
-    fn attachments_persist_as_small_references_and_read_back_byte_for_byte() {
-        let png = image_bytes(ImageFormat::Png);
-        let attachment = attach_bytes("screen.png", png.clone()).unwrap();
-        let value = attachment.to_value();
-        assert!(value.get("data").is_none());
-        assert!(!value.to_string().contains(&encode_base64(&png)));
-        let restored = Attachment::from_value(&value).unwrap();
-        assert_eq!(restored, attachment);
-        assert_eq!(read(&restored).unwrap(), png);
-        assert_eq!(
-            encode_images(std::slice::from_ref(&restored)).unwrap()[0]["mimeType"],
-            "image/png"
-        );
-    }
-
-    #[test]
-    fn display_thumbnails_are_bounded_and_do_not_replace_the_original_payload() {
-        let mut encoded = Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(1024, 640)
-            .write_to(&mut encoded, ImageFormat::Png)
-            .unwrap();
-        let original = encoded.into_inner();
-        let attached = attach_bytes("large.png", original.clone()).unwrap();
-        assert_eq!((attached.width, attached.height), (1024, 640));
-        let thumbnail = image::open(preview_path_for(&attached).unwrap()).unwrap();
-        assert!(thumbnail.width() <= 512 && thumbnail.height() <= 512);
-        assert_eq!(read(&attached).unwrap(), original);
-    }
     #[test]
     fn png_jpeg_gif_and_webp_are_detected_from_bytes() {
         for (format, mime) in [

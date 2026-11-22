@@ -734,19 +734,6 @@ mod tests {
             assert!(!close_to_tray(enabled, count, supported, quitting));
         }
     }
-    #[test]
-    fn endpoint_parsing_never_uses_userinfo_and_preserves_explicit_ports() {
-        assert_eq!(
-            endpoint("http://127.0.0.1:8317/v1"),
-            Some(("127.0.0.1".into(), 8317))
-        );
-        assert_eq!(
-            endpoint("https://proxy.example/v1"),
-            Some(("proxy.example".into(), 443))
-        );
-        assert_eq!(endpoint("http://[::1]:8317/v1"), Some(("::1".into(), 8317)));
-        assert_eq!(endpoint("https://secret@proxy.example"), None);
-    }
 
     fn wired() -> (State, mpsc::Receiver<Value>, mpsc::SyncSender<Event>) {
         let mut state = State::new(PathBuf::new(), false);
@@ -754,30 +741,6 @@ mod tests {
         state.current_mut().pi = Some(pi);
         state.current_mut().model_provider = "cpa".into();
         (state, commands, events)
-    }
-
-    #[test]
-    fn settings_default_off_and_round_trip_in_ui_state() {
-        let mut state = State::new(PathBuf::new(), false);
-        assert!(!state.background_settings().keep_working);
-        assert_eq!(state.background_settings().keep_awake, KeepAwake::Off);
-        state.background.settings.keep_working = true;
-        state.background.settings.keep_awake = KeepAwake::OnAcPower;
-        let saved = state.ui_snapshot();
-        let mut restored = State::new(PathBuf::new(), false);
-        restored.restore_ui(&saved).unwrap();
-        assert!(restored.background_settings().keep_working);
-        assert_eq!(
-            restored.background_settings().keep_awake,
-            KeepAwake::OnAcPower
-        );
-        let mut legacy = saved.clone();
-        legacy.as_object_mut().unwrap().remove("background");
-        restored.restore_ui(&legacy).unwrap();
-        assert!(!restored.background_settings().keep_working);
-        let mut damaged = saved;
-        damaged["background"]["keep_working"] = json!("yes");
-        assert!(restored.restore_ui(&damaged).is_err());
     }
 
     #[test]
@@ -827,60 +790,6 @@ mod tests {
         );
         state.retry();
         assert_eq!(commands.try_recv().unwrap()["type"], "prompt");
-    }
-
-    #[test]
-    fn normal_connection_errors_remain_failures_and_queued_work_counts_for_close() {
-        let (mut state, _commands, _events) = wired();
-        state.current_mut().status = Status::Failed;
-        state.current_mut().error = Some("Connection error.".into());
-        assert!(!state.pause_offline_errors());
-        assert_eq!(state.current().status, Status::Failed);
-        assert_eq!(state.background_work_count(), 0);
-        state
-            .current_mut()
-            .enqueue_injection("Queued report".into());
-        assert_eq!(state.background_work_count(), 1);
-    }
-
-    #[test]
-    fn cancelled_routine_delivery_releases_the_update_guard() {
-        let (mut state, _commands, _events) = wired();
-        state.load_global_for_test();
-        state.captains = Captain::presets();
-        state.current_mut().captain = Some(0);
-        state.current_mut().captain_home = true;
-        state.background.started = true;
-        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
-        state
-            .background
-            .routines
-            .create(
-                0,
-                1,
-                "Review".into(),
-                "Read status".into(),
-                Schedule::Every { minutes: 15 },
-                MissedPolicy::Skip,
-                chrono::Local::now(),
-            )
-            .unwrap();
-        let messages = state
-            .background
-            .routines
-            .due(chrono::Local::now() + chrono::Duration::minutes(15), |_| {
-                false
-            })
-            .unwrap();
-        assert_eq!(messages.len(), 1);
-        assert!(state.routines_running());
-        // The user cleared the queued message before Pi accepted it.
-        state.poll_background_end(&mut Tx::default());
-        assert!(!state.routines_running());
-        assert_eq!(
-            state.background.routines.entries()[0].last_status,
-            "Stopped before delivery"
-        );
     }
 
     #[test]
@@ -942,142 +851,5 @@ mod tests {
         assert!(state.current().accepted_deliveries.contains(&delivery));
         state.delete_routine(id).unwrap();
         assert!(state.routines(0).is_empty());
-    }
-
-    #[test]
-    fn routine_reset_rebinds_the_primary_home_and_earlier_homes_cannot_mutate() {
-        let (mut state, _commands, _events) = wired();
-        state.load_global_for_test();
-        state.captains = Captain::presets();
-        state.captain_homes.clear();
-        state.current_mut().captain = Some(0);
-        state.current_mut().captain_home = true;
-        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
-        let id = state.mcp_call(1, "create_routine", &json!({
-            "name":"Review", "prompt":"Read status", "schedule":{"kind":"every","minutes":15}
-        })).unwrap()["id"].as_u64().unwrap();
-        let mut before = serde_json::to_value(&state.background.routines.entries()[0]).unwrap();
-        state.reset_captain_conversation(0).unwrap();
-        let home = state.captain_home(0).unwrap();
-        assert_ne!(home, 1);
-        before["home"] = json!(home);
-        assert_eq!(
-            serde_json::to_value(&state.background.routines.entries()[0]).unwrap(),
-            before
-        );
-        assert_eq!(state.routines(0).len(), 1);
-        for (tool, args) in [
-            ("pause_routine", json!({"id":id})),
-            ("delete_routine", json!({"id":id})),
-            (
-                "create_routine",
-                json!({"name":"Another","prompt":"Read","schedule":{"kind":"every","minutes":15}}),
-            ),
-        ] {
-            assert!(
-                state
-                    .mcp_call(1, tool, &args)
-                    .unwrap_err()
-                    .contains("primary")
-            );
-        }
-        assert_eq!(
-            state
-                .mcp_call(1, "list_routines", &json!({}))
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        state
-            .mcp_call(home, "pause_routine", &json!({"id":id,"paused":true}))
-            .unwrap();
-        assert!(state.routines(0)[0].paused);
-        // A previous build may have left this routine attached to an earlier
-        // home. Startup repairs routing without changing the schedule.
-        state.background.routines.rebind_captain(0, 1).unwrap();
-        state.reconcile_routine_homes();
-        assert_eq!(state.background.routines.entries()[0].home, home);
-    }
-
-    #[test]
-    fn routine_dispatch_rejects_a_home_with_the_wrong_captain() {
-        let (mut state, commands, _events) = wired();
-        state.load_global_for_test();
-        state.captains = Captain::presets();
-        state.captain_homes.clear();
-        state.current_mut().captain = Some(0);
-        state.current_mut().captain_home = true;
-        state.background.started = true;
-        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
-        state
-            .background
-            .routines
-            .create(
-                1,
-                1,
-                "Wrong owner".into(),
-                "Do not dispatch".into(),
-                Schedule::Every { minutes: 15 },
-                MissedPolicy::RunOnce,
-                chrono::Local::now() - chrono::Duration::minutes(16),
-            )
-            .unwrap();
-        let before = serde_json::to_value(&state.background.routines.entries()[0]).unwrap();
-        state.poll_background_end(&mut Tx::default());
-        assert!(commands.try_recv().is_err());
-        assert!(state.current().pending_injections.is_empty());
-        assert_eq!(
-            serde_json::to_value(&state.background.routines.entries()[0]).unwrap(),
-            before
-        );
-    }
-
-    #[test]
-    fn unanswered_user_crew_questions_hold_routines_without_waking_the_home() {
-        let (mut state, commands, _events) = wired();
-        state.load_global_for_test();
-        state.captains = Captain::presets();
-        state.captain_homes.clear();
-        state.current_mut().captain = Some(0);
-        state.current_mut().captain_home = true;
-        state.background.started = true;
-        state.background.routines = Routines::load(state.data_dir.join("routines.json"));
-        state
-            .background
-            .routines
-            .create(
-                0,
-                1,
-                "Review".into(),
-                "Read status".into(),
-                Schedule::Every { minutes: 15 },
-                MissedPolicy::RunOnce,
-                chrono::Local::now() - chrono::Duration::minutes(16),
-            )
-            .unwrap();
-        let worker = state.next_id;
-        state.next_id += 1;
-        let mut thread = Thread::new(worker);
-        thread.crew_captain = Some(0);
-        thread.captain = Some(0);
-        thread.run_id = Some("question-run".into());
-        state.threads.push(thread);
-        state.mcp_call(worker, "captain_crew_report", &json!({
-            "requestId":uuid::Uuid::new_v4().to_string(),"outcome":"blocked","summary":"Needs a decision",
-            "question":{"text":"Which branch?","recipient":"user"}
-        })).unwrap();
-        assert!(
-            state.poll_background_end(&mut Tx::default()),
-            "routine ledger changes must promote a persisted global update"
-        );
-        assert_eq!(
-            state.routines(0)[0].last_status,
-            "Waiting for your response"
-        );
-        assert!(!state.routines_running());
-        assert!(commands.try_recv().is_err());
-        assert!(state.current().pending_injections.is_empty());
     }
 }

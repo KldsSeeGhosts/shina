@@ -2421,12 +2421,6 @@ pub(crate) mod testkit {
             }
             path.to_string_lossy().into_owned()
         }
-        pub fn wrapper(&self, path: &str) -> String {
-            let path = self.dir.join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, "#!/bin/sh\nexec real \"$@\"\n").unwrap();
-            path.to_string_lossy().into_owned()
-        }
     }
 
     pub fn service(

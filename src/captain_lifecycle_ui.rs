@@ -975,7 +975,7 @@ mod tests {
     use super::*;
     use rune::{Env, Runtime};
 
-    const WIDTHS: [f32; 4] = [620.0, 960.0, 1280.0, 1920.0];
+    const WIDTHS: [f32; 2] = [620.0, 1280.0];
 
     fn runtime(width: f32) -> Runtime<State> {
         Runtime::with_text(

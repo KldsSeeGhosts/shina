@@ -341,18 +341,6 @@ impl NativeCatalog {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_acp_fixture(agent: crate::harness::Agent, models: Vec<AgentModel>) -> Self {
-        Self {
-            agent: Some(agent),
-            models,
-            installed: true,
-            complete: true,
-            revision: 1,
-            ..Default::default()
-        }
-    }
-
     fn refresh_with(
         &mut self,
         workspace: &Path,
@@ -589,18 +577,6 @@ impl Catalog {
         self.started = Some(now);
         self.last_attempt = Some(now);
         self.pi = Some(Pi::discover(workspace, wake));
-    }
-
-    #[cfg(test)]
-    pub fn set_loading_for_test(&mut self, loading: bool) {
-        if loading {
-            let (pi, _, _) = Pi::test_connection();
-            self.pi = Some(pi);
-            self.started = Some(Instant::now());
-        } else {
-            self.pi = None;
-            self.started = None;
-        }
     }
 
     pub fn poll(&mut self) -> bool {

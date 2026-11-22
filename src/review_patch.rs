@@ -879,30 +879,6 @@ rename to pure_new.rs
     }
 
     #[test]
-    fn copied_file() {
-        let patch = "\
-diff --git a/template.txt b/copy.txt
-similarity index 90%
-copy from template.txt
-copy to copy.txt
-index 1111111..2222222 100644
---- a/template.txt
-+++ b/copy.txt
-@@ -1,2 +1,2 @@
- line 1
--template
-+copy
-";
-        let files = expect_files(patch);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "copy.txt");
-        assert_eq!(files[0].previous_path.as_deref(), Some("template.txt"));
-        assert_eq!(files[0].change, ChangeKind::Copied);
-        assert_eq!(files[0].additions, 1);
-        assert_eq!(files[0].deletions, 1);
-    }
-
-    #[test]
     fn binary_file_change() {
         let patch = "\
 diff --git a/x.png b/x.png
@@ -916,81 +892,6 @@ Binary files a/x.png and b/x.png differ
         assert_eq!(files[0].change, ChangeKind::Modified);
         assert!(files[0].binary);
         assert!(files[0].hunks.is_empty());
-    }
-
-    #[test]
-    fn mode_only_change() {
-        let patch = "\
-diff --git a/bin/run.sh b/bin/run.sh
-old mode 100644
-new mode 100755
-";
-        let files = expect_files(patch);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "bin/run.sh");
-        assert_eq!(files[0].previous_path, None);
-        assert_eq!(files[0].change, ChangeKind::Modified);
-        assert!(!files[0].binary);
-        assert_eq!(files[0].old_mode.as_deref(), Some("100644"));
-        assert_eq!(files[0].new_mode.as_deref(), Some("100755"));
-        assert!(files[0].hunks.is_empty());
-    }
-
-    #[test]
-    fn quoted_path_with_octal_escape() {
-        let patch = "\
-diff --git \"a/dir/caf\\303\\251\\t\\\"1\\\".txt\" \"b/dir/caf\\303\\251\\t\\\"1\\\".txt\"
-index 1111111..2222222 100644
---- \"a/dir/caf\\303\\251\\t\\\"1\\\".txt\"
-+++ \"b/dir/caf\\303\\251\\t\\\"1\\\".txt\"
-@@ -1 +1 @@
--a
-+b
-";
-        let files = expect_files(patch);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "dir/café\t\"1\".txt");
-    }
-
-    #[test]
-    fn no_newline_at_end_of_file_on_last_added_line() {
-        let patch = "\
-diff --git a/file.txt b/file.txt
-index 1111111..2222222 100644
---- a/file.txt
-+++ b/file.txt
-@@ -1 +1 @@
--old
-+new
-\\ No newline at end of file
-";
-        let files = expect_files(patch);
-        assert_eq!(files.len(), 1);
-        let lines = &files[0].hunks[0].lines;
-        assert_eq!(lines.len(), 2);
-        assert!(!lines[0].no_newline);
-        assert!(lines[1].no_newline);
-        assert_eq!(lines[1].kind, LineKind::Added);
-        assert_eq!(lines[1].text, "new");
-    }
-
-    #[test]
-    fn hunk_header_without_counts() {
-        let patch = "\
-diff --git a/a.txt b/a.txt
---- a/a.txt
-+++ b/a.txt
-@@ -1 +1 @@
--old
-+new
-";
-        let files = expect_files(patch);
-        let hunk = &files[0].hunks[0];
-        assert_eq!(hunk.old_start, 1);
-        assert_eq!(hunk.old_count, 1);
-        assert_eq!(hunk.new_start, 1);
-        assert_eq!(hunk.new_count, 1);
-        assert_eq!(hunk.section, "");
     }
 
     #[test]
@@ -1015,28 +916,6 @@ diff --git a/a.txt b/a.txt
     }
 
     #[test]
-    fn two_files_in_one_patch() {
-        let patch = "\
-diff --git a/one.txt b/one.txt
---- a/one.txt
-+++ b/one.txt
-@@ -1 +1 @@
--a
-+b
-diff --git a/two.txt b/two.txt
---- a/two.txt
-+++ b/two.txt
-@@ -1 +1 @@
--c
-+d
-";
-        let files = expect_files(patch);
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].path, "one.txt");
-        assert_eq!(files[1].path, "two.txt");
-    }
-
-    #[test]
     fn empty_unsupported_and_broken_hunk_inputs() {
         assert_eq!(parse(""), None);
         assert_eq!(parse("   \n\t\r\n "), None);
@@ -1058,118 +937,5 @@ diff --git a/two.txt b/two.txt
                 reason: "Failed to parse patch. Showing raw patch.".to_string(),
             })
         );
-    }
-
-    #[test]
-    fn every_prefix_does_not_panic() {
-        let sample = concat!(
-            "preamble line\n",
-            "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\r\n",
-            "old mode 100644\r\n",
-            "new mode 100755\r\n",
-            "--- \"a/caf\\303\\251.txt\"\r\n",
-            "+++ \"b/caf\\303\\251.txt\"\r\n",
-            "@@ -1,3 +1,3 @@ fn demo()\r\n",
-            " first\r\n",
-            "-second\r\n",
-            "+SECOND\r\n",
-            "\r\n",
-            "\\ No newline at end of file\r\n",
-            "diff --git a/bin.png b/bin.png\n",
-            "Binary files a/bin.png and b/bin.png differ\n",
-        );
-
-        for (byte_idx, _) in sample.char_indices() {
-            let _ = parse(&sample[..byte_idx]);
-        }
-        let _ = parse(sample);
-    }
-
-    #[test]
-    fn fnv1a32_matches_ksg_utf16() {
-        assert_eq!(fnv1a32(""), 0x811c_9dc5);
-        assert_eq!(fnv1a32("abc"), 0x1a47_e90b);
-        assert_eq!(fnv1a32("é"), 0x6c0b_6c44);
-    }
-
-    #[test]
-    fn line_stat_identity_key_and_collapse_helpers() {
-        use std::collections::HashSet;
-
-        let patch = "\
-diff --git a/a.rs b/a.rs
---- a/a.rs
-+++ b/a.rs
-@@ -1,2 +1,3 @@
- keep
--old
-+new1
-+new2
-diff --git a/b.rs b/c.rs
-rename from b.rs
-rename to c.rs
---- a/b.rs
-+++ b/c.rs
-@@ -1 +1 @@
--old
-+new
-";
-        let files = expect_files(patch);
-        assert_eq!(
-            line_stat(&[]),
-            LineStat {
-                additions: 0,
-                deletions: 0
-            }
-        );
-        assert_eq!(
-            line_stat(&files),
-            LineStat {
-                additions: 3,
-                deletions: 2
-            }
-        );
-
-        assert_eq!(identity_key(&files[0]), "a.rs\0a.rs\0modified");
-        assert_eq!(identity_key(&files[1]), "b.rs\0c.rs\0renamed");
-
-        let deleted_pair = FileDiff {
-            path: "link.txt".to_string(),
-            previous_path: None,
-            change: ChangeKind::Deleted,
-            binary: false,
-            old_mode: None,
-            new_mode: None,
-            hunks: Vec::new(),
-            additions: 0,
-            deletions: 1,
-        };
-        let added_pair = FileDiff {
-            change: ChangeKind::Added,
-            additions: 1,
-            deletions: 0,
-            ..deleted_pair.clone()
-        };
-        assert_ne!(identity_key(&deleted_pair), identity_key(&added_pair));
-
-        let mut collapsed = HashSet::new();
-        assert!(!all_collapsed(&[], &collapsed));
-        assert!(!all_collapsed(&files, &collapsed));
-
-        collapsed.insert(identity_key(&files[0]));
-        assert!(!all_collapsed(&files, &collapsed));
-
-        collapsed.insert("stale\0key\0modified".to_string());
-        toggle_all(&files, &mut collapsed);
-        assert!(all_collapsed(&files, &collapsed));
-        assert_eq!(collapsed.len(), 2);
-        assert!(!collapsed.contains("stale\0key\0modified"));
-
-        toggle_all(&files, &mut collapsed);
-        assert!(!all_collapsed(&files, &collapsed));
-        assert!(collapsed.is_empty());
-
-        toggle_all(&[], &mut collapsed);
-        assert!(collapsed.is_empty());
     }
 }

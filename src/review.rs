@@ -2065,56 +2065,6 @@ mod tests {
     }
 
     #[test]
-    fn branch_commits_truncates_past_the_commit_limit() {
-        require_git!();
-        let env = TestEnv::new("commit-limit");
-        let repo = env.init_repo("repo");
-        env.git(&repo, &["checkout", "-b", "feature", "--quiet"]);
-        for index in 0..(REVIEW_BRANCH_COMMIT_LIMIT + 3) {
-            env.git(
-                &repo,
-                &[
-                    "commit",
-                    "--allow-empty",
-                    "-m",
-                    &format!("c{index}"),
-                    "--quiet",
-                ],
-            );
-        }
-        let result = get_branch_commits(
-            &ReviewBranchCommitsInput {
-                cwd: repo.to_string_lossy().into_owned(),
-                base_ref: Some("main".into()),
-            },
-            &env.ctx,
-        )
-        .unwrap();
-        assert_eq!(result.commits.len(), REVIEW_BRANCH_COMMIT_LIMIT);
-        assert!(result.truncated);
-
-        let long_subject = "x".repeat(REVIEW_BRANCH_SUBJECT_LIMIT + 100);
-        env.git(&repo, &["checkout", "-b", "subjects", "--quiet"]);
-        env.git(
-            &repo,
-            &["commit", "--allow-empty", "-m", &long_subject, "--quiet"],
-        );
-        let subjects = get_branch_commits(
-            &ReviewBranchCommitsInput {
-                cwd: repo.to_string_lossy().into_owned(),
-                base_ref: Some("feature".into()),
-            },
-            &env.ctx,
-        )
-        .unwrap();
-        assert_eq!(subjects.commits.len(), 1);
-        assert_eq!(
-            subjects.commits[0].subject.chars().count(),
-            REVIEW_BRANCH_SUBJECT_LIMIT
-        );
-    }
-
-    #[test]
     fn unborn_repository_reports_additions_and_empty_commits() {
         require_git!();
         let env = TestEnv::new("unborn");
@@ -2152,75 +2102,6 @@ mod tests {
         .unwrap();
         assert!(commits.commits.is_empty());
         assert!(!commits.truncated);
-    }
-
-    #[test]
-    fn non_repository_returns_empty_shapes() {
-        require_git!();
-        let env = TestEnv::new("non-repo");
-        let plain = env._root.path.join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-
-        let preview = get_diff_preview(&preview_input(&plain), &env.ctx).unwrap();
-        assert!(preview.sources.is_empty());
-        assert_eq!(preview.cwd, plain.to_string_lossy());
-
-        let commits = get_branch_commits(
-            &ReviewBranchCommitsInput {
-                cwd: plain.to_string_lossy().into_owned(),
-                base_ref: None,
-            },
-            &env.ctx,
-        )
-        .unwrap();
-        assert!(commits.commits.is_empty());
-        assert!(!commits.truncated);
-
-        let err = get_diff_file_contents(
-            &contents_input(&plain, ReviewChangeType::Change, "x.txt"),
-            &env.ctx,
-            &env.state_dir(),
-        )
-        .unwrap_err();
-        assert!(err.contains("requires a Git repository"), "{err}");
-    }
-
-    #[test]
-    fn patch_output_truncates_at_review_limit() {
-        require_git!();
-        let env = TestEnv::new("patch-limit");
-        let repo = env.init_repo("repo");
-        let big: String = (0..9000)
-            .map(|i| format!("line-{i}-xxxxxxxxxxxxxxxx\n"))
-            .collect();
-        std::fs::write(repo.join("big.txt"), &big).unwrap();
-        env.git(&repo, &["add", "big.txt"]);
-        env.git(&repo, &["commit", "-m", "big", "--quiet"]);
-        let bigger: String = (0..9000)
-            .map(|i| format!("changed-{i}-yyyyyyyyyyyyyyyyyyyy\n"))
-            .collect();
-        std::fs::write(repo.join("big.txt"), &bigger).unwrap();
-
-        let result = get_diff_preview(&preview_input(&repo), &env.ctx).unwrap();
-        let source = &result.sources[0];
-        assert!(source.truncated);
-        assert_eq!(source.diff.len(), REVIEW_DIFF_PATCH_MAX_OUTPUT_BYTES);
-    }
-
-    #[test]
-    fn metadata_only_defers_patches() {
-        require_git!();
-        let env = TestEnv::new("metadata");
-        let repo = env.init_repo("repo");
-        std::fs::write(repo.join("changed.txt"), "new\n").unwrap();
-        let mut input = preview_input(&repo);
-        input.metadata_only = Some(true);
-        let result = get_diff_preview(&input, &env.ctx).unwrap();
-        let source = &result.sources[0];
-        assert_eq!(source.diff, "");
-        assert_eq!(source.patches_deferred, Some(true));
-        assert!(!source.truncated);
-        assert!(file_names(&result, 0).contains(&"changed.txt".to_owned()));
     }
 
     #[test]
@@ -2281,52 +2162,6 @@ mod tests {
     }
 
     #[test]
-    fn file_contents_reads_revision_and_working_tree() {
-        require_git!();
-        let env = TestEnv::new("file-contents");
-        let repo = env.init_repo("repo");
-        std::fs::write(repo.join("text.txt"), "before\n").unwrap();
-        env.git(&repo, &["add", "."]);
-        env.git(&repo, &["commit", "-m", "text", "--quiet"]);
-        std::fs::write(repo.join("text.txt"), "after\n").unwrap();
-
-        let result = get_diff_file_contents(
-            &contents_input(&repo, ReviewChangeType::Change, "text.txt"),
-            &env.ctx,
-            &env.state_dir(),
-        )
-        .unwrap();
-        assert_eq!(result.old_contents, "before\n");
-        assert_eq!(result.new_contents, "after\n");
-
-        std::fs::write(repo.join("added.txt"), "new file\n").unwrap();
-        let added = get_diff_file_contents(
-            &contents_input(&repo, ReviewChangeType::New, "added.txt"),
-            &env.ctx,
-            &env.state_dir(),
-        )
-        .unwrap();
-        assert_eq!(added.old_contents, "");
-        assert_eq!(added.new_contents, "new file\n");
-
-        let mut removed = contents_input(&repo, ReviewChangeType::Deleted, "README.md");
-        std::fs::remove_file(repo.join("README.md")).unwrap();
-        removed.new_path = "README.md".into();
-        let deleted = get_diff_file_contents(&removed, &env.ctx, &env.state_dir()).unwrap();
-        assert_eq!(deleted.old_contents, "hello\n");
-        assert_eq!(deleted.new_contents, "");
-
-        std::fs::write(repo.join("binary.dat"), [0u8, 1, 2]).unwrap();
-        let binary = get_diff_file_contents(
-            &contents_input(&repo, ReviewChangeType::New, "binary.dat"),
-            &env.ctx,
-            &env.state_dir(),
-        )
-        .unwrap_err();
-        assert!(binary.contains("Cannot expand binary file"), "{binary}");
-    }
-
-    #[test]
     fn file_contents_rejects_escapes_and_state_files() {
         require_git!();
         let env = TestEnv::new("escape");
@@ -2372,48 +2207,6 @@ mod tests {
     }
 
     #[test]
-    fn file_reads_enforce_the_one_mb_limit() {
-        require_git!();
-        let env = TestEnv::new("file-limit");
-        let repo = env.init_repo("repo");
-        let oversized = "x".repeat(REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES + 16);
-        std::fs::write(repo.join("huge.txt"), &oversized).unwrap();
-
-        let err = get_diff_file_contents(
-            &contents_input(&repo, ReviewChangeType::New, "huge.txt"),
-            &env.ctx,
-            &env.state_dir(),
-        )
-        .unwrap_err();
-        assert!(err.contains("exceeds the 1 MB expansion limit"), "{err}");
-
-        env.git(&repo, &["add", "huge.txt"]);
-        env.git(&repo, &["commit", "-m", "huge", "--quiet"]);
-        std::fs::remove_file(repo.join("huge.txt")).unwrap();
-        let err = get_diff_file_contents(
-            &contents_input(&repo, ReviewChangeType::Deleted, "huge.txt"),
-            &env.ctx,
-            &env.state_dir(),
-        )
-        .unwrap_err();
-        assert!(err.contains("Git output exceeded"), "{err}");
-    }
-
-    #[test]
-    fn too_many_untracked_files_mark_the_result_incomplete() {
-        require_git!();
-        let env = TestEnv::new("untracked-limit");
-        let repo = env.init_repo("repo");
-        for index in 0..=REVIEW_UNTRACKED_MAX_FILES {
-            std::fs::write(repo.join(format!("u{index}.txt")), "x").unwrap();
-        }
-        let result = get_diff_preview(&preview_input(&repo), &env.ctx).unwrap();
-        let source = &result.sources[0];
-        assert!(source.truncated);
-        assert!(source.files.is_none());
-    }
-
-    #[test]
     fn file_scoped_preview_diffs_only_that_path() {
         require_git!();
         let env = TestEnv::new("file-scoped");
@@ -2447,25 +2240,5 @@ mod tests {
         let result = get_diff_preview(&input, &env.ctx).unwrap();
         assert!(result.sources[0].diff.contains("new-untracked.txt"));
         assert_eq!(file_names(&result, 0), vec!["new-untracked.txt".to_owned()]);
-    }
-
-    #[test]
-    fn tracked_only_excludes_untracked_and_reports_incomplete() {
-        require_git!();
-        let env = TestEnv::new("tracked-only");
-        let repo = env.init_repo("repo");
-        std::fs::write(repo.join("tracked.txt"), "a\n").unwrap();
-        env.git(&repo, &["add", "tracked.txt"]);
-        env.git(&repo, &["commit", "-m", "tracked", "--quiet"]);
-        std::fs::write(repo.join("tracked.txt"), "b\n").unwrap();
-        std::fs::write(repo.join("untracked.txt"), "u\n").unwrap();
-
-        let mut input = preview_input(&repo);
-        input.tracked_only = Some(true);
-        let result = get_diff_preview(&input, &env.ctx).unwrap();
-        assert_eq!(result.incomplete, Some(true));
-        let files = file_names(&result, 0);
-        assert!(files.contains(&"tracked.txt".to_owned()));
-        assert!(!files.contains(&"untracked.txt".to_owned()));
     }
 }

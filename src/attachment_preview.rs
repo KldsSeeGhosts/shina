@@ -260,23 +260,11 @@ impl Drop for Preview {
 }
 
 impl Preview {
-    #[cfg(test)]
-    pub(super) fn zoom(&self) -> f32 {
-        self.zoom
-    }
-    #[cfg(test)]
-    pub(super) fn scroll_offset(&self) -> [f32; 2] {
-        self.scroll().offset
-    }
     fn scroll(&self) -> rune::ScrollPos {
         *self.image_scroll.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub(super) fn table_pos(&self) -> rune::ScrollPos {
         *self.table_scroll.lock().unwrap_or_else(|e| e.into_inner())
-    }
-    #[cfg(test)]
-    pub(super) fn table_scroll_offset(&self) -> [f32; 2] {
-        self.table_pos().offset
     }
     fn change_zoom(&mut self, next: f32, point: Option<[f32; 2]>, tx: &mut Tx) {
         let next = clamped_zoom(next);

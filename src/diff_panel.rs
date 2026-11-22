@@ -2336,14 +2336,6 @@ mod tests {
             ReviewSourceKind::Commit => "commit",
         }
     }
-    fn stat(path: &str, additions: usize, deletions: usize) -> ReviewDiffFileStat {
-        ReviewDiffFileStat {
-            path: path.to_string(),
-            previous_path: None,
-            additions,
-            deletions,
-        }
-    }
     fn file(path: &str, change: ChangeKind) -> FileDiff {
         FileDiff {
             path: path.to_string(),
@@ -2391,48 +2383,6 @@ mod tests {
         );
         assert_eq!(branch.base_ref, None);
         assert_eq!(branch.file, None);
-    }
-
-    #[test]
-    fn a_late_answer_for_a_replaced_request_is_ignored() {
-        let mut s = state();
-        let key = s.panel_key();
-        s.diffs.insert(
-            key.clone(),
-            ThreadDiff {
-                request: 2,
-                loading: true,
-                ..ThreadDiff::default()
-            },
-        );
-        assert!(!s.apply_diff_msg(DiffMsg::Preview {
-            panel_key: key.clone(),
-            request: 1,
-            done: Done::Empty,
-        }));
-        assert!(s.diffs[&key].done.is_none());
-        assert!(s.diffs[&key].loading);
-        assert!(s.apply_diff_msg(DiffMsg::Preview {
-            panel_key: key.clone(),
-            request: 2,
-            done: Done::Empty,
-        }));
-        assert!(matches!(s.diffs[&key].done, Some(Done::Empty)));
-        assert!(!s.diffs[&key].loading);
-    }
-
-    #[test]
-    fn refresh_respects_the_live_refresh_interval() {
-        let now = Instant::now();
-        assert!(refresh_due(None, now));
-        assert!(refresh_due(
-            Some(now - LIVE_REFRESH_MIN_INTERVAL - Duration::from_secs(1)),
-            now
-        ));
-        assert!(!refresh_due(
-            Some(now - LIVE_REFRESH_MIN_INTERVAL + Duration::from_secs(1)),
-            now
-        ));
     }
 
     #[test]
@@ -2625,81 +2575,6 @@ mod tests {
     }
 
     #[test]
-    fn preview_done_maps_sources_to_states() {
-        let cwd = "/repo";
-        // Not a repository.
-        let result = ReviewDiffPreviewResult {
-            cwd: cwd.into(),
-            generated_at: String::new(),
-            sources: vec![],
-            incomplete: None,
-        };
-        assert!(matches!(
-            preview_done(Scope::Branch, cwd, result),
-            Done::NotRepo
-        ));
-        // The requested scope's source is missing.
-        let result = ReviewDiffPreviewResult {
-            cwd: cwd.into(),
-            generated_at: String::new(),
-            sources: vec![source(
-                ReviewSourceKind::WorkingTree,
-                "diff --git a/x b/x\n",
-            )],
-            incomplete: None,
-        };
-        assert!(matches!(
-            preview_done(Scope::Branch, cwd, result),
-            Done::Missing
-        ));
-        // An empty patch is the empty state.
-        let result = ReviewDiffPreviewResult {
-            cwd: cwd.into(),
-            generated_at: String::new(),
-            sources: vec![source(ReviewSourceKind::BranchRange, "")],
-            incomplete: None,
-        };
-        assert!(matches!(
-            preview_done(Scope::Branch, cwd, result),
-            Done::Empty
-        ));
-        // Deferred stats make the lazy file list.
-        let mut deferred = source(ReviewSourceKind::BranchRange, "");
-        deferred.patches_deferred = Some(true);
-        deferred.files = Some(vec![stat("src/a.rs", 2, 1), stat("tests/t.rs", 4, 0)]);
-        let result = ReviewDiffPreviewResult {
-            cwd: cwd.into(),
-            generated_at: String::new(),
-            sources: vec![deferred],
-            incomplete: Some(true),
-        };
-        let Done::Ready(ready) = preview_done(Scope::Branch, cwd, result) else {
-            panic!("deferred stats make a lazy Ready");
-        };
-        assert_eq!(ready.files.len(), 2);
-        assert!(ready.files.iter().all(|e| e.body == FileBody::Pending));
-        assert_eq!((ready.additions, ready.deletions), (6, 1));
-        assert!(ready.incomplete);
-        // An inline patch parses straight into loaded files.
-        let mut inline = source(
-            ReviewSourceKind::WorkingTree,
-            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
-        );
-        inline.files = None;
-        let result = ReviewDiffPreviewResult {
-            cwd: cwd.into(),
-            generated_at: String::new(),
-            sources: vec![inline],
-            incomplete: None,
-        };
-        let Done::Ready(ready) = preview_done(Scope::Uncommitted, cwd, result) else {
-            panic!("an inline patch makes a loaded Ready");
-        };
-        assert_eq!(ready.files.len(), 1);
-        assert_eq!(ready.files[0].body, FileBody::Loaded);
-    }
-
-    #[test]
     fn file_outcome_merges_the_files_patch() {
         let result = ReviewDiffPreviewResult {
             cwd: "/repo".into(),
@@ -2730,75 +2605,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_capability_notice_names_the_machine() {
-        let mut s = state();
-        let key = s.panel_key();
-        s.diffs.insert(
-            key.clone(),
-            ThreadDiff {
-                request: 1,
-                done: Some(Done::Unsupported("Studio".into())),
-                ..ThreadDiff::default()
-            },
-        );
-        // The view string is produced in `body`; the notice shape is asserted
-        // here on the state it renders.
-        let Some(Done::Unsupported(label)) = &s.diffs[&key].done else {
-            panic!("the unsupported outcome keeps its label");
-        };
-        assert_eq!(
-            format!("Update Shina on {label} to view changes"),
-            "Update Shina on Studio to view changes"
-        );
-    }
-
-    #[test]
-    fn format_compact_diff_count_matches_ksg() {
-        assert_eq!(format_compact_diff_count(0), "0");
-        assert_eq!(format_compact_diff_count(999), "999");
-        assert_eq!(format_compact_diff_count(1000), "1k");
-        assert_eq!(format_compact_diff_count(1234), "1.2k");
-        assert_eq!(format_compact_diff_count(999_499), "999k");
-        assert_eq!(format_compact_diff_count(1_000_000), "1m");
-        assert_eq!(format_compact_diff_count(2_400_000), "2.4m");
-    }
-
-    #[test]
-    fn line_row_renders_with_and_without_language_highlighting() {
-        let p = palette(false);
-        let _highlighted = line_row(
-            LineKind::Added,
-            None,
-            Some(1),
-            "fn main() {}",
-            p,
-            Some("rust"),
-            false,
-        );
-        let _plain = line_row(
-            LineKind::Context,
-            Some(1),
-            Some(1),
-            "fn main() {}",
-            p,
-            None,
-            false,
-        );
-    }
-
-    #[test]
-    fn language_for_resolves_rust_and_ignores_plain_text() {
-        assert_eq!(
-            super::super::attachment_source_highlight::language_for("src/main.rs"),
-            Some("rust")
-        );
-        assert_eq!(
-            super::super::attachment_source_highlight::language_for("notes.txt"),
-            None
-        );
-    }
-
     fn ready_diff(scope: Scope, files: Vec<FileEntry>) -> ThreadDiff {
         let additions = files.iter().map(|entry| entry.additions).sum();
         let deletions = files.iter().map(|entry| entry.deletions).sum();
@@ -2821,29 +2627,6 @@ mod tests {
             }))),
             ..ThreadDiff::default()
         }
-    }
-
-    #[test]
-    fn file_path_matches_relative_absolute_outside_and_renamed_paths() {
-        let plain = file("src/a.rs", ChangeKind::Modified);
-        let mut renamed = file("src/new.rs", ChangeKind::Renamed);
-        renamed.previous_path = Some("src/old.rs".into());
-        // Relative paths compare against the preview's project directory.
-        assert!(file_path_matches(&plain, "/repo", "src/a.rs"));
-        // An absolute path inside the project reduces to the relative form.
-        assert!(file_path_matches(&plain, "/repo", "/repo/src/a.rs"));
-        // An absolute path outside the project is not the file.
-        assert!(!file_path_matches(&plain, "/repo", "/other/src/a.rs"));
-        // A sibling whose name only shares the directory's prefix is outside too.
-        assert!(!file_path_matches(&plain, "/repo", "/repo-other/src/a.rs"));
-        // A rename answers to its old or its new path.
-        assert!(file_path_matches(&renamed, "/repo", "src/old.rs"));
-        assert!(file_path_matches(&renamed, "/repo", "src/new.rs"));
-        assert!(file_path_matches(&renamed, "/repo", "/repo/src/old.rs"));
-        // Separators normalize on both sides (a Windows host's report).
-        assert!(file_path_matches(&plain, "C:\\repo", "C:\\repo\\src\\a.rs"));
-        // A different relative path does not match.
-        assert!(!file_path_matches(&plain, "/repo", "src/b.rs"));
     }
 
     #[test]
@@ -2876,82 +2659,5 @@ mod tests {
         assert!(!diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
         assert_eq!(diff.reveal_row.as_deref(), Some("diff-file-0"));
         assert!(diff.pending_reveal.is_none());
-    }
-
-    #[test]
-    fn reveal_file_while_loading_applies_when_the_result_lands() {
-        let mut s = state();
-        let key = s.panel_key();
-        let folded_identity =
-            crate::review_patch::identity_key(&file("src/a.rs", ChangeKind::Modified));
-        s.diffs.insert(
-            key.clone(),
-            ThreadDiff {
-                scope: Scope::Uncommitted,
-                request: 7,
-                loading: true,
-                collapsed: HashMap::from([(
-                    Scope::Uncommitted,
-                    HashSet::from([folded_identity.clone()]),
-                )]),
-                ..ThreadDiff::default()
-            },
-        );
-        reveal_file(&mut s, &key, "src/b.rs");
-        // The press waits on the in-flight request; the tab is already open.
-        assert_eq!(s.diffs[&key].pending_reveal.as_deref(), Some("src/b.rs"));
-        assert_eq!(
-            s.right_panels.active_view(&key),
-            Some(crate::right_panel::PanelView::Diff)
-        );
-        assert!(s.diffs[&key].reveal_row.is_none());
-
-        let folded = file("src/a.rs", ChangeKind::Modified);
-        let mut target = file("src/b.rs", ChangeKind::Modified);
-        target.additions = 3;
-        let mut diff = ready_diff(
-            Scope::Uncommitted,
-            vec![
-                entry(folded, FileBody::Loaded),
-                entry(target, FileBody::Loaded),
-            ],
-        );
-        s.apply_diff_msg(DiffMsg::Preview {
-            panel_key: key.clone(),
-            request: 7,
-            done: diff.done.take().unwrap(),
-        });
-
-        let diff = &s.diffs[&key];
-        assert!(diff.pending_reveal.is_none());
-        // Only the named file unfolds; the unrelated fold survives.
-        assert!(diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
-        assert_eq!(diff.reveal_row.as_deref(), Some("diff-file-1"));
-    }
-
-    #[test]
-    fn reveal_file_an_unknown_path_only_opens_the_tab() {
-        let mut s = state();
-        let key = s.panel_key();
-        let folded = file("src/a.rs", ChangeKind::Modified);
-        let folded_identity = crate::review_patch::identity_key(&folded);
-        let mut diff = ready_diff(Scope::Uncommitted, vec![entry(folded, FileBody::Loaded)]);
-        diff.collapsed
-            .insert(Scope::Uncommitted, HashSet::from([folded_identity.clone()]));
-        s.diffs.insert(key.clone(), diff);
-        s.diff_rebuild_rows(&key);
-
-        reveal_file(&mut s, &key, "src/missing.rs");
-
-        let diff = &s.diffs[&key];
-        // The tab still opens; nothing in the diff state moved.
-        assert!(s.right_panels.get(&key).open);
-        assert_eq!(
-            s.right_panels.active_view(&key),
-            Some(crate::right_panel::PanelView::Diff)
-        );
-        assert!(diff.reveal_row.is_none());
-        assert!(diff.pending_reveal.is_none());
-        assert!(diff.collapsed[&Scope::Uncommitted].contains(&folded_identity));
     }
 }

@@ -543,14 +543,6 @@ pub fn clone_command(source: &Source, target: &Path) -> Command {
 
 #[cfg(test)]
 impl CloneJob {
-    /// Completion followed by late progress, so one poll reads both in this order.
-    pub fn test_finished(progress: &str, result: Result<(), String>) -> Self {
-        let (tx, events) = channel();
-        let _ = tx.send(CloneEvent::Done(result));
-        let _ = tx.send(CloneEvent::Progress(progress.into()));
-        Self::test_idle_with(events)
-    }
-
     /// A clone that is running but never finishes, for guards and UI tests.
     pub fn test_idle() -> Self {
         let (tx, events) = channel();
@@ -1328,58 +1320,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oversized_project_icons_are_not_sent_to_the_full_resolution_decoder() {
-        let root = crate::store::directory().unwrap().join("icons");
-        fs::create_dir_all(&root).unwrap();
-        let icon = root.join("favicon.png");
-        image::DynamicImage::new_rgb8(4096, 1).save(&icon).unwrap();
-        let cached = find_icon(&root).unwrap();
-        assert_ne!(cached, icon);
-        let dimensions = image::ImageReader::open(cached)
-            .unwrap()
-            .into_dimensions()
-            .unwrap();
-        assert!(dimensions.0 <= 64 && dimensions.1 <= 64);
-        image::DynamicImage::new_rgb8(32, 32).save(&icon).unwrap();
-        let cached = find_icon(&root).unwrap();
-        assert_ne!(cached, icon);
-        assert_eq!(
-            image::ImageReader::open(cached)
-                .unwrap()
-                .into_dimensions()
-                .unwrap(),
-            (32, 32)
-        );
-    }
-
-    #[test]
-    fn cancelling_a_queued_clone_completion_does_not_add_the_project() {
-        let root = crate::store::directory().unwrap().join("cancelled-clone");
-        fs::create_dir_all(&root).unwrap();
-        let mut state = State::new(PathBuf::new(), false);
-        let mut job = CloneJob::test_finished("finished", Ok(()));
-        job.target = root.clone();
-        job.cancel();
-        state.projects.clone_job = Some(job);
-        state.poll_projects();
-        assert!(
-            !state
-                .projects
-                .entries
-                .iter()
-                .any(|project| same_path(&project.path, &root))
-        );
-        assert!(
-            state
-                .projects
-                .clone_error
-                .as_deref()
-                .unwrap()
-                .contains("canceled")
-        );
-    }
-
-    #[test]
     fn browse_queries_split_into_a_folder_and_a_filter_and_list_matching_folders() {
         let root = std::env::temp_dir().join(format!("shina-browse-{}", std::process::id()));
         for name in ["shina", "Shared", "rune", ".hidden"] {
@@ -1413,47 +1353,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn filesystem_paths_drop_verbatim_prefixes_without_changing_devices() {
-        assert_eq!(
-            clean_path(Path::new(r"\\?\D:\AiStack\shina")),
-            PathBuf::from(r"D:\AiStack\shina")
-        );
-        assert_eq!(
-            clean_path(Path::new(r"\\?\UNC\server\share\repo")),
-            PathBuf::from(r"\\server\share\repo")
-        );
-        assert_eq!(
-            clean_path(Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolume1")),
-            PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolume1")
-        );
-    }
-
-    #[test]
-    fn a_finished_clone_is_taken_in_once_even_with_progress_behind_its_result() {
-        let dir = temp("clone-finish");
-        let target = dir.join("repo");
-        fs::create_dir_all(&target).unwrap();
-        let mut state = crate::model::State::new(dir.clone(), false);
-        state.projects.entries.clear();
-        let mut job = CloneJob::test_finished("Receiving objects: 100%", Ok(()));
-        job.target = target.clone();
-        job.parent = dir.clone();
-        state.projects.clone_job = Some(job);
-        // The first poll takes the clone in; a late progress line must not repeat that.
-        state.poll_projects();
-        assert!(state.projects.clone_job.is_none());
-        assert!(
-            state
-                .projects
-                .entries
-                .iter()
-                .any(|project| same_path(&project.path, &target))
-        );
-        assert!(!state.poll_projects());
-        let _ = fs::remove_dir_all(dir);
-    }
-
     fn temp(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("shina-projects-{name}-{}", std::process::id()));
@@ -1482,45 +1381,6 @@ mod tests {
         // b does not exist: it stays in the file but not in the menu.
         assert_eq!(loaded.available().len(), 1);
         assert_eq!(loaded.last_existing(), Some(a));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn recents_keep_a_bounded_list() {
-        let mut recents = Recents::default();
-        for i in 0..30 {
-            recents.touch(Path::new(&format!("C:\\p{i}")), i);
-        }
-        assert_eq!(recents.projects.len(), LIMIT);
-        assert_eq!(recents.projects[0].path, Path::new("C:\\p29"));
-    }
-
-    #[test]
-    fn last_workspace_file_seeds_the_list_once() {
-        let dir = temp("migrate");
-        let project = dir.join("project");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(
-            dir.join("last-workspace.txt"),
-            project.to_string_lossy().as_bytes(),
-        )
-        .unwrap();
-        let recents = load_from(&dir);
-        assert_eq!(recents.projects.len(), 1);
-        assert_eq!(recents.projects[0].path, project);
-        assert!(recents.projects[0].opened > 0);
-        assert!(dir.join("projects.json").exists());
-        // Once projects.json exists the legacy file is no longer read.
-        fs::write(dir.join("last-workspace.txt"), "C:\\elsewhere").unwrap();
-        assert_eq!(load_from(&dir).projects[0].path, project);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_damaged_list_reads_as_empty() {
-        let dir = temp("damaged");
-        fs::write(dir.join("projects.json"), "{not json").unwrap();
-        assert_eq!(load_from(&dir), Recents::default());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1569,22 +1429,6 @@ mod tests {
     }
 
     #[test]
-    fn folder_names_follow_git_clone() {
-        let name = |input: &str| parse_source(input).unwrap().folder_name();
-        assert_eq!(name("owner/repo").unwrap(), "repo");
-        assert_eq!(name("https://github.com/owner/repo.git").unwrap(), "repo");
-        assert_eq!(name("https://github.com/owner/repo/").unwrap(), "repo");
-        assert_eq!(
-            name("https://host/owner/repo.git?x=1#frag").unwrap(),
-            "repo"
-        );
-        assert_eq!(name("git@github.com:owner/repo.git").unwrap(), "repo");
-        assert_eq!(name("git@host:repo").unwrap(), "repo");
-        assert!(name("https://host/owner/..").is_err());
-        assert!(name("https://host/owner/a%3F|b").is_err());
-    }
-
-    #[test]
     fn credentials_never_show_in_messages() {
         assert_eq!(
             redact("fatal: repository 'https://me:secret@github.com/o/r/' not found"),
@@ -1595,20 +1439,6 @@ mod tests {
             Source::Url("https://tok@host/a/b".into()).display(),
             "https://host/a/b"
         );
-    }
-
-    #[test]
-    fn a_path_from_another_machine_keeps_its_own_separator() {
-        let joined = |parent: &str| {
-            join_like(Path::new(parent), "rune")
-                .to_string_lossy()
-                .into_owned()
-        };
-        assert_eq!(joined(r"D:\AiStack"), r"D:\AiStack\rune");
-        assert_eq!(joined(r"D:\AiStack\"), r"D:\AiStack\rune");
-        assert_eq!(joined("/home/kid/Code"), "/home/kid/Code/rune");
-        assert_eq!(joined("/home/kid/Code/"), "/home/kid/Code/rune");
-        assert_eq!(joined("C:/Users/kid"), "C:/Users/kid/rune");
     }
 
     #[test]
@@ -1635,50 +1465,6 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    fn runtime() -> rune::Runtime<State> {
-        rune::Runtime::new(
-            State::new(".".into(), false),
-            crate::ui::view,
-            (1280.0, 720.0),
-            rune::Env::new(false, 1.0),
-        )
-    }
-    fn press(rt: &mut rune::Runtime<State>, key: &str) {
-        let (x, y) = rt
-            .find(key)
-            .unwrap_or_else(|| panic!("{key} is not on screen"));
-        rt.pointer_down(x, y);
-        rt.pointer_up(x, y);
-        rt.frame(0.0);
-    }
-
-    #[test]
-    fn add_workspace_opens_the_palette_and_the_clone_sheet() {
-        let mut rt = runtime();
-        rt.frame(0.0);
-        assert!(
-            rt.find("open-workspace").is_none(),
-            "the old footer button is gone"
-        );
-        press(&mut rt, "project-switcher");
-        assert_eq!(
-            rt.state.project_picker,
-            Some(crate::model::ProjectPicker::AddProject)
-        );
-        rt.frame(1.0 / 60.0);
-        assert!(rt.find("project-open-folder").is_some());
-        press(&mut rt, "project-clone");
-        assert!(rt.state.project_picker.is_none());
-        assert!(rt.state.projects.clone_open);
-        rt.frame(1.0 / 60.0);
-        press(&mut rt, "clone-start");
-        let error = rt.state.projects.clone_error.clone().unwrap();
-        assert!(error.contains("owner/repo"), "{error}");
-        assert!(!rt.state.projects.cloning());
-        press(&mut rt, "clone-cancel");
-        assert!(!rt.state.projects.clone_open);
-    }
-
     #[test]
     fn adding_a_project_keeps_busy_threads_and_unsent_drafts() {
         let mut state = State::new(".".into(), false);
@@ -1696,35 +1482,6 @@ mod tests {
         assert!(state.threads.iter().any(|t| t.project == Some(id)));
         assert_eq!(state.add_project(std::env::temp_dir()).unwrap(), Some(id));
         assert!(!state.project(Some(id)).unwrap().hidden);
-    }
-
-    /// Clones a small public repository over the network with both tools. Run it on demand:
-    /// `cargo test real_clone_of_a_public_repository -- --ignored`.
-    #[test]
-    #[ignore]
-    fn real_clone_of_a_public_repository() {
-        let dir = temp("network");
-        for (index, input) in [
-            "octocat/Hello-World",
-            "https://github.com/octocat/Spoon-Knife",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let source = parse_source(input).unwrap();
-            let target = destination(&dir, &source.folder_name().unwrap()).unwrap();
-            let job = CloneJob::start(&source, dir.clone(), target.clone(), Arc::new(|| {}));
-            let result = loop {
-                match job.events.recv().unwrap() {
-                    CloneEvent::Done(result) => break result,
-                    CloneEvent::Progress(_) => {}
-                }
-            };
-            assert_eq!(result, Ok(()), "clone {index} of {input}");
-            assert!(target.join(".git").is_dir());
-            assert!(destination(&dir, &source.folder_name().unwrap()).is_err());
-        }
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

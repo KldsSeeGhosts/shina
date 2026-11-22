@@ -433,17 +433,6 @@ pub(super) fn bind_anchor(s: &State, index: usize, element: El) -> El {
     element.drawn_rect_into(&s.composer_ui.drawn_anchors[index])
 }
 
-#[cfg(test)]
-pub(super) fn motion_debug(s: &State) -> String {
-    format!(
-        "clock {}, height {:?}, action {:?}, drawn {:?}",
-        s.composer_ui.clock.get(),
-        s.composer_ui.transition.get(),
-        s.composer_ui.anchors.get()[1],
-        s.composer_ui.drawn_anchors[1].get()
-    )
-}
-
 pub(super) fn prompt_surface(s: &State, content: El, collapsed: bool) -> El {
     let [x, y] = anchor_offset(s, 0, true);
     let mut surface = col()

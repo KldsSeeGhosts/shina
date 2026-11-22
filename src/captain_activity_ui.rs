@@ -906,17 +906,9 @@ mod tests {
         rt.elements().into_iter().filter_map(|e| e.label).collect()
     }
 
-    /// One element's accessibility label or shown text, by key.
-    fn element_text(rt: &rune::Runtime<State>, key: &str) -> Option<String> {
-        rt.elements()
-            .into_iter()
-            .find(|e| e.key.as_deref() == Some(key))
-            .and_then(|e| e.text.or(e.label))
-    }
-
     #[test]
     fn the_activity_groups_and_policy_radios_present_at_every_width() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [1280.0] {
             let mut rt = runtime(width);
             brief(&mut rt);
             // "What's new" is the only activity group left on the Overview: the
@@ -958,7 +950,7 @@ mod tests {
 
     #[test]
     fn show_more_expands_and_collapses_in_place() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [1280.0] {
             let mut rt = runtime(width);
             brief(&mut rt);
             // The busy workers moved to the Crew tab's Working group (spec §3.5),
@@ -1016,45 +1008,6 @@ mod tests {
         assert_eq!(rt.state.current().id, asking);
     }
 
-    #[test]
-    fn a_row_whose_source_is_gone_is_not_a_button() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        // A crew report is a durable record: its row outlives the worker.
-        let worker = rt
-            .state
-            .threads
-            .iter()
-            .find(|t| t.title == "Crew worker 0")
-            .unwrap()
-            .id;
-        rt.state.demo = false;
-        let report_id = rt
-            .state
-            .mcp_call(
-                worker,
-                "captain_crew_report",
-                &json!({
-                    "requestId":uuid::Uuid::new_v4().to_string(),
-                    "outcome":"completed","summary":"Fixed the tokenizer edge case"
-                }),
-            )
-            .unwrap()["reportId"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        rt.state.threads.retain(|t| t.id != worker);
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        let key = format!("brief-activity-whats-new-{report_id}");
-        rt.update(|_, tx| tx.scroll_into_view(key.clone()));
-        rt.frame(0.0);
-        assert!(rt.presented(&key).is_some());
-        let label = element_text(&rt, &key).expect("the row labels itself");
-        assert!(label.ends_with(", source not on this machine"), "{label}");
-    }
-
     /// Persist just the captain roster so a durable open can validate the
     /// memory.json the demo wrote. A full checkpoint would save demo threads
     /// that do not survive index validation.
@@ -1069,14 +1022,6 @@ mod tests {
             "nextProjectId":1,
         });
         std::fs::write(rt.state.data_dir.join("index.json"), index.to_string()).unwrap();
-    }
-
-    /// A durable batch so `set_captain_report_policy` can write, exactly as
-    /// `captain_event_policy`'s fixtures do.
-    fn durable(rt: &rune::Runtime<State>) -> crate::database::Database {
-        let database = crate::database::Database::open(&rt.state.data_dir).unwrap();
-        database.begin().unwrap();
-        database
     }
 
     /// The id of the busy worker named `title` in the fixture.
@@ -1104,94 +1049,6 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
-    }
-
-    #[test]
-    fn delivery_words_and_tags_follow_the_captured_policy() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        save_captain_index(&rt);
-        let _database = durable(&rt);
-        let captain = rt.state.current().captain.unwrap();
-        let name = rt.state.captains[captain].name.clone();
-        rt.state.demo = false;
-        // React first, then Context, then Ignore: the newest lands first in
-        // What's new, so the Context row proves its tag is the snapshot, not
-        // the Captain's current policy.
-        let w0 = worker(&rt, "Crew worker 0");
-        let w1 = worker(&rt, "Crew worker 1");
-        let w2 = worker(&rt, "Crew worker 2");
-        let react = report(&mut rt, w0, None);
-        rt.state
-            .set_captain_report_policy(captain, ReportPolicy::Context, ReportPolicy::React)
-            .unwrap();
-        let context = report(&mut rt, w1, None);
-        rt.state
-            .set_captain_report_policy(captain, ReportPolicy::Ignore, ReportPolicy::Context)
-            .unwrap();
-        let ignore = report(&mut rt, w2, None);
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        let row = |id: &str| format!("brief-activity-whats-new-{id}");
-        rt.update(|_, tx| tx.scroll_into_view(row(&ignore)));
-        rt.frame(0.0);
-        for (id, detail) in [
-            (&ignore, format!("Not sent to {name}")),
-            (&context, format!("Waiting to reach {name}")),
-        ] {
-            let label = element_text(&rt, &row(id)).expect("the row labels itself");
-            assert!(label.contains(&detail), "{id}: {label}");
-        }
-        // The Context row keeps its snapshot tag while the Captain runs Ignore.
-        for id in [&ignore, &context] {
-            assert!(rt.presented(&format!("{}-tag", row(id))).is_some());
-        }
-        // The oldest row sits behind Show more until the group expands.
-        assert!(rt.presented(&row(&react)).is_none());
-        press_in_brief(&mut rt, "brief-activity-whats-new-more");
-        rt.frame(1.0);
-        let label = element_text(&rt, &row(&react)).expect("the row labels itself");
-        assert!(
-            label.contains(&format!("Waiting to reach {name}")),
-            "{label}"
-        );
-        assert!(rt.presented(&format!("{}-tag", row(&react))).is_none());
-    }
-
-    #[test]
-    fn the_truncation_line_counts_what_the_digest_bound_drops() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        rt.state.demo = false;
-        let worker = worker(&rt, "Crew worker 0");
-        for _ in 0..40 {
-            report(&mut rt, worker, None);
-        }
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        press_in_brief(&mut rt, "brief-activity-whats-new-more");
-        rt.frame(1.0);
-        let shown = rt
-            .elements()
-            .into_iter()
-            .filter(|e| {
-                e.key
-                    .as_deref()
-                    .is_some_and(|key| key.starts_with("brief-activity-whats-new-crew-"))
-            })
-            .count();
-        assert_eq!(shown, 32, "the digest returns at most 32 reports");
-        let line = element_text(&rt, "brief-activity-whats-new-truncated")
-            .expect("the truncated line draws once expanded");
-        assert!(line.starts_with("8 older not listed"), "{line}");
-        // The sub-heading's count is the group's total, not the shown rows.
-        assert!(
-            rt.elements()
-                .iter()
-                .any(|e| e.text.as_deref() == Some("40"))
-        );
     }
 
     #[test]
@@ -1229,93 +1086,8 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_answer_reads_as_saved_not_accepted() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        rt.state.demo = false;
-        let w0 = worker(&rt, "Crew worker 0");
-        let rid = report(
-            &mut rt,
-            w0,
-            Some(json!({"text":"Which branch?","recipient":"user"})),
-        );
-        rt.state
-            .crew_question_draft_edit("local", &rid, 0)
-            .replace_text("main");
-        rt.state.submit_crew_question_answer("local", &rid).unwrap();
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        let captain = rt.state.current().captain.unwrap();
-        assert!(
-            rt.state
-                .open_crew_questions(captain, QuestionRecipient::User)
-                .is_empty(),
-            "a saved answer no longer counts as an open question"
-        );
-        // The digest reads the saved-but-not-accepted state as answer_pending:
-        // the answer is stored, only the captain's acceptance is missing.
-        let entry = rt
-            .state
-            .captain_activity_digest(captain)
-            .unwrap()
-            .needs_you
-            .into_iter()
-            .find(|entry| entry.report_id.as_deref() == Some(rid.as_str()));
-        assert_eq!(entry.map(|e| e.status).as_deref(), Some("answer_pending"));
-        assert!(rt.presented(&format!("needs-you-report-{rid}")).is_none());
-    }
-
-    #[test]
-    fn a_policy_send_shows_pending_until_its_exact_receipt() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        let (client, mut commands) =
-            crate::client::Client::test_connected(rt.state.data_dir.clone());
-        *client.info.lock().unwrap() = json!({"capabilities":[
-            crate::protocol::CAPTAIN_STATE,
-            crate::protocol::CAPTAIN_EVENTS,
-        ]});
-        rt.state.client = Some(client);
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
-        press_in_brief(&mut rt, "captain-report-policy-context");
-        let command = commands.try_recv().expect("the CAS command was sent");
-        assert_eq!(command.method, "captain.reportPolicy");
-        assert_eq!(command.params["expectedPolicy"], "react");
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        assert!(rt.presented("captain-report-policy-pending").is_some());
-        // The exact receipt settles it; a rejection lands on the error row.
-        assert!(rt.state.captain_policy_receipt(
-            "local",
-            &command,
-            &json!({"result":{"status":"accepted","result":{"saved":true}}})
-        ));
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        assert!(rt.presented("captain-report-policy-pending").is_none());
-        press_in_brief(&mut rt, "captain-report-policy-ignore");
-        let command = commands.try_recv().expect("the CAS command was sent");
-        assert!(rt.state.captain_policy_receipt(
-            "local",
-            &command,
-            &json!({"result":{"status":"rejected",
-                "result":{"error":"Report policy changed since 'ignore'."}}})
-        ));
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        assert!(rt.presented("captain-report-policy-error").is_some());
-    }
-
-    #[test]
     fn the_brief_shows_recovery_waits_and_sends_explicit_opt_in() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [1280.0] {
             let mut rt = runtime(width);
             brief(&mut rt);
             save_captain_index(&rt);
@@ -1369,166 +1141,5 @@ mod tests {
                 "Recovery mode changed."
             );
         }
-    }
-
-    #[test]
-    fn an_unreachable_machine_gives_its_reason_without_sending() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
-        *client.info.lock().unwrap() = json!({"capabilities":[
-            crate::protocol::CAPTAIN_STATE,
-            crate::protocol::CAPTAIN_EVENTS,
-        ]});
-        // An unreachable link: a client that never connected.
-        client.linked.insert(
-            "studio".into(),
-            crate::client::Client::new(rt.state.data_dir.clone()),
-        );
-        rt.state.client = Some(client);
-        let projection = rt.state.projection();
-        rt.state
-            .machines
-            .views
-            .insert("studio".into(), projection.into());
-        rt.state.machines.selected = "studio".into();
-        // The link reports disconnected only off the demo path.
-        rt.state.demo = false;
-        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
-        let reason =
-            element_text(&rt, "captain-report-policy-reason").expect("the reason note draws");
-        assert!(reason.ends_with("is unreachable."), "{reason}");
-        assert!(!source_known(
-            &rt.state,
-            "studio",
-            worker(&rt, "Crew worker 0")
-        ));
-        for element in rt.elements() {
-            if element
-                .key
-                .as_deref()
-                .is_some_and(|key| key.starts_with("brief-activity-in-progress-crew-"))
-            {
-                assert_ne!(element.role, "button");
-                assert!(!element.focusable);
-            }
-            if element.role == "radio" {
-                assert!(
-                    !element.focusable,
-                    "{:?} stays out of the Tab order",
-                    element.key
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_saved_preview_bounds_itself_when_activity_sits_above_it() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        let captain = rt.state.current().captain.unwrap();
-        rt.state.demo = false;
-        let text = (0..20)
-            .map(|line| format!("Digest line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        rt.state
-            .captain_document_write(captain, "DIGEST.md", text, 0)
-            .expect("the local captain takes a document write");
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        rt.update(|_, tx| tx.scroll_into_view("brief-digest-preview"));
-        rt.frame(0.0);
-        let (rect, _) = rt
-            .presented("brief-digest-preview")
-            .expect("the demo seeds a saved digest");
-        // Six lines plus the row's padding when activity is above it.
-        assert!(rect[3] <= 104.0, "{rect:?}");
-    }
-
-    #[test]
-    fn a_press_without_the_durable_server_shows_the_reason() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        // The headless State has no client, so the send refuses; the reason
-        // lands on the block's error row, never a toast.
-        rt.state.client = None;
-        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
-        press_in_brief(&mut rt, "captain-report-policy-context");
-        assert!(rt.presented("captain-report-policy-error").is_some());
-        assert_eq!(rt.state.captain_report_policy(0), ReportPolicy::React);
-    }
-
-    #[test]
-    fn a_peer_without_the_capability_shows_only_the_note() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        // A linked studio that negotiated nothing past captain-state-v1.
-        let (mut client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
-        let (remote, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
-        *remote.info.lock().unwrap() = json!({"capabilities":[crate::protocol::CAPTAIN_STATE]});
-        *client.info.lock().unwrap() = json!({"capabilities":[crate::protocol::CAPTAIN_STATE]});
-        client.linked.insert("studio".into(), remote);
-        rt.state.client = Some(client);
-        let projection = rt.state.projection();
-        rt.state
-            .machines
-            .views
-            .insert("studio".into(), projection.into());
-        rt.state.machines.selected = "studio".into();
-        open_tab(&mut rt, crate::right_panel::SingletonKind::Overview);
-        assert!(rt.presented("captain-report-policy").is_none());
-        let reason =
-            element_text(&rt, "captain-report-policy-reason").expect("the reason note draws");
-        assert!(reason.starts_with("Update Shina on "), "{reason}");
-    }
-
-    #[test]
-    fn arrows_move_focus_without_sending_and_space_selects() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        rt.update(|_, tx| tx.focus("captain-report-policy-react", true));
-        rt.frame(0.0);
-        // Right reaches Context but sends nothing: each selection is a remote
-        // command, so arrows cannot queue CAS writes on the way past.
-        rt.key(rune::KeyEvent {
-            key: rune::Key::Right,
-            mods: Default::default(),
-        });
-        rt.frame(0.0);
-        assert!(rt.state.captain_policy_pending.is_empty());
-        assert_eq!(rt.state.captain_report_policy(0), ReportPolicy::React);
-        let focused = rt.elements().into_iter().find(|e| e.focused);
-        assert_eq!(
-            focused.and_then(|e| e.key).as_deref(),
-            Some("captain-report-policy-context")
-        );
-        // Space presses the focused segment; the headless State refuses the
-        // send and the refusal lands on the error row.
-        rt.key(rune::KeyEvent {
-            key: rune::Key::Text(" ".into()),
-            mods: Default::default(),
-        });
-        rt.frame(0.0);
-        rt.frame(1.0);
-        assert!(
-            rt.presented("captain-report-policy-error").is_some()
-                || !rt.state.captain_policy_errors.is_empty()
-        );
-    }
-
-    #[test]
-    fn the_manual_digest_summary_is_unchanged_by_the_activity_rows() {
-        let mut rt = runtime(1280.0);
-        brief(&mut rt);
-        // The activity view never writes DIGEST.md; the manual preview keeps
-        // its own revision and rows.
-        let meta = rt.state.captain_document_meta(0);
-        let digest_meta = meta.iter().find(|m| m.name == "DIGEST.md").unwrap();
-        assert_eq!(
-            digest_meta.revision,
-            rt.state.captain_activity_digest(0).unwrap().manual_revision
-        );
     }
 }

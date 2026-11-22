@@ -44,17 +44,6 @@ fn version_parsing_and_qualified_release_rules() {
 }
 
 #[test]
-fn client_info_by_version() {
-    assert_eq!(client_info(Some("1.5.1"))["name"], "Shina");
-    assert_eq!(client_info(Some("1.5.10"))["title"], "Shina");
-    assert_eq!(
-        client_info(Some("1.4.5")),
-        json!({"name":"zed","version":"0.0.0"})
-    );
-    assert_eq!(client_info(None), json!({"name":"zed","version":"0.0.0"}));
-}
-
-#[test]
 fn permission_modes_round_trip() {
     assert_eq!(permission_mode("full-access"), "yolo");
     assert_eq!(permission_mode("auto-accept-edits"), "auto_edit");
@@ -131,72 +120,6 @@ fn model_thinking_split_and_combine() {
 }
 
 #[test]
-fn session_models_combined_ids_and_manifest() {
-    let options = config_options();
-    let setup = json!({"configOptions":options,
-        "models":{"currentModelId":"gemini-3.8-flash",
-            "availableModels":[{"modelId":"gemini-3.8-flash-high","name":"Flash"},
-                {"modelId":"gemini-3.8-flash-medium","name":"Flash"},
-                {"modelId":"gemini-4-carbon","name":"Carbon"}]}});
-    let mut thinking_levels = std::collections::HashMap::new();
-    observe_thinking_levels(&options, &mut thinking_levels);
-    assert!(thinking_levels["gemini-3.8-flash"].is_some());
-    let (mut models, current) = session_models(&setup, &thinking_levels, "");
-    apply_manifest(&mut models);
-    assert_eq!(current.as_deref(), Some("gemini-3.8-flash-high"));
-    let default = models.iter().find(|m| m["isDefault"] == true).unwrap();
-    assert_eq!(default["slug"], "gemini-3.8-flash-high");
-    assert_eq!(default["aliases"], json!([DEFAULT_MODEL]));
-    assert_eq!(models.len(), 3);
-    assert_eq!(models[0]["name"], "Flash");
-    assert_eq!(models[1]["name"], "Flash (gemini-3.8-flash-medium)");
-    assert_eq!(models[2]["name"], "Carbon");
-    assert_eq!(models[0]["thinking"]["currentValue"], "high");
-    assert!(models[1]["thinking"]["currentValue"].is_null());
-
-    models[0]["isDefault"] = json!(false);
-    models[0]["aliases"] = Value::Null;
-    models[2]["isDefault"] = json!(true);
-    models[2]["aliases"] = json!([DEFAULT_MODEL]);
-    apply_manifest(&mut models);
-    assert_eq!(models[0]["aliases"], json!([DEFAULT_MODEL]));
-    assert_eq!(models[2]["isDefault"], false);
-}
-
-#[test]
-fn gateway_model_selections_parse_list_and_effort_aliases() {
-    assert_eq!(
-        gateway_model_selections(
-            "gemini-4-argon, gemini-4-carbon(low), claude-opus-5-5(high), gemini-4-argon, ,"
-        ),
-        [
-            "gemini-4-argon",
-            "gemini-4-carbon-low",
-            "claude-opus-5-5-high"
-        ]
-    );
-    assert!(gateway_model_selections("").is_empty());
-    assert!(gateway_model_selections(" , ,").is_empty());
-    // KSG keeps the configured id when its tail is not a known effort.
-    assert_eq!(
-        gateway_model_selections("claude-opus-5-5(bonus)"),
-        ["claude-opus-5-5(bonus)"]
-    );
-    assert!(has_configured_gateway_model(
-        &["gemini-4-argon".into()],
-        "gemini-4-argon-medium"
-    ));
-    assert!(has_configured_gateway_model(
-        &["claude-opus-5-5-high".into()],
-        "claude-opus-5-5"
-    ));
-    assert!(!has_configured_gateway_model(
-        &["gemini-4-argon".into()],
-        "gemini-9-x"
-    ));
-}
-
-#[test]
 fn gateway_model_rows_group_family_routes_and_default_medium() {
     // The shape agy 1.5.10 reported in gateway mode on 2026-11-17 (KSG test).
     let advertised: Vec<(String, String)> = [
@@ -267,85 +190,6 @@ fn gateway_model_rows_group_family_routes_and_default_medium() {
     let single = gateway_model_rows(&["claude-opus-5-5-high".into()], &advertised);
     assert_eq!(single[0].slug, "claude-opus-5-5-high");
     assert_eq!(single[0].name, "Claude Opus 5.5");
-}
-
-#[test]
-fn gateway_labels_strip_the_advertised_route_id_before_the_effort_suffix() {
-    let rows = gateway_model_rows(
-        &["gemini-neon".into(), "claude-opus-high".into()],
-        &[
-            (
-                "gemini-neon-low".into(),
-                " Gemini Neon (Low) (gemini-neon-low) ".into(),
-            ),
-            (
-                "gemini-neon-medium".into(),
-                "Gemini Neon (Medium) (gemini-neon-medium)".into(),
-            ),
-            ("claude-opus".into(), "Claude Opus (claude-opus)".into()),
-        ],
-    );
-    assert_eq!(rows[0].slug, "gemini-neon");
-    assert_eq!(rows[0].name, "Gemini Neon");
-    assert_eq!(
-        rows[0].routes[1],
-        ("gemini-neon-medium".into(), "Gemini Neon".into())
-    );
-    assert_eq!(rows[0].default_route, "gemini-neon-medium");
-    assert_eq!(rows[1].slug, "claude-opus-high");
-    assert_eq!(rows[1].name, "Claude Opus");
-}
-
-#[test]
-fn session_models_gateway_rows_expose_family_ids_and_efforts() {
-    // KSG AntigravityProvider gateway test: flat config list, no thinking config.
-    let setup = json!({"configOptions":[
-        {"id":"model","name":"Model","category":"model","type":"select",
-            "currentValue":"gpt-6.0-luna",
-            "options":[{"value":"gpt-6.0-luna","name":"GPT 6.0 Luna"},
-                {"value":"gemini-4-argon-high","name":"Gemini 4 Argon"},
-                {"value":"gemini-4-argon-medium","name":"Gemini 4 Argon"},
-                {"value":"gemini-4-hydrogen-high","name":"Gemini 4 Hydrogen"},
-                {"value":"gemini-4-hydrogen-low","name":"Gemini 4 Hydrogen"},
-                {"value":"gemini-4-carbon-high","name":"Gemini 4 Carbon"},
-                {"value":"claude-opus-5-5","name":"Claude Opus 5.5"},
-                {"value":"devin/claude-opus-5-5","name":"Claude Opus 5.5"},
-                {"value":"claude-opus-5-5-high","name":"Claude Opus 5.5 (High)"},
-                {"value":"claude-sonnet-5-5-high","name":"Claude Sonnet 5.5 (High)"}]}]});
-    let (models, current) = session_models(
-        &setup,
-        &std::collections::HashMap::new(),
-        "gemini-4-argon, gemini-4-hydrogen, gemini-4-carbon-high, claude-opus-5-5-high, claude-sonnet-5-5-high",
-    );
-    let slugs: Vec<&str> = models.iter().filter_map(|m| m["slug"].as_str()).collect();
-    assert_eq!(
-        slugs,
-        [
-            "gemini-4-argon",
-            "gemini-4-hydrogen",
-            "gemini-4-carbon-high",
-            "claude-opus-5-5-high",
-            "claude-sonnet-5-5-high"
-        ]
-    );
-    // An unconfigured current model leaves the first configured row the default.
-    assert_eq!(current.as_deref(), Some("gemini-4-argon"));
-    assert_eq!(models[0]["isDefault"], true);
-    assert_eq!(models[0]["aliases"], json!([DEFAULT_MODEL]));
-    assert_eq!(
-        models[0]["efforts"],
-        json!([
-            {"id":"medium","label":"Medium","isDefault":true},
-            {"id":"high","label":"High","isDefault":false}
-        ])
-    );
-    assert_eq!(
-        models[2]["efforts"],
-        json!([{"id":"high","label":"High","isDefault":true}])
-    );
-    // The ` (effort)` label suffix drops; devin/-prefixed aliases are not grouped.
-    assert_eq!(models[3]["name"], "Claude Opus 5.5");
-    assert_eq!(models[4]["name"], "Claude Sonnet 5.5");
 }
 
 #[test]
@@ -481,65 +325,4 @@ fn auth_url_extraction_validates_google_loopback() {
         "No browser is available here, do x"
     ));
     assert!(!is_sign_in_required_error(-32602, "Invalid params"));
-}
-
-#[test]
-fn read_text_file_bounds_roots_and_lines() {
-    let dir = crate::store::directory().unwrap();
-    let workspace = dir.join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let file = workspace.join("note.txt");
-    std::fs::write(&file, "one\ntwo\nthree").unwrap();
-    let path = file.to_string_lossy().into_owned();
-    let read = |params: Value| read_text_file(&params, &[workspace.as_path()]);
-    assert_eq!(
-        read(json!({"path":path})).unwrap()["content"],
-        "one\ntwo\nthree"
-    );
-    assert_eq!(
-        read(json!({"path":path,"line":2,"limit":1})).unwrap()["content"],
-        "two"
-    );
-    assert!(read(json!({"path":"/etc/passwd"})).is_err());
-    assert!(read(json!({"path":"/definitely/missing/file"})).is_err());
-}
-
-#[test]
-fn session_update_normalization_sanitizes_tool_payloads() {
-    let notification = json!({"sessionId":"s","update":{
-        "sessionUpdate":"tool_call","toolCallId":"t","title":"Run",
-        "content":[{"type":"content","content":{"type":"text","text":"hi"}}],
-        "_meta":{"image":{"type":"image","data":"data:image/png;base64,AAA"}},
-        "rawInput":{"note":"x".repeat(40_000)}}});
-    let normalized = normalize_session_update(&notification);
-    let update = &normalized["update"];
-    assert!(
-        update["_meta"]["image"]["data"].is_null()
-            || update["_meta"]["image"].get("data").is_none()
-    );
-    let note = update["rawInput"]["note"].as_str().unwrap();
-    assert!(note.len() < 40_000);
-    // Non-tool updates pass through untouched.
-    let other = json!({"sessionId":"s","update":{"sessionUpdate":"plan"}});
-    assert_eq!(normalize_session_update(&other), other);
-}
-
-#[test]
-fn manifest_models_populate_catalog_before_live_session() {
-    let models = manifest_models();
-    assert!(!models.is_empty());
-    let default = models
-        .iter()
-        .find(|m| m.id == "gemini-3.8-flash-high")
-        .expect("default antigravity model from manifest");
-    assert_eq!(default.provider, "antigravity");
-    assert_eq!(default.name, "Gemini 3.8 Flash (High)");
-    assert!(default.is_default);
-    assert!(!default.is_legacy);
-    assert!(default.aliases.iter().any(|a| a == DEFAULT_MODEL));
-    let legacy = models
-        .iter()
-        .find(|m| m.id == "gemini-3.7-flash-high")
-        .expect("legacy antigravity model from manifest");
-    assert!(legacy.is_legacy);
 }

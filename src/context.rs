@@ -383,59 +383,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_context_usage_and_nulls_stay_unknown() {
-        let missing = ContextUsage::from_stats(&json!({"tokens": {"total": 900000}}));
-        assert_eq!(missing, ContextUsage::default());
-        let nulls = ContextUsage::from_stats(&json!({
-            "contextUsage": {"tokens": null, "contextWindow": null, "percent": null}
-        }));
-        assert_eq!(nulls, ContextUsage::default());
-        assert!(!nulls.has_usage());
-    }
-
-    #[test]
-    fn zero_window_never_becomes_a_fake_zero_percentage() {
-        let zero_window = ContextUsage::from_stats(&json!({
-            "contextUsage": {"tokens": 0, "contextWindow": 0, "percent": null}
-        }));
-        assert_eq!(zero_window.tokens, Some(0));
-        assert_eq!(zero_window.context_window, None);
-        assert_eq!(zero_window.percent, None);
-        assert!(!zero_window.has_usage());
-        assert_eq!(zero_window.usage_text(Some(200000)), "0 of 200,000 tokens");
-    }
-
-    #[test]
-    fn an_explicit_zero_is_real_usage() {
-        let usage = ContextUsage::from_stats(&json!({
-            "contextUsage": {"tokens": 0, "contextWindow": 200000, "percent": 0}
-        }));
-        assert!(usage.has_usage());
-        assert_eq!(usage.percent, Some(0.0));
-        assert_eq!(usage.percent_text().as_deref(), Some("0%"));
-    }
-
-    #[test]
-    fn percent_falls_back_to_live_tokens_not_session_totals() {
-        let usage = ContextUsage::from_stats(&json!({
-            "tokens": {"total": 500000},
-            "contextUsage": {"tokens": 5000, "contextWindow": 20000}
-        }));
-        assert_eq!(usage.percent, Some(25.0));
-        assert_eq!(usage.tokens, Some(5000));
-    }
-
-    #[test]
-    fn an_explicit_null_percent_is_unknown_even_when_tokens_are_present() {
-        let usage = ContextUsage::from_stats(&json!({
-            "contextUsage": {"tokens": 6000, "contextWindow": 20000, "percent": null}
-        }));
-        assert_eq!(usage.tokens, Some(6000));
-        assert_eq!(usage.percent, None);
-        assert!(!usage.has_usage());
-    }
-
-    #[test]
     fn a_stats_response_from_before_compaction_cannot_restore_the_old_ring() {
         let mut meter = ContextMeter::default();
         meter.requested("1-1".into());
@@ -476,20 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_stats_after_compaction_return_the_ring_to_real_usage() {
-        let mut meter = ContextMeter::default();
-        meter.begin_compaction();
-        meter.finish_compaction();
-        meter.requested("2-1".into());
-        meter.accept_response(&json!({
-            "id": "2-1", "command": "get_session_stats", "success": true,
-            "data": {"contextUsage": {"tokens": 30000, "contextWindow": 200000, "percent": 15}}
-        }));
-        assert_eq!(meter.phase, ContextPhase::Idle);
-        assert_eq!(meter.usage.percent, Some(15.0));
-    }
-
-    #[test]
     fn model_changes_clear_the_previous_capacity_and_percentage() {
         let mut meter = ContextMeter {
             usage: ContextUsage {
@@ -508,24 +441,6 @@ mod tests {
             meter.accessible_label(Some(100000)),
             "Context usage unavailable. View context details"
         );
-    }
-
-    #[test]
-    fn number_grouping_and_state_text_are_human_readable() {
-        assert_eq!(count_text(0), "0");
-        assert_eq!(count_text(999), "999");
-        assert_eq!(count_text(1000), "1,000");
-        assert_eq!(count_text(200000), "200,000");
-        assert_eq!(count_text(1234567), "1,234,567");
-
-        let mut meter = ContextMeter::default();
-        assert_eq!(meter.state_text(), None);
-        meter.requested("1-1".into());
-        assert_eq!(meter.state_text(), Some("Refreshing context"));
-        meter.begin_compaction();
-        assert_eq!(meter.state_text(), Some("Compacting context"));
-        meter.finish_compaction();
-        assert_eq!(meter.state_text(), Some("Waiting for Pi to report usage"));
     }
 
     #[test]

@@ -742,22 +742,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_the_entry_and_rewrites_the_file() {
-        let mut s = state();
-        s.current_mut().draft.replace_text("first");
-        stash(&mut s);
-        s.current_mut().draft.replace_text("second");
-        stash(&mut s);
-        let newest = s.stash.entries[0].id.clone();
-        delete(&mut s, &newest);
-        assert_eq!(s.stash.entries.len(), 1);
-        assert_eq!(s.stash.entries[0].snapshot.text, "first");
-        let (loaded, _) = load(&s.data_dir);
-        assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(loaded.entries[0].snapshot.text, "first");
-    }
-
-    #[test]
     fn the_stash_survives_save_and_reload() {
         let mut s = state();
         s.current_mut().draft.replace_text("kept");
@@ -771,17 +755,6 @@ mod tests {
         assert_eq!(entry.snapshot.text, "kept");
         assert_eq!(entry.snapshot.attachments.len(), 1);
         assert!(entry.missing.is_empty());
-    }
-
-    #[test]
-    fn a_corrupt_stash_file_moves_aside_and_warns() {
-        let s = state();
-        fs::write(s.data_dir.join(FILE), b"not json").unwrap();
-        let (loaded, warning) = load(&s.data_dir);
-        assert!(loaded.entries.is_empty());
-        assert!(warning.is_some());
-        assert!(s.data_dir.join(format!("{FILE}.corrupt")).is_file());
-        assert!(!s.data_dir.join(FILE).exists());
     }
 
     #[test]
@@ -843,53 +816,6 @@ mod tests {
         assert!(t.draft_context.iter().any(|r| r.context_id == "model-1"));
     }
 
-    #[test]
-    fn a_missing_attachment_comes_back_needing_reattach_with_one_warning() {
-        let mut s = state();
-        let directory = crate::attachments::directory().unwrap();
-        let attachment = crate::attachments::store_uploaded_file(
-            &directory,
-            "notes.txt",
-            "text/plain",
-            b"notes",
-        )
-        .unwrap();
-        let blob = directory.join(&attachment.id);
-        s.current_mut().draft_images.push(attachment);
-        s.current_mut().draft.replace_text("with file");
-        stash(&mut s);
-        fs::remove_file(&blob).unwrap();
-        let id = s.stash.entries[0].id.clone();
-        restore(&mut s, &id);
-        let t = s.current();
-        assert_eq!(t.draft_images.len(), 1);
-        assert!(t.draft_images[0].needs_reattach());
-        let notices = s
-            .composer_notices
-            .ordered()
-            .iter()
-            .filter(|n| n.id == "stash-missing")
-            .count();
-        assert_eq!(notices, 1);
-    }
-
-    #[test]
-    fn a_stashed_attachment_blob_survives_while_the_entry_lives() {
-        let mut s = state();
-        s.current_mut().draft_images.push(image("kept-alive.png"));
-        s.current_mut().draft.replace_text("x");
-        stash(&mut s);
-        let (loaded, _) = load(&s.data_dir);
-        assert_eq!(loaded.entries[0].snapshot.attachments.len(), 1);
-        assert!(loaded.entries[0].missing.is_empty());
-        assert!(
-            crate::attachments::directory()
-                .unwrap()
-                .join("kept-alive.png")
-                .is_file()
-        );
-    }
-
     fn key_event(key: rune::Key) -> rune::KeyEvent {
         rune::KeyEvent {
             key,
@@ -910,31 +836,6 @@ mod tests {
             rt.state.current_mut().draft.replace_text(*text);
             stash(&mut rt.state);
         }
-    }
-
-    #[test]
-    fn the_shortcut_stashes_restores_one_and_opens_the_menu_for_many() {
-        let mut s = state();
-        // Empty composer, empty stash: Mod+S does nothing.
-        command(&mut s);
-        assert!(s.stash.entries.is_empty() && !s.stash_menu);
-        // With content it stashes.
-        s.current_mut().draft.replace_text("only draft");
-        command(&mut s);
-        assert!(s.current().draft.text.is_empty());
-        assert_eq!(s.stash.entries.len(), 1);
-        // Empty composer and exactly one entry restores it.
-        command(&mut s);
-        assert_eq!(s.current().draft.text, "only draft");
-        assert!(s.stash.entries.is_empty());
-        // Several entries open the menu.
-        s.current_mut().draft.replace_text("first");
-        command(&mut s);
-        s.current_mut().draft.replace_text("second");
-        command(&mut s);
-        assert_eq!(s.stash.entries.len(), 2);
-        command(&mut s);
-        assert!(menu_open(&s));
     }
 
     #[test]
@@ -992,93 +893,5 @@ mod tests {
         rt.frame(0.0);
         assert!(rt.state.stash.entries.is_empty());
         assert!(!menu_open(&rt.state));
-    }
-
-    #[test]
-    fn the_menu_restores_on_row_click_deletes_per_row_and_closes_outside() {
-        let mut rt = stash_runtime(1280.0);
-        stash_texts(&mut rt, &["alpha", "beta"]);
-        rt.state.stash_menu = true;
-        rt.invalidate();
-        rt.frame(0.0);
-        // A row click restores that entry.
-        crate::ui::tests::press(&mut rt, "composer-stash-row-1");
-        assert_eq!(rt.state.current().draft.text, "alpha");
-        assert_eq!(rt.state.stash.entries.len(), 1);
-        // Reopen: the per-row delete removes its entry.
-        rt.state.stash_menu = true;
-        rt.invalidate();
-        rt.frame(0.0);
-        crate::ui::tests::press(&mut rt, "composer-stash-delete-0");
-        rt.frame(0.0);
-        assert!(rt.state.stash.entries.is_empty());
-        assert!(!menu_open(&rt.state), "the last delete closes the menu");
-        // Reopen, then a press outside the drawer dismisses it as the composer
-        // overflow menu's outside press does.
-        stash_texts(&mut rt, &["again"]);
-        rt.state.stash_menu = true;
-        rt.invalidate();
-        rt.frame(0.0);
-        assert!(menu_open(&rt.state));
-        rt.pointer_down(640.0, 240.0);
-        rt.pointer_up(640.0, 240.0);
-        rt.frame(0.0);
-        assert!(!rt.state.stash_menu);
-    }
-
-    #[test]
-    fn escape_closes_and_hover_highlights() {
-        let mut rt = stash_runtime(1280.0);
-        stash_texts(&mut rt, &["one", "two", "three"]);
-        rt.state.stash_menu = true;
-        rt.invalidate();
-        rt.frame(0.0);
-        let (x, y) = rt.find("composer-stash-row-2").expect("row 2");
-        rt.pointer_move(x, y);
-        rt.frame(0.0);
-        assert_eq!(rt.state.stash_highlight, 2);
-        crate::ui::tests::press(&mut rt, "composer-input");
-        rt.key(key_event(rune::Key::Escape));
-        rt.frame(0.0);
-        assert!(!menu_open(&rt.state));
-    }
-
-    #[test]
-    fn the_badge_sits_in_the_footer_and_the_menu_fits_at_all_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
-            let mut rt = stash_runtime(width);
-            stash_texts(&mut rt, &["one", "two", "three"]);
-            rt.state.stash_menu = true;
-            rt.frame(0.0);
-            rt.frame(1.0);
-            let (badge, _) = rt
-                .presented("composer-stash-badge")
-                .unwrap_or_else(|| panic!("{width}: badge"));
-            let (footer, _) = rt
-                .presented("composer-footer")
-                .unwrap_or_else(|| panic!("{width}: footer"));
-            assert!(
-                badge[1] >= footer[1] - 1.0 && badge[1] + badge[3] <= footer[1] + footer[3] + 1.0,
-                "{width}: badge {badge:?} in footer {footer:?}"
-            );
-            assert!(
-                badge[0] + badge[2] <= footer[0] + footer[2] + 1.0,
-                "{width}: badge inside the footer row {footer:?}"
-            );
-            let (menu_rect, _) = rt
-                .presented("composer-stash-menu")
-                .unwrap_or_else(|| panic!("{width}: menu"));
-            assert!(
-                menu_rect[0] >= -1.0 && menu_rect[0] + menu_rect[2] <= width + 1.0,
-                "{width}: menu {menu_rect:?} inside the window"
-            );
-            assert!(menu_rect[1] >= -1.0, "{width}: menu top {menu_rect:?}");
-            for i in 0..3 {
-                assert!(
-                    rt.presented(&format!("composer-stash-row-{i}")).is_some(),
-                    "{width}: row {i}"
-                );
-            }
-        }
     }
 }

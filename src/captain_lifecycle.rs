@@ -353,25 +353,6 @@ impl State {
             .filter(|&captain| self.captain_phase(captain) != CaptainPhase::Deleted)
     }
 
-    /// Test-only tombstone matching `captain_delete`'s roster residue, without
-    /// the durable server that deletion requires.
-    #[cfg(test)]
-    pub(crate) fn delete_captain_for_test(&mut self, captain: usize) {
-        self.captains[captain] = Captain {
-            name: format!("Deleted Captain {captain}"),
-            role: String::new(),
-            instructions: String::new(),
-            portrait: 0,
-        };
-        self.captain_lifecycles.insert(
-            captain,
-            CaptainLifecycle {
-                phase: CaptainPhase::Deleted,
-                ..Default::default()
-            },
-        );
-    }
-
     pub(super) fn require_active_captain(&self, captain: usize) -> Result<(), String> {
         self.require_captain(captain)?;
         match self.captain_phase(captain) {

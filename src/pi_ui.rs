@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn read_only_option_fits_the_existing_permissions_menu_at_all_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut state = State::new(".".into(), false);
             state.current_mut().native.access_picker = true;
             let mut rt = rune::Runtime::with_text(

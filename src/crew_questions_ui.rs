@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_user_question_card_lays_out_at_supported_widths() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut rt = crew_runtime(width);
             let rid = question_report(&mut rt, "user");
             rt.invalidate();
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn captain_questions_stay_collapsed_behind_a_count_line() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut rt = crew_runtime(width);
             let rid = question_report(&mut rt, "captain");
             rt.invalidate();

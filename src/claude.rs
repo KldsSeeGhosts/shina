@@ -2224,18 +2224,6 @@ fn auth_error(message: &str) -> bool {
     .any(|s| text.contains(s))
 }
 
-#[cfg(test)]
-fn input_blocks(record: &Value) -> Result<Vec<Value>, String> {
-    input_blocks_with_budget(
-        record,
-        crate::claude_attachment_budget::Usage {
-            bytes: crate::claude_attachment_budget::MAX_BYTES,
-            pages: crate::claude_attachment_budget::MAX_PAGES,
-        },
-    )
-    .map(|(blocks, _)| blocks)
-}
-
 // Ported from KSG ClaudeAdapterV2.makeClaudeUserMessageWithAttachments.
 fn input_blocks_with_budget(
     record: &Value,
