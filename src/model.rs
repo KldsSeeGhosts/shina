@@ -58,7 +58,8 @@ impl Default for DetailsCard {
     }
 }
 pub const SIDEBAR_MAX: f32 = 420.0;
-pub const DEFAULT_SIDEBAR_WIDTH: f32 = 336.0;
+// KSG Code's `SIDEBAR_WIDTH`: 16 rem.
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 256.0;
 const PREVIOUS_DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
 pub(crate) const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
@@ -17368,11 +17369,17 @@ impl State {
             })
             .transpose()?
             .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
-        // Give profiles still on the old default the wider cards. A width saved by the
-        // new layout, including a deliberately chosen 288 pt, stays as the user left it.
-        if ui.get("sidebarWidthDefault").is_none()
-            && self.sidebar_width == PREVIOUS_DEFAULT_SIDEBAR_WIDTH
-        {
+        // Profiles still on a default move to the new one. A width saved equal to the
+        // layout's own default was never chosen; a width that differs from the saved
+        // default was, and stays as the user left it.
+        let still_on_default = match ui.get("sidebarWidthDefault").and_then(Value::as_f64) {
+            Some(saved) => self.sidebar_width == saved as f32,
+            None => {
+                self.sidebar_width == PREVIOUS_DEFAULT_SIDEBAR_WIDTH
+                    || self.sidebar_width == 336.0
+            }
+        };
+        if still_on_default {
             self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
         }
         self.details.docked = ui
