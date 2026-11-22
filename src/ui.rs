@@ -4606,7 +4606,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
         Some(machine) => format!("{scope}, {machine}"),
         None => scope.clone(),
     };
-    if let Some(notice) = crew_ui::recovery_banner(s, p) {
+    if let Some(notice) = crew_ui::provider_recovery_notice(s, p) {
         side = side.child(notice);
     }
     let scope_button = el()
