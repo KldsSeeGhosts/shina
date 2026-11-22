@@ -313,14 +313,20 @@ fn contrast(a: Color, b: Color) -> f32 {
 }
 
 /// Rune's token colours, with the light ones darkened until each reads at 4.5:1 on the code
-/// fill. Identifiers, punctuation, operators and comments go no lighter than `#595f73`.
-/// The dark theme already passes and stays as Rune draws it.
+/// fill and the dark ones lightened the same way toward white. Quiet kinds (identifiers,
+/// punctuation, operators and comments) stay at least as readable as `#595f73` in light,
+/// `#8b8b8b` in dark.
 pub(super) fn syntax_theme(dark: bool, p: Palette) -> SyntaxTheme {
     let mut theme = SyntaxTheme::neutral(dark);
-    if dark {
-        return theme;
-    }
-    let quiet = contrast(rgb_bytes([0x59, 0x5f, 0x73]), p.code_bg);
+    let quiet = contrast(
+        rgb_bytes(if dark {
+            [0x8b, 0x8b, 0x8b]
+        } else {
+            [0x59, 0x5f, 0x73]
+        }),
+        p.code_bg,
+    );
+    let toward = if dark { Color::WHITE } else { Color::BLACK };
     for kind in SYNTAX_KINDS {
         let want = match kind {
             Syntax::Punctuation
@@ -334,7 +340,7 @@ pub(super) fn syntax_theme(dark: bool, p: Palette) -> SyntaxTheme {
         let mut step = 0.0;
         while contrast(colour, p.code_bg) < want && step < 1.0 {
             step += 0.02;
-            colour = mix_srgb(theme.color(kind), Color::BLACK, step);
+            colour = mix_srgb(theme.color(kind), toward, step);
         }
         theme = theme.with(kind, colour);
     }
@@ -365,6 +371,27 @@ mod tests {
         let p = palette(false);
         let theme = syntax_theme(false, p);
         let quiet = contrast(rgb_bytes([0x59, 0x5f, 0x73]), p.code_bg);
+        for kind in SYNTAX_KINDS {
+            let ratio = contrast(theme.color(kind), p.code_bg);
+            assert!(ratio >= 4.5, "{kind:?} is {ratio:.2}:1");
+            if matches!(
+                kind,
+                Syntax::Punctuation
+                    | Syntax::Operator
+                    | Syntax::Variable
+                    | Syntax::Parameter
+                    | Syntax::Comment
+            ) {
+                assert!(ratio >= quiet - 0.01, "{kind:?} is {ratio:.2}:1");
+            }
+        }
+    }
+
+    #[test]
+    fn dark_code_colours_read_at_4_5_to_1_on_the_code_fill() {
+        let p = palette(true);
+        let theme = syntax_theme(true, p);
+        let quiet = contrast(rgb_bytes([0x8b, 0x8b, 0x8b]), p.code_bg);
         for kind in SYNTAX_KINDS {
             let ratio = contrast(theme.color(kind), p.code_bg);
             assert!(ratio >= 4.5, "{kind:?} is {ratio:.2}:1");

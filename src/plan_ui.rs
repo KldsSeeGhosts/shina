@@ -10,7 +10,7 @@
 //!
 //! Everything shown is the value the MCP `task_plan` tool returns for this Captain home, and
 //! every action is a `task.plan.*` command routed to the same reducer as the MCP tools.
-use super::crew_ui::{ghost_button, hairline, hover_wash, motion, solid_button};
+use super::crew_ui::{ghost_button, hover_wash, motion, solid_button};
 use super::*;
 use rune::ScrollSpec;
 use serde_json::Value;
@@ -696,7 +696,7 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
         .padding(6.0)
         .radius(12.0)
         .fill(p.card)
-        .border(1.0, hairline(p))
+        .border(1.0, p.line)
         .child(header);
     if plans.len() > 1 {
         let mut tabs = row().key("plan-tabs").gap(4.0).flex_wrap();

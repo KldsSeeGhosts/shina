@@ -5,8 +5,9 @@
 //! The Brief is ported from KSG Code's `chat/ThreadDetailsPanel.tsx` and
 //! `chat/ThreadDetailsSection.tsx`: sections with a small muted heading and a hairline between
 //! them, 32 px rows at a 10 px radius. It shares crew_ui's design language: hover is ink at 6 %,
-//! active 8 %, hairlines at 10 % ink, motion of 0.18 s on `cubic-bezier(.23, 1, .32, 1)`.
-use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, motion, solid_button};
+//! active 8 %, opaque hairlines in `line`, motion of 0.18 s on `cubic-bezier(.23, 1, .32, 1)`.
+use super::META_COMPACT as META;
+use super::crew_ui::{active_wash, ghost_button, hover_wash, motion, solid_button};
 use super::*;
 use crate::model::BackgroundStatus;
 #[cfg(test)]
@@ -26,7 +27,6 @@ const ROW_RADIUS: f32 = 4.0;
 const CARD_RADIUS: f32 = 6.0;
 /// KSG's `text-[13px] font-medium` detail rows.
 const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
-const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
 fn glyph_icon(glyph: &'static Icon, ink: Color) -> El {
     rune::icon(glyph, super::ICON).color(ink).a11y_hidden()
@@ -333,7 +333,7 @@ pub(super) fn brief_panel_for(s: &State, p: Palette, captain: usize, record: boo
     };
     for section in sections.into_iter().flatten() {
         body = body
-            .child(el().h(1.0).mx(16.0).fill(hairline(p)))
+            .child(el().h(1.0).mx(16.0).fill(p.line).hairline())
             .child(section);
     }
     col()
@@ -507,7 +507,8 @@ pub(super) fn digest_section(s: &State, p: Palette, captain: usize) -> El {
         el().key("brief-digest-rule")
             .h(1.0)
             .mx(10.0)
-            .fill(hairline(p)),
+            .fill(p.line)
+            .hairline(),
     );
     let mut summary = row()
         .key("brief-digest-summary")
@@ -743,7 +744,7 @@ fn crew_roster_footer(s: &State, p: Palette, captain: usize) -> El {
     let recruit_server = server.clone();
     col()
         .key("crew-roster-footer")
-        .child(el().h(1.0).fill(hairline(p)))
+        .child(el().h(1.0).fill(p.line).hairline())
         .child(
             row()
                 .h(44.0)
@@ -1005,7 +1006,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .gap(10.0)
         .center_y()
         .radius(CARD_RADIUS)
-        .border(1.0, hairline(p))
+        .border(1.0, p.line)
         .child(
             rune::icon(&super::icons::LOCK, super::ICON)
                 .color(p.muted)
@@ -1273,10 +1274,9 @@ pub(super) fn background_settings(s: &State, p: Palette) -> Vec<El> {
                 .child(row_note(note)),
         )
         .child(group.w(244.0).min_w(244.0));
-    let rule = || el().w_full().h(1.0).fill(p.line);
     let mut rows = vec![
-        col().child(working).child(rule()),
-        col().child(awake).child(rule()),
+        col().child(working).child(rule(p)),
+        col().child(awake).child(rule(p)),
     ];
     if let Some(error) = s.background_status().error {
         rows.push(label(error, SMALL, p.danger).wrap().px(10.0).pb(6.0));

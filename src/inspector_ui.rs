@@ -8,7 +8,7 @@
 //! Context `context_ui::tab` (documents, scope, memory and earlier conversations,
 //! plus an open captain document) and Diff `diff_panel`. Workstreams 3 and 4
 //! reshape each body in place; the shell is settled here.
-use super::crew_ui::{active_wash, hairline, hover_wash, motion};
+use super::crew_ui::{active_wash, hover_wash, motion};
 use super::*;
 
 /// The tabs a thread offers, in strip order. Captain homes and crew workers get
@@ -528,7 +528,7 @@ fn worker_overview_body(s: &State, p: Palette) -> El {
             stick_bottom: false,
         })
         .child(identity)
-        .child(el().h(1.0).mx(16.0).fill(hairline(p)));
+        .child(el().h(1.0).mx(16.0).fill(p.line).hairline());
     // "Delegated by": the captain's face and name, pressable back to its home.
     if let Some(captain) = captain {
         let profile = &s.captains[captain];
@@ -618,7 +618,7 @@ fn worker_overview_body(s: &State, p: Palette) -> El {
         );
     }
     body = body
-        .child(el().h(1.0).mx(16.0).fill(hairline(p)))
+        .child(el().h(1.0).mx(16.0).fill(p.line).hairline())
         .child(session_body(s, p));
     col()
         .key("worker-overview")
@@ -793,7 +793,7 @@ pub(super) fn view(s: &State, p: Palette, zoom: f32, resize_max: Option<f32>) ->
         .h_full()
         .min_h(0.0)
         .fill(p.panel)
-        .child(el().w(1.0).h_full().a11y_hidden().fill(p.line))
+        .child(el().w(1.0).h_full().a11y_hidden().fill(p.line).hairline())
         .child(
             col()
                 .grow(1.0)

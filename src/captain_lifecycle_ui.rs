@@ -5,14 +5,13 @@
 //! The dialogs adapt captain_ui's `reset_dialog`, itself ported from KSG's
 //! `ui/alert-dialog.tsx`. Captain-specific group actions have no KSG equivalent: KSG's
 //! `Sidebar.tsx` only confirms one thread's archive or delete at a time.
+use super::META_COMPACT as META;
 use super::captain_ui::{quiet_note, switch};
-use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, mark_slot, motion};
+use super::crew_ui::{active_wash, ghost_button, hover_wash, mark_slot, motion};
 use super::*;
 use crate::model::{CaptainLifecycleAction, CaptainLifecycleDialog, CaptainPhase, CrewMutation};
 use serde_json::Value;
 
-/// Brief meta text, as captain_ui's `META`.
-const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 /// Brief row text, as captain_ui's `ROW_TEXT`.
 const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
 /// Row corners, shared with the Brief.
@@ -949,7 +948,7 @@ pub(super) fn archived_bar(s: &State, p: Palette, wide: bool, pane_width: f32) -
         .gap(10.0)
         .center_y()
         .radius(CARD_RADIUS)
-        .border(1.0, hairline(p))
+        .border(1.0, p.line)
         .child(icon("archive", p.muted))
         .child(
             label(

@@ -8,9 +8,10 @@
 //! the composer ring already measures, the memory book, the captain's scope
 //! and the conversation controls, ported from KSG Code's
 //! `chat/ContextWindowMeter.tsx` and the Brief's `ThreadDetailsSection` rows.
+use super::META_COMPACT as META;
 use super::*;
 
-use super::crew_ui::{active_wash, ghost_button, hairline, hover_wash, motion, solid_button};
+use super::crew_ui::{active_wash, ghost_button, hover_wash, motion, solid_button};
 use crate::model::{
     CONTEXT_TRUNCATION, CREW_CONTEXT_MAX_BYTES, ESSENTIAL_BUDGET, MemoryView,
     NOTES_CONTEXT_MAX_BYTES, PROFILE_BUDGET, RULES_CONTEXT_MAX_BYTES, covered_bytes,
@@ -18,7 +19,6 @@ use crate::model::{
 
 /// KSG's `text-[13px] font-medium` detail rows.
 const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
-const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 /// The right column of a document row: 132 pt at the panel's 420 pt default,
 /// 96 pt at the 360 pt minimum (spec §4.5).
 const DOC_META_WIDE: f32 = 132.0;
@@ -1302,7 +1302,7 @@ pub(super) fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .center_y()
                 .max_w(captain_ui::PANEL_WIDTH - 32.0)
                 .radius(6.0)
-                .border(1.0, hairline(p))
+                .border(1.0, p.line)
                 .child(super::project_tile(s, p, project, 14.0))
                 .child(
                     label(name.clone(), TextStyle::new(13.0, 500.0), p.ink)
@@ -1350,7 +1350,7 @@ pub(super) fn scope_section(s: &State, p: Palette, captain: usize) -> El {
                 .center_y()
                 .max_w(captain_ui::PANEL_WIDTH - 32.0)
                 .radius(6.0)
-                .border(1.0, hairline(p))
+                .border(1.0, p.line)
                 .child(
                     label(text.clone(), TextStyle::new(13.0, 500.0), p.ink)
                         .truncate()
@@ -1647,7 +1647,7 @@ fn from_captain_section(s: &State, p: Palette, captain: usize) -> El {
 }
 
 fn rule_inset(p: Palette) -> El {
-    el().h(1.0).mx(16.0).fill(hairline(p))
+    el().h(1.0).mx(16.0).fill(p.line).hairline()
 }
 
 /// The document viewer's header: a back control, the title and file name, the

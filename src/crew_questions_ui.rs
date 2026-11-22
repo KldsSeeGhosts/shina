@@ -10,14 +10,13 @@
 //! to reach", "Delivered to") is not an answer; and the card stays until an answer
 //! record exists. Artifact claims render as bounded labels with the owning
 //! machine named — Shina never opens their paths or runs their references.
+use super::META_COMPACT as META;
 use super::*;
 use crate::model::ReportPolicy;
 use crate::model::crew_question_state::CrewQuestionView;
 use crate::model::crew_reports::{ArtifactKind, CrewOutcome, QuestionRecipient};
 use rune::Transition;
 
-/// Meta text inside a report card, matching `captain_ui`'s quiet lines.
-const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 /// Second and later lines start past the status mark's 14 px slot and its gap.
 const CARD_INDENT: f32 = 22.0;
 
@@ -330,7 +329,7 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         .gap(8.0)
         .radius(12.0)
         .fill(p.card)
-        .border(1.0, crew_ui::hairline(p))
+        .border(1.0, p.line)
         .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
         .child(
             el().key(format!("needs-you-report-bar-{rid}"))

@@ -19,8 +19,7 @@ use serde_json::Value;
 
 /// KSG's `text-[13px] font-medium` detail rows, matching `captain_ui::ROW_TEXT`.
 const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
-/// The quiet meta line under a row's title.
-const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
+use super::META_COMPACT as META;
 
 /// How many entries each group shows before its Show more button takes over:
 /// Needs you 3, What's new 2, In progress 3.

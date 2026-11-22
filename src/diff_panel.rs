@@ -1713,9 +1713,9 @@ fn loading_skeleton(scope: Scope, p: Palette) -> El {
                 .center_y()
                 .px(8.0)
                 .gap(8.0)
-                .child(el().h(1.0).grow(1.0).fill(p.line))
+                .child(el().h(1.0).grow(1.0).fill(p.line).hairline())
                 .child(block(96.0, 10.0, p, true))
-                .child(el().h(1.0).grow(1.0).fill(p.line)),
+                .child(el().h(1.0).grow(1.0).fill(p.line).hairline()),
         )
         .child(lines)
         .child(header_skeleton(160.0, p))
