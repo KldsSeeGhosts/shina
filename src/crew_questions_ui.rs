@@ -484,7 +484,7 @@ mod tests {
             view,
             (width, 1400.0),
             Env::new(false, 1.0),
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)),
         );
         rt.set_tab_visits_controls(true);
         rt.state.data_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());

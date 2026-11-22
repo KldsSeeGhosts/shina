@@ -255,159 +255,262 @@ fn resize(s: &State, p: Palette, zoom: f32, max: f32) -> El {
         )
 }
 
-/// The thread's session details, as the old Session drawer showed them, under
-/// the `session-panel` key without its own header (the strip names the tab).
-fn session_body(s: &State, p: Palette) -> El {
+/// KSG Code's `ThreadDetailsSection` card: `surface-tray rounded-pane p-1`, a 14 px tray
+/// with 4 px of padding that holds an optional heading and one inner surface.
+fn details_tray(key: &str, title: &str, p: Palette) -> El {
+    col()
+        .key(key)
+        .role("group")
+        .label(title)
+        .w_full()
+        .min_w(0.0)
+        .padding(4.0)
+        .radius(14.0)
+        .fill(p.tray)
+        .border(1.0, p.line)
+}
+
+/// The card's 28 px heading (`flex h-7 items-center gap-1 ps-3`): the title, then a muted
+/// caption at the end.
+fn details_heading(title: &str, summary: Option<El>, p: Palette) -> El {
+    let mut heading = row()
+        .h(28.0)
+        .pl(12.0)
+        .pr(8.0)
+        .gap(4.0)
+        .center_y()
+        .child(meta_label(title, p.muted))
+        .child(spacer());
+    if let Some(summary) = summary {
+        heading = heading.child(summary);
+    }
+    heading
+}
+
+/// The card's inner list: `surface-composer rounded-lg p-0.5`.
+fn details_surface(p: Palette) -> El {
+    col()
+        .w_full()
+        .min_w(0.0)
+        .padding(2.0)
+        .radius(10.0)
+        .fill(p.card_top)
+}
+
+/// KSG's `THREAD_DETAILS_PANEL_ROW_CLASS`: a 28 px row, 10 px in and 4 px at the end, with
+/// a 16 px muted icon 10 px before a medium label. Callers add the trailing meta or action.
+fn details_row(key: &str, glyph: &str, title: &str, p: Palette) -> El {
+    row()
+        .key(key)
+        .h(28.0)
+        .min_w(0.0)
+        .pl(10.0)
+        .pr(4.0)
+        .gap(10.0)
+        .center_y()
+        .radius(8.0)
+        .child(icon(glyph, p.muted).size(16.0, 16.0))
+        .child(label(title, TITLE, p.ink).truncate().grow(1.0).min_w(0.0))
+}
+
+/// A `details_row` the user can press: KSG's `hover:surface-selected-soft`.
+fn details_action(s: &State, p: Palette, row_: El, a11y: String) -> El {
+    row_.role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(a11y)
+        .focusable(true)
+        .hover(hover_wash(s, p))
+        .press(active_wash(s, p))
+        .hover_motion(motion(), motion())
+}
+
+/// A row's trailing caption (`THREAD_DETAILS_PANEL_META_CLASS`): tabular and muted.
+fn details_meta(value: impl Into<String>, p: Palette) -> El {
+    label(value, TIMER, p.muted).pr(6.0)
+}
+
+/// The workspace card, ported from KSG Code's `ThreadDetailsPanel` Workspace section: where
+/// the thread runs (machine, workspace, branch, changes) in the inner surface, then the
+/// context meter under it (`ThreadDetailsContext`).
+fn workspace_card(s: &State, p: Palette) -> El {
     let t = s.current();
-    let mut details = col()
-        .padding(16.0)
-        .gap(8.0)
-        .child(label(&t.title, CARD_TITLE, p.ink).wrap())
-        .child(
-            row()
-                .center_y()
-                .gap(6.0)
-                .child(status_mark(t.status, p, 8.0))
-                .child(label(
-                    t.started
-                        .filter(|_| t.status == Status::Running)
-                        .map_or_else(
-                            || t.status.label().into(),
-                            |at| format!("Working for {}", timer_label(at.elapsed().as_secs())),
-                        ),
-                    META,
-                    status_ink(t.status, p),
-                )),
-        )
-        .child(rule(p));
-    let fact = |key: &str, glyph: &str, title: &str, value: &str, style| {
-        row()
-            .key(key)
-            .min_h(28.0)
-            .gap(8.0)
-            .center_y()
-            .child(icon(glyph, p.faint).size(14.0, 14.0))
-            .child(label(title, META, p.faint).w(66.0))
-            .child(
-                label(value, style, p.ink)
-                    .wrap_anywhere()
-                    .grow(1.0)
-                    .min_w(0.0),
+    let mut rows = details_surface(p).child(details_row(
+        "overview-machine",
+        "monitor",
+        &s.machine_label(&s.machines.selected),
+        p,
+    ));
+    if let Some(project) = s.project(t.project) {
+        rows = rows.child(details_row(
+            "overview-workspace",
+            "folder",
+            &project.name,
+            p,
+        ));
+    }
+    if let Some(branch) = &t.branch {
+        let copy = branch.clone();
+        rows = rows.child(
+            details_row("overview-branch", "branch", branch, p).child(
+                icon_button(
+                    "overview-branch-copy",
+                    "Copy branch name",
+                    "copy",
+                    p,
+                    |_| {},
+                )
+                .on_press_tx(move |_: &mut State, tx| tx.copy(copy.clone())),
+            ),
+        );
+    }
+    if let Some(ready) = s
+        .diffs
+        .get(&s.panel_key())
+        .and_then(diff_panel::ThreadDiff::ready)
+        && (ready.additions > 0 || ready.deletions > 0)
+    {
+        let stat =
+            diff_panel::diff_stat_label("overview-diff-stat", ready.additions, ready.deletions, p);
+        rows = rows.child(
+            details_action(
+                s,
+                p,
+                details_row("overview-changes", "diff", "Changes", p),
+                "Open changes".into(),
             )
-    };
+            .on_press(|s: &mut State| {
+                let key = s.panel_key();
+                s.right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Diff);
+            })
+            .child(stat.pr(6.0)),
+        );
+    }
+    let mut card = details_tray("overview-workspace-card", "Workspace", p).child(rows);
+    // KSG's context row: a 32 px line with the gauge, a 4 px meter and the percentage. It
+    // opens the Context tab, where the breakdown lives.
+    if let Some(percent) = t.context.usage.percent {
+        let amount = (percent as f32 / 100.0).clamp(0.0, 1.0);
+        card = card.child(
+            details_action(
+                s,
+                p,
+                row()
+                    .key("overview-context")
+                    .h(32.0)
+                    .pl(12.0)
+                    .pr(8.0)
+                    .gap(6.0)
+                    .center_y()
+                    .radius(8.0)
+                    .child(icon("gauge", p.muted).size(16.0, 16.0))
+                    .child(label("Context", TITLE, p.ink)),
+                format!("Context, {percent:.0}% used. Open the Context tab"),
+            )
+            .on_press(|s: &mut State| {
+                let key = s.panel_key();
+                s.right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Context);
+            })
+            .child(
+                row()
+                    .h(4.0)
+                    .ml(6.0)
+                    .min_w(48.0)
+                    .grow(1.0)
+                    .radius(2.0)
+                    .fill(p.line)
+                    .child(el().grow(amount).h_full().radius(2.0).fill(p.ink))
+                    .child(el().grow(1.0 - amount)),
+            )
+            .child(label(context_percent_text(percent), TIMER, p.muted)),
+        );
+        if let (Some(tokens), Some(limit)) =
+            (t.context.usage.tokens, t.context.usage.context_window)
+        {
+            card = card.child(
+                details_surface(p).child(
+                    row()
+                        .key("overview-context-tokens")
+                        .h(32.0)
+                        .px(10.0)
+                        .gap(8.0)
+                        .center_y()
+                        .child(label("Used / max", TITLE, p.ink).grow(1.0).min_w(0.0))
+                        .child(label(
+                            format!(
+                                "{} / {}",
+                                context_tokens_text(tokens),
+                                context_tokens_text(limit)
+                            ),
+                            TIMER,
+                            p.muted,
+                        )),
+                ),
+            );
+        }
+    }
+    card
+}
+
+/// The session card. KSG Code has no equivalent, because its composer always shows the
+/// model, effort and access: this is a Shina-only card in the same tray-and-rows shape, so
+/// those facts, the saved session ID and any session notices keep one place to be read.
+fn session_card(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let status = row()
+        .center_y()
+        .gap(6.0)
+        .child(status_mark(t.status, p, 8.0))
+        .child(label(
+            t.started
+                .filter(|_| t.status == Status::Running)
+                .map_or_else(
+                    || t.status.label().into(),
+                    |at| format!("Working for {}", timer_label(at.elapsed().as_secs())),
+                ),
+            TIMER,
+            status_ink(t.status, p),
+        ));
     let model = if t.thinking.is_empty() || t.thinking == "off" {
         t.model.clone()
     } else {
         format!("{} · {}", t.model, effort_name(&t.thinking))
     };
-    details = details
-        .child(fact("overview-model", "chip", "Model", &model, SMALL))
-        .child(fact(
+    let mut rows = details_surface(p)
+        .child(details_row("overview-model", "chip", &model, p))
+        .child(details_row(
             "overview-access",
             "shield",
-            "Access",
             t.native.access.label(),
-            SMALL,
-        ));
-    if let Some(project) = s.project(t.project) {
-        details = details.child(fact(
-            "overview-workspace",
-            "folder",
-            "Workspace",
-            &project.name,
-            SMALL,
-        ));
-    }
-    if let Some(branch) = &t.branch {
-        details = details.child(fact(
-            "overview-branch",
-            "branch",
-            "Branch",
-            branch,
-            MONO_META,
-        ));
-    }
-    details = details
-        .child(fact(
-            "overview-machine",
-            "monitor",
-            "Machine",
-            &s.machine_label(&s.machines.selected),
-            SMALL,
+            p,
         ))
-        .child(fact(
+        .child(details_row(
             "overview-harness",
             "terminal",
-            "Harness",
             &harness_name(s, &t.harness),
-            SMALL,
+            p,
         ));
-    if let Some(percent) = t.context.usage.percent {
-        let amount = (percent as f32 / 100.0).clamp(0.0, 1.0);
-        details = details
-            .child(fact(
-                "overview-context",
-                "gauge",
-                "Context",
-                &format!("{percent}% used"),
-                SMALL,
-            ))
-            .child(
-                row()
-                    .h(4.0)
-                    .ml(88.0)
-                    .radius(2.0)
-                    .fill(p.line)
-                    .child(el().grow(amount).h_full().radius(2.0).fill(p.sea))
-                    .child(el().grow(1.0 - amount)),
-            );
-    }
-    if let Some(start) = t.started {
-        let time =
-            chrono::Local::now() - chrono::Duration::seconds(start.elapsed().as_secs() as i64);
-        details = details.child(fact(
-            "overview-started",
-            "clock",
-            "Started",
-            &time.format("%H:%M").to_string(),
-            SMALL,
-        ));
-    }
     if let Some(updated) = relative_time(t.updated) {
-        details = details.child(fact(
-            "overview-updated",
-            "clock",
-            "Updated",
-            &updated,
-            SMALL,
-        ));
+        rows = rows.child(
+            details_row("overview-updated", "clock", "Updated", p).child(details_meta(updated, p)),
+        );
     }
-    details = details.child(rule(p)).child(
-        col()
-            .gap(5.0)
-            .child(meta_label("Conversation", p.muted))
-            .child(
-                label(
-                    if t.session.is_some() {
-                        format!("Saved locally by {}", harness_name(s, &t.harness))
-                    } else {
-                        "No saved session yet".to_string()
-                    },
-                    LABEL,
-                    p.ink,
-                )
-                .wrap(),
-            ),
-    );
     if let Some(session) = &t.session {
         let copy = session.clone();
-        details = details.child(
+        rows = rows.child(
             row()
-                .gap(8.0)
+                .key("overview-session")
+                .h(28.0)
+                .min_w(0.0)
+                .pl(10.0)
+                .pr(4.0)
+                .gap(10.0)
                 .center_y()
+                .child(icon("file", p.muted).size(16.0, 16.0))
                 .child(
                     label(session, MONO_META, p.muted)
-                        .wrap_anywhere()
+                        .truncate_middle()
                         .selectable(true)
                         .grow(1.0)
                         .min_w(0.0),
@@ -424,123 +527,87 @@ fn session_body(s: &State, p: Palette) -> El {
                 ),
         );
     }
+    let mut card = details_tray("overview-session-card", "Session", p)
+        .child(details_heading("Session", Some(status), p))
+        .child(rows);
     if !t.diagnostics.is_empty() {
         let key = s.panel_key();
         let expanded = s.session_notices.contains(&key);
-        details = details.child(rule(p)).child(
-            button(
-                "overview-session-notices",
-                &format!("Session notices ({})", t.diagnostics.len()),
+        let mut notices = details_surface(p).mt(4.0).child(
+            details_action(
+                s,
                 p,
-                move |s| {
-                    if !s.session_notices.remove(&key) {
-                        s.session_notices.insert(key.clone());
-                    }
-                },
+                details_row("overview-session-notices", "info", "Session notices", p),
+                format!("Session notices, {}", t.diagnostics.len()),
             )
-            .expanded(expanded),
+            .expanded(expanded)
+            .on_press(move |s: &mut State| {
+                if !s.session_notices.remove(&key) {
+                    s.session_notices.insert(key.clone());
+                }
+            })
+            .child(details_meta(t.diagnostics.len().to_string(), p))
+            .child(
+                icon(if expanded { "chevron" } else { "open" }, p.faint)
+                    .size(12.0, 12.0)
+                    .mr(6.0),
+            ),
         );
         if expanded {
             for diagnostic in &t.diagnostics {
-                details = details.child(
+                notices = notices.child(
                     label(truncate(diagnostic, 600), SMALL, p.muted)
                         .wrap_anywhere()
-                        .selectable(true),
+                        .selectable(true)
+                        .px(10.0)
+                        .py(4.0),
                 );
             }
         }
+        card = card.child(notices);
     }
-    col().key("session-panel").min_h(0.0).w_full().child(
-        col()
-            .grow(1.0)
-            .min_h(0.0)
-            .scroll(ScrollSpec {
-                stick_bottom: false,
-            })
-            .child(details),
-    )
+    card
 }
 
-/// The Details tab: the captain's Brief sections on a home or worker thread,
-/// else the session details.
-fn overview_body(s: &State, p: Palette) -> El {
-    if let Some(captain) = captain_ui::home_brief_captain(s) {
-        captain_ui::brief_panel_for(s, p, captain, false)
-    } else if s.current().crew_captain.is_some()
-        || s.current().delegated
-        || s.current().peer_origin.is_some()
-    {
-        worker_overview_body(s, p)
-    } else {
-        session_body(s, p)
-    }
-}
-
-/// The Details tab on a crew worker (spec §3.4): the worker's title and status, a
-/// pressable "Delegated by" row back to its captain, a "Runs" line for its placement,
-/// then the session details below.
-fn worker_overview_body(s: &State, p: Palette) -> El {
+/// The lineage card on a crew worker, in the shape of KSG Code's `ThreadRelationshipsPanel`
+/// Lineage card: who delegated the thread, pressable back to the captain's home, and where
+/// it runs.
+fn lineage_card(s: &State, p: Palette) -> Option<El> {
     let t = s.current();
     let captain = t
         .captain
         .or(t.crew_captain)
         .filter(|c| *c < s.captains.len());
-    let mut identity = row()
-        .key("brief-identity")
-        .px(16.0)
-        .pt(14.0)
-        .pb(12.0)
-        .gap(12.0)
-        .center_y();
-    identity = identity.child(crewmate_avatar(s, p, &t.model, shown_status(s), 36.0));
-    identity = identity.child(
-        col()
-            .grow(1.0)
-            .min_w(0.0)
-            .gap(1.0)
-            .child(label(&t.title, IDENTITY, p.ink).truncate().min_w(0.0))
-            .child(label(crate::model::status_word(t.status), META, p.muted).truncate()),
-    );
-    let mut body = col()
-        .key("brief-sections")
-        .grow(1.0)
-        .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(identity)
-        .child(el().h(1.0).mx(16.0).fill(p.line).hairline());
-    // "Delegated by": the captain's face and name, pressable back to its home.
+    let mut rows = details_surface(p);
+    let mut any = false;
     if let Some(captain) = captain {
         let profile = &s.captains[captain];
-        body = body.child(
-            captain_ui::section("brief-delegated", "Delegated by", None, vec![], p).child(
+        any = true;
+        rows = rows.child(
+            details_action(
+                s,
+                p,
                 row()
                     .key("open-captain-from-overview")
-                    .role("button")
-                    .cursor(rune::Cursor::Pointer)
-                    .label(format!("Open {}", profile.name))
-                    .focusable(true)
-                    .px(10.0)
-                    .min_h(40.0)
+                    .h(28.0)
+                    .min_w(0.0)
+                    .pl(10.0)
+                    .pr(4.0)
                     .gap(10.0)
                     .center_y()
-                    .radius(6.0)
-                    .hover(hover_wash(s, p))
-                    .press(active_wash(s, p))
-                    .hover_motion(motion(), motion())
-                    .on_press(move |s: &mut State| s.open_captain(captain))
-                    .child(avatar(s, p, captain, 24.0, s.captain_status(captain)))
+                    .radius(8.0)
+                    .child(avatar(s, p, captain, 16.0, s.captain_status(captain)))
                     .child(
-                        label(
-                            &profile.name,
-                            TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08),
-                            p.ink,
-                        )
-                        .truncate()
-                        .min_w(0.0),
+                        label(&profile.name, TITLE, p.ink)
+                            .truncate()
+                            .grow(1.0)
+                            .min_w(0.0),
                     ),
-            ),
+                format!("Open {}", profile.name),
+            )
+            .on_press(move |s: &mut State| s.open_captain(captain))
+            .child(details_meta("Captain", p))
+            .child(icon("open", p.faint).size(12.0, 12.0).mr(6.0)),
         );
     } else if let Some(origin) = &t.peer_origin {
         let server_id = origin.server_id.clone();
@@ -549,64 +616,99 @@ fn worker_overview_body(s: &State, p: Palette) -> El {
             .client
             .as_ref()
             .is_some_and(|c| c.linked.contains_key(&server_id));
-        let mut cap_row = row()
-            .key("open-captain-from-overview")
-            .px(10.0)
-            .min_h(40.0)
-            .gap(10.0)
-            .center_y()
-            .radius(6.0)
-            .child(icon("crew", p.muted))
-            .child(
-                label(
-                    format!("{} on {}", origin.captain, origin.server_label),
-                    TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08),
-                    p.ink,
-                )
-                .truncate()
-                .min_w(0.0),
-            );
-        if linked {
-            cap_row = cap_row
-                .role("button")
-                .cursor(rune::Cursor::Pointer)
-                .label(format!(
-                    "Open {} on {}",
-                    origin.captain, origin.server_label
-                ))
-                .focusable(true)
-                .hover(hover_wash(s, p))
-                .press(active_wash(s, p))
-                .hover_motion(motion(), motion())
-                .on_press(move |s: &mut State| s.open_machine_thread(&server_id, home_id));
-        }
-        body = body.child(
-            captain_ui::section("brief-delegated", "Delegated by", None, vec![], p).child(cap_row),
+        any = true;
+        let base = details_row(
+            "open-captain-from-overview",
+            "crew",
+            &format!("{} on {}", origin.captain, origin.server_label),
+            p,
         );
+        rows = rows.child(if linked {
+            details_action(
+                s,
+                p,
+                base,
+                format!("Open {} on {}", origin.captain, origin.server_label),
+            )
+            .on_press(move |s: &mut State| s.open_machine_thread(&server_id, home_id))
+            .child(icon("open", p.faint).size(12.0, 12.0).mr(6.0))
+        } else {
+            base
+        });
     }
-    // "Runs": the placement details the parent bar used to carry.
     if let Some(placement) = crew_ui::worker_placement(s, t.id) {
         let machine = crew_ui::placement_machine(s, t.id, &placement);
-        let details = crew_ui::placement_details(&placement, &machine);
-        body = body.child(
-            captain_ui::section("brief-runs", "Runs", None, vec![], p).child(
-                label(details, SMALL, p.muted)
-                    .key("worker-placement")
-                    .wrap()
-                    .px(10.0)
-                    .pb(4.0),
-            ),
+        any = true;
+        rows = rows.child(
+            label(
+                crew_ui::placement_details(&placement, &machine),
+                SMALL,
+                p.muted,
+            )
+            .key("worker-placement")
+            .wrap()
+            .px(10.0)
+            .py(6.0),
         );
     }
-    body = body
-        .child(el().h(1.0).mx(16.0).fill(p.line).hairline())
-        .child(session_body(s, p));
+    any.then(|| {
+        details_tray("brief-delegated", "Lineage", p)
+            .child(details_heading("Lineage", None, p))
+            .child(rows)
+    })
+}
+
+/// The Details tab on a plain thread or a crew worker, ported from KSG Code's
+/// `ThreadDetailsPanel`: a stack of tray cards 4 px apart (`thread-details-stack`), the
+/// workspace card first.
+fn session_body(s: &State, p: Palette) -> El {
+    // KSG's `.thread-details-stack` lifts its own text a step: `--foreground` is `#f5f5f5`
+    // and `--muted-foreground` `#a3a3a3` in dark, and `--foreground` `#18181b` in light.
+    let p = if s.dark {
+        Palette {
+            ink: color("#f5f5f5"),
+            muted: color("#a3a3a3"),
+            ..p
+        }
+    } else {
+        Palette {
+            ink: color("#18181b"),
+            ..p
+        }
+    };
+    let mut stack = col()
+        .w_full()
+        .min_w(0.0)
+        .padding(8.0)
+        .gap(4.0)
+        .child(workspace_card(s, p));
+    if let Some(lineage) = lineage_card(s, p) {
+        stack = stack.child(lineage);
+    }
+    stack = stack.child(session_card(s, p));
     col()
-        .key("worker-overview")
+        .key("session-panel")
         .min_h(0.0)
         .h_full()
         .w_full()
-        .child(body)
+        .child(
+            col()
+                .grow(1.0)
+                .min_h(0.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(stack),
+        )
+}
+
+/// The Details tab: the captain's Brief sections on a home thread, else the detail cards.
+fn overview_body(s: &State, p: Palette) -> El {
+    if let Some(captain) = captain_ui::home_brief_captain(s) {
+        captain_ui::brief_panel_for(s, p, captain, false)
+    } else {
+        session_body(s, p)
+    }
 }
 
 /// The crew half of the Work tab: the captain's roster where a captain backs the

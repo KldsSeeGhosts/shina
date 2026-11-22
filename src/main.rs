@@ -1388,7 +1388,7 @@ fn main() {
     OPTIONS.set((workspace, demo, snapshot)).ok();
     let app = rune::App::new(AppSpec {
         fonts: ui::FONTS,
-        families: (ui::SANS_FAMILY, "Cascadia Mono, Consolas"),
+        families: (ui::SANS_FAMILY, ui::MONO_FAMILY),
         min_size: Some((620.0, 480.0)),
         setup: Some(|state: &mut State, wake| {
             if !OPTIONS.get().expect("startup options").2 { state.setup(wake); }

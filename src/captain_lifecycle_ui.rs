@@ -987,7 +987,7 @@ mod tests {
             view,
             (width, 840.0),
             Env::new(false, 1.0),
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)),
         )
     }
     fn press(rt: &mut Runtime<State>, key: &str) {
