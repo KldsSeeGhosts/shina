@@ -699,6 +699,11 @@ pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         );
     }
     let mut tab = col().key("crew-tab").grow(1.0).min_h(0.0).w_full();
+    if let Some(plan) = super::plan_ui::plan_panel(s, p, 0.0) {
+        tab = tab
+            .child(col().w_full().px(10.0).pt(8.0).pb(6.0).child(plan))
+            .child(el().h(1.0).w_full().fill(p.line).hairline());
+    }
     tab = tab.child(
         col()
             .key("crew-roster-rows")
@@ -1801,6 +1806,9 @@ mod tests {
         rt.state.threads.push(recruit);
         let ordinary = rt.state.threads.len() - 1;
         press(&mut rt, "crew-roster-toggle");
+        rt.frame(0.25);
+        press(&mut rt, "now-popover-open-inspector");
+        rt.frame(0.25);
         press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         press(&mut rt, &format!("crew-recruit-{thread_id}"));

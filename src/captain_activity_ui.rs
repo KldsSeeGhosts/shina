@@ -257,7 +257,7 @@ fn open_activity_source(s: &mut State, tx: &mut Tx, server: String, captain: usi
                 .into_iter()
                 .filter(|item| super::crew_ui::needs_you_item(s, home, item))
                 .count();
-            s.needs_you_page = live_count + q_idx;
+            s.needs_you_page = super::crew_ui::thread_request_pages(s) + live_count + q_idx;
             tx.scroll_into_view(format!("needs-you-report-{rid}"));
             tx.focus(format!("needs-you-report-{rid}-text"), true);
             return;

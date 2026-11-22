@@ -1158,6 +1158,10 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             s.viewport_height = rect[3];
         })
         .on_key(|s: &mut State, ev, tx| {
+            if ev.key == rune::Key::Escape && s.now_popover {
+                s.now_popover = false;
+                return true;
+            }
             if ev.key == rune::Key::Escape && sidebar_preview::dismiss(s, true) {
                 return true;
             }
@@ -1471,6 +1475,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     .size(0.0, 0.0)
                     .a11y_hidden()
                     .on_layout(|s: &mut State, _| s.composer_ui.overflow.set(false)),
+            );
+        }
+    }
+    if s.now_popover {
+        if !s.composer_hidden() && cx.layout_with("crew-tray", |_| ()).is_some() {
+            root = root.child(crew_ui::now_popover(s, p, lane_width(main_width, wide)));
+        } else {
+            root = root.child(
+                el().key("now-popover-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.now_popover = false),
             );
         }
     }
@@ -13931,12 +13948,141 @@ fn attach_composer_notices(s: &State, p: Palette, lane: f32, composer_card: El) 
     }
 }
 
-/// KSG Code's `ComposerSurface.Shell`: the 16 px tray that holds the attached notices, the
-/// 15 px main card and the context strip under it, with a hairline rim painted above the
-/// inner surfaces (matching `ComposerSurface.Shell::after`) so the opaque card never covers
-/// the straight tray edges and the rim adds zero layout height. The shell is always present,
-/// while the strip joins only when content renders below the card.
-fn composer_shell(s: &State, p: Palette, inner: El, strip: Option<El>) -> El {
+/// Ported from KSG Code's `ComposerRequestCard.Well`: inset radius-8 `surface-well`
+/// (`p.code_bg` + hairline `p.line`) holding commands, question text, evidence or options.
+fn request_card_well(p: Palette, options: bool, content: El) -> El {
+    let mut well = col()
+        .w_full()
+        .min_w(0.0)
+        .radius(8.0)
+        .fill(p.code_bg)
+        .border(1.0, p.line);
+    well = if options {
+        well.padding(4.0)
+    } else {
+        well.px(10.0).py(8.0)
+    };
+    col()
+        .pl(10.0)
+        .pr(13.0)
+        .w_full()
+        .min_w(0.0)
+        .child(well.child(content))
+}
+
+/// Ported from KSG Code's `ComposerRequestCard.Footer`: aligned action row below the body.
+pub(super) fn request_card_footer(content: El) -> El {
+    row()
+        .w_full()
+        .min_w(0.0)
+        .flex_wrap()
+        .center_y()
+        .justify_end()
+        .gap(8.0)
+        .py(6.0)
+        .pl(10.0)
+        .pr(13.0)
+        .child(content)
+}
+
+/// One unified request banner docked at the top of `ComposerSurface.Shell` (ported from
+/// KSG Code's `ComposerRequestCard` and `ChildThreadApprovals`). Pages cleanly across the
+/// current thread's non-questionnaire request, Captain home crew requests, and crew report
+/// questions so at most one request surface ever appears above the composer card.
+fn composer_request_banner(s: &State, p: Palette, lane: f32) -> Option<El> {
+    let t = s.current();
+    let has_thread_req = t.request.is_some()
+        && !t.request_held_by_typing_guard()
+        && t.native.questionnaire.is_none();
+    let is_home = s.is_captain_home(t);
+    let crew_items = if is_home {
+        crew_ui::needs_you_items(s)
+    } else {
+        Vec::new()
+    };
+    let user_reports = if is_home {
+        crew_questions_ui::user_question_count(s)
+    } else {
+        0
+    };
+    let captain_line = if is_home {
+        crew_questions_ui::captain_questions_line(s, p)
+    } else {
+        None
+    };
+    let thread_offset = usize::from(has_thread_req);
+    let total = thread_offset + crew_items.len() + user_reports;
+    if total == 0 && captain_line.is_none() {
+        return None;
+    }
+    let page = if total > 0 {
+        s.needs_you_page.min(total - 1)
+    } else {
+        0
+    };
+    let mut stack = col().w_full().min_w(0.0).padding(4.0).gap(4.0);
+    let mut is_report_form = false;
+    if total > 0 {
+        if has_thread_req && page == 0 {
+            stack = stack.child(dialog(s, p, page, total));
+        } else {
+            let crew_idx = page - thread_offset;
+            if let Some(item) = crew_items.get(crew_idx) {
+                stack = stack.child(crew_ui::needs_you_card(s, p, item, page, total, lane));
+            } else {
+                let report_idx = crew_idx - crew_items.len();
+                let pager = (total > 1).then(|| crew_ui::pager_controls(p, page, total));
+                if let Some(report_card) =
+                    crew_questions_ui::user_question_card(s, p, report_idx, pager)
+                {
+                    is_report_form = true;
+                    stack = stack.child(report_card);
+                }
+            }
+        }
+    }
+    if let Some(line) = captain_line {
+        if total > 0 {
+            stack = stack.child(el().h(1.0).mx(10.0).fill(p.line).hairline());
+        }
+        stack = stack.child(line);
+    }
+    let mut region = col()
+        .key(if is_home {
+            "needs-you"
+        } else {
+            "composer-request"
+        })
+        .role("region")
+        .label(if is_home {
+            "Needs you"
+        } else {
+            "Pending request"
+        })
+        .w_full()
+        .min_w(0.0)
+        .shrink();
+    if is_report_form {
+        region = region.max_h(220.0).scroll(ScrollSpec {
+            stick_bottom: false,
+        });
+    }
+    Some(region.child(stack))
+}
+
+/// KSG Code's `ComposerSurface.Shell`: the 16 px tray that holds the unified request
+/// banner, attached notices, the 15 px main card and the context strip under it, with a
+/// hairline rim painted above the inner surfaces (matching `ComposerSurface.Shell::after`)
+/// so the opaque card never covers the straight tray edges and the rim adds zero layout
+/// height. The shell is always present, while the strip joins only when content renders
+/// below the card.
+fn composer_shell(
+    s: &State,
+    p: Palette,
+    request_banner: Option<El>,
+    inner: El,
+    strip: Option<El>,
+) -> El {
     let rim = if !composer_disabled(s) && (s.attachment_drop_hover || s.current().draft.focused) {
         p.ring.alpha(0.6)
     } else {
@@ -13954,8 +14100,13 @@ fn composer_shell(s: &State, p: Palette, inner: El, strip: Option<El>) -> El {
             spread: 0.0,
             color: p.shadow.alpha(p.shadow.a * 0.6),
             inset: false,
-        })
-        .child(inner);
+        });
+    if let Some(banner) = request_banner {
+        shell = shell
+            .child(banner)
+            .child(el().w_full().h(1.0).fill(p.line).hairline());
+    }
+    shell = shell.child(inner);
     if let Some(strip) = strip {
         shell = shell.child(strip);
     }
@@ -15021,7 +15172,7 @@ struct AboveComposerBudget {
     floor: f32,
 }
 
-fn above_composer_budget(s: &State, _cap: f32, lane: f32) -> AboveComposerBudget {
+fn above_composer_budget(s: &State, _cap: f32, _lane: f32) -> AboveComposerBudget {
     let t = s.current();
     let mut parts = 0usize;
     let mut others_floor = 0.0f32;
@@ -15033,29 +15184,9 @@ fn above_composer_budget(s: &State, _cap: f32, lane: f32) -> AboveComposerBudget
         parts += 1;
         others_floor += 36.0;
     }
-    let has_needs_you = crew_ui::needs_you_shows(s);
-    if has_needs_you {
-        parts += 1;
-        // One paged 52 pt request card, or 84 pt when wrapped under 520 pt or showing a form.
-        others_floor += if lane < 520.0 || crew_ui::needs_you_active_is_form(s) {
-            84.0
-        } else {
-            52.0
-        };
-    }
     if crew_ui::crew_tray_shows(s) {
         parts += 1;
         others_floor += 28.0;
-    }
-    if s.plan_panel_open() {
-        parts += 1;
-        // Header (28) + footer (32) + padding/gaps (24) + scrolling body floor.
-        let min_body = if s.plan_panel.editor.is_some() {
-            144.0
-        } else {
-            120.0
-        };
-        others_floor += 84.0 + min_body;
     }
     let queued = t.native.queue.len() + t.native.steering.len() + t.native.follow_ups.len();
     if queued > 0 {
@@ -15161,11 +15292,46 @@ fn composer(
         );
     }
     let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
-    if t.native.questionnaire.is_some() && request_visible {
-        return area.child(pi_ui::questionnaire_drawer(s, p, lane));
+    // Delegation notices, queued messages, and the 28 pt Now / crew strip stay visible above
+    // `ComposerSurface.Shell`, even when a structured questionnaire replaces the draft card.
+    let viewport_cap = (s.viewport_height * 0.4).max(120.0);
+    let budget = above_composer_budget(s, viewport_cap, lane);
+    let cap = viewport_cap.max(budget.floor);
+    let mut stack = col()
+        .key("above-composer-stack")
+        .w_full()
+        .gap(6.0)
+        .min_h(0.0)
+        .max_h(cap);
+    for part in [
+        crew_ui::parent_bar(s, p, lane),
+        crew_ui::crew_bar(s, p, lane),
+        crew_ui::crew_tray(s, p, lane, None),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        stack = stack.child(part);
     }
-    if request_visible {
-        area = area.child(dialog(s, p));
+    if pi_ui::queued_messages_shows(s) {
+        stack = stack.child(pi_ui::queued_messages(s, p));
+    }
+    area = area.child(stack);
+    if t.native.questionnaire.is_some() && request_visible {
+        area = area.child(composer_shell(
+            s,
+            p,
+            None,
+            pi_ui::questionnaire_drawer(s, p, lane),
+            None,
+        ));
+        return col()
+            .key("composer-lane")
+            .w_full()
+            .pl(lane_gutter(pane_width) + lane_rect.inset_start)
+            .pr(lane_gutter(pane_width) + lane_rect.inset_end)
+            .items_center()
+            .child(area);
     }
     let show_resume = t.can_resume() && !t.has_draft_content() && t.queued_edit.is_none();
     let compact_before_send_tokens = if !collapsed && !show_resume && t.queued_edit.is_none() {
@@ -15387,40 +15553,6 @@ fn composer(
         || t.configuring
         || t.native.operating() && t.queued_edit.is_none()
         || t.request.is_some();
-    // Delegation context sits above the composer, nearest first: who sent this worker, then
-    // what the crew needs from the user, then what it is doing. The stack caps at 40% of the
-    // viewport, and the crew roster gives room first: when an open roster would push the
-    // stack past the cap it draws collapsed (its header's count still reads), as the
-    // toggle's closed state does.
-    let viewport_cap = (s.viewport_height * 0.4).max(120.0);
-    let budget = above_composer_budget(s, viewport_cap, lane);
-    // The stack caps at 40% of the viewport, yielding only to the minimum floors so controls
-    // stay reachable on short windows.
-    let cap = viewport_cap.max(budget.floor);
-    let needs_you_part = crew_ui::needs_you(s, p, lane);
-    let tray = crew_ui::crew_tray(s, p, lane, None);
-    let mut stack = col()
-        .key("above-composer-stack")
-        .w_full()
-        .gap(8.0)
-        .min_h(0.0)
-        .max_h(cap);
-    for part in [
-        crew_ui::parent_bar(s, p, lane),
-        crew_ui::crew_bar(s, p, lane),
-        needs_you_part,
-        tray,
-        plan_ui::plan_panel(s, p, lane),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        stack = stack.child(part);
-    }
-    if pi_ui::queued_messages_shows(s) {
-        stack = stack.child(pi_ui::queued_messages(s, p));
-    }
-    area = area.child(stack);
     // KSG Code's `ComposerSurface.Main`: a 15 px card with a hairline outline. A composer that
     // cannot send drops its shadow and its frame takes the lighter `line` colour.
     // The resting row and the prompt body swap at once, so a press right after expanding
@@ -15760,6 +15892,7 @@ fn composer(
             .child(area.child(composer_shell(
                 s,
                 p,
+                composer_request_banner(s, p, lane),
                 attach_composer_notices(s, p, lane, composer_card),
                 None,
             )));
@@ -15963,6 +16096,7 @@ fn composer(
     area = area.child(composer_shell(
         s,
         p,
+        composer_request_banner(s, p, lane),
         attach_composer_notices(s, p, lane, composer_card),
         Some(footer),
     ));
@@ -17267,7 +17401,10 @@ fn approval_actions(s: &State, id: usize, inline: bool, allowed: bool, p: Palett
     actions
 }
 
-fn dialog(s: &State, p: Palette) -> El {
+/// Ported from KSG Code's `ComposerRequestCard`: 32 pt header with tone icon, title and
+/// optional pager, inset `surface-well` body/input, and footer actions inside the composer
+/// tray.
+fn dialog(s: &State, p: Palette, page: usize, total: usize) -> El {
     let t = s.current();
     let request = t.request.as_ref().expect("pending dialog");
     let remote = s.remote_task(t.id);
@@ -17276,28 +17413,72 @@ fn dialog(s: &State, p: Palette) -> El {
             .as_ref()
             .is_some_and(|c| c.commands_for(&r.server_id).is_some())
     });
+    let method = crate::model::string(request, "method");
     let can_answer = linked
         && remote.is_none_or(|r| s.machine_connected(&r.server_id))
-        && matches!(
-            crate::model::string(request, "method"),
-            "confirm" | "input" | "editor" | "select"
+        && matches!(method, "confirm" | "input" | "editor" | "select");
+    let title = crate::model::string(request, "title");
+    let message = crate::model::string(request, "message");
+    let header_icon = if method == "confirm" {
+        "shield"
+    } else {
+        "info"
+    };
+    let mut header = row()
+        .min_h(32.0)
+        .w_full()
+        .min_w(0.0)
+        .pl(10.0)
+        .pr(13.0)
+        .center_y()
+        .gap(8.0)
+        .child(icon(header_icon, p.brass).size(13.0, 13.0).a11y_hidden())
+        .child(
+            label(
+                if title.is_empty() {
+                    if method == "confirm" {
+                        "Approval required"
+                    } else {
+                        "Input required"
+                    }
+                } else {
+                    title
+                },
+                LABEL,
+                p.ink,
+            )
+            .grow(1.0)
+            .min_w(0.0)
+            .wrap(),
         );
+    if total > 1 {
+        header = header.child(crew_ui::pager_controls(p, page, total));
+    }
     let mut card = col()
         .key("pi-dialog")
         .role("group")
         .label("Pi needs your input")
-        .padding(13.0)
-        .gap(10.0)
-        .radius(12.0)
-        .fill(p.coral_bg)
-        .border(1.0, p.line)
-        .child(label(crate::model::string(request, "title"), LABEL, p.ink).wrap())
-        .child(label(crate::model::string(request, "message"), BODY, p.ink).wrap());
-    if !t.requests_supported {
-        card = card.child(label(crate::protocol::REQUESTS_UPDATE_REQUIRED, SMALL, p.danger).wrap());
+        .w_full()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(header);
+    if !message.is_empty() {
+        card = card.child(request_card_well(
+            p,
+            false,
+            label(message, BODY, p.ink).wrap(),
+        ));
     }
-    let mut actions = row().gap(6.0).flex_wrap();
-    match crate::model::string(request, "method") {
+    if !t.requests_supported {
+        card = card.child(
+            label(crate::protocol::REQUESTS_UPDATE_REQUIRED, SMALL, p.danger)
+                .pl(10.0)
+                .pr(13.0)
+                .wrap(),
+        );
+    }
+    let mut actions = row().gap(6.0).flex_wrap().center_y();
+    match method {
         "confirm" => {
             actions = approval_actions(s, t.id, false, can_answer, p);
         }
@@ -17321,20 +17502,23 @@ fn dialog(s: &State, p: Palette) -> El {
         }
         _ => {
             card = card.child(
-                text_input(&t.reply, BODY)
-                    .key("dialog-reply")
-                    .label("Reply to Pi")
-                    .placeholder(crate::model::string(request, "placeholder"), p.muted)
-                    .color(p.ink)
-                    .min_h(32.0)
-                    .max_h(120.0)
-                    .px(8.0)
-                    .py(6.0)
-                    .radius(12.0)
-                    .fill(p.card)
-                    .field_focus(&t.reply, p)
-                    .disabled(!can_answer)
-                    .on_edit(|s: &mut State| &mut s.current_mut().reply),
+                col().pl(10.0).pr(13.0).w_full().min_w(0.0).child(
+                    text_input(&t.reply, BODY)
+                        .key("dialog-reply")
+                        .label("Reply to Pi")
+                        .placeholder(crate::model::string(request, "placeholder"), p.muted)
+                        .color(p.ink)
+                        .w_full()
+                        .min_h(32.0)
+                        .max_h(120.0)
+                        .px(10.0)
+                        .py(6.0)
+                        .radius(8.0)
+                        .fill(p.card)
+                        .field_focus(&t.reply, p)
+                        .disabled(!can_answer)
+                        .on_edit(|s: &mut State| &mut s.current_mut().reply),
+                ),
             );
             actions = actions.child(button("dialog-submit", "Submit reply", p, |s| {
                 let value = s.current().reply.text.clone();
@@ -17342,31 +17526,36 @@ fn dialog(s: &State, p: Palette) -> El {
             }));
         }
     }
-    if request["method"] != "confirm" {
+    if method != "confirm" {
         actions = actions.child(button("dialog-cancel", "Cancel", p, |s| {
             let _ = s.respond_to_request(s.current().id, json!({"cancelled":true}));
         }));
     }
-    card = card.child(actions.disabled(!can_answer));
+    let mut footer_row = row()
+        .gap(6.0)
+        .flex_wrap()
+        .center_y()
+        .child(actions.disabled(!can_answer));
     if !linked && let Some(remote) = remote {
-        card = card
-            .child(
-                label(
-                    format!("Link this desktop to {} to answer.", remote.label),
-                    SMALL,
-                    p.muted,
-                )
-                .wrap(),
+        card = card.child(
+            label(
+                format!("Link this desktop to {} to answer.", remote.label),
+                SMALL,
+                p.muted,
             )
-            .child(crew_ui::ghost_button(
-                s,
-                "dialog-link-machine".into(),
-                "Link machine",
-                p,
-                |s| s.machines.dialog = true,
-            ));
+            .pl(10.0)
+            .pr(13.0)
+            .wrap(),
+        );
+        footer_row = footer_row.child(crew_ui::ghost_button(
+            s,
+            "dialog-link-machine".into(),
+            "Link machine",
+            p,
+            |s| s.machines.dialog = true,
+        ));
     }
-    card
+    card.child(request_card_footer(footer_row))
 }
 
 const LONG_PREAMBLE: &str = "Starting the audit.\n\n";
@@ -21845,7 +22034,21 @@ pub(crate) mod tests {
             assert_inside(
                 &mut rt,
                 width,
-                &["plan-panel", "plan-empty", "plan-new-draft", "plan-start"],
+                &[
+                    "right-panel",
+                    "plan-panel",
+                    "plan-empty",
+                    "plan-new-draft",
+                    "plan-start",
+                ],
+            );
+            // The task plan lives inside the Inspector's Crew tab, not above the composer.
+            let right_rect = rt.presented("right-panel").unwrap().0;
+            let plan_rect = rt.presented("plan-panel").unwrap().0;
+            assert!(
+                plan_rect[0] >= right_rect[0] - 1.0
+                    && plan_rect[0] + plan_rect[2] <= right_rect[0] + right_rect[2] + 1.0,
+                "{width}: plan panel should dock inside right-panel: {plan_rect:?} vs {right_rect:?}"
             );
             // Three drafts allocate nothing: no task, thread or provider.
             let (threads, tasks) = (rt.state.threads.len(), rt.state.tasks_for(home).len());
@@ -22138,23 +22341,38 @@ pub(crate) mod tests {
     fn the_crew_tab_lists_each_member_once_grouped_by_state_at_all_widths() {
         for width in [1280.0] {
             let mut rt = crew_runtime(width);
-            // The strip is a flat 28 pt row that opens the Crew tab; it never expands.
+            // The strip is a flat 28 pt row that toggles the dismissible Now popover.
             let header = rt.presented("crew-roster-toggle").unwrap().0;
             assert!((header[3] - 28.0).abs() < 0.5, "{width}: {header:?}");
+            assert!(rt.presented("now-popover").is_none());
             assert!(rt.presented("crew-roster-rows").is_none());
             press(&mut rt, "crew-roster-toggle");
             rt.frame(1.0);
+            assert_inside(
+                &mut rt,
+                width,
+                &["now-popover", "now-popover-open-inspector"],
+            );
+            assert!(rt.presented("right-panel").is_none(), "{width}");
+            // Escape dismisses the popover without opening the Inspector.
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Escape,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+            rt.frame(1.0);
+            assert!(rt.presented("now-popover").is_none(), "{width}");
+            // Reopen and use the footer action to open the full Inspector Crew tab.
+            press(&mut rt, "crew-roster-toggle");
+            rt.frame(1.0);
+            press(&mut rt, "now-popover-open-inspector");
+            rt.frame(1.0);
+            assert!(rt.presented("now-popover").is_none(), "{width}");
             assert_eq!(
                 rt.state.right_panel_active_view(),
                 Some(crate::right_panel::PanelView::Crew),
                 "{width}"
             );
-            // Pressing again hides the panel, KSG-toggle style.
-            press(&mut rt, "crew-roster-toggle");
-            rt.frame(1.0);
-            assert!(rt.presented("right-panel").is_none(), "{width}");
-            press(&mut rt, "crew-roster-toggle");
-            rt.frame(1.0);
             assert_inside(
                 &mut rt,
                 width,
@@ -22190,6 +22408,89 @@ pub(crate) mod tests {
                 "{width}: groups out of order"
             );
         }
+    }
+
+    #[test]
+    fn composer_request_banner_pages_thread_and_crew_requests_and_now_strip_works_for_subagents() {
+        // 1. Unified request surface inside ComposerSurface.Shell: a Captain home with both
+        // its own pending confirm dialog and a crew approval pages both in one banner.
+        let mut rt = crew_runtime(1280.0);
+        rt.state.current_mut().apply(json!({
+            "type": "extension_ui_request",
+            "id": "home-confirm",
+            "method": "confirm",
+            "title": "Run cargo test?",
+            "message": "Allow running cargo test in this workspace."
+        }));
+        rt.invalidate();
+        rt.frame(0.0);
+        let shell = rt.presented("composer-shell").unwrap().0;
+        let dialog = rt.presented("pi-dialog").unwrap().0;
+        assert!(
+            dialog[1] >= shell[1] - 1.0 && dialog[1] + dialog[3] <= shell[1] + shell[3] + 1.0,
+            "request banner should dock inside composer-shell: {dialog:?} vs {shell:?}"
+        );
+        assert!(rt.presented("needs-you-2").is_none());
+        assert_eq!(
+            element_text(&rt, "needs-you-page-count").as_deref(),
+            Some("1/2")
+        );
+        press(&mut rt, "needs-you-next");
+        rt.frame(0.5);
+        rt.frame(0.5);
+        assert!(rt.presented("pi-dialog").is_none());
+        assert!(rt.presented("needs-you-2").is_some());
+        assert_eq!(
+            element_text(&rt, "needs-you-page-count").as_deref(),
+            Some("2/2")
+        );
+
+        // 2. A questionnaire on a Captain home keeps the Now / crew strip visible above the shell.
+        let mut rt = crew_runtime(1280.0);
+        rt.state.current_mut().apply(json!({
+            "type": "extension_ui_request",
+            "id": "home-form",
+            "method": "input",
+            "questions": [
+                {"id": "q1", "header": "Scope", "question": "Pick one", "options": [{"label": "Local"}]}
+            ]
+        }));
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.presented("questionnaire-drawer").is_some());
+        assert!(rt.presented("crew-tray").is_some());
+
+        // 3. A plain thread with a provider subagent shows the same 28 pt Now strip and popover.
+        let mut plain = runtime(1280.0);
+        plain.state.current_mut().apply(json!({
+            "type": "tool_execution_start",
+            "toolCallId": "sub-1",
+            "toolName": "subagent",
+            "args": {"tasks": [{"agent": "Reviewer", "task": "Audit C4 layout"}]}
+        }));
+        plain.invalidate();
+        plain.frame(0.0);
+        let strip = plain.presented("crew-roster-toggle").unwrap().0;
+        assert!((strip[3] - 28.0).abs() < 0.5, "{strip:?}");
+        press(&mut plain, "crew-roster-toggle");
+        plain.frame(0.0);
+        assert_inside(
+            &mut plain,
+            1280.0,
+            &[
+                "now-popover",
+                "now-popover-agent-sub-1-0",
+                "now-popover-open-inspector",
+            ],
+        );
+        press(&mut plain, "now-popover-open-inspector");
+        plain.frame(0.5);
+        assert!(!plain.state.now_popover);
+        assert!(plain.presented("now-popover").is_none());
+        assert_eq!(
+            plain.state.right_panel_active_view(),
+            Some(crate::right_panel::PanelView::Agents)
+        );
     }
 
     /// Opens `count` distinct threads. Each has a title and a sent message, so none is a blank

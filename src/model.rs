@@ -5262,9 +5262,11 @@ pub struct State {
     /// Whether the Snoozed and Settled shelves are open.
     pub shelves: [bool; 2],
     pub settled_visible: usize,
-    /// Which request the one-row needs-you bar above the composer is showing, clamped to
+    /// Which request the unified composer request banner is showing, clamped to
     /// the live request count each frame (spec §3.6).
     pub needs_you_page: usize,
+    /// Whether the dismissible Now / crew & subagents popover above the composer is open.
+    pub now_popover: bool,
     pub undo: Option<UndoNotice>,
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
@@ -6401,6 +6403,7 @@ impl State {
             shelves: [false; 2],
             settled_visible: 10,
             needs_you_page: 0,
+            now_popover: false,
             undo: None,
             toasts: Vec::new(),
             next_toast_id: 1,
@@ -6695,6 +6698,7 @@ impl State {
             && !self.env_mode_picker
             && !self.base_branch_picker
             && !self.stash_menu
+            && !self.now_popover
             && !self.composer_ui.overflow.get()
             && self.code_picker.open.is_none()
             && self.attachment_preview.is_none()

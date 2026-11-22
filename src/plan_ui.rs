@@ -627,7 +627,7 @@ fn override_actions(s: &State, p: Palette, busy: bool) -> El {
         )
 }
 
-/// The panel itself, between the crew tray and the composer.
+/// The task plan panel, mounted inside the Inspector's Crew tab when toggled open.
 pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
     if !s.plan_panel_open() {
         return None;
@@ -763,7 +763,7 @@ pub(super) fn plan_panel(s: &State, p: Palette, _lane: f32) -> Option<El> {
         body = body.child(list);
     }
     let body_max = if s.viewport_height > 0.0 {
-        (s.viewport_height * 0.2).clamp(120.0, LIST_MAX)
+        (s.viewport_height * 0.34).clamp(144.0, 360.0)
     } else {
         LIST_MAX
     };

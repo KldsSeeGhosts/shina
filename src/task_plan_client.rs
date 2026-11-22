@@ -154,10 +154,14 @@ impl State {
             self.plan_panel = PlanPanel::default();
             return;
         }
+        self.now_popover = false;
         self.plan_panel = PlanPanel {
             open: Some((self.machines.selected.clone(), home)),
             ..PlanPanel::default()
         };
+        let key = self.panel_key();
+        self.right_panels
+            .open(&key, crate::right_panel::SingletonKind::Crew);
         if let Err(error) = self.plan_capability() {
             self.plan_panel.error = Some(error);
             return;

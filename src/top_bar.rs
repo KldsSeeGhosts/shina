@@ -417,7 +417,8 @@ fn actions(
         p,
         |s: &mut State| s.right_panel_toggle(),
     );
-    let needs_you = crew_ui::needs_you_shows(s);
+    let needs_you =
+        !crew_ui::needs_you_items(s).is_empty() || super::crew_questions_ui::cards_shows(s);
     if !panel_open && (needs_you || crate::agents::active_count(s.current()) > 0) {
         panel = panel.child(
             el().size(6.0, 6.0)
