@@ -86,6 +86,30 @@ fn mono(value: impl Into<String>, p: Palette) -> El {
     .selectable(true)
 }
 
+/// Ported from KSG Code's `WORK_LOG_OUTPUT_CLASS_NAME`: quiet mono tool output.
+fn mono_muted(value: impl Into<String>, p: Palette) -> El {
+    label(
+        value,
+        TextStyle::new(12.0, 400.0)
+            .family(rune::Family::SystemMono)
+            .lh(18.0),
+        p.muted,
+    )
+    .min_w(0.0)
+    .wrap_anywhere()
+    .selectable(true)
+}
+
+/// A radius-8 `surface-well` frame used only for embedded commands, diffs, and raw payloads.
+fn code_well(p: Palette) -> El {
+    col()
+        .min_w(0.0)
+        .radius(8.0)
+        .clip_rounded(8.0)
+        .fill(p.code_bg)
+        .border(1.0, p.line)
+}
+
 fn block(key: String, content: El, running: bool) -> El {
     col()
         .key(key)
@@ -149,7 +173,7 @@ fn output(tool: &Tool, p: Palette, id: &str) -> El {
     };
     block(
         format!("tool-text-output-{id}"),
-        padded(mono(text, p)),
+        mono_muted(text, p).py(2.0),
         !tool.done,
     )
 }
@@ -186,12 +210,23 @@ pub(super) fn thought_head(s: &State, p: Palette, indices: &[usize]) -> El {
     } else {
         format!("Thought ×{}", indices.len())
     };
+    // Ported from KSG Code's collapsed reasoning preview: show the first line/heading while folded.
+    let preview = (!expanded)
+        .then(|| {
+            indices
+                .iter()
+                .map(|&index| live_thought_line(&t.thoughts[index].text))
+                .find(|line| !line.is_empty())
+        })
+        .flatten()
+        .unwrap_or_default();
     activity_line(
         key,
         format!("{} thinking text", if expanded { "Hide" } else { "Show" }),
-        (title, ""),
+        (title, preview.as_str()),
         false,
         expanded,
+        false,
         "brain",
         p,
     )
@@ -224,7 +259,7 @@ pub(super) fn thought_body(s: &State, p: Palette, index: usize) -> El {
         .role("group")
         .label("Thinking text")
         .min_w(0.0)
-        .pl(28.0)
+        .pl(30.0)
         .mb(4.0)
         .max_h(200.0)
         .scroll(ScrollSpec {
@@ -245,7 +280,9 @@ pub(super) fn thought_body(s: &State, p: Palette, index: usize) -> El {
         )
 }
 
-/// The existing output frame owns padding and caps, not a second inspector or drawer.
+/// Ported from KSG Code's `WorkLogDetails` (`ms-7.5` unboxed indent, quiet mono output) and
+/// `V2ItemInspector`: plain outputs stay unboxed and indented; commands and diffs keep a radius-8
+/// `surface-well`.
 pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let tool = &t.tools[index];
@@ -256,26 +293,25 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
         .role("group")
         .label(format!("Output for {}", tool_title(tool)))
         .min_w(0.0)
-        .mb(4.0)
-        .ml(28.0)
-        .radius(12.0)
-        .fill(p.code_bg)
-        .border(1.0, p.line);
+        .mb(6.0)
+        .ml(30.0)
+        .gap(6.0);
     match tool.resolved_kind() {
         ToolKind::Command => {
             body = body
-                .child(block(
-                    format!("tool-command-{id}"),
-                    padded(
-                        col()
-                            .min_w(0.0)
-                            .gap(4.0)
-                            .child(meta_text("sh", p.muted))
-                            .child(mono(input_text(tool, &["command", "cmd"]), p)),
-                    ),
-                    false,
-                ))
-                .child(rule(p))
+                .child(
+                    code_well(p).child(block(
+                        format!("tool-command-{id}"),
+                        padded(
+                            col()
+                                .min_w(0.0)
+                                .gap(4.0)
+                                .child(meta_text("sh", p.muted))
+                                .child(mono(input_text(tool, &["command", "cmd"]), p)),
+                        ),
+                        false,
+                    )),
+                )
                 .child(output(tool, p, &id));
         }
         ToolKind::FileChange if !tool.changes.is_empty() => {
@@ -304,8 +340,10 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         }),
                 );
                 if let Some(old) = &change.old_path {
-                    heading =
-                        heading.child(mono(format!("Previously {}", relative(old, &root)), p));
+                    heading = heading.child(mono_muted(
+                        format!("Previously {}", relative(old, &root)),
+                        p,
+                    ));
                 }
                 let mut meta = row().gap(8.0).child(meta_text(&change.operation, p.muted));
                 if !change.diff.is_empty() {
@@ -314,7 +352,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         p.muted,
                     ));
                 }
-                body = body.child(padded(heading.child(meta)));
+                body = body.child(heading.child(meta));
                 if !change.diff.is_empty() {
                     let mut lines = col().min_w(0.0).py(6.0);
                     for (line, value) in change.diff.lines().enumerate() {
@@ -322,36 +360,34 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                             .key(format!("tool-diff-line-{id}-{file}-{line}"))
                             .px(12.0);
                         if let Some(added) = crate::work::diff_line_kind(value) {
-                            // Added lines take the sea pair and removed lines the danger
-                            // pair. The +/- gutter stays, so colour is never the only cue.
+                            // Added lines use ok_bg/ok and removed lines use danger_bg/danger.
+                            // The +/- gutter stays, so colour is never the only cue.
                             let (fill, edge) = if added {
-                                (p.sea_bg, p.sea)
+                                (p.ok_bg, p.ok)
                             } else {
-                                (p.coral_bg, p.danger)
+                                (p.danger_bg, p.danger)
                             };
                             content = content.fill(fill).border_sides([0.0, 0.0, 0.0, 2.0], edge);
                         }
                         lines = lines.child(content);
                     }
-                    body = body.child(rule(p)).child(block(
+                    body = body.child(code_well(p).child(block(
                         format!("tool-diff-{id}-{file}"),
                         lines,
                         false,
-                    ));
+                    )));
                 }
             }
             if tool.failed && !tool.output.is_empty() {
-                body = body.child(rule(p)).child(output(tool, p, &id));
+                body = body.child(output(tool, p, &id));
             }
         }
         ToolKind::FileSearch => {
-            body = body
-                .child(block(
-                    format!("tool-pattern-{id}"),
-                    padded(mono(input_text(tool, &["pattern", "query"]), p)),
-                    false,
-                ))
-                .child(rule(p));
+            body = body.child(block(
+                format!("tool-pattern-{id}"),
+                mono(input_text(tool, &["pattern", "query"]), p),
+                false,
+            ));
             let results = tool.structured["fileSearchResults"].as_array();
             if let Some(results) = results.filter(|r| !r.is_empty()) {
                 let mut list = col().min_w(0.0).gap(4.0);
@@ -369,28 +405,18 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         .min_w(0.0)
                         .child(mono(path, p));
                     if let Some(preview) = result["preview"].as_str() {
-                        entry = entry.child(mono(preview, p));
+                        entry = entry.child(mono_muted(preview, p));
                     }
                     list = list.child(entry);
                 }
-                body = body.child(block(
-                    format!("tool-search-results-{id}"),
-                    padded(list),
-                    false,
-                ));
+                body = body.child(block(format!("tool-search-results-{id}"), list, false));
             } else {
                 body = body.child(output(tool, p, &id));
             }
         }
         ToolKind::WebSearch => {
             let query = input_text(tool, &["query", "url", "queries", "patterns"]);
-            body = body
-                .child(block(
-                    format!("tool-query-{id}"),
-                    padded(mono(query, p)),
-                    false,
-                ))
-                .child(rule(p));
+            body = body.child(block(format!("tool-query-{id}"), mono(query, p), false));
             let results = tool.structured["webResults"].as_array();
             if let Some(results) = results.filter(|r| !r.is_empty()) {
                 let mut list = col().min_w(0.0).gap(6.0);
@@ -420,7 +446,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                     }
                     list = list.child(entry);
                 }
-                body = body.child(block(format!("tool-web-results-{id}"), padded(list), false));
+                body = body.child(block(format!("tool-web-results-{id}"), list, false));
             } else {
                 body = body.child(output(tool, p, &id));
             }
@@ -432,7 +458,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                     fields = fields.child(
                         col()
                             .min_w(0.0)
-                            .child(label(key, SMALL, p.muted))
+                            .child(label(key, SMALL, p.faint))
                             .child(mono(
                                 value
                                     .as_str()
@@ -442,24 +468,20 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                             )),
                     );
                 }
-            } else {
+            } else if !tool.detail.is_empty() {
                 fields = fields.child(mono(&tool.detail, p));
             }
             body = body
-                .child(block(format!("tool-fields-{id}"), padded(fields), false))
-                .child(rule(p))
+                .child(block(format!("tool-fields-{id}"), fields, false))
                 .child(output(tool, p, &id));
         }
     }
     if let Some(exit) = tool.exit_code.filter(|exit| *exit != 0) {
-        body = body.child(
-            padded(meta_text(format!("Exit code {exit}"), p.muted)).key(format!("tool-exit-{id}")),
-        );
+        body = body
+            .child(meta_text(format!("Exit code {exit}"), p.muted).key(format!("tool-exit-{id}")));
     }
     if let Some(parent) = &tool.parent_call {
-        body = body.child(padded(
-            label(format!("Called by {parent}"), SMALL, p.muted).wrap_anywhere(),
-        ));
+        body = body.child(label(format!("Called by {parent}"), SMALL, p.muted).wrap_anywhere());
     }
     if !tool.images.is_empty() {
         body = body.child(message_images(
@@ -469,7 +491,7 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
             &format!("tool-image-{id}"),
         ));
     }
-    body.child(rule(p)).child(raw(s, p, index))
+    body.child(raw(s, p, index))
 }
 
 /// Ported from KSG's HtmlRenderFrame and HtmlRenderTimelineRow placement.
@@ -552,7 +574,7 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
     let tool = &s.current().tools[index];
     let tool_id = tool.id.clone();
     let id = format!("{}-{index}", s.current().id);
-    let mut body = col().min_w(0.0).child(
+    let mut body = col().min_w(0.0).gap(4.0).child(
         row()
             .key(format!("tool-raw-toggle-{id}"))
             .role("button")
@@ -562,14 +584,15 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
             .cursor(rune::Cursor::Pointer)
             .center_y()
             .gap(4.0)
-            .px(12.0)
-            .py(8.0)
+            .px(6.0)
+            .ml(-6.0)
+            .py(4.0)
+            .radius(6.0)
             .hover(p.selected)
             .child(meta_text("Raw", p.muted))
-            .child(icon(
-                if tool.raw_expanded { "chevron" } else { "open" },
-                p.faint,
-            ))
+            .child(
+                icon(if tool.raw_expanded { "chevron" } else { "open" }, p.faint).size(12.0, 12.0),
+            )
             .on_press(move |s: &mut State| {
                 let thread = s.current_mut();
                 if let Some(tool) = thread.tools.iter_mut().find(|tool| tool.id == tool_id) {
@@ -580,7 +603,7 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
             }),
     );
     if tool.raw_expanded {
-        body = body.child(block(
+        body = body.child(code_well(p).child(block(
             format!("tool-raw-{id}"),
             padded(mono(
                 truncate(
@@ -590,7 +613,7 @@ fn raw(s: &State, p: Palette, index: usize) -> El {
                 p,
             )),
             false,
-        ));
+        )));
     }
     body
 }
@@ -749,6 +772,7 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
             false,
             !tool.done,
             &format!("plan-{id}"),
+            &s.unwrapped_code_blocks,
             with_find
                 .then(|| {
                     query.map(|query| {

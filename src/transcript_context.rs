@@ -437,6 +437,7 @@ impl<'a> Document<'a> {
                     true,
                     false,
                     &identity,
+                    &self.state.unwrapped_code_blocks,
                     None,
                 )
             }

@@ -552,7 +552,8 @@ pub(super) fn digest_section(s: &State, p: Palette, captain: usize) -> El {
                 false,
                 false,
                 false,
-                "brief-digest-markdown",
+                &format!("brief-digest-{}-{captain}", s.machines.selected),
+                &s.unwrapped_code_blocks,
                 None,
             )),
     );
