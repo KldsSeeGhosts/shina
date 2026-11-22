@@ -1490,6 +1490,7 @@ impl Profile {
             .args(args)
             .env("LOCALAPPDATA", &self.root)
             .env("XDG_DATA_HOME", &self.root)
+            .env("T3CODE_HOME", self.root.join("t3-fixture"))
             .env("PI_CODING_AGENT_DIR", self.root.join("enrollment"))
             .env("SHINA_PI_CLI", self.root.join("fake_pi.js"))
             .env("SHINA_CODEX_CLI", self.root.join("no-real-codex"))
@@ -3425,6 +3426,43 @@ fn paired_cli_client_starts_views_steers_and_stops_only_the_remote_server() {
     assert!(a.cli(&["links"]).stdout.is_empty());
     a.stop();
     b.stop();
+}
+
+#[test]
+fn registered_acp_catalog_reaches_the_picker_before_the_first_send() {
+    let mut profile = Profile::new();
+    profile.launch(&["serve"]);
+    let mut client = profile.client(uuid::Uuid::new_v4());
+    let hello = client.rpc(
+        "hello",
+        json!({"protocolMajor":1,"protocolMinor":protocol::MINOR,"projectionSchema":1}),
+        json!("acp-catalog-before-send"),
+    );
+    assert!(hello["error"].is_null(), "{hello}");
+    client.until(|state| {
+        let catalog = &state["nativeCatalogs"]["fixture-acp"];
+        catalog["ready"] == true && catalog["models"][0]["id"] == "fixture-model"
+    });
+    let catalog = &client.snapshot["nativeCatalogs"]["fixture-acp"];
+    assert_eq!(catalog["name"], "Fixture ACP");
+    assert_eq!(catalog["models"][0]["is_default"], true);
+    let records: Vec<Value> = fs::read_to_string(profile.root.join("acp-log.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let setup = records
+        .iter()
+        .find(|record| record["method"] == "session/new")
+        .unwrap();
+    assert_eq!(setup["params"]["mcpServers"], json!([]));
+    assert_eq!(setup["params"]["cwd"], json!(profile.root.join("Shina")));
+    assert!(
+        !records
+            .iter()
+            .any(|record| record["method"] == "session/prompt")
+    );
+    profile.stop();
 }
 
 #[test]

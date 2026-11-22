@@ -320,6 +320,13 @@ fn strip_label_suffix(name: &str) -> &str {
     }
     name
 }
+
+fn gateway_model_label<'a>(route: &str, name: &'a str) -> &'a str {
+    let label = name.trim();
+    let suffix = format!(" ({route})");
+    strip_label_suffix(label.strip_suffix(&suffix).unwrap_or(label))
+}
+
 /// KSG `antigravityGatewayModelRows`: group configured routes by family. A configured
 /// tier the agent folds into the family option stays, named after the family.
 pub fn gateway_model_rows(selections: &[String], models: &[(String, String)]) -> Vec<GatewayRow> {
@@ -333,7 +340,13 @@ pub fn gateway_model_rows(selections: &[String], models: &[(String, String)]) ->
             }
             matched = true;
             let family = route_family(value).to_owned();
-            gateway_insert(&mut grouped, &mut index, &family, value, name);
+            gateway_insert(
+                &mut grouped,
+                &mut index,
+                &family,
+                value,
+                gateway_model_label(value, name),
+            );
         }
         if matched || !has_route_suffix(selection) {
             continue;
@@ -342,11 +355,17 @@ pub fn gateway_model_rows(selections: &[String], models: &[(String, String)]) ->
         // does not know. The gateway still serves a configured tier of a family the
         // agent advertises, so keep it rather than hide a working level.
         let family = route_family(selection).to_owned();
-        if let Some((_, name)) = models
+        if let Some((route, name)) = models
             .iter()
             .find(|(v, _)| v == &family || route_family(v) == family)
         {
-            gateway_insert(&mut grouped, &mut index, &family, selection, name);
+            gateway_insert(
+                &mut grouped,
+                &mut index,
+                &family,
+                selection,
+                gateway_model_label(route, name),
+            );
         }
     }
     grouped
@@ -381,11 +400,10 @@ pub fn gateway_model_rows(selections: &[String], models: &[(String, String)]) ->
                     .count()
                     > 1;
             let name = {
-                let trimmed = strip_label_suffix(first.1.trim());
-                if trimmed.is_empty() {
+                if first.1.is_empty() {
                     family.clone()
                 } else {
-                    trimmed.to_owned()
+                    first.1
                 }
             };
             GatewayRow {
@@ -1049,16 +1067,25 @@ pub fn session_models(
         } else {
             name
         };
-        let name = if names.contains(&base) {
+        let name = if !names.insert(base.clone()) {
             format!("{base} ({value})")
         } else {
             base
         };
-        names.insert(name.clone());
+        let thinking = if current.as_deref() == Some(value.as_str()) {
+            current_thinking.cloned()
+        } else if let Some(observed) = thinking_levels.get(&value) {
+            observed.clone()
+        } else {
+            current_thinking.cloned().map(|mut option| {
+                option["currentValue"] = Value::Null;
+                option
+            })
+        };
         models.push(json!({"slug":value,"name":name,
             "isDefault":current.as_deref()==Some(value.as_str()),
             "aliases":(current.as_deref()==Some(value.as_str())).then(||vec![DEFAULT_MODEL]),
-            "thinking":thinking_levels.get(&value).cloned().flatten().or_else(||current_thinking.cloned().filter(|_|current.as_deref()==Some(value.as_str())))}));
+            "thinking":thinking}));
     }
     (models, current)
 }
@@ -1084,27 +1111,44 @@ pub fn manifest() -> &'static Value {
             .clone()
     })
 }
-/// KSG `catalogServerModel`/`applyModelCatalog` join: display name, legacy badge, alias.
-pub fn apply_manifest(models: &mut Vec<Value>) {
-    let entries = manifest()["models"].as_array().cloned().unwrap_or_default();
+/// KSG `applyModelCatalog`: classify live rows and move the default alias. The
+/// bundled display names belong to fallback rows, never to a live advertisement.
+pub fn apply_manifest(models: &mut [Value]) {
+    let entries = manifest()["models"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     for model in models.iter_mut() {
         let slug = model["slug"].as_str().unwrap_or("");
-        let Some(entry) = entries.iter().find(|e| e["slug"] == slug) else {
-            continue;
-        };
-        if let Some(name) = entry["name"].as_str() {
-            model["name"] = json!(name);
-        }
-        if entry["status"] == "legacy" {
-            model["isLegacy"] = json!(true);
-        }
+        model["isLegacy"] = json!(
+            entries
+                .iter()
+                .any(|entry| entry["slug"] == slug && entry["status"] == "legacy")
+        );
     }
-    if !models.iter().any(|m| m["isDefault"] == true)
-        && let Some(default) = manifest()["defaults"]["chat"].as_str()
-        && let Some(model) = models.iter_mut().find(|m| m["slug"] == default)
+    if let Some(default) = manifest()["defaults"]["chat"].as_str()
+        && let Some(next) = models.iter().position(|m| m["slug"] == default)
+        && let Some(previous) = models
+            .iter()
+            .position(|m| m["isDefault"] == true && m["slug"] != default)
     {
-        model["isDefault"] = json!(true);
-        model["aliases"] = json!([DEFAULT_MODEL]);
+        let old_aliases = models[previous]["aliases"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        models[previous]["isDefault"] = json!(false);
+        models[previous]["aliases"] = Value::Null;
+        models[next]["isDefault"] = json!(true);
+        let mut aliases = models[next]["aliases"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for alias in old_aliases {
+            if !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+        models[next]["aliases"] = json!(aliases);
     }
 }
 /// Fallback Antigravity catalog from `assets/model-manifest.json` before a live session reports models.

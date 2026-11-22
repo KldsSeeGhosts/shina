@@ -144,10 +144,19 @@ fn catalog_models_map_items_to_wire_rows_with_parameter_descriptors() {
 #[test]
 fn list_models_reads_cli_lines_and_json_output() {
     let rows = list_models(
-        "Available models:\n  - auto\n  - gpt-5\n1. claude-4.5-sonnet\n  opus-4.6 - recommended\n  gpt-5\n",
+        "Available models:\n  - auto\n  - gpt-5\n1. claude-4.5-sonnet\n  opus-4.6 - recommended\n  gpt-5\n3.5-model\n",
     );
     let ids: Vec<_> = rows.iter().map(|m| m["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, ["auto", "gpt-5", "claude-4.5-sonnet", "opus-4.6"]);
+    assert_eq!(
+        ids,
+        [
+            "auto",
+            "gpt-5",
+            "claude-4.5-sonnet",
+            "opus-4.6",
+            "3.5-model"
+        ]
+    );
     assert!(rows.iter().all(|m| m["provider"] == "cursor"));
     // JSON output reuses the catalog parser.
     let rows = list_models(r#"{"items":[{"id":"auto","displayName":"Auto"}]}"#);
@@ -168,11 +177,24 @@ fn catalog_rows_round_trip_through_the_native_catalog_model_parse() {
     assert_eq!(model.provider, "cursor");
     assert_eq!(model.id, "auto");
     assert_eq!(model.name, "Auto");
+    assert_eq!(model.thinking_levels, ["off", "on"]);
     assert_eq!(model.capabilities.option_descriptors.len(), 1);
     assert!(
         AgentModel::from_harness_value(&row, "codex").is_none(),
         "rows stay tagged to the cursor provider"
     );
+}
+
+#[test]
+fn sdk_defaults_come_only_from_the_first_default_variant() {
+    let rows = catalog_models(&json!({"items":[
+        {"id":"x","displayName":"X","parameters":[
+            {"id":"context","values":[{"value":"200k"},{"value":"1m"}]}],
+         "variants":[{"isDefault":true,"params":[]},{"isDefault":true,"params":[{"id":"context","value":"1m"}]}]}
+    ]}));
+    let descriptor = &rows[0]["capabilities"]["optionDescriptors"][0];
+    assert_eq!(descriptor["label"], "Contextwindow");
+    assert_ne!(descriptor["options"][1]["isDefault"], true);
 }
 
 #[test]
@@ -218,7 +240,7 @@ fn version_and_url_helpers() {
     );
     assert_eq!(cli_version("agent 1.2.3-4 extra"), Some("1.2.3-4".into()));
     assert_eq!(cli_version("no version"), None);
-    assert_eq!(title_case("contextWindow"), "Context Window");
+    assert_eq!(title_case("contextWindow"), "Contextwindow");
     assert_eq!(title_case("fast-mode"), "Fast Mode");
     assert_eq!(title_case("effort"), "Effort");
     assert_eq!(provider_option_id("context"), "contextWindow");

@@ -107,7 +107,13 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
                         }
                     }
                     batch.run_ended |= settled;
+                    let acp_catalog = state.acp_catalogs.get_mut(&thread.harness).filter(|_| {
+                        record["command"] == "get_available_models" && record["success"] == true
+                    });
                     thread.apply(record);
+                    if let Some(catalog) = acp_catalog {
+                        catalog.apply_live_acp_models(&thread.models);
+                    }
                     if settled
                         || changes_before.is_some_and(|before| {
                             thread

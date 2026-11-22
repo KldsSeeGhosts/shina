@@ -1936,6 +1936,9 @@ impl State {
             "harnessIds":self.harness_ids(),
             "clone":{"running":self.projects.cloning(),"progress":self.projects.clone_progress,"error":self.projects.clone_error},
         });
+        for (id, catalog) in &self.acp_catalogs {
+            projection["nativeCatalogs"][id] = catalog.snapshot();
+        }
         projection
             .as_object_mut()
             .unwrap()

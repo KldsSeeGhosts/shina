@@ -315,7 +315,7 @@
         "provider": "cpa",
         "service_tiers": [],
         "short_name": null,
-        "sub_provider": null,
+        "sub_provider": "cpa",
         "supports_images": false,
         "thinking_levels": [
           "off"

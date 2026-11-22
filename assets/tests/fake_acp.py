@@ -14,6 +14,7 @@ args.add_argument("--resume", action="store_true")
 args.add_argument("--auth-denied", action="store_true")
 args.add_argument("--antigravity", action="store_true")
 args.add_argument("--discovery", action="store_true")
+args.add_argument("--late-catalog", action="store_true")
 args.add_argument("--delay-seconds", type=float, default=0)
 args.add_argument("--no-history", action="store_true")
 args.add_argument("--no-mcp", action="store_true")
@@ -87,6 +88,8 @@ for line in sys.stdin:
             "promptCapabilities": {"image": True},
             "mcpCapabilities": {"http": not opts.stdio and not opts.no_mcp,
                                 "stdio": not opts.no_mcp}}
+        if opts.late_catalog:
+            capabilities["sessionCapabilities"]["delete"] = {}
         if opts.antigravity:
             assert params["clientInfo"]["name"] == "zed"
             capabilities["_meta"] = {"antigravity": {"systemPrompt": {"append": True}}}
@@ -100,9 +103,10 @@ for line in sys.stdin:
             continue
         assert params["cwd"]
         session_cwd = params["cwd"]
-        if opts.discovery:
+        metadata_only = params["mcpServers"] == []
+        if opts.discovery or metadata_only:
             assert method == "session/new"
-            assert params["mcpServers"] == []
+            assert metadata_only
         elif opts.stdio:
             mcp = params["mcpServers"][0]
             assert mcp["name"] == "shina"
@@ -146,11 +150,30 @@ for line in sys.stdin:
                         {"modelId": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)"},
                         {"modelId": "gemini-4-carbon", "name": "Gemini 4 Carbon"}]},
                 "modes": {"currentModeId": "code", "availableModes": [{"id": "code", "name": "Code"}]}})
+        elif opts.late_catalog:
+            result(req_id, {"sessionId": session, "models": {
+                "currentModelId": "startup",
+                "availableModels": [{"modelId": "startup", "name": "Starting up"}]}})
+            time.sleep(0.6)
+            update("config_option_update", configOptions=[
+                {"id": "model", "name": "Model", "type": "select", "category": "model",
+                 "currentValue": "deep",
+                 "options": [{"group": "Family", "name": "Family", "options": [
+                     {"value": "fast", "name": " Fast "},
+                     {"value": "deep", "name": "Deep"},
+                     {"value": "fast", "name": "Duplicate"}]}]},
+                {"id": "runtime_effort", "name": "Thinking", "type": "select",
+                 "category": "thinking", "currentValue": "high",
+                 "options": [{"value": "high", "name": "High"}]},
+            ])
         else:
             result(req_id, {"sessionId": session, "models": {
                 "currentModelId": "fixture-model",
                 "availableModels": [{"modelId": "fixture-model", "name": "Fixture model"}]},
                 "modes": {"currentModeId": "code", "availableModes": [{"id": "code", "name": "Code"}]}})
+    elif method == "session/delete":
+        assert opts.late_catalog and opts.discovery and params["sessionId"] == session
+        result(req_id, {})
     elif method == "session/set_config_option":
         assert opts.antigravity and agy_config
         config_id = params["configId"]

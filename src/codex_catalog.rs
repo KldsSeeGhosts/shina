@@ -8,7 +8,7 @@
 //! Shared manifest/semver/catalog mechanics live in `crate::model_catalog`, as
 //! KSG shares them through `provider-core`'s `ModelCatalog`.
 use crate::model_catalog::{
-    BUNDLED_MANIFEST, CatalogMatching, ProviderCatalog, apply_model_catalog, catalog_entry,
+    BUNDLED_MANIFEST, CatalogMatching, ProviderCatalog, apply_model_catalog,
     compare_semver_versions, parse_semver, resolve_provider_catalog, trimmed_non_empty,
 };
 use crate::model_picker::UpdateRequiredModel;
@@ -102,38 +102,33 @@ pub fn codex_update_required_models(
         .collect()
 }
 
-/// The `catalogServerModel` join on discovered rows: a matched entry lends its
-/// manifest name, short name, badge, aliases and catalogued capabilities while
-/// wire ids and every other `model/list` field survive untouched.
-fn merge_codex_catalog_entries(models: &mut Vec<Value>, catalog: Option<&ProviderCatalog>) {
-    for model in models.iter_mut() {
-        if model["isCustom"] == true {
-            continue;
-        }
-        let slug = model["id"].as_str().unwrap_or_default().to_owned();
-        let Some(entry) = catalog_entry(catalog, &CODEX_MATCHING, &slug) else {
-            continue;
-        };
-        model["name"] = json!(entry.name);
-        if let Some(short_name) = &entry.short_name {
-            model["shortName"] = json!(short_name);
-        }
-        if let Some(badge) = &entry.badge {
-            model["badge"] = json!(badge);
-        }
-        if !entry.aliases.is_empty() {
-            model["aliases"] = json!(entry.aliases);
-        }
-        if !entry.capabilities.option_descriptors.is_empty() {
-            model["capabilities"] = json!(entry.capabilities);
-        }
+/// KSG `formatCodexModelName`: preserve the reported name with GPT capitalization.
+pub(crate) fn format_codex_model_name(name: &str) -> String {
+    let mut name = name.to_owned();
+    if name
+        .get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gpt"))
+    {
+        name.replace_range(..3, "GPT");
     }
+    let mut previous = '\0';
+    name.chars()
+        .map(|ch| {
+            let out = if previous == '-' {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            };
+            previous = ch;
+            out
+        })
+        .collect()
 }
 
 /// Ported from `codexModelCatalog.ts` (`applyCodexModelCatalog`): update-required
 /// entries are computed before the catalog pass; `applyModelCatalog` classifies
-/// `model/list` rows against the manifest without changing their wire ids or
-/// order, and the `catalogServerModel` join fills in manifest metadata.
+/// `model/list` rows against the manifest without overwriting their names,
+/// order or capabilities.
 /// Returns the applied rows and the update-required entries (KSG sets the field
 /// only when non-empty; the caller owns emission).
 pub fn apply_codex_model_catalog(
@@ -142,8 +137,7 @@ pub fn apply_codex_model_catalog(
     version: Option<&str>,
 ) -> (Vec<Value>, Vec<UpdateRequiredModel>) {
     let update_required = codex_update_required_models(catalog, version, &models);
-    let mut models = apply_model_catalog(models, catalog, &CODEX_MATCHING);
-    merge_codex_catalog_entries(&mut models, catalog);
+    let models = apply_model_catalog(models, catalog, &CODEX_MATCHING);
     (models, update_required)
 }
 
@@ -394,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_names_merge_without_changing_wire_data_or_order() {
+    fn manifest_classifies_without_changing_wire_labels_capabilities_or_order() {
         let catalog = bundled_codex_provider_catalog(crate::lifecycle::now()).unwrap();
         let (models, _) = apply_codex_model_catalog(
             vec![
@@ -409,15 +403,27 @@ mod tests {
         );
         let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
         assert_eq!(ids, ["openai.gpt-6-sol", "gpt-6-astra", "zzz-fixture"]);
-        assert_eq!(models[0]["name"], "GPT-6 Sol");
+        assert_eq!(models[0]["name"], "GPT-6 Sol wire");
         assert_eq!(models[0]["isLegacy"], true);
         assert_eq!(models[0]["thinkingLevels"], json!(["high"]));
-        assert_eq!(models[1]["name"], "GPT-6 Astra");
+        assert_eq!(models[1]["name"], "GPT-6 Astra wire");
         assert!(models[1].get("isLegacy").is_none());
         assert_eq!(models[1]["isDefault"], true);
         // Unknown rows keep their `model/list` data entirely.
         assert_eq!(models[2]["name"], "Fixture Unknown");
         assert!(models[2].get("isLegacy").is_none());
+    }
+
+    #[test]
+    fn codex_wire_labels_use_ksg_capitalization() {
+        assert_eq!(
+            format_codex_model_name("gPt-6-astra (CPA)"),
+            "GPT-6-Astra (CPA)"
+        );
+        assert_eq!(
+            format_codex_model_name("model-x-4 (élan)"),
+            "model-X-4 (élan)"
+        );
     }
 
     #[test]
