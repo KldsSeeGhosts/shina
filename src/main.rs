@@ -1449,6 +1449,37 @@ fn main() {
                 state.populate_demo();
                 state.current_mut().tools[3].expanded = true;
             }),
+            // Expanded rows of the remaining kinds KSG's V2ItemInspector shapes: a
+            // file search, a web search, and a provider tool call.
+            ("work-inspector", |state| {
+                state.populate_demo();
+                let t = state.current_mut();
+                t.messages.truncate(2);
+                t.tools.clear();
+                t.thoughts.clear();
+                t.work.clear();
+                t.apply(serde_json::json!({"type":"tool_execution_start","toolCallId":"demo-search","toolName":"grep",
+                    "toolKind":"file_search","args":{"pattern":"reconnect","path":"src/transport"}}));
+                t.apply(serde_json::json!({"type":"tool_execution_end","toolCallId":"demo-search","result":{
+                    "content":[],"fileSearchResults":[
+                        {"fileName":"src/transport/socket.ts","line":12,"preview":"socket.on(\"reconnect\", reconnect);"},
+                        {"fileName":"src/transport/retry.ts","line":40,"preview":"retry(reconnect);"}]}}));
+                t.apply(serde_json::json!({"type":"tool_execution_start","toolCallId":"demo-web","toolName":"web_search",
+                    "toolKind":"web_search","args":{"query":"t3 code tool call row"}}));
+                t.apply(serde_json::json!({"type":"tool_execution_end","toolCallId":"demo-web","result":{
+                    "content":[],"webResults":[
+                        {"url":"https://example.com/rows","title":"Work entry rows","snippet":"How the timeline draws a tool call."},
+                        {"url":"https://example.com/inspector","title":"Item inspector","snippet":"Expanded tool body layout."}]}}));
+                t.apply(serde_json::json!({"type":"tool_execution_start","toolCallId":"demo-mcp","toolName":"mcp__docs__lookup",
+                    "args":{"query":"reconnect listener","limit":3}}));
+                t.apply(serde_json::json!({"type":"tool_execution_end","toolCallId":"demo-mcp","result":{
+                    "content":[{"type":"text","text":"Example lookup result, not a real call."}],"details":{"exitCode":0}}}));
+                for tool in &mut t.tools {
+                    tool.expanded = true;
+                }
+                t.tools[0].group_expanded = true;
+                t.work[0].expanded = true;
+            }),
             ("typed-work", typed_work_demo),
             ("typed-work-dark", |state| {
                 typed_work_demo(state);
