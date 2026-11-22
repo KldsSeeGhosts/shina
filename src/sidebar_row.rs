@@ -48,24 +48,30 @@ impl RowStatus {
 
     fn ink(self, p: Palette) -> Color {
         match self {
-            Self::Working | Self::Woke => p.sea,
-            Self::Approval | Self::Input | Self::Interrupted | Self::Attention => p.brass,
+            Self::Working => p.sea,
+            Self::Input => p.input,
+            Self::Attention => p.guest,
+            Self::Approval | Self::Interrupted | Self::Woke => p.brass,
             Self::Failed => p.danger,
             Self::Done => p.ok,
             Self::Idle => p.faint,
         }
     }
 
-    pub(super) fn mark(self, p: Palette) -> El {
+    // KSG's `SIDEBAR_STATUSES` glyphs: a 16 pt Lucide icon beside the status word, 12 pt on
+    // slim rows.
+    pub(super) fn mark(self, p: Palette, size: f32) -> El {
+        let ink = self.ink(p);
         match self {
             Self::Idle => el(),
-            Self::Working => status_mark(Status::Running, p, 8.0),
-            Self::Approval | Self::Input | Self::Interrupted | Self::Attention => {
-                status_mark(Status::Waiting, p, 8.0)
-            }
-            Self::Failed => status_mark(Status::Failed, p, 8.0),
-            Self::Done => status_mark(Status::Completed, p, 8.0),
-            Self::Woke => icon("clock", p.sea).size(12.0, 12.0),
+            Self::Working => icon("unresolved", ink).size(size, size),
+            Self::Approval => icon("shield-question", ink).size(size, size),
+            Self::Input => icon("message-question", ink).size(size, size),
+            Self::Interrupted => icon("alert", ink).size(size, size),
+            Self::Attention => icon("user-round", ink).size(size, size),
+            Self::Failed => icon("alert", ink).size(size, size),
+            Self::Done => icon("circle-check", ink).size(size, size),
+            Self::Woke => icon("alarm-clock", ink).size(size, size),
         }
     }
 }
@@ -110,7 +116,10 @@ pub(super) struct ThreadRowModel<'a> {
     pub harness: Option<&'a str>,
     pub model: Option<&'a str>,
     pub agents_active: usize,
-    pub lead: El,
+    pub badge: Option<El>,
+    pub pinned: bool,
+    pub unsent: bool,
+    pub worktree: bool,
     pub selected: bool,
     pub shelved: bool,
     pub draft: bool,
@@ -204,9 +213,20 @@ pub(super) fn thread_row_el(
         };
         let mut status = row().center_y().gap(4.0);
         if m.status != RowStatus::Idle {
-            status = status.child(m.status.mark(p));
+            status = status.child(m.status.mark(p, if compact { 12.0 } else { 16.0 }));
         }
-        status = status.child(label(details, TIMER, m.status.ink(p)).key(key));
+        status = status.child(
+            label(
+                details,
+                if m.status == RowStatus::Idle && !compact {
+                    SMALL
+                } else {
+                    TIMER
+                },
+                m.status.ink(p),
+            )
+            .key(key),
+        );
         if actions.is_some() && m.status != RowStatus::Woke {
             status = status.group_opacity(1.0, 0.0);
         }
@@ -235,12 +255,31 @@ pub(super) fn thread_row_el(
     if quiet {
         title = title.group_color(p.strong);
     }
-    // KSG dims the lead icon of every row but the open one (`dark:opacity-40`, 55% in light)
-    // and restores it on hover.
-    let mut lead = el().size(16.0, 16.0).center().child(m.lead);
-    if !m.selected {
-        lead = lead.group_opacity(if s.dark { 0.4 } else { 0.55 }, 1.0);
-    }
+    // KSG's slim row dims the project favicon of every row but the open one
+    // (`opacity-55`, `dark:opacity-40`) and restores it on hover.
+    let badge = m.badge.map(|badge| {
+        let badge = el().size(16.0, 16.0).center().child(badge);
+        if m.selected || !compact {
+            badge
+        } else {
+            badge.group_opacity(if s.dark { 0.4 } else { 0.55 }, 1.0)
+        }
+    });
+    // KSG's `pinIndicator`: a 12 pt pin after the favicon on pinned rows.
+    let pin = m.pinned.then(|| {
+        icon("pin", p.faint)
+            .size(12.0, 12.0)
+            .key(format!("thread-pin-{id}"))
+    });
+    // KSG's `draftIndicator`: a 12 pt pen before the favicon on rows with unsent text.
+    let pen = m.unsent.then(|| {
+        icon("compose", p.brass)
+            .size(12.0, 12.0)
+            .role("img")
+            .label("Unsent draft")
+            .help("Unsent draft")
+            .key(format!("thread-draft-pen-{id}"))
+    });
     let machine = || {
         m.machine.map(|machine| {
             icon(m.machine_glyph, p.faint)
@@ -252,22 +291,23 @@ pub(super) fn thread_row_el(
         })
     };
     let (height, content) = if compact {
-        let mut line = row()
-            .h(COMPACT_HEIGHT)
-            .px(10.0)
-            .center_y()
-            .gap(10.0)
-            .child(lead)
-            .child(title);
+        let mut line = row().h(COMPACT_HEIGHT).px(10.0).center_y().gap(10.0);
+        if let Some(badge) = badge {
+            line = line.child(badge);
+        }
+        if let Some(pen) = pen {
+            line = line.child(pen);
+        }
+        line = line.child(title);
+        if let Some(pin) = pin {
+            line = line.child(pin);
+        }
         if m.agents_active > 0 && sidebar_row_width(s) >= 232.0 {
             line = line.child(agents_ui::chip(
                 &format!("thread-agents-{id}"),
                 m.agents_active,
                 p,
             ));
-        }
-        if let Some(machine) = machine() {
-            line = line.child(machine);
         }
         (COMPACT_HEIGHT, line.child(slot))
     } else {
@@ -278,11 +318,18 @@ pub(super) fn thread_row_el(
             || m.agents_active > 0
             || m.snippet.is_some()
             || scratch_machine.is_some();
-        let header = row()
-            .h(20.0)
-            .center_y()
-            .gap(6.0)
-            .child(lead)
+        // KSG's card header: draft pen, project favicon, pin, project name, status slot.
+        let mut header = row().h(20.0).center_y().gap(6.0);
+        if let Some(pen) = pen {
+            header = header.child(pen);
+        }
+        if let Some(badge) = badge {
+            header = header.child(badge);
+        }
+        if let Some(pin) = pin {
+            header = header.child(pin);
+        }
+        header = header
             .child(
                 label(m.workspace.unwrap_or_default(), SMALL, p.muted)
                     .key(format!("thread-workspace-{id}"))
@@ -296,6 +343,16 @@ pub(super) fn thread_row_el(
         if let Some(snippet) = m.snippet {
             metadata = metadata.child(snippet.grow(1.0));
         } else if let Some(branch) = m.branch {
+            // KSG's `ThreadWorktreeIndicator`: a folder-git glyph ahead of a worktree branch.
+            if m.worktree {
+                metadata = metadata.child(
+                    icon("folder-git2", p.faint)
+                        .size(14.0, 14.0)
+                        .role("img")
+                        .label("Worktree")
+                        .help("Worktree"),
+                );
+            }
             metadata = metadata.child(
                 label(branch, SMALL, p.muted)
                     .key(format!("thread-where-{id}"))
@@ -360,7 +417,7 @@ pub(super) fn thread_row_el(
                     s,
                     p,
                     model_vendor(harness, m.model.unwrap_or(harness)),
-                    14.0,
+                    12.0,
                 )
                 .opacity(0.6)
                 .key(format!("thread-harness-{id}")),
@@ -377,18 +434,20 @@ pub(super) fn thread_row_el(
         }
         (if has_meta { 78.0 } else { 60.0 }, content)
     };
-    select_bar(
-        item.h(height)
-            .my(if compact { 0.0 } else { 2.0 })
-            .hover_group_focus()
-            .label(description.join(", "))
-            .description("Preview available")
-            .hover_motion(MOTION_FAST, MOTION_FAST),
-        m.selected,
-        s.dark,
-        p,
-    )
-    .child(content.grow(1.0).min_w(0.0))
+    let item = item
+        .h(height)
+        .my(if compact { 0.0 } else { 2.0 })
+        .hover_group_focus()
+        .label(description.join(", "))
+        .description("Preview available")
+        .hover_motion(MOTION_FAST, MOTION_FAST);
+    // KSG's `draftSurfaceClassName`: a faint warning wash under rows with unsent text.
+    let item = if m.unsent && !m.selected {
+        item.fill(p.brass.alpha(0.04)).hover(p.brass.alpha(0.08))
+    } else {
+        item
+    };
+    select_bar(item, m.selected, s.dark, p).child(content.grow(1.0).min_w(0.0))
 }
 
 pub(super) fn captain_row_el(s: &State, p: Palette, item: El, m: CaptainRowModel<'_>) -> El {

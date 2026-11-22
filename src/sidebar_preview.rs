@@ -464,11 +464,13 @@ pub(super) fn view(s: &State, p: Palette, sidebar_width: f32) -> Option<El> {
     if let Some(profile) = profile {
         title_block = title_block.child(label(&profile.role, SMALL, p.muted));
     }
-    title_block = title_block.child(row().center_y().gap(6.0).child(state.mark(p)).child(label(
-        word,
-        SMALL,
-        status_ink(status, p),
-    )));
+    title_block = title_block.child(
+        row()
+            .center_y()
+            .gap(6.0)
+            .child(state.mark(p, 12.0))
+            .child(label(word, SMALL, status_ink(status, p))),
+    );
     let mut header = row().center_y().gap(12.0);
     if let Some(profile) = profile {
         header = header.child(haloed(

@@ -267,37 +267,16 @@ fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relati
             },
         );
     }
-    let lead = if worker {
+    if worker {
         let task = crew_ui::worker_task_mark(s, thread);
         if !thread.life.settled() && thread.request.is_none() && task == Some(Status::Waiting) {
             state = RowStatus::Interrupted;
         }
-        let mark = task.unwrap_or(status);
-        let mut avatar = crewmate_avatar(s, p, &thread.model, mark, 16.0)
-            .key(format!("worker-captain-portrait-{id}"));
-        if thread.actionable() || thread.unread() || task.is_some() {
-            avatar = el().size(16.0, 16.0).child(avatar).key(
-                if thread.actionable() || thread.unread() {
-                    format!("worker-alert-{id}")
-                } else {
-                    format!("worker-task-mark-{id}")
-                },
-            );
-        }
-        avatar
-    } else if !draft {
-        thread_avatar(
-            s,
-            p,
-            &thread.model_id,
-            &thread.model,
-            status,
-            thread.pinned(),
-        )
-        .key(format!("thread-provider-portrait-{suffix}"))
-    } else {
-        lead_mark(state, thread.pinned(), draft, p)
-    };
+    }
+    let badge = thread
+        .project
+        .is_some()
+        .then(|| project_tile(s, p, s.project(thread.project), 16.0));
     let snippet = entry.search_hit.as_ref().map(|hit| {
         search_snippet_el(
             entry.server,
@@ -348,7 +327,10 @@ fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relati
             harness: Some(&thread.harness),
             model: Some(&thread.model),
             agents_active: crate::agents::active_count(thread),
-            lead,
+            badge,
+            pinned: thread.pinned(),
+            unsent: draft || !thread.draft.text.trim().is_empty(),
+            worktree: thread.worktree_path.is_some(),
             selected: entry.selected(s),
             shelved,
             draft,
@@ -479,45 +461,6 @@ fn row_age(
         Section::Settled => relative_time(life.settled_at.unwrap_or_default() / 1000),
         _ => relative_time(updated),
     }
-}
-
-fn lead_mark(status: RowStatus, pinned: bool, draft: bool, p: Palette) -> El {
-    if status != RowStatus::Idle {
-        status.mark(p)
-    } else if pinned || draft {
-        icon(if pinned { "pin" } else { "edit" }, p.faint).size(12.0, 12.0)
-    } else {
-        el()
-    }
-}
-
-pub(super) fn thread_mascot(model_id: &str, label: &str) -> crate::visuals::ProviderMascot {
-    use crate::visuals::{ProviderMascot, provider_mascot_for};
-    match provider_mascot_for(model_id) {
-        ProviderMascot::Default => provider_mascot_for(label),
-        mascot => mascot,
-    }
-}
-
-fn thread_avatar(
-    s: &State,
-    p: Palette,
-    model_id: &str,
-    label: &str,
-    status: Status,
-    pinned: bool,
-) -> El {
-    let avatar = mascot_avatar(s, p, thread_mascot(model_id, label), status, 16.0);
-    if !pinned {
-        return avatar;
-    }
-    el().size(16.0, 16.0).child(avatar).child(
-        icon("pin", p.ink)
-            .size(9.0, 9.0)
-            .pin(None, Some(-2.0), Some(-2.0), None)
-            .radius(3.0)
-            .fill(p.card),
-    )
 }
 
 /// KSG Code's `SidebarThreadRow` uses the trailing slot for hover actions.
@@ -1608,27 +1551,10 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
     }
     let section = lifecycle::section(&entry.life, now);
     let shelved = matches!(section, Section::Snoozed | Section::Settled);
-    let worker = !record["crewCaptain"].is_null()
-        || record["parent"]
-            .as_u64()
-            .and_then(|id| remote_record(projection, rel, entry.server, id as usize))
-            .is_some_and(|parent| parent["captainHome"] == true);
-    let lead = if worker {
-        crewmate_avatar(s, p, model.unwrap_or_default(), status, 16.0)
-            .key(format!("crewmate-{}-{id}", entry.server))
-    } else if !entry.draft {
-        thread_avatar(
-            s,
-            p,
-            view.record["model_id"].as_str().unwrap_or_default(),
-            model.unwrap_or_default(),
-            status,
-            entry.life.pinned_at.is_some(),
-        )
-        .key(format!("thread-provider-portrait-{suffix}"))
-    } else {
-        lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
-    };
+    let badge = entry
+        .project(s)
+        .is_some()
+        .then(|| project_tile(s, p, project.as_ref(), 16.0));
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
         .as_str()
@@ -1680,7 +1606,13 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
                 .as_u64()
                 .or_else(|| record["agentsActive"].as_u64())
                 .unwrap_or_default() as usize,
-            lead,
+            badge,
+            pinned: entry.life.pinned_at.is_some(),
+            unsent: entry.draft || !draft.trim().is_empty(),
+            worktree: view.record["worktreePath"]
+                .as_str()
+                .or_else(|| record["worktreePath"].as_str())
+                .is_some(),
             selected: entry.selected(s),
             shelved,
             draft: entry.draft,

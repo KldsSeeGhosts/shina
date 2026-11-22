@@ -1440,11 +1440,6 @@ impl Thread {
             && !self.renamed
             && self.parent.is_none()
     }
-    pub fn actionable(&self) -> bool {
-        self.request.is_some()
-            || self.status == Status::Waiting
-            || matches!(self.status, Status::Failed | Status::Paused)
-    }
     /// Working, in every count the user reads (the header's background line, the crew line,
     /// the band's sails): running now. Queued, interrupted, finished and approval-blocked
     /// threads are not working.
@@ -17375,8 +17370,7 @@ impl State {
         let still_on_default = match ui.get("sidebarWidthDefault").and_then(Value::as_f64) {
             Some(saved) => self.sidebar_width == saved as f32,
             None => {
-                self.sidebar_width == PREVIOUS_DEFAULT_SIDEBAR_WIDTH
-                    || self.sidebar_width == 336.0
+                self.sidebar_width == PREVIOUS_DEFAULT_SIDEBAR_WIDTH || self.sidebar_width == 336.0
             }
         };
         if still_on_default {
