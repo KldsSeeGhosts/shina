@@ -2027,8 +2027,7 @@ impl State {
                     || self.crew_question_receipt(&server, command, value)
                     || self.crew_draft_receipt(&server, command, value)
                     || self.captain_document_receipt(&server, command, value)
-                    || self.captain_crew_receipt(&server, command, value)
-                    || self.task_plan_receipt(&server, command, value))
+                    || self.captain_crew_receipt(&server, command, value))
             {
                 continue;
             }
@@ -2533,7 +2532,6 @@ impl State {
         }
         changed |= self.poll_approval_sends();
         changed |= self.poll_question_answers();
-        changed |= self.poll_plan_panel();
         if self.approval_sends_pending() {
             tx.wake_after(Duration::from_millis(16));
         }

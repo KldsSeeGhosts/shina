@@ -1110,8 +1110,7 @@ pub(super) fn crew_tray_shows(s: &State) -> bool {
 /// The 28 pt Now / crew & subagents strip above the composer, modeled on KSG Code's
 /// `QueuedRunsControl` and `ThreadRelationshipsControl`: shows Crew counts on a Captain
 /// home (plus any active subagents), or subagent counts on a plain thread with agents.
-/// Pressing it toggles the dismissible `now_popover`; the Plan toggle on the right opens
-/// the task plan inside the Inspector's Crew tab.
+/// Pressing it toggles the dismissible `now_popover`.
 pub(super) fn crew_tray(s: &State, p: Palette, lane: f32, _rows_max: Option<f32>) -> Option<El> {
     let t = s.current();
     let captain = t.captain.filter(|_| s.is_captain_home(t));
@@ -1124,7 +1123,6 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32, _rows_max: Option<f32>
     let chevron = if open { "chevron-up" } else { "chevron-down" };
     if let Some(captain) = captain {
         let members = roster_members(s, t.id, captain);
-        let plan = super::plan_ui::plan_toggle(s, p);
         let count = |want: Status| members.iter().filter(|m| m.status == want).count();
         let active_subagents = subagents.iter().filter(|r| r.state.active()).count();
         let (working, needs_you) = (
@@ -1220,8 +1218,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32, _rows_max: Option<f32>
                         )
                         .child(summary)
                         .child(icon(chevron, p.faint).size(12.0, 12.0)),
-                )
-                .child(plan.unwrap_or_else(el)),
+                ),
         );
     }
 

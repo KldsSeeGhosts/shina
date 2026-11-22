@@ -131,8 +131,6 @@ mod question_attachment_tests;
 mod question_flow_tests;
 #[path = "task_plan.rs"]
 mod task_plan;
-#[path = "task_plan_client.rs"]
-pub(crate) mod task_plan_client;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -5459,8 +5457,6 @@ pub struct State {
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
-    /// A Captain home's task plan panel, bound to its machine and home.
-    pub plan_panel: task_plan_client::PlanPanel,
     pub settings_picker: Option<SettingsPicker>,
     pub open_option_menu: Option<String>,
     pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
@@ -6551,7 +6547,6 @@ impl State {
             memory: Arc::default(),
             captain_editor: None,
             brief: BriefUi::default(),
-            plan_panel: Default::default(),
             settings_picker: None,
             open_option_menu: None,
             model_picker_tab: None,
