@@ -1219,6 +1219,9 @@ mod tests {
         for width in [620.0, 1280.0] {
             let mut state = State::new(".".into(), false);
             state.current_mut().native.access_picker = true;
+            // The picker's anchor is the footer access chip, which stays hidden while the
+            // thread runs the default mode (KSG `composerControlsOwnership`).
+            state.current_mut().native.access = crate::model::AccessMode::Supervised;
             let mut rt = rune::Runtime::with_text(
                 state,
                 view,

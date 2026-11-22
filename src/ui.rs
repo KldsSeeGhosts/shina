@@ -1,4 +1,5 @@
 use crate::attachments::Attachment;
+use crate::canvas_layout;
 use crate::context::{ContextMeter, ContextPhase};
 use crate::lifecycle::{self, Section};
 use crate::model::{
@@ -145,6 +146,9 @@ struct Palette {
     lift: Color,
     /// KSG's `surface-tray`: the composer shell around the card and the context strip.
     tray: Color,
+    /// KSG's `--pill-fill`: the recessed send pill inside the composer card, a step below
+    /// the card's gradient in both themes.
+    pill: Color,
     line: Color,
     ink: Color,
     muted: Color,
@@ -194,6 +198,7 @@ fn palette(dark: bool) -> Palette {
             card: color("#1a1a1a"),
             lift: color("#262626"),
             tray: color("#191919"),
+            pill: color("#0e0e0e"),
             line: color("#242424"),
             ink: color("#e6e7ea"),
             muted: color("#a8a8a8"),
@@ -230,6 +235,7 @@ fn palette(dark: bool) -> Palette {
             card: color("#ffffff"),
             lift: color("#ececec"),
             tray: color("#fafafa"),
+            pill: color("#efefef"),
             line: color("#e6e6e6"),
             ink: color("#1c1d20"),
             muted: color("#55595f"),
@@ -251,7 +257,7 @@ fn palette(dark: bool) -> Palette {
             frame: color("#e1e1e1"),
             portrait_frame: color("#e3e3e3"),
             shadow: color("#000000").alpha(0.10),
-            field_line: color("#858585"),
+            field_line: color("#7d7d7d"),
             ring: color("#1d4ed8"),
             message_bg: color("#ececec"),
             code_bg: color("#f0f0f0"),
@@ -410,9 +416,27 @@ fn measure(wide: bool) -> f32 {
 fn lane_gutter(pane_width: f32) -> f32 {
     if pane_width >= 640.0 { 48.0 } else { 12.0 }
 }
+/// The chat lane the conversation and the composer share, resolved through KSG Code's
+/// `resolveChatCanvasLayout` (`chatCanvasLayout.ts`): centred at `measure` until an inline
+/// Details card docks beside it, when `inset_start`/`inset_end` carry the shift (KSG's
+/// `--chat-lane-inset-start`/`--chat-lane-inset-end`). `details_card` stays `None` until C5
+/// mounts the card; the resolver is the single source for both lanes already.
+fn chat_lane(
+    pane_width: f32,
+    wide: bool,
+    details_card: Option<canvas_layout::DetailsCardEdges>,
+) -> canvas_layout::ChatLane {
+    canvas_layout::resolve_chat_canvas_layout(canvas_layout::ChatCanvasInput {
+        container_width: pane_width,
+        padding: lane_gutter(pane_width),
+        max_chat_width: measure(wide),
+        details_card,
+    })
+    .chat
+}
 /// How wide the lane is in a pane of `pane_width`.
 fn lane_width(pane_width: f32, wide: bool) -> f32 {
-    (pane_width - 2.0 * lane_gutter(pane_width)).clamp(0.0, measure(wide))
+    chat_lane(pane_width, wide, None).width
 }
 /// Live timers and counts use tabular figures, so "12m 05s" never shifts as a digit changes.
 const TABULAR: &str = "'tnum' 1";
@@ -2110,10 +2134,12 @@ fn finish_model_pick(s: &mut State) {
 }
 
 /// Ported from KSG Code's `ProviderModelPicker` (docked): the provider rail, search and model
-/// list at one fixed height, and the `ComposerEffortColumn` (`optionsOnly`) beside it when the
-/// model has options besides reasoning. Below 640 px the column stacks under the list, as
-/// KSG's `max-sm` classes do. Reasoning, speed and permissions have their own controls.
+/// list at one fixed height, the `ComposerEffortColumn` (`optionsOnly`) beside it when the
+/// model has options besides reasoning, and the Permissions footer below (as KSG's
+/// `composerControlsOwnership` keeps Permissions reachable when the default chip is quiet).
+/// Below 640 px the column stacks under the list, as KSG's `max-sm` classes do.
 fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
+    const PERMISSIONS_FOOTER_H: f32 = 37.0;
     let t = s.current();
     let can_choose = !t.status.busy() && !t.configuring;
     let stacked = s.viewport_width <= 640.0;
@@ -2137,7 +2163,7 @@ fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
     // room it leaves bounds the column, so a clamped card never overflows its
     // own rows. One frame behind, as `anchored_fit` measures it.
     let above = rune::memo::layout("composer")
-        .map(|rect| rect[1] - 16.0)
+        .map(|rect| rect[1] - 16.0 - PERMISSIONS_FOOTER_H)
         .unwrap_or(f32::MAX);
     let list_h = (if stacked && has_options {
         224.0
@@ -2195,6 +2221,42 @@ fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
                 &controls,
             ));
     }
+    let display_access = s.effective_access_mode(t);
+    let access_disabled = t.status.busy() || t.configuring || t.archived();
+    let access_emphasized = display_access.id() != s.thread_defaults.access;
+    let mut permissions_row = row()
+        .key("model-picker-permissions")
+        .role("button")
+        .label(format!("Permissions: {}", display_access.label()))
+        .w_full()
+        .h(36.0)
+        .px(12.0)
+        .gap(8.0)
+        .center_y()
+        .disabled(access_disabled)
+        .opacity(if access_disabled { 0.65 } else { 1.0 })
+        .child(
+            icon(
+                pi_ui::access_glyph(display_access),
+                if access_emphasized { p.ink } else { p.muted },
+            )
+            .size(14.0, 14.0),
+        )
+        .child(label("Permissions", SMALL, p.ink))
+        .child(spacer())
+        .child(label(display_access.label(), META, p.muted))
+        .child(icon("chevron-right", p.faint).size(12.0, 12.0));
+    if !access_disabled {
+        permissions_row = permissions_row
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .hover(p.selected)
+            .press(p.selected)
+            .on_press(|s: &mut State| {
+                s.settings_picker = None;
+                s.open_access_picker();
+            });
+    }
     let mut card = col()
         .key("pi-settings-picker")
         .role("dialog")
@@ -2206,7 +2268,9 @@ fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
         .border(1.0, p.frame)
         .box_shadow(soft_shadow(p))
         .on_press(|_: &mut State| {})
-        .child(body);
+        .child(body)
+        .child(rule(p))
+        .child(permissions_row);
     if let Some(error) = &t.error {
         card = card.child(rule(p)).child(
             label(error, SMALL, p.danger)
@@ -11911,6 +11975,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let t = s.current();
     let visit = s.timeline_positions.borrow().visit();
     let gutter = lane_gutter(pane_width);
+    // The lane the composer resolves too; `None` until C5 mounts the Details card.
+    let lane_rect = chat_lane(pane_width, wide, None);
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
     let visible_tools = t.messages.is_empty()
@@ -11928,8 +11994,9 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         let mut introduction = col()
             .key("empty-state")
             .w_full()
-            .max_w(measure(wide) + 2.0 * gutter)
-            .px(gutter)
+            .max_w(measure(wide) + 2.0 * gutter + lane_rect.inset_start + lane_rect.inset_end)
+            .pl(gutter + lane_rect.inset_start)
+            .pr(gutter + lane_rect.inset_end)
             .pb(12.0)
             .gap(16.0);
         if let Some(captain) = t.captain {
@@ -12126,7 +12193,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
         // rule, stuck to the viewport's top, and the 28 pt fade starts below it, so nothing
         // scrolled shows through as a sliver under the rule.
         .scroll_fade(rune::ScrollFade::strength(28.0).below_sticky())
-        .px(gutter)
+        .pl(gutter + lane_rect.inset_start)
+        .pr(gutter + lane_rect.inset_end)
         .items_center()
         .child(
             el().key("transcript-cap")
@@ -13053,10 +13121,17 @@ fn preparing_attachment_chip(
 
 // Ported from KSG Code's ComposerAttachmentFileList. Rune's editable pill has no
 // suffix/adornment slot, so pending inline files use the reference implementation's file row.
-fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
+fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<(El, Option<String>)> {
     use crate::attachment_uploads::Phase;
-    let mut rows = col().w_full().gap(4.0).px(12.0).pt(8.0);
+    let mut rows = col()
+        .keeps_text_selection()
+        .on_key(composer_ui::control_key)
+        .w_full()
+        .gap(4.0)
+        .px(12.0)
+        .pt(8.0);
     let mut any = false;
+    let mut first_focusable: Option<String> = None;
     let inline = inline_file_attachment_ids(s.current());
     for file in s.current().draft_images.iter().filter(|a| {
         !a.is_image() && !attachment_is_video(a) && !a.needs_reattach() && !inline.contains(&a.id)
@@ -13069,6 +13144,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
         }
         any = true;
         let id = file.id.clone();
+        first_focusable.get_or_insert_with(|| format!("attachment-thumb-{id}"));
         let preview_id = id.clone();
         let size = if file.bytes.div_ceil(1024).max(1) >= 1024 {
             format!("{:.1} MB", file.bytes as f64 / 1048576.0)
@@ -13122,6 +13198,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
     {
         any = true;
         let id = file.id.clone();
+        first_focusable.get_or_insert_with(|| format!("remove-missing-attachment-{id}"));
         let can_attach = s.file_attachment_staging_supported_on(&s.machines.selected)
             && file.bytes <= crate::attachments::MAX_FILE_BYTES;
         rows = rows.child(
@@ -13203,6 +13280,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
             .child(meta_text(status, p.muted).key(format!("attachment-status-{}", entry.id)));
         if let Phase::Failed(reason) = &entry.phase {
             let id = entry.id.clone();
+            first_focusable.get_or_insert_with(|| format!("retry-attachment-{id}"));
             file = file.child(
                 icon_button(
                     &format!("retry-attachment-{id}"),
@@ -13215,6 +13293,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
             );
         }
         let id = entry.id.clone();
+        first_focusable.get_or_insert_with(|| format!("remove-pending-attachment-{id}"));
         file = file.child(icon_button(
             &format!("remove-pending-attachment-{id}"),
             &format!("Remove {}", entry.name),
@@ -13224,7 +13303,7 @@ fn attachment_upload_file_rows(s: &State, p: Palette) -> Option<El> {
         ));
         rows = rows.child(file);
     }
-    any.then_some(rows)
+    any.then_some((rows, first_focusable))
 }
 
 fn inline_file_attachment_ids(t: &Thread) -> std::collections::HashSet<String> {
@@ -13634,6 +13713,7 @@ fn context_ring(s: &State, t: &Thread, p: Palette, lane: f32) -> El {
                 && !event.mods.shift
                 && let Some(first) = &first_legend_key
             {
+                s.composer_ui.scope_focused.set(false);
                 tx.focus(first.as_str(), true);
                 s.current_mut().context.focus_segment(Some(0));
                 return true;
@@ -13730,18 +13810,21 @@ fn attach_composer_notices(s: &State, p: Palette, lane: f32, composer_card: El) 
 }
 
 /// KSG Code's `ComposerSurface.Shell`: the 16 px tray that holds the attached notices, the
-/// 15 px main card and the context strip under it, with a hairline rim and a soft shadow. The
-/// resting composer has no strip, so its shell draws nothing; it is there so the card keeps
-/// one place in the tree and never animates out when the composer expands.
-fn composer_shell(p: Palette, inner: El, strip: Option<El>) -> El {
-    let shell = col().key("composer-shell").w_full();
-    let Some(strip) = strip else {
-        return shell.child(inner);
+/// 15 px main card and the context strip under it, with a hairline rim painted above the
+/// inner surfaces (matching `ComposerSurface.Shell::after`) so the opaque card never covers
+/// the straight tray edges and the rim adds zero layout height. The shell is always present,
+/// while the strip joins only when content renders below the card.
+fn composer_shell(s: &State, p: Palette, inner: El, strip: Option<El>) -> El {
+    let rim = if !composer_disabled(s) && (s.attachment_drop_hover || s.current().draft.focused) {
+        p.ring.alpha(0.6)
+    } else {
+        p.line
     };
-    shell
+    let mut shell = col()
+        .key("composer-shell")
+        .w_full()
         .radius(16.0)
         .fill(p.tray)
-        .border(1.0, p.line)
         .box_shadow(rune::Shadow {
             x: 0.0,
             y: 4.0,
@@ -13750,8 +13833,17 @@ fn composer_shell(p: Palette, inner: El, strip: Option<El>) -> El {
             color: p.shadow.alpha(p.shadow.a * 0.6),
             inset: false,
         })
-        .child(inner)
-        .child(strip)
+        .child(inner);
+    if let Some(strip) = strip {
+        shell = shell.child(strip);
+    }
+    shell.child(
+        el().key("composer-shell-rim")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .radius(16.0)
+            .border(1.0, rim)
+            .inert(),
+    )
 }
 
 fn composer_notice_overflows(notice: &crate::composer_notices::Notice, lane: f32) -> bool {
@@ -14732,6 +14824,7 @@ fn composer_reply_banner(t: &Thread, p: Palette) -> Option<El> {
             )
             .child(
                 row()
+                    .key("composer-reply-target")
                     .role("button")
                     .label(aria_label)
                     .cursor(rune::Cursor::Pointer)
@@ -14864,7 +14957,9 @@ fn composer(
     caret_edges: Option<[bool; 2]>,
 ) -> El {
     let t = s.current();
-    let lane = lane_width(pane_width, wide);
+    // The lane the conversation resolves too; `None` until C5 mounts the Details card.
+    let lane_rect = chat_lane(pane_width, wide, None);
+    let lane = lane_rect.width;
     let inline_files = inline_file_attachment_ids(t);
     let collapsed = s
         .attachment_uploads
@@ -15004,7 +15099,6 @@ fn composer(
     let mut send = el()
         .key("send-message")
         .role("button")
-        .cursor(rune::Cursor::Pointer)
         .label(if s.machines.draft_retarget.is_some() {
             "Preparing machine"
         } else if t.resume_pending() {
@@ -15029,10 +15123,8 @@ fn composer(
             "Submit message"
         })
         .size(32.0, 32.0)
-        .radius(6.0)
+        .radius(7.0)
         .center()
-        .hover(p.selected)
-        .press(p.selected)
         .child(
             icon(
                 if show_resume {
@@ -15044,29 +15136,36 @@ fn composer(
                 } else if t.status.busy() {
                     "corner-up-right"
                 } else {
-                    "send"
+                    "arrow-up"
                 },
                 if can_send { p.ink } else { p.muted },
             )
             .size(14.0, 14.0),
         )
         .disabled(!can_send);
-    if can_send && show_resume {
+    if can_send {
         send = send
-            .focusable(true)
-            .on_press(|s: &mut State| s.resume_thread());
-    } else if can_send {
-        send = send.focusable(true).on_press_tx(|s: &mut State, tx| {
-            let previous = s.current().native.follow_up;
-            if tx.mods().cmd || tx.mods().ctrl {
-                s.current_mut().native.follow_up = !previous;
-            }
-            s.send();
-            s.current_mut().native.follow_up = previous;
-        });
+            .cursor(rune::Cursor::Pointer)
+            .hover(p.selected)
+            .press(p.selected)
+            .focusable(true);
+        if show_resume {
+            send = send.on_press(|s: &mut State| s.resume_thread());
+        } else {
+            send = send.on_press_tx(|s: &mut State, tx| {
+                let previous = s.current().native.follow_up;
+                if tx.mods().cmd || tx.mods().ctrl {
+                    s.current_mut().native.follow_up = !previous;
+                }
+                s.send();
+                s.current_mut().native.follow_up = previous;
+            });
+        }
     }
     let [action_x, action_y] = composer_ui::anchor_offset(s, 1, true);
-    // KSG Code's `ComposerSendPill`: compact, send and stop share one 32 pt control.
+    // KSG Code's `ComposerSendPill` (`surface-pill`): compact, send and stop share one 32 pt
+    // recessed control (`--pill-fill`, `field_line` rim >= 3:1 painted above the slots, and
+    // the soft `--pill-shadow`), with 7 px slots concentric inside the 8 px rim.
     let mut action = composer_ui::bind_anchor(
         s,
         1,
@@ -15074,12 +15173,17 @@ fn composer(
             .key("composer-transition-actions")
             .offset(action_x, action_y)
             .h(32.0)
-            .radius(7.0)
-            .fill(p.bg)
-            .border(1.0, p.frame)
+            .radius(8.0)
+            .fill(p.pill)
+            .box_shadow(control_shadow(p))
             .center_y(),
     );
-    if !t.status.busy() || !collapsed && (t.has_draft_content() || t.queued_edit.is_some()) {
+    let show_send_slot =
+        !t.status.busy() || !collapsed && (t.has_draft_content() || t.queued_edit.is_some());
+    let compact_disabled =
+        composer_disabled(s) || (s.client.is_some() && !s.machine_connected(&s.machines.selected));
+    let show_compact_slot = show_send_slot && compact_before_send_tokens.is_some();
+    if show_send_slot {
         if let Some(tokens) = compact_before_send_tokens {
             let amount = crate::context::format_context_window_tokens(tokens);
             let tooltip = if keep_full_history {
@@ -15090,58 +15194,71 @@ fn composer(
             let mut toggle = row()
                 .key("composer-compact-send")
                 .role("button")
-                .cursor(rune::Cursor::Pointer)
                 .label(format!("Compact {amount} tokens of history before sending"))
                 .help(tooltip)
-                .focusable(true)
                 .h(32.0)
                 .px(10.0)
-                .radius(6.0)
+                .radius(7.0)
                 .center_y()
                 .gap(6.0)
-                .hover(p.selected)
-                .press(p.selected)
-                .disabled(
-                    composer_disabled(s)
-                        || (s.client.is_some() && !s.machine_connected(&s.machines.selected)),
-                )
-                .on_press(|s: &mut State| s.toggle_keep_full_history())
+                .disabled(compact_disabled)
                 .child(icon("minimize", p.muted));
+            // Never stack two washes: active state uses one `p.selected` fill, while the
+            // inactive state applies `p.selected` only on hover/press when enabled.
             if !keep_full_history {
                 toggle = toggle.fill(p.selected);
+            } else if !compact_disabled {
+                toggle = toggle.hover(p.selected).press(p.selected);
+            }
+            if !compact_disabled {
+                toggle = toggle
+                    .cursor(rune::Cursor::Pointer)
+                    .focusable(true)
+                    .on_press(|s: &mut State| s.toggle_keep_full_history());
             }
             toggle = toggle.child(label(&amount, META.features(TABULAR), p.muted));
             action = action.child(toggle);
         }
         action = action.child(send);
     }
-    if !s.demo && (t.status.busy() && t.queued_edit.is_none() || t.stop_control.phase().is_some()) {
-        action = action.child(
-            el().key("stop-agent")
-                .role("button")
+    let show_stop_slot =
+        !s.demo && (t.status.busy() && t.queued_edit.is_none() || t.stop_control.phase().is_some());
+    let stop_disabled = t.stop_control.disabled()
+        || !t.turn_capabilities().supports_interrupt
+        || s.client.is_some() && !s.machine_connected(&s.machines.selected);
+    if show_stop_slot {
+        let mut stop = el()
+            .key("stop-agent")
+            .role("button")
+            .label(t.stop_control.label())
+            .disabled(stop_disabled)
+            .size(32.0, 32.0)
+            .radius(7.0)
+            .center()
+            .child(
+                el().key("composer-stop-mark")
+                    .size(10.0, 10.0)
+                    .radius(2.0)
+                    .fill(p.danger)
+                    .a11y_hidden(),
+            );
+        if !stop_disabled {
+            stop = stop
                 .cursor(rune::Cursor::Pointer)
-                .label(t.stop_control.label())
                 .focusable(true)
-                .disabled(
-                    t.stop_control.disabled()
-                        || !t.turn_capabilities().supports_interrupt
-                        || s.client.is_some() && !s.machine_connected(&s.machines.selected),
-                )
-                .size(32.0, 32.0)
-                .radius(6.0)
-                .center()
                 .hover(p.selected)
                 .press(p.selected)
-                .on_press(|s: &mut State| s.current_mut().stop())
-                .child(
-                    el().key("composer-stop-mark")
-                        .size(10.0, 10.0)
-                        .radius(2.0)
-                        .fill(p.danger)
-                        .a11y_hidden(),
-                ),
-        );
+                .on_press(|s: &mut State| s.current_mut().stop());
+        }
+        action = action.child(stop);
     }
+    action = action.child(
+        el().key("composer-pill-rim")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .radius(8.0)
+            .border(1.0, p.field_line)
+            .inert(),
+    );
     let locked = s.demo || t.archived() || t.status.busy() || t.configuring;
     let attach_locked = s.demo
         || t.archived()
@@ -15206,6 +15323,7 @@ fn composer(
                 && matches!(entry.phase, crate::attachment_uploads::Phase::Preparing)
         })
         .collect();
+    let mut first_focusable: Option<String> = None;
     if !collapsed && (!tray_items.is_empty() || !preparing.is_empty()) {
         let mut tray = row()
             .key("composer-attachments")
@@ -15217,18 +15335,28 @@ fn composer(
             .px(12.0)
             .pt(12.0);
         for image in tray_items {
+            first_focusable.get_or_insert_with(|| format!("attachment-thumb-{}", image.id));
             tray = tray.child(attachment_chip(s, p, image));
         }
         for entry in preparing {
+            first_focusable.get_or_insert_with(|| format!("remove-attachment-{}", entry.id));
             tray = tray.child(preparing_attachment_chip(s, p, entry));
         }
         card = card.child(tray);
     }
-    if !collapsed && let Some(rows) = attachment_upload_file_rows(s, p) {
+    if !collapsed && let Some((rows, file_first)) = attachment_upload_file_rows(s, p) {
+        if first_focusable.is_none() {
+            first_focusable = file_first;
+        }
         card = card.child(rows);
     }
     if let Some(banner) = composer_reply_banner(t, p) {
+        first_focusable.get_or_insert_with(|| "composer-reply-target".into());
         card = card.child(banner).child(rule(p));
+    }
+    if !collapsed {
+        *s.composer_ui.first_focusable.borrow_mut() =
+            first_focusable.unwrap_or_else(|| "composer-input".into());
     }
     // Ported from KSG Code's composer body (`px-4 pt-4 pb-2`, `ChatComposer.tsx`) and its
     // editor (`max-h-52 overflow-y-auto p-1 -m-1`, `ComposerPromptEditorTiptap.tsx`): the field
@@ -15504,9 +15632,11 @@ fn composer(
         return col()
             .key("composer-lane")
             .w_full()
-            .px(lane_gutter(pane_width))
+            .pl(lane_gutter(pane_width) + lane_rect.inset_start)
+            .pr(lane_gutter(pane_width) + lane_rect.inset_end)
             .items_center()
             .child(area.child(composer_shell(
+                s,
                 p,
                 attach_composer_notices(s, p, lane, composer_card),
                 None,
@@ -15656,12 +15786,32 @@ fn composer(
                 .child(label(error, SMALL, p.danger).wrap().selectable(true)),
         );
     }
+    let mut card_last = "composer-input";
+    if !attach_locked {
+        card_last = "attach-image";
+    }
+    if t.status.busy() && t.has_draft_content() && t.queued_edit.is_none() && t.can_steer() {
+        card_last = "dispatch-mode";
+    }
+    if show_compact_slot && !compact_disabled {
+        card_last = "composer-compact-send";
+    }
+    if show_send_slot && can_send {
+        card_last = "send-message";
+    }
+    if show_stop_slot && !stop_disabled {
+        card_last = "stop-agent";
+    }
+    s.composer_ui.last_focusable.set(card_last);
     let composer_card = composer_ui::frame_card(s, p, card);
     // KSG Code's `ComposerSurface.ContextStrip`: a 30 px muted row inside the tray, the run
     // context on the left and the model, effort, context and access on the right.
     let footer = if s.demo {
+        s.composer_ui.last_focusable.set("leave-example");
         row()
             .key("composer-footer")
+            .on_key(composer_ui::control_key)
+            .keeps_text_selection()
             .h(30.0)
             .px(10.0)
             .center_y()
@@ -15689,6 +15839,7 @@ fn composer(
         composer_ui::controls(s, model, p, lane - 16.0, false, locked)
     };
     area = area.child(composer_shell(
+        s,
         p,
         attach_composer_notices(s, p, lane, composer_card),
         Some(footer),
@@ -15714,7 +15865,8 @@ fn composer(
     col()
         .key("composer-lane")
         .w_full()
-        .px(lane_gutter(pane_width))
+        .pl(lane_gutter(pane_width) + lane_rect.inset_start)
+        .pr(lane_gutter(pane_width) + lane_rect.inset_end)
         .items_center()
         .child(area)
 }
@@ -17370,6 +17522,8 @@ pub(crate) mod tests {
     fn tab_inside_the_expanded_composer_keeps_its_controls_mounted() {
         for width in [620.0, 1280.0] {
             let mut rt = runtime(width);
+            // A non-default access mode keeps the permissions chip mounted in the strip.
+            rt.state.current_mut().native.access = crate::model::AccessMode::Supervised;
             rt.frame(0.0);
             press(&mut rt, "composer-input");
             tap(&mut rt, rune::Key::Tab);
@@ -19349,6 +19503,17 @@ pub(crate) mod tests {
                 (p.faint, over_srgb(p.card, p.selected)),
                 (p.faint, p.code_bg),
                 (p.ink, p.message_bg),
+                // The send pill's icon, compact label and stop mark on the recessed `pill` fill
+                // and under a single interaction wash in linear light and sRGB compositing.
+                (p.ink, p.pill),
+                (p.ink, p.pill.mix(p.selected, p.selected.a)),
+                (p.ink, over_srgb(p.pill, p.selected)),
+                (p.muted, p.pill),
+                (p.muted, p.pill.mix(p.selected, p.selected.a)),
+                (p.muted, over_srgb(p.pill, p.selected)),
+                (p.danger, p.pill),
+                (p.danger, p.pill.mix(p.selected, p.selected.a)),
+                (p.danger, over_srgb(p.pill, p.selected)),
                 // The "Shina" role label sits on the coral wash.
                 (p.ink, p.panel.mix(p.coral_bg, p.coral_bg.a)),
                 (p.ink, over_srgb(p.panel, p.coral_bg)),
@@ -19384,7 +19549,12 @@ pub(crate) mod tests {
                 ("panel", p.panel),
                 ("tray", p.tray),
                 ("card", p.card),
+                ("card_top", p.card_top),
+                ("card_bottom", p.card_bottom),
                 ("lift", p.lift),
+                ("pill", p.pill),
+                ("pill-hover-linear", p.pill.mix(p.selected, p.selected.a)),
+                ("pill-hover-srgb", over_srgb(p.pill, p.selected)),
             ] {
                 let contrast = ratio(p.field_line, surface);
                 assert!(
@@ -20717,6 +20887,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn composer_shell_recessed_pill_and_quiet_access_chip_at_supported_widths() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.state.populate_demo();
+            rt.state.demo = false;
+            rt.frame(0.0);
+            rt.frame(0.0);
+            let p = palette(rt.state.dark);
+            // KSG's `ComposerSurface.Shell`: the 16 pt tray wraps the card in the resting
+            // and the expanded composer alike.
+            let (shell, _) = rt
+                .presented("composer-shell")
+                .unwrap_or_else(|| panic!("{width}: composer-shell"));
+            let (card, _) = rt
+                .presented("composer")
+                .unwrap_or_else(|| panic!("{width}: composer card"));
+            assert!(
+                card[0] >= shell[0] - 0.5
+                    && card[0] + card[2] <= shell[0] + shell[2] + 0.5
+                    && card[1] >= shell[1] - 0.5
+                    && card[1] + card[3] <= shell[1] + shell[3] + 0.5,
+                "{width}: card {card:?} outside shell {shell:?}"
+            );
+            let fills: std::collections::HashMap<String, Color> = rt
+                .elements()
+                .into_iter()
+                .filter_map(|e| e.key.map(|k| (k, e.fill)))
+                .collect();
+            assert_eq!(
+                fills.get("composer-shell"),
+                Some(&p.tray),
+                "{width}: shell fill"
+            );
+            // KSG's `ComposerSendPill`: the recessed 32 pt action slot in `pill` fill.
+            assert_eq!(
+                fills.get("composer-transition-actions"),
+                Some(&p.pill),
+                "{width}: send pill fill"
+            );
+            let (pill, _) = rt.presented("composer-transition-actions").unwrap();
+            assert!(
+                (pill[3] - 32.0).abs() < 0.5,
+                "{width}: pill height {pill:?}"
+            );
+            let (send, _) = rt.presented("send-message").unwrap();
+            assert!(
+                send[0] >= pill[0] - 0.5
+                    && send[0] + send[2] <= pill[0] + pill[2] + 0.5
+                    && send[1] >= pill[1] - 0.5
+                    && send[1] + send[3] <= pill[1] + pill[3] + 0.5,
+                "{width}: send {send:?} outside pill {pill:?}"
+            );
+            // Conversation and composer share the resolved lane.
+            let (lane, _) = rt.presented("chat-lane").unwrap();
+            assert!(
+                (card[0] - lane[0]).abs() < 0.5 && (card[2] - lane[2]).abs() < 0.5,
+                "{width}: composer {card:?} and transcript {lane:?} share one lane"
+            );
+            // KSG's `composerControlsOwnership`: the default mode keeps the chip quiet.
+            assert!(
+                rt.presented("access-mode").is_none(),
+                "{width}: the default access mode must not mount the chip"
+            );
+            assert!(
+                !rt.state.composer_ui.show_access.get(),
+                "{width}: default mode keeps the mode block out of the strip and the overflow"
+            );
+            rt.state.current_mut().native.access = crate::model::AccessMode::Supervised;
+            rt.state.current_mut().draft.focused = true;
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(0.0);
+            assert!(
+                rt.state.composer_ui.show_access.get(),
+                "{width}: a non-default access mode shows the chip"
+            );
+            // The chip sits in the strip, or is measured into the overflow menu, which then
+            // carries the permissions section (KSG's `overflowShowsPermissions`).
+            assert!(
+                rt.presented("access-mode").is_some()
+                    || rt.presented("composer-overflow").is_some(),
+                "{width}: the non-default chip is in the strip or its overflow"
+            );
+            rt.state.current_mut().native.access = crate::model::AccessMode::Full;
+        }
+    }
+
+    #[test]
     fn tool_groups_and_individual_outputs_expand_independently() {
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
@@ -21804,12 +22062,12 @@ pub(crate) mod tests {
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(1.0);
-            assert_eq!(fill_of(&rt, "composer-transition-actions"), p.bg);
+            assert_eq!(fill_of(&rt, "composer-transition-actions"), p.pill);
             rt.state.current_mut().draft.replace_text("Hello");
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(1.0);
-            assert_eq!(fill_of(&rt, "composer-transition-actions"), p.bg);
+            assert_eq!(fill_of(&rt, "composer-transition-actions"), p.pill);
             let (send, _) = rt.presented("send-message").unwrap();
             assert_eq!((send[2], send[3]), (32.0, 32.0));
             // Without a draft, the red stop mark takes the same slot.
@@ -21819,10 +22077,455 @@ pub(crate) mod tests {
             rt.invalidate();
             rt.frame(0.0);
             rt.frame(1.0);
-            assert_eq!(fill_of(&rt, "composer-transition-actions"), p.bg);
+            assert_eq!(fill_of(&rt, "composer-transition-actions"), p.pill);
             assert_eq!(fill_of(&rt, "composer-stop-mark"), p.danger);
             let (stop, _) = rt.presented("stop-agent").unwrap();
             assert_eq!((stop[2], stop[3]), (32.0, 32.0));
+        }
+    }
+
+    #[test]
+    fn default_permissions_stay_quiet_and_open_from_model_picker_at_all_widths() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.composer_ui.force_expanded = true;
+            rt.state.catalog.models = vec![crate::session::AgentModel {
+                provider: "cpa".into(),
+                id: "gpt-6-astra".into(),
+                name: "GPT-6 Astra".into(),
+                ..Default::default()
+            }];
+            rt.state.current_mut().models = rt.state.catalog.models.clone();
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            assert!(
+                rt.presented("access-mode").is_none(),
+                "{width}: default permissions chip stays quiet"
+            );
+
+            press(&mut rt, "model-effort");
+            rt.frame(0.1);
+            let (card, _) = rt
+                .presented("pi-settings-picker")
+                .unwrap_or_else(|| panic!("{width}: model picker did not open"));
+            let (perm, _) = rt
+                .presented("model-picker-permissions")
+                .unwrap_or_else(|| panic!("{width}: model-picker-permissions missing"));
+            assert!(
+                perm[0] >= card[0] - 0.5
+                    && perm[0] + perm[2] <= card[0] + card[2] + 0.5
+                    && perm[1] + perm[3] <= card[1] + card[3] + 0.5,
+                "{width}: permissions footer outside card: {perm:?} in {card:?}"
+            );
+
+            press(&mut rt, "model-picker-permissions");
+            rt.frame(0.1);
+            assert_eq!(
+                rt.state.settings_picker, None,
+                "{width}: model picker closed"
+            );
+            assert!(
+                rt.state.current().native.access_picker,
+                "{width}: access picker opened from model picker footer"
+            );
+            let (picker, _) = rt
+                .presented("access-picker")
+                .unwrap_or_else(|| panic!("{width}: access-picker not presented"));
+            assert!(
+                picker[0] >= 0.0 && picker[0] + picker[2] <= width + 0.5 && picker[1] >= 0.0,
+                "{width}: access picker out of viewport: {picker:?}"
+            );
+
+            // When busy, clicking the disabled footer row does not open the access picker.
+            rt.state.current_mut().native.access_picker = false;
+            rt.state.current_mut().status = Status::Running;
+            rt.state.settings_picker = Some(SettingsPicker::Model);
+            rt.invalidate();
+            rt.frame(0.2);
+            press(&mut rt, "model-picker-permissions");
+            assert!(
+                !rt.state.current().native.access_picker,
+                "{width}: disabled permissions footer must not open access picker"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_leaves_expanded_composer_when_trailing_controls_are_disabled() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            let non_default =
+                if rt.state.thread_defaults.access == crate::model::AccessMode::Full.id() {
+                    crate::model::AccessMode::Supervised
+                } else {
+                    crate::model::AccessMode::Full
+                };
+            {
+                let t = rt.state.current_mut();
+                t.messages.push(crate::model::Message {
+                    id: "m1".into(),
+                    role: "You",
+                    text: "Working".into(),
+                    images: vec![],
+                    context: None,
+                });
+                t.native.access = non_default;
+                t.status = Status::Running;
+                t.draft.focused = true;
+            }
+            rt.state.composer_ui.scope_focused.set(true);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            rt.update(|_, tx| tx.focus("composer-input", true));
+            rt.frame(1.0);
+
+            assert!(
+                rt.presented("composer-prompt-body").is_some(),
+                "{width}: expanded composer mounted while focused"
+            );
+            let mut cleared = false;
+            for _ in 0..16 {
+                rt.key(rune::KeyEvent {
+                    key: rune::Key::Tab,
+                    mods: Default::default(),
+                });
+                rt.frame(0.05);
+                if !rt.state.composer_ui.scope_focused.get() {
+                    cleared = true;
+                    break;
+                }
+            }
+            assert!(
+                cleared,
+                "{width}: Tab never cleared scope_focused (last_focusable={:?}, focused={:?})",
+                rt.state.composer_ui.last_focusable.get(),
+                rt.elements()
+                    .into_iter()
+                    .find(|e| e.focused)
+                    .and_then(|e| e.key),
+            );
+            if width < 640.0 {
+                rt.frame(1.0);
+                assert!(
+                    rt.presented("composer-prompt-body").is_none(),
+                    "{width}: narrow composer stays stuck open after Tab leaves"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tab_scope_and_disabled_labeled_access_chip_cover_demo_context_and_attachments() {
+        // 1. Demo footer routes Tab on `leave-example` to `control_key` and collapses narrow composer.
+        {
+            let mut rt = runtime(620.0);
+            rt.set_viewport((620.0, 900.0), 1.0);
+            rt.state.demo = true;
+            rt.state.current_mut().draft.focused = true;
+            rt.state.composer_ui.scope_focused.set(true);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            rt.update(|_, tx| tx.focus("leave-example", true));
+            rt.frame(0.1);
+            assert!(rt.presented("composer-prompt-body").is_some());
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(1.0);
+            assert!(
+                !rt.state.composer_ui.scope_focused.get(),
+                "Tab on demo leave-example must clear scope_focused"
+            );
+            assert!(
+                rt.presented("composer-prompt-body").is_none(),
+                "narrow demo composer should collapse after Tab leaves"
+            );
+        }
+
+        // 2. Context ring with open breakdown popover clears scope_focused when Tab enters legend.
+        {
+            use crate::context_breakdown::{BreakdownRowKind, ContextBreakdownRow};
+            let mut rt = context_fixture(620.0);
+            rt.state.current_mut().context.usage.breakdown = Some(vec![
+                ContextBreakdownRow {
+                    label: "Messages".into(),
+                    tokens: 80_000,
+                    kind: BreakdownRowKind::Estimated,
+                },
+                ContextBreakdownRow {
+                    label: "System".into(),
+                    tokens: 20_000,
+                    kind: BreakdownRowKind::Inferred,
+                },
+            ]);
+            context_toggle(&mut rt.state);
+            rt.state.composer_ui.scope_focused.set(true);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            rt.update(|_, tx| tx.focus("context-usage-ring", true));
+            rt.frame(0.1);
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: Default::default(),
+            });
+            rt.frame(0.1);
+            assert!(
+                !rt.state.composer_ui.scope_focused.get(),
+                "Tab from context-usage-ring into breakdown popover must clear scope_focused"
+            );
+            assert!(
+                focused_key(&rt)
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("context-breakdown-legend-")),
+                "focus moved into breakdown legend: {:?}",
+                focused_key(&rt)
+            );
+        }
+
+        // 3. Shift+Tab from Remove stays inside composer on Preview, then leaves from Preview.
+        {
+            let mut rt = runtime(620.0);
+            rt.set_viewport((620.0, 900.0), 1.0);
+            rt.state.attach_image("shot.png", &ui_png(4));
+            let id = rt.state.current().draft_images[0].id.clone();
+            rt.state.composer_ui.scope_focused.set(true);
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let remove_key = format!("remove-attachment-{id}");
+            let thumb_key = format!("attachment-thumb-{id}");
+            rt.update(|_, tx| tx.focus(&remove_key, true));
+            rt.frame(0.1);
+            let shift = rune::Mods {
+                shift: true,
+                ..Default::default()
+            };
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: shift,
+            });
+            rt.frame(0.1);
+            assert_eq!(
+                focused_key(&rt).as_deref(),
+                Some(thumb_key.as_str()),
+                "Shift+Tab from Remove lands on Preview"
+            );
+            assert!(
+                rt.state.composer_ui.scope_focused.get(),
+                "Shift+Tab from Remove must keep scope_focused while Preview is focused"
+            );
+            assert!(
+                rt.presented("composer-prompt-body").is_some(),
+                "narrow composer stays expanded while Preview is focused"
+            );
+            rt.key(rune::KeyEvent {
+                key: rune::Key::Tab,
+                mods: shift,
+            });
+            rt.frame(1.0);
+            assert!(
+                !rt.state.composer_ui.scope_focused.get(),
+                "Shift+Tab from Preview must clear scope_focused"
+            );
+            assert!(
+                rt.presented("composer-prompt-body").is_none(),
+                "narrow composer collapses after Shift+Tab leaves Preview"
+            );
+        }
+
+        // 4. Disabled labeled access chip applies no hover or press wash and ignores presses.
+        {
+            let mut rt = runtime(1280.0);
+            rt.set_viewport((1280.0, 900.0), 1.0);
+            let non_default =
+                if rt.state.thread_defaults.access == crate::model::AccessMode::Full.id() {
+                    crate::model::AccessMode::Supervised
+                } else {
+                    crate::model::AccessMode::Full
+                };
+            let element_of = |rt: &Runtime<State>| {
+                rt.elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some("access-mode"))
+                    .expect("labeled access-mode chip should be mounted")
+            };
+            {
+                let t = rt.state.current_mut();
+                t.native.access = non_default;
+                t.status = Status::Ready;
+            }
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+            let (rect, _) = rt
+                .presented("access-mode")
+                .expect("labeled access-mode chip should be mounted");
+            assert!(
+                rect[2] > 40.0,
+                "expected labeled access chip at 1280 px, got {rect:?}"
+            );
+            let (cx, cy) = (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0);
+            // Sanity-check that the enabled chip does activate hover and press overlays.
+            rt.pointer_move(cx, cy);
+            rt.frame(1.5);
+            assert!(
+                element_of(&rt).hover > 0.0,
+                "enabled labeled access chip should report hover state"
+            );
+            rt.pointer_down(cx, cy);
+            rt.frame(2.0);
+            assert!(
+                element_of(&rt).press > 0.0,
+                "enabled labeled access chip should report press state"
+            );
+            rt.pointer_up(cx, cy);
+
+            let mut disabled_rt = runtime(1280.0);
+            disabled_rt.set_viewport((1280.0, 900.0), 1.0);
+            {
+                let t = disabled_rt.state.current_mut();
+                t.native.access = non_default;
+                t.status = Status::Running;
+            }
+            disabled_rt.invalidate();
+            disabled_rt.frame(0.0);
+            disabled_rt.frame(1.0);
+            let (drect, _) = disabled_rt
+                .presented("access-mode")
+                .expect("disabled labeled access-mode chip should be mounted");
+            assert!(
+                drect[2] > 40.0,
+                "expected disabled labeled access chip at 1280 px, got {drect:?}"
+            );
+            let (dx, dy) = (drect[0] + drect[2] / 2.0, drect[1] + drect[3] / 2.0);
+            disabled_rt.pointer_move(dx, dy);
+            disabled_rt.frame(1.5);
+            let hovered = element_of(&disabled_rt);
+            assert_eq!(
+                hovered.hover, 0.0,
+                "disabled labeled access chip must not get a hover wash"
+            );
+            disabled_rt.pointer_down(dx, dy);
+            disabled_rt.frame(2.0);
+            let pressed = element_of(&disabled_rt);
+            assert_eq!(
+                pressed.press, 0.0,
+                "disabled labeled access chip must not get a press wash"
+            );
+            disabled_rt.pointer_up(dx, dy);
+            disabled_rt.frame(2.5);
+            assert!(
+                !disabled_rt.state.current().native.access_picker,
+                "disabled labeled access chip must not open access picker"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_shell_and_pill_rims_overlay_cleanly_and_disabled_pill_slots_do_nothing() {
+        for width in [620.0, 1280.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            rt.state.composer_ui.force_expanded = true;
+            rt.state.current_mut().draft.replace_text("Check rims");
+            rt.invalidate();
+            rt.frame(0.0);
+            rt.frame(1.0);
+
+            let (shell, _) = rt.presented("composer-shell").unwrap();
+            let (shell_rim, _) = rt.presented("composer-shell-rim").unwrap();
+            assert!(
+                (shell[0] - shell_rim[0]).abs() < 0.5
+                    && (shell[1] - shell_rim[1]).abs() < 0.5
+                    && (shell[2] - shell_rim[2]).abs() < 0.5
+                    && (shell[3] - shell_rim[3]).abs() < 0.5,
+                "{width}: shell rim mismatch: shell={shell:?} rim={shell_rim:?}"
+            );
+            let (pill, _) = rt.presented("composer-transition-actions").unwrap();
+            let (pill_rim, _) = rt.presented("composer-pill-rim").unwrap();
+            assert!(
+                (pill[0] - pill_rim[0]).abs() < 0.5
+                    && (pill[1] - pill_rim[1]).abs() < 0.5
+                    && (pill[2] - pill_rim[2]).abs() < 0.5
+                    && (pill[3] - pill_rim[3]).abs() < 0.5,
+                "{width}: pill rim mismatch: pill={pill:?} rim={pill_rim:?}"
+            );
+
+            // Disabled compact toggle (e.g. offline remote machine) does not toggle
+            // keep_full_history on pointer press.
+            let stale_at = crate::lifecycle::now().saturating_sub(80 * 60_000);
+            let (client, _) = crate::client::Client::test_connected(rt.state.data_dir.clone());
+            rt.state.client = Some(client);
+            rt.state.machines.selected = "offline-remote".into();
+            {
+                let t = rt.state.current_mut();
+                t.harness = "claude".into();
+                t.model_provider = "claude".into();
+                t.session = Some("11111111-1111-4111-8111-111111111111".into());
+                t.status = Status::Completed;
+                t.context.absorb(&json!({
+                    "contextUsage": {
+                        "tokens": 220_000,
+                        "contextWindow": 1_000_000,
+                        "updatedAt": stale_at
+                    }
+                }));
+                t.messages.push(crate::model::Message {
+                    id: "m1".into(),
+                    role: "You",
+                    text: "Old".into(),
+                    images: vec![],
+                    context: None,
+                });
+            }
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(
+                rt.presented("composer-compact-send").is_some(),
+                "{width}: compact toggle should be mounted"
+            );
+            let before = rt.state.keep_full_history(rt.state.current());
+            press(&mut rt, "composer-compact-send");
+            assert_eq!(
+                rt.state.keep_full_history(rt.state.current()),
+                before,
+                "{width}: disabled compact toggle fired on press"
+            );
+
+            // Disabled stop button does not trigger stop on pointer press.
+            rt.state.client = None;
+            rt.state.machines.selected = "local".into();
+            {
+                let t = rt.state.current_mut();
+                t.harness_state = json!({"turnCapabilities": {"supportsInterrupt": false}});
+                t.draft.replace_text("");
+                t.status = Status::Running;
+            }
+            rt.invalidate();
+            rt.frame(0.1);
+            assert!(
+                rt.presented("stop-agent").is_some(),
+                "{width}: stop button should be mounted"
+            );
+            press(&mut rt, "stop-agent");
+            assert_eq!(
+                rt.state.current().stop_control.phase(),
+                None,
+                "{width}: disabled stop button fired on press"
+            );
+            assert_ne!(
+                rt.state.current().phase,
+                "Stopping",
+                "{width}: disabled stop button changed phase"
+            );
         }
     }
 

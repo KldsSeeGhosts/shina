@@ -993,11 +993,14 @@ pub(super) fn routines_section(s: &State, p: Palette, captain: usize) -> El {
 pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let captain = brief_captain(s);
     let home = captain.and_then(|c| s.captain_home(c));
+    // The lane the conversation and composer resolve (`chatCanvasLayout.ts`); `None` until
+    // C5 mounts the Details card.
+    let lane = chat_lane(pane_width, wide, None);
     let bar = row()
         .key("earlier-bar")
         .role("status")
         .label("Earlier conversation, read-only")
-        .w(lane_width(pane_width, wide))
+        .w(lane.width)
         .min_h(44.0)
         .px(14.0)
         .py(8.0)
@@ -1035,7 +1038,8 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
     col()
         .key("earlier-lane")
         .w_full()
-        .px(lane_gutter(pane_width))
+        .pl(lane_gutter(pane_width) + lane.inset_start)
+        .pr(lane_gutter(pane_width) + lane.inset_end)
         .pb(16.0)
         .items_center()
         .child(bar)

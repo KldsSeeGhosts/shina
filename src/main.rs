@@ -14,6 +14,7 @@ mod backend;
 mod branch_toolbar;
 mod brand;
 mod cache_persistence;
+mod canvas_layout;
 mod captains;
 mod claude;
 mod claude_attachment_budget;

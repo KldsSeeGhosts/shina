@@ -1,7 +1,7 @@
 //! Composer layout and focus policy, ported from KSG Code's composerFooterLayout,
 //! composerFocusRedirect, composerEventScope and useFocusComposerOnThreadOpen.
 use super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct ControlsLayout {
@@ -18,6 +18,8 @@ pub(crate) struct Behavior {
     pub menu_expanded: bool,
     pub visible_blocks: Cell<usize>,
     pub show_access: Cell<bool>,
+    pub(super) first_focusable: RefCell<String>,
+    pub(super) last_focusable: Cell<&'static str>,
     paste_as_text_until: Option<std::time::Instant>,
     clock: Cell<f64>,
     natural_height: Cell<Option<f32>>,
@@ -57,6 +59,8 @@ impl Default for Behavior {
             menu_expanded: false,
             visible_blocks: Cell::new(3),
             show_access: Cell::new(true),
+            first_focusable: RefCell::new("composer-input".into()),
+            last_focusable: Cell::new("composer-input"),
             paste_as_text_until: None,
             clock: Cell::new(0.0),
             natural_height: Cell::new(None),
@@ -348,19 +352,12 @@ pub(super) fn control_key(s: &mut State, event: &rune::KeyEvent, tx: &mut Tx) ->
         return false;
     }
     if event.key == rune::Key::Tab && !event.mods.cmd && !event.mods.ctrl && !event.mods.alt {
-        let last = if s.demo {
-            "leave-example"
-        } else if s.composer_ui.layout.get().hidden > 0 {
-            "composer-overflow"
-        } else {
-            "access-mode"
-        };
+        // The expanded composer's first and last focusable, enabled Tab stops in DOM order,
+        // recorded as the card and context strip mount their enabled controls.
+        let last = s.composer_ui.last_focusable.get();
         let leaving = if event.mods.shift {
-            if let Some(image) = super::tray_attachments(s.current()).first() {
-                tx.focused() == Some(format!("remove-attachment-{}", image.id).as_str())
-            } else {
-                tx.focused() == Some("composer-input")
-            }
+            let first = s.composer_ui.first_focusable.borrow();
+            tx.focused() == Some(first.as_str())
         } else {
             tx.focused() == Some(last)
         };
@@ -497,6 +494,8 @@ pub(super) fn measurement_probes(s: &State, model: &ComposerModelDisplay, p: Pal
             s.current().native.access.label(),
             pi_ui::access_glyph(s.current().native.access),
             p,
+            false,
+            false,
         )))
         .child(row().child(machine_selector(s, p, true).key("measure-machine-icon")))
         .child(row().child(captain_selector_trigger(s, p, true).key("measure-captain-icon")))
@@ -834,7 +833,11 @@ pub(super) fn controls(
         0.0
     };
     let measurement = s.composer_ui.measurement.get();
-    let show_access = !resting || display_access.id() != s.thread_defaults.access;
+    // KSG's `composerControlsOwnership`: the permissions chip is quiet while the thread's
+    // access mode matches the default, in the resting row and the expanded strip alike. The
+    // `composer.mode` shortcut still opens the access picker, and the overflow menu carries
+    // permissions only when a shown chip was measured into it (`overflowShowsPermissions`).
+    let show_access = display_access.id() != s.thread_defaults.access;
     s.composer_ui.show_access.set(show_access);
     let vcs_controls = s.composer_vcs_controls();
     let branch_max_w = (width * 0.30).clamp(100.0, 200.0);
@@ -955,13 +958,21 @@ pub(super) fn controls(
                 .offset(model_x - controls_x, model_y - controls_y),
         ));
     }
+    let mut last_focusable = s.composer_ui.last_focusable.get();
     if crew_width > 0.0 {
         controls = controls.child(super::crew_draft_chip(s, p, crew_width));
+        if t.client_creating.is_none() {
+            last_focusable = "composer-crew-chip-remove";
+        }
     }
     if visible > 0 {
         controls = controls.child(machine_selector(s, p, icon_only(0)));
+        if s.client.is_some() && s.can_retarget_draft() {
+            last_focusable = "machine-selector";
+        }
         if let crate::model::ComposerVcsControls::Editable { mode, .. } = &vcs_controls {
             controls = controls.child(env_mode_trigger(s, p, icon_only(0), *mode));
+            last_focusable = "env-mode-trigger";
         }
     }
     // The base branch stays in the strip when the machine and workspace move into the
@@ -982,6 +993,7 @@ pub(super) fn controls(
             *start_from_origin,
             branch_max_w,
         ));
+        last_focusable = "base-branch-trigger";
     }
     if visible > 0
         && let crate::model::ComposerVcsControls::LockedWorktree {
@@ -998,6 +1010,10 @@ pub(super) fn controls(
     }
     if visible > 1 {
         controls = controls.child(captain_selector_trigger(s, p, icon_only(1)));
+        let captain_locked = t.status.busy() || t.configuring || t.archived() || !t.is_draft();
+        if !captain_locked {
+            last_focusable = "captain-selector";
+        }
     }
     if !resting {
         let [model_x, model_y] = anchor_offset(s, 3, false);
@@ -1010,33 +1026,70 @@ pub(super) fn controls(
                 .max_w(strip_model_max(width))
                 .offset(model_x - controls_x, model_y - controls_y),
         ));
+        if !locked {
+            last_focusable = "model-effort";
+        }
         if let Some(effort) = effort_trigger(model, p, locked, strip_compact(width)) {
             controls = controls.child(effort);
+            if !locked {
+                last_focusable = "composer-effort";
+            }
         }
         if context_ring_shown(t) {
             controls = controls.child(context_ring(s, t, p, width));
+            last_focusable = "context-usage-ring";
         }
     }
     if visible > 2 {
         let glyph = pi_ui::access_glyph(display_access);
+        let access_disabled = t.status.busy() || t.configuring || t.archived();
         let mut access_control = if resting || icon_only(2) {
-            icon_button("access-mode", display_access.label(), glyph, p, |s| {
-                s.begin_composer_menu();
-                s.open_access_picker();
-            })
-            .size(28.0, 24.0)
+            // The icon-only chip: `icon_button`'s shape with the emphasized icon, since it
+            // renders only for a non-default mode.
+            let mut el = el()
+                .key("access-mode")
+                .role("button")
+                .label(display_access.label())
+                .size(28.0, 24.0)
+                .center()
+                .radius(6.0)
+                .child(tool_icon(glyph, p.ink));
+            if !access_disabled {
+                el = el
+                    .cursor(rune::Cursor::Pointer)
+                    .focusable(true)
+                    .hover(p.selected)
+                    .press(p.selected)
+                    .on_press(|s: &mut State| {
+                        s.begin_composer_menu();
+                        s.open_access_picker();
+                    });
+            }
+            el
         } else {
-            access_trigger("access-mode", display_access.label(), glyph, p).on_press(
-                |s: &mut State| {
+            let mut el = access_trigger(
+                "access-mode",
+                display_access.label(),
+                glyph,
+                p,
+                true,
+                access_disabled,
+            );
+            if !access_disabled {
+                el = el.on_press(|s: &mut State| {
                     s.begin_composer_menu();
                     s.open_access_picker();
-                },
-            )
+                });
+            }
+            el
         };
         access_control = access_control
             .preserve_focus_on_press(true)
-            .disabled(t.status.busy() || t.configuring || t.archived());
+            .disabled(access_disabled);
         controls = controls.child(access_control);
+        if !access_disabled {
+            last_focusable = "access-mode";
+        }
     }
     if layout.hidden > 0 {
         controls = controls.child(
@@ -1054,9 +1107,16 @@ pub(super) fn controls(
             .size(28.0, 24.0)
             .preserve_focus_on_press(true),
         );
+        last_focusable = "composer-overflow";
     }
     // KSG Code's ComposerStashBadge sits at the right end of the composer footer.
     controls = controls.child(composer_stash::badge(s, p));
+    if !s.stash.entries.is_empty() {
+        last_focusable = "composer-stash-badge";
+    }
+    if !resting {
+        s.composer_ui.last_focusable.set(last_focusable);
+    }
     if resting && !layout.visible {
         controls = controls.opacity(0.0).inert();
     }
@@ -1105,22 +1165,35 @@ pub(super) fn strip_fixed(s: &State, display: &ComposerModelDisplay, width: f32)
 }
 
 /// KSG's access mode control in the context strip: a shield and the mode, muted.
-fn access_trigger(key: &str, title: &str, glyph: &str, p: Palette) -> El {
-    row()
+/// `emphasized` lifts the icon to the label's colour, as KSG's `emphasized` does for a
+/// non-default mode: the chip's presence marks the mode, so the label itself stays quiet.
+fn access_trigger(
+    key: &str,
+    title: &str,
+    glyph: &str,
+    p: Palette,
+    emphasized: bool,
+    disabled: bool,
+) -> El {
+    let mut el = row()
         .key(key)
         .role("button")
-        .cursor(rune::Cursor::Pointer)
         .label(title)
-        .focusable(true)
         .center_y()
         .gap(6.0)
         .px(7.0)
         .h(24.0)
         .radius(6.0)
-        .hover(p.selected)
-        .press(p.selected)
-        .child(icon(glyph, p.muted).size(14.0, 14.0))
-        .child(label(title, SMALL, p.muted).truncate().shrink())
+        .child(icon(glyph, if emphasized { p.ink } else { p.muted }).size(14.0, 14.0))
+        .child(label(title, SMALL, p.muted).truncate().shrink());
+    if !disabled {
+        el = el
+            .cursor(rune::Cursor::Pointer)
+            .focusable(true)
+            .hover(p.selected)
+            .press(p.selected);
+    }
+    el
 }
 
 pub(super) fn overflow_menu(s: &State, p: Palette) -> El {
