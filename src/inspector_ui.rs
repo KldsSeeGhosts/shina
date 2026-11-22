@@ -1,45 +1,36 @@
 //! The Inspector: the one right-side panel, holding four fixed tabs. Ported from
-//! KSG Code's `ChatRightPanel` and `RightPanelTabs`, which the old `right_panel`
-//! already followed; where KSG's strip scrolls, this one keeps Overview, Crew,
-//! Context and Diff in a fixed 36 pt strip.
+//! KSG Code's `ChatRightPanel` and `RightPanelTabs`; where KSG's strip scrolls and
+//! holds any surface, this one keeps Details, Work, Context and Changes in a fixed
+//! 36 pt strip, in the same order on every thread.
 //!
-//! Tab bodies are still the sections the app already had: Overview is the
-//! captain's Brief or the thread's session details, Crew the roster section,
-//! Context `context_ui::tab` (documents, scope, memory and earlier conversations,
-//! plus an open captain document) and Diff `diff_panel`. Workstreams 3 and 4
-//! reshape each body in place; the shell is settled here.
+//! Details is the captain's Brief or the thread's session details. Work lists the
+//! thread's provider subagents and its captain's crew. Context is `context_ui::tab`
+//! (documents, scope, memory and earlier conversations, plus an open captain
+//! document) and Changes is `diff_panel`.
 use super::crew_ui::{active_wash, hover_wash, motion};
 use super::*;
 
-/// The tabs a thread offers, in strip order. Captain homes and crew workers get
-/// all four; a plain thread has no Crew tab.
-pub(super) fn tabs(s: &State) -> Vec<crate::right_panel::PanelView> {
+/// The strip's tabs, in order. Every thread has all four.
+pub(super) const TABS: [crate::right_panel::PanelView; 4] = {
     use crate::right_panel::PanelView;
-    let mut views = vec![PanelView::Overview];
-    if s.inspector_has_agents_tab() {
-        views.push(PanelView::Agents);
-    }
-    if s.inspector_has_crew_tab() {
-        views.push(PanelView::Crew);
-    }
-    views.extend([PanelView::Context, PanelView::Diff]);
-    views
-}
+    [
+        PanelView::Overview,
+        PanelView::Work,
+        PanelView::Context,
+        PanelView::Diff,
+    ]
+};
 
-/// The tab the shell actually draws: a stored view the thread does not have
-/// falls back to Overview.
-fn resolved_view(s: &State) -> crate::right_panel::PanelView {
-    s.right_panel_resolved_view()
-}
-
-/// One segment of the strip's control: a 24 px pressable row with an icon and
-/// its title, the active segment framed in `card`/`frame` as before.
+/// One tab of the strip, as KSG's `RightPanelTabs` item: a 24 px borderless row with an
+/// icon and its title. The active tab takes `lift` and `ink`; the others stay `muted`
+/// and take the hover wash.
 fn segment(
+    s: &State,
     p: Palette,
     key: &str,
     glyph: &str,
     title: &str,
-    badge: Option<String>,
+    badge: Option<(String, Color)>,
     on: bool,
     glyph_only: bool,
     action: impl Fn(&mut State) + 'static,
@@ -57,12 +48,15 @@ fn segment(
         .gap(5.0)
         .center_y()
         .radius(6.0)
-        .border(1.0, if on { p.frame } else { Color::TRANSPARENT })
-        .fill(if on { p.card } else { Color::TRANSPARENT })
-        .hover(p.selected)
-        .press(p.selected)
+        .fill(if on { p.lift } else { Color::TRANSPARENT })
         .on_press(action)
         .child(icon(glyph, if on { p.ink } else { p.muted }).size(12.0, 12.0));
+    if !on {
+        content = content
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion());
+    }
     if !glyph_only {
         content = content.child(
             label(
@@ -73,46 +67,46 @@ fn segment(
             .truncate(),
         );
     }
-    if let Some(badge) = badge {
-        content = content.child(label(
-            badge,
-            TIMER,
-            if glyph == "agents" { p.sea } else { p.faint },
-        ));
+    if let Some((badge, ink)) = badge {
+        content = content.child(label(badge, TIMER, ink));
     }
     content
 }
 
-/// The working count on the Crew segment, absent at zero.
-fn crew_working_count(s: &State) -> Option<String> {
+/// The crew a captain put beside this thread: the home's roster, or a peer worker's
+/// siblings.
+fn crew_members(s: &State) -> Vec<crew_ui::RosterMember> {
     let t = s.current();
-    let home = if s.is_captain_home(t) {
-        Some(t.id)
-    } else {
-        None
-    };
-    let captain = t.captain.or(t.crew_captain)?;
-    let members = match home {
-        Some(home) => crew_ui::roster_members(s, home, captain),
-        None => t
-            .peer_origin
-            .as_ref()
-            .map(|origin| crew_ui::peer_sibling_members(s, t.id, origin))
-            .unwrap_or_default(),
-    };
-    let working = members
-        .iter()
-        .filter(|member| member.status == Status::Running)
-        .count();
-    (working > 0).then(|| working.to_string())
+    if s.is_captain_home(t) {
+        return t
+            .captain
+            .map(|captain| crew_ui::roster_members(s, t.id, captain))
+            .unwrap_or_default();
+    }
+    t.peer_origin
+        .as_ref()
+        .map(|origin| crew_ui::peer_sibling_members(s, t.id, origin))
+        .unwrap_or_default()
 }
 
-/// The strip atop the panel: the four-segment control, then the maximize and
-/// close controls. Fixed at 36 pt, since nothing else in the pane shares its
-/// line now.
+/// The count on the Work tab: crew waiting on the user in brass, else everything
+/// working (crew and subagents) in sea. Absent at zero.
+fn work_badge(s: &State, p: Palette) -> Option<(String, Color)> {
+    let members = crew_members(s);
+    let count = |want: Status| members.iter().filter(|m| m.status == want).count();
+    let waiting = count(Status::Waiting);
+    if waiting > 0 {
+        return Some((waiting.to_string(), p.brass));
+    }
+    let working = count(Status::Running) + crate::agents::active_count(s.current());
+    (working > 0).then(|| (working.to_string(), p.sea))
+}
+
+/// The strip atop the panel: the four tabs, then the maximize and close controls.
+/// Fixed at 36 pt. Under 340 pt the inactive tabs show their icon only.
 fn strip(s: &State, p: Palette, width: f32) -> El {
+    use crate::right_panel::{PanelView, SingletonKind};
     let panel = s.right_panel();
-    let view = resolved_view(s);
     let mut segments = row()
         .key("right-panel-tabs")
         .role("tablist")
@@ -120,51 +114,38 @@ fn strip(s: &State, p: Palette, width: f32) -> El {
         .min_w(0.0)
         .center_y()
         .gap(2.0);
-    let tabs = tabs(s);
-    let compact = tabs.len() == 5 && width < 420.0;
-    for tab in tabs {
+    let compact = width < 340.0;
+    for tab in TABS {
         let (key, glyph, title, kind) = match tab {
-            crate::right_panel::PanelView::Overview => (
+            PanelView::Overview => (
                 "right-panel-segment-overview",
                 "info",
-                "Overview",
-                crate::right_panel::SingletonKind::Overview,
+                "Details",
+                SingletonKind::Overview,
             ),
-            crate::right_panel::PanelView::Agents => (
-                "right-panel-segment-agents",
+            PanelView::Work => (
+                "right-panel-segment-work",
                 "agents",
-                "Agents",
-                crate::right_panel::SingletonKind::Agents,
+                "Work",
+                SingletonKind::Work,
             ),
-            crate::right_panel::PanelView::Crew => (
-                "right-panel-segment-crew",
-                "crew",
-                "Crew",
-                crate::right_panel::SingletonKind::Crew,
-            ),
-            crate::right_panel::PanelView::Context => (
+            PanelView::Context => (
                 "right-panel-segment-context",
                 "book",
                 "Context",
-                crate::right_panel::SingletonKind::Context,
+                SingletonKind::Context,
             ),
-            crate::right_panel::PanelView::Diff => (
+            PanelView::Diff => (
                 "right-panel-segment-diff",
                 "diff",
-                "Diff",
-                crate::right_panel::SingletonKind::Diff,
+                "Changes",
+                SingletonKind::Diff,
             ),
         };
-        let badge = match tab {
-            crate::right_panel::PanelView::Crew => crew_working_count(s),
-            crate::right_panel::PanelView::Agents => {
-                let count = crate::agents::active_count(s.current());
-                (count > 0).then(|| count.to_string())
-            }
-            _ => None,
-        };
-        let on = view == tab;
+        let badge = (tab == PanelView::Work).then(|| work_badge(s, p)).flatten();
+        let on = panel.view == tab;
         segments = segments.child(segment(
+            s,
             p,
             key,
             glyph,
@@ -480,7 +461,7 @@ fn session_body(s: &State, p: Palette) -> El {
     )
 }
 
-/// The Overview tab: the captain's Brief sections on a home or worker thread,
+/// The Details tab: the captain's Brief sections on a home or worker thread,
 /// else the session details.
 fn overview_body(s: &State, p: Palette) -> El {
     if let Some(captain) = captain_ui::home_brief_captain(s) {
@@ -495,7 +476,7 @@ fn overview_body(s: &State, p: Palette) -> El {
     }
 }
 
-/// The Overview tab on a crew worker (spec §3.4): the worker's title and status, a
+/// The Details tab on a crew worker (spec §3.4): the worker's title and status, a
 /// pressable "Delegated by" row back to its captain, a "Runs" line for its placement,
 /// then the session details below.
 fn worker_overview_body(s: &State, p: Palette) -> El {
@@ -628,8 +609,8 @@ fn worker_overview_body(s: &State, p: Palette) -> El {
         .child(body)
 }
 
-/// The Crew tab: the captain's roster section where a captain backs the
-/// thread, else a quiet note. Workstream 3 gives it the grouped roster.
+/// The crew half of the Work tab: the captain's roster where a captain backs the
+/// thread, or a peer worker's siblings.
 fn crew_body(s: &State, p: Palette) -> El {
     let t = s.current();
     let captain = t
@@ -639,16 +620,65 @@ fn crew_body(s: &State, p: Palette) -> El {
         .filter(|captain| *captain < s.captains.len());
     match captain {
         Some(captain) => captain_ui::crew_section(s, p, captain),
-        None if t.peer_origin.is_some() => peer_crew_body(s, p),
-        None => col()
-            .key("crew-tab")
-            .min_h(0.0)
-            .w_full()
-            .child(captain_ui::quiet_note("This thread has no crew.", p)),
+        None => peer_crew_body(s, p),
     }
 }
 
-/// The Crew tab on a peer-launched worker (spec §3.5): the workers the same remote
+/// The Work tab: everything running for this thread in one place. Provider subagents
+/// (`agents_ui::view`) sit above the captain's crew roster. A thread with only one of
+/// them gives it the whole tab, and a thread with neither says so. When both show, the
+/// subagent list takes the height its rows need, capped at 40% of the viewport, and
+/// the roster keeps its pinned footer below.
+fn work_body(s: &State, p: Palette) -> El {
+    let t = s.current();
+    let has_agents = crate::agents::has_agents(t);
+    let has_crew = s.thread_has_crew();
+    let tab = col().key("work-tab").h_full().min_h(0.0).w_full();
+    match (has_agents, has_crew) {
+        (false, false) => tab.center().child(
+            col()
+                .key("work-empty")
+                .max_w(240.0)
+                .gap(6.0)
+                .items_center()
+                .child(icon("agents", p.faint).size(20.0, 20.0))
+                .child(label("Nothing running", LABEL, p.ink))
+                .child(
+                    label(
+                        "Subagents and crew show here while they work.",
+                        SMALL,
+                        p.muted,
+                    )
+                    .align(rune::Align::Center)
+                    .wrap()
+                    .w_full(),
+                ),
+        ),
+        (true, false) => tab.child(agents_ui::view(s, p)),
+        (false, true) => tab.child(crew_body(s, p)),
+        (true, true) => {
+            let runs = crate::agents::runs(t);
+            let groups = runs
+                .iter()
+                .map(|run| run.tool_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let needed = 48.0 + groups as f32 * 29.0 + runs.len() as f32 * 45.0;
+            let cap = (s.viewport_height * 0.4).max(140.0);
+            tab.child(
+                col()
+                    .key("work-agents")
+                    .w_full()
+                    .h(needed.min(cap))
+                    .child(agents_ui::view(s, p)),
+            )
+            .child(el().h(1.0).w_full().fill(p.line).hairline())
+            .child(crew_body(s, p))
+        }
+    }
+}
+
+/// The crew half of the Work tab on a peer-launched worker (spec §3.5): the workers the same remote
 /// delegation put on this machine, with the open worker filled. There is no local
 /// captain to foot the tab with, so no footer.
 fn peer_crew_body(s: &State, p: Palette) -> El {
@@ -716,22 +746,16 @@ fn peer_crew_body(s: &State, p: Palette) -> El {
     };
     rows = rows.child(
         crew_ui::roster_row(s, p, &own_member, format!("crew-chip-{}", t.id), false)
-            .h(32.0)
-            .px(10.0)
             .fill(active_wash(s, p)),
     );
     for member in &members {
-        rows = rows.child(
-            crew_ui::roster_row(
-                s,
-                p,
-                member,
-                format!("crew-chip-{}", member.thread_id),
-                true,
-            )
-            .h(32.0)
-            .px(10.0),
-        );
+        rows = rows.child(crew_ui::roster_row(
+            s,
+            p,
+            member,
+            format!("crew-chip-{}", member.thread_id),
+            true,
+        ));
     }
     if members.is_empty() {
         rows = rows.child(
@@ -750,7 +774,7 @@ fn peer_crew_body(s: &State, p: Palette) -> El {
         .child(rows)
 }
 
-/// The Diff tab keeps its embedded header row, as before.
+/// The Changes tab keeps its embedded header row, as before.
 fn diff_body(s: &State, p: Palette) -> El {
     col()
         .min_h(0.0)
@@ -768,16 +792,12 @@ fn diff_body(s: &State, p: Palette) -> El {
 /// owns the entire Context tab, including its document-viewer route, so Workstream 4
 /// can evolve both the Context list and the document editor header inside `context_ui.rs`.
 fn body(s: &State, p: Palette) -> (String, El) {
-    match resolved_view(s) {
-        crate::right_panel::PanelView::Overview => {
-            ("right-panel-body-overview".into(), overview_body(s, p))
-        }
-        crate::right_panel::PanelView::Agents => {
-            ("right-panel-body-agents".into(), agents_ui::view(s, p))
-        }
-        crate::right_panel::PanelView::Crew => ("right-panel-body-crew".into(), crew_body(s, p)),
-        crate::right_panel::PanelView::Context => context_ui::view(s, p),
-        crate::right_panel::PanelView::Diff => ("right-panel-body-diff".into(), diff_body(s, p)),
+    use crate::right_panel::PanelView;
+    match s.right_panel().view {
+        PanelView::Overview => ("right-panel-body-overview".into(), overview_body(s, p)),
+        PanelView::Work => ("right-panel-body-work".into(), work_body(s, p)),
+        PanelView::Context => context_ui::view(s, p),
+        PanelView::Diff => ("right-panel-body-diff".into(), diff_body(s, p)),
     }
 }
 

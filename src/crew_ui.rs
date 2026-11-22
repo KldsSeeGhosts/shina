@@ -1002,10 +1002,9 @@ pub(super) fn roster_row(
         })
         .focusable(true)
         .center_y()
-        .gap(7.0)
-        .h(52.0)
-        .pl(8.0)
-        .pr(6.0)
+        .gap(8.0)
+        .h(44.0)
+        .px(10.0)
         .radius(ROW_RADIUS)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
@@ -1037,7 +1036,7 @@ pub(super) fn roster_row(
             }
             open_thread(s, child);
         })
-        .child(crewmate_avatar(s, p, &member.model, member.status, 32.0))
+        .child(crewmate_avatar(s, p, &member.model, member.status, 24.0))
         .child(
             col()
                 .grow(1.0)
@@ -1046,10 +1045,11 @@ pub(super) fn roster_row(
                 .child(label(&member.title, TITLE, p.ink).truncate())
                 .child(
                     label(
+                        // The clock column names the state, so this line is the model.
                         if member.model.is_empty() {
                             member.word.clone()
                         } else {
-                            format!("{} · {}", member.word, member.model)
+                            member.model.clone()
                         },
                         SMALL,
                         p.muted,
@@ -1308,7 +1308,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, lane: f32, _rows_max: Option<f32>
 /// Dismissible anchored popover for the 28 pt Now / crew & subagents strip, modeled on
 /// KSG Code's `ThreadRelationshipsControl` lineage card. Lists active and recent crew
 /// members (on a Captain home) and/or provider subagents (on any thread), with one
-/// action at the bottom to open the full Inspector tab.
+/// action at the bottom to open the Inspector's Work tab.
 pub(super) fn now_popover(s: &State, p: Palette, lane: f32) -> El {
     let t = s.current();
     let captain = t.captain.filter(|_| s.is_captain_home(t));
@@ -1317,12 +1317,9 @@ pub(super) fn now_popover(s: &State, p: Palette, lane: f32) -> El {
     let mut body = col().gap(2.0).w_full();
     let total_count: usize;
     let heading: &str;
-    let inspector_label: &str;
-    let open_crew = captain.is_some();
 
     if let Some(captain_idx) = captain {
         heading = "Crew";
-        inspector_label = "Open Crew panel";
         let members = roster_members(s, t.id, captain_idx);
         total_count = members.len();
         let groups: [(&str, fn(&RosterMember) -> bool); 5] = [
@@ -1401,7 +1398,6 @@ pub(super) fn now_popover(s: &State, p: Palette, lane: f32) -> El {
         }
     } else {
         heading = "Now";
-        inspector_label = "Open Agents panel";
         total_count = subagents.len();
     }
 
@@ -1498,7 +1494,7 @@ pub(super) fn now_popover(s: &State, p: Palette, lane: f32) -> El {
         .key("now-popover-open-inspector")
         .role("button")
         .cursor(rune::Cursor::Pointer)
-        .label(inspector_label)
+        .label("Open Work panel")
         .focusable(true)
         .h(30.0)
         .px(8.0)
@@ -1511,15 +1507,11 @@ pub(super) fn now_popover(s: &State, p: Palette, lane: f32) -> El {
         .on_press(move |s: &mut State| {
             s.now_popover = false;
             let key = s.panel_key();
-            if open_crew {
-                s.right_panels
-                    .open(&key, crate::right_panel::SingletonKind::Crew);
-            } else {
-                super::agents_ui::open(s);
-            }
+            s.right_panels
+                .open(&key, crate::right_panel::SingletonKind::Work);
         })
-        .child(icon(if open_crew { "crew" } else { "agents" }, p.muted).size(14.0, 14.0))
-        .child(label(inspector_label, SMALL, p.ink).grow(1.0).min_w(0.0))
+        .child(icon("agents", p.muted).size(14.0, 14.0))
+        .child(label("Open Work panel", SMALL, p.ink).grow(1.0).min_w(0.0))
         .child(icon("chevron-right", p.faint).size(12.0, 12.0));
 
     col()

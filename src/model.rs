@@ -6651,17 +6651,14 @@ impl State {
     pub fn right_panel(&self) -> crate::right_panel::ThreadPanel {
         self.right_panels.get(&self.panel_key())
     }
-    /// Whether the current thread offers the Crew tab in the Inspector (spec §3.3):
-    /// captain homes and crew/delegated/peer workers do; plain threads do not.
-    pub fn inspector_has_crew_tab(&self) -> bool {
+    /// Whether a captain backs the current thread, so the Inspector's Work tab lists its
+    /// crew: captain homes and crew, delegated or peer workers. Plain threads have none.
+    pub fn thread_has_crew(&self) -> bool {
         let t = self.current();
         self.is_captain_home(t)
             || t.crew_captain.is_some()
             || t.delegated
             || t.peer_origin.is_some()
-    }
-    pub fn inspector_has_agents_tab(&self) -> bool {
-        crate::agents::has_agents(self.current())
     }
 
     pub fn preview_allowed(&self) -> bool {
@@ -6752,23 +6749,10 @@ impl State {
         self.pending_tool_reveal = Some(row);
         self.flash_tool = Some((tool_id, Instant::now()));
     }
-    /// The Inspector tab actually shown for the current thread (resolving an unoffered
-    /// stored view such as Crew on a released/plain thread to Overview).
-    pub fn right_panel_resolved_view(&self) -> crate::right_panel::PanelView {
-        let view = self.right_panel().view;
-        if view == crate::right_panel::PanelView::Crew && !self.inspector_has_crew_tab()
-            || view == crate::right_panel::PanelView::Agents && !self.inspector_has_agents_tab()
-        {
-            crate::right_panel::PanelView::Overview
-        } else {
-            view
-        }
-    }
-    /// The visible Inspector tab while open, with unoffered views resolved to Overview.
+    /// The visible Inspector tab while the panel is open.
     pub fn right_panel_active_view(&self) -> Option<crate::right_panel::PanelView> {
-        self.right_panel()
-            .open
-            .then(|| self.right_panel_resolved_view())
+        let panel = self.right_panel();
+        panel.open.then_some(panel.view)
     }
     /// Whether the Inspector covers the conversation column at the current viewport width.
     pub fn inspector_covers(&self) -> bool {

@@ -955,7 +955,7 @@ mod tests {
             brief(&mut rt);
             // The busy workers moved to the Crew tab's Working group (spec §3.5),
             // which lists them all without a Show more fold.
-            open_tab(&mut rt, crate::right_panel::SingletonKind::Crew);
+            open_tab(&mut rt, crate::right_panel::SingletonKind::Work);
             let worker_ids: Vec<usize> = rt
                 .state
                 .threads

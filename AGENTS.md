@@ -49,13 +49,13 @@ Already ported:
 | `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
 | `crew_ui::needs_you` | `chat/ChildThreadApprovals.tsx` (one paged request card, spec §3.6) |
 | `crew_ui::task_card` | `chat/ProviderSubagentBar.tsx` restyled as a single 32 pt work row (spec §3.7) |
-| `crew_ui::crew_tray` | `chat/QueuedRunsControl.tsx` — a flat 28 pt strip that toggles the Inspector on the Crew tab; never expands in place (spec §3.6) |
+| `crew_ui::crew_tray`, `crew_ui::now_popover` | `chat/QueuedRunsControl.tsx`, `chat/ThreadRelationshipsControl.tsx`. A flat 28 pt strip, labelled Crew on a Captain home and Now on a thread with subagents. It opens a dismissible popover and never expands in place. The popover's footer opens the Inspector's Work tab. |
 | `crew_ui::parent_bar`, `crew_ui::crew_bar` | Shina-only 36 pt borderless notice bars (`p.selected`), shown only for actionable recovery/offline/pending-crew states (spec §3.8) |
-| `inspector_ui` tabs: `overview`/`crew` bodies, `worker_overview_body`, `peer_crew_body` | `chat/ChatRightPanel.tsx` + `chat/RightPanelTabs.tsx`; Crew tab is Shina-only (`crew_ui::roster_row` groups + pinned 44 pt footer) (spec §3.4, §3.5) |
+| `inspector_ui` bodies: `overview_body`, `worker_overview_body`, `work_body`, `peer_crew_body` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`. The Work tab is Shina-only: subagents (`agents_ui::view`) above the crew roster (`crew_ui::roster_row` groups and a pinned 44 pt footer), both in 44 pt two-line rows with a 24 pt avatar. |
 | `captain_hero` | `chat/DraftHeroHeadline.tsx` |
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
-| `inspector_ui::view`, `agents_ui::view` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`, `chat/ProviderSubagentBar.tsx` (fixed Overview/Agents/Crew/Context/Diff strip; Agents is thread-scoped) |
+| `inspector_ui::view`, `agents_ui::view` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`, `chat/ProviderSubagentBar.tsx`. The strip is four fixed tabs on every thread: Details, Work, Context and Changes. Tabs are borderless and the active one takes `lift`. |
 | `sidebar_ui::content`, `sidebar_row::{thread_row_el,captain_row_el}`, `sidebar_preview::view` | KSG Code's flat list and `SidebarThreadRow` card variant for active and pinned threads. Keep project and machine on each card, separate from the title. Use the model avatar, or Shina's default avatar when no model avatar matches. Only shelves and drafts use slim rows. Captain rows keep their portraits and crew attention count. |
 | `pi_ui::access_picker`, `updates_ui::footer`, `updates_ui::popover` | `chat/ComposerPermissionsSection.tsx` and `sidebar/SidebarUpdatePill.tsx`, adapted to the Wave 3 access radio group and quiet footer |
 | `top_bar::bar`, `quick_switcher::view` | `chat/CommandPalette.tsx`, `chat/CommandPaletteResults.tsx` (row metrics for the switcher; the single 40 pt title bar with nav buttons and the breadcrumb title is a Shina-only design) |
@@ -68,6 +68,7 @@ Removed at the user's request. Do not add them back:
 
 - Starter prompt buttons ("Understand project", "Plan a change") on the new-thread screen.
 - The "No sandbox" note under the composer.
+- The desktop task plan panel and the Plan toggle on the crew strip. Captains keep the `task_*` MCP tools.
 
 ### Tailwind to Rune
 

@@ -801,7 +801,7 @@ pub(super) fn subagent_results(s: &State, tool: &Tool, p: Palette) -> El {
         .child(
             button(
                 &format!("pi-subagents-open-{}", tool.id),
-                "Open in Agents",
+                "Open in Work",
                 p,
                 agents_ui::open,
             )

@@ -22027,7 +22027,7 @@ pub(crate) mod tests {
             assert!((card[3] - 32.0).abs() < 0.5, "{width}: {card:?}");
             rt.state.right_panels.open(
                 &rt.state.panel_key(),
-                crate::right_panel::SingletonKind::Crew,
+                crate::right_panel::SingletonKind::Work,
             );
             rt.invalidate();
             rt.frame(0.0);
@@ -22104,7 +22104,7 @@ pub(crate) mod tests {
             assert!(rt.presented("now-popover").is_none(), "{width}");
             assert_eq!(
                 rt.state.right_panel_active_view(),
-                Some(crate::right_panel::PanelView::Crew),
+                Some(crate::right_panel::PanelView::Work),
                 "{width}"
             );
             assert_inside(
@@ -22118,13 +22118,13 @@ pub(crate) mod tests {
                     "crew-roster-recruit",
                 ],
             );
-            // Every member has exactly one row, 32 pt, filed under its group.
+            // Every member has exactly one row, 44 pt, filed under its group.
             for id in [1, 2, 16, 17, 18, 19] {
                 let chip = format!("crew-chip-{id}");
                 let (row, _) = rt
                     .presented(&chip)
                     .unwrap_or_else(|| panic!("{width}: {chip} missing"));
-                assert!((row[3] - 32.0).abs() < 0.5, "{width}: {chip} {row:?}");
+                assert!((row[3] - 44.0).abs() < 0.5, "{width}: {chip} {row:?}");
             }
             // The groups appear in the spec's order: needs you leads, queued before idle.
             for group in [
@@ -22223,7 +22223,7 @@ pub(crate) mod tests {
         assert!(plain.presented("now-popover").is_none());
         assert_eq!(
             plain.state.right_panel_active_view(),
-            Some(crate::right_panel::PanelView::Agents)
+            Some(crate::right_panel::PanelView::Work)
         );
     }
 

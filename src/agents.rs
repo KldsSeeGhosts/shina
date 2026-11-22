@@ -314,21 +314,8 @@ mod tests {
     fn pi_input_and_partial_results_keep_stable_runs_without_creating_threads() {
         let mut state = State::headless(crate::store::directory().unwrap());
         let thread_count = state.threads.len();
-        assert!(!state.inspector_has_agents_tab());
-        state.right_panels.open(
-            &state.panel_key(),
-            crate::right_panel::SingletonKind::Agents,
-        );
-        assert_eq!(
-            state.right_panel_resolved_view(),
-            crate::right_panel::PanelView::Overview
-        );
         state.current_mut().apply(json!({"type":"tool_execution_start","toolCallId":"call","toolName":"subagent",
             "args":{"tasks":[{"agent":"scout","task":"Find the source"},{"agent":"test","task":"Check it"}]}}));
-        assert_eq!(
-            state.right_panel_resolved_view(),
-            crate::right_panel::PanelView::Agents
-        );
         let runs_before = runs(state.current());
         assert_eq!(runs_before.len(), 2);
         assert_eq!(runs_before[0].state, AgentState::Queued);

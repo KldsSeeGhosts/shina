@@ -680,9 +680,7 @@ pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         );
         for member in group_members {
             let key = format!("crew-chip-{}", member.thread_id);
-            let mut member_row = super::crew_ui::roster_row(s, p, member, key, true)
-                .h(32.0)
-                .px(10.0);
+            let mut member_row = super::crew_ui::roster_row(s, p, member, key, true);
             if member.thread_id == current {
                 member_row = member_row.fill(super::crew_ui::active_wash(s, p));
             }

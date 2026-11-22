@@ -363,7 +363,7 @@ fn dispatch_global_command(
             let key = state.panel_key();
             state
                 .right_panels
-                .open(&key, crate::right_panel::SingletonKind::Crew);
+                .open(&key, crate::right_panel::SingletonKind::Work);
         }
         "inspector.context" => {
             let key = state.panel_key();
@@ -1461,6 +1461,48 @@ fn main() {
                 state
                     .right_panels
                     .open(&key, crate::right_panel::SingletonKind::Overview);
+            }),
+            // The Inspector's Work tab on a plain thread with two provider subagents.
+            ("inspector-work", |state| {
+                state.populate_demo();
+                state.dark = true;
+                state.current_mut().apply(serde_json::json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": "demo-subagents",
+                    "toolName": "subagent",
+                    "args": {"tasks": [
+                        {"agent": "scout", "task": "Find where the reconnect listener attaches"},
+                        {"agent": "reviewer", "task": "Check the regression test covers both paths"}
+                    ]}
+                }));
+                state.current_mut().apply(serde_json::json!({
+                    "type": "tool_execution_update",
+                    "toolCallId": "demo-subagents",
+                    "partialResult": {"details": {"results": [
+                        {"agent": "scout", "task": "Find where the reconnect listener attaches",
+                         "finished": false, "activity": "Reading src/transport/socket.ts"}
+                    ]}}
+                }));
+                let key = state.panel_key();
+                state
+                    .right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Work);
+            }),
+            // The same tab on a Captain home: the crew roster grouped by state.
+            ("inspector-work-crew", |state| {
+                captain_workspace_demo(state);
+                let key = state.panel_key();
+                state
+                    .right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Work);
+            }),
+            // The tab on a thread with no subagents and no crew.
+            ("inspector-work-empty", |state| {
+                state.populate_demo();
+                let key = state.panel_key();
+                state
+                    .right_panels
+                    .open(&key, crate::right_panel::SingletonKind::Work);
             }),
             // A five paragraph draft that wraps past the composer's 200 pt text window.
             ("composer-long-draft", long_draft_demo),
