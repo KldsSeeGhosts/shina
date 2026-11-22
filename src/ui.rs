@@ -1236,7 +1236,34 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             root = root.child(settings_picker(s, &composer_model, p));
         }
     } else if s.captain_picker {
-        root = root.child(captain_picker(s, p));
+        let anchor = (!s.composer_hidden())
+            .then(|| {
+                if s.composer_ui.visible_blocks.get() >= 2
+                    && cx.layout_with("captain-selector", |_| ()).is_some()
+                {
+                    Some("captain-selector")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else if cx.layout_with("captain-selector", |_| ()).is_some() {
+                    Some("captain-selector")
+                } else if cx.layout_with("composer", |_| ()).is_some() {
+                    Some("composer")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(captain_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("captain-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.cancel_captain_flow()),
+            );
+        }
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
     } else if s.current().native.access_picker {
@@ -1306,7 +1333,32 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(settings_ui::dialog(s, p));
     }
     if s.machines.picker {
-        root = root.child(machine_picker(s, p));
+        let anchor = (!s.composer_hidden())
+            .then(|| {
+                if s.composer_ui.visible_blocks.get() > 0
+                    && cx.layout_with("machine-selector", |_| ()).is_some()
+                {
+                    Some("machine-selector")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else if cx.layout_with("machine-selector", |_| ()).is_some() {
+                    Some("machine-selector")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(machine_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("machine-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.machines.picker = false),
+            );
+        }
     }
     if s.env_mode_picker {
         let can_show = !s.composer_hidden()
@@ -1374,11 +1426,31 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
     }
     if s.composer_ui.overflow.get() {
-        root = root.child(composer_ui::overflow_menu(s, p));
+        if !s.composer_hidden() && cx.layout_with("composer-overflow", |_| ()).is_some() {
+            root = root.child(composer_ui::overflow_menu(s, p));
+        } else {
+            root = root.child(
+                el().key("composer-overflow-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.composer_ui.overflow.set(false)),
+            );
+        }
     }
     if composer_stash::menu_open(s) {
-        // KSG's drawer portal, mounted beside the other composer popovers.
-        root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+        if !s.composer_hidden() && cx.layout_with("composer-stash-badge", |_| ()).is_some() {
+            // KSG's drawer portal, mounted beside the other composer popovers.
+            root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+        } else {
+            root = root.child(
+                el().key("composer-stash-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.stash_menu = false),
+            );
+        }
     }
     if composer_code_picker::menu_open(s) {
         root = root.child(composer_code_picker::menu(s, p));
@@ -5463,7 +5535,7 @@ fn captain_selector_trigger(s: &State, p: Palette, icon_only: bool) -> El {
 /// Ported from KSG Code's `ModelPickerContent` (searchable list in a bordered popover card)
 /// and `BranchToolbarEnvironmentSelector` (anchored above the composer footer control).
 /// Captains, portraits, and the "No captain" / "New captain" rows are Shina-specific.
-fn captain_picker(s: &State, p: Palette) -> El {
+fn captain_picker(s: &State, p: Palette, anchor: &str) -> El {
     let t = s.current();
     let selected_captain = t.captain;
     let query = s.captain_picker_query.text.trim().to_lowercase();
@@ -5670,21 +5742,12 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .child(label("New captain", TextStyle::new(14.0, 500.0), p.ink));
     card = card.child(col().py(4.0).child(new_captain));
 
-    card.anchored_fit(
-        if s.composer_ui.visible_blocks.get() < 2 {
-            "composer-overflow"
-        } else {
-            "captain-selector"
-        },
-        rune::Side::Top,
-        rune::Align::Start,
-        6.0,
-    )
-    .focus_return("composer-input")
-    .modal(true, |s: &mut State| {
-        s.cancel_captain_flow();
-        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-    })
+    card.anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.cancel_captain_flow();
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// A portrait's cell in the captain editor's grid: the 40 pt face and 4 pt each side.
@@ -16040,7 +16103,7 @@ fn machine_option(key: &str, title: &str, server: &str, online: bool, p: Palette
 }
 
 /// Ported from KSG Code's BranchToolbarEnvironmentSelector SelectPopup/SelectGroup.
-fn machine_picker(s: &State, p: Palette) -> El {
+fn machine_picker(s: &State, p: Palette, anchor: &str) -> El {
     let mut menu = col()
         .key("machine-picker")
         .role("menu")
@@ -16076,21 +16139,12 @@ fn machine_picker(s: &State, p: Palette) -> El {
             s.machines.dialog = true;
         }),
     );
-    menu.anchored_fit(
-        if s.composer_ui.visible_blocks.get() == 0 {
-            "composer-overflow"
-        } else {
-            "machine-selector"
-        },
-        rune::Side::Top,
-        rune::Align::Start,
-        6.0,
-    )
-    .focus_return("composer-input")
-    .modal(true, |s: &mut State| {
-        s.machines.picker = false;
-        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-    })
+    menu.anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.machines.picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// Ported from KSG Code's `BranchToolbarEnvModeSelector` `SelectPopup`.
@@ -33997,6 +34051,88 @@ pub(crate) mod tests {
         assert!(rt.state.brief.recruit.is_none());
         assert!(rt.state.brief.more.is_none());
         assert!(rt.state.preview_allowed());
+    }
+
+    #[test]
+    fn composer_overflow_menu_dismisses_when_widening_removes_overflow_button() {
+        let mut rt = runtime(620.0);
+        rt.state.compact_sidebar = true;
+        rt.state.current_mut().client_draft = true;
+        rt.state.current_mut().draft.focused = true;
+        rt.state.current_mut().crew_draft = Some(crate::model::CrewDraftTarget {
+            server: "local".into(),
+            captain: 0,
+            name: "Ember".into(),
+        });
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        rt.state
+            .set_draft_env_mode(crate::model::ThreadEnvMode::Worktree);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        assert!(
+            rt.presented("composer-overflow").is_some(),
+            "narrow crew draft should show More composer controls"
+        );
+        press(&mut rt, "composer-overflow");
+        rt.frame(2.0);
+        let (menu, opacity) = rt
+            .presented("composer-overflow-menu")
+            .expect("composer overflow menu should open at 620 px");
+        assert!(
+            menu[2] > 0.0 && menu[3] > 0.0 && opacity > 0.0,
+            "composer overflow menu must be visible: rect={menu:?} opacity={opacity}"
+        );
+
+        // Widening until every composer control fits inline removes the overflow trigger.
+        rt.state.compact_sidebar = false;
+        rt.state.viewport_width = 1280.0;
+        rt.set_viewport((1280.0, 720.0), 1.0);
+        rt.invalidate();
+        rt.frame(2.5);
+        rt.frame(3.5);
+        assert!(
+            rt.presented("composer-overflow").is_none(),
+            "overflow button should unmount at 1280 px"
+        );
+        assert!(
+            rt.presented("composer-overflow-menu").is_none(),
+            "overflow menu must unmount when its trigger disappears"
+        );
+        assert!(!rt.state.composer_ui.overflow.get());
+        assert!(rt.state.preview_allowed());
+
+        // Underlying controls must respond immediately without focus trapped by a hidden modal.
+        press(&mut rt, "thread-actions");
+        assert!(
+            rt.presented("thread-menu").is_some(),
+            "underlying chat controls must respond after composer overflow menu dismisses"
+        );
     }
 
     #[test]
