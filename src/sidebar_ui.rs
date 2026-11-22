@@ -2093,10 +2093,10 @@ pub(super) fn content(s: &State, p: Palette) -> El {
                 p,
                 first,
                 index,
-                if shelf == 0 {
-                    "sidebar-rows"
-                } else {
-                    "sidebar-snoozed-rows"
+                match shelf {
+                    0 => "sidebar-rows",
+                    1 => "sidebar-working-rows",
+                    _ => "sidebar-snoozed-rows",
                 },
             ));
         }
