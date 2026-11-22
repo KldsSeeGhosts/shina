@@ -4842,17 +4842,20 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .child(keycap_chip("Ctrl+Z", p)),
         );
     }
-    // The footer is a row of quiet icons, as in T3 Code: no divider and no wordmark. Settings
-    // holds preferences such as the theme.
+    // The footer is a row of quiet icons, as in T3 Code: no divider and no wordmark.
+    // Ported from KSG Code's `SidebarChrome` footer (`SidebarUtilityItem`): 32 px icon-only
+    // controls with 16 px glyphs, 4 px apart, in an 8/12 px padded strip. Settings holds
+    // preferences such as the theme.
     side = side.child(
         row()
             .key("sidebar-footer")
-            .h(40.0)
-            .px(4.0)
-            .gap(2.0)
+            .pt(8.0)
+            .pb(12.0)
+            .px(8.0)
+            .gap(4.0)
             .center_y()
             .child(
-                toggle_button(
+                footer_button(
                     "sidebar-settings",
                     "Settings",
                     "settings",
@@ -4863,7 +4866,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .help("Settings"),
             )
             .child(
-                toggle_button(
+                footer_button(
                     "show-archive",
                     if s.show_archive {
                         "Back to threads"
@@ -4881,6 +4884,36 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
             .child(updates_ui::footer(s, p)),
     );
     side
+}
+
+/// KSG's `SidebarUtilityItem`: a 32 px `size="footer"` icon button with a 16 px glyph and
+/// the shared 8 px control radius, showing its on state with a card fill like `toggle_button`.
+fn footer_button(
+    key: &str,
+    title: &str,
+    glyph: &str,
+    on: bool,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    let active_fill = if p.panel.luminance() < 0.5 {
+        p.lift
+    } else {
+        p.card
+    };
+    el().key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(title)
+        .checked(on)
+        .focusable(true)
+        .size(32.0, 32.0)
+        .center()
+        .radius(8.0)
+        .fill(if on { active_fill } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .on_press(action)
+        .child(tool_icon(glyph, p.muted))
 }
 
 fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
