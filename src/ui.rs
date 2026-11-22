@@ -5039,6 +5039,23 @@ fn sidebar_docked(s: &State) -> bool {
     (s.sidebar && !compact) || (compact && s.compact_sidebar)
 }
 
+/// Where a thread row's popover anchors: its sidebar row when that is on screen, else the
+/// header's actions button. A row exists only while the sidebar is docked and lists the
+/// thread; opened from the header menu, for a row filtered or shelved away, or under a
+/// compact window with no dock, the row key would not resolve and Rune suppresses the
+/// overlay rather than drawing it at the window's origin.
+fn sidebar_row_anchor(s: &State, id: usize) -> String {
+    if sidebar_docked(s)
+        && s.visible_sidebar_threads()
+            .iter()
+            .any(|&i| s.threads[i].id == id)
+    {
+        format!("thread-{id}")
+    } else {
+        "thread-actions".to_owned()
+    }
+}
+
 /// Advances the sidebar's portrait animations. Called from the app's poll; the answer is
 /// when to wake for the next frame, or None when no portrait plays.
 pub(crate) fn tick_portraits(
@@ -6949,16 +6966,13 @@ fn snooze_menu(s: &State, p: Palette) -> El {
     }
     // A popover on the thread's row, like the thread menu: no scrim, no Cancel row. Escape and a
     // press outside close it.
-    card.anchored_fit(
-        format!("thread-{}", s.snooze_menu.as_ref().unwrap().0),
-        rune::Side::Right,
-        rune::Align::Start,
-        4.0,
-    )
-    .modal(true, |s: &mut State| {
-        s.snooze_menu = None;
-        s.lifecycle_error = None;
-    })
+    let id = s.snooze_menu.as_ref().unwrap().0;
+    let anchor = sidebar_row_anchor(s, id);
+    card.anchored_fit(anchor, rune::Side::Right, rune::Align::Start, 4.0)
+        .modal(true, |s: &mut State| {
+            s.snooze_menu = None;
+            s.lifecycle_error = None;
+        })
 }
 
 fn bulk_thread_actions(s: &State, p: Palette) -> El {
@@ -7017,7 +7031,7 @@ fn row_menu(s: &State, p: Palette) -> El {
     let target = s.row_menu.expect("row menu target");
     let (anchor, actions) = match target {
         RowTarget::Thread(id) => (
-            format!("thread-{id}"),
+            sidebar_row_anchor(s, id),
             if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
                 bulk_thread_actions(s, p)
             } else {
@@ -32365,7 +32379,7 @@ pub(crate) mod tests {
                 rt.frame(0.0);
                 assert_eq!(rt.state.current().id, id);
                 assert_eq!(rt.state.current().draft.text, "Repeat/IME");
-                rt.ime(rune::Ime::Preedit("あ".into(), None));
+                rt.ime(rune::Ime::Preedit("あ".into(), None, Vec::new()));
                 rt.frame(0.0);
                 assert!(rt.state.current().draft.is_composing());
                 rt.key(enter_chord(true));

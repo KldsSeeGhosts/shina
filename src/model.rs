@@ -8407,7 +8407,6 @@ impl State {
             .map(|parent| self.effective_home(parent))
             .unwrap_or(current.id)
     }
-    #[cfg(test)]
     pub fn visible_sidebar_threads(&self) -> Vec<usize> {
         let mut settled = 0;
         self.sidebar_threads()

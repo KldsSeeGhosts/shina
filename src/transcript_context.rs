@@ -529,11 +529,41 @@ impl<'a> Document<'a> {
                 el = el.help("This context is no longer available.");
             }
         }
+        // `El::pill` turns each chip into a bidi isolate: Rune rewrites the
+        // element's content with U+2068/U+2069 marks around it
+        // (`TextSpec::apply_isolates`), so `TextSelection` ranges on the text are
+        // in those marked coordinates. Keep the copy bookkeeping in them too.
+        let mut marked = String::with_capacity(text.len() + copied.len() * 6);
+        let mut marked_links = Vec::with_capacity(copied.len());
+        let mut at = 0;
+        let mut marks = 0usize;
+        for link in copied.into_iter() {
+            let (a, b) = (link.range.start, link.range.end);
+            let ok = a < b
+                && b <= text.len()
+                && a >= at
+                && text.is_char_boundary(a)
+                && text.is_char_boundary(b);
+            if !ok {
+                continue;
+            }
+            marked.push_str(&text[at..a]);
+            marked.push('\u{2068}');
+            marked.push_str(&text[a..b]);
+            marked.push('\u{2069}');
+            marked_links.push(CopyLink {
+                range: (a + 6 * marks + 3)..(b + 6 * marks + 3),
+                ..link
+            });
+            at = b;
+            marks += 1;
+        }
+        marked.push_str(&text[at..]);
         self.copies.insert(
             key,
             CopyText {
-                text,
-                links: copied,
+                text: marked,
+                links: marked_links,
             },
         );
         let message_id = self.message.id.clone();
@@ -879,6 +909,8 @@ fn selection_payload(
                 message_id = Some(message.id.clone());
             }
             body.push_str(&copy.text[cursor..range.end]);
+            // The marked content's isolate marks are layout, not copied text.
+            body.retain(|c| !('\u{2066}'..='\u{2069}').contains(&c));
             selected.push((text.path().to_string(), body));
         }
     }

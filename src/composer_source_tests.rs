@@ -217,7 +217,7 @@ fn part_a_ime_composition_defers_reveal_and_collapse_until_commit() {
     let mut edit = state_from("**bold** after");
     let mut st = MarkdownSourceState::default();
     edit.set_caret(2);
-    edit.ime(&Ime::Preedit("に".into(), None));
+    edit.ime(&Ime::Preedit("に".into(), None, Vec::new()));
     on_selection_change(&mut st, &mut edit);
     assert!(!has_shown_source(&edit));
     assert_eq!(edit.text, "bold after");
@@ -229,7 +229,7 @@ fn part_a_ime_composition_defers_reveal_and_collapse_until_commit() {
 
     // Composition while revealed does not collapse even if caret moves outside during preedit.
     edit.set_caret(edit.text.len());
-    edit.ime(&Ime::Preedit("か".into(), None));
+    edit.ime(&Ime::Preedit("か".into(), None, Vec::new()));
     on_selection_change(&mut st, &mut edit);
     assert!(has_shown_source(&edit));
 
@@ -701,14 +701,14 @@ fn part_b_ksg_undoes_composition_in_revealed_markdown_through_earlier_paste() {
         // Canceled composition keeps redo and adds no undo.
         rt.update(move |s, _| s.edit.set_selection(sel.0, sel.1));
         rt.frame(0.0);
-        rt.ime(Ime::Preedit(" ".into(), None));
+        rt.ime(Ime::Preedit(" ".into(), None, Vec::new()));
         rt.frame(0.0);
-        rt.ime(Ime::Preedit("".into(), None));
+        rt.ime(Ime::Preedit("".into(), None, Vec::new()));
         rt.frame(0.0);
         assert_eq!(probe_redo_depth(&rt.state.edit, true), 1);
 
         // Actual composition commit records one step against the revealed/collapsed history.
-        rt.ime(Ime::Preedit("漢".into(), None));
+        rt.ime(Ime::Preedit("漢".into(), None, Vec::new()));
         rt.frame(0.0);
         rt.ime(Ime::Commit("漢".into()));
         rt.frame(0.0);
@@ -927,11 +927,11 @@ fn part_c_ksg_formats_or_keeps_literal_a_pair_whose_backticks_came_from_a_dead_k
     // 1. Dead-key backtick pair converts to inline code on exit.
     let mut rt = TestEditor::new("");
     type_str(&mut rt, "do ");
-    rt.ime(Ime::Preedit("`".into(), None));
+    rt.ime(Ime::Preedit("`".into(), None, Vec::new()));
     rt.frame(0.0);
     rt.ime(Ime::Commit("`".into()));
     rt.frame(0.0);
-    rt.ime(Ime::Preedit("`".into(), None));
+    rt.ime(Ime::Preedit("`".into(), None, Vec::new()));
     rt.frame(0.0);
     rt.ime(Ime::Commit("`".into()));
     rt.frame(0.0);
@@ -980,7 +980,7 @@ fn part_c_ksg_keeps_composition_edits_literal_until_the_caret_leaves_the_typed_p
     type_str(&mut rt, "``");
     rt.update(|s, _| s.edit.set_caret(1));
     rt.frame(0.0);
-    rt.ime(Ime::Preedit("世".into(), None));
+    rt.ime(Ime::Preedit("世".into(), None, Vec::new()));
     rt.frame(0.0);
     rt.ime(Ime::Commit("世界".into()));
     rt.frame(0.0);
