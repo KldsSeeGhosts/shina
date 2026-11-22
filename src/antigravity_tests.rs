@@ -148,9 +148,19 @@ fn session_models_combined_ids_and_manifest() {
     assert_eq!(default["slug"], "gemini-3.8-flash-high");
     assert_eq!(default["aliases"], json!([DEFAULT_MODEL]));
     assert_eq!(models.len(), 3);
-    // Manifest renames to the shared catalog names and marks legacy rows.
-    assert_eq!(models[0]["name"], "Gemini 3.8 Flash (High)");
-    assert_eq!(models[2]["name"], "Gemini 4 Carbon");
+    assert_eq!(models[0]["name"], "Flash");
+    assert_eq!(models[1]["name"], "Flash (gemini-3.8-flash-medium)");
+    assert_eq!(models[2]["name"], "Carbon");
+    assert_eq!(models[0]["thinking"]["currentValue"], "high");
+    assert!(models[1]["thinking"]["currentValue"].is_null());
+
+    models[0]["isDefault"] = json!(false);
+    models[0]["aliases"] = Value::Null;
+    models[2]["isDefault"] = json!(true);
+    models[2]["aliases"] = json!([DEFAULT_MODEL]);
+    apply_manifest(&mut models);
+    assert_eq!(models[0]["aliases"], json!([DEFAULT_MODEL]));
+    assert_eq!(models[2]["isDefault"], false);
 }
 
 #[test]
@@ -257,6 +267,33 @@ fn gateway_model_rows_group_family_routes_and_default_medium() {
     let single = gateway_model_rows(&["claude-opus-5-5-high".into()], &advertised);
     assert_eq!(single[0].slug, "claude-opus-5-5-high");
     assert_eq!(single[0].name, "Claude Opus 5.5");
+}
+
+#[test]
+fn gateway_labels_strip_the_advertised_route_id_before_the_effort_suffix() {
+    let rows = gateway_model_rows(
+        &["gemini-neon".into(), "claude-opus-high".into()],
+        &[
+            (
+                "gemini-neon-low".into(),
+                " Gemini Neon (Low) (gemini-neon-low) ".into(),
+            ),
+            (
+                "gemini-neon-medium".into(),
+                "Gemini Neon (Medium) (gemini-neon-medium)".into(),
+            ),
+            ("claude-opus".into(), "Claude Opus (claude-opus)".into()),
+        ],
+    );
+    assert_eq!(rows[0].slug, "gemini-neon");
+    assert_eq!(rows[0].name, "Gemini Neon");
+    assert_eq!(
+        rows[0].routes[1],
+        ("gemini-neon-medium".into(), "Gemini Neon".into())
+    );
+    assert_eq!(rows[0].default_route, "gemini-neon-medium");
+    assert_eq!(rows[1].slug, "claude-opus-high");
+    assert_eq!(rows[1].name, "Claude Opus");
 }
 
 #[test]

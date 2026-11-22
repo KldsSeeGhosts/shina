@@ -1922,6 +1922,7 @@ impl Thread {
                 metadata_only: false,
             },
             wake,
+            &self.models,
         ) {
             Ok(session) => self.pi = Some(session),
             Err(error) => self.fail_session(error),
@@ -3728,16 +3729,6 @@ impl Thread {
                     self.harness_context_sent = record["value"] == true;
                 } else if let Some(field) = record["field"].as_str() {
                     self.harness_state[field] = record["value"].clone();
-                    if field == "optionDescriptors"
-                        && let Ok(descriptors) = serde_json::from_value::<
-                            Vec<crate::descriptors::ProviderOptionDescriptor>,
-                        >(record["value"].clone())
-                    {
-                        for model in &mut self.models {
-                            model.capabilities.option_descriptors = descriptors.clone();
-                        }
-                        self.refresh_thinking_levels();
-                    }
                     if matches!(field, "plan" | "plan_update") {
                         self.record_plan(&record["value"]);
                     }
@@ -3882,6 +3873,9 @@ impl Thread {
                         if !self.initializing || self.selected_thinking.is_none() {
                             self.thinking = string(data, "thinkingLevel").to_owned();
                         }
+                        if self.harness == "pi" {
+                            self.note_pi_thinking_default();
+                        }
                         self.session = data["sessionFile"].as_str().map(str::to_owned);
                         if record["id"] == "state" {
                             self.state_loaded = true;
@@ -3895,14 +3889,21 @@ impl Thread {
                         self.models = record["data"]["models"]
                             .as_array()
                             .map(|models| {
-                                models
-                                    .iter()
-                                    .filter_map(|model| {
-                                        AgentModel::from_harness_value(model, &self.harness)
-                                    })
-                                    .collect()
+                                if self.harness == "pi" {
+                                    AgentModel::pi_models(models)
+                                } else {
+                                    models
+                                        .iter()
+                                        .filter_map(|model| {
+                                            AgentModel::from_harness_value(model, &self.harness)
+                                        })
+                                        .collect()
+                                }
                             })
                             .unwrap_or_default();
+                        if self.harness == "pi" {
+                            self.note_pi_thinking_default();
+                        }
                         self.refresh_thinking_levels();
                     }
                     "get_available_thinking_levels" => {
@@ -4756,6 +4757,12 @@ impl Thread {
         }
     }
 
+    fn note_pi_thinking_default(&mut self) {
+        if let Some(model) = self.models.iter_mut().find(|m| m.id == self.model_id) {
+            model.apply_pi_thinking_default(&self.thinking);
+        }
+    }
+
     fn restore_prompt(&mut self, prompt: &Prompt) {
         let split_reply = prompt.draft.as_ref().and_then(|draft| {
             crate::composer_tokens::split_leading_reply_reference(
@@ -5410,6 +5417,7 @@ pub struct State {
     pub claude_catalog: crate::session::NativeCatalog,
     pub antigravity_catalog: crate::session::NativeCatalog,
     pub cursor_catalog: crate::session::NativeCatalog,
+    pub(crate) acp_catalogs: std::collections::BTreeMap<String, crate::session::NativeCatalog>,
     pub harnesses: crate::harness::Registry,
     provider_availability: crate::harness::AvailabilityProbe,
     refresh_optional_catalogs: bool,
@@ -6468,6 +6476,7 @@ impl State {
             claude_catalog: Default::default(),
             antigravity_catalog: Default::default(),
             cursor_catalog: Default::default(),
+            acp_catalogs: Default::default(),
             harnesses: crate::harness::Registry::read(),
             provider_availability: Default::default(),
             refresh_optional_catalogs: false,
@@ -18168,10 +18177,15 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         tx.wake_after(remaining);
     }
     changed |= state.refresh_native_catalogs(false);
+    let mut acp_changed = false;
+    for (harness, catalog) in &mut state.acp_catalogs {
+        acp_changed |= catalog.poll(harness);
+    }
     if state.codex_catalog.poll("codex")
         | state.claude_catalog.poll("claude")
         | state.antigravity_catalog.poll("antigravity")
         | state.cursor_catalog.poll("cursor")
+        | acp_changed
     {
         state.apply_native_catalogs();
         changed = true;
@@ -18180,6 +18194,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         || state.claude_catalog.loading()
         || state.antigravity_catalog.loading()
         || state.cursor_catalog.loading()
+        || state
+            .acp_catalogs
+            .values()
+            .any(crate::session::NativeCatalog::loading)
     {
         tx.wake_after(Duration::from_millis(50));
     }

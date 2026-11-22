@@ -1,5 +1,7 @@
 //! ACP v1 JSON-RPC over stdio, ported from KSG's effect-acp and provider-acp.
 //! The UI sees the same event envelope as Pi. No provider authentication is performed here.
+mod catalog;
+
 use crate::{
     backend::{self, Event, HostLink, Pi, SessionOwner, SessionSource},
     harness::{Agent, Start},
@@ -117,8 +119,23 @@ fn probe_uncached(agent: &Agent) -> Result<Value, String> {
 }
 
 pub fn start(agent: Agent, start: Start, wake: Waker) -> Result<Pi, String> {
+    start_with_catalog(agent, start, wake, &[])
+}
+
+pub(crate) fn start_with_catalog(
+    agent: Agent,
+    start: Start,
+    wake: Waker,
+    models: &[crate::session::AgentModel],
+) -> Result<Pi, String> {
     let command = agent.process()?;
-    start_command(agent, start, wake, command)
+    let previous = models.iter().map(|model| json!({
+        "id":model.id, "name":model.name, "provider":model.provider,
+        "isDefault":model.is_default, "thinkingLevels":model.thinking_levels,
+        "capabilities":model.capabilities,
+        "input":model.supports_images.map(|images| if images { vec!["text", "image"] } else { vec!["text"] }),
+    })).collect();
+    start_worker(agent, start, wake, |_| Ok(command), previous)
 }
 
 /// The Antigravity layer supplies its own isolated command; every other agent
@@ -137,6 +154,16 @@ pub(crate) fn start_with_command(
     start: Start,
     wake: Waker,
     command: impl FnOnce(&std::path::Path) -> Result<std::process::Command, String> + Send + 'static,
+) -> Result<Pi, String> {
+    start_worker(agent, start, wake, command, vec![])
+}
+
+fn start_worker(
+    agent: Agent,
+    start: Start,
+    wake: Waker,
+    command: impl FnOnce(&std::path::Path) -> Result<std::process::Command, String> + Send + 'static,
+    previous: Vec<Value>,
 ) -> Result<Pi, String> {
     if matches!(start.source, SessionSource::Fork(_)) {
         return Err("ACP conversation forks are not supported. Start a new thread instead.".into());
@@ -192,7 +219,9 @@ pub(crate) fn start_with_command(
                 } else {
                     vec![]
                 };
-                run(command, start, input, events, wake, stopped, owner, skills)
+                run(
+                    command, start, input, events, wake, stopped, owner, skills, previous,
+                )
             };
             #[cfg(test)]
             {
@@ -283,6 +312,11 @@ struct Client {
     legacy_models: Value,
     /// The session's ACP `modes` block, for KSG's setMode modeState.
     modes: Value,
+    early_config_options: Option<Value>,
+    catalog_started: Option<Instant>,
+    models_advertised: bool,
+    commands_advertised: bool,
+    catalog_delete_deadline: Option<Instant>,
     file_reads: bool,
     /// KSG `registryAgentId === "devin"`: normalization, subagent routing and
     /// `shellCommands` client terminals.
@@ -337,6 +371,11 @@ impl Client {
             gateway_effort: None,
             legacy_models: Value::Null,
             modes: Value::Null,
+            early_config_options: None,
+            catalog_started: None,
+            models_advertised: false,
+            commands_advertised: false,
+            catalog_delete_deadline: None,
             file_reads: false,
             devin,
             devin_children: HashSet::new(),
@@ -413,6 +452,15 @@ impl Client {
     fn state(&self) -> Value {
         json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":"",
             "turnCapabilities":self.turn_capabilities()})
+    }
+
+    fn current_thinking_levels(&self) -> Vec<String> {
+        self.model["thinkingLevels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|level| level.as_str().map(str::to_owned))
+            .collect()
     }
 
     fn turn_capabilities(&self) -> crate::model::TurnCapabilities {
@@ -577,6 +625,11 @@ impl Client {
             }
             return Ok(());
         }
+        if kind == "catalog_delete" {
+            // Closing a disposable probe is best effort, including on older CLI versions.
+            self.catalog_delete_deadline = Some(Instant::now());
+            return Ok(());
+        }
         if !record["error"].is_null() {
             let error = &record["error"];
             if kind == "start"
@@ -638,10 +691,13 @@ impl Client {
                     &message,
                 ) {
                 crate::antigravity::SIGN_IN_REQUIRED.to_owned()
-            } else {
+            } else if error["code"] == -32000 || crate::usage_limits::authentication_error(&message)
+            {
                 format!(
-                    "ACP {kind} failed: {message}. If authentication is required, configure or sign in to the agent outside Shina, then retry."
+                    "ACP authentication failed during {kind}: {message}. Configure or sign in to the agent outside Shina, then retry."
                 )
+            } else {
+                format!("ACP {kind} failed: {message}")
             };
             if kind == "authenticate" {
                 return Err(message);
@@ -697,11 +753,23 @@ impl Client {
                 }
                 // The persisted per-session marker avoids repeating context after resume.
                 self.finish_replay();
-                self.configure_models(result);
-                if let Some(modes) = result.get("modes") {
-                    self.modes = modes.clone();
+                let mut configuration = result.clone();
+                if let Some(options) = self.early_config_options.take() {
+                    configuration["configOptions"] = options;
                 }
+                self.configure_models(&configuration);
                 self.ready = true;
+                if self.start.metadata_only {
+                    self.catalog_started = Some(Instant::now());
+                    self.models_advertised |= catalog::advertises_models(
+                        result["configOptions"]
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                        &result["models"],
+                    );
+                    return Ok(());
+                }
                 // KSG sessionModeForPolicy: the thread's runtime policy becomes the
                 // session mode at setup; the agy CLI maps yolo/auto_edit to default.
                 if self.antigravity && !self.start.metadata_only {
@@ -714,13 +782,10 @@ impl Client {
                     let policy = crate::antigravity::permission_mode(access).to_owned();
                     self.antigravity_set_mode(&policy, json!({"type":"antigravity_mode"}));
                 }
-                self.reply(
-                    &json!({"id":"models","type":"get_available_models"}),
-                    json!({"models":self.models}),
-                );
+                self.publish_models();
                 self.reply(
                     &json!({"id":"levels","type":"get_available_thinking_levels"}),
-                    json!({"levels":[]}),
+                    json!({"levels":self.current_thinking_levels()}),
                 );
                 self.reply(&json!({"id":"state","type":"get_state"}), self.state());
                 self.reply(
@@ -748,6 +813,7 @@ impl Client {
             "set_model" => {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
+                    self.publish_models();
                 } else {
                     self.model = self
                         .models
@@ -757,6 +823,13 @@ impl Client {
                         .unwrap_or_else(|| {
                             self.model_value(request["modelId"].as_str().unwrap_or("default"), None)
                         });
+                    if !self.antigravity {
+                        self.legacy_models["currentModelId"] = request["modelId"].clone();
+                        for row in &mut self.models {
+                            row["isDefault"] = json!(row["id"] == request["modelId"]);
+                        }
+                        self.publish_models();
+                    }
                 }
                 // KSG applyAntigravityAcpModelSelection: thinking levels vary by family, so
                 // read them after the family switch and apply the level second.
@@ -793,6 +866,7 @@ impl Client {
             "antigravity_gateway" => {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
+                    self.publish_models();
                 } else {
                     // A bare set_model reply carries no configOptions; mark the row
                     // containing the resolved route current.
@@ -821,6 +895,7 @@ impl Client {
             "antigravity_mode" => {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
+                    self.publish_models();
                 }
                 self.note_modes(result);
                 if self.modes.is_object() {
@@ -832,6 +907,7 @@ impl Client {
                 let original = request["original"].clone();
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
+                    self.publish_models();
                 }
                 self.pending_thinking = None;
                 let combined = request["combined"]
@@ -851,12 +927,55 @@ impl Client {
             "set_option" | "set_thinking_level" => {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
+                    self.publish_models();
                 }
                 self.reply(&request, result.clone());
             }
             _ => self.reply(&request, result.clone()),
         }
         Ok(())
+    }
+
+    fn publish_models(&mut self) {
+        self.reply(
+            &json!({"id":"models","type":"get_available_models"}),
+            json!({"models":self.models}),
+        );
+    }
+
+    /// KSG ACP registry probe waits up to five seconds for late models
+    /// and up to 500 ms for commands, concurrently.
+    fn settle_discovery(&mut self, now: Instant) {
+        let Some(started) = self.catalog_started else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(started);
+        if !(self.models_advertised || elapsed >= Duration::from_secs(5))
+            || !(self.commands_advertised || elapsed >= Duration::from_millis(500))
+        {
+            return;
+        }
+        if self.capabilities["sessionCapabilities"]["delete"].is_object() {
+            match self.catalog_delete_deadline {
+                None => {
+                    self.catalog_delete_deadline = Some(now + Duration::from_secs(5));
+                    self.request(
+                        "session/delete",
+                        json!({"sessionId":self.session}),
+                        json!({"type":"catalog_delete"}),
+                    );
+                    return;
+                }
+                Some(deadline) if now < deadline => return,
+                Some(_) => {}
+            }
+        }
+        self.catalog_started = None;
+        self.publish_models();
+        self.reply(
+            &json!({"id":"commands","type":"get_commands"}),
+            json!({"commands":self.available_commands()}),
+        );
     }
 
     /// Session creation, extracted so Antigravity can authenticate first. KSG
@@ -983,17 +1102,7 @@ impl Client {
         } else {
             vec!["text"]
         };
-        let thinking_levels: Vec<String> = self
-            .option_descriptors
-            .iter()
-            .find(|d| crate::descriptors::is_reasoning_control(d))
-            .map(|d| {
-                crate::descriptors::selectable_provider_option_choices(d)
-                    .into_iter()
-                    .map(|c| c.id)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let thinking_levels = crate::descriptors::model_reasoning_levels(&self.option_descriptors);
         json!({
             "id": id,
             "name": name.unwrap_or(id),
@@ -1005,9 +1114,15 @@ impl Client {
     }
 
     fn configure_models(&mut self, result: &Value) {
+        if let Some(modes) = result.get("modes") {
+            self.modes = modes.clone();
+        }
+        if let Some(models) = result.get("models").filter(|models| models.is_object()) {
+            self.legacy_models = models.clone();
+        }
         self.option_descriptors = crate::descriptors::acp_provider_option_descriptors(
             result["configOptions"].as_array().map(Vec::as_slice),
-            result.get("modes"),
+            Some(&self.modes),
         );
         self.config_options = result["configOptions"]
             .as_array()
@@ -1019,11 +1134,9 @@ impl Client {
                 &self.config_options,
                 &mut self.thinking_levels,
             );
-            if result["models"].is_object() {
-                self.legacy_models = result["models"].clone();
-            }
+            let setup = json!({"configOptions":self.config_options,"models":self.legacy_models});
             let (mut rows, current) = crate::antigravity::session_models(
-                result,
+                &setup,
                 &self.thinking_levels,
                 &self.gateway_models,
             );
@@ -1042,44 +1155,33 @@ impl Client {
                 .unwrap_or_else(|| self.model_value(current.as_deref().unwrap_or("default"), None));
             return;
         }
-        if let Some(options) = result["configOptions"].as_array()
-            && let Some(option) = options
-                .iter()
-                .find(|o| o["category"] == "model" && o["type"] == "select")
-        {
-            self.model_option = option["id"].as_str().map(str::to_owned);
-            let mut choices = vec![];
-            for group in option["options"].as_array().into_iter().flatten() {
-                if let Some(options) = group["options"].as_array() {
-                    choices.extend(options.iter());
-                } else {
-                    choices.push(group);
-                }
-            }
-            self.models = choices
-                .into_iter()
-                .filter_map(|choice| {
-                    Some(self.model_value(choice["value"].as_str()?, choice["name"].as_str()))
-                })
-                .collect();
-            self.model =
-                self.model_value(option["currentValue"].as_str().unwrap_or("default"), None);
+        self.model_option = catalog::model_select(&self.config_options)
+            .and_then(|option| option["id"].as_str())
+            .map(|id| id.trim().to_owned());
+        let input = if self.capabilities["promptCapabilities"]["image"] == true {
+            &["text", "image"][..]
         } else {
-            self.models = result["models"]["availableModels"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|model| {
-                    Some(self.model_value(model["modelId"].as_str()?, model["name"].as_str()))
-                })
-                .collect();
-            self.model = self.model_value(
-                result["models"]["currentModelId"]
-                    .as_str()
-                    .unwrap_or("default"),
-                None,
-            );
-        }
+            &["text"][..]
+        };
+        let (rows, current) = catalog::model_rows(
+            &self.start.id,
+            &self.config_options,
+            &self.legacy_models,
+            &self.option_descriptors,
+            if self.start.metadata_only {
+                &[]
+            } else {
+                &self.models
+            },
+            input,
+        );
+        self.models = rows;
+        self.model = self
+            .models
+            .iter()
+            .find(|row| row["id"].as_str() == current.as_deref())
+            .cloned()
+            .unwrap_or_else(|| self.model_value("default", Some("Default")));
     }
 
     /// KSG `thinkingCapabilities`: per-model reasoning descriptor, current value
@@ -1092,7 +1194,12 @@ impl Client {
         value["isDefault"] = row["isDefault"].clone();
         value["aliases"] = row["aliases"].clone();
         value["isLegacy"] = row["isLegacy"].clone();
-        if let Some(efforts) = row["efforts"].as_array() {
+        value["capabilities"] = json!({"optionDescriptors":[]});
+        value["thinkingLevels"] = json!([]);
+        if let Some(efforts) = row["efforts"]
+            .as_array()
+            .filter(|efforts| !efforts.is_empty())
+        {
             // KSG buildSelectOptionDescriptor(ANTIGRAVITY_GATEWAY_EFFORT_OPTION_ID):
             // the adapter owns the pick and routes it through the model config option.
             let descriptor = crate::descriptors::ProviderOptionDescriptor::Select {
@@ -1338,7 +1445,7 @@ impl Client {
                 self.reply(&request, self.history_value());
             }
             "get_available_models" => self.reply(&record, json!({"models":self.models})),
-            "get_available_thinking_levels" => self.reply(&record, json!({"levels":[]})),
+            "get_available_thinking_levels" => self.reply(&record, json!({"levels":self.current_thinking_levels()})),
             "get_commands" => self.reply(&record, json!({"commands":self.available_commands()})),
             "get_session_stats" => self.reply(&record, json!({"contextUsage":null})),
             "set_session_name" => {
@@ -1433,6 +1540,8 @@ impl Client {
                     } else {
                         self.request("session/set_model", json!({"sessionId":self.session,"modelId":resolved}), record);
                     }
+                } else if record["modelId"] == "default" && self.model["id"] == "default" {
+                    self.reply(&record, self.model.clone());
                 } else if !self.models.iter().any(|model| model["id"] == record["modelId"]) {
                     self.reject(&record, "This ACP agent did not advertise that model. Refresh the session or choose one of its advertised models.");
                 } else if let Some(option) = &self.model_option {
@@ -2086,9 +2195,10 @@ impl Client {
                 }
             }
             "available_commands_update" => {
+                self.commands_advertised = true;
                 self.commands = update["availableCommands"].as_array().into_iter().flatten()
                     .map(|command| json!({"name":command["name"],"description":command["description"],"source":"ACP"})).collect();
-                if emit {
+                if emit && !self.start.metadata_only {
                     self.reply(
                         &json!({"type":"get_commands","id":"commands"}),
                         json!({"commands":self.available_commands()}),
@@ -2108,25 +2218,17 @@ impl Client {
                     .push(json!({"type":"harness_update","field":"plan","value":value}));
             }
             "config_option_update" => {
-                self.option_descriptors = crate::descriptors::acp_provider_option_descriptors(
-                    update["configOptions"].as_array().map(Vec::as_slice),
-                    None,
-                );
-                self.config_options = update["configOptions"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                if self.antigravity {
-                    crate::antigravity::observe_thinking_levels(
-                        &self.config_options,
-                        &mut self.thinking_levels,
-                    );
+                if let Some(options) = update["configOptions"].as_array() {
+                    self.models_advertised |= catalog::advertises_models(options, &Value::Null);
+                    if self.ready {
+                        self.configure_models(update);
+                        if !self.start.metadata_only {
+                            self.publish_models();
+                        }
+                    } else {
+                        self.early_config_options = Some(update["configOptions"].clone());
+                    }
                 }
-                self.events.push(json!({
-                    "type": "harness_update",
-                    "field": "optionDescriptors",
-                    "value": self.option_descriptors
-                }));
             }
             "current_mode_update" => {
                 self.events.push(
@@ -2365,6 +2467,7 @@ fn run(
     stopped: &AtomicBool,
     owner: &SessionOwner,
     claude_skills: Vec<crate::composer_skills::Skill>,
+    previous: Vec<Value>,
 ) -> Result<(), String> {
     command
         .current_dir(&start.workspace)
@@ -2462,6 +2565,7 @@ fn run(
         let _ = write_result.send(result);
     });
     let mut client = Client::new(start);
+    client.models = previous;
     let executable = command.get_program().to_string_lossy();
     if executable.rsplit(['/', '\\']).next().is_some_and(|name| {
         matches!(
@@ -2551,6 +2655,11 @@ fn run(
                         }
                         client.incoming(record)?;
                     }
+                    Ok(Ok(None)) if client.catalog_delete_deadline.is_some() => {
+                        // Some agents close the connection as soon as the disposable session is deleted.
+                        client.catalog_delete_deadline = Some(Instant::now());
+                        break;
+                    }
                     Ok(Ok(None)) => {
                         return Err(
                             "ACP agent closed its output. Retry to resume the saved session."
@@ -2564,6 +2673,7 @@ fn run(
                     }
                 }
             }
+            client.settle_discovery(Instant::now());
             // terminal/wait_for_exit answers once the child records an exit status.
             client.flush_terminal_waiters();
             // Publish responses before the UI can dispatch its next operation.

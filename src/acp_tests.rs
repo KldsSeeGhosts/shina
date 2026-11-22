@@ -866,6 +866,165 @@ fn antigravity_linkless_discovery_returns_models_and_commands() {
 }
 
 #[test]
+fn acp_discovery_waits_for_the_catalog_then_deletes_only_the_probe_session() {
+    let (agent, log) = fixture(&["--discovery", "--late-catalog"]);
+    let dir = crate::store::directory().unwrap();
+    let mut catalog = crate::session::NativeCatalog::default();
+    assert!(catalog.refresh_acp(&agent, &dir, Arc::new(|| {}), false));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while catalog.loading() {
+        assert!(
+            Instant::now() < deadline,
+            "fixture discovery did not settle"
+        );
+        catalog.poll(&agent.id);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(catalog.error, None);
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .map(|row| (row.id.as_str(), row.name.as_str(), row.is_default))
+            .collect::<Vec<_>>(),
+        [("fast", "Fast", false), ("deep", "Deep", true)]
+    );
+    assert_eq!(catalog.models[1].thinking_levels, ["high"]);
+    assert!(catalog.models[0].thinking_levels.is_empty());
+    assert_eq!(catalog.commands[0]["name"], "fixture");
+    assert_eq!(
+        records(&log)
+            .iter()
+            .map(|record| record["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["initialize", "session/new", "session/delete"]
+    );
+    assert!(!catalog.refresh_acp(&agent, &dir, Arc::new(|| {}), false));
+}
+
+#[test]
+fn acp_discovery_does_not_retry_or_authenticate_after_a_denial() {
+    let (agent, log) = fixture(&["--discovery", "--auth-denied"]);
+    let dir = crate::store::directory().unwrap();
+    let mut catalog = crate::session::NativeCatalog::default();
+    let wake: Waker = Arc::new(|| {});
+    assert!(catalog.refresh_acp(&agent, &dir, wake.clone(), false));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while catalog.loading() {
+        assert!(Instant::now() < deadline);
+        catalog.poll(&agent.id);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        catalog
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("sign in to the agent outside Shina")
+    );
+    assert!(!catalog.refresh_acp(&agent, &dir, wake, false));
+    assert_eq!(
+        records(&log)
+            .iter()
+            .map(|record| record["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["initialize", "session/new"]
+    );
+}
+
+#[test]
+fn acp_model_options_remain_per_model_after_late_updates_and_singleton_choices() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.ready = true;
+    client.configure_models(&json!({
+        "models":{"currentModelId":"first","availableModels":[
+           {"modelId":"first","name":"First"},
+           {"modelId":"second","name":"Second","_meta":{
+               "reasoningEffort":"low","reasoningEfforts":[{"value":"low","label":"Quick"},{"value":"high"}]}},
+           {"modelId":"none","name":"None","_meta":{"supportsReasoningEffort":false}}
+        ]},
+        "configOptions":[
+           {"id":"r","category":"thinking","type":"select","name":"Thinking","currentValue":"medium",
+            "options":[{"value":"medium","name":"Medium"}]},
+           {"id":"s","category":"model_config","type":"boolean","name":"Specific","currentValue":true},
+           {"id":"shared","type":"boolean","name":"Shared","currentValue":true}
+        ]
+    }));
+    let ids = |row: &Value| {
+        row["capabilities"]["optionDescriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&client.models[0]), ["r", "s", "shared"]);
+    assert_eq!(ids(&client.models[1]), ["shared", "r"]);
+    assert_eq!(ids(&client.models[2]), ["shared"]);
+    assert_eq!(client.models[1]["thinkingLevels"], json!(["low", "high"]));
+    assert_eq!(
+        client.models[1]["capabilities"]["optionDescriptors"][1]["options"][0]["label"],
+        "Quick"
+    );
+
+    client.configure_models(
+        &json!({"models":{"currentModelId":"first","availableModels":[
+            {"modelId":"first","name":"Provisional"}
+        ]}}),
+    );
+    assert_eq!(client.models.len(), 3, "a legacy singleton is provisional");
+    assert_eq!(ids(&client.models[1]), ["shared", "r"]);
+    client.update(
+        &json!({"sessionUpdate":"config_option_update","configOptions":[
+            {"id":"model","type":"select","category":"model","currentValue":"second",
+             "options":[{"value":"second","name":"Only second"}]},
+        ]}),
+    );
+    assert_eq!(
+        client.models.len(),
+        1,
+        "an explicit singleton replaces the previous inventory"
+    );
+    assert_eq!(client.model["id"], "second");
+    assert_eq!(
+        client.events.last().unwrap()["data"]["models"][0]["name"],
+        "Only second"
+    );
+    assert_eq!(
+        client.events.last().unwrap()["data"]["models"][0]["isDefault"],
+        true
+    );
+}
+
+#[test]
+fn acp_probe_buffers_early_config_and_keeps_the_current_model_at_the_cap() {
+    let mut client = Client::new(spec(SessionSource::New));
+    let candidates: Vec<_> = (0..=256)
+        .map(|index| json!({"value":format!("m{index}"),"name":format!(" Model {index} ")}))
+        .collect();
+    client.update(
+        &json!({"sessionUpdate":"config_option_update","configOptions":[
+            {"id":"model","type":"select","category":"model","currentValue":"m256",
+             "options":[{"value":" m1 ","name":"Invalid"},{"value":"","name":"Empty"},
+                        {"value":"m0","name":" First "},{"options":candidates}]}
+        ]}),
+    );
+    assert!(client.models_advertised);
+    client.request("session/new", json!({}), json!({"type":"start"}));
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":"shina-acp-1",
+        "result":{"sessionId":"fixture","models":{"currentModelId":"placeholder","availableModels":[
+            {"modelId":"placeholder","name":"Placeholder"}
+        ]}}}))
+        .unwrap();
+    assert_eq!(client.models.len(), 256);
+    assert_eq!(client.models[0]["name"], "First");
+    assert_eq!(client.models[254]["id"], "m254");
+    assert_eq!(client.models[255]["id"], "m256");
+    assert_eq!(client.models[255]["isDefault"], true);
+}
+
+#[test]
 fn interactive_acp_requires_an_mcp_bridge() {
     let (agent, _log) = fixture(&["--antigravity"]);
     let mut start = spec(SessionSource::New);

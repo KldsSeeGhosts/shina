@@ -3694,10 +3694,11 @@ fn model_list(
         let mut name_col = col().gap(4.0).grow(1.0).min_w(0.0).child(name_row);
         // The provider line, when the rows mix providers or the model names a sub-provider.
         if rows_mix_providers || model.sub_provider.is_some() {
-            let provider_label = match &model.sub_provider {
-                Some(sub) => format!("{} · {sub}", model.instance_display_name),
-                None => model.instance_display_name.clone(),
-            };
+            // KSG `ModelListRow` uses the sub-provider name on this line when present.
+            let provider_label = model
+                .sub_provider
+                .as_deref()
+                .unwrap_or(&model.instance_display_name);
             name_col = name_col.child(
                 row()
                     .center_y()
@@ -3713,7 +3714,7 @@ fn model_list(
                         .opacity(0.6),
                     )
                     .child(
-                        label(&provider_label, META, p.faint)
+                        label(provider_label, META, p.faint)
                             .truncate()
                             .shrink()
                             .min_w(0.0),
@@ -21091,6 +21092,54 @@ pub(crate) mod tests {
             );
         }
     }
+
+    #[test]
+    fn acp_catalog_rows_are_visible_before_a_thread_selects_the_provider_at_all_widths() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.set_viewport((width, 900.0), 1.0);
+            let agent = crate::harness::Agent {
+                id: "fixture".into(),
+                name: "Fixture ACP".into(),
+                command: "fixture-agent".into(),
+                args: vec![],
+                env: vec![],
+            };
+            rt.state.harnesses.agents.push(agent.clone());
+            rt.state.acp_catalogs.insert(
+                agent.id.clone(),
+                crate::session::NativeCatalog::from_acp_fixture(
+                    agent,
+                    [("first", "Fixture speedy"), ("second", "Fixture thorough")]
+                        .into_iter()
+                        .map(|(id, name)| crate::session::AgentModel {
+                            provider: "fixture".into(),
+                            id: id.into(),
+                            name: name.into(),
+                            is_default: id == "second",
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+            );
+            open_picker(&mut rt, SettingsPicker::Model);
+            press(&mut rt, "choose-harness-fixture");
+            rt.frame(1.0 / 60.0);
+            for key in ["model-list", "choose-model-0", "choose-model-1"] {
+                let (rect, _) = rt
+                    .presented(key)
+                    .unwrap_or_else(|| panic!("{width}: {key}"));
+                assert!(
+                    rect[0] >= 0.0 && rect[0] + rect[2] <= width + 1.0,
+                    "{width}: {rect:?}"
+                );
+            }
+            let rows = &rt.state.picker_models_by_instance()["fixture"];
+            assert_eq!(rows[0].slug, "first");
+            assert_eq!(rows[1].name, "Fixture thorough");
+            assert!(rows[1].is_default);
+        }
+    }
     fn find<'a>(tree: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
         if tree["key"] == key {
             return Some(tree);
@@ -28948,10 +28997,10 @@ pub(crate) mod tests {
     }
 
     /// KSG's `ModelPickerContent` on `applyCodexModelCatalog` output: the Codex tab
-    /// shows manifest names, folds manifest legacies behind "Show more", keeps the
+    /// shows discovered names, folds manifest legacies behind "Show more", keeps the
     /// row the manifest lacks, and carries the update-required notice.
     #[test]
-    fn codex_tab_lists_manifest_names_at_all_widths() {
+    fn codex_tab_lists_wire_names_at_all_widths() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
             rt.set_viewport((width, 900.0), 1.0);
@@ -28990,9 +29039,7 @@ pub(crate) mod tests {
             press(&mut rt, "choose-harness-codex");
             rt.frame(1.0);
             let tree = rt.accessibility_json().to_string();
-            // Manifest names replace the wire display names; the unknown slug keeps its own.
-            assert!(tree.contains("GPT-6 Astra"), "{width}: {tree}");
-            assert!(!tree.contains("GPT-6 Astra Wire"), "{width}: {tree}");
+            assert!(tree.contains("GPT-6 Astra Wire"), "{width}: {tree}");
             assert!(tree.contains("Fixture Unknown"), "{width}: {tree}");
             // Manifest legacies collapse behind the section toggle until expanded.
             assert!(
@@ -29016,9 +29063,8 @@ pub(crate) mod tests {
             rt.invalidate();
             rt.frame(1.0);
             let expanded = rt.accessibility_json().to_string();
-            assert!(expanded.contains("GPT-6 Sol"), "{width}: {expanded}");
+            assert!(expanded.contains("GPT-6 Sol Wire"), "{width}: {expanded}");
             assert!(expanded.contains("GPT-5.5"), "{width}: {expanded}");
-            assert!(!expanded.contains("GPT-6 Sol Wire"), "{width}: {expanded}");
         }
     }
 
@@ -29191,6 +29237,10 @@ pub(crate) mod tests {
             assert!(tree.contains("Unavailable"), "{width}: {tree}");
             assert!(tree.contains("New"), "{width}: {tree}");
             assert!(tree.contains("Show more"), "{width}: {tree}");
+            assert!(
+                tree.contains("Anthropic") && !tree.contains("Pi · Anthropic"),
+                "{width}: {tree}"
+            );
 
             // Expanding legacy shows the legacy model and flips to "Show less"
             press(&mut rt, "legacy-models-pi");

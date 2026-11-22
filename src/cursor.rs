@@ -385,6 +385,9 @@ fn catalog_models(payload: &Value) -> Vec<Value> {
             if id.is_empty() || !seen.insert(id.to_owned()) {
                 return None;
             }
+            let capabilities = catalog_capabilities(model);
+            let thinking_levels =
+                crate::descriptors::model_reasoning_levels(&capabilities.option_descriptors);
             Some(json!({
                 "provider": "cursor",
                 "id": id,
@@ -393,8 +396,8 @@ fn catalog_models(payload: &Value) -> Vec<Value> {
                     .filter_map(|alias| alias.as_str().map(str::trim)
                         .filter(|alias| !alias.is_empty()).map(str::to_owned))
                     .collect::<Vec<_>>(),
-                "capabilities": serde_json::to_value(catalog_capabilities(model))
-                    .unwrap_or_default(),
+                "thinkingLevels": thinking_levels,
+                "capabilities": capabilities,
             }))
         })
         .collect()
@@ -424,13 +427,19 @@ fn list_models(text: &str) -> Vec<Value> {
     trimmed
         .lines()
         .filter_map(|line| {
+            let line = line.trim();
             let line = line
-                .trim()
-                .trim_start_matches(|c: char| {
-                    c == '-' || c == '*' || c == '•' || c.is_ascii_digit()
+                .strip_prefix(['-', '*', '•'])
+                .filter(|tail| tail.starts_with(char::is_whitespace))
+                .or_else(|| {
+                    let tail = line.trim_start_matches(|c: char| c.is_ascii_digit());
+                    (tail.len() < line.len())
+                        .then_some(tail)?
+                        .strip_prefix(['.', ')'])
+                        .filter(|tail| tail.starts_with(char::is_whitespace))
                 })
-                .trim_start_matches(['.', ')'])
-                .trim();
+                .unwrap_or(line)
+                .trim_start();
             let id = line
                 .split(|c: char| c.is_whitespace() || c == '(' || c == '[' || c == ':')
                 .next()?
@@ -575,42 +584,17 @@ fn default_parameter(model: &Value, native: &str) -> Option<String> {
         .as_array()
         .into_iter()
         .flatten()
-        .find_map(|variant| {
-            (variant["isDefault"] == true).then(|| {
-                variant["params"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find_map(|parameter| {
-                        (parameter["id"].as_str() == Some(native))
-                            .then(|| parameter["value"].as_str().map(str::to_owned))?
-                    })
-            })?
-        })
+        .find(|variant| variant["isDefault"] == true)?["params"]
+        .as_array()?
+        .iter()
+        .find(|parameter| parameter["id"] == native)?["value"]
+        .as_str()
+        .map(str::to_owned)
 }
 
-/// KSG `toTitleCaseWords`, also splitting camelCase so mapped ids like
-/// `contextWindow` label as "Context Window".
+/// KSG `toTitleCaseWords`.
 fn title_case(id: &str) -> String {
-    let mut words = String::new();
-    for (index, c) in id.chars().enumerate() {
-        if matches!(c, ' ' | '_' | '-') {
-            if !words.ends_with(' ') {
-                words.push(' ');
-            }
-            continue;
-        }
-        if c.is_uppercase()
-            && index > 0
-            && !words.ends_with(' ')
-            && words.chars().last().is_some_and(|last| last.is_lowercase())
-        {
-            words.push(' ');
-        }
-        words.push(c);
-    }
-    words
-        .split(' ')
+    id.split(|ch: char| ch.is_whitespace() || matches!(ch, '_' | '-'))
         .filter(|word| !word.is_empty())
         .map(|word| {
             let mut chars = word.chars();

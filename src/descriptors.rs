@@ -571,6 +571,19 @@ pub fn is_reasoning_control(descriptor: &ProviderOptionDescriptor) -> bool {
     }
 }
 
+pub(crate) fn model_reasoning_levels(descriptors: &[ProviderOptionDescriptor]) -> Vec<String> {
+    descriptors
+        .iter()
+        .find(|d| is_reasoning_control(d))
+        .map(|d| {
+            selectable_provider_option_choices(d)
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Ported from `apps/web/src/components/chat/ComposerModelEffort.tsx` (`splitSpeed`, `columnControls`).
 pub fn split_column_and_footer_controls(
     descriptors: &[ProviderOptionDescriptor],
@@ -776,7 +789,10 @@ pub fn pi_thinking_label(level: &str) -> &str {
     }
 }
 
-fn clamp_pi_thinking_level<'a>(input: Option<&str>, available: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn clamp_pi_thinking_level<'a>(
+    input: Option<&str>,
+    available: &[&'a str],
+) -> Option<&'a str> {
     let input = input?;
     let req_idx = PI_THINKING_LEVELS.iter().position(|&l| l == input)?;
     if let Some(&exact) = available.iter().find(|&&l| l == input) {
@@ -843,7 +859,7 @@ pub fn pi_model_capabilities(
         let mut seen = HashSet::from([PI_STANDARD_SERVICE_TIER.to_owned()]);
         let mut options = Vec::new();
         for tier in tiers {
-            let Some(id) = tier["id"].as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            let Some(id) = tier["id"].as_str().filter(|s| !s.trim().is_empty()) else {
                 continue;
             };
             if !seen.insert(id.to_owned()) {
@@ -851,13 +867,11 @@ pub fn pi_model_capabilities(
             }
             let name = tier["name"]
                 .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .unwrap_or(id);
             let description = tier["description"]
                 .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .map(str::to_owned);
             options.push(ProviderOptionChoice {
                 id: id.to_owned(),
@@ -1151,6 +1165,11 @@ fn acp_select_choices(candidates: Vec<(&str, &str, Option<&str>)>) -> Vec<Provid
 }
 
 /// Ported from `packages/provider-acp/src/server/sessionConfig.ts` (`acpProviderOptionDescriptors`).
+pub(crate) fn is_acp_thought_level_option(option: &Value) -> bool {
+    option["category"] == "thought_level"
+        || (option["category"] == "thinking" && option["type"] == "select")
+}
+
 pub fn acp_provider_option_descriptors(
     config_options: Option<&[Value]>,
     mode_state: Option<&Value>,
@@ -1225,7 +1244,8 @@ pub fn acp_provider_option_descriptors(
         if category == "mode" {
             has_mode_category = true;
         }
-        if category == "thought_level" {
+        let thought_level = is_acp_thought_level_option(option);
+        if thought_level {
             mirrored_mode_choice_sets.push(choices.iter().map(|c| c.id.clone()).collect());
         }
         let current_value = option["currentValue"]
@@ -1239,7 +1259,7 @@ pub fn acp_provider_option_descriptors(
             options: choices,
             current_value,
             prompt_injected_values: vec![],
-            role: (category == "thought_level").then_some(ProviderOptionRole::Reasoning),
+            role: thought_level.then_some(ProviderOptionRole::Reasoning),
         });
         if descriptors.len() == MAX_ACP_OPTION_DESCRIPTORS {
             return descriptors;

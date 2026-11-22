@@ -461,7 +461,12 @@ pub struct Start {
     pub(crate) metadata_only: bool,
 }
 
-pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, String> {
+pub fn start(
+    host: BackendHost,
+    start: Start,
+    wake: Waker,
+    models: &[crate::session::AgentModel],
+) -> Result<Session, String> {
     if start.id == "pi" {
         // All real Pi paths, including forks and resumes, pass through this boundary.
         let start = pi_start(start);
@@ -484,7 +489,12 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
         if start.id == "antigravity" {
             let registry = Registry::read();
             if registry.agents.iter().any(|a| a.id == "antigravity") {
-                return crate::acp::start(registry.find("antigravity")?, start, wake);
+                return crate::acp::start_with_catalog(
+                    registry.find("antigravity")?,
+                    start,
+                    wake,
+                    models,
+                );
             }
             return crate::antigravity::start(start, wake);
         }
@@ -492,12 +502,17 @@ pub fn start(host: BackendHost, start: Start, wake: Waker) -> Result<Session, St
         if start.id == "cursor" {
             let registry = Registry::read();
             if registry.agents.iter().any(|a| a.id == "cursor") {
-                return crate::acp::start(registry.find("cursor")?, start, wake);
+                return crate::acp::start_with_catalog(
+                    registry.find("cursor")?,
+                    start,
+                    wake,
+                    models,
+                );
             }
             return crate::cursor::start(start, wake);
         }
         let agent = Registry::read().find(&start.id)?;
-        crate::acp::start(agent, start, wake)
+        crate::acp::start_with_catalog(agent, start, wake, models)
     }
 }
 

@@ -1973,11 +1973,16 @@ fn probe_applies_the_manifest_catalog_to_model_list() {
         ids,
         ["gpt-6-astra", "zzz-fixture", "openai.gpt-6-sol", "gpt-5.5"]
     );
-    // Manifest names and the legacy split; the unknown row keeps its wire data.
+    // The manifest classifies legacy rows without replacing the app-server labels.
     let names: Vec<&str> = models.iter().filter_map(|m| m["name"].as_str()).collect();
     assert_eq!(
         names,
-        ["GPT-6 Astra", "Fixture Unknown", "GPT-6 Sol", "GPT-5.5"]
+        [
+            "GPT-6 Astra Wire",
+            "Fixture Unknown",
+            "GPT-6 Sol Wire",
+            "GPT-5.5 Wire"
+        ]
     );
     assert!(models.iter().all(|m| m.get("badge").is_none()));
     assert!(models[0].get("isLegacy").is_none());
@@ -1985,8 +1990,7 @@ fn probe_applies_the_manifest_catalog_to_model_list() {
     assert_eq!(models[2]["isLegacy"], true);
     assert_eq!(models[3]["isLegacy"], true);
     assert_eq!(models[0]["isDefault"], true);
-    // Merged capabilities: the manifest row keeps KSG's effort levels and speed
-    // options; the unknown row keeps its wire data.
+    // The app-server supplies capabilities, even for manifest-classified rows.
     assert_eq!(
         models[0]["thinkingLevels"],
         json!(["low", "medium", "high"])

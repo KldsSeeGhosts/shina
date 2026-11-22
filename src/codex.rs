@@ -1483,8 +1483,7 @@ impl Client {
         // KSG orders `applyPreferredCodexDefaultModel` before the catalog.
         crate::codex_catalog::apply_preferred_codex_default_model(&mut self.models);
         // `applyCodexModelCatalog`: the manifest's `codex` section
-        // classifies rows by family, fills in catalog metadata, and
-        // names models the installed CLI predates.
+        // classifies rows by family and names models the installed CLI predates.
         let catalog = crate::codex_catalog::bundled_codex_provider_catalog(crate::lifecycle::now());
         let (models, update_required) = crate::codex_catalog::apply_codex_model_catalog(
             std::mem::take(&mut self.models),
@@ -2524,7 +2523,7 @@ fn model_value(model: &Value, configured_service_tier: Option<&str>) -> Option<V
     let capabilities =
         crate::descriptors::map_codex_model_capabilities(model, configured_service_tier);
     Some(
-        json!({"provider":"codex","id":id,"name":model["displayName"].as_str().unwrap_or(id),
+        json!({"provider":"codex","id":id,"name":crate::codex_catalog::format_codex_model_name(model["displayName"].as_str().unwrap_or(id)),
         "thinkingLevels":levels,"input":model.get("inputModalities").cloned().unwrap_or_else(||json!(["text","image"])),
         "contextWindow":model["contextWindow"],"serviceTiers":service_tiers(model),
         "defaultServiceTier":model["defaultServiceTier"],

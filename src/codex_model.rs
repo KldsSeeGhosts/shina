@@ -244,15 +244,20 @@ impl Thread {
 
 impl State {
     pub(super) fn update_projected_native_models(&mut self, next: &Value) {
-        for harness in ["codex", "claude", "antigravity", "cursor"] {
+        let Some(catalogs) = next["nativeCatalogs"].as_object() else {
+            self.projected_native_catalogs.clear();
+            return;
+        };
+        self.projected_native_catalogs
+            .retain(|id, _| catalogs.contains_key(id));
+        for (harness, next) in catalogs {
             let previous = &self.client_views["nativeCatalogs"][harness];
-            let next = &next["nativeCatalogs"][harness];
             let models_changed = previous["models"] != next["models"];
             let updates_changed = previous["updateRequiredModels"] != next["updateRequiredModels"];
             if models_changed || updates_changed {
                 let cached = self
                     .projected_native_catalogs
-                    .entry(harness.into())
+                    .entry(harness.clone())
                     .or_default();
                 if models_changed {
                     cached.models =
@@ -288,9 +293,14 @@ impl State {
         let catalog = match harness {
             "codex" => &self.codex_catalog,
             "claude" => &self.claude_catalog,
+            "antigravity" => &self.antigravity_catalog,
             "cursor" => &self.cursor_catalog,
-            _ => return (false, None),
+            _ => match self.acp_catalogs.get(harness) {
+                Some(catalog) => catalog,
+                None => return (false, None),
+            },
         };
+        let catalog = self.acp_catalogs.get(harness).unwrap_or(catalog);
         (catalog.loading(), catalog.error.as_deref())
     }
     pub(super) fn refresh_provider_availability(&mut self, force: bool) {
@@ -335,6 +345,9 @@ impl State {
         let optional_force = !self.provider_availability.loading()
             && std::mem::take(&mut self.refresh_optional_catalogs);
         let cwd = self.working_directory();
+        // Unsent scratch threads have no directory yet. Use the existing profile
+        // directory without creating a thread directory or a missing project.
+        let acp_cwd = if cwd.is_dir() { &cwd } else { &self.data_dir };
         let wake = &self.wake;
         let mut changed = false;
         if !self.provider_update_drivers.contains("codex") {
@@ -349,19 +362,41 @@ impl State {
         }
         if !self.refresh_optional_catalogs
             && self.builtin_cli_available("antigravity")
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "antigravity")
             && !self.provider_update_drivers.contains("antigravity")
         {
-            changed |=
-                self.antigravity_catalog
-                    .refresh("antigravity", &cwd, wake.clone(), optional_force);
+            changed |= self.antigravity_catalog.refresh(
+                "antigravity",
+                acp_cwd,
+                wake.clone(),
+                optional_force,
+            );
         }
         if !self.refresh_optional_catalogs
             && self.builtin_cli_available("cursor")
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == "cursor")
             && !self.provider_update_drivers.contains("cursor")
         {
             changed |= self
                 .cursor_catalog
                 .refresh("cursor", &cwd, wake.clone(), optional_force);
+        }
+        self.acp_catalogs
+            .retain(|id, _| self.harnesses.agents.iter().any(|agent| agent.id == *id));
+        for agent in &self.harnesses.agents {
+            changed |= self
+                .acp_catalogs
+                .entry(agent.id.clone())
+                .or_default()
+                .refresh_acp(agent, acp_cwd, wake.clone(), optional_force);
         }
         if changed {
             self.apply_native_catalogs();
@@ -371,7 +406,7 @@ impl State {
 
     pub(super) fn apply_native_catalogs(&mut self) {
         if self.client.is_some() {
-            for harness in ["codex", "claude", "antigravity", "cursor"] {
+            for harness in self.projected_native_catalogs.keys().map(String::as_str) {
                 if !self
                     .threads
                     .iter()
@@ -436,12 +471,17 @@ impl State {
             .map(|index| self.thread_directory(index).ok())
             .collect();
         for (index, thread) in self.threads.iter_mut().enumerate() {
-            let catalog = match thread.harness.as_str() {
-                "codex" => &self.codex_catalog,
-                "claude" => &self.claude_catalog,
-                "antigravity" => &self.antigravity_catalog,
-                "cursor" => &self.cursor_catalog,
-                _ => continue,
+            let acp_catalog = self.acp_catalogs.get(&thread.harness);
+            let catalog = if let Some(catalog) = acp_catalog {
+                catalog
+            } else {
+                match thread.harness.as_str() {
+                    "codex" => &self.codex_catalog,
+                    "claude" => &self.claude_catalog,
+                    "antigravity" => &self.antigravity_catalog,
+                    "cursor" => &self.cursor_catalog,
+                    _ => continue,
+                }
             };
             if thread.pi.is_some() {
                 continue;
@@ -450,7 +490,8 @@ impl State {
                 continue;
             }
             thread.harness_state["catalogRevision"] = json!(catalog.revision);
-            if let Some(error) = &catalog.error
+            if acp_catalog.is_none()
+                && let Some(error) = &catalog.error
                 && crate::usage_limits::authentication_error(error)
             {
                 thread.error = Some(error.clone());
@@ -513,12 +554,36 @@ impl State {
             .projected_native_catalogs
             .get(harness)
             .map_or(&[][..], |c| c.models.as_slice());
+        let acp = self.acp_catalogs.get(harness);
+        let projected_acp = self.client_views["nativeCatalogs"][harness]["name"].is_string();
+        let acp_models = if projected_acp {
+            projected
+        } else {
+            acp.map_or(&[][..], |catalog| catalog.models.as_slice())
+        };
+        if !acp_models.is_empty() {
+            // An advertised catalog replaces earlier results. Don't merge stale rows from
+            // other threads back into the provider's picker tab.
+            return ModelRefs::Slice(acp_models);
+        }
+        if harness == "cursor" && acp.is_none() && !projected_acp {
+            let models = if self.client.is_some() {
+                projected
+            } else {
+                &self.cursor_catalog.models
+            };
+            if !models.is_empty() {
+                return ModelRefs::Slice(models);
+            }
+        }
         let catalog = match harness {
             "pi" => self.catalog.models.as_slice(),
             "codex" => self.codex_catalog.models.as_slice(),
             "claude" => self.claude_catalog.models.as_slice(),
-            "antigravity" => self.antigravity_catalog.models.as_slice(),
-            "cursor" => self.cursor_catalog.models.as_slice(),
+            "antigravity" if acp.is_none() && !projected_acp => {
+                self.antigravity_catalog.models.as_slice()
+            }
+            "cursor" if acp.is_none() && !projected_acp => self.cursor_catalog.models.as_slice(),
             _ => &[],
         };
         let default = self
@@ -636,6 +701,7 @@ impl State {
     pub(crate) fn harness_ids(&self) -> Vec<String> {
         let mut ids = vec!["pi".to_string(), "codex".to_string(), "claude".to_string()];
         if self.builtin_cli_available("antigravity")
+            && !self.client_views["nativeCatalogs"]["antigravity"]["name"].is_string()
             && !self
                 .harnesses
                 .agents
@@ -645,6 +711,7 @@ impl State {
             ids.push("antigravity".to_string());
         }
         if self.builtin_cli_available("cursor")
+            && !self.client_views["nativeCatalogs"]["cursor"]["name"].is_string()
             && !self
                 .harnesses
                 .agents
@@ -654,6 +721,13 @@ impl State {
             ids.push("cursor".to_string());
         }
         ids.extend(self.harnesses.agents.iter().map(|agent| agent.id.clone()));
+        if let Some(projected) = self.client_views["harnessIds"].as_array() {
+            for id in projected.iter().filter_map(Value::as_str) {
+                if !ids.iter().any(|known| known == id) {
+                    ids.push(id.into());
+                }
+            }
+        }
         ids
     }
 
@@ -900,6 +974,7 @@ impl State {
 
         // Built-in Antigravity (KSG provider instance): `agy` on PATH, no ACP tag.
         if self.builtin_cli_available("antigravity")
+            && !self.client_views["nativeCatalogs"]["antigravity"]["name"].is_string()
             && !self
                 .harnesses
                 .agents
@@ -926,6 +1001,7 @@ impl State {
 
         // Built-in Cursor (`agent acp`): `cursor-agent`/`agent` resolved from env or PATH.
         if self.builtin_cli_available("cursor")
+            && !self.client_views["nativeCatalogs"]["cursor"]["name"].is_string()
             && !self
                 .harnesses
                 .agents
@@ -956,26 +1032,42 @@ impl State {
         }
 
         // ACP agents
-        for agent in &self.harnesses.agents {
-            if seen.iter().any(|(earlier_id, earlier_name)| {
-                earlier_id == &agent.id && earlier_name == &agent.name
-            }) {
+        let projected_agents = self.client_views["nativeCatalogs"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(id, value)| Some((id.as_str(), value["name"].as_str()?)));
+        let local_agents = self
+            .harnesses
+            .agents
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent.name.as_str()));
+        for (id, name) in projected_agents.chain(local_agents) {
+            if seen
+                .iter()
+                .any(|(earlier_id, earlier_name)| earlier_id == id && earlier_name == name)
+            {
                 continue;
             }
-            seen.push((agent.id.clone(), agent.name.clone()));
+            seen.push((id.into(), name.into()));
+            let error = self.native_catalog_status(id).1.map(str::to_owned);
             entries.push(ProviderInstanceEntry {
-                instance_id: agent.id.clone(),
-                driver_kind: agent.id.clone(),
-                display_name: agent.name.clone(),
+                instance_id: id.into(),
+                driver_kind: id.into(),
+                display_name: name.into(),
                 continuation_group_key: None,
                 enabled: true,
                 installed: true,
-                status: ProviderStatusKind::Ready,
+                status: if error.is_some() {
+                    ProviderStatusKind::Warning
+                } else {
+                    ProviderStatusKind::Ready
+                },
                 auth_status: ProviderAuthStatus::Unknown,
                 can_setup: false,
                 is_available: true,
                 is_acp: true,
-                message: None,
+                message: error,
                 compatibility_broken_message: None,
                 update_required_models: vec![],
             });
@@ -1010,7 +1102,29 @@ impl State {
 
     fn composer_model_refs(&self, instance: &str) -> ModelRefs<'_> {
         let t = self.current();
-        if instance == t.harness && !t.models.is_empty() {
+        if instance == "cursor"
+            && !self
+                .harnesses
+                .agents
+                .iter()
+                .any(|agent| agent.id == instance)
+            && !self.client_views["nativeCatalogs"][instance]["name"].is_string()
+        {
+            let catalog = if self.client.is_some() {
+                self.projected_native_catalogs
+                    .get(instance)
+                    .map(|catalog| catalog.models.as_slice())
+            } else {
+                Some(self.cursor_catalog.models.as_slice())
+            };
+            if let Some(models) = catalog.filter(|models| !models.is_empty()) {
+                return ModelRefs::Slice(models);
+            }
+        }
+        if instance == t.harness
+            && !t.models.is_empty()
+            && (t.pi.is_some() || !self.acp_catalogs.contains_key(instance))
+        {
             ModelRefs::Slice(&t.models)
         } else {
             self.harness_model_refs(instance)

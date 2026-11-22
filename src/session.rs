@@ -3,6 +3,7 @@ use crate::backend::{Event, Pi};
 use rune::Waker;
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -185,23 +186,13 @@ impl AgentModel {
         if model["provider"] != "cpa" {
             return None;
         }
-        let id = model["id"].as_str()?;
-        // Pi's model metadata has the same rules as get_available_thinking_levels.
+        let id = model["id"].as_str().filter(|id| !id.trim().is_empty())?;
+        let capabilities = crate::descriptors::pi_model_capabilities(model, None);
         let thinking_levels = if model["reasoning"] == true {
-            ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
-                .into_iter()
-                .filter(|level| {
-                    let mapped = &model["thinkingLevelMap"][*level];
-                    !mapped.is_null()
-                        || (!matches!(*level, "xhigh" | "max")
-                            && model["thinkingLevelMap"].get(*level).is_none())
-                })
-                .map(str::to_owned)
-                .collect()
+            crate::descriptors::model_reasoning_levels(&capabilities.option_descriptors)
         } else {
             vec!["off".into()]
         };
-        let capabilities = crate::descriptors::pi_model_capabilities(model, None);
         Some(Self {
             provider: "cpa".into(),
             id: id.into(),
@@ -216,7 +207,7 @@ impl AgentModel {
                 .cloned()
                 .unwrap_or_default(),
             short_name: model["shortName"].as_str().map(str::to_owned),
-            sub_provider: model["subProvider"].as_str().map(str::to_owned),
+            sub_provider: Some("cpa".into()),
             aliases: model["aliases"]
                 .as_array()
                 .into_iter()
@@ -230,6 +221,31 @@ impl AgentModel {
             is_unavailable: model["isUnavailable"] == true,
             capabilities,
         })
+    }
+
+    pub(crate) fn pi_models(models: &[Value]) -> Vec<Self> {
+        let mut seen = HashSet::new();
+        models
+            .iter()
+            .filter_map(Self::from_value)
+            .filter(|model| seen.insert(model.id.clone()))
+            .collect()
+    }
+
+    pub(crate) fn apply_pi_thinking_default(&mut self, level: &str) {
+        for descriptor in &mut self.capabilities.option_descriptors {
+            if let crate::descriptors::ProviderOptionDescriptor::Select { id, options, .. } =
+                descriptor
+                && id == "thinking"
+            {
+                let available: Vec<_> = options.iter().map(|choice| choice.id.as_str()).collect();
+                let default = crate::descriptors::clamp_pi_thinking_level(Some(level), &available)
+                    .map(str::to_owned);
+                for choice in options {
+                    choice.is_default = default.as_ref() == Some(&choice.id);
+                }
+            }
+        }
     }
 }
 
@@ -261,6 +277,7 @@ pub struct NativeCatalog {
     started: Option<Instant>,
     loaded: Option<Instant>,
     last_attempt: Option<Instant>,
+    agent: Option<crate::harness::Agent>,
 }
 
 impl NativeCatalog {
@@ -280,13 +297,68 @@ impl NativeCatalog {
             "installed":self.installed,"version":self.version,"authStatus":self.auth_status,
             "updateRequiredModels":self.update_required_models,"providerMessage":self.provider_message,
             "usageLimits":self.usage_limits,"usageLimitsRaw":self.usage_limits_raw,
-            "usageAccount":self.usage_account})
+            "usageAccount":self.usage_account,"name":self.agent.as_ref().map(|agent| &agent.name)})
     }
     pub fn loading(&self) -> bool {
         self.pi.is_some()
     }
 
     pub fn refresh(&mut self, harness: &str, workspace: &Path, wake: Waker, force: bool) -> bool {
+        self.refresh_with(workspace, force, |models, workspace| match harness {
+            "codex" => Ok(crate::codex::discover(workspace, wake, models)),
+            "claude" => Ok(crate::claude::discover(workspace, wake)),
+            "antigravity" => crate::antigravity::discover(workspace, wake),
+            "cursor" => Ok(crate::cursor::discover(workspace, wake)),
+            _ => unreachable!(),
+        })
+    }
+
+    pub fn refresh_acp(
+        &mut self,
+        agent: &crate::harness::Agent,
+        workspace: &Path,
+        wake: Waker,
+        force: bool,
+    ) -> bool {
+        if self.agent.as_ref() != Some(agent) {
+            *self = Self {
+                agent: Some(agent.clone()),
+                revision: self.revision,
+                ..Default::default()
+            };
+        }
+        if !force
+            && self
+                .error
+                .as_deref()
+                .is_some_and(crate::usage_limits::authentication_error)
+        {
+            return false;
+        }
+        self.refresh_with(workspace, force, |_, workspace| {
+            let start = crate::harness::Start::discovery(&agent.id, workspace);
+            crate::acp::start(agent.clone(), start, wake)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_acp_fixture(agent: crate::harness::Agent, models: Vec<AgentModel>) -> Self {
+        Self {
+            agent: Some(agent),
+            models,
+            installed: true,
+            complete: true,
+            revision: 1,
+            ..Default::default()
+        }
+    }
+
+    fn refresh_with(
+        &mut self,
+        workspace: &Path,
+        force: bool,
+        discover: impl FnOnce(bool, PathBuf) -> Result<Pi, String>,
+    ) -> bool {
         if self.pi.is_some() {
             return false;
         }
@@ -326,18 +398,7 @@ impl NativeCatalog {
         self.error = None;
         self.started = Some(now);
         self.last_attempt = Some(now);
-        let result = match harness {
-            "codex" => Ok(crate::codex::discover(
-                workspace.to_path_buf(),
-                wake,
-                models,
-            )),
-            "claude" => Ok(crate::claude::discover(workspace.to_path_buf(), wake)),
-            "antigravity" => crate::antigravity::discover(workspace.to_path_buf(), wake),
-            "cursor" => Ok(crate::cursor::discover(workspace.to_path_buf(), wake)),
-            _ => unreachable!(),
-        };
-        match result {
+        match discover(models, workspace.to_path_buf()) {
             Ok(pi) => self.pi = Some(pi),
             Err(error) => self.fail(error),
         }
@@ -433,7 +494,12 @@ impl NativeCatalog {
                 _ => {}
             }
         }
-        if self.started.is_some_and(|at| at.elapsed() >= START_TIMEOUT) {
+        let timeout = if self.agent.is_some() || harness == "antigravity" {
+            Duration::from_secs(27)
+        } else {
+            START_TIMEOUT
+        };
+        if self.started.is_some_and(|at| at.elapsed() >= timeout) {
             self.fail(format!("{harness} catalog discovery timed out."));
             changed = true;
         }
@@ -442,6 +508,15 @@ impl NativeCatalog {
 
     pub fn commands_ready(&self) -> bool {
         self.complete
+    }
+
+    pub(crate) fn apply_live_acp_models(&mut self, models: &[AgentModel]) {
+        if models.is_empty() || self.models == models {
+            return;
+        }
+        self.models = models.to_vec();
+        self.installed = true;
+        self.revision += 1;
     }
 
     fn fail(&mut self, error: String) {
@@ -563,8 +638,7 @@ impl Catalog {
                                 );
                                 break;
                             };
-                            self.models =
-                                models.iter().filter_map(AgentModel::from_value).collect();
+                            self.models = AgentModel::pi_models(models);
                             if self.models.is_empty() {
                                 self.fail("Pi returned no CPA models. Check the existing CPA enrollment launcher and retry catalog discovery. No direct-provider fallback was used.".into());
                                 break;
@@ -574,6 +648,13 @@ impl Catalog {
                         _ => {}
                     }
                     if self.state_loaded && self.models_loaded {
+                        if let Some(model) = &mut self.default_model {
+                            model.apply_pi_thinking_default(&self.default_thinking);
+                            if let Some(row) = self.models.iter_mut().find(|row| row.id == model.id)
+                            {
+                                row.apply_pi_thinking_default(&self.default_thinking);
+                            }
+                        }
                         self.pi = None;
                         self.started = None;
                         self.loaded = Some(Instant::now());
@@ -649,6 +730,8 @@ mod tests {
             json!({"type":"response","command":"get_available_models","success":true,"data":{"models":[
                 {"provider":"direct","id":"hidden"},
                 {"provider":"cpa","id":"default","reasoning":true,"thinkingLevelMap":{"minimal":null,"xhigh":"xhigh","max":"max"},"contextWindow":200000,"input":["text","image"]},
+                {"provider":"cpa","id":"default","name":"Duplicate"},
+                {"provider":"cpa","id":"   ","name":"Invalid"},
                 {"provider":"cpa","id":"plain","reasoning":false,"contextWindow":32000,"input":["text"]}
             ]}}),
         ] {
@@ -666,6 +749,16 @@ mod tests {
         );
         assert_eq!(catalog.models[1].thinking_levels, ["off"]);
         assert_eq!(catalog.models[0].context_window, Some(200000));
+        assert_eq!(catalog.models[0].sub_provider.as_deref(), Some("cpa"));
+        let descriptor = &catalog.models[0].capabilities.option_descriptors[0];
+        assert_eq!(
+            crate::descriptors::selectable_provider_option_choices(descriptor)
+                .into_iter()
+                .find(|c| c.is_default)
+                .unwrap()
+                .id,
+            "high"
+        );
         assert_eq!(catalog.models[0].supports_images, Some(true));
         assert_eq!(catalog.models[1].context_window, Some(32000));
         assert_eq!(catalog.models[1].supports_images, Some(false));
