@@ -512,7 +512,8 @@ fn lineage_row(s: &State, p: Palette, item: &LineageRow) -> El {
         );
     }
     second = second.child(spacer());
-    if !failed {
+    // A waiting row already shows its status word on the first line.
+    if !failed && !(item.status == Status::Waiting && item.clock == item.word) {
         second = second.child(label(
             &item.clock,
             LINEAGE_CAPTION.features(TABULAR),

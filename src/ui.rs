@@ -177,8 +177,6 @@ struct Palette {
     sea_bg: Color,
     /// KSG's `--sidebar-status-input`: a thread waiting on user input.
     input: Color,
-    /// KSG's `--guest-foreground`: a crew request's status ink.
-    guest: Color,
     danger: Color,
     danger_bg: Color,
     ok: Color,
@@ -229,7 +227,6 @@ fn palette(dark: bool) -> Palette {
             sea: color("#8aa4ff"),
             sea_bg: color("#1d2338"),
             input: color("#a5b4fc"),
-            guest: color("#f0abfc"),
             danger: color("#ff6b63"),
             danger_bg: color("#2e1a1b"),
             ok: color("#4cc35f"),
@@ -269,7 +266,6 @@ fn palette(dark: bool) -> Palette {
             sea: color("#1d4ed8"),
             sea_bg: color("#e3e9fb"),
             input: color("#4f46e5"),
-            guest: color("#c026d3"),
             danger: color("#b42318"),
             danger_bg: color("#fbe7e4"),
             ok: color("#176f31"),

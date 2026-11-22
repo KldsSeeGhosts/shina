@@ -50,8 +50,8 @@ impl RowStatus {
         match self {
             Self::Working => p.sea,
             Self::Input => p.input,
-            Self::Attention => p.guest,
-            Self::Approval | Self::Interrupted | Self::Woke => p.brass,
+            // Mixed crew attention is Shina-only; KSG's fuchsia is for guest requests alone.
+            Self::Approval | Self::Interrupted | Self::Attention | Self::Woke => p.brass,
             Self::Failed => p.danger,
             Self::Done => p.ok,
             Self::Idle => p.faint,
