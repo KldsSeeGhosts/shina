@@ -42,13 +42,15 @@ const HANDLE_W: f32 = 4.0;
 /// The handle's 16 px keyboard step, the right panel's.
 const KEYBOARD_STEP: f32 = 16.0;
 
-/// A row of the flattened tree. `File` rows point into `Ready::files` by
-/// `file` and carry `display`, the shown-file ordinal `diff-file-{display}`
+/// A row of the flattened tree. `File` rows point into the caller's file list
+/// by `file` and carry `display`, the shown-file ordinal `diff-file-{display}`
 /// keys use. `Dir` rows carry the flattened chain: `path` is the chain's
-/// deepest directory (`a/b/c/`) and `name` its segments joined `a / b / c`,
-/// as Pierre's `flattenEmptyDirectories` shows them. `parent` is the row
-/// index of the enclosing directory row for Left's "move to parent".
-/// `collapsed` folds any chain member the collapse set holds.
+/// deepest directory (`a/b/c/`) and `name` its segments joined by the caller's
+/// `join` string, as Pierre's `flattenEmptyDirectories` shows them. `stat` is
+/// the subtree's summed line counts, which the changed-files card draws (KSG's
+/// `TurnDiffTreeDirectoryNode.stat`). `parent` is the row index of the
+/// enclosing directory row for Left's "move to parent". `collapsed` folds any
+/// chain member the collapse set holds.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DiffTreeRow {
     Dir {
@@ -57,6 +59,7 @@ pub enum DiffTreeRow {
         depth: usize,
         parent: Option<usize>,
         collapsed: bool,
+        stat: (u32, u32),
     },
     File {
         file: usize,
@@ -89,7 +92,7 @@ impl DiffTreeRow {
 }
 
 /// KSG's `toGitStatus`: the tree's A/D/M/R mark for a change kind.
-fn tree_status(change: &crate::review_patch::ChangeKind) -> TreeStatus {
+pub(crate) fn tree_status(change: &crate::review_patch::ChangeKind) -> TreeStatus {
     use crate::review_patch::ChangeKind as K;
     match change {
         K::Added | K::Copied => TreeStatus::Added,
@@ -165,51 +168,66 @@ impl DirNode {
     }
 }
 
-/// The visible tree rows for a ready diff. `files` is `Ready::files` in
-/// `order_like_tree` order; KSG hands the tree that same order and ranks
-/// siblings by first-seen position, which insertion order reproduces here.
-/// `hide_tests` drops test files and the folders they leave empty (a folder
-/// with no shown descendants is never an ancestor of a shown file, so it
-/// never exists in the model). `dirs_collapsed` prunes a folder's subtree
-/// while keeping its row.
+/// One file the tree flattens: its slash path, the A/D/M/R mark the Diff
+/// tab's rows draw, and the line counts when known (the changed-files card's
+/// per-file stat and the source of each directory's summed `Dir::stat`).
+pub(crate) struct TreeFile<'a> {
+    pub path: &'a str,
+    pub status: TreeStatus,
+    pub stat: Option<(u32, u32)>,
+}
+
+/// The visible tree rows for a file list in tree order; KSG hands the tree
+/// its sibling order and insertion order reproduces it here. `hide_tests`
+/// drops test files and the folders they leave empty (a folder with no shown
+/// descendants is never an ancestor of a shown file, so it never exists in
+/// the model). `dirs_collapsed` prunes a folder's subtree while keeping its
+/// row. `join` joins a flattened chain's segments (" / " on the Diff tab,
+/// "/" in the changed-files card, as each KSG source shows them).
 pub(crate) fn flatten_tree(
-    files: &[diff_panel::FileEntry],
+    files: &[TreeFile<'_>],
     hide_tests: bool,
     dirs_collapsed: &HashSet<String>,
+    join: &str,
 ) -> Vec<DiffTreeRow> {
     // Dedupe paths the way KSG's `diffFileTreeEntries` does: one row per
     // path, a differing status folding to Modified; `display` is the file's
     // shown ordinal in the diff list.
     let mut status_by_path: HashMap<&str, TreeStatus> = HashMap::new();
-    let mut unique: Vec<(usize, usize, &str)> = Vec::new();
+    let mut unique: Vec<(usize, usize, &str, Option<(u32, u32)>)> = Vec::new();
     let mut display = 0usize;
     for (index, entry) in files.iter().enumerate() {
-        if hide_tests && crate::review_tree::is_test_changed_file(&entry.file.path) {
+        if hide_tests && crate::review_tree::is_test_changed_file(entry.path) {
             continue;
         }
         let ordinal = display;
         display += 1;
-        let path = entry.file.path.as_str();
-        let status = tree_status(&entry.file.change);
-        match status_by_path.get_mut(path) {
+        match status_by_path.get_mut(entry.path) {
             Some(prev) => {
-                if *prev != status {
+                if *prev != entry.status {
                     *prev = TreeStatus::Modified;
                 }
             }
             None => {
-                status_by_path.insert(path, status);
-                unique.push((index, ordinal, path));
+                status_by_path.insert(entry.path, entry.status);
+                unique.push((index, ordinal, entry.path, entry.stat));
             }
         }
     }
     let mut root = DirNode::new(String::new());
-    for &(index, ordinal, path) in &unique {
+    // KSG `buildTurnDiffTree`: a file's stat adds to every ancestor directory.
+    let mut dir_stats: HashMap<String, (u32, u32)> = HashMap::new();
+    for &(index, ordinal, path, stat) in &unique {
         let mut node = &mut root;
         let mut directory = String::new();
         for segment in path.split('/').take(path.matches('/').count()) {
             directory.push_str(segment);
             directory.push('/');
+            if let Some((additions, deletions)) = stat {
+                let entry = dir_stats.entry(directory.clone()).or_default();
+                entry.0 = entry.0.saturating_add(additions);
+                entry.1 = entry.1.saturating_add(deletions);
+            }
             node = node.dir_child(directory.clone());
         }
         node.children.push(DirChild::File {
@@ -219,7 +237,7 @@ pub(crate) fn flatten_tree(
         });
     }
     let mut out = Vec::new();
-    emit_children(&root, 0, None, dirs_collapsed, &mut out);
+    emit_children(&root, 0, None, dirs_collapsed, join, &dir_stats, &mut out);
     out
 }
 
@@ -231,6 +249,8 @@ fn emit_children(
     depth: usize,
     parent: Option<usize>,
     dirs_collapsed: &HashSet<String>,
+    join: &str,
+    dir_stats: &HashMap<String, (u32, u32)>,
     out: &mut Vec<DiffTreeRow>,
 ) {
     for child in &node.children {
@@ -264,7 +284,7 @@ fn emit_children(
                     .trim_end_matches('/')
                     .split('/')
                     .collect::<Vec<_>>()
-                    .join(" / ");
+                    .join(join);
                 let row = out.len();
                 out.push(DiffTreeRow::Dir {
                     path: terminal.path.clone(),
@@ -272,9 +292,18 @@ fn emit_children(
                     depth,
                     parent,
                     collapsed,
+                    stat: dir_stats.get(&terminal.path).copied().unwrap_or_default(),
                 });
                 if !collapsed {
-                    emit_children(terminal, depth + 1, Some(row), dirs_collapsed, out);
+                    emit_children(
+                        terminal,
+                        depth + 1,
+                        Some(row),
+                        dirs_collapsed,
+                        join,
+                        dir_stats,
+                        out,
+                    );
                 }
             }
         }
@@ -408,7 +437,16 @@ impl State {
         // `ready_mut` borrows all of `diff`; take the set out for the call.
         let collapsed = std::mem::take(&mut diff.dirs_collapsed);
         if let Some(ready) = diff.ready_mut() {
-            ready.tree_rows = flatten_tree(&ready.files, hide, &collapsed);
+            let inputs: Vec<TreeFile<'_>> = ready
+                .files
+                .iter()
+                .map(|entry| TreeFile {
+                    path: &entry.file.path,
+                    status: tree_status(&entry.file.change),
+                    stat: Some((entry.additions, entry.deletions)),
+                })
+                .collect();
+            ready.tree_rows = flatten_tree(&inputs, hide, &collapsed, " / ");
             ready.tree_version += 1;
         }
         diff.dirs_collapsed = collapsed;
@@ -866,49 +904,65 @@ fn tree_status_mark(status: TreeStatus, p: Palette) -> (&'static str, Color) {
 
 #[cfg(test)]
 mod tests {
-    use super::diff_panel::{FileBody, FileEntry};
     use super::*;
-    use crate::review_patch::{ChangeKind, FileDiff};
+    use crate::review_patch::ChangeKind;
 
-    fn file(_index: usize, change: ChangeKind, path: &str) -> FileEntry {
-        FileEntry {
-            additions: 1,
-            deletions: 0,
-            file: FileDiff {
-                path: path.to_string(),
-                previous_path: None,
-                change,
-                binary: false,
-                old_mode: None,
-                new_mode: None,
-                hunks: Vec::new(),
-                additions: 1,
-                deletions: 0,
-            },
-            body: FileBody::Loaded,
-            truncated: false,
+    fn file<'a>(change: ChangeKind, path: &'a str) -> TreeFile<'a> {
+        TreeFile {
+            path,
+            status: tree_status(&change),
+            stat: Some((1, 0)),
         }
     }
 
     /// The six-file fixture across three folder levels, already in
     /// `order_like_tree` order as `Ready::files` holds them.
-    fn six_files() -> Vec<FileEntry> {
+    fn six_files() -> Vec<TreeFile<'static>> {
         vec![
-            file(0, ChangeKind::Modified, "README.md"),
-            file(1, ChangeKind::Modified, "src/lib.rs"),
-            file(2, ChangeKind::Added, "src/ui/app.rs"),
-            file(3, ChangeKind::Modified, "src/ui/widgets/list.rs"),
-            file(4, ChangeKind::Deleted, "tests/app.test.ts"),
-            file(5, ChangeKind::Modified, "src/ui/widgets/deep/item.rs"),
+            file(ChangeKind::Modified, "README.md"),
+            file(ChangeKind::Modified, "src/lib.rs"),
+            file(ChangeKind::Added, "src/ui/app.rs"),
+            file(ChangeKind::Modified, "src/ui/widgets/list.rs"),
+            file(ChangeKind::Deleted, "tests/app.test.ts"),
+            file(ChangeKind::Modified, "src/ui/widgets/deep/item.rs"),
         ]
     }
 
-    fn row_names(files: &[FileEntry], rows: &[DiffTreeRow]) -> Vec<String> {
+    /// The same fixture as the diff panel's `Ready::files` entries.
+    fn six_entries() -> Vec<diff_panel::FileEntry> {
+        six_files()
+            .iter()
+            .map(|file| diff_panel::FileEntry {
+                file: crate::review_patch::FileDiff {
+                    path: file.path.to_string(),
+                    previous_path: None,
+                    change: match file.status {
+                        TreeStatus::Added => ChangeKind::Added,
+                        TreeStatus::Deleted => ChangeKind::Deleted,
+                        TreeStatus::Modified => ChangeKind::Modified,
+                        TreeStatus::Renamed => ChangeKind::Renamed,
+                    },
+                    binary: false,
+                    old_mode: None,
+                    new_mode: None,
+                    hunks: vec![],
+                    additions: file.stat.map(|stat| stat.0).unwrap_or_default(),
+                    deletions: file.stat.map(|stat| stat.1).unwrap_or_default(),
+                },
+                additions: file.stat.map(|stat| stat.0).unwrap_or_default(),
+                deletions: file.stat.map(|stat| stat.1).unwrap_or_default(),
+                body: diff_panel::FileBody::Loaded,
+                truncated: false,
+            })
+            .collect()
+    }
+
+    fn row_names(files: &[TreeFile<'_>], rows: &[DiffTreeRow]) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
                 DiffTreeRow::Dir { name, .. } => format!("dir:{name}"),
                 DiffTreeRow::File { file, .. } => {
-                    let path = &files[*file].file.path;
+                    let path = files[*file].path;
                     format!("file:{}", path.rsplit('/').next().unwrap_or(path))
                 }
             })
@@ -917,7 +971,7 @@ mod tests {
 
     #[test]
     fn tree_rows_order_depth_and_folder_rows() {
-        let rows = flatten_tree(&six_files(), false, &HashSet::new());
+        let rows = flatten_tree(&six_files(), false, &HashSet::new(), " / ");
         // src/lib.rs first-seens src/ ahead of README.md? No: README.md is at
         // index 0, so the root file comes first, then src/'s subtree.
         let names: Vec<&str> = rows
@@ -980,7 +1034,7 @@ mod tests {
     fn collapsing_a_folder_hides_its_descendants() {
         let files = six_files();
         let collapsed = HashSet::from(["src/ui/".to_string()]);
-        let rows = flatten_tree(&files, false, &collapsed);
+        let rows = flatten_tree(&files, false, &collapsed, " / ");
         let names = row_names(&files, &rows);
         assert_eq!(
             names,
@@ -1002,14 +1056,14 @@ mod tests {
         };
         assert!(*collapsed && *depth == 1);
         // Re-opening restores the subtree.
-        let open = flatten_tree(&files, false, &HashSet::new());
+        let open = flatten_tree(&files, false, &HashSet::new(), " / ");
         assert!(open.len() > rows.len());
     }
 
     #[test]
     fn hide_tests_removes_files_and_empty_folders() {
         let files = six_files();
-        let rows = flatten_tree(&files, true, &HashSet::new());
+        let rows = flatten_tree(&files, true, &HashSet::new(), " / ");
         let names = row_names(&files, &rows);
         assert!(
             !names
@@ -1037,10 +1091,10 @@ mod tests {
         // Every level holds only the next: KSG draws the whole run as one
         // "a / b / c / d" row keyed on its deepest directory.
         let files = vec![
-            file(0, ChangeKind::Modified, "a/b/c/d/leaf.rs"),
-            file(1, ChangeKind::Modified, "root.rs"),
+            file(ChangeKind::Modified, "a/b/c/d/leaf.rs"),
+            file(ChangeKind::Modified, "root.rs"),
         ];
-        let rows = flatten_tree(&files, false, &HashSet::new());
+        let rows = flatten_tree(&files, false, &HashSet::new(), " / ");
         let names = row_names(&files, &rows);
         assert_eq!(
             names,
@@ -1056,10 +1110,10 @@ mod tests {
         // A fork ends the chain: `a` folds into `b` only as far as `b`'s two
         // children allow, so `c` gets its own row.
         let files = vec![
-            file(0, ChangeKind::Modified, "a/b/c/leaf.rs"),
-            file(1, ChangeKind::Modified, "a/b/sibling.rs"),
+            file(ChangeKind::Modified, "a/b/c/leaf.rs"),
+            file(ChangeKind::Modified, "a/b/sibling.rs"),
         ];
-        let names = row_names(&files, &flatten_tree(&files, false, &HashSet::new()));
+        let names = row_names(&files, &flatten_tree(&files, false, &HashSet::new(), " / "));
         assert_eq!(
             names,
             vec!["dir:a / b", "dir:c", "file:leaf.rs", "file:sibling.rs"]
@@ -1113,12 +1167,12 @@ mod tests {
     #[test]
     fn built_row_keys_are_stable_across_collapse() {
         let files = six_files();
-        let rows = flatten_tree(&files, false, &HashSet::new());
+        let rows = flatten_tree(&files, false, &HashSet::new(), " / ");
         let keys: Vec<String> = rows.iter().map(|row| row.key()).collect();
         assert!(keys.contains(&"diff-tree-file-3".to_string()));
         assert!(keys.contains(&"diff-tree-dir-src/ui/".to_string()));
         let collapsed = HashSet::from(["src/ui/widgets/deep/".to_string()]);
-        let after = flatten_tree(&files, false, &collapsed);
+        let after = flatten_tree(&files, false, &collapsed, " / ");
         let after_keys: Vec<String> = after.iter().map(|row| row.key()).collect();
         for key in keys
             .iter()
@@ -1132,16 +1186,14 @@ mod tests {
     fn five_thousand_files_build_bounded_rows() {
         // One row per shown path plus its branch folders — the row list stays
         // linear in files, and `virtual_rows` bounds the built elements.
-        let files: Vec<FileEntry> = (0..5000)
-            .map(|i| {
-                file(
-                    i,
-                    ChangeKind::Modified,
-                    &format!("dir{}/sub/file{}.rs", i % 50, i),
-                )
-            })
+        let paths: Vec<String> = (0..5000)
+            .map(|i| format!("dir{}/sub/file{}.rs", i % 50, i))
             .collect();
-        let rows = flatten_tree(&files, false, &HashSet::new());
+        let files: Vec<TreeFile<'_>> = paths
+            .iter()
+            .map(|path| file(ChangeKind::Modified, path))
+            .collect();
+        let rows = flatten_tree(&files, false, &HashSet::new(), " / ");
         let file_rows = rows
             .iter()
             .filter(|row| matches!(row, DiffTreeRow::File { .. }))
@@ -1168,11 +1220,11 @@ mod tests {
         // KSG's `diffFileTreeEntries` dedupes by path; differing statuses
         // fold to Modified.
         let files = vec![
-            file(0, ChangeKind::Added, "src/dup.rs"),
-            file(1, ChangeKind::Deleted, "src/dup.rs"),
-            file(2, ChangeKind::Modified, "src/other.rs"),
+            file(ChangeKind::Added, "src/dup.rs"),
+            file(ChangeKind::Deleted, "src/dup.rs"),
+            file(ChangeKind::Modified, "src/other.rs"),
         ];
-        let rows = flatten_tree(&files, false, &HashSet::new());
+        let rows = flatten_tree(&files, false, &HashSet::new(), " / ");
         let names = row_names(&files, &rows);
         assert_eq!(names, vec!["dir:src", "file:dup.rs", "file:other.rs"]);
         let DiffTreeRow::File { file, status, .. } = &rows[1] else {
@@ -1190,7 +1242,7 @@ mod tests {
             key.clone(),
             diff_panel::ThreadDiff {
                 done: Some(diff_panel::Done::Ready(Box::new(diff_panel::Ready {
-                    files: six_files(),
+                    files: six_entries(),
                     raw: None,
                     additions: 6,
                     deletions: 0,
