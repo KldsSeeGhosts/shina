@@ -5404,6 +5404,9 @@ pub struct State {
     pub attachment_drop_hover: bool,
     /// The assistant message whose Copy button last copied, and when, for its check feedback.
     pub copied_message: Option<(String, std::time::Instant)>,
+    /// Per-turn changed-files card folder state, keyed `changed-files-{message key}`.
+    /// Session only, as KSG's `directoryExpansionState` is.
+    pub(crate) changed_files: std::collections::HashMap<String, crate::ui::changed_files::CardUi>,
     pub(crate) transcript_preview: Option<crate::ui::transcript_context::Preview>,
     pub(crate) attachment_preview: Option<crate::ui::attachment_preview::Preview>,
     pasted_text_names: Option<(String, usize, std::collections::HashSet<String>)>,
@@ -6521,6 +6524,7 @@ impl State {
             attachment_poster_clock: Default::default(),
             attachment_drop_hover: false,
             copied_message: None,
+            changed_files: Default::default(),
             transcript_preview: None,
             attachment_preview: None,
             pasted_text_names: None,

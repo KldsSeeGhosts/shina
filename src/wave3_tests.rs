@@ -380,3 +380,109 @@ fn access_picker_focuses_and_checks_the_current_radio() {
         assert!(!rt.state.current().native.access_picker);
     }
 }
+
+/// KSG's `AssistantChangedFilesSection`: a finished turn that touched files in
+/// two directories shows the card with the summed count, folders start
+/// collapsed (`persistedExpanded ?? false`), the chevrons expand them all, and
+/// "Open diff" opens the right panel's Changes tab.
+#[test]
+fn changed_files_card_counts_expands_and_open_diff_shows_the_panel() {
+    let mut rt = runtime(1280.0);
+    rt.state.populate_demo();
+    {
+        let t = rt.state.current_mut();
+        t.messages.truncate(2);
+        t.tools.clear();
+        t.thoughts.clear();
+        t.work.clear();
+        t.messages.push(crate::model::Message {
+            id: "cf-reply".into(),
+            role: "Pi",
+            text: "Done.".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        t.work.push(crate::model::AssistantWork {
+            start: 1,
+            stopped: false,
+            stopped_order: 0,
+            expanded: false,
+            elapsed: Some(42),
+            outcome: Some(Status::Completed),
+        });
+        let change = |path: &str, additions: usize, deletions: usize| crate::work::FileChange {
+            path: path.into(),
+            old_path: None,
+            operation: "update".into(),
+            diff: String::new(),
+            additions,
+            deletions,
+        };
+        t.tools.push(Tool {
+            id: "cf-edit".into(),
+            kind: None,
+            changes: vec![
+                change("src/transport/socket.ts", 18, 4),
+                change("tests/reconnect.test.ts", 47, 0),
+            ],
+            input: serde_json::Value::Null,
+            raw_expanded: false,
+            order: 0,
+            name: "edit".into(),
+            detail: "src/transport/socket.ts".into(),
+            done: true,
+            failed: false,
+            output: String::new(),
+            anchor: crate::model::ToolAnchor {
+                message: 1,
+                offset: 0,
+            },
+            block: 0,
+            expanded: false,
+            group_expanded: false,
+            started: None,
+            duration_ms: Some(120),
+            subagents: vec![],
+            images: vec![],
+            structured: serde_json::Value::Null,
+            parent_call: None,
+            exit_code: None,
+        });
+    }
+    rt.frame(0.0);
+    let turn_key = {
+        let t = rt.state.current();
+        format!("message-{}-id-{}", t.id, t.messages[1].id)
+    };
+    let key = |kind: &str, rest: &str| format!("changed-files-{kind}-{turn_key}{rest}");
+    assert!(rt.presented(&format!("changed-files-{turn_key}")).is_some());
+    assert_eq!(
+        rt.elements()
+            .into_iter()
+            .find(|element| element.key.as_deref() == Some(&key("count", "")))
+            .and_then(|element| element.text)
+            .as_deref(),
+        Some("2 changed files")
+    );
+    // Collapsed by default: the folder rows show, the file rows do not.
+    assert!(rt.presented(&key("dir", "-src/transport/")).is_some());
+    assert!(rt.presented(&key("dir", "-tests/")).is_some());
+    assert!(
+        rt.presented(&key("file", "-src/transport/socket.ts"))
+            .is_none()
+    );
+    press(&mut rt, &format!("changed-files-toggle-{turn_key}"));
+    assert!(
+        rt.presented(&key("file", "-src/transport/socket.ts"))
+            .is_some()
+    );
+    assert!(
+        rt.presented(&key("file", "-tests/reconnect.test.ts"))
+            .is_some()
+    );
+    press(&mut rt, &format!("changed-files-open-diff-{turn_key}"));
+    let panel_key = rt.state.panel_key();
+    let panel = rt.state.right_panels.get(&panel_key);
+    assert!(panel.open);
+    assert_eq!(panel.view, crate::right_panel::PanelView::Diff);
+}
