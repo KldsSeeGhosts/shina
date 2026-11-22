@@ -59,45 +59,52 @@ pub(super) fn retry_row(s: &State, p: Palette, index: usize) -> El {
         })
 }
 
+/// Ported from KSG Code's `workEntryIconName`/`toolGroupSummaryIconName`
+/// (`TimelineToolActivityIcon.tsx`, `TimelineWorkEntryRow.logic.ts`).
 pub(super) fn kind_icon(kind: ToolKind) -> &'static str {
     match kind {
         ToolKind::Command => "terminal",
-        ToolKind::FileChange => "edit",
-        ToolKind::FileSearch | ToolKind::WebSearch => "search",
+        ToolKind::FileChange => "square-pen",
+        ToolKind::FileSearch => "search",
+        ToolKind::WebSearch => "globe",
         ToolKind::Read => "eye",
         ToolKind::List => "folder",
-        ToolKind::Subagent => "crew",
-        ToolKind::Plan => "list",
+        ToolKind::Subagent => "bot",
+        ToolKind::Plan => "list-todo",
         ToolKind::Html => "open",
         ToolKind::Other => "wrench",
     }
 }
 
+fn mono_style() -> TextStyle {
+    TextStyle::new(12.0, 400.0)
+        .family(rune::Family::SystemMono)
+        .lh(18.0)
+}
+
+/// KSG's `--font-size-code` mono at `text-foreground/85`, for commands, patterns and
+/// argument values (`ToolCallBody`, `ShellCommandBlock`).
 fn mono(value: impl Into<String>, p: Palette) -> El {
-    label(
-        value,
-        TextStyle::new(12.0, 400.0)
-            .family(rune::Family::SystemMono)
-            .lh(18.0),
-        p.ink,
-    )
-    .min_w(0.0)
-    .wrap_anywhere()
-    .selectable(true)
+    label(value, mono_style(), p.ink.alpha(0.85))
+        .min_w(0.0)
+        .wrap_anywhere()
+        .selectable(true)
+}
+
+/// KSG's mono at `text-dim-foreground`, for changed-file lists and search result paths.
+fn mono_dim(value: impl Into<String>, p: Palette) -> El {
+    label(value, mono_style(), p.faint)
+        .min_w(0.0)
+        .wrap_anywhere()
+        .selectable(true)
 }
 
 /// Ported from KSG Code's `WORK_LOG_OUTPUT_CLASS_NAME`: quiet mono tool output.
 fn mono_muted(value: impl Into<String>, p: Palette) -> El {
-    label(
-        value,
-        TextStyle::new(12.0, 400.0)
-            .family(rune::Family::SystemMono)
-            .lh(18.0),
-        p.muted,
-    )
-    .min_w(0.0)
-    .wrap_anywhere()
-    .selectable(true)
+    label(value, mono_style(), p.muted)
+        .min_w(0.0)
+        .wrap_anywhere()
+        .selectable(true)
 }
 
 /// A radius-8 `surface-well` frame used only for embedded commands, diffs, and raw payloads.
@@ -110,31 +117,48 @@ fn code_well(p: Palette) -> El {
         .border(1.0, p.line)
 }
 
+/// KSG's `StructuredValue` bound (`max-h-80`, 320 px).
 fn block(key: String, content: El, running: bool) -> El {
     col()
         .key(key)
         .min_w(0.0)
-        .max_h(200.0)
+        .max_h(320.0)
         .scroll(ScrollSpec {
             stick_bottom: running,
         })
         .child(content)
 }
 
+pub(super) fn relative(path: &str, root: &std::path::Path) -> String {
+    crate::work::relative_path(path, root)
+}
+
 fn padded(content: El) -> El {
     content.px(12.0).py(9.0)
 }
 
-fn relative(path: &str, root: &std::path::Path) -> String {
-    // Projection paths belong to their host. Do not canonicalize or read their files.
-    let root = root.to_string_lossy().replace('\\', "/");
-    let path = path.replace('\\', "/");
-    path.strip_prefix(&format!("{}/", root.trim_end_matches('/')))
-        .unwrap_or(&path)
-        .to_owned()
+/// KSG's `isJsonToolText`: true when the string parses as a JSON object or array.
+fn looks_like_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<Value>(trimmed).is_ok()
 }
 
-fn input_text(tool: &Tool, keys: &[&str]) -> String {
+/// KSG's `canExpandProjectedItem` proxy: the row offers a disclosure only when its body
+/// has something beyond the collapsed label.
+pub(super) fn has_body(tool: &Tool) -> bool {
+    tool.expanded
+        || !tool.output.is_empty()
+        || !tool.input.is_null()
+        || !tool.changes.is_empty()
+        || !tool.images.is_empty()
+        || tool.exit_code.is_some()
+        || tool.parent_call.is_some()
+        || !tool.structured.is_null()
+        || !tool.detail.is_empty()
+}
+
+pub(super) fn input_text(tool: &Tool, keys: &[&str]) -> String {
     if let Some(input) = tool.input.as_str() {
         return input.into();
     }
@@ -180,9 +204,12 @@ fn output(tool: &Tool, p: Palette, id: &str) -> El {
 
 /// Ported from KSG Code's reasoning-only group summary. Keep one disclosure per
 /// consecutive run of thoughts, with the original text keys inside it.
-pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
+pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize], listed: bool) -> El {
     let t = s.current();
-    let mut content = col().min_w(0.0).gap(4.0).child(thought_head(s, p, indices));
+    let mut content = col()
+        .min_w(0.0)
+        .gap(4.0)
+        .child(thought_head(s, p, indices, listed));
     if t.thoughts[indices[0]].expanded {
         for index in indices {
             content = content.child(thought_body(s, p, *index));
@@ -193,7 +220,10 @@ pub(super) fn thoughts(s: &State, p: Palette, indices: &[usize]) -> El {
 
 /// The disclosure line of a thought run. Long turns place it and each body in
 /// their own transcript slice; `thoughts` keeps them together for short turns.
-pub(super) fn thought_head(s: &State, p: Palette, indices: &[usize]) -> El {
+/// Ported from KSG Code's `WorkEntryLogRow` reasoning labels: a folded single thought
+/// reads the thought's own text, an unfolded one reads "Thought" ("Thinking" while live),
+/// and a thought run's head reads "Thought (×N)", the icon the brain glyph.
+pub(super) fn thought_head(s: &State, p: Palette, indices: &[usize], listed: bool) -> El {
     let t = s.current();
     let first = indices[0];
     let expanded = t.thoughts[first].expanded;
@@ -206,27 +236,35 @@ pub(super) fn thought_head(s: &State, p: Palette, indices: &[usize]) -> El {
     let key = format!("inline-thought-{}-{first}", t.id);
     let press_key = key.clone();
     let title = if indices.len() == 1 {
-        "Thought".into()
+        if expanded {
+            if t.thoughts[first].done {
+                "Thought".into()
+            } else {
+                "Thinking".into()
+            }
+        } else {
+            let line = live_thought_line(&t.thoughts[first].text);
+            if line.is_empty() {
+                "Thought".into()
+            } else {
+                line
+            }
+        }
     } else {
-        format!("Thought ×{}", indices.len())
+        format!("Thought (×{})", indices.len())
     };
-    // Ported from KSG Code's collapsed reasoning preview: show the first line/heading while folded.
-    let preview = (!expanded)
-        .then(|| {
-            indices
-                .iter()
-                .map(|&index| live_thought_line(&t.thoughts[index].text))
-                .find(|line| !line.is_empty())
-        })
-        .flatten()
-        .unwrap_or_default();
+    // KSG offers the disclosure only when the thought has text to show.
+    let expandable = indices.len() > 1 || !t.thoughts[first].text.trim().is_empty();
     activity_line(
         key,
         format!("{} thinking text", if expanded { "Hide" } else { "Show" }),
-        (title, preview.as_str()),
+        title,
+        None,
+        false,
         false,
         expanded,
-        false,
+        expandable,
+        listed,
         "brain",
         p,
     )
@@ -251,9 +289,18 @@ pub(super) fn thought_head(s: &State, p: Palette, indices: &[usize]) -> El {
     })
 }
 
+/// KSG's `WorkLogDetails` for reasoning: 30 pt in (`ms-7.5`), one bounded scroll region
+/// (`max-h-96`), the thinking rendered as markdown in the foreground colour
+/// (`ReasoningTraceContent`).
 pub(super) fn thought_body(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let thought = &t.thoughts[index];
+    let empty = thought.text.is_empty();
+    let text = if empty {
+        "The provider did not provide visible thinking text.".to_owned()
+    } else {
+        thought.text.clone()
+    };
     col()
         .key(format!("thought-output-{}-{index}", t.id))
         .role("group")
@@ -261,74 +308,100 @@ pub(super) fn thought_body(s: &State, p: Palette, index: usize) -> El {
         .min_w(0.0)
         .pl(30.0)
         .mb(4.0)
-        .max_h(200.0)
+        .py(4.0)
+        .max_h(384.0)
         .scroll(ScrollSpec {
             stick_bottom: !thought.done,
         })
-        .child(
-            label(
-                if thought.text.is_empty() {
-                    "The provider did not provide visible thinking text."
-                } else {
-                    &thought.text
-                },
-                TextStyle::new(13.0, 400.0).lh(20.0),
-                p.faint,
+        .child(if empty {
+            label(text, BODY, p.muted).wrap_anywhere().selectable(true)
+        } else {
+            markdown_ui::render_with_find(
+                &text,
+                p,
+                s.dark,
+                false,
+                false,
+                !thought.done,
+                &format!("thought-{}-{index}", t.id),
+                &s.unwrapped_code_blocks,
+                None,
             )
-            .wrap_anywhere()
-            .selectable(true),
-        )
+        })
 }
 
-/// Ported from KSG Code's `WorkLogDetails` (`ms-7.5` unboxed indent, quiet mono output) and
-/// `V2ItemInspector`: plain outputs stay unboxed and indented; commands and diffs keep a radius-8
-/// `surface-well`.
+/// Ported from KSG Code's `WorkLogDetails` (`ms-7.5` indent, `max-h-96` scroll region,
+/// `gap-3` between sections, `py-1`) and `V2ItemInspector` (`ToolCallBody` and the
+/// file_change, file_search and web_search sections).
 pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
     let t = s.current();
     let tool = &t.tools[index];
     let id = format!("{}-{index}", t.id);
     let root = s.working_directory();
+    let kind = tool.resolved_kind();
     let mut body = col()
         .key(format!("tool-output-{id}"))
         .role("group")
-        .label(format!("Output for {}", tool_title(tool)))
+        .label(format!("Output for {}", tool_title(tool, &root)))
         .min_w(0.0)
         .mb(6.0)
         .ml(30.0)
-        .gap(6.0);
-    match tool.resolved_kind() {
+        .py(4.0)
+        .gap(12.0)
+        .max_h(384.0)
+        .scroll(ScrollSpec {
+            stick_bottom: !tool.done,
+        });
+    match kind {
         ToolKind::Command => {
-            body = body
-                .child(
-                    code_well(p).child(block(
-                        format!("tool-command-{id}"),
-                        padded(
-                            col()
-                                .min_w(0.0)
-                                .gap(4.0)
-                                .child(meta_text("sh", p.muted))
-                                .child(mono(input_text(tool, &["command", "cmd"]), p)),
-                        ),
-                        false,
-                    )),
-                )
-                .child(output(tool, p, &id));
+            // KSG's ToolCallBody: the command at text-foreground/85, muted output, then
+            // `exit {code}` in destructive. No wells or labels.
+            let mut section = col().min_w(0.0).gap(6.0).child(
+                mono(input_text(tool, &["command", "cmd"]), p).key(format!("tool-command-{id}")),
+            );
+            section = section.child(output(tool, p, &id));
+            body = body.child(section);
         }
         ToolKind::FileChange if !tool.changes.is_empty() => {
+            // KSG's file_change inspector: counts and an "Open diff" action on one line,
+            // then the changed paths in quiet mono. Diffs stay in the diff panel.
+            let additions: usize = tool.changes.iter().map(|c| c.additions).sum();
+            let deletions: usize = tool.changes.iter().map(|c| c.deletions).sum();
+            let first_path = tool.changes[0].path.clone();
+            let mut head = row().center_y().gap(12.0);
+            if additions > 0 {
+                head = head.child(label(format!("+{additions}"), SMALL, p.ok));
+            }
+            if deletions > 0 {
+                head = head.child(label(format!("-{deletions}"), SMALL, p.danger));
+            }
+            head = head.child(crew_ui::ghost_button(
+                s,
+                format!("tool-open-diff-{id}"),
+                "Open diff",
+                p,
+                move |s: &mut State| {
+                    let panel_key = s.panel_key();
+                    crate::ui::diff_panel::reveal_file(s, &panel_key, &first_path);
+                },
+            ));
+            body = body.child(head);
+            if tool.failed && !tool.output.is_empty() {
+                body = body.child(output(tool, p, &id));
+            }
+            let mut list = col().min_w(0.0).gap(4.0);
             for (file, change) in tool.changes.iter().enumerate() {
-                if file > 0 {
-                    body = body.child(rule(p));
+                let mut line = change.operation.clone();
+                if let Some(old) = &change.old_path {
+                    line.push_str(&format!(" {} →", relative(old, &root)));
                 }
-                // The path is KSG's changed-file row: pressing it opens the
-                // right panel's Diff tab on the file, the hover fill the row
-                // gets on the web.
-                let path = relative(&change.path, &root);
-                let raw = change.path.clone();
-                let mut heading = col().min_w(0.0).gap(4.0).child(
-                    mono(path.clone(), p)
+                line.push_str(&format!(" {}", relative(&change.path, &root)));
+                let path = change.path.clone();
+                list = list.child(
+                    mono_dim(line, p)
                         .key(format!("tool-file-path-{id}-{file}"))
                         .role("button")
-                        .label(format!("Open diff for {path}"))
+                        .label(format!("Open diff for {}", relative(&change.path, &root)))
                         .cursor(rune::Cursor::Pointer)
                         .focusable(true)
                         .w_full()
@@ -336,58 +409,18 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                         .hover(p.selected)
                         .on_press(move |s: &mut State| {
                             let panel_key = s.panel_key();
-                            crate::ui::diff_panel::reveal_file(s, &panel_key, &raw);
+                            crate::ui::diff_panel::reveal_file(s, &panel_key, &path);
                         }),
                 );
-                if let Some(old) = &change.old_path {
-                    heading = heading.child(mono_muted(
-                        format!("Previously {}", relative(old, &root)),
-                        p,
-                    ));
-                }
-                let mut meta = row().gap(8.0).child(meta_text(&change.operation, p.muted));
-                if !change.diff.is_empty() {
-                    meta = meta.child(meta_text(
-                        format!("+{} -{}", change.additions, change.deletions),
-                        p.muted,
-                    ));
-                }
-                body = body.child(heading.child(meta));
-                if !change.diff.is_empty() {
-                    let mut lines = col().min_w(0.0).py(6.0);
-                    for (line, value) in change.diff.lines().enumerate() {
-                        let mut content = mono(if value.is_empty() { " " } else { value }, p)
-                            .key(format!("tool-diff-line-{id}-{file}-{line}"))
-                            .px(12.0);
-                        if let Some(added) = crate::work::diff_line_kind(value) {
-                            // Added lines use ok_bg/ok and removed lines use danger_bg/danger.
-                            // The +/- gutter stays, so colour is never the only cue.
-                            let (fill, edge) = if added {
-                                (p.ok_bg, p.ok)
-                            } else {
-                                (p.danger_bg, p.danger)
-                            };
-                            content = content.fill(fill).border_sides([0.0, 0.0, 0.0, 2.0], edge);
-                        }
-                        lines = lines.child(content);
-                    }
-                    body = body.child(code_well(p).child(block(
-                        format!("tool-diff-{id}-{file}"),
-                        lines,
-                        false,
-                    )));
-                }
             }
-            if tool.failed && !tool.output.is_empty() {
-                body = body.child(output(tool, p, &id));
-            }
+            body = body.child(list);
         }
         ToolKind::FileSearch => {
-            body = body.child(block(
-                format!("tool-pattern-{id}"),
-                mono(input_text(tool, &["pattern", "query"]), p),
-                false,
-            ));
+            // KSG's file_search inspector: the pattern at text-foreground/85, then a
+            // path list in dim mono with a sans preview under each entry.
+            body = body.child(
+                mono(input_text(tool, &["pattern", "query"]), p).key(format!("tool-pattern-{id}")),
+            );
             let results = tool.structured["fileSearchResults"].as_array();
             if let Some(results) = results.filter(|r| !r.is_empty()) {
                 let mut list = col().min_w(0.0).gap(4.0);
@@ -399,13 +432,21 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
                     let mut path = relative(path, &root);
                     if let Some(line) = result["line"].as_u64() {
                         path.push_str(&format!(":{line}"));
+                        if let Some(column) = result["column"].as_u64() {
+                            path.push_str(&format!(":{column}"));
+                        }
                     }
                     let mut entry = col()
                         .key(format!("tool-search-result-{id}-{i}"))
                         .min_w(0.0)
-                        .child(mono(path, p));
+                        .child(mono_dim(path, p));
                     if let Some(preview) = result["preview"].as_str() {
-                        entry = entry.child(mono_muted(preview, p));
+                        entry = entry.child(
+                            label(preview, SMALL, p.muted)
+                                .min_w(0.0)
+                                .wrap_anywhere()
+                                .selectable(true),
+                        );
                     }
                     list = list.child(entry);
                 }
@@ -415,27 +456,32 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
             }
         }
         ToolKind::WebSearch => {
+            // KSG's web_search inspector: queries in mono, then medium titles with an
+            // external-link glyph and a muted snippet.
             let query = input_text(tool, &["query", "url", "queries", "patterns"]);
-            body = body.child(block(format!("tool-query-{id}"), mono(query, p), false));
+            body = body.child(mono(query, p).key(format!("tool-query-{id}")));
             let results = tool.structured["webResults"].as_array();
             if let Some(results) = results.filter(|r| !r.is_empty()) {
                 let mut list = col().min_w(0.0).gap(6.0);
                 for (i, result) in results.iter().enumerate() {
                     let url = result["url"].as_str().unwrap_or("");
                     let title = result["title"].as_str().unwrap_or(url);
-                    let mut title = label(title, SMALL, p.ink)
-                        .min_w(0.0)
-                        .wrap_anywhere()
-                        .key(format!("tool-web-link-{id}-{i}"));
+                    let mut head = row().center_y().gap(4.0).min_w(0.0).child(
+                        label(title, TextStyle::new(12.0, 500.0), p.ink)
+                            .min_w(0.0)
+                            .truncate()
+                            .key(format!("tool-web-link-{id}-{i}")),
+                    );
                     if url.starts_with("https://") || url.starts_with("http://") {
                         // Rune's href dispatches through Tx::open_url, including keyboard activation.
-                        title = title
+                        head = head
+                            .child(icon("external-link", p.ink).size(12.0, 12.0))
                             .href(url)
                             .focusable(true)
                             .cursor(rune::Cursor::Pointer)
                             .hover(p.selected);
                     }
-                    let mut entry = col().min_w(0.0).gap(2.0).child(title);
+                    let mut entry = col().min_w(0.0).gap(2.0).child(head);
                     if let Some(snippet) = result["snippet"].as_str() {
                         entry = entry.child(
                             label(snippet, SMALL, p.muted)
@@ -452,33 +498,55 @@ pub(super) fn expanded(s: &State, p: Palette, index: usize) -> El {
             }
         }
         _ => {
-            let mut fields = col().min_w(0.0).gap(4.0);
+            // KSG's ToolCallBody args: a muted key, then the value inline in fg/85 or as
+            // a muted StructuredValue block when it carries JSON or newlines.
+            let mut fields = col().min_w(0.0).gap(6.0);
             if let Some(input) = tool.input.as_object().filter(|i| !i.is_empty()) {
                 for (key, value) in input {
-                    fields = fields.child(
-                        col()
-                            .min_w(0.0)
-                            .child(label(key, SMALL, p.faint))
-                            .child(mono(
-                                value
-                                    .as_str()
-                                    .map(str::to_owned)
-                                    .unwrap_or_else(|| value.to_string()),
-                                p,
-                            )),
-                    );
+                    let text = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    if value.is_string() && !looks_like_json(&text) && !text.contains('\n') {
+                        fields = fields.child(
+                            row()
+                                .min_w(0.0)
+                                .child(mono_muted(format!("{key} "), p))
+                                .child(mono(text, p)),
+                        );
+                    } else {
+                        fields = fields.child(
+                            col()
+                                .min_w(0.0)
+                                .gap(2.0)
+                                .child(mono_muted(format!("{key} "), p))
+                                .child(block(
+                                    format!("tool-field-{id}-{key}"),
+                                    mono_muted(text, p),
+                                    false,
+                                )),
+                        );
+                    }
                 }
+            } else if let Some(text) = tool.input.as_str().filter(|v| !v.is_empty()) {
+                fields = fields.child(mono_muted(text, p));
             } else if !tool.detail.is_empty() {
                 fields = fields.child(mono(&tool.detail, p));
             }
             body = body
-                .child(block(format!("tool-fields-{id}"), fields, false))
+                .child(block(format!("tool-fields-{id}"), fields, !tool.done))
                 .child(output(tool, p, &id));
         }
     }
     if let Some(exit) = tool.exit_code.filter(|exit| *exit != 0) {
-        body = body
-            .child(meta_text(format!("Exit code {exit}"), p.muted).key(format!("tool-exit-{id}")));
+        // KSG's ToolCallBody exit line, mono and destructive.
+        body = body.child(
+            label(format!("exit {exit}"), mono_style(), p.danger)
+                .key(format!("tool-exit-{id}"))
+                .min_w(0.0)
+                .wrap_anywhere()
+                .selectable(true),
+        );
     }
     if let Some(parent) = &tool.parent_call {
         body = body.child(label(format!("Called by {parent}"), SMALL, p.muted).wrap_anywhere());

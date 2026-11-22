@@ -8781,44 +8781,111 @@ fn add_project_palette(s: &State, p: Palette) -> El {
     }
 }
 
-/// The verb for a call, in the tense of its state: "Reading" while it runs, "Read" after.
-fn tool_verb(tool: &Tool) -> String {
-    tool_verb_in(tool, tool.done || tool.failed)
-}
-
-/// The verb for a call in a given tense. KSG's live activity row keeps the present tense
-/// ("Reading") while its turn is still acting on the result (`liveActivityToolStatus`).
-fn tool_verb_in(tool: &Tool, done: bool) -> String {
-    use crate::work::ToolKind::*;
-    match (tool.resolved_kind(), done) {
-        (Read, true) => "Read".into(),
-        (Read, false) => "Reading".into(),
-        (List, true) => "Listed".into(),
-        (List, false) => "Listing".into(),
-        (FileSearch | WebSearch, true) => "Searched".into(),
-        (FileSearch | WebSearch, false) => "Searching".into(),
-        (FileChange, true) => "Changed".into(),
-        (FileChange, false) => "Changing".into(),
-        (Command, true) => "Ran".into(),
-        (Command, false) => "Running".into(),
-        (Subagent, true) => "Delegated".into(),
-        (Subagent, false) => "Delegating".into(),
-        (Plan, true) => "Updated plan".into(),
-        (Plan, false) => "Updating plan".into(),
-        (Html, true) => "Rendered".into(),
-        (Html, false) => "Rendering".into(),
-        (Other, true) => format!("Called {}", tool.name),
-        (Other, false) => format!("Calling {}", tool.name),
-    }
-}
-
-fn tool_title(tool: &Tool) -> String {
-    let verb = tool_verb(tool);
-    if tool.detail.is_empty() {
-        verb
+/// KSG's provider-title fallback for a command with no command text
+/// (`commandlessCommandLabel`): the provider's own title, or the generic status label.
+fn commandless_label(tool: &Tool, status: &'static str) -> String {
+    let generic = match status {
+        "inProgress" => "Running command",
+        "failed" => "Failed command",
+        _ => "Ran command",
+    };
+    let title = tool.detail.trim();
+    if title.is_empty() || matches!(title, "Ran command" | "Run command" | "Command") {
+        generic.into()
     } else {
-        format!("{verb} {}", tool.detail)
+        title.to_owned()
     }
+}
+
+/// Ported from KSG Code's `workEntryDisplayLabel` (`MessagesTimeline.logic.ts`): the
+/// collapsed row's one label — the command itself for a command, "Searched …" or
+/// "Read {path}" for search and reads, the first changed path for an edit, then a
+/// single-line detail, then the title.
+fn entry_label(tool: &Tool, root: &std::path::Path) -> String {
+    use crate::work::ToolKind::*;
+    let detail = tool.detail.trim();
+    match tool.resolved_kind() {
+        Command => {
+            let command = work_ui::input_text(tool, &["command", "cmd"]);
+            return if command.trim().is_empty() {
+                commandless_label(tool, "completed")
+            } else {
+                crate::work::command_display_text(&command)
+            };
+        }
+        // KSG's classifyToolActivity puts "ls" under search.
+        FileSearch | WebSearch | List => {
+            if let Some(label) = crate::work::search_label(tool) {
+                return label;
+            }
+        }
+        Read => {
+            let paths = crate::work::read_paths(tool);
+            if let Some(first) = paths.first() {
+                let path = crate::work::relative_path(first, root);
+                return if paths.len() == 1 {
+                    format!("Read {path}")
+                } else {
+                    format!("Read {path} +{} more", paths.len() - 1)
+                };
+            }
+        }
+        _ => {}
+    }
+    if !detail.is_empty() && !detail.contains(['\r', '\n']) {
+        return detail.to_owned();
+    }
+    match tool.resolved_kind() {
+        FileChange if !tool.changes.is_empty() => {
+            let path = crate::work::relative_path(&tool.changes[0].path, root);
+            if tool.changes.len() == 1 {
+                path
+            } else {
+                format!("{path} +{} more", tool.changes.len() - 1)
+            }
+        }
+        Read => "Read file".into(),
+        _ => {
+            // KSG's last resort: the tool title, first letter capitalized.
+            let name = tool.name.trim();
+            match name.chars().next() {
+                Some(first) => first.to_uppercase().chain(name.chars().skip(1)).collect(),
+                None => "Tool call".into(),
+            }
+        }
+    }
+}
+
+/// Ported from KSG's `liveWorkEntryLabel`: a running command names its program
+/// ("Running cargo"), a failed one reads "Failed cargo", a finished one "Ran cargo";
+/// every other entry keeps its display label.
+fn live_label(tool: &Tool, root: &std::path::Path) -> String {
+    if tool.resolved_kind() != crate::work::ToolKind::Command {
+        return entry_label(tool, root);
+    }
+    let command = work_ui::input_text(tool, &["command", "cmd"]);
+    let status = if tool.failed {
+        "failed"
+    } else if !tool.done {
+        "inProgress"
+    } else {
+        "completed"
+    };
+    if command.trim().is_empty() {
+        return commandless_label(tool, status);
+    }
+    match crate::work::command_program_name(&command) {
+        Some(program) => match status {
+            "inProgress" => format!("Running {program}"),
+            "failed" => format!("Failed {program}"),
+            _ => format!("Ran {program}"),
+        },
+        None => commandless_label(tool, status),
+    }
+}
+
+fn tool_title(tool: &Tool, root: &std::path::Path) -> String {
+    entry_label(tool, root)
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
@@ -9013,62 +9080,85 @@ fn quiet_inks(p: Palette) -> (Color, Color) {
     (p.muted, p.faint)
 }
 
-/// Ported from KSG Code's `WorkLogLine` and `TimelineWorkEntryRow`: a 24 px row with a 14 px
-/// glyph in a 24 px icon slot. The whole label, verb and target, is `text-secondary-label`
-/// (the palette's `muted`) at body weight, so tool rows read quieter than the prose around
-/// them. A failed row's verb is medium `danger`. The optional 12 px caret is `dim` and
-/// shows on folded group headers only, never on individual rows.
 #[allow(clippy::too_many_arguments)]
+/// A work row's line, ported from KSG Code's `WorkLogRow`/`WorkLogLine` (`chat/WorkLog.tsx`):
+/// a `rounded-md pe-1.5` row (`py-0.5` standalone, `py-0` inside a group list), a 24 pt
+/// icon slot holding a 14 pt glyph in `text-dim-foreground`, one truncating `text-body`
+/// label in `text-secondary-label`, then the edit counts, a 12 pt X on failure
+/// (`text-tool-error-icon/40`), and a 12 pt chevron at 70% opacity when the row expands.
+/// `interactive` is KSG's `canExpandProjectedItem`: only it makes the row a button.
+/// `severe` is KSG's destructive row style for a failed test run: medium destructive text.
 fn activity_line(
     key: String,
     a11y: String,
-    action: (String, &str),
+    title: String,
+    counts: Option<(usize, usize)>,
     failed: bool,
+    severe: bool,
     open: bool,
-    show_caret: bool,
+    interactive: bool,
+    listed: bool,
     glyph: &str,
     p: Palette,
 ) -> El {
-    let (verb, detail) = action;
+    // KSG keeps a failed call's label and glyph quiet: the glyph drops to a 40% error
+    // tint and a same-tint X sits in the trailing slot.
+    let icon_ink = if failed { p.danger.alpha(0.4) } else { p.faint };
     let mut line = row()
         .key(key)
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
+        .role(if interactive { "button" } else { "group" })
         .label(a11y)
-        .expanded(open)
-        .focusable(true)
+        .min_w(0.0)
         .center_y()
         .gap(5.0)
         .min_h(24.0)
-        .px(6.0)
-        .ml(-6.0)
-        .radius(6.0)
-        .hover(p.selected)
+        .pr(6.0)
+        .radius(6.0);
+    if interactive {
+        line = line
+            .cursor(rune::Cursor::Pointer)
+            .expanded(open)
+            .focusable(true)
+            .hover(p.selected);
+    }
+    if !listed {
+        line = line.py(2.0);
+    }
+    line = line
         .child(
             el().size(24.0, 24.0)
                 .center()
-                .child(icon(glyph, if failed { p.danger } else { p.muted }).size(14.0, 14.0)),
+                .child(icon(glyph, icon_ink).size(14.0, 14.0)),
         )
-        .child(if failed {
-            label(verb, TextStyle::new(13.0, 500.0).tracking(-0.08), p.danger)
-        } else {
-            label(verb, ACTIVITY, p.muted)
-        });
-    if !detail.is_empty() {
+        .child(
+            label(
+                title,
+                if severe {
+                    TextStyle::new(13.0, 500.0).tracking(-0.08)
+                } else {
+                    ACTIVITY
+                },
+                if severe { p.danger } else { p.muted },
+            )
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+        );
+    if let Some((additions, deletions)) = counts {
         line = line.child(
-            label(detail, ACTIVITY, p.muted)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
+            label(format!("+{additions} −{deletions}"), BAR_TIMER, p.faint).selectable(true),
         );
     }
+    line = line.child(spacer());
     if failed {
-        line = line.child(meta_text("failed", p.danger));
+        line = line.child(icon("x", icon_ink).size(12.0, 12.0));
     }
-    if show_caret {
-        line = line.child(icon(if open { "chevron" } else { "open" }, p.faint).size(12.0, 12.0));
+    if interactive {
+        line = line.child(el().size(16.0, 16.0).center().child(
+            icon(if open { "chevron" } else { "open" }, p.faint.alpha(0.7)).size(12.0, 12.0),
+        ));
     }
-    line.child(spacer())
+    line
 }
 
 /// KSG Code's `WORKING_BAR_CLASS_NAME` (`chat/TimelineRowParts.tsx`): a 32 pt bar over a 1 px
@@ -9186,7 +9276,10 @@ fn working_bar(t: &Thread, start: usize, foldable: bool, p: Palette) -> El {
     )
 }
 
-fn inline_tool(s: &State, p: Palette, index: usize) -> El {
+/// A tool call's collapsed row, ported from KSG Code's `WorkEntryLogRow`: one display
+/// label, `+a −d` counts after an edit, " for Ns" after a running command, and a
+/// disclosure only while the body has something to show.
+fn inline_tool(s: &State, p: Palette, index: usize, listed: bool) -> El {
     let t = s.current();
     let tool = &t.tools[index];
     if tool.resolved_kind() == crate::work::ToolKind::Html
@@ -9197,7 +9290,32 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
     if tool.resolved_kind() == crate::work::ToolKind::Plan {
         return work_ui::plan_card(s, p, index);
     }
-    let title = tool_title(tool);
+    let root = s.working_directory();
+    let mut title = entry_label(tool, &root);
+    let counts = (tool.resolved_kind() == crate::work::ToolKind::FileChange)
+        .then(|| {
+            (
+                tool.changes.iter().map(|c| c.additions).sum::<usize>(),
+                tool.changes.iter().map(|c| c.deletions).sum::<usize>(),
+            )
+        })
+        .filter(|counts| counts.0 > 0 || counts.1 > 0);
+    // KSG's RunningFor: " for 1m 5s" after a running command's label.
+    if tool.resolved_kind() == crate::work::ToolKind::Command && !tool.done && !tool.failed {
+        if let Some(seconds) = tool.started.map(|started| started.elapsed().as_secs()) {
+            title.push_str(&format!(" for {}", elapsed_label(seconds)));
+        }
+    }
+    let expandable = work_ui::has_body(tool);
+    // KSG's severeFailure: a failed test command's label reads medium destructive.
+    let severe = tool.failed
+        && tool.resolved_kind() == crate::work::ToolKind::Command
+        && crate::work::command_runs_tests(&work_ui::input_text(tool, &["command", "cmd"]));
+    let a11y = if tool.failed {
+        format!("{title}, tool call failed")
+    } else {
+        title.clone()
+    };
     let tool_id = tool.id.clone();
     let line_key = format!("inline-tool-{}-{index}", t.id);
     let press_key = line_key.clone();
@@ -9214,14 +9332,14 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
         .child(
             activity_line(
                 line_key,
-                format!(
-                    "{} output for {title}",
-                    if tool.expanded { "Hide" } else { "Show" }
-                ),
-                (tool_verb(tool), &tool.detail),
+                a11y,
+                title,
+                counts,
                 tool.failed,
+                severe,
                 tool.expanded,
-                false,
+                expandable,
+                listed,
                 work_ui::kind_icon(tool.resolved_kind()),
                 p,
             )
@@ -9301,10 +9419,10 @@ fn toggle_group(t: &mut Thread, tool_id: Option<&str>, thought: Option<(usize, u
 }
 
 /// One step of an unfolded work streak.
-fn work_entry_row(s: &State, p: Palette, entry: WorkEntry) -> El {
+fn work_entry_row(s: &State, p: Palette, entry: WorkEntry, listed: bool) -> El {
     match entry {
-        WorkEntry::Tool(index) => inline_tool(s, p, index),
-        WorkEntry::Thought(index) => work_ui::thoughts(s, p, &[index]),
+        WorkEntry::Tool(index) => inline_tool(s, p, index, listed),
+        WorkEntry::Thought(index) => work_ui::thoughts(s, p, &[index], listed),
     }
 }
 
@@ -9315,16 +9433,16 @@ fn work_part(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
     let t = s.current();
     let thoughts = entry_thoughts(entries);
     if thoughts.len() == entries.len() {
-        return work_ui::thoughts(s, p, &thoughts);
+        return work_ui::thoughts(s, p, &thoughts, false);
     }
     if entries.len() == 1 {
-        return work_entry_row(s, p, entries[0]);
+        return work_entry_row(s, p, entries[0], false);
     }
     let mut group = work_group_head(s, p, entries);
     if group_open(t, entries) {
         let mut rows = col().pl(WORK_LIST_INDENT).gap(WORK_GAP);
         for entry in entries {
-            rows = rows.child(work_entry_row(s, p, *entry));
+            rows = rows.child(work_entry_row(s, p, *entry, true));
         }
         group = group.child(rows);
     }
@@ -9347,7 +9465,8 @@ fn work_group_head(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
     let first = indices[0];
     let first_id = tools[0].id.clone();
     let expanded = group_open(t, entries);
-    let failed = tools.last().is_some_and(|tool| tool.failed);
+    // KSG's hasFailure: any call in the group, not just the last.
+    let failed = tools.iter().any(|tool| tool.failed);
     let summary = tool_summary(&tools);
     let kind = tools[0].resolved_kind();
     let glyph = if tools.iter().all(|tool| tool.resolved_kind() == kind) {
@@ -9364,10 +9483,13 @@ fn work_group_head(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
             activity_line(
                 toggle_key,
                 format!("{} {summary}", if expanded { "Collapse" } else { "Expand" }),
-                (summary.clone(), ""),
+                summary.clone(),
+                None,
                 failed,
+                false,
                 expanded,
                 true,
+                false,
                 glyph,
                 p,
             )
@@ -9399,7 +9521,7 @@ fn transcript_part(
     let t = s.current();
     match part {
         TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
-        TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
+        TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices, false),
         TranscriptPart::Work(entries) => work_part(s, p, entries),
         TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
         TranscriptPart::Retry(index) => work_ui::retry_row(s, p, *index),
@@ -9718,8 +9840,16 @@ fn live_row_width(s: &State) -> f32 {
     (s.html_lane_width as f32).max(0.0)
 }
 
-/// KSG Code's `LiveActivityContent`: a 24 pt icon slot and one truncating label.
-fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) -> El {
+/// KSG Code's `LiveActivityContent`: a 24 pt icon slot and one truncating label. The glyph
+/// sits in `text-dim-foreground`, the label in `text-secondary-label`; the shimmer's
+/// highlight copy brightens both to the foreground.
+fn activity_content(
+    glyph: &str,
+    text: &str,
+    ink: Color,
+    icon_ink: Color,
+    key: Option<String>,
+) -> El {
     let mut words = label(text, ACTIVITY, ink).truncate().shrink().min_w(0.0);
     if let Some(key) = key {
         words = words.key(key);
@@ -9734,7 +9864,7 @@ fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) ->
         .child(
             el().size(24.0, 24.0)
                 .center()
-                .child(icon(glyph, ink).size(14.0, 14.0)),
+                .child(icon(glyph, icon_ink).size(14.0, 14.0)),
         )
         .child(words)
 }
@@ -9749,13 +9879,13 @@ fn live_activity(
     animated: bool,
     key: Option<String>,
 ) -> El {
-    let base = activity_content(glyph, text, p.muted, key);
+    let base = activity_content(glyph, text, p.muted, p.faint, key);
     if !animated {
         return base;
     }
     shimmer(
         base,
-        activity_content(glyph, text, p.ink, None),
+        activity_content(glyph, text, p.ink, p.ink, None),
         live_row_width(s),
     )
 }
@@ -9778,7 +9908,8 @@ fn live_status_row(s: &State, t: &Thread, start: usize, p: Palette) -> El {
         ))
 }
 
-/// KSG Code's `LiveWorkToggle`: a live row that is its work group's disclosure.
+/// KSG Code's `LiveWorkToggle`: a live row that is its work group's disclosure. Same
+/// chrome as the settled rows (`rounded-md pe-1.5`).
 fn live_toggle(key: String, a11y: String, p: Palette) -> El {
     col()
         .key(key)
@@ -9788,8 +9919,7 @@ fn live_toggle(key: String, a11y: String, p: Palette) -> El {
         .focusable(true)
         .w_full()
         .min_w(0.0)
-        .px(6.0)
-        .ml(-6.0)
+        .pr(6.0)
         .radius(6.0)
         .hover(p.selected)
 }
@@ -9852,14 +9982,9 @@ fn live_work(s: &State, p: Palette, parts: &[TranscriptPart], tail: LiveTail, st
         ),
         WorkEntry::Tool(index) => {
             let tool = &t.tools[index];
-            let verb = tool_verb_in(tool, tool.failed || !tail.active && tool.done);
             (
                 work_ui::kind_icon(tool.resolved_kind()),
-                if tool.detail.is_empty() {
-                    verb
-                } else {
-                    format!("{verb} {}", tool.detail)
-                },
+                live_label(tool, &s.working_directory()),
             )
         }
     };
@@ -10356,10 +10481,10 @@ fn work_item(
         (TranscriptPart::Work(entries), WorkItem::GroupEntry(_, k)) => col()
             .min_w(0.0)
             .pl(WORK_LIST_INDENT)
-            .child(work_entry_row(s, p, entries[k])),
+            .child(work_entry_row(s, p, entries[k], true)),
         (TranscriptPart::Work(entries), WorkItem::ThoughtHead(_)) => col()
             .min_w(0.0)
-            .child(work_ui::thought_head(s, p, &entry_thoughts(entries))),
+            .child(work_ui::thought_head(s, p, &entry_thoughts(entries), true)),
         (TranscriptPart::Work(entries), WorkItem::ThoughtBody(_, k)) => col()
             .min_w(0.0)
             .child(work_ui::thought_body(s, p, entry_thoughts(entries)[k])),
@@ -21660,7 +21785,7 @@ pub(crate) mod tests {
             let step = rt.presented("live-work-text-1").unwrap().0;
             assert!(thought[1] < step[1]);
             assert!(texts(&rt).iter().any(|text| text == "Checking the tests"));
-            assert!(texts(&rt).iter().any(|text| text == "Reading d.rs"));
+            assert!(texts(&rt).iter().any(|text| text == "Read d.rs"));
             for key in ["inline-tool-1-2", "inline-tool-1-3", "live-status-1"] {
                 assert!(rt.presented(key).is_none(), "{width}: {key}");
             }
@@ -21685,7 +21810,7 @@ pub(crate) mod tests {
             rt.state.current_mut().tools[3].done = true;
             rt.invalidate();
             rt.frame(1.0);
-            assert!(texts(&rt).iter().any(|text| text == "Reading d.rs"));
+            assert!(texts(&rt).iter().any(|text| text == "Read d.rs"));
             assert!(rt.presented("live-status-1").is_none());
 
             // It failed instead: the Thinking row stands in, at the bottom, and unfolds the tail.
