@@ -286,6 +286,201 @@ pub(super) fn is_delegation(tool: &Tool) -> bool {
     tool.name == "delegate_task" || tool.name.ends_with("__delegate_task")
 }
 
+/// The task a `delegate_task` call started. Its result names the child thread; while that is
+/// unreadable, the n-th delegation in the transcript is the parent's n-th task.
+fn delegated_task(s: &State, t: &Thread, index: usize) -> Option<TaskView> {
+    let tasks = s.tasks_for(t.id);
+    let tool = &t.tools[index];
+    let named = serde_json::from_str::<serde_json::Value>(&tool.output)
+        .ok()
+        .and_then(|value| value["thread_id"].as_u64())
+        .or_else(|| tool.structured["thread_id"].as_u64());
+    if let Some(id) = named {
+        return tasks.into_iter().find(|task| task.child_id == id as usize);
+    }
+    let ordinal = t.tools[..index]
+        .iter()
+        .filter(|tool| is_delegation(tool) && !tool.failed)
+        .count();
+    tasks.into_iter().nth(ordinal)
+}
+
+/// A tool batch in the transcript. In a captain's home each delegation becomes a subagent
+/// row; every other call keeps the shared tool rows. KSG hides the delegation call and
+/// shows the subagent's own row in its place (`withoutSubagentDelegationRows`).
+pub(super) fn tool_part(s: &State, p: Palette, indices: &[usize]) -> El {
+    let t = s.current();
+    if !s.is_captain_home(t) {
+        return inline_tools(s, p, indices);
+    }
+    let mut cards = vec![];
+    let mut rest = vec![];
+    for &index in indices {
+        match is_delegation(&t.tools[index])
+            .then(|| delegated_task(s, t, index))
+            .flatten()
+        {
+            Some(task) => cards.push(task),
+            None => rest.push(index),
+        }
+    }
+    if cards.is_empty() {
+        return inline_tools(s, p, indices);
+    }
+    // KSG's `V2SubagentGroup`: one row each on the tool rows' rhythm, in start order.
+    let mut part = col().gap(2.0);
+    if !rest.is_empty() {
+        part = part.child(inline_tools(s, p, &rest));
+    }
+    for task in &cards {
+        part = part.child(task_card(s, p, task));
+    }
+    part
+}
+
+/// `text-label`: a subagent row's title.
+const SUBAGENT_TITLE: TextStyle = TextStyle::new(14.0, 500.0).lh(20.0);
+/// `text-body`: what the subagent is doing, or what it returned.
+const SUBAGENT_DETAIL: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0);
+/// `text-caption`: the model, the state and the time.
+const SUBAGENT_CAPTION: TextStyle = TextStyle::new(11.0, 500.0).lh(16.0);
+
+/// What a subagent's line starts with, besides its title.
+struct SubagentLine<'a> {
+    key: String,
+    /// The accessible name.
+    name: String,
+    child: usize,
+    model_label: &'a str,
+    remote: Option<El>,
+    detail: &'a str,
+    failed: bool,
+}
+
+/// The start of a subagent's line, ported from KSG Code's `SubagentTimelineLink`
+/// (`chat/V2LifecycleRow.tsx`): the tool rows' metrics (24 px tall, flush left, 8 px gaps,
+/// 6 px end inset), the bare provider logo in the 24 px icon column, the title, then what
+/// the subagent is doing or returned, then its model. Callers append the time and the
+/// state. The whole line opens the worker.
+fn subagent_line(s: &State, p: Palette, title: El, line: SubagentLine) -> El {
+    let child = line.child;
+    let mut row_ = row()
+        .key(line.key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(line.name)
+        .focusable(true)
+        .min_h(24.0)
+        .w_full()
+        .min_w(0.0)
+        .pr(6.0)
+        .gap(8.0)
+        .center_y()
+        .radius(6.0)
+        .hover(hover_wash(s, p))
+        .press(active_wash(s, p))
+        .hover_motion(motion(), motion())
+        .on_press(move |s: &mut State| open_thread(s, child))
+        .child(el().size(24.0, 24.0).mr(-3.0).center().child(provider_icon(
+            s,
+            p,
+            model_vendor(line.model_label, line.model_label),
+            16.0,
+        )))
+        .child(title);
+    if let Some(remote) = line.remote {
+        row_ = row_.child(remote);
+    }
+    row_ = row_.child(
+        label(
+            line.detail,
+            SUBAGENT_DETAIL,
+            if line.failed { p.danger } else { p.muted },
+        )
+        .truncate()
+        .grow(1.0)
+        .min_w(0.0),
+    );
+    let (model, _) = split_model_label(line.model_label);
+    if !model.is_empty() {
+        row_ = row_.child(label(model, SUBAGENT_CAPTION, p.muted));
+    }
+    row_
+}
+
+/// A delegated task in the captain's transcript, as KSG Code's `SubagentTimelineLink` draws a
+/// subagent: logo, title, what it is doing, model, time, state. The remote machine tag ports
+/// KSG's "on {environment}" label.
+pub(super) fn task_card(s: &State, p: Palette, task: &TaskView) -> El {
+    let (status, word) = task_status(s, task);
+    let child = task.child_id;
+    let placement = worker_placement(s, child);
+    // A failed placement's reason is the line's detail.
+    let setup_error = placement
+        .as_ref()
+        .filter(|p_| p_.phase == PlacementPhase::Failed)
+        .and_then(|p_| p_.error.clone())
+        .map(|e| truncate(&e, 200));
+    let detail = setup_error.unwrap_or_else(|| {
+        // The view falls back to the bare state id when the task has said nothing yet.
+        if task.last_activity_line == task.state.id() {
+            String::new()
+        } else {
+            task.last_activity_line.clone()
+        }
+    });
+    let mut line = subagent_line(
+        s,
+        p,
+        label(&task.title, SUBAGENT_TITLE, p.ink)
+            .key(format!("task-title-{child}"))
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+        SubagentLine {
+            key: format!("task-card-{child}"),
+            name: format!("{}. {word}. Open the worker", task.title),
+            child,
+            model_label: &task.model_label,
+            remote: task.remote.as_ref().map(|remote| {
+                machine_tag(
+                    s,
+                    p,
+                    &remote.server_id,
+                    format!("task-machine-{child}"),
+                    SUBAGENT_CAPTION,
+                    true,
+                )
+            }),
+            detail: &detail,
+            failed: status == Status::Failed,
+        },
+    );
+    if let Some(placement) = &placement {
+        line = line.help(placement_details(
+            placement,
+            &placement_machine(s, child, placement),
+        ));
+    }
+    // A state the trailing mark cannot say on its own gets its word. A queued task's
+    // clock already says so.
+    if !matches!(status, Status::Running | Status::Completed) && task.queue_position.is_none() {
+        line = line.child(
+            label(word, SUBAGENT_CAPTION, super::status_ink(status, p))
+                .key(format!("task-meta-{child}")),
+        );
+    }
+    line.child(
+        label(
+            task_clock(task),
+            SUBAGENT_CAPTION.features(TABULAR),
+            p.faint,
+        )
+        .key(format!("task-clock-{child}")),
+    )
+    .child(mark_slot(status, p))
+}
+
 /// A task result Shina delivered to its captain, read from `Task::completion_message`.
 pub(super) struct Completion<'a> {
     pub child: usize,
@@ -316,87 +511,70 @@ pub(super) fn parse_completion(text: &str) -> Option<Completion<'_>> {
     })
 }
 
-/// A worker's result in the captain's home: a quiet block on a rail under the task's context,
-/// not a "Shina" bubble. The header opens the worker; the reply reads in the secondary ink.
-pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Completion) -> El {
-    let (secondary, tertiary) = quiet_inks(p);
+/// A worker's result in the captain's home, as KSG Code draws a subagent's notification
+/// (`SubagentNotificationLink`, the event form of `SubagentTimelineLink`): the same line as
+/// its task row, ending in the outcome and the time it finished. The line opens the worker,
+/// where the full reply is.
+pub(super) fn result_block(s: &State, p: Palette, completion: &Completion) -> El {
     let child = completion.child;
-    let status = match completion.status {
-        "completed" => Status::Completed,
-        "failed" => Status::Failed,
-        "interrupted" => Status::Waiting,
-        _ => Status::Ready,
-    };
+    let failed = completion.status == "failed";
     let word = match completion.status {
         "completed" => "Finished",
         "failed" => "Failed",
         "cancelled" => "Dismissed",
+        "interrupted" => "Stopped",
         other => other,
     };
-    let header = row()
-        .key(format!("result-open-{child}"))
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("Result from {}. Open the worker", completion.title))
-        .focusable(true)
-        .center_y()
-        .gap(6.0)
-        .h(26.0)
-        .px(6.0)
-        .ml(-6.0)
-        .radius(6.0)
-        .hover(hover_wash(s, p))
-        .press(active_wash(s, p))
-        .hover_motion(motion(), motion())
-        .on_press(move |s: &mut State| open_thread(s, child))
-        .child(mark_slot(status, p))
-        .child(super::meta_text(word, super::status_ink(status, p)))
-        .child(
-            label(completion.title, ACTIVITY, tertiary)
-                .truncate()
-                .shrink()
-                .min_w(0.0),
-        )
-        .child(icon("open", tertiary).opacity(0.8));
+    let task = s
+        .tasks_for(s.current().id)
+        .into_iter()
+        .find(|task| task.child_id == child);
+    let error = completion.error.trim();
     let reply = completion.reply.trim();
-    let mut body = col().gap(6.0).pl(CARD_INDENT - 6.0).ml(6.0);
-    if !reply.is_empty() && reply != "(no reply)" {
-        let style = MarkdownStyle::neutral(s.dark)
-            .text(secondary)
-            .muted(p.muted)
-            .body_font(body_style(wide))
-            .inline_code_bg(p.ink.alpha(if s.dark { 0.07 } else { 0.055 }))
-            .selection(p.coral_bg)
-            .code_block(p.card, p.line);
-        let reply = truncate(reply, 1200);
-        body = body.child(
-            memo(
-                format!("result-reply-{child}"),
-                (reply.clone(), s.dark, wide),
-                || Markdown::new(&reply).render(&style),
-            )
-            .key(format!("result-reply-{child}")),
-        );
-    }
-    if completion.error != "none" && !completion.error.trim().is_empty() {
-        body = body.child(
-            label(truncate(completion.error, 400), SMALL, p.danger)
-                .wrap()
-                .selectable(true),
-        );
-    }
-    col().gap(4.0).child(header).child(
-        row()
-            .child(
-                el().w(1.0)
-                    .h_full()
-                    .ml(6.5)
-                    .fill(p.line)
-                    .hairline()
-                    .a11y_hidden(),
-            )
-            .child(body.grow(1.0).min_w(0.0)),
+    // KSG's settled detail: the result, else the error.
+    let detail = if failed && error != "none" && !error.is_empty() {
+        error
+    } else if reply == "(no reply)" {
+        ""
+    } else {
+        reply
+    };
+    let detail = truncate(detail.lines().next().unwrap_or_default(), 200);
+    let mut line = subagent_line(
+        s,
+        p,
+        label(completion.title, SUBAGENT_TITLE, p.ink)
+            .truncate()
+            .shrink()
+            .min_w(0.0),
+        SubagentLine {
+            key: format!("result-open-{child}"),
+            name: format!("Result from {}. {word}. Open the worker", completion.title),
+            child,
+            model_label: task.as_ref().map_or("", |task| task.model_label.as_str()),
+            remote: None,
+            detail: &detail,
+            failed,
+        },
     )
+    .child(label(
+        word,
+        SUBAGENT_CAPTION,
+        if failed { p.danger } else { p.muted },
+    ));
+    if let Some(at) = task.and_then(|task| task.finished_at)
+        && let Some(time) = chrono::DateTime::from_timestamp_millis(at as i64)
+    {
+        line = line.child(label(
+            time.with_timezone(&chrono::Local)
+                .format("%-I:%M %p")
+                .to_string(),
+            SUBAGENT_CAPTION.features(TABULAR),
+            p.faint,
+        ));
+    }
+    // The transcript keys the element it gets back, so the line keeps its own key inside.
+    col().child(line)
 }
 
 /// KSG has no crew report record. Adapt its result row geometry, reading the saved

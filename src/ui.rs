@@ -1096,7 +1096,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             && s.current().history_error.is_none()
         {
             // Sizes from the last layout: the hero keeps its height only while the composer
-            // and its agent pills still fit under it.
+            // still fits under it.
             let pane = cx.layout_with("empty-thread", |r| r[3]);
             let lane = cx.layout_with("composer-lane", |r| r[3]);
             let hero_fits = match (pane, lane) {
@@ -8847,8 +8847,9 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
     turn_parts_in(t, &timeline_structure(t).events, start, end)
 }
 
-/// A tool that shows as its own card rather than a step: a plan, rendered HTML, or a
-/// subagent run with its result cards (KSG keeps subagent events out of work groups too).
+/// A tool that shows as its own card rather than a step: a plan, rendered HTML, a captain's
+/// delegation, or a subagent run with its result cards (KSG keeps subagent events out of
+/// work groups too).
 fn is_card_tool(t: &Thread, index: usize) -> bool {
     let tool = &t.tools[index];
     if !tool.subagents.is_empty() {
@@ -8859,7 +8860,7 @@ fn is_card_tool(t: &Thread, index: usize) -> bool {
         crate::work::ToolKind::Html => {
             crate::html_render::find_reference(&tool.structured).is_some()
         }
-        _ => false,
+        _ => t.captain_home && !t.delegated && crew_ui::is_delegation(tool),
     }
 }
 
@@ -9376,7 +9377,7 @@ fn transcript_part(
 ) -> El {
     let t = s.current();
     match part {
-        TranscriptPart::Tools(indices) => inline_tools(s, p, indices),
+        TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
         TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
         TranscriptPart::Work(entries) => work_part(s, p, entries),
         TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
@@ -9980,10 +9981,15 @@ fn is_html_card(t: &Thread, part: &TranscriptPart) -> bool {
             && crate::html_render::find_reference(&t.tools[i].structured).is_some()))
 }
 
-/// A card that stays in view when the rest of the turn folds into "Worked for". It reads
-/// the thread only, so the timeline structure can split turns without the window state.
+/// A captain's delegations are its answer, not its working: their subagent rows stay in view
+/// when the rest of the turn folds into "Worked for". It reads the thread only, so the
+/// timeline structure can split turns without the window state.
 fn is_lifted_card(t: &Thread, part: &TranscriptPart) -> bool {
-    is_html_card(t, part)
+    (t.captain_home
+        && !t.delegated
+        && matches!(part, TranscriptPart::Tools(indices)
+            if indices.iter().all(|&index| crew_ui::is_delegation(&t.tools[index]))))
+        || is_html_card(t, part)
 }
 
 /// The last work part and the preamble above the fold.
@@ -11791,7 +11797,7 @@ fn build_user_or_system_row(
         .then(|| crew_ui::parse_completion(message.display_text()))
         .flatten()
     {
-        crew_ui::result_block(s, p, wide, &completion)
+        crew_ui::result_block(s, p, &completion)
     } else if let Some(brief) = (message.role == "Shina" && t.delegated)
         .then(|| crew_ui::parse_brief(message.display_text()))
         .flatten()
@@ -12118,8 +12124,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let gutter = lane_gutter(pane_width);
     // The lane the composer resolves too; `None` until C5 mounts the Details card.
     let lane_rect = chat_lane(pane_width, wide, details_ui::edges(s, pane_width));
-    // A captain's delegations sit inside a turn, so with no messages they have nothing to
-    // hang from. The home counts as empty and greets above its agent pills.
+    // A captain's delegations show as subagent rows inside a turn, so with no messages they
+    // have nothing to hang from. The home counts as empty and greets.
     let visible_tools = t.messages.is_empty()
         && t.tools
             .iter()
@@ -12817,7 +12823,7 @@ fn empty_thread(
     hero_fits: bool,
     caret_edges: Option<[bool; 2]>,
 ) -> El {
-    // A captain's hero keeps its height above the agent pills and takes the room from the
+    // A captain's hero keeps its height and takes the room from the
     // space below the composer. In a window too short for both, the composer stays on screen
     // and the clip keeps the hero out of the header.
     let floor = if s.current().captain.is_some() && hero_fits {
@@ -15181,10 +15187,6 @@ fn above_composer_budget(s: &State, _cap: f32, _lane: f32) -> AboveComposerBudge
         parts += 1;
         others_floor += 36.0;
     }
-    if details_ui::agent_pills_show(s) {
-        parts += 1;
-        others_floor += 28.0;
-    }
     let queued = t.native.queue.len() + t.native.steering.len() + t.native.follow_ups.len();
     if queued > 0 {
         parts += 1;
@@ -15289,7 +15291,7 @@ fn composer(
         );
     }
     let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
-    // Delegation notices, queued messages, and the 28 pt agent pills stay visible above
+    // Delegation notices and queued messages stay visible above
     // `ComposerSurface.Shell`, even when a structured questionnaire replaces the draft card.
     let viewport_cap = (s.viewport_height * 0.4).max(120.0);
     let budget = above_composer_budget(s, viewport_cap, lane);
@@ -15303,7 +15305,6 @@ fn composer(
     for part in [
         crew_ui::parent_bar(s, p, lane),
         crew_ui::crew_bar(s, p, lane),
-        details_ui::agent_pills(s, p, lane),
     ]
     .into_iter()
     .flatten()
@@ -22018,21 +22019,21 @@ pub(crate) mod tests {
                 &mut rt,
                 width,
                 &[
+                    "task-card-16",
+                    "task-clock-16",
                     "result-open-1",
                     "needs-you",
                     "needs-you-2",
                     "approve-2",
                     "decline-2",
-                    "agent-pills",
-                    "agent-pill-crew-16",
                     "composer",
                 ],
             );
-            // The crew at work is a row of pills, not task rows in the transcript. Every
-            // crew member has a row in the Crew tab.
-            assert!(rt.presented("task-card-16").is_none());
-            let pills = rt.presented("agent-pills").unwrap().0;
-            assert!((pills[3] - 28.0).abs() < 0.5, "{width}: {pills:?}");
+            // Delegations are subagent rows on the tool rows' rhythm, not generic tool rows.
+            // Every crew member has a row in the Crew tab.
+            assert!(rt.presented("inline-tool-7-0").is_none());
+            let card = rt.presented("task-card-16").unwrap().0;
+            assert!((card[3] - 24.0).abs() < 0.5, "{width}: {card:?}");
             rt.state.right_panels.open(
                 &rt.state.panel_key(),
                 crate::right_panel::SingletonKind::Work,
@@ -22053,14 +22054,12 @@ pub(crate) mod tests {
                     "crew-roster-recruit",
                 ],
             );
-            // A pill opens its worker.
-            press(&mut rt, "agent-pill-crew-16");
+            press(&mut rt, "crew-chip-16");
             rt.frame(1.0);
             assert_eq!(rt.state.current().id, 16, "{width}");
             // A healthy worker has nothing between the conversation and the composer.
             assert!(rt.presented("parent-bar").is_none(), "{width}");
             assert_inside(&mut rt, width, &["composer"]);
-            assert!(rt.presented("agent-pills").is_none());
             // The worker's details card links back to its captain. Beside an open Inspector
             // the card cannot dock, so the top bar opens it as a popover.
             assert!(rt.presented("details-card").is_none(), "{width}");
@@ -22147,8 +22146,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn composer_request_banner_pages_thread_and_crew_requests_and_pills_open_subagents() {
-        // 1. Unified request surface inside ComposerSurface.Shell: a Captain home with both
+    fn composer_request_banner_pages_thread_and_crew_requests() {
+        // Unified request surface inside ComposerSurface.Shell: a Captain home with both
         // its own pending confirm dialog and a crew approval pages both in one banner.
         let mut rt = crew_runtime(1280.0);
         rt.state.current_mut().apply(json!({
@@ -22179,44 +22178,6 @@ pub(crate) mod tests {
         assert_eq!(
             element_text(&rt, "needs-you-page-count").as_deref(),
             Some("2/2")
-        );
-
-        // 2. A questionnaire on a Captain home keeps the agent pills visible above the shell.
-        let mut rt = crew_runtime(1280.0);
-        rt.state.current_mut().apply(json!({
-            "type": "extension_ui_request",
-            "id": "home-form",
-            "method": "input",
-            "questions": [
-                {"id": "q1", "header": "Scope", "question": "Pick one", "options": [{"label": "Local"}]}
-            ]
-        }));
-        rt.invalidate();
-        rt.frame(0.0);
-        assert!(rt.presented("questionnaire-drawer").is_some());
-        assert!(rt.presented("agent-pills").is_some());
-
-        // 3. A plain thread with a running provider subagent shows its pill, which opens the
-        // subagent in the Work tab.
-        let mut plain = runtime(1280.0);
-        plain.state.current_mut().apply(json!({
-            "type": "tool_execution_start",
-            "toolCallId": "sub-1",
-            "toolName": "subagent",
-            "args": {"tasks": [{"agent": "Reviewer", "task": "Audit C4 layout"}]}
-        }));
-        plain.invalidate();
-        plain.frame(0.0);
-        assert_inside(
-            &mut plain,
-            1280.0,
-            &["agent-pills", "agent-pill-agent-sub-1-0"],
-        );
-        press(&mut plain, "agent-pill-agent-sub-1-0");
-        plain.frame(0.5);
-        assert_eq!(
-            plain.state.right_panel_active_view(),
-            Some(crate::right_panel::PanelView::Work)
         );
     }
 
