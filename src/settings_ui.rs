@@ -837,7 +837,7 @@ fn setting(key: &str, title: &str, description: &str, control: El, p: Palette) -
                 )
                 .child(control),
         )
-        .child(el().h(1.0).w_full().fill(p.line))
+        .child(el().h(1.0).w_full().fill(p.line).hairline())
 }
 fn info(key: &str, title: &str, description: &str, value: &str, p: Palette) -> El {
     setting(key, title, description, meta_text(value, p.muted), p)
@@ -1160,13 +1160,13 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                 ))
                 .child(search),
         )
-        .child(el().h(1.0).w_full().fill(p.line))
+        .child(el().h(1.0).w_full().fill(p.line).hairline())
         .child(
             row()
                 .grow(1.0)
                 .min_h(0.0)
                 .child(nav)
-                .child(el().w(1.0).h_full().fill(p.line))
+                .child(el().w(1.0).h_full().fill(p.line).hairline())
                 .child(content),
         );
     let mut backdrop = el()
@@ -3272,7 +3272,7 @@ fn keybindings_section(s: &State, p: Palette) -> (El, bool) {
                             .child(info_col)
                             .child(controls),
                     )
-                    .child(el().h(1.0).w_full().fill(p.line)),
+                    .child(el().h(1.0).w_full().fill(p.line).hairline()),
             );
         }
     }
@@ -3379,7 +3379,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
                         .child(meta_label("PROVIDERS", p.muted)),
                 ),
         )
-        .child(el().h(1.0).w_full().fill(p.line));
+        .child(el().h(1.0).w_full().fill(p.line).hairline());
     for (position, index) in updating.iter().enumerate() {
         let machine = &s.fleet.rows[*index];
         let mut providers = row()
@@ -3455,7 +3455,7 @@ pub(super) fn fleet_dialog(s: &State, p: Palette) -> El {
             .child(providers);
         table = table.child(row_el);
         if position + 1 < updating.len() {
-            table = table.child(el().h(1.0).w_full().fill(p.line));
+            table = table.child(el().h(1.0).w_full().fill(p.line).hairline());
         }
     }
     let mut body = col().gap(12.0).w_full();

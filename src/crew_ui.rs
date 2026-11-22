@@ -4,7 +4,8 @@
 //!
 //! One design language for all of them: hover is ink at 6 %, pressed or active at 8 %, hairline
 //! borders in `line`, rows at a 4 px radius, cards at 6 px, and motion of 0.18 s on
-//! `cubic-bezier(.23, 1, .32, 1)`. The visual skin follows docs/ui/pixel-voyage.md.
+//! `cubic-bezier(.23, 1, .32, 1)`. The skin follows KSG Code's neutral theme, the app's shared
+//! `Palette` and tokens in `ui.rs`.
 use super::*;
 use crate::model::placement::{PlacementMode, PlacementPhase, ThreadPlacement};
 use crate::model::{AttentionItem, AttentionKind, PeerOrigin, TaskState, TaskView};
@@ -27,10 +28,6 @@ pub(super) fn hover_wash(s: &State, p: Palette) -> Color {
 pub(super) fn active_wash(s: &State, p: Palette) -> Color {
     p.ink.alpha(if s.dark { 0.05 } else { 0.08 })
 }
-pub(super) fn hairline(p: Palette) -> Color {
-    p.line
-}
-
 /// A quiet, outlined action: Decline, Dismiss, Open.
 pub(super) fn ghost_button(
     s: &State,
@@ -568,7 +565,14 @@ pub(super) fn result_block(s: &State, p: Palette, wide: bool, completion: &Compl
     }
     col().gap(4.0).child(header).child(
         row()
-            .child(el().w(1.0).h_full().ml(6.5).fill(hairline(p)).a11y_hidden())
+            .child(
+                el().w(1.0)
+                    .h_full()
+                    .ml(6.5)
+                    .fill(p.line)
+                    .hairline()
+                    .a11y_hidden(),
+            )
             .child(body.grow(1.0).min_w(0.0)),
     )
 }
@@ -778,7 +782,14 @@ pub(super) fn brief_block(
     }
     col().gap(4.0).child(header).child(
         row()
-            .child(el().w(1.0).h_full().ml(7.5).fill(hairline(p)).a11y_hidden())
+            .child(
+                el().w(1.0)
+                    .h_full()
+                    .ml(7.5)
+                    .fill(p.line)
+                    .hairline()
+                    .a11y_hidden(),
+            )
             .child(
                 label(body.trim(), body_style(wide), p.ink)
                     .wrap_anywhere()
@@ -1466,7 +1477,7 @@ fn needs_you_card(
         .gap(10.0)
         .radius(12.0)
         .fill(p.card)
-        .border(1.0, hairline(p))
+        .border(1.0, p.line)
         .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
     let row_ = row()
         .gap(10.0)

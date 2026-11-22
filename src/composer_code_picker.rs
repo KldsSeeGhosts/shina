@@ -134,7 +134,7 @@ fn header(index: usize, id: rune::BlockId, info: &str, disabled: bool, p: Palett
                 .pr(6.0)
                 .child(outlined(trigger, p)),
         )
-        .child(el().w_full().h(1.0).fill(p.frame))
+        .child(el().w_full().h(1.0).fill(p.frame).hairline())
 }
 
 /// KSG's `ComboboxPopup`: a search field above the language list in a `w-56` card,

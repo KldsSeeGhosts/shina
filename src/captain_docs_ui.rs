@@ -4,10 +4,10 @@
 //! `captain.document.write` receipt clears a Saving one.
 //!
 //! The panel's structure follows the KSG `RightPanelSurfaceContent` bodies: a header row with
-//! the document's title and actions, then the scrollable body. Skin and tokens are Pixel
-//! Voyage's.
+//! the document's title and actions, then the scrollable body. Skin and tokens are KSG Code's,
+//! through the shared `Palette`.
 use super::captain_ui::quiet_note;
-use super::crew_ui::{ghost_button, hairline, solid_button};
+use super::crew_ui::{ghost_button, solid_button};
 use super::markdown_ui;
 use super::*;
 use crate::model::CaptainAccess;
@@ -15,8 +15,6 @@ use crate::model::{DiscardKind, DocDiscard, DocumentDraft, DocumentDraftKey, Dra
 
 /// The document's hard size cap, shared with the context budget a whole document can cost.
 const TEXT_CAP: usize = 64 * 1024;
-
-const META: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 
 /// The friendly labels from the design: AGENTS.md is the captain's rules, NOTES.md its plan,
 /// CREW.md the crew's shared rules, DIGEST.md the digest it writes on demand.
@@ -429,7 +427,8 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
         }
         footer = footer.child(save);
     }
-    body.child(el().h(1.0).fill(hairline(p))).child(footer)
+    body.child(el().h(1.0).fill(p.line).hairline())
+        .child(footer)
 }
 
 fn machine_label(s: &State, server: &str) -> String {

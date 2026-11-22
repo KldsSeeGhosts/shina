@@ -377,7 +377,9 @@ pub(super) fn frame_card(s: &State, p: Palette, card: El) -> El {
         .w_full()
         // KSG's `ComposerSurface.Main`: 15 px corners, concentric with the 16 px tray.
         .radius(15.0)
-        .fill(p.card)
+        // KSG's `--composer-fill`: the card runs a quiet top-to-bottom gradient.
+        .fill(p.card_bottom)
+        .gradient(p.card_top, p.card_bottom)
         .border(1.0, composer_frame(s, p))
         // The numerical transition owns geometry. Rune must not spring each sampled height.
         .instant_changes();

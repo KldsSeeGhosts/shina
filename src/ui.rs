@@ -178,6 +178,10 @@ struct Palette {
     ring: Color,
     message_bg: Color,
     code_bg: Color,
+    /// KSG's `--composer-fill` gradient ends: the composer card runs `card_top`
+    /// into `card_bottom`.
+    card_top: Color,
+    card_bottom: Color,
 }
 fn color(hex: &str) -> Color {
     rune::color::hex(hex).expect("palette color")
@@ -185,18 +189,18 @@ fn color(hex: &str) -> Color {
 fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: color("#0e0f12"),
-            panel: color("#151619"),
-            card: color("#1e1f23"),
-            lift: color("#2a2b31"),
-            tray: color("#191a1e"),
-            line: color("#ffffff").alpha(0.08),
+            bg: color("#000000"),
+            panel: color("#151515"),
+            card: color("#1a1a1a"),
+            lift: color("#262626"),
+            tray: color("#191919"),
+            line: color("#242424"),
             ink: color("#e6e7ea"),
-            muted: color("#b2b7bf"),
-            faint: color("#969ca7"),
+            muted: color("#a8a8a8"),
+            faint: color("#949494"),
             // Rune blends in linear light, so a small alpha still gives a visible highlight.
             selected: color("#ffffff").alpha(0.006),
-            row: color("#1e1f23"),
+            row: color("#1e1e1e"),
             coral: color("#eceef2"),
             coral_bg: color("#8aa4ff").alpha(0.16),
             on_coral: color("#111215"),
@@ -209,25 +213,27 @@ fn palette(dark: bool) -> Palette {
             danger_bg: color("#2e1a1b"),
             ok: color("#4cc35f"),
             ok_bg: color("#16281b"),
-            frame: color("#ffffff").alpha(0.11),
-            portrait_frame: color("#ffffff").alpha(0.11),
+            frame: color("#2c2c2c"),
+            portrait_frame: color("#2c2c2c"),
             shadow: color("#000000").alpha(0.45),
-            field_line: color("#ffffff").alpha(0.13),
+            field_line: color("#333333"),
             ring: color("#8aa4ff"),
-            message_bg: color("#25262b"),
-            code_bg: color("#111215"),
+            message_bg: color("#222222"),
+            code_bg: color("#131313"),
+            card_top: color("#202020"),
+            card_bottom: color("#1c1c1c"),
         }
     } else {
         Palette {
-            bg: color("#e8e8ea"),
-            panel: color("#f5f5f6"),
+            bg: color("#ebebeb"),
+            panel: color("#f5f5f5"),
             card: color("#ffffff"),
-            lift: color("#ececef"),
-            tray: color("#efeff1"),
-            line: color("#000000").alpha(0.08),
+            lift: color("#ececec"),
+            tray: color("#fafafa"),
+            line: color("#e6e6e6"),
             ink: color("#1c1d20"),
             muted: color("#55595f"),
-            faint: color("#62666e"),
+            faint: color("#666666"),
             selected: color("#000000").alpha(0.045),
             row: color("#ffffff"),
             coral: color("#141518"),
@@ -242,13 +248,15 @@ fn palette(dark: bool) -> Palette {
             danger_bg: color("#fbe7e4"),
             ok: color("#176f31"),
             ok_bg: color("#ddf3e3"),
-            frame: color("#000000").alpha(0.11),
-            portrait_frame: color("#000000").alpha(0.11),
+            frame: color("#e1e1e1"),
+            portrait_frame: color("#e3e3e3"),
             shadow: color("#000000").alpha(0.10),
-            field_line: color("#000000").alpha(0.14),
+            field_line: color("#d9d9d9"),
             ring: color("#1d4ed8"),
-            message_bg: color("#ececef"),
-            code_bg: color("#ededef"),
+            message_bg: color("#ececec"),
+            code_bg: color("#f0f0f0"),
+            card_top: color("#ffffff"),
+            card_bottom: color("#f7f7f7"),
         }
     }
 }
@@ -441,7 +449,7 @@ fn spacer() -> El {
     el().grow(1.0)
 }
 fn rule(p: Palette) -> El {
-    el().h(1.0).w_full().fill(p.line)
+    el().h(1.0).w_full().fill(p.line).hairline()
 }
 /// KSG Code's soft control shadow (`shadow-xs`): one point down, a few points of blur.
 fn control_shadow(p: Palette) -> rune::Shadow {
@@ -780,7 +788,7 @@ fn toggle_button(
         .size(24.0, 24.0)
         .center()
         .radius(6.0)
-        .fill(if on { p.selected } else { Color::TRANSPARENT })
+        .fill(if on { p.lift } else { Color::TRANSPARENT })
         .hover(p.selected)
         .on_press(action)
         .child(tool_icon(glyph, if on { p.ink } else { p.muted }))
@@ -855,8 +863,9 @@ fn timer_label(seconds: u64) -> String {
     }
 }
 
-/// The chat pane rounds its top corners and runs square to the window's bottom edge.
-const PANE_CORNERS: [f32; 4] = [12.0, 12.0, 0.0, 0.0];
+/// The chat pane rounds its top corners (KSG's `--radius-pane: 14px`) and runs square to the
+/// window's bottom edge.
+const PANE_CORNERS: [f32; 4] = [14.0, 14.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     #[cfg(test)]
@@ -1098,13 +1107,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         }
         pane = pane.child(body);
     }
-    // The pane's 1 px `line` border sits over its content, which would otherwise paint across it.
-    pane = pane.child(
-        el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .corners(PANE_CORNERS)
-            .border(1.0, p.line)
-            .a11y_hidden(),
-    );
+    // The pane has no edge border: the `bg`/`panel` contrast draws its edge (KSG's pane sits
+    // borderless on the chrome).
     let mut root = col()
         .key("workspace-root")
         .focusable(false)
@@ -2172,7 +2176,7 @@ fn model_picker(s: &State, model: &ComposerModelDisplay, p: Palette) -> El {
             .child(if stacked {
                 rule(p)
             } else {
-                el().w(1.0).h_full().fill(p.line)
+                el().w(1.0).h_full().fill(p.line).hairline()
             })
             .child(options_column(
                 s,
@@ -8930,9 +8934,9 @@ fn activity_line(
 }
 
 /// KSG Code's `WORKING_BAR_CLASS_NAME` (`chat/TimelineRowParts.tsx`): a 32 pt bar over a 1 px
-/// `--timeline-working-rule`, 5 pt in at the start and 4 pt at the end. A running turn's
-/// "Working for" and a finished turn's "Worked for" are this one bar.
-fn working_bar_frame(dark: bool, p: Palette) -> El {
+/// `--timeline-working-rule` (the palette's `line`), 5 pt in at the start and 4 pt at the end.
+/// A running turn's "Working for" and a finished turn's "Worked for" are this one bar.
+fn working_bar_frame(p: Palette) -> El {
     row()
         .w_full()
         .min_w(0.0)
@@ -8941,10 +8945,7 @@ fn working_bar_frame(dark: bool, p: Palette) -> El {
         .gap(10.0)
         .pl(5.0)
         .pr(4.0)
-        .border_sides(
-            [0.0, 0.0, 1.0, 0.0],
-            if dark { color("#242424") } else { p.line },
-        )
+        .border_sides([0.0, 0.0, 1.0, 0.0], p.line)
 }
 
 /// The folded work bar's button, ported from KSG Code's `WorkFoldToggle` and `WorkFoldCaret`:
@@ -8994,7 +8995,7 @@ const BAR_TIMER: TextStyle = ACTIVITY.features(TABULAR);
 
 /// Ported from KSG Code's `WorkingTimelineRow`: the running turn's bar at its top, under the
 /// captain's name. It is not a toggle while the turn runs, so it has no chevron.
-fn working_bar(t: &Thread, dark: bool, p: Palette) -> El {
+fn working_bar(t: &Thread, p: Palette) -> El {
     let (words, seconds) = working_label(t);
     let mut text = row().center_y().min_w(0.0).shrink().child(
         label(words, ACTIVITY, p.muted)
@@ -9008,7 +9009,7 @@ fn working_bar(t: &Thread, dark: bool, p: Palette) -> El {
             label(timer_label(seconds), BAR_TIMER, p.muted).key(format!("live-timer-{}", t.id)),
         );
     }
-    working_bar_frame(dark, p)
+    working_bar_frame(p)
         .key(format!("working-bar-{}", t.id))
         .role("status")
         .child(text)
@@ -10440,7 +10441,7 @@ fn build_assistant_turn(
     if live {
         // KSG's `WorkingTimelineRow`: the turn's bar at its top while it runs.
         if head {
-            response = response.child(working_bar(t, s.dark, p));
+            response = response.child(working_bar(t, p));
         }
     } else if !inline_work && (last_work.is_some() || work.is_some_and(|work| work.stopped)) {
         let expanded = work.is_some_and(|work| work.expanded);
@@ -10470,7 +10471,7 @@ fn build_assistant_turn(
             .key(format!("work-section-{}", message_key(t, start)))
             .w_full()
             .child(
-                working_bar_frame(s.dark, p).child(
+                working_bar_frame(p).child(
                     work_fold_toggle(
                         toggle_key,
                         format!(
@@ -10776,9 +10777,9 @@ fn history_control(s: &State, p: Palette) -> Option<El> {
             .gap(12.0)
             .center_y()
             .disabled(loading)
-            .child(el().h(1.0).grow(1.0).fill(p.line))
+            .child(el().h(1.0).grow(1.0).fill(p.line).hairline())
             .child(label(text, SMALL, p.muted))
-            .child(el().h(1.0).grow(1.0).fill(p.line));
+            .child(el().h(1.0).grow(1.0).fill(p.line).hairline());
         if !loading {
             btn = btn
                 .cursor(rune::Cursor::Pointer)
@@ -11641,7 +11642,7 @@ fn fresh_session_row(message_id: &str, p: Palette) -> El {
         .py(8.0)
         .gap(8.0)
         .center_y()
-        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(el().h(1.0).grow(1.0).fill(p.line).hairline())
         .child(
             row()
                 .center_y()
@@ -11649,7 +11650,7 @@ fn fresh_session_row(message_id: &str, p: Palette) -> El {
                 .child(icon("alert", p.muted))
                 .child(meta_text("New session", p.muted)),
         )
-        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(el().h(1.0).grow(1.0).fill(p.line).hairline())
 }
 
 /// Ported from KSG Code's `HandoffRow` (`components/chat/V2LifecycleRow.tsx`): the
@@ -11726,7 +11727,7 @@ fn handoff_row(s: &State, index: usize, handoff: &crate::handoff::Handoff, p: Pa
         .py(8.0)
         .gap(8.0)
         .center_y()
-        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(el().h(1.0).grow(1.0).fill(p.line).hairline())
         .child(
             row()
                 .center_y()
@@ -11737,7 +11738,7 @@ fn handoff_row(s: &State, index: usize, handoff: &crate::handoff::Handoff, p: Pa
                 .child(meta_text(title, tone).shrink())
                 .child(detail),
         )
-        .child(el().h(1.0).grow(1.0).fill(p.line))
+        .child(el().h(1.0).grow(1.0).fill(p.line).hairline())
 }
 
 /// Ported from KSG Code's `ThreadFindBar` (`components/chat/ThreadFindBar.tsx`).
@@ -24898,7 +24899,21 @@ pub(crate) mod tests {
                 .into_iter()
                 .find(|element| element.key.as_deref() == Some("chat-status-text"))
                 .unwrap();
-            assert_eq!(label.text.as_deref(), Some("Working for 12m 05s"));
+            // The status word mounts, but the ticking timer lives in the timeline's
+            // working bar; the title bar must not repeat it.
+            assert_eq!(label.text.as_deref(), Some("Working"));
+            assert!(
+                !rt.elements().iter().any(|element| {
+                    element.key.as_deref().is_some_and(|key| {
+                        key.starts_with("chat-status")
+                            && element
+                                .text
+                                .as_deref()
+                                .is_some_and(|text| text.starts_with("Working for"))
+                    })
+                }),
+                "{width}: the top bar repeats the timeline's timer"
+            );
             let (text, _) = rt.presented("chat-status-text").unwrap();
             let (slot, _) = rt.presented("chat-status").unwrap();
             let (actions, _) = rt.presented("top-bar-actions").unwrap();
@@ -24914,6 +24929,45 @@ pub(crate) mod tests {
                 slot[0] + slot[2] <= actions[0] + 0.5,
                 "{width}: status {slot:?} crosses the actions {actions:?}"
             );
+        }
+    }
+
+    #[test]
+    fn top_bar_leaves_the_live_timer_to_the_timelines_working_bar() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let rt = streak_runtime(width);
+            // The timeline's working bar owns the ticking "Working for …" once; the
+            // title bar's status slot shows only the status word.
+            assert_eq!(
+                texts(&rt)
+                    .iter()
+                    .filter(|text| text.starts_with("Working for"))
+                    .count(),
+                1,
+                "{width}"
+            );
+            assert_eq!(
+                element_text(&rt, "chat-status-text").as_deref(),
+                Some("Working"),
+                "{width}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_pane_rounds_its_top_corners_over_the_chrome() {
+        for width in [620.0, 960.0, 1280.0, 1920.0] {
+            let mut rt = runtime(width);
+            rt.frame(0.0);
+            // KSG's `--radius-pane: 14px` top corners; the pane draws no edge border,
+            // so the `bg`/`panel` step is the only rim.
+            let pane = rt
+                .elements()
+                .into_iter()
+                .find(|element| element.key.as_deref() == Some("chat-pane"))
+                .unwrap();
+            assert_eq!(pane.radius, 14.0, "{width}");
+            assert_eq!(pane.fill, palette(rt.state.dark).panel, "{width}");
         }
     }
 

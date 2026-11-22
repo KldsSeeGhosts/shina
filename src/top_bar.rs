@@ -54,18 +54,11 @@ pub(super) fn bar(s: &State, p: Palette, narrow: bool, compact: bool, tabs_width
         bar = bar.child(thread_title(s, p, narrow, compact));
     }
     let t = s.current();
-    let text = match (t.status, t.started) {
-        (Status::Running, Some(start)) => Some(format!(
-            "Working for {}",
-            timer_label(start.elapsed().as_secs())
-        )),
-        _ => None,
-    };
     // `chat-status` sits right after the title at intrinsic width. Ready draws
-    // nothing, so there is no empty slot holding space.
+    // nothing, so there is no empty slot holding space. The live "Working for …"
+    // timer belongs to the timeline's working bar, not the title bar.
     let active = crate::agents::active_count(t);
     if !s.demo && active > 0 {
-        let words = text.as_deref().unwrap_or("Working");
         bar = bar.child(
             row()
                 .key("chat-status")
@@ -74,16 +67,15 @@ pub(super) fn bar(s: &State, p: Palette, narrow: bool, compact: bool, tabs_width
                 .role("button")
                 .focusable(true)
                 .cursor(rune::Cursor::Pointer)
-                .label(format!("{words}, {active} agents working"))
+                .label(format!("Working, {active} agents working"))
                 .radius(6.0)
                 .hover(p.selected)
                 .on_press(agents_ui::open)
-                .child(label(words, TIMER, p.sea).truncate())
+                .child(label("Working", TIMER, p.sea).truncate())
                 .child(agents_ui::chip("chat-status-agents", active, p)),
         );
-    } else if !s.demo && !(text.is_none() && matches!(t.status, Status::Ready | Status::Completed))
-    {
-        bar = bar.child(status_slot("chat-status", t.status, text, p));
+    } else if !s.demo && !matches!(t.status, Status::Ready | Status::Completed) {
+        bar = bar.child(status_slot("chat-status", t.status, None, p));
     }
     bar = bar
         .child(spacer())
