@@ -86,6 +86,8 @@ mod crew_membership_ui;
 mod crew_questions_ui;
 #[path = "crew_ui.rs"]
 pub(crate) mod crew_ui;
+#[path = "details_ui.rs"]
+mod details_ui;
 #[path = "diff_panel.rs"]
 pub(crate) mod diff_panel;
 #[path = "diff_tree.rs"]
@@ -951,6 +953,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .unwrap_or(900.0)
     });
     let wide = main_width >= WIDE_PANE;
+    // The details card docks in the chat column when it fits there. The top bar's button
+    // and the lanes below both read the answer.
+    s.details.pane_height.set(
+        cx.layout_with("chat-main", |r| r[3])
+            .unwrap_or(s.viewport_height - 56.0),
+    );
+    let details_rect = details_ui::rect(s, main_width);
+    s.details.fits.set(details_rect.is_some());
     let chrome = cx.chrome_insets();
     // Zoom draws the whole UI k times larger. The root is laid out at the window size divided
     // by k and scaled back up, so layout, hit testing and text stay native at every step.
@@ -1131,6 +1141,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let covering =
             panel_open && (panel.maximized || narrow || crate::right_panel::covers(body_width));
         let mut main_wrap = el().grow(1.0).min_w(0.0).min_h(0.0).h_full().child(main);
+        // KSG's inline `ThreadDetailsCard`: pinned 12 pt inside the column's top right
+        // corner, under a covering Inspector.
+        if let Some(rect) = details_rect.filter(|_| s.details.docked) {
+            main_wrap = main_wrap.child(details_ui::card(s, p, rect.height).pin(
+                None,
+                Some(rect.y),
+                Some(rect.right_inset),
+                None,
+            ));
+        }
         if covering && compact {
             compact_inspector = Some(inspector_ui::view(s, p, zoom, None));
         } else if covering {
@@ -1487,6 +1507,18 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     .on_layout(|s: &mut State, _| s.composer_ui.overflow.set(false)),
             );
         }
+    }
+    // Where the card cannot dock, the top bar's button opens it as a popover (KSG's
+    // `PopoverPopup` presentation of the same card).
+    if s.details.popover && details_rect.is_none() && details_ui::available(s) {
+        root = root.child(
+            details_ui::card(s, p, (s.viewport_height - 80.0).max(160.0))
+                .anchored_fit("header-details", rune::Side::Bottom, rune::Align::End, 6.0)
+                .modal(true, |s: &mut State| s.details.popover = false),
+        );
+    }
+    if let Some(hover) = details_ui::hover_card(s, p) {
+        root = root.child(hover);
     }
     if s.now_popover {
         if !s.composer_hidden() && cx.layout_with("crew-tray", |_| ()).is_some() {
@@ -12112,7 +12144,7 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let visit = s.timeline_positions.borrow().visit();
     let gutter = lane_gutter(pane_width);
     // The lane the composer resolves too; `None` until C5 mounts the Details card.
-    let lane_rect = chat_lane(pane_width, wide, None);
+    let lane_rect = chat_lane(pane_width, wide, details_ui::edges(s, pane_width));
     // A captain's delegations show as task cards inside a turn, so with no messages they have
     // nothing to hang from. The home counts as empty and greets above its crew tray.
     let visible_tools = t.messages.is_empty()
@@ -15203,7 +15235,7 @@ fn composer(
 ) -> El {
     let t = s.current();
     // The lane the conversation resolves too; `None` until C5 mounts the Details card.
-    let lane_rect = chat_lane(pane_width, wide, None);
+    let lane_rect = chat_lane(pane_width, wide, details_ui::edges(s, pane_width));
     let lane = lane_rect.width;
     let inline_files = inline_file_attachment_ids(t);
     let collapsed = s
@@ -22058,12 +22090,10 @@ pub(crate) mod tests {
             assert!(rt.presented("parent-bar").is_none(), "{width}");
             assert_inside(&mut rt, width, &["composer"]);
             assert!(rt.presented("crew-tray").is_none());
-            // The worker's Overview links back to its captain.
-            rt.state.right_panels.open(
-                &rt.state.panel_key(),
-                crate::right_panel::SingletonKind::Overview,
-            );
-            rt.invalidate();
+            // The worker's details card links back to its captain. Beside an open Inspector
+            // the card cannot dock, so the top bar opens it as a popover.
+            assert!(rt.presented("details-card").is_none(), "{width}");
+            press(&mut rt, "header-details");
             rt.frame(1.0);
             press(&mut rt, "open-captain-from-overview");
             assert_eq!(rt.state.current().id, 7, "{width}");

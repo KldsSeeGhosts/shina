@@ -20,6 +20,43 @@ use std::{
 /// The label shown when a thread uses whatever model Pi is configured with.
 pub const DEFAULT_MODEL: &str = "Default model";
 pub const SIDEBAR_MIN: f32 = 220.0;
+
+/// The floating thread details card, ported from KSG Code's `ThreadDetailsCard`: docked at
+/// the chat pane's top right where it fits, a popover from the top bar elsewhere.
+#[derive(Clone, Debug)]
+pub struct DetailsCard {
+    /// The user keeps the docked card on screen. Saved with the UI state.
+    pub docked: bool,
+    /// The popover is open, where the card cannot dock.
+    pub popover: bool,
+    /// "Show N more": the session rows under the workspace rows.
+    pub more: bool,
+    /// The "previous agents" group is unfolded.
+    pub previous_open: bool,
+    /// How many previous agents the group lists: KSG's 6, then 12 more at a time.
+    pub previous_shown: usize,
+    /// The lineage row under the pointer, for its hover card.
+    pub hover: Option<String>,
+    /// Whether the card can dock in the chat pane, from the last frame.
+    pub fits: std::cell::Cell<bool>,
+    /// The chat pane's height, from the last layout.
+    pub pane_height: std::cell::Cell<f32>,
+}
+
+impl Default for DetailsCard {
+    fn default() -> Self {
+        Self {
+            docked: true,
+            popover: false,
+            more: false,
+            previous_open: false,
+            previous_shown: 6,
+            hover: None,
+            fits: std::cell::Cell::new(false),
+            pane_height: std::cell::Cell::new(720.0),
+        }
+    }
+}
 pub const SIDEBAR_MAX: f32 = 420.0;
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 336.0;
 const PREVIOUS_DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
@@ -5480,6 +5517,8 @@ pub struct State {
     #[allow(dead_code, reason = "Read by the Slice B Agents panel.")]
     pub agents_expanded:
         std::collections::HashSet<(String, usize, String, crate::agents::AgentRunId)>,
+    /// The floating thread details card over the chat pane.
+    pub details: DetailsCard,
     pub mention_search: crate::ui::composer_menu::MentionSearch,
     /// Sequence for `mention:preview:{seq}` workspace.readFile calls.
     pub(crate) file_preview_seq: u64,
@@ -6566,6 +6605,7 @@ impl State {
             pending_tool_reveal: None,
             agents_filter: Default::default(),
             agents_expanded: Default::default(),
+            details: DetailsCard::default(),
             mention_search: crate::ui::composer_menu::MentionSearch::default(),
             file_preview_seq: 0,
             pending_open_urls: Vec::new(),
@@ -6649,7 +6689,31 @@ impl State {
     }
     /// The current thread's panel state; a default (closed, empty) one when it has none.
     pub fn right_panel(&self) -> crate::right_panel::ThreadPanel {
-        self.right_panels.get(&self.panel_key())
+        let mut panel = self.right_panels.get(&self.panel_key());
+        // Only a Captain home has the first tab, its Brief. A thread's own details are the
+        // floating card, so the panel opens on Work there.
+        if panel.view == crate::right_panel::PanelView::Overview && !self.has_brief_tab() {
+            panel.view = crate::right_panel::PanelView::Work;
+        }
+        panel
+    }
+    /// Whether the Inspector shows the Brief tab: the open thread is a Captain's home.
+    pub fn has_brief_tab(&self) -> bool {
+        let t = self.current();
+        self.is_captain_home(t)
+            && t.captain
+                .is_some_and(|captain| captain < self.captains.len())
+    }
+    /// The top bar's details button: hide or show the docked card where it fits, else open
+    /// or close its popover.
+    pub fn details_toggle(&mut self) {
+        if self.details.fits.get() {
+            self.details.docked = !self.details.docked;
+            self.details.popover = false;
+            self.checkpoint();
+        } else {
+            self.details.popover = !self.details.popover;
+        }
     }
     /// Whether a captain backs the current thread, so the Inspector's Work tab lists its
     /// crew: captain homes and crew, delegated or peer workers. Plain threads have none.
@@ -6778,8 +6842,13 @@ impl State {
         self.right_panels
             .toggle(&key, crate::right_panel::SingletonKind::Diff);
     }
-    /// `threadPanel.toggle`: the Inspector's Overview tab, toggled as a surface.
+    /// `threadPanel.toggle`: the thread details card, as in KSG Code. A Captain's home
+    /// toggles its Brief tab instead.
     pub fn right_panel_toggle_overview(&mut self) {
+        if !self.has_brief_tab() {
+            self.details_toggle();
+            return;
+        }
         let key = self.panel_key();
         if self.right_panel_active_view() == Some(crate::right_panel::PanelView::Overview) {
             self.right_panels.close(&key);
@@ -14879,7 +14948,7 @@ impl State {
         .unwrap_or_default()
     }
 
-    fn friendly_model_name(&self, harness: &str, model_id: &str) -> String {
+    pub(crate) fn friendly_model_name(&self, harness: &str, model_id: &str) -> String {
         if self.current().harness == harness
             && let Some(m) = self.current().models.iter().find(|m| m.id == model_id)
         {
@@ -17231,6 +17300,7 @@ impl State {
             "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "sidebarWidthDefault":DEFAULT_SIDEBAR_WIDTH,
+            "detailsCard":self.details.docked,
             "rightPanelWidth":self.right_panel_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -17305,6 +17375,10 @@ impl State {
         {
             self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
         }
+        self.details.docked = ui
+            .get("detailsCard")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         // Panel state itself is session-only; the width is the one saved value.
         self.right_panel_width = ui
             .get("rightPanelWidth")
@@ -23043,29 +23117,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // `rightPanel.toggle`: an empty thread opens the Diff segment; an open one hides and
-    // re-shows keeping its tab (KSG `toggleRightPanel`).
+    // `rightPanel.toggle`: a plain thread opens on Work, its first tab; an open panel hides
+    // and re-shows keeping its tab (KSG `toggleRightPanel`).
     #[test]
-    fn right_panel_toggle_opens_overview_then_hides_and_reshows() {
+    fn right_panel_toggle_opens_work_then_hides_and_reshows() {
         let mut state = State::new(".".into(), false);
 
         // Empty thread: opens the Inspector on its default tab.
         state.right_panel_toggle();
         let panel = state.right_panel();
         assert!(panel.open);
-        assert_eq!(panel.view, crate::right_panel::PanelView::Overview);
+        assert_eq!(panel.view, crate::right_panel::PanelView::Work);
 
         // Open panel: hides, keeping the tab selection.
         state.right_panel_toggle();
         let hidden = state.right_panel();
         assert!(!hidden.open);
-        assert_eq!(hidden.view, crate::right_panel::PanelView::Overview);
+        assert_eq!(hidden.view, crate::right_panel::PanelView::Work);
 
         // Hidden: re-shows on the same tab.
         state.right_panel_toggle();
         let shown = state.right_panel();
         assert!(shown.open);
-        assert_eq!(shown.view, crate::right_panel::PanelView::Overview);
+        assert_eq!(shown.view, crate::right_panel::PanelView::Work);
 
         // Open on a document: hides too.
         let key = state.panel_key();
@@ -23100,7 +23174,7 @@ mod tests {
         let second_key = state.panel_key();
         assert_ne!(first_key, second_key);
         assert_eq!(
-            state.right_panel(),
+            state.right_panels.get(&second_key),
             crate::right_panel::ThreadPanel::default()
         );
 
@@ -23115,7 +23189,7 @@ mod tests {
         let panel = state.right_panel();
         assert!(panel.open);
         assert!(panel.maximized);
-        assert_eq!(panel.view, crate::right_panel::PanelView::Overview);
+        assert_eq!(panel.view, crate::right_panel::PanelView::Work);
 
         // Deleting a thread forgets its panel state.
         let mut ids = std::collections::HashSet::new();

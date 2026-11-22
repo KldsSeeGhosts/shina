@@ -994,7 +994,7 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
     let home = captain.and_then(|c| s.captain_home(c));
     // The lane the conversation and composer resolve (`chatCanvasLayout.ts`); `None` until
     // C5 mounts the Details card.
-    let lane = chat_lane(pane_width, wide, None);
+    let lane = chat_lane(pane_width, wide, details_ui::edges(s, pane_width));
     let bar = row()
         .key("earlier-bar")
         .role("status")
