@@ -1186,8 +1186,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if docked && let Some(preview) = sidebar_preview::view(s, p, sidebar_width) {
         root = root.child(preview);
     }
-    if let Some(notice) = s.composer_notices.open_details_notice() {
-        root = root.child(composer_notice_details_popover(notice, p));
+    if let Some(notice) = s.composer_notices.open_details_notice()
+        && let Some(popover) =
+            composer_notice_details_popover(notice, p, lane_width(main_width, wide), cx)
+    {
+        root = root.child(popover);
     }
     // Citation chips get a comment action pinned over each pill's right end,
     // mounted at the root like the other composer overlays so nothing clips it.
@@ -1319,7 +1322,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let crew_overlay_captain = captain_ui::brief_captain(s)
         .or_else(|| s.current().crew_captain.filter(|c| *c < s.captains.len()));
     if let Some(captain) = crew_overlay_captain {
-        if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
+        if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain, cx) {
             root = root.child(menu);
         }
         // A secondary press on a Crew Roster row opens the member's More menu right there,
@@ -1332,10 +1335,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                         .anchored_fit(anchor, rune::Side::Bottom, rune::Align::End, 4.0)
                         .modal(true, |s: &mut State| s.brief.more = None),
                 );
+            } else {
+                root = root.child(
+                    el().key("crew-more-dismiss")
+                        .absolute(0.0, 0.0)
+                        .size(0.0, 0.0)
+                        .a11y_hidden()
+                        .on_layout(|s: &mut State, _| s.brief.more = None),
+                );
             }
         }
     }
-    if let Some(menu) = crew_membership_ui::move_picker(s, p) {
+    if let Some((x, y)) = s.brief.moving.as_ref().and_then(|m| m.at) {
+        root = root.child(
+            el().key("crew-move-point")
+                .absolute(x / zoom, y / zoom)
+                .size(0.0, 0.0),
+        );
+    }
+    if let Some(menu) = crew_membership_ui::move_picker(s, p, cx) {
         root = root.child(menu);
     }
     if !s.toasts.is_empty() {
@@ -6638,13 +6656,20 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                             {
                                 return;
                             }
+                            let at = if move_anchor == "thread-actions" {
+                                None
+                            } else {
+                                s.row_menu_at
+                            };
                             s.row_menu = None;
+                            s.row_menu_at = None;
                             s.thread_menu = false;
                             s.brief.moving = Some(crate::model::MovePicker {
                                 server: move_server.clone(),
                                 thread: id,
                                 mode: crate::model::MoveMode::Move { from: owner },
                                 anchor: move_anchor.clone(),
+                                at,
                             });
                         }),
                 )
@@ -6707,13 +6732,20 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                     if s.machines.selected != join_server {
                         return;
                     }
+                    let at = if join_anchor == "thread-actions" {
+                        None
+                    } else {
+                        s.row_menu_at
+                    };
                     s.row_menu = None;
+                    s.row_menu_at = None;
                     s.thread_menu = false;
                     s.brief.moving = Some(crate::model::MovePicker {
                         server: join_server.clone(),
                         thread: id,
                         mode: crate::model::MoveMode::Join,
                         anchor: join_anchor.clone(),
+                        at,
                     });
                 }),
             );
@@ -13552,6 +13584,28 @@ fn composer_shell(p: Palette, inner: El, strip: Option<El>) -> El {
         .child(strip)
 }
 
+fn composer_notice_overflows(notice: &crate::composer_notices::Notice, lane: f32) -> bool {
+    let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
+    let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
+    let action_style = TextStyle::new(12.0, 500.0);
+    let mut actions_width = 0.0;
+    for act in &notice.actions {
+        actions_width += 20.0 + rune::text::measure(&act.label, &[], action_style, None).0 + 4.0;
+    }
+    let dismiss_width = if notice.dismiss_label.is_some() {
+        24.0 + 4.0
+    } else {
+        0.0
+    };
+    let available_text =
+        (lane - 4.0 - 8.0 - 24.0 - 4.0 - actions_width - dismiss_width - 4.0).max(0.0);
+    let title_width = rune::text::measure(&notice.title, &[], title_style, None).0;
+    let desc_width = notice.description.as_deref().map_or(0.0, |desc| {
+        4.0 + rune::text::measure(desc, &[], desc_style, None).0
+    });
+    title_width + desc_width > available_text + 0.5
+}
+
 /// Ported from KSG Code's `ComposerBannerStack` and `ComposerBanner` (`attached`,
 /// `density="comfortable"`), inside the composer tray: 15 px outer corners on the top notice,
 /// variant colour on the icon and a 2 px left edge.
@@ -13563,7 +13617,6 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
     }
     let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
     let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
-    let action_style = TextStyle::new(12.0, 500.0);
     let mut stack = col().key("composer-notices").w_full().gap(0.0);
     for (index, notice) in notices.iter().enumerate() {
         let top = index == 0;
@@ -13586,23 +13639,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
             Some(desc) if !desc.is_empty() => format!("{}: {desc}", notice.title),
             _ => notice.title.clone(),
         };
-        let mut actions_width = 0.0;
-        for act in &notice.actions {
-            actions_width +=
-                20.0 + rune::text::measure(&act.label, &[], action_style, None).0 + 4.0;
-        }
-        let dismiss_width = if notice.dismiss_label.is_some() {
-            24.0 + 4.0
-        } else {
-            0.0
-        };
-        let available_text =
-            (lane - 4.0 - 8.0 - 24.0 - 4.0 - actions_width - dismiss_width - 4.0).max(0.0);
-        let title_width = rune::text::measure(&notice.title, &[], title_style, None).0;
-        let desc_width = notice.description.as_deref().map_or(0.0, |desc| {
-            4.0 + rune::text::measure(desc, &[], desc_style, None).0
-        });
-        let overflows = title_width + desc_width > available_text + 0.5;
+        let overflows = composer_notice_overflows(notice, lane);
 
         let mut content = row()
             .key(format!("composer-notice-content-{}", notice.id))
@@ -13867,7 +13904,30 @@ fn usage_limits_notice_body(
 }
 
 /// Overflow details popover for a composer notice, reusing `context_popover` styling.
-fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: Palette) -> El {
+fn composer_notice_details_popover(
+    notice: &crate::composer_notices::Notice,
+    p: Palette,
+    lane: f32,
+    cx: &Cx<State>,
+) -> Option<El> {
+    let trigger = format!("composer-notice-details-{}", notice.id);
+    let row_key = format!("composer-notice-{}", notice.id);
+    let anchor =
+        if composer_notice_overflows(notice, lane) && cx.layout_with(&trigger, |_| ()).is_some() {
+            trigger
+        } else if cx.layout_with(&row_key, |_| ()).is_some() {
+            row_key
+        } else if cx.layout_with("composer", |_| ()).is_some() {
+            "composer".to_owned()
+        } else {
+            return Some(
+                el().key("composer-notice-details-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.composer_notices.close_details()),
+            );
+        };
     let mut card = col()
         .key("composer-notice-details-popover")
         .role("dialog")
@@ -13881,12 +13941,7 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
         .fill(p.card)
         .border(1.0, p.frame)
         .box_shadow(soft_shadow(p))
-        .anchored(
-            &format!("composer-notice-details-{}", notice.id),
-            rune::Side::Top,
-            rune::Align::End,
-            4.0,
-        )
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.composer_notices.close_details())
         .on_key(|s: &mut State, event, _| {
             if event.key == rune::Key::Escape {
@@ -13922,7 +13977,7 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
                 .selectable(true),
         );
     }
-    card
+    Some(card)
 }
 
 /// Derives the breakdown legend for a thread when breakdown rows are available.
@@ -23676,11 +23731,20 @@ pub(crate) mod tests {
         );
         press(&mut rt, "thread-actions");
         press(&mut rt, "menu-snooze-thread");
-        let (menu, _) = rt
+        let (menu, opacity) = rt
             .presented("snooze-menu")
             .expect("header snooze menu must remain visible when sidebar row is unmounted");
+        assert!(
+            menu[2] > 0.0 && menu[3] > 0.0 && opacity > 0.0,
+            "snooze menu must not be suppressed: rect={menu:?} opacity={opacity}"
+        );
         assert!(menu[0] >= 0.0 && menu[0] + menu[2] <= 1280.5, "{menu:?}");
         assert!(menu[1] >= 0.0 && menu[1] + menu[3] <= 720.5, "{menu:?}");
+        press(&mut rt, "snooze-preset-0");
+        assert!(
+            rt.state.threads[0].life.snoozed(lifecycle::now()),
+            "activating a preset inside the fallback-anchored snooze menu must snooze the thread"
+        );
     }
 
     #[test]
@@ -33513,18 +33577,41 @@ pub(crate) mod tests {
             rt.presented(&pencil).is_none(),
             "pencil anchor should unmount when short draft folds"
         );
-        let (rect, _) = rt
+        let (rect, opacity) = rt
             .presented("citation-comment-popover")
             .expect("citation popover must fall back to a mounted composer anchor");
+        assert!(
+            rect[2] > 0.0 && rect[3] > 0.0 && opacity > 0.0,
+            "citation popover must not be suppressed: rect={rect:?} opacity={opacity}"
+        );
         assert!(rect[0] >= -1.0 && rect[0] + rect[2] <= 621.0, "{rect:?}");
         assert!(rect[1] >= -1.0 && rect[1] + rect[3] <= 721.0, "{rect:?}");
 
-        rt.key(rune::KeyEvent {
-            key: rune::Key::Escape,
-            mods: Default::default(),
+        // Editing and saving through the fallback-anchored popover must still work.
+        rt.update(|s, _| {
+            s.citation_comment
+                .as_mut()
+                .unwrap()
+                .draft
+                .replace_text("kept while narrow");
         });
+        rt.frame(0.0);
+        press(&mut rt, "citation-comment-save");
         rt.frame(1.0);
         assert!(rt.presented("citation-comment-popover").is_none());
+        let saved = rt
+            .state
+            .current()
+            .draft_context
+            .iter()
+            .find(|r| r.context_id == context_id)
+            .and_then(|r| match &r.data {
+                crate::composer_context::ComposerContextData::Response { citation, .. } => {
+                    citation.comment.as_deref()
+                }
+                _ => None,
+            });
+        assert_eq!(saved, Some("kept while narrow"));
     }
 
     #[test]
@@ -33543,20 +33630,178 @@ pub(crate) mod tests {
         rt.frame(0.0);
         rt.frame(1.0);
         press(&mut rt, &actions_key);
-        assert!(rt.presented(&menu_key).is_some());
+        rt.frame(2.0);
+        let (menu, opacity) = rt
+            .presented(&menu_key)
+            .expect("plan menu must be visible while plan row is mounted");
+        assert!(
+            menu[2] > 0.0 && menu[3] > 0.0 && opacity > 0.0,
+            "plan menu must not be suppressed: rect={menu:?} opacity={opacity}"
+        );
 
-        // Removing the plan trigger from the mounted tree must not leave an invisible modal active.
+        // Removing the plan trigger from the mounted tree must clear `plan_menu`
+        // rather than leaving an invisible modal or stale flag behind.
         rt.state.current_mut().work[0].expanded = false;
         rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
+        rt.frame(2.5);
+        rt.frame(3.5);
         assert!(rt.presented(&actions_key).is_none());
         assert!(rt.presented(&menu_key).is_none());
+        assert!(
+            rt.state.plan_menu.is_none(),
+            "stale plan_menu flag must be cleared when its trigger unmounts"
+        );
+        assert!(
+            rt.state.preview_allowed(),
+            "clearing stale plan_menu must restore sidebar previews"
+        );
         press(&mut rt, "thread-actions");
         assert!(
             rt.presented("thread-menu").is_some(),
             "header menu must remain reachable without focus trapped by a hidden plan menu"
         );
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(4.5);
+
+        // Re-expanding the plan row must not resurrect the dismissed plan menu.
+        rt.state.current_mut().work[0].expanded = true;
+        rt.invalidate();
+        rt.frame(5.0);
+        rt.frame(6.0);
+        assert!(rt.presented(&actions_key).is_some());
+        assert!(rt.presented(&menu_key).is_none());
+    }
+
+    #[test]
+    fn crew_move_picker_stays_visible_when_launched_without_sidebar_row() {
+        let mut rt = crew_runtime(1280.0);
+        let next_id = rt.state.threads.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let mut thread = Thread::new(next_id);
+        thread.title = "Standalone root thread".into();
+        thread.project = rt.state.current().project;
+        thread.messages.push(crate::model::Message {
+            id: "msg-crew-join".into(),
+            role: "User",
+            text: "Ready to join".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        let idx = rt.state.threads.len();
+        rt.state.threads.push(thread);
+        rt.state.active = idx;
+        rt.state.tabs_enabled = false;
+        rt.state.sidebar = false;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        assert!(
+            rt.presented(&format!("thread-{next_id}")).is_none(),
+            "thread sidebar row must not be mounted when sidebar is closed and tabs are off"
+        );
+        let (title_rect, _) = rt
+            .presented("thread-title")
+            .expect("top bar thread title should be mounted");
+        let cx = title_rect[0] + title_rect[2] / 2.0;
+        let cy = title_rect[1] + title_rect[3] / 2.0;
+        rt.secondary_down(cx, cy);
+        rt.secondary_up(cx, cy);
+        rt.frame(1.5);
+        rt.frame(2.5);
+        press(&mut rt, "menu-crew-recruit");
+        rt.frame(3.0);
+        rt.frame(4.0);
+
+        let (picker, opacity) = rt
+            .presented("crew-move-picker")
+            .expect("crew move picker must stay visible when sidebar row is absent");
+        assert!(
+            picker[2] > 0.0 && picker[3] > 0.0 && opacity > 0.0,
+            "crew move picker must not be suppressed: rect={picker:?} opacity={opacity}"
+        );
+        assert!(
+            picker[0] >= -1.0 && picker[0] + picker[2] <= 1281.0,
+            "{picker:?}"
+        );
+        assert!(
+            picker[1] >= -1.0 && picker[1] + picker[3] <= 721.0,
+            "{picker:?}"
+        );
+
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(4.5);
+        rt.frame(5.5);
+        assert!(rt.state.brief.moving.is_none());
+        assert!(rt.presented("crew-move-picker").is_none());
+    }
+
+    #[test]
+    fn composer_notice_details_popover_stays_visible_when_widening_unmounts_details_button() {
+        use crate::composer_notices::{Notice, Variant};
+
+        let mut rt = runtime(620.0);
+        rt.state.composer_notices.push(
+            Notice::new("att-mid", Variant::Info, "alert", "Sync notice")
+                .description(Some(
+                    "This description overflows at 620 px wide and fits cleanly once widened to 1920 px."
+                        .into(),
+                ))
+                .dismiss_label("Dismiss notice"),
+        );
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        assert!(
+            rt.presented("composer-notice-details-att-mid").is_some(),
+            "Details button should mount at 620 px"
+        );
+        press(&mut rt, "composer-notice-details-att-mid");
+        rt.frame(2.0);
+        let (narrow_rect, narrow_opacity) = rt
+            .presented("composer-notice-details-popover")
+            .expect("details popover should open at 620 px");
+        assert!(
+            narrow_rect[2] > 0.0 && narrow_rect[3] > 0.0 && narrow_opacity > 0.0,
+            "narrow details popover must be visible: rect={narrow_rect:?} opacity={narrow_opacity}"
+        );
+
+        // Widening the window makes the notice fit on one line, unmounting the Details button.
+        rt.state.viewport_width = 1920.0;
+        rt.set_viewport((1920.0, 720.0), 1.0);
+        rt.invalidate();
+        rt.frame(2.5);
+        assert!(
+            rt.presented("composer-notice-details-att-mid").is_none(),
+            "Details button should unmount once the notice fits at 1920 px"
+        );
+        let (wide_rect, wide_opacity) = rt
+            .presented("composer-notice-details-popover")
+            .expect("details popover must fall back to a mounted notice anchor on widen");
+        assert!(
+            wide_rect[2] > 0.0 && wide_rect[3] > 0.0 && wide_opacity > 0.0,
+            "widened details popover must not be suppressed: rect={wide_rect:?} opacity={wide_opacity}"
+        );
+        assert!(
+            wide_rect[0] >= -1.0 && wide_rect[0] + wide_rect[2] <= 1921.0,
+            "{wide_rect:?}"
+        );
+        assert!(
+            wide_rect[1] >= -1.0 && wide_rect[1] + wide_rect[3] <= 721.0,
+            "{wide_rect:?}"
+        );
+
+        press(&mut rt, "close-notice-details");
+        rt.frame(3.0);
+        rt.frame(4.0);
+        assert!(rt.presented("composer-notice-details-popover").is_none());
+        assert!(rt.state.composer_notices.open_details_notice().is_none());
     }
 
     #[test]

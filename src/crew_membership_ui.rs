@@ -65,6 +65,7 @@ pub(super) fn more_menu(s: &State, p: Palette, captain: usize, thread_id: usize)
                     thread: thread_id,
                     mode: MoveMode::Move { from: captain },
                     anchor: format!("crew-chip-{thread_id}"),
+                    at: None,
                 });
             },
         ))
@@ -142,11 +143,26 @@ fn report_mutation(s: &mut State, result: Result<crate::model::CrewMutation, Str
 /// The move picker: the other captains with their portraits, in the row structure of
 /// `captain_picker`. In Join mode every captain is a target; in Move mode the current
 /// owner drops out. Disabled rows carry the scope/idle reason.
-pub(super) fn move_picker(s: &State, p: Palette) -> Option<El> {
+pub(super) fn move_picker(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
     let picker = s.brief.moving.as_ref()?;
     if picker.server != s.machines.selected {
         return None;
     }
+    let anchor = if cx.layout_with(&picker.anchor, |_| ()).is_some() {
+        picker.anchor.clone()
+    } else if picker.at.is_some() {
+        "crew-move-point".to_owned()
+    } else if cx.layout_with("thread-actions", |_| ()).is_some() {
+        "thread-actions".to_owned()
+    } else {
+        return Some(
+            el().key("crew-move-dismiss")
+                .absolute(0.0, 0.0)
+                .size(0.0, 0.0)
+                .a11y_hidden()
+                .on_layout(|s: &mut State, _| s.brief.moving = None),
+        );
+    };
     let thread_id = picker.thread;
     let expected = picker.server.clone();
     let thread_title = s
@@ -258,13 +274,8 @@ pub(super) fn move_picker(s: &State, p: Palette) -> Option<El> {
         menu = menu.child(quiet_note("No other captains.", p));
     }
     Some(
-        menu.anchored_fit(
-            picker.anchor.clone(),
-            rune::Side::Bottom,
-            rune::Align::End,
-            4.0,
-        )
-        .modal(true, |s: &mut State| s.brief.moving = None),
+        menu.anchored_fit(anchor, rune::Side::Bottom, rune::Align::End, 4.0)
+            .modal(true, |s: &mut State| s.brief.moving = None),
     )
 }
 
@@ -282,10 +293,19 @@ fn structurally_excluded(thread: &crate::model::Thread) -> bool {
 /// The recruit palette over the Brief's Recruit button: a search field, the eligible
 /// roots under "Can join", then the unavailable rows with their real blocker under
 /// "Can't join yet". Keyboard follows the focus group: arrows skip disabled rows.
-pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize) -> Option<El> {
+pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize, cx: &Cx<State>) -> Option<El> {
     let picker = s.brief.recruit.as_ref()?;
     if picker.server != s.machines.selected || picker.captain != captain {
         return None;
+    }
+    if cx.layout_with("crew-roster-recruit", |_| ()).is_none() {
+        return Some(
+            el().key("crew-recruit-dismiss")
+                .absolute(0.0, 0.0)
+                .size(0.0, 0.0)
+                .a11y_hidden()
+                .on_layout(|s: &mut State, _| s.brief.recruit = None),
+        );
     }
     let expected = picker.server.clone();
     let expected_submit = expected.clone();

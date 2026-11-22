@@ -781,6 +781,8 @@ pub struct MovePicker {
     pub mode: MoveMode,
     /// The element key the picker hangs from.
     pub anchor: String,
+    /// Captured pointer position when opened from a context menu without a mounted row.
+    pub at: Option<(f32, f32)>,
 }
 
 /// The Captain lifecycle actions the shared confirmation dialog can ask for.

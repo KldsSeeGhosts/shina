@@ -806,7 +806,17 @@ pub(super) fn plan_menu(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
     let anchor = format!("plan-actions-{id}");
     // Under Rune #1339 an anchored modal whose trigger scrolled out of the
     // virtualized timeline is suppressed visually while still holding focus.
-    cx.layout_with(&anchor, |_| ())?;
+    // Dismiss the state on layout instead of mounting an invisible modal or
+    // leaving `plan_menu` stale.
+    if cx.layout_with(&anchor, |_| ()).is_none() {
+        return Some(
+            el().key("plan-menu-dismiss")
+                .absolute(0.0, 0.0)
+                .size(0.0, 0.0)
+                .a11y_hidden()
+                .on_layout(|s: &mut State, _| s.plan_menu = None),
+        );
+    }
     let t = s.current();
     let prefix = format!("{}-", t.id);
     let index = id
