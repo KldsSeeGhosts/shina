@@ -680,9 +680,7 @@ pub(super) fn crew_section(s: &State, p: Palette, captain: usize) -> El {
         );
         for member in group_members {
             let key = format!("crew-chip-{}", member.thread_id);
-            let mut member_row = super::crew_ui::roster_row(s, p, member, key, true)
-                .h(32.0)
-                .px(10.0);
+            let mut member_row = super::crew_ui::roster_row(s, p, member, key, true);
             if member.thread_id == current {
                 member_row = member_row.fill(super::crew_ui::active_wash(s, p));
             }
@@ -1801,6 +1799,9 @@ mod tests {
         rt.state.threads.push(recruit);
         let ordinary = rt.state.threads.len() - 1;
         press(&mut rt, "crew-roster-toggle");
+        rt.frame(0.25);
+        press(&mut rt, "now-popover-open-inspector");
+        rt.frame(0.25);
         press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         press(&mut rt, &format!("crew-recruit-{thread_id}"));

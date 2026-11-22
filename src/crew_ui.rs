@@ -13,6 +13,7 @@ use rune::Transition;
 
 /// Row corners, shared by cards, chips and popover items.
 const ROW_RADIUS: f32 = 4.0;
+const ROW_TEXT: TextStyle = TextStyle::new(13.0, 500.0).lh(19.0).tracking(-0.08);
 /// Width of a card's elapsed-time slot: room for "1h 05m" and "#8 queued" in tabular figures.
 const ELAPSED_SLOT: f32 = 72.0;
 /// Where a card's second and later lines start: past the status mark's 14 px slot and its gap.
@@ -1001,10 +1002,9 @@ pub(super) fn roster_row(
         })
         .focusable(true)
         .center_y()
-        .gap(7.0)
-        .h(52.0)
-        .pl(8.0)
-        .pr(6.0)
+        .gap(8.0)
+        .h(44.0)
+        .px(10.0)
         .radius(ROW_RADIUS)
         .hover(hover_wash(s, p))
         .press(active_wash(s, p))
@@ -1026,7 +1026,7 @@ pub(super) fn roster_row(
                 }
                 let items = needs_you_items(s);
                 if let Some(idx) = items.iter().position(|item| item.thread_id == child) {
-                    s.needs_you_page = idx;
+                    s.needs_you_page = thread_request_pages(s) + idx;
                     if s.inspector_covers() {
                         let key = s.panel_key();
                         s.right_panels.close(&key);
@@ -1036,7 +1036,7 @@ pub(super) fn roster_row(
             }
             open_thread(s, child);
         })
-        .child(crewmate_avatar(s, p, &member.model, member.status, 32.0))
+        .child(crewmate_avatar(s, p, &member.model, member.status, 24.0))
         .child(
             col()
                 .grow(1.0)
@@ -1045,10 +1045,11 @@ pub(super) fn roster_row(
                 .child(label(&member.title, TITLE, p.ink).truncate())
                 .child(
                     label(
+                        // The clock column names the state, so this line is the model.
                         if member.model.is_empty() {
                             member.word.clone()
                         } else {
-                            format!("{} · {}", member.word, member.model)
+                            member.model.clone()
                         },
                         SMALL,
                         p.muted,
@@ -1099,67 +1100,158 @@ pub(super) fn roster_row(
     row_
 }
 
-/// `crew_tray_shows` prices the tray in the composer's stack budget before it is built.
+/// `crew_tray_shows` prices the 28 pt Now / crew & subagents strip in the composer's
+/// stack budget before it is built.
 pub(super) fn crew_tray_shows(s: &State) -> bool {
-    s.is_captain_home(s.current()) && s.current().captain.is_some()
+    let t = s.current();
+    (s.is_captain_home(t) && t.captain.is_some()) || !crate::agents::runs(t).is_empty()
 }
 
-/// The 28 pt crew strip above the composer (spec §3.6): icon, "Crew", member count,
-/// status summary and a chevron on the left, the Plan toggle on the right. It never
-/// expands in place — pressing it toggles the Inspector on the Crew tab.
-pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, _rows_max: Option<f32>) -> Option<El> {
+/// The 28 pt Now / crew & subagents strip above the composer, modeled on KSG Code's
+/// `QueuedRunsControl` and `ThreadRelationshipsControl`: shows Crew counts on a Captain
+/// home (plus any active subagents), or subagent counts on a plain thread with agents.
+/// Pressing it toggles the dismissible `now_popover`.
+pub(super) fn crew_tray(s: &State, p: Palette, lane: f32, _rows_max: Option<f32>) -> Option<El> {
     let t = s.current();
-    if !s.is_captain_home(t) {
+    let captain = t.captain.filter(|_| s.is_captain_home(t));
+    let subagents = crate::agents::runs(t);
+    if captain.is_none() && subagents.is_empty() {
         return None;
     }
-    let captain = t.captain?;
-    let members = roster_members(s, t.id, captain);
-    let plan = super::plan_ui::plan_toggle(s, p);
-    // One definition of working, shared with the chat header: running now. A worker waiting
-    // on an approval needs you instead, and a queued one waits for a slot. Independent crew
-    // members count the same way; only an idle member is no task at all.
-    let count = |want: Status| members.iter().filter(|m| m.status == want).count();
-    let (working, needs_you) = (count(Status::Running), count(Status::Waiting));
-    let offline = count(Status::Paused);
-    let queued = members.iter().filter(|m| m.queued).count();
+    let narrow = lane < 480.0;
+    let open = s.now_popover;
+    let chevron = if open { "chevron-up" } else { "chevron-down" };
+    if let Some(captain) = captain {
+        let members = roster_members(s, t.id, captain);
+        let count = |want: Status| members.iter().filter(|m| m.status == want).count();
+        let active_subagents = subagents.iter().filter(|r| r.state.active()).count();
+        let (working, needs_you) = (
+            count(Status::Running) + active_subagents,
+            count(Status::Waiting),
+        );
+        let offline = count(Status::Paused);
+        let queued = members.iter().filter(|m| m.queued).count();
+        let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
+        let ordered = [
+            (
+                "crew-tray-needs-you",
+                needs_you,
+                Status::Waiting,
+                "needs you",
+            ),
+            ("crew-tray-working", working, Status::Running, "working"),
+            ("crew-tray-queued", queued, Status::Ready, "queued"),
+            ("crew-tray-offline", offline, Status::Paused, "offline"),
+        ];
+        let wide_order = [
+            ("crew-tray-working", working, Status::Running, "working"),
+            (
+                "crew-tray-needs-you",
+                needs_you,
+                Status::Waiting,
+                "needs you",
+            ),
+            ("crew-tray-queued", queued, Status::Ready, "queued"),
+            ("crew-tray-offline", offline, Status::Paused, "offline"),
+        ];
+        let chosen: Vec<_> = if narrow {
+            ordered
+                .into_iter()
+                .filter(|(_, n, _, _)| *n > 0)
+                .take(2)
+                .collect()
+        } else {
+            wide_order
+                .into_iter()
+                .filter(|(_, n, _, _)| *n > 0)
+                .collect()
+        };
+        for (key, n, status, word) in chosen {
+            summary = summary.child(
+                row()
+                    .key(key)
+                    .gap(6.0)
+                    .center_y()
+                    .child(mark_slot(status, p))
+                    .child(super::meta_text(
+                        format!("{n} {word}"),
+                        super::status_ink(status, p),
+                    )),
+            );
+        }
+        return Some(
+            row()
+                .key("crew-tray")
+                .role("group")
+                .label("Crew")
+                .h(28.0)
+                .gap(8.0)
+                .center_y()
+                .child(
+                    row()
+                        .key("crew-roster-toggle")
+                        .role("button")
+                        .cursor(rune::Cursor::Pointer)
+                        .label(format!(
+                            "Crew, {} members. Toggle crew popover",
+                            members.len()
+                        ))
+                        .expanded(open)
+                        .focusable(true)
+                        .h_full()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .px(6.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(ROW_RADIUS)
+                        .fill(if open { p.selected } else { Color::TRANSPARENT })
+                        .hover(hover_wash(s, p))
+                        .hover_motion(motion(), motion())
+                        .on_press(|s: &mut State| {
+                            s.now_popover = !s.now_popover;
+                        })
+                        .child(icon("crew", p.muted))
+                        .child(meta_label("Crew", p.muted))
+                        .child(
+                            meta_text(members.len().to_string(), p.faint).key("crew-roster-count"),
+                        )
+                        .child(summary)
+                        .child(icon(chevron, p.faint).size(12.0, 12.0)),
+                ),
+        );
+    }
+
+    // Plain or worker thread with provider subagents.
+    let working = subagents
+        .iter()
+        .filter(|r| r.state == crate::agents::AgentState::Working)
+        .count();
+    let queued = subagents
+        .iter()
+        .filter(|r| r.state == crate::agents::AgentState::Queued)
+        .count();
+    let failed = subagents
+        .iter()
+        .filter(|r| r.state == crate::agents::AgentState::Failed)
+        .count();
+    let done = subagents
+        .iter()
+        .filter(|r| r.state == crate::agents::AgentState::Done)
+        .count();
     let mut summary = row().key("crew-tray-summary").gap(8.0).center_y();
-    // Under 480 pt of lane the summary shows at most two segments, needs you first.
-    let narrow = _lane < 480.0;
-    let ordered = [
-        (
-            "crew-tray-needs-you",
-            needs_you,
-            Status::Waiting,
-            "needs you",
-        ),
+    let segments = [
         ("crew-tray-working", working, Status::Running, "working"),
         ("crew-tray-queued", queued, Status::Ready, "queued"),
-        ("crew-tray-offline", offline, Status::Paused, "offline"),
+        ("crew-tray-failed", failed, Status::Failed, "failed"),
+        ("crew-tray-done", done, Status::Completed, "done"),
     ];
-    let wide_order = [
-        ("crew-tray-working", working, Status::Running, "working"),
-        (
-            "crew-tray-needs-you",
-            needs_you,
-            Status::Waiting,
-            "needs you",
-        ),
-        ("crew-tray-queued", queued, Status::Ready, "queued"),
-        ("crew-tray-offline", offline, Status::Paused, "offline"),
-    ];
-    let chosen: Vec<_> = if narrow {
-        ordered
-            .into_iter()
-            .filter(|(_, n, _, _)| *n > 0)
-            .take(2)
-            .collect()
-    } else {
-        wide_order
-            .into_iter()
-            .filter(|(_, n, _, _)| *n > 0)
-            .collect()
-    };
-    for (key, n, status, word) in chosen {
+    let limit = if narrow { 2 } else { 4 };
+    for (key, n, status, word) in segments
+        .into_iter()
+        .filter(|(_, n, _, _)| *n > 0)
+        .take(limit)
+    {
         summary = summary.child(
             row()
                 .key(key)
@@ -1176,7 +1268,7 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, _rows_max: Option<f32
         row()
             .key("crew-tray")
             .role("group")
-            .label("Crew")
+            .label("Now")
             .h(28.0)
             .gap(8.0)
             .center_y()
@@ -1186,118 +1278,316 @@ pub(super) fn crew_tray(s: &State, p: Palette, _lane: f32, _rows_max: Option<f32
                     .role("button")
                     .cursor(rune::Cursor::Pointer)
                     .label(format!(
-                        "Crew, {} members. Open the crew panel",
-                        members.len()
+                        "Now, {} agents. Toggle activity popover",
+                        subagents.len()
                     ))
+                    .expanded(open)
                     .focusable(true)
                     .h_full()
                     .grow(1.0)
                     .min_w(0.0)
+                    .px(6.0)
+                    .gap(8.0)
+                    .center_y()
+                    .radius(ROW_RADIUS)
+                    .fill(if open { p.selected } else { Color::TRANSPARENT })
+                    .hover(hover_wash(s, p))
+                    .hover_motion(motion(), motion())
+                    .on_press(|s: &mut State| {
+                        s.now_popover = !s.now_popover;
+                    })
+                    .child(icon("agents", p.muted))
+                    .child(meta_label("Now", p.muted))
+                    .child(meta_text(subagents.len().to_string(), p.faint).key("crew-roster-count"))
+                    .child(summary)
+                    .child(icon(chevron, p.faint).size(12.0, 12.0)),
+            ),
+    )
+}
+
+/// Dismissible anchored popover for the 28 pt Now / crew & subagents strip, modeled on
+/// KSG Code's `ThreadRelationshipsControl` lineage card. Lists active and recent crew
+/// members (on a Captain home) and/or provider subagents (on any thread), with one
+/// action at the bottom to open the Inspector's Work tab.
+pub(super) fn now_popover(s: &State, p: Palette, lane: f32) -> El {
+    let t = s.current();
+    let captain = t.captain.filter(|_| s.is_captain_home(t));
+    let subagents = crate::agents::runs(t);
+    let width = lane.clamp(280.0, 380.0);
+    let mut body = col().gap(2.0).w_full();
+    let total_count: usize;
+    let heading: &str;
+
+    if let Some(captain_idx) = captain {
+        heading = "Crew";
+        let members = roster_members(s, t.id, captain_idx);
+        total_count = members.len();
+        let groups: [(&str, fn(&RosterMember) -> bool); 5] = [
+            ("Needs you", |m| m.status == Status::Waiting),
+            ("Working", |m| m.status == Status::Running),
+            ("Queued", |m| m.queued),
+            ("Offline", |m| m.status == Status::Paused),
+            ("Idle", |_| true),
+        ];
+        let mut placed: std::collections::HashSet<usize> = Default::default();
+        for (group_title, matches) in groups {
+            let group_members: Vec<&RosterMember> = members
+                .iter()
+                .filter(|m| !placed.contains(&m.thread_id) && matches(m))
+                .collect();
+            if group_members.is_empty() {
+                continue;
+            }
+            placed.extend(group_members.iter().map(|m| m.thread_id));
+            body = body.child(
+                row()
+                    .h(24.0)
+                    .px(8.0)
+                    .center_y()
+                    .child(meta_label(group_title, p.faint))
+                    .child(spacer())
+                    .child(label(group_members.len().to_string(), TIMER, p.faint)),
+            );
+            for member in group_members {
+                let id = member.thread_id;
+                let detail = member
+                    .place
+                    .as_deref()
+                    .filter(|place| !place.is_empty())
+                    .unwrap_or(crate::model::status_word(member.status));
+                body = body.child(
+                    row()
+                        .key(format!("now-popover-member-{id}"))
+                        .role("button")
+                        .cursor(rune::Cursor::Pointer)
+                        .label(format!("Open {}, {detail}", member.title))
+                        .focusable(true)
+                        .h(34.0)
+                        .px(8.0)
+                        .gap(8.0)
+                        .center_y()
+                        .radius(ROW_RADIUS)
+                        .hover(hover_wash(s, p))
+                        .press(active_wash(s, p))
+                        .hover_motion(motion(), motion())
+                        .on_press(move |s: &mut State| {
+                            s.now_popover = false;
+                            open_thread(s, id);
+                        })
+                        .child(mark_slot(member.status, p))
+                        .child(
+                            label(&member.title, ROW_TEXT, p.ink)
+                                .truncate()
+                                .grow(1.0)
+                                .min_w(0.0),
+                        )
+                        .child(
+                            label(detail, SMALL, super::status_ink(member.status, p))
+                                .truncate()
+                                .max_w(120.0),
+                        ),
+                );
+            }
+        }
+        if members.is_empty() && subagents.is_empty() {
+            body = body.child(
+                label("No active crew members.", SMALL, p.muted)
+                    .px(8.0)
+                    .py(6.0),
+            );
+        }
+    } else {
+        heading = "Now";
+        total_count = subagents.len();
+    }
+
+    if !subagents.is_empty() {
+        if captain.is_some() {
+            body = body.child(
+                row()
+                    .h(24.0)
+                    .px(8.0)
+                    .center_y()
+                    .child(meta_label("Agents", p.faint))
+                    .child(spacer())
+                    .child(label(subagents.len().to_string(), TIMER, p.faint)),
+            );
+        }
+        for run in &subagents {
+            let (status, word) = super::agents_ui::status(run.state);
+            let tool_id = run.tool_id.to_owned();
+            let suffix = format!("{}-{}", run.tool_id, run.index);
+            let summary = run
+                .activity
+                .filter(|line| !line.is_empty())
+                .unwrap_or(run.brief);
+            let elapsed = if run.state.active() {
+                run.started.map(|at| at.elapsed().as_secs())
+            } else {
+                run.duration_ms.map(|ms| ms / 1000)
+            };
+            body = body.child(
+                row()
+                    .key(format!("now-popover-agent-{suffix}"))
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label(format!("Show {}, {word}", run.name))
+                    .focusable(true)
+                    .min_h(36.0)
+                    .px(8.0)
+                    .py(4.0)
                     .gap(8.0)
                     .center_y()
                     .radius(ROW_RADIUS)
                     .hover(hover_wash(s, p))
+                    .press(active_wash(s, p))
                     .hover_motion(motion(), motion())
                     .on_press(move |s: &mut State| {
-                        // Toggle the Inspector on the Crew tab (spec §3.6).
-                        let key = s.panel_key();
-                        s.right_panels
-                            .toggle(&key, crate::right_panel::SingletonKind::Crew);
+                        s.now_popover = false;
+                        s.reveal_tool(tool_id.clone());
                     })
-                    .child(icon("crew", p.muted))
-                    .child(meta_label("Crew", p.muted))
-                    .child(meta_text(members.len().to_string(), p.faint).key("crew-roster-count"))
-                    .child(summary)
-                    .child(icon("chevron-right", p.faint).size(12.0, 12.0)),
+                    .child(mark_slot(status, p))
+                    .child(
+                        col()
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .gap(1.0)
+                            .child(label(run.name.as_ref(), ROW_TEXT, p.ink).truncate())
+                            .child(
+                                label(
+                                    if summary.is_empty() { word } else { summary },
+                                    SMALL,
+                                    p.muted,
+                                )
+                                .truncate(),
+                            ),
+                    )
+                    .child(label(
+                        elapsed.map_or_else(|| word.to_owned(), elapsed_label),
+                        TIMER,
+                        super::status_ink(status, p),
+                    )),
+            );
+        }
+    }
+
+    let header = row()
+        .h(28.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .child(meta_label(heading, p.ink))
+        .child(meta_text(total_count.to_string(), p.faint))
+        .child(spacer())
+        .child(
+            icon_button(
+                "now-popover-close",
+                "Close activity popover",
+                "close",
+                p,
+                |s: &mut State| s.now_popover = false,
             )
-            .child(plan.unwrap_or_else(el)),
+            .autofocus(),
+        );
+
+    let footer = row()
+        .key("now-popover-open-inspector")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label("Open Work panel")
+        .focusable(true)
+        .h(30.0)
+        .px(8.0)
+        .gap(6.0)
+        .center_y()
+        .radius(ROW_RADIUS)
+        .hover(hover_wash(s, p))
+        .press(active_wash(s, p))
+        .hover_motion(motion(), motion())
+        .on_press(move |s: &mut State| {
+            s.now_popover = false;
+            let key = s.panel_key();
+            s.right_panels
+                .open(&key, crate::right_panel::SingletonKind::Work);
+        })
+        .child(icon("agents", p.muted).size(14.0, 14.0))
+        .child(label("Open Work panel", SMALL, p.ink).grow(1.0).min_w(0.0))
+        .child(icon("chevron-right", p.faint).size(12.0, 12.0));
+
+    col()
+        .key("now-popover")
+        .role("dialog")
+        .label(heading)
+        .w(width)
+        .padding(6.0)
+        .gap(4.0)
+        .radius(12.0)
+        .fill(p.card)
+        .border(1.0, p.frame)
+        .box_shadow(soft_shadow(p))
+        .child(header)
+        .child(el().h(1.0).w_full().fill(p.line).hairline())
+        .child(
+            col()
+                .key("now-popover-list")
+                .w_full()
+                .max_h(260.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(body),
+        )
+        .child(el().h(1.0).w_full().fill(p.line).hairline())
+        .child(footer)
+        .anchored_fit("crew-tray", rune::Side::Top, rune::Align::Start, 6.0)
+        .on_key(|s: &mut State, ev, _| {
+            let escape = ev.key == rune::Key::Escape;
+            if escape {
+                s.now_popover = false;
+            }
+            escape
+        })
+        .focus_return("crew-roster-toggle")
+        .modal(true, |s: &mut State| s.now_popover = false)
+}
+
+/// Pages the current thread's own request takes at the front of the unified request
+/// banner: one when a non-questionnaire request is showing, otherwise none.
+pub(super) fn thread_request_pages(s: &State) -> usize {
+    let t = s.current();
+    usize::from(
+        t.request.is_some()
+            && !t.request_held_by_typing_guard()
+            && t.native.questionnaire.is_none(),
     )
 }
 
-/// Whether `needs_you` draws, so the composer's stack budget can price it before building.
-pub(super) fn needs_you_shows(s: &State) -> bool {
+/// Total number of paged requests in the unified composer request surface: the current
+/// thread's own non-questionnaire request (if visible), plus Captain home crew live
+/// requests and user-addressed crew report questions.
+pub(super) fn unified_request_total(s: &State) -> usize {
+    let t = s.current();
+    let thread_req = thread_request_pages(s);
+    if s.is_captain_home(t) {
+        thread_req + needs_you_items(s).len() + super::crew_questions_ui::user_question_count(s)
+    } else {
+        thread_req
+    }
+}
+
+/// The live crew approval/question items for the current Captain home.
+pub(super) fn needs_you_items(s: &State) -> Vec<AttentionItem> {
     let t = s.current();
     if !s.is_captain_home(t) {
-        return false;
+        return Vec::new();
     }
-    s.attention()
-        .into_iter()
-        .any(|item| needs_you_item(s, t.id, &item))
-        || super::crew_questions_ui::cards_shows(s)
-}
-/// The request items the needs-you bar pages through: live approvals/questions plus the
-/// report questions, so the pager's "n of m" counts everything the bar can show.
-fn needs_you_items(s: &State) -> Vec<AttentionItem> {
-    let t = s.current();
     s.attention()
         .into_iter()
         .filter(|item| needs_you_item(s, t.id, item))
         .collect()
 }
 
-/// Approvals and questions from this captain's crew, ported from KSG Code's
-/// `ChildThreadApprovals` but reduced to one request at a time (spec §3.6): a 52 pt
-/// card with the request, its actions and a pager when more than one waits.
-pub(super) fn needs_you(s: &State, p: Palette, lane: f32) -> Option<El> {
-    let t = s.current();
-    if !s.is_captain_home(t) {
-        return None;
-    }
-    let items = needs_you_items(s);
-    let user_reports = super::crew_questions_ui::user_question_count(s);
-    let captain_line = super::crew_questions_ui::captain_questions_line(s, p);
-    let total = items.len() + user_reports;
-    if total == 0 && captain_line.is_none() {
-        return None;
-    }
-    let mut card_stack = col().gap(6.0);
-    if total > 0 {
-        // Unified pager over live requests AND user report questions: only one card
-        // mounts at a time so report questions never stack below approvals.
-        let page = s.needs_you_page.min(total - 1);
-        if page < items.len() {
-            card_stack = card_stack.child(needs_you_card(s, p, &items[page], page, total, lane));
-        } else if let Some(report_card) =
-            super::crew_questions_ui::user_question_card(s, p, page - items.len())
-        {
-            let mut wrapped = col().gap(4.0);
-            if total > 1 {
-                wrapped = wrapped.child(
-                    row()
-                        .gap(6.0)
-                        .center_y()
-                        .justify_end()
-                        .child(pager_controls(p, page, total)),
-                );
-            }
-            card_stack = card_stack.child(wrapped.child(report_card));
-        }
-    }
-    if let Some(line) = captain_line {
-        card_stack = card_stack.child(line);
-    }
-    let is_form = total > 0 && s.needs_you_page.min(total - 1) >= items.len();
-    let mut region = col()
-        .key("needs-you")
-        .role("region")
-        .label("Needs you")
-        .shrink();
-    if is_form {
-        region = region.max_h(220.0).scroll(ScrollSpec {
-            stick_bottom: false,
-        });
-    }
-    Some(region.child(card_stack))
-}
-
-pub(super) fn needs_you_active_is_form(s: &State) -> bool {
-    let items = needs_you_items(s);
-    let user_reports = super::crew_questions_ui::user_question_count(s);
-    let total = items.len() + user_reports;
-    total > 0 && s.needs_you_page.min(total - 1) >= items.len()
-}
-
-fn pager_controls(p: Palette, page: usize, total: usize) -> El {
+pub(super) fn pager_controls(p: Palette, page: usize, total: usize) -> El {
     row()
         .gap(4.0)
         .center_y()
@@ -1307,32 +1597,30 @@ fn pager_controls(p: Palette, page: usize, total: usize) -> El {
             "chevron-left",
             p,
             move |s: &mut State| {
-                let total =
-                    needs_you_items(s).len() + super::crew_questions_ui::user_question_count(s);
+                let total = unified_request_total(s);
                 let max = total.saturating_sub(1);
                 s.needs_you_page = s.needs_you_page.min(max).saturating_sub(1);
             },
         ))
-        .child(
-            label(format!("{} of {total}", page + 1), TIMER, p.faint).key("needs-you-page-count"),
-        )
+        .child(label(format!("{}/{total}", page + 1), TIMER, p.faint).key("needs-you-page-count"))
         .child(icon_button(
             "needs-you-next",
             "Next request",
             "chevron-right",
             p,
             move |s: &mut State| {
-                let total =
-                    needs_you_items(s).len() + super::crew_questions_ui::user_question_count(s);
+                let total = unified_request_total(s);
                 let max = total.saturating_sub(1);
                 s.needs_you_page = (s.needs_you_page + 1).min(max);
             },
         ))
 }
 
-/// The one paged request card: ring + question + source link on the left, pager and
-/// actions on the right. Lane under 520 pt wraps the actions to a second row.
-fn needs_you_card(
+/// The one paged crew request inside the unified composer request surface, ported from
+/// KSG Code's `ComposerRequestCard` and `ChildThreadApprovals`: compact header row with
+/// status mark, request title, source link, pager and actions. Under 520 pt the actions
+/// wrap into a footer row.
+pub(super) fn needs_you_card(
     s: &State,
     p: Palette,
     item: &AttentionItem,
@@ -1370,8 +1658,6 @@ fn needs_you_card(
     // be authorized safely from a one-line bar; route them to Review instead of blind Approve.
     let needs_full_review = approval && (message.contains('\n') || message.chars().count() > 140);
     let kind_word = if approval { "Approval" } else { "Question" };
-    // Second line: brass kind word, then the pressable source title (the old "Open"
-    // button), then a chevron.
     let mut meta = row()
         .gap(6.0)
         .center_y()
@@ -1460,7 +1746,6 @@ fn needs_you_card(
             },
         ));
     }
-    // KSG's `.child-approval-card` reduced: one 52 pt row, wrapping under 520 pt.
     let lane_narrow = lane < 520.0;
     let mut content = col()
         .key(format!("needs-you-{id}"))
@@ -1471,13 +1756,12 @@ fn needs_you_card(
         } else {
             String::new()
         })
-        .min_h(52.0)
-        .px(12.0)
-        .py(8.0)
-        .gap(10.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.line)
+        .w_full()
+        .min_w(0.0)
+        .pl(10.0)
+        .pr(13.0)
+        .py(6.0)
+        .gap(6.0)
         .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
     let row_ = row()
         .gap(10.0)

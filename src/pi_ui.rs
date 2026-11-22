@@ -114,251 +114,251 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
     live_form.edit(t.reply.text.clone());
     let can_advance = live_form.answer(form.index).is_some();
     let last = form.index + 1 == form.questions.len();
+    let mut drawer = col()
+        .key("questionnaire-drawer")
+        .w_full()
+        .min_w(0.0)
+        .padding(4.0)
+        .gap(4.0)
+        .child(
+            row()
+                .key("questionnaire-toggle")
+                .role("button")
+                .label(toggle_title)
+                .help(toggle_title)
+                .focusable(true)
+                .cursor(rune::Cursor::Pointer)
+                .min_h(32.0)
+                .w_full()
+                .min_w(0.0)
+                .pl(10.0)
+                .pr(13.0)
+                .center_y()
+                .gap(8.0)
+                .radius(8.0)
+                .hover(p.selected)
+                .on_press(move |s: &mut State| {
+                    if s.current().id == thread_id
+                        && s.machines.selected == toggle_machine
+                        && s.current().question_scope() == toggle_scope
+                    {
+                        s.current_mut().toggle_questionnaire();
+                    }
+                })
+                .child(icon("info", p.brass).size(13.0, 13.0).a11y_hidden())
+                .child(
+                    label(&question.header, LABEL, p.ink)
+                        .grow(if collapsed { 0.0 } else { 1.0 })
+                        .max_w(if collapsed {
+                            (lane - 48.0).max(0.0) * 0.5
+                        } else {
+                            f32::INFINITY
+                        })
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(if collapsed {
+                    row()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .gap(4.0)
+                        .child(label("·", SMALL, p.faint))
+                        .child(
+                            label(&question.text, SMALL, p.faint)
+                                .key("questionnaire-summary")
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .truncate(),
+                        )
+                } else {
+                    el()
+                })
+                .child(if form.questions.len() > 1 {
+                    label(
+                        format!("{}/{}", form.index + 1, form.questions.len()),
+                        TIMER,
+                        p.faint,
+                    )
+                    .key("questionnaire-count")
+                } else {
+                    el()
+                })
+                .child(
+                    icon(if collapsed { "chevron-up" } else { "chevron" }, p.muted).a11y_hidden(),
+                )
+                .child(if dismissible {
+                    icon_button(
+                        "dialog-cancel",
+                        "Dismiss question without answering",
+                        "close",
+                        p,
+                        move |s| {
+                            if s.current().id != thread_id
+                                || s.machines.selected != machine
+                                || s.current().question_scope() != question_scope
+                            {
+                                return;
+                            }
+                            if let Err(error) = s.dismiss_question(thread_id, &request_id) {
+                                s.current_mut().error = Some(error);
+                            }
+                        },
+                    )
+                    .help("Dismiss question without answering")
+                    .disabled(dismissal_disabled)
+                } else {
+                    el()
+                }),
+        );
+    if !collapsed {
+        let mut body = col()
+            .key("questionnaire-scroll")
+            .w_full()
+            .min_w(0.0)
+            .gap(6.0)
+            .max_h((s.viewport_height * 0.32).clamp(96.0, 260.0))
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            })
+            .child(
+                col().px(10.0).pt(2.0).pb(2.0).child(
+                    markdown_ui::render_with_find(
+                        &question.text,
+                        p,
+                        s.dark,
+                        false,
+                        false,
+                        false,
+                        &format!("question-{}-{}", t.id, question.id),
+                        &s.unwrapped_code_blocks,
+                        None,
+                    )
+                    .key("questionnaire-markdown"),
+                ),
+            );
+        if !question.options.is_empty() {
+            body = body.child(super::request_card_well(p, true, options));
+        }
+        drawer = drawer.child(body);
+    }
+    if question.allow_custom {
+        drawer = drawer.child(
+            col().pl(10.0).pr(13.0).pt(2.0).w_full().min_w(0.0).child(
+                text_input(&t.reply, BODY)
+                    .key("dialog-reply")
+                    .label("Other answer")
+                    .placeholder(
+                        "Type your own answer, or leave this blank to use the selected option",
+                        p.muted,
+                    )
+                    .color(p.ink)
+                    .w_full()
+                    .min_h(32.0)
+                    .max_h(72.0)
+                    .px(10.0)
+                    .py(6.0)
+                    .radius(8.0)
+                    .fill(p.card)
+                    .field_focus(&t.reply, p)
+                    .disabled(disabled)
+                    .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
+                    .on_input_change(|s: &mut State, _| {
+                        s.current_mut().questionnaire_changed();
+                        if let Some(scope) = s.current().question_scope() {
+                            s.with_question_draft(s.active, scope, |s| {
+                                s.current_mut().reconcile_draft_context()
+                            });
+                        }
+                    })
+                    .on_input_key(|s: &mut State, event, tx| {
+                        if event.is_command('c') || event.is_command('x') {
+                            let cut = event.is_command('x');
+                            if let Some(scope) = s.current().question_scope()
+                                && let Some(content) = s
+                                    .with_question_draft(s.active, scope, |s| {
+                                        s.copy_composer_selection(cut)
+                                    })
+                                    .flatten()
+                            {
+                                tx.copy_rich(content);
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .on_input_paste(|s: &mut State, content, _| {
+                        s.paste_composer_content(content, false)
+                    })
+                    .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false)),
+            ),
+        );
+    }
+    let files = t.question_files();
+    if !files.is_empty() {
+        drawer = drawer.child(
+            row()
+                .key("question-attachments")
+                .pl(10.0)
+                .pr(13.0)
+                .gap(8.0)
+                .flex_wrap()
+                .children(files.iter().map(|file| attachment_chip(s, p, file))),
+        );
+    }
+    let mut footer = row().w_full().min_w(0.0).gap(6.0).center_y().flex_wrap();
+    if question.allow_custom
+        && s.client.as_ref().is_none_or(|c| {
+            c.supports_capability(&s.machines.selected, crate::protocol::QUESTION_ATTACHMENTS)
+        })
+    {
+        footer = footer.child(attach_control(disabled, p));
+    }
+    footer = footer.child(spacer());
+    if form.index > 0 {
+        footer = footer.child(
+            button("questionnaire-previous", "Previous", p, |s| {
+                s.current_mut().questionnaire_step(true)
+            })
+            .disabled(disabled),
+        );
+    }
+    footer = footer.child(
+        button(
+            if last {
+                "dialog-submit"
+            } else {
+                "questionnaire-next"
+            },
+            if t.responding_request.is_some() || t.question_submission_pending() {
+                "Submitting..."
+            } else if s.viewport_width < 640.0 {
+                if last { "Submit" } else { "Next" }
+            } else if !last {
+                "Next question"
+            } else if form.index > 0 {
+                "Submit answers"
+            } else {
+                "Submit answer"
+            },
+            p,
+            |s| s.current_mut().questionnaire_step(false),
+        )
+        .disabled(disabled || !can_advance || last && !live_form.complete()),
+    );
+    if t.status.busy() || t.stop_control.phase().is_some() {
+        footer = footer.child(
+            icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
+                s.current_mut().stop();
+            })
+            .disabled(t.stop_control.disabled()),
+        );
+    }
     col()
         .key("pi-dialog")
         .role("group")
         .label("Pi needs your input")
         .w_full()
-        .child(
-            col()
-                .key("questionnaire-drawer")
-                .w_full()
-                .padding(16.0)
-                .gap(8.0)
-                .radius(12.0)
-                .fill(p.card)
-                .border(1.0, p.frame)
-                .box_shadow(soft_shadow(p))
-                .child(
-                    row()
-                        .key("questionnaire-toggle")
-                        .role("button")
-                        .label(toggle_title)
-                        .help(toggle_title)
-                        .focusable(true)
-                        .cursor(rune::Cursor::Pointer)
-                        .py(6.0)
-                        .gap(8.0)
-                        .on_press(move |s: &mut State| {
-                            if s.current().id == thread_id
-                                && s.machines.selected == toggle_machine
-                                && s.current().question_scope() == toggle_scope
-                            {
-                                s.current_mut().toggle_questionnaire();
-                            }
-                        })
-                        .child(
-                            meta_label(&question.header, p.muted)
-                                .grow(if collapsed { 0.0 } else { 1.0 })
-                                .max_w(if collapsed {
-                                    (lane - 32.0).max(0.0) * 0.5
-                                } else {
-                                    f32::INFINITY
-                                })
-                                .min_w(0.0)
-                                .truncate(),
-                        )
-                        .child(if collapsed {
-                            row()
-                                .grow(1.0)
-                                .min_w(0.0)
-                                .gap(4.0)
-                                .child(label("·", SMALL, p.faint))
-                                .child(
-                                    label(&question.text, SMALL, p.muted)
-                                        .key("questionnaire-summary")
-                                        .grow(1.0)
-                                        .min_w(0.0)
-                                        .truncate(),
-                                )
-                        } else {
-                            el()
-                        })
-                        .child(if form.questions.len() > 1 {
-                            label(
-                                format!("{}/{}", form.index + 1, form.questions.len()),
-                                TIMER,
-                                p.muted,
-                            )
-                            .key("questionnaire-count")
-                        } else {
-                            el()
-                        })
-                        .child(
-                            icon(if collapsed { "chevron-up" } else { "chevron" }, p.muted)
-                                .a11y_hidden(),
-                        )
-                        .child(if dismissible {
-                            icon_button(
-                                "dialog-cancel",
-                                "Dismiss question without answering",
-                                "close",
-                                p,
-                                move |s| {
-                                    if s.current().id != thread_id
-                                        || s.machines.selected != machine
-                                        || s.current().question_scope() != question_scope
-                                    {
-                                        return;
-                                    }
-                                    if let Err(error) = s.dismiss_question(thread_id, &request_id) {
-                                        s.current_mut().error = Some(error);
-                                    }
-                                },
-                            )
-                            .help("Dismiss question without answering")
-                            .disabled(dismissal_disabled)
-                        } else {
-                            el()
-                        }),
-                )
-                .child(if !collapsed {
-                    col()
-                        .key("questionnaire-scroll")
-                        .w_full()
-                        .max_h((s.viewport_height * 0.32).clamp(96.0, 260.0))
-                        .scroll(ScrollSpec {
-                            stick_bottom: false,
-                        })
-                        .child(
-                            markdown_ui::render_with_find(
-                                &question.text,
-                                p,
-                                s.dark,
-                                false,
-                                false,
-                                false,
-                                &format!("question-{}-{}", t.id, question.id),
-                                &s.unwrapped_code_blocks,
-                                None,
-                            )
-                            .key("questionnaire-markdown"),
-                        )
-                        .child(options)
-                } else {
-                    el()
-                })
-                .child(if question.allow_custom {
-                    text_input(&t.reply, BODY)
-                        .key("dialog-reply")
-                        .label("Other answer")
-                        .placeholder(
-                            "Type your own answer, or leave this blank to use the selected option",
-                            p.muted,
-                        )
-                        .color(p.ink)
-                        .w_full()
-                        .min_h(32.0)
-                        .max_h(72.0)
-                        .px(8.0)
-                        .py(6.0)
-                        .radius(12.0)
-                        .fill(p.card)
-                        .field_focus(&t.reply, p)
-                        .disabled(disabled)
-                        .on_edit(|s: &mut State| s.current_mut().questionnaire_edit())
-                        .on_input_change(|s: &mut State, _| {
-                            s.current_mut().questionnaire_changed();
-                            if let Some(scope) = s.current().question_scope() {
-                                s.with_question_draft(s.active, scope, |s| {
-                                    s.current_mut().reconcile_draft_context()
-                                });
-                            }
-                        })
-                        .on_input_key(|s: &mut State, event, tx| {
-                            if event.is_command('c') || event.is_command('x') {
-                                let cut = event.is_command('x');
-                                if let Some(scope) = s.current().question_scope()
-                                    && let Some(content) = s
-                                        .with_question_draft(s.active, scope, |s| {
-                                            s.copy_composer_selection(cut)
-                                        })
-                                        .flatten()
-                                {
-                                    tx.copy_rich(content);
-                                    return true;
-                                }
-                            }
-                            false
-                        })
-                        .on_input_paste(|s: &mut State, content, _| {
-                            s.paste_composer_content(content, false)
-                        })
-                        .on_submit(|s: &mut State, _| s.current_mut().questionnaire_step(false))
-                } else {
-                    el()
-                })
-                .child(
-                    row()
-                        .key("question-attachments")
-                        .gap(8.0)
-                        .flex_wrap()
-                        .children(
-                            t.question_files()
-                                .iter()
-                                .map(|file| attachment_chip(s, p, file)),
-                        ),
-                )
-                .child(
-                    row()
-                        .gap(6.0)
-                        .flex_wrap()
-                        .child(
-                            if question.allow_custom
-                                && s.client.as_ref().is_none_or(|c| {
-                                    c.supports_capability(
-                                        &s.machines.selected,
-                                        crate::protocol::QUESTION_ATTACHMENTS,
-                                    )
-                                })
-                            {
-                                attach_control(disabled, p)
-                            } else {
-                                el()
-                            },
-                        )
-                        .child(if form.index > 0 {
-                            button("questionnaire-previous", "Previous", p, |s| {
-                                s.current_mut().questionnaire_step(true)
-                            })
-                            .disabled(disabled)
-                        } else {
-                            el()
-                        })
-                        .child(
-                            button(
-                                if last {
-                                    "dialog-submit"
-                                } else {
-                                    "questionnaire-next"
-                                },
-                                if t.responding_request.is_some() || t.question_submission_pending()
-                                {
-                                    "Submitting..."
-                                } else if s.viewport_width < 640.0 {
-                                    if last { "Submit" } else { "Next" }
-                                } else if !last {
-                                    "Next question"
-                                } else if form.index > 0 {
-                                    "Submit answers"
-                                } else {
-                                    "Submit answer"
-                                },
-                                p,
-                                |s| s.current_mut().questionnaire_step(false),
-                            )
-                            .disabled(disabled || !can_advance || last && !live_form.complete()),
-                        )
-                        .child(if t.status.busy() || t.stop_control.phase().is_some() {
-                            icon_button("stop-agent", t.stop_control.label(), "stop", p, |s| {
-                                s.current_mut().stop();
-                            })
-                            .disabled(t.stop_control.disabled())
-                        } else {
-                            el()
-                        }),
-                ),
-        )
+        .child(drawer.child(super::request_card_footer(footer)))
 }
 
 pub(crate) fn questionnaire_key(s: &mut State, event: &rune::KeyEvent) -> bool {
@@ -801,7 +801,7 @@ pub(super) fn subagent_results(s: &State, tool: &Tool, p: Palette) -> El {
         .child(
             button(
                 &format!("pi-subagents-open-{}", tool.id),
-                "Open in Agents",
+                "Open in Work",
                 p,
                 agents_ui::open,
             )

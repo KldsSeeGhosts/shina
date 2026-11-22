@@ -101,17 +101,16 @@ fn agents_tab_and_jump_use_the_originating_thread() {
         rt.state.current_mut().title = "Investigate deployment".into();
         rt.state.current_mut().renamed = true;
         let thread = rt.state.current().id;
-        assert!(!inspector_ui::tabs(&rt.state).contains(&crate::right_panel::PanelView::Agents));
         rt.state.current_mut().apply(json!({"type":"tool_execution_start","toolCallId":"dispatch","toolName":"subagent",
             "args":{"tasks":[{"agent":"scout","task":"Find the source"},{"agent":"test","task":"Check it"}]}}));
         rt.state
             .right_panels
-            .open(&rt.state.panel_key(), SingletonKind::Agents);
+            .open(&rt.state.panel_key(), SingletonKind::Work);
         rt.frame(0.0);
         let panel = bounds(&rt, "agents-panel", width);
         for index in 0..2 {
             let row = bounds(&rt, &format!("agent-row-dispatch-{index}"), width);
-            assert_eq!(row[3], 52.0);
+            assert_eq!(row[3], 44.0);
             assert!(row[0] >= panel[0] && row[0] + row[2] <= panel[0] + panel[2]);
         }
         assert!(rt.presented(&format!("thread-agents-{thread}")).is_some());
@@ -131,6 +130,48 @@ fn agents_tab_and_jump_use_the_originating_thread() {
         rt.frame(1.0);
         assert!(rt.presented(&format!("thread-agents-{thread}")).is_none());
     }
+}
+
+#[test]
+fn work_tab_stacks_subagents_above_the_crew_and_says_when_nothing_runs() {
+    // A plain thread with no subagents and no crew still has the tab, with a note.
+    let mut plain = runtime(1280.0);
+    let key = plain.state.panel_key();
+    plain.state.right_panels.open(&key, SingletonKind::Work);
+    plain.frame(0.0);
+    bounds(&plain, "right-panel-segment-work", 1280.0);
+    bounds(&plain, "work-empty", 1280.0);
+
+    // A Captain home whose own turn also started a subagent shows both lists, the
+    // subagents first, with the roster footer still on screen.
+    let mut rt = runtime(1280.0);
+    crate::captain_workspace_demo(&mut rt.state);
+    rt.state.use_pi_for_test();
+    rt.state.current_mut().apply(
+        json!({"type":"tool_execution_start","toolCallId":"dispatch","toolName":"subagent",
+        "args":{"tasks":[{"agent":"scout","task":"Find the source"}]}}),
+    );
+    let key = rt.state.panel_key();
+    rt.state.right_panels.open(&key, SingletonKind::Work);
+    rt.invalidate();
+    rt.frame(0.0);
+    let agents = bounds(&rt, "work-agents", 1280.0);
+    let agent = bounds(&rt, "agent-row-dispatch-0", 1280.0);
+    let roster = bounds(&rt, "crew-roster-rows", 1280.0);
+    let footer = bounds(&rt, "crew-roster-footer", 1280.0);
+    assert!(
+        agent[1] + agent[3] <= agents[1] + agents[3] + 0.5,
+        "{agent:?} {agents:?}"
+    );
+    assert!(
+        agents[1] + agents[3] <= roster[1] + 0.5,
+        "{agents:?} {roster:?}"
+    );
+    assert!(roster[3] >= 44.0, "{roster:?}");
+    assert!(
+        roster[1] + roster[3] <= footer[1] + 0.5,
+        "{roster:?} {footer:?}"
+    );
 }
 
 #[test]

@@ -17,9 +17,6 @@ use crate::model::crew_question_state::CrewQuestionView;
 use crate::model::crew_reports::{ArtifactKind, CrewOutcome, QuestionRecipient};
 use rune::Transition;
 
-/// Second and later lines start past the status mark's 14 px slot and its gap.
-const CARD_INDENT: f32 = 22.0;
-
 /// What the record proves about a report's delivery to its Captain. React and
 /// Context undelivered both read "Waiting to reach" — the client cannot see a
 /// hold — and Ignore reads "Not sent", the one outcome `needs_delivery` makes
@@ -121,9 +118,10 @@ fn artifact_row(p: Palette, artifact: &crate::model::crew_reports::CrewArtifact)
         .child(label(word, META, p.faint))
 }
 
-/// One report question card. `read_only` draws the captain-recipient form: the
-/// same claim, question and evidence, with only "Open thread" to act on.
-fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
+/// One report question card styled after KSG Code's `ComposerRequestCard`. `read_only`
+/// draws the captain-recipient form: the same claim, question and evidence, with only
+/// "Open thread" to act on.
+fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool, pager: Option<El>) -> El {
     let status = outcome_status(view.outcome);
     let (secondary, _) = quiet_inks(p);
     let rid = view.report_id.clone();
@@ -134,19 +132,25 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         .map(|c| c.name.clone())
         .unwrap_or_default();
     let machine = s.machine_label(&server);
-    let head = row()
+    let mut head = row()
+        .min_h(32.0)
+        .pl(10.0)
+        .pr(13.0)
         .center_y()
         .gap(8.0)
         .child(crew_ui::mark_slot(status, p))
         .child(meta_text("Question from", status_ink(status, p)))
         .child(
-            label(&view.title, TextStyle::new(13.0, 600.0), p.ink)
+            label(&view.title, TextStyle::new(13.0, 500.0), p.ink)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
         )
         .child(spacer())
         .child(meta_text(outcome_word(view.outcome), status_ink(status, p)));
+    if let Some(pager) = pager {
+        head = head.child(pager);
+    }
     let mut detail = col().gap(8.0);
     let question = truncate(&view.question, 2000);
     detail = detail.child(
@@ -206,7 +210,9 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
                 ),
         );
     }
-    let mut body = col().pl(CARD_INDENT).gap(10.0).child(detail);
+    let mut body = col()
+        .gap(6.0)
+        .child(super::request_card_well(p, false, detail));
     let mut actions = row().gap(6.0).flex_wrap().center_y();
     let thread_id = view.thread_id;
     if !read_only {
@@ -227,26 +233,28 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
         let submit_key = (server.clone(), rid.clone());
         body = body
             .child(
-                text_input(edit, BODY)
-                    .key(format!("needs-you-report-{rid}-text"))
-                    .label(format!("Your answer to {}", view.title))
-                    .placeholder("Write an answer", p.muted)
-                    .color(p.ink)
-                    .w_full()
-                    .min_h(30.0)
-                    .max_h(120.0)
-                    .px(8.0)
-                    .py(6.0)
-                    .radius(12.0)
-                    .fill(p.card)
-                    .field_focus(edit, p)
-                    .disabled(pending)
-                    .on_edit(move |s: &mut State| {
-                        s.crew_question_draft_edit(&edit_key.0, &edit_key.1, expected_revision)
-                    })
-                    .on_submit(move |s: &mut State, _| {
-                        let _ = s.submit_crew_question_answer(&submit_key.0, &submit_key.1);
-                    }),
+                col().pl(10.0).pr(13.0).w_full().min_w(0.0).child(
+                    text_input(edit, BODY)
+                        .key(format!("needs-you-report-{rid}-text"))
+                        .label(format!("Your answer to {}", view.title))
+                        .placeholder("Write an answer", p.muted)
+                        .color(p.ink)
+                        .w_full()
+                        .min_h(30.0)
+                        .max_h(120.0)
+                        .px(10.0)
+                        .py(6.0)
+                        .radius(8.0)
+                        .fill(p.card)
+                        .field_focus(edit, p)
+                        .disabled(pending)
+                        .on_edit(move |s: &mut State| {
+                            s.crew_question_draft_edit(&edit_key.0, &edit_key.1, expected_revision)
+                        })
+                        .on_submit(move |s: &mut State, _| {
+                            let _ = s.submit_crew_question_answer(&submit_key.0, &submit_key.1);
+                        }),
+                ),
             )
             .child(
                 label(
@@ -257,6 +265,8 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
                     META,
                     p.muted,
                 )
+                .pl(10.0)
+                .pr(13.0)
                 .wrap(),
             );
         let disabled = pending || blocker.is_some() || empty;
@@ -285,6 +295,8 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
             body = body.child(
                 label(reason, SMALL, p.muted)
                     .key(format!("needs-you-report-{rid}-blocked"))
+                    .pl(10.0)
+                    .pr(13.0)
                     .wrap(),
             );
         }
@@ -293,6 +305,8 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
                 label(error, SMALL, p.danger)
                     .key(format!("needs-you-report-{rid}-error"))
                     .role("alert")
+                    .pl(10.0)
+                    .pr(13.0)
                     .wrap(),
             );
         }
@@ -308,6 +322,9 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
     let delivery = delivery_words(view.delivered, view.policy, &captain_name);
     let mut footer = row()
         .key(format!("needs-you-report-{rid}-footer"))
+        .pl(10.0)
+        .pr(13.0)
+        .pb(4.0)
         .gap(8.0)
         .center_y()
         .child(label(delivery.clone(), META, p.faint))
@@ -315,8 +332,10 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
     if let Some(badge) = policy_badge(format!("needs-you-report-{rid}-tag"), view.policy, p) {
         footer = footer.child(badge);
     }
-    body = body.child(actions).child(footer);
-    col()
+    body = body
+        .child(super::request_card_footer(actions))
+        .child(footer);
+    let mut root = col()
         .key(format!("needs-you-report-{rid}"))
         .role("group")
         .label(format!(
@@ -325,21 +344,21 @@ fn card(s: &State, p: Palette, view: &CrewQuestionView, read_only: bool) -> El {
             outcome_word(view.outcome).to_lowercase(),
             delivery.to_lowercase()
         ))
-        .padding(12.0)
-        .gap(8.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.line)
-        .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()))
-        .child(
-            el().key(format!("needs-you-report-bar-{rid}"))
-                .pin(Some(0.0), Some(6.0), None, Some(6.0))
-                .w(2.0)
-                .fill(p.brass)
-                .a11y_hidden(),
-        )
-        .child(head)
-        .child(body)
+        .padding(4.0)
+        .gap(4.0)
+        .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
+    if read_only {
+        root = root.radius(8.0).fill(p.code_bg).border(1.0, p.line);
+    }
+    root.child(
+        el().key(format!("needs-you-report-bar-{rid}"))
+            .pin(Some(0.0), Some(6.0), None, Some(6.0))
+            .w(2.0)
+            .fill(p.brass)
+            .a11y_hidden(),
+    )
+    .child(head)
+    .child(body)
 }
 
 /// Whether `cards` draws, so the composer's stack budget can price it before building.
@@ -375,7 +394,12 @@ pub(super) fn user_question_count(s: &State) -> usize {
 }
 
 /// One paged user report question card (indexed into `open_crew_questions(captain, User)`).
-pub(super) fn user_question_card(s: &State, p: Palette, index: usize) -> Option<El> {
+pub(super) fn user_question_card(
+    s: &State,
+    p: Palette,
+    index: usize,
+    pager: Option<El>,
+) -> Option<El> {
     let t = s.current();
     if !s.is_captain_home(t) {
         return None;
@@ -388,7 +412,7 @@ pub(super) fn user_question_card(s: &State, p: Palette, index: usize) -> Option<
             .key("needs-you-reports")
             .role("group")
             .label("Crew report questions")
-            .child(card(s, p, view, false)),
+            .child(card(s, p, view, false, pager)),
     )
 }
 
@@ -434,7 +458,7 @@ pub(super) fn captain_questions_line(s: &State, p: Palette) -> Option<El> {
     );
     if open {
         for view in &crew {
-            stack = stack.child(card(s, p, view, true));
+            stack = stack.child(card(s, p, view, true, None));
         }
     }
     Some(

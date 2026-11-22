@@ -3,10 +3,8 @@ use super::*;
 use crate::agents::{self, AgentRun, AgentState, AgentsFilter};
 
 pub(super) fn open(s: &mut State) {
-    if s.inspector_has_agents_tab() {
-        s.right_panels
-            .open(&s.panel_key(), crate::right_panel::SingletonKind::Agents);
-    }
+    s.right_panels
+        .open(&s.panel_key(), crate::right_panel::SingletonKind::Work);
 }
 
 pub(super) fn chip(key: &str, active: usize, p: Palette) -> El {
@@ -38,7 +36,8 @@ fn jump(key: &str, tool: &str, p: Palette) -> El {
     })
 }
 
-/// Status and provider treatment follow KSG Code's `ProviderSubagentBar`.
+/// Status and provider treatment follow KSG Code's `ProviderSubagentBar`. The row shares
+/// the crew roster's 10 pt inset and 6 pt radius so both halves of the Work tab line up.
 fn agent_row(s: &State, p: Palette, run: &AgentRun<'_>) -> El {
     let key = run.owned_key(&s.machines.selected, s.current().id);
     let expanded = s.agents_expanded.contains(&key);
@@ -81,11 +80,11 @@ fn agent_row(s: &State, p: Palette, run: &AgentRun<'_>) -> El {
     );
     let header = row()
         .key(format!("agent-row-{suffix}"))
-        .h(52.0)
-        .px(8.0)
+        .h(44.0)
+        .px(10.0)
         .gap(8.0)
         .center_y()
-        .radius(8.0)
+        .radius(6.0)
         .hover(p.selected)
         .hover_motion(MOTION_FAST, MOTION_FAST)
         .role("button")
@@ -103,7 +102,7 @@ fn agent_row(s: &State, p: Palette, run: &AgentRun<'_>) -> El {
             p,
             model.unwrap_or(&s.current().model),
             state,
-            28.0,
+            24.0,
         ))
         .child(
             col().gap(1.0).grow(1.0).min_w(0.0).child(name).child(
@@ -135,6 +134,8 @@ fn agent_row(s: &State, p: Palette, run: &AgentRun<'_>) -> El {
     let mut card = col().w_full().child(header);
     if expanded {
         let mut detail = col()
+            .mx(10.0)
+            .mb(6.0)
             .padding(8.0)
             .gap(6.0)
             .radius(8.0)
@@ -204,31 +205,27 @@ pub(super) fn view(s: &State, p: Palette) -> El {
     for run in &runs {
         *group_counts.entry(run.tool_id).or_insert(0) += run.count;
     }
+    // One 32 pt header in the crew groups' style: the section word and its count on the
+    // left, the active and finished split on the right.
     let mut summary = row()
         .key("agents-summary")
-        .h(36.0)
+        .h(32.0)
+        .px(10.0)
         .center_y()
         .gap(6.0)
+        .child(meta_label("Agents", p.muted))
+        .child(meta_text(total.to_string(), p.faint))
+        .child(spacer())
         .child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .child(label(
-                    format!("{total} {}", if total == 1 { "agent" } else { "agents" }),
-                    CARD_TITLE,
-                    p.ink,
-                ))
-                .child(
-                    label(
-                        format!(
-                            "{active} active · {} finished",
-                            total.saturating_sub(active)
-                        ),
-                        SMALL,
-                        p.muted,
-                    )
-                    .truncate(),
+            label(
+                format!(
+                    "{active} active · {} finished",
+                    total.saturating_sub(active)
                 ),
+                TIMER,
+                p.faint,
+            )
+            .truncate(),
         );
     if active > 0 && active < total {
         for (filter, key, word) in [
@@ -275,8 +272,11 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         ));
     }
     if rows.is_empty() {
-        list =
-            list.child(label("Agent details load with the conversation.", SMALL, p.muted).wrap());
+        list = list.child(
+            label("Agent details load with the conversation.", SMALL, p.muted)
+                .wrap()
+                .px(10.0),
+        );
     } else {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -292,12 +292,12 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                 .growth(rune::GrowthSpec::default())
                 .virtual_rows(
                     rows.len(),
-                    52.0,
+                    44.0,
                     move |_: &State, index| keys[index].0.clone().into(),
                     move |s: &State, index| match &rows[index].1 {
                         AgentRow::Group { tool_id, count } => row()
                             .h(28.0)
-                            .px(8.0)
+                            .px(10.0)
                             .center_y()
                             .child(
                                 label(
@@ -323,9 +323,7 @@ pub(super) fn view(s: &State, p: Palette) -> El {
         .w_full()
         .h_full()
         .min_h(0.0)
-        .padding(10.0)
-        .gap(6.0)
+        .pt(4.0)
         .child(summary)
-        .child(rule(p))
         .child(list)
 }

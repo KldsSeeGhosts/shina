@@ -131,8 +131,6 @@ mod question_attachment_tests;
 mod question_flow_tests;
 #[path = "task_plan.rs"]
 mod task_plan;
-#[path = "task_plan_client.rs"]
-pub(crate) mod task_plan_client;
 #[path = "tasks.rs"]
 // Public UI entry points are consumed by the concurrent captain UI implementation.
 #[allow(dead_code)]
@@ -5262,9 +5260,11 @@ pub struct State {
     /// Whether the Snoozed and Settled shelves are open.
     pub shelves: [bool; 2],
     pub settled_visible: usize,
-    /// Which request the one-row needs-you bar above the composer is showing, clamped to
+    /// Which request the unified composer request banner is showing, clamped to
     /// the live request count each frame (spec §3.6).
     pub needs_you_page: usize,
+    /// Whether the dismissible Now / crew & subagents popover above the composer is open.
+    pub now_popover: bool,
     pub undo: Option<UndoNotice>,
     pub toasts: Vec<ToastNotice>,
     next_toast_id: u64,
@@ -5457,8 +5457,6 @@ pub struct State {
     memory: Arc<std::sync::Mutex<memory::MemoryBook>>,
     pub captain_editor: Option<CaptainEditor>,
     pub brief: BriefUi,
-    /// A Captain home's task plan panel, bound to its machine and home.
-    pub plan_panel: task_plan_client::PlanPanel,
     pub settings_picker: Option<SettingsPicker>,
     pub open_option_menu: Option<String>,
     pub model_picker_tab: Option<crate::model_picker::ModelPickerTab>,
@@ -6401,6 +6399,7 @@ impl State {
             shelves: [false; 2],
             settled_visible: 10,
             needs_you_page: 0,
+            now_popover: false,
             undo: None,
             toasts: Vec::new(),
             next_toast_id: 1,
@@ -6548,7 +6547,6 @@ impl State {
             memory: Arc::default(),
             captain_editor: None,
             brief: BriefUi::default(),
-            plan_panel: Default::default(),
             settings_picker: None,
             open_option_menu: None,
             model_picker_tab: None,
@@ -6653,17 +6651,14 @@ impl State {
     pub fn right_panel(&self) -> crate::right_panel::ThreadPanel {
         self.right_panels.get(&self.panel_key())
     }
-    /// Whether the current thread offers the Crew tab in the Inspector (spec §3.3):
-    /// captain homes and crew/delegated/peer workers do; plain threads do not.
-    pub fn inspector_has_crew_tab(&self) -> bool {
+    /// Whether a captain backs the current thread, so the Inspector's Work tab lists its
+    /// crew: captain homes and crew, delegated or peer workers. Plain threads have none.
+    pub fn thread_has_crew(&self) -> bool {
         let t = self.current();
         self.is_captain_home(t)
             || t.crew_captain.is_some()
             || t.delegated
             || t.peer_origin.is_some()
-    }
-    pub fn inspector_has_agents_tab(&self) -> bool {
-        crate::agents::has_agents(self.current())
     }
 
     pub fn preview_allowed(&self) -> bool {
@@ -6695,6 +6690,7 @@ impl State {
             && !self.env_mode_picker
             && !self.base_branch_picker
             && !self.stash_menu
+            && !self.now_popover
             && !self.composer_ui.overflow.get()
             && self.code_picker.open.is_none()
             && self.attachment_preview.is_none()
@@ -6753,23 +6749,10 @@ impl State {
         self.pending_tool_reveal = Some(row);
         self.flash_tool = Some((tool_id, Instant::now()));
     }
-    /// The Inspector tab actually shown for the current thread (resolving an unoffered
-    /// stored view such as Crew on a released/plain thread to Overview).
-    pub fn right_panel_resolved_view(&self) -> crate::right_panel::PanelView {
-        let view = self.right_panel().view;
-        if view == crate::right_panel::PanelView::Crew && !self.inspector_has_crew_tab()
-            || view == crate::right_panel::PanelView::Agents && !self.inspector_has_agents_tab()
-        {
-            crate::right_panel::PanelView::Overview
-        } else {
-            view
-        }
-    }
-    /// The visible Inspector tab while open, with unoffered views resolved to Overview.
+    /// The visible Inspector tab while the panel is open.
     pub fn right_panel_active_view(&self) -> Option<crate::right_panel::PanelView> {
-        self.right_panel()
-            .open
-            .then(|| self.right_panel_resolved_view())
+        let panel = self.right_panel();
+        panel.open.then_some(panel.view)
     }
     /// Whether the Inspector covers the conversation column at the current viewport width.
     pub fn inspector_covers(&self) -> bool {

@@ -62,15 +62,13 @@ impl Surface {
     }
 }
 
-/// The Inspector's four fixed tabs. `right_panel_body` degrades a stored view
-/// the open thread does not offer (such as Crew on a plain thread) to
-/// `Overview`, so saved state always lands somewhere real.
+/// The Inspector's four fixed tabs, the same on every thread: Details (`Overview`),
+/// Work (provider subagents and crew), Context and Changes (`Diff`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PanelView {
     #[default]
     Overview,
-    Agents,
-    Crew,
+    Work,
     Context,
     Diff,
 }
@@ -78,8 +76,7 @@ pub enum PanelView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SingletonKind {
     Overview,
-    Agents,
-    Crew,
+    Work,
     Context,
     Diff,
 }
@@ -88,8 +85,7 @@ impl SingletonKind {
     fn into_view(self) -> PanelView {
         match self {
             Self::Overview => PanelView::Overview,
-            Self::Agents => PanelView::Agents,
-            Self::Crew => PanelView::Crew,
+            Self::Work => PanelView::Work,
             Self::Context => PanelView::Context,
             Self::Diff => PanelView::Diff,
         }
