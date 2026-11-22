@@ -48,9 +48,8 @@ Already ported:
 | `captain_editor` portrait grid | `settings/ProjectIconPickerDialog.tsx` (emoji grid) |
 | `provider_icon` | `components/Icons.tsx` (`OpenAI`, `ClaudeAI`, `AntigravityIcon`), `chat/ProviderInstanceIcon.tsx` |
 | `crew_ui::needs_you` | `chat/ChildThreadApprovals.tsx` (one paged request card, spec §3.6) |
-| `crew_ui::task_card` | `chat/ProviderSubagentBar.tsx` restyled as a single 32 pt work row (spec §3.7) |
-| `crew_ui::crew_tray`, `crew_ui::now_popover` | `chat/QueuedRunsControl.tsx`, `chat/ThreadRelationshipsControl.tsx`. A flat 28 pt strip, labelled Crew on a Captain home and Now on a thread with subagents. It opens a dismissible popover and never expands in place. The popover's footer opens the Inspector's Work tab. |
-| `crew_ui::parent_bar`, `crew_ui::crew_bar` | Shina-only 36 pt borderless notice bars (`p.selected`), shown only for actionable recovery/offline/pending-crew states (spec §3.8) |
+| `details_ui::agent_pills` | Shina-only: KSG lists a thread's agents in the Lineage card and has no strip above the composer. One 24 pt pill per agent at work (a Captain home's live crew, any thread's running subagents) in a 28 pt row. A pill opens its agent as its Lineage row does. Pills that do not fit fold into a `+N` pill that opens the details card. |
+| `crew_ui::parent_bar`, `crew_ui::crew_bar` | Shina-only 36 pt borderless notice bars (`p.selected`), shown only for actionable recovery/offline/pending-crew states (spec §3.8). A stopped worker's bar has Resume and Dismiss. |
 | `details_ui::card` (`workspace_card`, `lineage_card`, `lineage_row`, `hover_card`), `canvas_layout` | `chat/ThreadDetailsCard.tsx`, `ThreadDetailsPanel.tsx`, `ThreadDetailsSection.tsx`, `ThreadDetailsControl.tsx`, `ThreadRelationshipsControl.tsx`, `threadDetailsPanelStyles.ts`, `threadDetailsCardLayout.ts`, `chatCanvasLayout.ts`, `index.css` (`.thread-details-stack`). A 272 pt stack of 14 pt trays docks 12 pt inside the chat column's top right corner and the lane moves 32 pt clear of it. Where the column cannot fit it, the top bar's details button opens it as a popover. The Lineage card lists crew and provider subagents in 40 pt two-line rows, the finished ones under "N previous agents" (6, then 12 more at a time), each with a hover card. A row opens the worker's thread or the subagent in the Work tab. The model, access, harness and session ID rows behind "Show N more" are Shina-only. |
 | `inspector_ui` bodies: `overview_body`, `work_body`, `peer_crew_body` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`. The Work tab is Shina-only: subagents (`agents_ui::view`) above the crew roster (`crew_ui::roster_row` groups and a pinned 44 pt footer), both in 44 pt two-line rows with a 24 pt avatar. |
 | `captain_hero` | `chat/DraftHeroHeadline.tsx` |
@@ -69,7 +68,8 @@ Removed at the user's request. Do not add them back:
 
 - Starter prompt buttons ("Understand project", "Plan a change") on the new-thread screen.
 - The "No sandbox" note under the composer.
-- The desktop task plan panel and the Plan toggle on the crew strip. Captains keep the `task_*` MCP tools.
+- The desktop task plan panel and its Plan toggle. Captains keep the `task_*` MCP tools.
+- The task rows in a Captain's transcript (`task_card`), the crew counts strip above the composer with its popover (`crew_tray`, `now_popover`), and the "Working in the background, N tasks" line in the top bar. The details card's Lineage list and the agent pills carry that information.
 
 The user wants Shina to match KSG Code verbatim (restated 2026-11-22). When a Shina design and KSG's differ, copy KSG's values, weights and layout from `origin/ksg/dev` exactly, and keep a Shina-only piece only where KSG has nothing equivalent. Compare by screenshot: capture the running KSG Code window and Shina's `--demo --snap` at the same pixel size and theme.
 

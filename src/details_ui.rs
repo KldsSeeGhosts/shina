@@ -555,17 +555,134 @@ fn lineage_row(s: &State, p: Palette, item: &LineageRow) -> El {
             s.details.hover = None;
         }
     })
-    .on_press(move |s: &mut State| {
-        s.details.hover = None;
-        s.details.popover = false;
-        match &target {
-            Target::Crew(id) => super::crew_ui::open_thread(s, *id),
-            Target::Agent(key) => {
-                s.agents_expanded.insert(key.clone());
-                agents_ui::open(s);
-            }
+    .on_press(move |s: &mut State| open(s, &target))
+}
+
+/// Opens an agent: a crew worker's own thread, or a provider subagent unfolded in the
+/// right panel's Work tab.
+fn open(s: &mut State, target: &Target) {
+    s.details.hover = None;
+    s.details.popover = false;
+    match target {
+        Target::Crew(id) => super::crew_ui::open_thread(s, *id),
+        Target::Agent(key) => {
+            s.agents_expanded.insert(key.clone());
+            agents_ui::open(s);
         }
-    })
+    }
+}
+
+/// The narrowest a pill gets before the strip folds the rest into a count.
+const PILL_MIN: f32 = 96.0;
+
+/// The agents at work on this thread, for the pills above the composer: a Captain home's
+/// live crew and any thread's running subagents. Finished and stopped agents stay in the
+/// Lineage card.
+fn pill_rows(s: &State) -> Vec<LineageRow> {
+    let home = s.is_captain_home(s.current());
+    lineage_rows(s)
+        .0
+        .into_iter()
+        .filter(|row| home || matches!(row.target, Target::Agent(_)))
+        .collect()
+}
+
+/// Whether `agent_pills` draws, so the composer's stack budget can price it before building.
+pub(super) fn agent_pills_show(s: &State) -> bool {
+    !pill_rows(s).is_empty()
+}
+
+/// One pill per agent at work, above the composer. Pressing a pill opens that agent as its
+/// Lineage row does. Shina-only: KSG Code lists a thread's agents in the Lineage card and
+/// has no strip here. It replaces the crew counts strip and its popover.
+pub(super) fn agent_pills(s: &State, p: Palette, lane: f32) -> Option<El> {
+    let rows = pill_rows(s);
+    if rows.is_empty() {
+        return None;
+    }
+    // As many pills as the lane holds at their narrowest; the rest fold into a count that
+    // opens the details card, where every agent is listed.
+    let fit = (((lane + 6.0) / (PILL_MIN + 6.0)).floor() as usize).max(1);
+    let shown = if rows.len() > fit {
+        fit.saturating_sub(1).max(1)
+    } else {
+        rows.len()
+    };
+    let more = rows.len() - shown;
+    let pill = |key: String, name: String| {
+        row()
+            .key(key)
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(name)
+            .focusable(true)
+            .h(24.0)
+            .min_w(0.0)
+            .center_y()
+            .radius(12.0)
+            .border(1.0, p.frame)
+            .hover(hover_wash(s, p))
+            .press(active_wash(s, p))
+            .hover_motion(motion(), motion())
+    };
+    let mut strip = row()
+        .key("agent-pills")
+        .role("group")
+        .label("Agents at work")
+        .h(28.0)
+        .gap(6.0)
+        .center_y()
+        .min_w(0.0);
+    for item in rows.into_iter().take(shown) {
+        let model = if item.model.is_empty() {
+            s.current().model.clone()
+        } else {
+            item.model.clone()
+        };
+        let mut help = item.word.clone();
+        if !item.model_name.is_empty() {
+            help = format!("{help}, {}", item.model_name);
+        }
+        let target = item.target;
+        strip = strip.child(
+            pill(
+                item.key.replace("lineage-row-", "agent-pill-"),
+                format!("{}. {}. Open", item.title, item.word),
+            )
+            .help(help)
+            .max_w(220.0)
+            .shrink()
+            .pl(4.0)
+            .pr(10.0)
+            .gap(6.0)
+            .on_press(move |s: &mut State| open(s, &target))
+            .child(crewmate_avatar(s, p, &model, item.status, 16.0))
+            .child(
+                label(&item.title, META, p.ink)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            ),
+        );
+    }
+    if more > 0 {
+        strip = strip.child(
+            pill(
+                "agent-pills-more".into(),
+                format!("{more} more at work. Show thread details"),
+            )
+            .px(8.0)
+            .on_press(|s: &mut State| {
+                if s.details.fits.get() {
+                    s.details.docked = true;
+                } else {
+                    s.details.popover = true;
+                }
+            })
+            .child(label(format!("+{more}"), META, p.muted)),
+        );
+    }
+    Some(strip)
 }
 
 /// The Lineage card, ported from KSG Code's `ThreadRelationshipsPanel`: who delegated the

@@ -1044,75 +1044,39 @@ pub(super) fn earlier_bar(s: &State, p: Palette, wide: bool, pane_width: f32) ->
         .child(bar)
 }
 
-/// A quiet line in a captain's header when background mode is hiding work or routines are
-/// paused while the user is away. Nothing otherwise.
-/// `available` is the width the header leaves the line, from the last layout. The count never
-/// shrinks: the phrase gives way first, and when the whole phrase cannot fit beside the count it
-/// reads "Background".
-pub(super) fn away_status(s: &State, p: Palette, available: Option<f32>) -> Option<El> {
-    let captain = brief_captain(s)?;
+/// A quiet line in a captain's header while routines are paused because the user is away.
+/// Nothing otherwise: the details card and the agent pills already say what is running.
+pub(super) fn away_status(s: &State, p: Palette) -> Option<El> {
+    brief_captain(s)?;
     let status: BackgroundStatus = s
         .brief
         .demo_status
         .clone()
         .unwrap_or_else(|| s.background_status());
-    // Both texts are status words, so both are pixel type. Work running in the background is
-    // `sea`, as it is in the crew tray; paused routines are muted.
-    // The same count as the crew line and the band's sails: this captain's threads running now.
-    let working = if s.brief.demo_status.is_some() {
-        status.working
-    } else {
-        s.crew_working_now(s.captain_home(captain).unwrap_or(s.current().id))
-    };
-    let (word, detail, ink) = if status.hidden_to_tray && working > 0 {
-        (
-            "Working in the background",
-            Some(plural(working, "task", "tasks")),
-            p.sea,
-        )
-    } else if status.routines_paused_while_away {
-        ("Routines paused while you're away", None, p.muted)
-    } else {
+    if !status.routines_paused_while_away {
         return None;
-    };
-    let text = match &detail {
-        Some(detail) => format!("{word}, {detail}"),
-        None => word.to_string(),
-    };
-    let word = match (&detail, available) {
-        (Some(detail), Some(available)) => {
-            let width = |t: &str| rune::text::measure(t, &[], super::META, None).0;
-            // The line's 4 pt padding each side, the 18 pt icon and two 8 pt gaps.
-            let full = 8.0 + super::ICON + 16.0 + width(word) + width(detail);
-            if full > available + 0.5 {
-                "Background"
-            } else {
-                word
-            }
-        }
-        _ => word,
-    };
-    let mut line = row()
-        .key("captain-away-status")
-        .role("status")
-        .label(text)
-        .h(20.0)
-        .px(4.0)
-        .gap(8.0)
-        .center_y()
-        .min_w(0.0)
-        .shrink()
-        .opacity_motion(motion())
-        // The moon is for paused routines only. Work that runs on in the background gets the bolt.
-        .child(icon(
-            if detail.is_some() { "bolt" } else { "crescent" },
-            ink,
-        ))
-        .child(super::meta_text(word, ink).truncate().shrink().min_w(0.0));
-    if let Some(detail) = detail {
-        line = line.child(super::meta_text(detail, ink).key("captain-away-count"));
     }
-    Some(line)
+    let word = "Routines paused while you're away";
+    Some(
+        row()
+            .key("captain-away-status")
+            .role("status")
+            .label(word)
+            .h(20.0)
+            .px(4.0)
+            .gap(8.0)
+            .center_y()
+            .min_w(0.0)
+            .shrink()
+            .opacity_motion(motion())
+            .child(icon("crescent", p.muted))
+            .child(
+                super::meta_text(word, p.muted)
+                    .truncate()
+                    .shrink()
+                    .min_w(0.0),
+            ),
+    )
 }
 
 /// Add or remove a workspace from the picker in its captain-scope mode.
@@ -1798,10 +1762,7 @@ mod tests {
         recruit.never_sent = false;
         rt.state.threads.push(recruit);
         let ordinary = rt.state.threads.len() - 1;
-        press(&mut rt, "crew-roster-toggle");
-        rt.frame(0.25);
-        press(&mut rt, "now-popover-open-inspector");
-        rt.frame(0.25);
+        open_tab(&mut rt, crate::right_panel::SingletonKind::Work);
         press(&mut rt, "crew-roster-recruit");
         rt.frame(0.25);
         press(&mut rt, &format!("crew-recruit-{thread_id}"));

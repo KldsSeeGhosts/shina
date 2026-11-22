@@ -1002,7 +1002,7 @@ Error: none".into(),
         },
         model::Message { id: uuid::Uuid::new_v4().to_string(),
             role: "Pi",
-            text: "The reconnect fix is in and tested. The sidebar review is waiting on your approval below, and the crew tray notes start when a slot frees up.".into(),
+            text: "The reconnect fix is in and tested. The sidebar review is waiting on your approval below, and the crew notes start when a slot frees up.".into(),
             images: vec![],
             context: None,
         },
@@ -1216,7 +1216,7 @@ fn settings_profile_demo(state: &mut State) {
     state.brief.profile_name.focused = true;
 }
 
-/// A captain's home with its crew: the needs-you card and the crew tray above the composer.
+/// A captain's home with its crew: the needs-you card and the agent pills above the composer.
 fn captain_crews_demo(state: &mut State) {
     captain_workspace_demo(state);
     let home = state.threads.iter().position(|t| t.id == 7).unwrap();

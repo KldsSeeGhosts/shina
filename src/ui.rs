@@ -1096,7 +1096,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             && s.current().history_error.is_none()
         {
             // Sizes from the last layout: the hero keeps its height only while the composer
-            // and its crew tray still fit under it.
+            // and its agent pills still fit under it.
             let pane = cx.layout_with("empty-thread", |r| r[3]);
             let lane = cx.layout_with("composer-lane", |r| r[3]);
             let hero_fits = match (pane, lane) {
@@ -1188,10 +1188,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             s.viewport_height = rect[3];
         })
         .on_key(|s: &mut State, ev, tx| {
-            if ev.key == rune::Key::Escape && s.now_popover {
-                s.now_popover = false;
-                return true;
-            }
             if ev.key == rune::Key::Escape && sidebar_preview::dismiss(s, true) {
                 return true;
             }
@@ -1519,19 +1515,6 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
     if let Some(hover) = details_ui::hover_card(s, p) {
         root = root.child(hover);
-    }
-    if s.now_popover {
-        if !s.composer_hidden() && cx.layout_with("crew-tray", |_| ()).is_some() {
-            root = root.child(crew_ui::now_popover(s, p, lane_width(main_width, wide)));
-        } else {
-            root = root.child(
-                el().key("now-popover-dismiss")
-                    .absolute(0.0, 0.0)
-                    .size(0.0, 0.0)
-                    .a11y_hidden()
-                    .on_layout(|s: &mut State, _| s.now_popover = false),
-            );
-        }
     }
     if composer_stash::menu_open(s) {
         if !s.composer_hidden() && cx.layout_with("composer-stash-badge", |_| ()).is_some() {
@@ -8821,10 +8804,6 @@ fn tool_title(tool: &Tool) -> String {
     }
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
-}
-
 /// Ported from KSG Code's work-log/presentation.ts summarizeToolGroup.
 fn tool_summary(tools: &[&Tool]) -> String {
     crate::work::summarize(tools)
@@ -8868,9 +8847,8 @@ fn turn_parts(t: &Thread, start: usize, end: usize) -> Vec<TranscriptPart> {
     turn_parts_in(t, &timeline_structure(t).events, start, end)
 }
 
-/// A tool that shows as its own card rather than a step: a plan, rendered HTML, a captain's
-/// delegation, or a subagent run with its result cards (KSG keeps subagent events out of
-/// work groups too).
+/// A tool that shows as its own card rather than a step: a plan, rendered HTML, or a
+/// subagent run with its result cards (KSG keeps subagent events out of work groups too).
 fn is_card_tool(t: &Thread, index: usize) -> bool {
     let tool = &t.tools[index];
     if !tool.subagents.is_empty() {
@@ -8881,7 +8859,7 @@ fn is_card_tool(t: &Thread, index: usize) -> bool {
         crate::work::ToolKind::Html => {
             crate::html_render::find_reference(&tool.structured).is_some()
         }
-        _ => t.captain_home && !t.delegated && crew_ui::is_delegation(tool),
+        _ => false,
     }
 }
 
@@ -8905,7 +8883,7 @@ fn group_work(t: &Thread, parts: Vec<TranscriptPart>) -> Vec<TranscriptPart> {
                 }
             }
             TranscriptPart::Tools(indices) => {
-                // Cards from one call batch stay one part, as the crew's task cards expect.
+                // Cards from one call batch stay one part.
                 let mut cards_open = false;
                 for index in indices {
                     if !is_card_tool(t, index) {
@@ -9398,7 +9376,7 @@ fn transcript_part(
 ) -> El {
     let t = s.current();
     match part {
-        TranscriptPart::Tools(indices) => crew_ui::tool_part(s, p, indices),
+        TranscriptPart::Tools(indices) => inline_tools(s, p, indices),
         TranscriptPart::Thought(indices) => work_ui::thoughts(s, p, indices),
         TranscriptPart::Work(entries) => work_part(s, p, entries),
         TranscriptPart::Compaction(index) => pi_ui::compaction_activity(s, p, *index),
@@ -10002,15 +9980,10 @@ fn is_html_card(t: &Thread, part: &TranscriptPart) -> bool {
             && crate::html_render::find_reference(&t.tools[i].structured).is_some()))
 }
 
-/// A captain's delegations are its answer, not its working: their task cards stay in view
-/// when the rest of the turn folds into "Worked for". It reads the thread only, so the
-/// timeline structure can split turns without the window state.
+/// A card that stays in view when the rest of the turn folds into "Worked for". It reads
+/// the thread only, so the timeline structure can split turns without the window state.
 fn is_lifted_card(t: &Thread, part: &TranscriptPart) -> bool {
-    (t.captain_home
-        && !t.delegated
-        && matches!(part, TranscriptPart::Tools(indices)
-            if indices.iter().all(|&index| crew_ui::is_delegation(&t.tools[index]))))
-        || is_html_card(t, part)
+    is_html_card(t, part)
 }
 
 /// The last work part and the preamble above the fold.
@@ -12145,8 +12118,8 @@ fn conversation(s: &State, p: Palette, wide: bool, pane_width: f32) -> El {
     let gutter = lane_gutter(pane_width);
     // The lane the composer resolves too; `None` until C5 mounts the Details card.
     let lane_rect = chat_lane(pane_width, wide, details_ui::edges(s, pane_width));
-    // A captain's delegations show as task cards inside a turn, so with no messages they have
-    // nothing to hang from. The home counts as empty and greets above its crew tray.
+    // A captain's delegations sit inside a turn, so with no messages they have nothing to
+    // hang from. The home counts as empty and greets above its agent pills.
     let visible_tools = t.messages.is_empty()
         && t.tools
             .iter()
@@ -12844,7 +12817,7 @@ fn empty_thread(
     hero_fits: bool,
     caret_edges: Option<[bool; 2]>,
 ) -> El {
-    // A captain's hero keeps its height above a tall crew tray and takes the room from the
+    // A captain's hero keeps its height above the agent pills and takes the room from the
     // space below the composer. In a window too short for both, the composer stays on screen
     // and the clip keeps the hero out of the header.
     let floor = if s.current().captain.is_some() && hero_fits {
@@ -15208,7 +15181,7 @@ fn above_composer_budget(s: &State, _cap: f32, _lane: f32) -> AboveComposerBudge
         parts += 1;
         others_floor += 36.0;
     }
-    if crew_ui::crew_tray_shows(s) {
+    if details_ui::agent_pills_show(s) {
         parts += 1;
         others_floor += 28.0;
     }
@@ -15316,7 +15289,7 @@ fn composer(
         );
     }
     let request_visible = t.request.is_some() && !t.request_held_by_typing_guard();
-    // Delegation notices, queued messages, and the 28 pt Now / crew strip stay visible above
+    // Delegation notices, queued messages, and the 28 pt agent pills stay visible above
     // `ComposerSurface.Shell`, even when a structured questionnaire replaces the draft card.
     let viewport_cap = (s.viewport_height * 0.4).max(120.0);
     let budget = above_composer_budget(s, viewport_cap, lane);
@@ -15330,7 +15303,7 @@ fn composer(
     for part in [
         crew_ui::parent_bar(s, p, lane),
         crew_ui::crew_bar(s, p, lane),
-        crew_ui::crew_tray(s, p, lane, None),
+        details_ui::agent_pills(s, p, lane),
     ]
     .into_iter()
     .flatten()
@@ -22045,24 +22018,21 @@ pub(crate) mod tests {
                 &mut rt,
                 width,
                 &[
-                    "task-card-16",
-                    "task-clock-16",
-                    "resume-task-18",
-                    "dismiss-task-18",
                     "result-open-1",
                     "needs-you",
                     "needs-you-2",
                     "approve-2",
                     "decline-2",
-                    "crew-tray",
+                    "agent-pills",
+                    "agent-pill-crew-16",
                     "composer",
                 ],
             );
-            // Delegations are compact task rows, not generic tool rows, and finished tasks
-            // stay off the transcript. Every crew member has a row in the Crew tab.
-            assert!(rt.presented("inline-tool-7-0").is_none());
-            let card = rt.presented("task-card-16").unwrap().0;
-            assert!((card[3] - 32.0).abs() < 0.5, "{width}: {card:?}");
+            // The crew at work is a row of pills, not task rows in the transcript. Every
+            // crew member has a row in the Crew tab.
+            assert!(rt.presented("task-card-16").is_none());
+            let pills = rt.presented("agent-pills").unwrap().0;
+            assert!((pills[3] - 28.0).abs() < 0.5, "{width}: {pills:?}");
             rt.state.right_panels.open(
                 &rt.state.panel_key(),
                 crate::right_panel::SingletonKind::Work,
@@ -22083,13 +22053,14 @@ pub(crate) mod tests {
                     "crew-roster-recruit",
                 ],
             );
-            press(&mut rt, "crew-chip-16");
+            // A pill opens its worker.
+            press(&mut rt, "agent-pill-crew-16");
             rt.frame(1.0);
             assert_eq!(rt.state.current().id, 16, "{width}");
             // A healthy worker has nothing between the conversation and the composer.
             assert!(rt.presented("parent-bar").is_none(), "{width}");
             assert_inside(&mut rt, width, &["composer"]);
-            assert!(rt.presented("crew-tray").is_none());
+            assert!(rt.presented("agent-pills").is_none());
             // The worker's details card links back to its captain. Beside an open Inspector
             // the card cannot dock, so the top bar opens it as a popover.
             assert!(rt.presented("details-card").is_none(), "{width}");
@@ -22099,6 +22070,21 @@ pub(crate) mod tests {
             assert_eq!(rt.state.current().id, 7, "{width}");
             press(&mut rt, "needs-you-source-2");
             assert_eq!(rt.state.current().id, 2, "{width}");
+            // A stopped worker offers Resume and Dismiss on its own notice bar.
+            crew_ui::open_thread(&mut rt.state, 18);
+            rt.invalidate();
+            rt.frame(0.0);
+            assert_eq!(rt.state.current().id, 18, "{width}");
+            assert_inside(
+                &mut rt,
+                width,
+                &[
+                    "parent-bar",
+                    "resume-task-18",
+                    "dismiss-task-18",
+                    "composer",
+                ],
+            );
         }
     }
 
@@ -22111,33 +22097,13 @@ pub(crate) mod tests {
     fn the_crew_tab_lists_each_member_once_grouped_by_state_at_all_widths() {
         for width in [1280.0] {
             let mut rt = crew_runtime(width);
-            // The strip is a flat 28 pt row that toggles the dismissible Now popover.
-            let header = rt.presented("crew-roster-toggle").unwrap().0;
-            assert!((header[3] - 28.0).abs() < 0.5, "{width}: {header:?}");
-            assert!(rt.presented("now-popover").is_none());
             assert!(rt.presented("crew-roster-rows").is_none());
-            press(&mut rt, "crew-roster-toggle");
-            rt.frame(1.0);
-            assert_inside(
-                &mut rt,
-                width,
-                &["now-popover", "now-popover-open-inspector"],
+            rt.state.right_panels.open(
+                &rt.state.panel_key(),
+                crate::right_panel::SingletonKind::Work,
             );
-            assert!(rt.presented("right-panel").is_none(), "{width}");
-            // Escape dismisses the popover without opening the Inspector.
-            rt.key(rune::KeyEvent {
-                key: rune::Key::Escape,
-                mods: Default::default(),
-            });
-            rt.frame(1.0);
-            rt.frame(1.0);
-            assert!(rt.presented("now-popover").is_none(), "{width}");
-            // Reopen and use the footer action to open the full Inspector Crew tab.
-            press(&mut rt, "crew-roster-toggle");
-            rt.frame(1.0);
-            press(&mut rt, "now-popover-open-inspector");
-            rt.frame(1.0);
-            assert!(rt.presented("now-popover").is_none(), "{width}");
+            rt.invalidate();
+            rt.frame(0.0);
             assert_eq!(
                 rt.state.right_panel_active_view(),
                 Some(crate::right_panel::PanelView::Work),
@@ -22181,7 +22147,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn composer_request_banner_pages_thread_and_crew_requests_and_now_strip_works_for_subagents() {
+    fn composer_request_banner_pages_thread_and_crew_requests_and_pills_open_subagents() {
         // 1. Unified request surface inside ComposerSurface.Shell: a Captain home with both
         // its own pending confirm dialog and a crew approval pages both in one banner.
         let mut rt = crew_runtime(1280.0);
@@ -22215,7 +22181,7 @@ pub(crate) mod tests {
             Some("2/2")
         );
 
-        // 2. A questionnaire on a Captain home keeps the Now / crew strip visible above the shell.
+        // 2. A questionnaire on a Captain home keeps the agent pills visible above the shell.
         let mut rt = crew_runtime(1280.0);
         rt.state.current_mut().apply(json!({
             "type": "extension_ui_request",
@@ -22228,9 +22194,10 @@ pub(crate) mod tests {
         rt.invalidate();
         rt.frame(0.0);
         assert!(rt.presented("questionnaire-drawer").is_some());
-        assert!(rt.presented("crew-tray").is_some());
+        assert!(rt.presented("agent-pills").is_some());
 
-        // 3. A plain thread with a provider subagent shows the same 28 pt Now strip and popover.
+        // 3. A plain thread with a running provider subagent shows its pill, which opens the
+        // subagent in the Work tab.
         let mut plain = runtime(1280.0);
         plain.state.current_mut().apply(json!({
             "type": "tool_execution_start",
@@ -22240,23 +22207,13 @@ pub(crate) mod tests {
         }));
         plain.invalidate();
         plain.frame(0.0);
-        let strip = plain.presented("crew-roster-toggle").unwrap().0;
-        assert!((strip[3] - 28.0).abs() < 0.5, "{strip:?}");
-        press(&mut plain, "crew-roster-toggle");
-        plain.frame(0.0);
         assert_inside(
             &mut plain,
             1280.0,
-            &[
-                "now-popover",
-                "now-popover-agent-sub-1-0",
-                "now-popover-open-inspector",
-            ],
+            &["agent-pills", "agent-pill-agent-sub-1-0"],
         );
-        press(&mut plain, "now-popover-open-inspector");
+        press(&mut plain, "agent-pill-agent-sub-1-0");
         plain.frame(0.5);
-        assert!(!plain.state.now_popover);
-        assert!(plain.presented("now-popover").is_none());
         assert_eq!(
             plain.state.right_panel_active_view(),
             Some(crate::right_panel::PanelView::Work)
