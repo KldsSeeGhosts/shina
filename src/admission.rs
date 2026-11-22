@@ -270,6 +270,8 @@ pub struct Reservation {
     pub workspace: Option<usize>,
     #[serde(default)]
     pub captain: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initiating_device: Option<String>,
     #[serde(default)]
     pub priority: i64,
     #[serde(default)]
@@ -282,7 +284,7 @@ pub struct Reservation {
     pub release_reason: Option<String>,
     /// Why a queued reservation has not started: offline, recovering,
     /// placement, placement_failed, provider_update, owner_inactive,
-    /// worker_busy, backoff, provider_backoff, subject_gone, superseded,
+    /// worker_busy, execution, backoff, provider_backoff, subject_gone, superseded,
     /// start_refused, or a scope name.
     #[serde(default)]
     pub blocked_by: Option<String>,
@@ -773,6 +775,14 @@ impl State {
             self.tasks[task_index].state,
             TaskState::Starting | TaskState::Running
         );
+        let initiating_device = self.tasks[task_index]
+            .remote
+            .is_none()
+            .then(|| {
+                self.execution_initiator_for_thread(self.tasks[task_index].parent_thread_id)
+                    .or_else(|| self.execution_command_device.clone())
+            })
+            .flatten();
         self.scheduler.reservations.push(Reservation {
             id,
             subject,
@@ -787,6 +797,7 @@ impl State {
             provider,
             workspace,
             captain,
+            initiating_device,
             priority: 0,
             queued_at: lifecycle::now(),
             granted_at: occupying.then(lifecycle::now),
@@ -976,6 +987,7 @@ impl State {
             provider,
             workspace,
             captain,
+            initiating_device: None,
             priority: 0,
             queued_at: lifecycle::now(),
             granted_at: running.then(lifecycle::now),
@@ -1397,6 +1409,12 @@ impl State {
                 if !task.captain_turn() && (child.status.busy() || child.phase == "Stopping") {
                     return Some("worker_busy".into());
                 }
+                if task.remote.is_none()
+                    && self.prepared_local_attempt(task, child).is_none()
+                    && self.require_execution_recovery(child.id).is_err()
+                {
+                    return Some("execution".into());
+                }
                 match child.placement.as_ref().map(|p| &p.phase) {
                     Some(placement::PlacementPhase::Pending) => {
                         return Some("placement".into());
@@ -1560,6 +1578,23 @@ impl State {
                 else {
                     return false;
                 };
+                // A connected worker can flush the injection in this same poll.
+                // Bind the attempt before exposing its brief to the provider.
+                if self.tasks[task_index].remote.is_none()
+                    && crate::database::for_path(&self.data_dir.join("index.json")).is_some()
+                {
+                    let initiating_device = self.scheduler.reservations[reservation_index]
+                        .initiating_device
+                        .clone()
+                        .unwrap_or_else(|| self.identity.controller_id.clone());
+                    if let Err(error) =
+                        self.allocate_local_task_execution(task_index, &initiating_device)
+                    {
+                        self.tasks[task_index].finish(TaskState::Failed, "", &error);
+                        self.release_reservation_at(reservation_index, "execution");
+                        return true;
+                    }
+                }
                 self.scheduler.reservations[reservation_index].state = ReservationState::Held;
                 self.scheduler.reservations[reservation_index].granted_at = Some(lifecycle::now());
                 self.scheduler.reservations[reservation_index].blocked_by = None;
@@ -2845,6 +2880,7 @@ mod tests {
             provider: "cpa".into(),
             workspace: None,
             captain: None,
+            initiating_device: None,
             priority: 0,
             queued_at: 1,
             granted_at: Some(1),

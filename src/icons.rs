@@ -68,6 +68,10 @@ glyph!(
     r#"<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>"#
 );
 glyph!(
+    SERVER,
+    r#"<rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/>"#
+);
+glyph!(
     SIDEBAR,
     r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>"#
 );
@@ -84,6 +88,14 @@ glyph!(
     r#"<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>"#
 );
 glyph!(SEND, r#"<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>"#);
+glyph!(
+    LIST_PLUS,
+    r#"<path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/>"#
+);
+glyph!(
+    CORNER_UP_RIGHT,
+    r#"<path d="m15 14 5-5-5-5"/><path d="M4 20v-7a4 4 0 0 1 4-4h12"/>"#
+);
 glyph!(PLAY, r#"<path d="M6 3v18l14-9z"/>"#);
 glyph!(
     BUBBLE,
@@ -302,11 +314,14 @@ pub(super) const NAMES: &[&str] = &[
     "paperclip",
     "back",
     "monitor",
+    "server",
     "sidebar",
     "compose",
     "edit",
     "pencil",
     "send",
+    "list-plus",
+    "corner-up-right",
     "play",
     "thread",
     "cloud",
@@ -387,10 +402,13 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "paperclip" => &PAPERCLIP,
         "back" | "chevron-left" => &CHEVRON_LEFT,
         "monitor" => &MONITOR,
+        "server" => &SERVER,
         "sidebar" => &SIDEBAR,
         "compose" => &COMPOSE,
         "edit" | "pencil" => &PENCIL,
         "send" => &SEND,
+        "list-plus" => &LIST_PLUS,
+        "corner-up-right" => &CORNER_UP_RIGHT,
         "play" => &PLAY,
         "thread" => &BUBBLE,
         "cloud" => &CLOUD,

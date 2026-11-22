@@ -47,11 +47,13 @@ struct Relations {
     crew: HashMap<usize, Vec<usize>>,
     remote: HashMap<String, HashMap<usize, usize>>,
     remote_children: HashMap<RowId, Vec<usize>>,
+    pull_requests: HashMap<RowId, u64>,
 }
 
 impl Relations {
     fn build(s: &State) -> Self {
         let mut result = Self::default();
+        result.add_pull_requests(&s.machines.selected, local_pull_references(s));
         for (index, thread) in s.threads.iter().enumerate() {
             result.local.insert(thread.id, index);
             if thread
@@ -70,6 +72,7 @@ impl Relations {
             if server == &s.machines.selected {
                 continue;
             }
+            result.add_pull_requests(server, remote_pull_references(projection));
             let mut rows = HashMap::new();
             let homes = &projection["index"]["captainHomes"];
             for (index, record) in projection["index"]["threads"]
@@ -98,16 +101,23 @@ impl Relations {
         }
         result
     }
+
+    fn add_pull_requests<'a>(
+        &mut self,
+        server: &str,
+        references: impl Iterator<Item = (usize, &'a str)>,
+    ) {
+        for (thread, reference) in references {
+            if let Some(number) = pull_request_number(reference) {
+                // Reports are ordered by capture. Prefer the latest reported PR.
+                self.pull_requests
+                    .insert(RowId::new(server, thread), number);
+            }
+        }
+    }
 }
 
-fn render_local(
-    s: &State,
-    p: Palette,
-    entry: &Entry<'_>,
-    item: El,
-    target: RowTarget,
-    rel: &Relations,
-) -> El {
+fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relations) -> El {
     let thread = &s.threads[entry.local.expect("local row")];
     let row_id = RowId::new(entry.server, entry.id);
     let id = row_id.thread;
@@ -116,12 +126,21 @@ fn render_local(
     let section = s.thread_section(thread, now);
     let worker = thread.crew_captain.is_some();
     let (status, approval) = local_status(s, thread, rel);
-    let state = RowStatus::of(status, approval, thread.unread(), thread.life.woke(now));
-    let workspace = row_workspace(s, thread);
+    let mut state = RowStatus::of(
+        status,
+        approval,
+        !thread.life.settled() && thread.unread(),
+        thread.life.woke(now),
+    );
+    let workspace = if entry.captain {
+        row_workspace(s, thread)
+    } else {
+        s.project(thread.project)
+            .map(|project| project.name.clone())
+    };
     let machine = multiple_machines(s).then(|| machine_caption(s, entry.server));
     let draft = entry.draft;
     let shelved = matches!(section, Section::Snoozed | Section::Settled);
-    let project = s.project(thread.project);
     if entry.captain {
         let captain = thread.captain.unwrap_or(0);
         let profile = s.captains.get(captain);
@@ -135,8 +154,64 @@ fn render_local(
             .map(|&i| &s.threads[i])
             .filter(|t| t.archived() == s.show_archive);
         let family = || std::iter::once(thread).chain(crew.clone());
-        let requests = family().filter(|thread| thread.request.is_some()).count();
-        let unread = family().filter(|thread| thread.unread()).count();
+        let tasks = s.tasks_for(id);
+        let mut attention = family()
+            .filter(|thread| !thread.life.settled())
+            .filter_map(|member| {
+                let task = tasks.iter().find(|task| task.child_id == member.id);
+                let mark = if let Some(request) = &member.request {
+                    if request["method"] == "confirm" {
+                        RowStatus::Approval
+                    } else {
+                        RowStatus::Input
+                    }
+                } else if task
+                    .is_some_and(|task| task.state == crate::model::TaskState::Interrupted)
+                {
+                    RowStatus::Interrupted
+                } else if member.status == Status::Failed
+                    || task.is_some_and(|task| task.state == crate::model::TaskState::Failed)
+                {
+                    RowStatus::Failed
+                } else {
+                    return None;
+                };
+                Some((mark, member.title.as_str()))
+            })
+            .collect::<Vec<_>>();
+        attention.sort_by_key(|(mark, _)| match mark {
+            RowStatus::Approval => 0,
+            RowStatus::Input => 1,
+            RowStatus::Interrupted => 2,
+            _ => 3,
+        });
+        let attention_count = attention.len();
+        let status = if let Some((mark, _)) = attention.first() {
+            if *mark == RowStatus::Failed {
+                Status::Failed
+            } else {
+                Status::Waiting
+            }
+        } else {
+            family()
+                .filter(|member| !member.life.settled())
+                .map(|member| member.status)
+                .max_by_key(|status| status.urgency())
+                .unwrap_or(Status::Ready)
+        };
+        let state = attention.first().map_or_else(
+            || RowStatus::of(status, approval, thread.unread(), thread.life.woke(now)),
+            |(mark, _)| {
+                if attention.iter().all(|(other, _)| other == mark) {
+                    *mark
+                } else {
+                    RowStatus::Attention
+                }
+            },
+        );
+        let unread = family()
+            .filter(|thread| !thread.life.settled() && thread.unread())
+            .count();
         let timer = if status == Status::Running {
             family()
                 .filter(|thread| thread.status == Status::Running)
@@ -152,11 +227,8 @@ fn render_local(
         };
         let activity = if thread.archived() {
             "Archived".into()
-        } else if requests > 0 {
-            format!(
-                "{requests} {}",
-                if requests == 1 { "request" } else { "requests" }
-            )
+        } else if let Some((mark, title)) = attention.first() {
+            format!("{}: {title}", mark.word())
         } else if let Some(worker) = crew
             .clone()
             .filter(|thread| thread.status == Status::Running)
@@ -189,7 +261,7 @@ fn render_local(
                 workspace: workspace.as_deref(),
                 machine: machine.as_deref(),
                 crew: crew.count(),
-                requests,
+                attention_count,
                 unread,
                 selected: entry.selected(s),
             },
@@ -197,6 +269,9 @@ fn render_local(
     }
     let lead = if worker {
         let task = crew_ui::worker_task_mark(s, thread);
+        if !thread.life.settled() && thread.request.is_none() && task == Some(Status::Waiting) {
+            state = RowStatus::Interrupted;
+        }
         let mark = task.unwrap_or(status);
         let mut avatar = crewmate_avatar(s, p, &thread.model, mark, 16.0)
             .key(format!("worker-captain-portrait-{id}"));
@@ -210,10 +285,18 @@ fn render_local(
             );
         }
         avatar
-    } else if s.sidebar_grouped() && !shelved {
-        lead_mark(state, thread.pinned(), draft, p)
+    } else if !draft {
+        thread_avatar(
+            s,
+            p,
+            &thread.model_id,
+            &thread.model,
+            status,
+            thread.pinned(),
+        )
+        .key(format!("thread-provider-portrait-{suffix}"))
     } else {
-        status_badge(p, project_tile(s, p, project, 16.0), 16.0, status)
+        lead_mark(state, thread.pinned(), draft, p)
     };
     let snippet = entry.search_hit.as_ref().map(|hit| {
         search_snippet_el(
@@ -230,11 +313,16 @@ fn render_local(
     } else {
         &thread.title
     };
-    let actions = if s.hovered_row == Some(target) && thread.machine == "local" {
-        row_actions(s, p, thread, section, draft)
-    } else {
-        el().absolute(0.0, 0.0)
-    };
+    let actions = (thread.machine == "local").then(|| {
+        let (controls, width) = row_actions(s, p, thread, section, draft);
+        (
+            controls,
+            width,
+            sidebar_preview::row_actions_open(s, &row_id),
+        )
+    });
+    let machine =
+        machine.or_else(|| (!shelved && !draft).then(|| machine_caption(s, entry.server)));
     thread_row_el(
         s,
         p,
@@ -252,8 +340,11 @@ fn render_local(
             }),
             age: row_age(&thread.life, section, thread.updated, now),
             workspace: workspace.as_deref(),
-            branch: thread.branch.as_deref(),
+            branch: local_row_branch(s, thread),
+            pull_request: rel.pull_requests.get(&row_id).copied(),
+            diff: row_diff(s, &row_id),
             machine: machine.as_deref(),
+            machine_glyph: machine_glyph(s, entry.server),
             harness: Some(&thread.harness),
             model: Some(&thread.model),
             agents_active: crate::agents::active_count(thread),
@@ -265,6 +356,86 @@ fn render_local(
         },
         actions,
     )
+}
+
+fn local_row_branch<'a>(s: &'a State, thread: &'a Thread) -> Option<&'a str> {
+    thread.branch.as_deref().or_else(|| {
+        if thread.worktree_path.is_some() || s.vcs_branches.is_empty() {
+            return None;
+        }
+        let key = s.thread_vcs_repo_key(thread)?;
+        s.vcs_branches
+            .get(&key)?
+            .refs
+            .iter()
+            .find(|branch| branch.current)
+            .map(|branch| branch.name.as_str())
+    })
+}
+
+// Reports contain evidence links, not GitHub state. Only display a number for a real
+// GitHub pull request URL and do not infer open/closed status from a report.
+fn pull_request_number(reference: &str) -> Option<u64> {
+    let url = url::Url::parse(reference).ok()?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let (owner, repo, kind, number) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    if owner.is_empty()
+        || repo.is_empty()
+        || kind != "pull"
+        || segments.any(|segment| !segment.is_empty())
+    {
+        return None;
+    }
+    number.parse::<u64>().ok().filter(|number| *number > 0)
+}
+
+fn local_pull_references(s: &State) -> impl Iterator<Item = (usize, &str)> {
+    s.crew_reports().iter().flat_map(|report| {
+        report
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.kind == crate::model::crew_reports::ArtifactKind::PullRequest
+            })
+            .map(|artifact| (report.thread_id, artifact.reference.as_str()))
+    })
+}
+
+fn remote_pull_references(
+    projection: &crate::client_history::Projection,
+) -> impl Iterator<Item = (usize, &str)> {
+    projection["index"]["captainReports"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|report| {
+            Some((
+                usize::try_from(report["threadId"].as_u64()?).ok()?,
+                report["artifacts"].as_array()?,
+            ))
+        })
+        .flat_map(|(id, artifacts)| {
+            artifacts
+                .iter()
+                .filter(|artifact| artifact["kind"] == "pull_request")
+                .filter_map(move |artifact| Some((id, artifact["reference"].as_str()?)))
+        })
+}
+
+fn row_diff(s: &State, id: &RowId) -> Option<(u32, u32)> {
+    let diff = s
+        .diffs
+        .get(&crate::right_panel::key(&id.server, id.thread))?
+        .ready()?;
+    (diff.additions > 0 || diff.deletions > 0).then_some((diff.additions, diff.deletions))
 }
 
 fn local_status(s: &State, thread: &Thread, rel: &Relations) -> (Status, bool) {
@@ -285,6 +456,11 @@ fn local_status(s: &State, thread: &Thread, rel: &Relations) -> (Status, bool) {
         Status::Running
     } else {
         thread.status
+    };
+    let status = if status == Status::Failed && thread.life.settled() {
+        Status::Ready
+    } else {
+        status
     };
     (status, approval)
 }
@@ -315,15 +491,42 @@ fn lead_mark(status: RowStatus, pinned: bool, draft: bool, p: Palette) -> El {
     }
 }
 
-fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: bool) -> El {
+pub(super) fn thread_mascot(model_id: &str, label: &str) -> crate::visuals::ProviderMascot {
+    use crate::visuals::{ProviderMascot, provider_mascot_for};
+    match provider_mascot_for(model_id) {
+        ProviderMascot::Default => provider_mascot_for(label),
+        mascot => mascot,
+    }
+}
+
+fn thread_avatar(
+    s: &State,
+    p: Palette,
+    model_id: &str,
+    label: &str,
+    status: Status,
+    pinned: bool,
+) -> El {
+    let avatar = mascot_avatar(s, p, thread_mascot(model_id, label), status, 16.0);
+    if !pinned {
+        return avatar;
+    }
+    el().size(16.0, 16.0).child(avatar).child(
+        icon("pin", p.ink)
+            .size(9.0, 9.0)
+            .pin(None, Some(-2.0), Some(-2.0), None)
+            .radius(3.0)
+            .fill(p.card),
+    )
+}
+
+/// KSG Code's `SidebarThreadRow` uses the trailing slot for hover actions.
+fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: bool) -> (El, f32) {
     let id = thread.id;
-    let mut actions = super::row()
-        .pin(Some(4.0), Some(4.0), None, None)
-        .center_y()
-        .gap(2.0)
-        .radius(6.0)
-        .fill(p.row);
+    let mut actions = super::row().h(20.0).center_y().gap(2.0);
+    let mut width = 0.0;
     if draft || !thread.draft.text.is_empty() {
+        width += 22.0;
         actions = actions.child(
             icon_button(
                 &format!("thread-discard-{id}"),
@@ -332,11 +535,12 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
                 p,
                 move |s| s.discard_draft(id),
             )
-            .size(24.0, 24.0),
+            .size(20.0, 20.0),
         );
     }
     if !draft {
         if !matches!(section, Section::Snoozed | Section::Settled) {
+            width += 22.0;
             actions = actions.child(
                 icon_button(
                     &format!("thread-snooze-{id}"),
@@ -345,7 +549,7 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
                     p,
                     move |s| s.open_snooze(id),
                 )
-                .size(24.0, 24.0)
+                .size(20.0, 20.0)
                 .blocked(
                     s.snooze_blocker(id),
                     &format!("thread-snooze-{id}"),
@@ -359,28 +563,50 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
             Section::Settled => ("Un-settle", "check"),
             _ => ("Settle", "check"),
         };
-        actions = actions.child(
-            icon_button(&format!("thread-park-{id}"), title, glyph, p, move |s| {
-                if section == Section::Snoozed {
-                    s.unsnooze_thread(id);
-                } else {
-                    s.settle_thread(id);
-                }
-            })
-            .size(24.0, 24.0)
-            .blocked(
-                if section == Section::Snoozed {
-                    None
-                } else {
-                    s.lifecycle_blocker(id)
-                },
-                &format!("thread-park-{id}"),
-                p,
-                false,
-            ),
-        );
+        let action = move |s: &mut State| {
+            if section == Section::Snoozed {
+                s.unsnooze_thread(id);
+            } else {
+                s.settle_thread(id);
+            }
+        };
+        let key = format!("thread-park-{id}");
+        let control = if title == "Settle" {
+            width += 62.0;
+            row()
+                .key(&key)
+                .size(62.0, 20.0)
+                .role("button")
+                .label(title)
+                .focusable(true)
+                .focus_ring(1.0, 1.0, p.ring)
+                .cursor(rune::Cursor::Pointer)
+                .radius(6.0)
+                .hover(p.selected)
+                .center()
+                .gap(4.0)
+                .on_press(action)
+                .child(icon(glyph, p.muted).size(14.0, 14.0))
+                .child(label(title, SMALL, p.muted))
+        } else {
+            width += 20.0;
+            icon_button(&key, title, glyph, p, action).size(20.0, 20.0)
+        };
+        actions = actions.child(control.blocked(
+            if section == Section::Snoozed {
+                None
+            } else {
+                s.lifecycle_blocker(id)
+            },
+            &key,
+            p,
+            false,
+        ));
     }
-    actions
+    if draft {
+        width -= 2.0;
+    }
+    (actions.w(width), width)
 }
 
 pub(super) struct Entry<'a> {
@@ -396,17 +622,6 @@ pub(super) struct Entry<'a> {
     pub visible: bool,
     pub title_match: bool,
     pub search_hit: Option<crate::thread_search::ThreadSearchHit>,
-}
-
-/// One workspace group in the sidebar (ported from KSG Code's
-/// `SidebarProjectFolderHeader`). Groups sort by most recent row, pinned first
-/// inside each group, "Chats" (no workspace) last.
-pub(super) struct Group<'a> {
-    pub server: &'a str,
-    pub project: Option<usize>,
-    pub name: String,
-    pub project_data: Option<crate::projects::Project>,
-    pub rows: Vec<&'a Entry<'a>>,
 }
 
 impl<'a> Entry<'a> {
@@ -449,168 +664,39 @@ impl<'a> Entry<'a> {
         }
     }
 
-    fn working(&self, s: &State, rel: &Relations) -> bool {
-        if let Some(index) = self.local {
-            local_status(s, &s.threads[index], rel).0 == Status::Running
-        } else {
-            status_of_view(self.view) == Status::Running
-        }
-    }
-
-    fn recent_rank(&self, s: &State) -> u64 {
-        // `updated` is in Unix seconds; lifecycle timestamps are in Unix milliseconds.
-        // Convert `updated` to ms before comparing, and exclude `pinned_at` so pinning
-        // a single row keeps it first inside its group without reordering the whole workspace.
-        let updated_ms = if let Some(index) = self.local {
-            s.threads[index].updated
-        } else {
-            self.record.and_then(|r| r["updated"].as_u64()).unwrap_or(0)
-        }
-        .saturating_mul(1000);
-        let life_ts = self
-            .life
-            .latest_user_message_at
-            .max(self.life.last_completed_at)
-            .unwrap_or(0);
-        updated_ms.max(life_ts)
+    fn failed(&self, s: &State, rel: &Relations) -> bool {
+        !self.life.settled()
+            && if let Some(index) = self.local {
+                local_status(s, &s.threads[index], rel).0 == Status::Failed
+            } else {
+                status_of_view(self.view) == Status::Failed
+            }
     }
 }
 
-/// Group ordinary active/pinned sidebar rows by `(server, project)`.
-pub(super) fn groups<'a>(s: &'a State, rows: &[&'a Entry<'a>]) -> Vec<Group<'a>> {
-    let mut grouped: Vec<(Group<'a>, u64)> = Vec::new();
-    let mut group_index = HashMap::new();
-    for &entry in rows {
-        let project = entry.project(s);
-        let index = *group_index
-            .entry((entry.server, project))
-            .or_insert_with(|| {
-                let index = grouped.len();
-                let data = entry.project_data(s);
-                grouped.push((
-                    Group {
-                        server: entry.server,
-                        project,
-                        name: data
-                            .as_ref()
-                            .map_or_else(|| "Chats".into(), |p| p.name.clone()),
-                        project_data: data,
-                        rows: Vec::new(),
-                    },
-                    0,
-                ));
-                index
-            });
-        let (group, rank) = &mut grouped[index];
-        group.rows.push(entry);
-        *rank = (*rank).max(entry.recent_rank(s));
+fn aggregate_attention<'a>(
+    s: &State,
+    p: Palette,
+    rows: impl Iterator<Item = &'a Entry<'a>>,
+    rel: &Relations,
+) -> Option<(Color, &'static str)> {
+    let mut failed = false;
+    for entry in rows {
+        if entry.needs_you(s, rel) {
+            return Some((p.brass, "Needs input"));
+        }
+        failed |= entry.failed(s, rel);
     }
-    // Sort groups: "Chats" (no workspace) last, otherwise most recent row first.
-    // Rows inside each group already preserve pinned-first, lifecycle order.
-    grouped.sort_by_cached_key(|(group, rank)| {
-        (
-            group.project.is_none(),
-            std::cmp::Reverse(*rank),
-            group.name.to_lowercase(),
-            group.server,
-            group.project,
-        )
-    });
-    grouped.into_iter().map(|(group, _)| group).collect()
+    failed.then_some((p.danger, "Failed"))
 }
 
-/// Workspace group header, ported from KSG Code's `SidebarProjectFolderHeader`.
-fn group_header(s: &State, p: Palette, group: &Group<'_>, collapsed: bool, rel: &Relations) -> El {
-    let project_key = group
-        .project
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "none".into());
-    let key = format!("sidebar-group-{}-{project_key}", group.server);
-    let new_key = format!("new-thread-in-{}-{project_key}", group.server);
-    let server = group.server.to_string();
-    let project = group.project;
-    let new_server = server.clone();
-    let name = group.name.clone();
-    let needs_you = group.rows.iter().any(|e| e.needs_you(s, rel));
-    let working = group.rows.iter().any(|e| e.working(s, rel));
-    let lead = if group.project.is_some() {
-        project_tile(s, p, group.project_data.as_ref(), 16.0)
-    } else {
-        el().size(16.0, 16.0)
-            .center()
-            .a11y_hidden()
-            .child(icon("thread", p.muted).size(14.0, 14.0))
-    };
-    let mut header = rune::row()
-        .key(key)
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!(
-            "{}, {} threads, {}",
-            name,
-            group.rows.len(),
-            if collapsed { "collapsed" } else { "expanded" }
-        ))
-        .focusable(true)
-        .h(28.0)
-        .mt(4.0)
-        .pl(ROW_INSET)
-        .pr(4.0)
-        .gap(8.0)
-        .center_y()
-        .radius(6.0)
-        .hover(p.selected)
-        .hover_group()
-        .on_press(move |s: &mut State| s.toggle_sidebar_group(server.clone(), project))
-        .child(lead)
-        .child(label(&name, META, p.muted).truncate().grow(1.0).min_w(0.0));
-    if multiple_machines(s) {
-        header = header.child(machine_tag(
-            s,
-            p,
-            group.server,
-            format!("sidebar-group-machine-{}-{project_key}", group.server),
-            SMALL,
-            sidebar_row_width(s) >= 232.0,
-        ));
-    }
-    if needs_you {
-        header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.brass).a11y_hidden());
-    } else if working {
-        header = header.child(el().size(6.0, 6.0).radius(3.0).fill(p.sea).a11y_hidden());
-    }
-    if collapsed {
-        header = header.child(label(
-            group.rows.len().to_string(),
-            META.features(TABULAR),
-            p.faint,
-        ));
-    }
-    let new_label = format!("New thread in {name}");
-    header
-        .child(
-            icon_button(&new_key, &new_label, "plus", p, move |s| {
-                if new_server != s.machines.selected && s.machine_connected(&new_server) {
-                    s.select_machine_without_draft(&new_server);
-                }
-                if new_server == s.machines.selected {
-                    s.new_thread_in(project);
-                }
-            })
-            .group_opacity(0.0, 1.0)
-            .help(new_label),
-        )
-        .child(
-            icon(
-                if collapsed {
-                    "chevron-right"
-                } else {
-                    "chevron-down"
-                },
-                p.faint,
-            )
-            .size(12.0, 12.0),
-        )
+fn attention_dot(key: String, ink: Color, word: &str) -> El {
+    el().key(key)
+        .size(6.0, 6.0)
+        .radius(3.0)
+        .fill(ink)
+        .help(word)
+        .label(word)
 }
 
 pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
@@ -955,14 +1041,9 @@ enum Node {
     SearchHeader(usize),
     Empty,
     Thread(IndexedRow),
-    Group {
-        server: String,
-        project: Option<usize>,
-        rows: Vec<IndexedRow>,
-    },
     Shelf {
         section: Section,
-        count: usize,
+        rows: Vec<IndexedRow>,
         index: usize,
         inset: f32,
     },
@@ -986,11 +1067,10 @@ fn structure_signature(s: &State, at: u64) -> u64 {
     s.machines.selected.hash(&mut hash);
     s.client.is_some().hash(&mut hash);
     s.show_archive.hash(&mut hash);
-    s.sidebar_grouped().hash(&mut hash);
     s.shelves.hash(&mut hash);
     s.settled_visible.hash(&mut hash);
     s.drag_thread.is_some().hash(&mut hash);
-    if s.sidebar_grouped() || s.shelves.contains(&false) {
+    if s.shelves.contains(&false) {
         s.selected_row().hash(&mut hash);
     }
     s.selected_threads.hash(&mut hash);
@@ -1003,11 +1083,7 @@ fn structure_signature(s: &State, at: u64) -> u64 {
     for project in &s.projects.entries {
         project.id.hash(&mut hash);
         project.name.hash(&mut hash);
-        s.sidebar_group_collapsed(&s.machines.selected, Some(project.id))
-            .hash(&mut hash);
     }
-    s.sidebar_group_collapsed(&s.machines.selected, None)
-        .hash(&mut hash);
     for t in &s.threads {
         t.id.hash(&mut hash);
         t.machine.hash(&mut hash);
@@ -1035,9 +1111,6 @@ fn structure_signature(s: &State, at: u64) -> u64 {
         life.latest_user_message_at.hash(&mut hash);
         life.last_completed_at.hash(&mut hash);
         life.created_at.hash(&mut hash);
-        if s.sidebar_grouped() {
-            t.updated.hash(&mut hash);
-        }
         if !s.search.text.is_empty() {
             t.title.hash(&mut hash);
             t.draft.text.hash(&mut hash);
@@ -1087,17 +1160,6 @@ fn structure_signature(s: &State, at: u64) -> u64 {
             projection["index"][key].hash(&mut hash);
         }
         s.machines.ui[server]["drafts"].hash(&mut hash);
-        s.sidebar_group_collapsed(server, None).hash(&mut hash);
-        for project in projection["index"]["projects"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            if let Some(id) = project["id"].as_u64() {
-                s.sidebar_group_collapsed(server, Some(id as usize))
-                    .hash(&mut hash);
-            }
-        }
     }
     hash.finish()
 }
@@ -1111,6 +1173,17 @@ fn relations_signature(s: &State, structure: u64) -> u64 {
             .is_some_and(|request| request["method"] == "confirm")
         {
             t.id.hash(&mut hash);
+        }
+    }
+    for reference in local_pull_references(s) {
+        reference.hash(&mut hash);
+    }
+    for (server, projection) in &s.machines.views {
+        if server != &s.machines.selected {
+            server.hash(&mut hash);
+            for reference in remote_pull_references(projection) {
+                reference.hash(&mut hash);
+            }
         }
     }
     hash.finish()
@@ -1228,46 +1301,6 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         }
     }
     let dragging = s.drag_thread.is_some();
-    let grouped = s.sidebar_grouped() && !dragging;
-    if grouped {
-        let active: Vec<_> = all
-            .iter()
-            .copied()
-            .filter(|row| {
-                !row.draft
-                    && row.visible
-                    && matches!(
-                        lifecycle::section(&row.life, at),
-                        Section::Pinned | Section::Active
-                    )
-            })
-            .collect();
-        for group in groups(s, &active) {
-            let key = format!(
-                "sidebar-group-{}-{}",
-                group.server,
-                group
-                    .project
-                    .map_or_else(|| "none".into(), |id| id.to_string())
-            );
-            let collapsed = s.sidebar_group_collapsed(group.server, group.project);
-            plan.add(
-                key,
-                Node::Group {
-                    server: group.server.into(),
-                    project: group.project,
-                    rows: group.rows.iter().map(|row| IndexedRow::new(row)).collect(),
-                },
-            );
-            for row in group
-                .rows
-                .into_iter()
-                .filter(|row| !collapsed || row.selected(s))
-            {
-                plan.thread(s, row);
-            }
-        }
-    }
     let settled_exists = all
         .iter()
         .any(|row| !row.draft && lifecycle::section(&row.life, at) == Section::Settled);
@@ -1277,7 +1310,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         Section::Snoozed,
         Section::Settled,
     ];
-    for section in sections.into_iter().skip(if grouped { 2 } else { 0 }) {
+    for section in sections {
         let rows: Vec<_> = all
             .iter()
             .copied()
@@ -1291,7 +1324,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
                 format!("shelf-block-{section:?}"),
                 Node::Shelf {
                     section,
-                    count: rows.len(),
+                    rows: rows.iter().map(|row| IndexedRow::new(row)).collect(),
                     index: usize::from(section == Section::Settled),
                     inset: if section == Section::Snoozed && (settled_exists || dragging) {
                         SHELF_HEADING
@@ -1457,10 +1490,14 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
         .as_str()
         .or_else(|| record["model"].as_str());
     let mut status = status_of_view(view);
+    if status == Status::Failed && entry.life.settled() {
+        status = Status::Ready;
+    }
     let mut approval = view.record["request"]["method"] == "confirm";
     let mut elapsed = view_running_seconds(view);
     let mut requests = usize::from(!view.record["request"].is_null());
-    let mut unread = usize::from(entry.life.unread());
+    let mut failures = usize::from(status == Status::Failed);
+    let mut unread = usize::from(!entry.life.settled() && entry.life.unread());
     let mut crew = 0;
     for child in rel.remote_children.get(&row_id).into_iter().flatten() {
         let child_view = projection
@@ -1468,8 +1505,8 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             .get(&(*child as u64))
             .map(std::sync::Arc::as_ref)
             .unwrap_or(null_view());
-        approval |= child_view.record["request"]["method"] == "confirm";
         if !entry.captain {
+            approval |= child_view.record["request"]["method"] == "confirm";
             continue;
         }
         let Some(child_record) = remote_record(projection, rel, entry.server, *child) else {
@@ -1482,9 +1519,14 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             continue;
         }
         crew += 1;
+        if life.settled() {
+            continue;
+        }
+        approval |= child_view.record["request"]["method"] == "confirm";
         requests += usize::from(!child_view.record["request"].is_null());
         unread += usize::from(life.unread());
         let state = status_of_view(child_view);
+        failures += usize::from(state == Status::Failed && child_view.record["request"].is_null());
         if state == Status::Running {
             elapsed = elapsed.max(view_running_seconds(child_view));
         }
@@ -1499,11 +1541,15 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
     let state = RowStatus::of(status, approval, unread > 0, entry.life.woke(now));
     let title = record["title"].as_str().unwrap_or("Thread");
     let project = entry.project_data(s);
-    let workspace = (!workspace_named_by_filter(s, entry.server, entry.project(s))).then(|| {
-        project
-            .as_ref()
-            .map_or("No workspace", |project| project.name.as_str())
-    });
+    let workspace = if entry.captain {
+        (!workspace_named_by_filter(s, entry.server, entry.project(s))).then(|| {
+            project
+                .as_ref()
+                .map_or("No workspace", |project| project.name.as_str())
+        })
+    } else {
+        project.as_ref().map(|project| project.name.as_str())
+    };
     let machine = machine_caption(s, entry.server);
     if entry.captain {
         let captain = record["captain"]
@@ -1516,7 +1562,12 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             .and_then(|cap| cap["portrait"].as_u64())
             .unwrap_or_default() as usize;
         let activity = if requests > 0 {
-            format!("{requests} requests")
+            format!(
+                "{requests} {}",
+                if requests == 1 { "request" } else { "requests" }
+            )
+        } else if failures > 0 {
+            format!("{failures} failed")
         } else if status == Status::Running {
             "Working".into()
         } else {
@@ -1539,13 +1590,17 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
                     36.0,
                     status,
                 ),
-                status: state,
+                status: if requests > 0 && failures > 0 {
+                    RowStatus::Attention
+                } else {
+                    state
+                },
                 timer: elapsed.filter(|_| status == Status::Running),
                 activity: &activity,
                 workspace,
                 machine: Some(&machine),
                 crew,
-                requests,
+                attention_count: requests + failures,
                 unread,
                 selected: entry.selected(s),
             },
@@ -1561,10 +1616,18 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
     let lead = if worker {
         crewmate_avatar(s, p, model.unwrap_or_default(), status, 16.0)
             .key(format!("crewmate-{}-{id}", entry.server))
-    } else if s.sidebar_grouped() && !shelved {
-        lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
+    } else if !entry.draft {
+        thread_avatar(
+            s,
+            p,
+            view.record["model_id"].as_str().unwrap_or_default(),
+            model.unwrap_or_default(),
+            status,
+            entry.life.pinned_at.is_some(),
+        )
+        .key(format!("thread-provider-portrait-{suffix}"))
     } else {
-        status_badge(p, project_tile(s, p, project.as_ref(), 16.0), 16.0, status)
+        lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
     };
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
@@ -1605,7 +1668,10 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             branch: view.record["branch"]
                 .as_str()
                 .or_else(|| record["branch"].as_str()),
+            pull_request: rel.pull_requests.get(&row_id).copied(),
+            diff: row_diff(s, &row_id),
             machine: Some(&machine),
+            machine_glyph: machine_glyph(s, entry.server),
             harness: view.record["harness"]
                 .as_str()
                 .or_else(|| record["harness"].as_str()),
@@ -1620,7 +1686,7 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             draft: entry.draft,
             snippet,
         },
-        el().absolute(0.0, 0.0),
+        None,
     )
 }
 
@@ -1673,11 +1739,6 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
             }
         })
         .on_hover_change(move |s: &mut State, hovered, tx| {
-            if local && hovered {
-                s.hovered_row = Some(target);
-            } else if s.hovered_row == Some(target) {
-                s.hovered_row = None;
-            }
             super::sidebar_preview::row_hover(s, &hover_id, hovered, tx);
         })
         .on_key(move |s: &mut State, ev, tx| match ev.key {
@@ -1725,8 +1786,9 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
         {
             item = item
                 .on_drag(move |s: &mut State, drag, _| s.drag_pointer(id, drag))
-                .on_drawn_layout(move |s: &mut State, rect| {
+                .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                     s.drop_rects.insert(drop_key.clone(), rect);
+                    tx.live_only();
                 })
                 .on_visible(move |s: &mut State, visible, tx| {
                     if !visible {
@@ -1737,7 +1799,7 @@ fn render_thread(s: &State, p: Palette, row: &IndexedRow, rel: &Relations) -> El
         }
     }
     let built = if local {
-        render_local(s, p, &entry, item, target, rel)
+        render_local(s, p, &entry, item, rel)
     } else {
         render_remote(s, p, &entry, item, rel)
     };
@@ -1908,34 +1970,10 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                     workspace: None,
                     machine: None,
                     crew: 0,
-                    requests: 0,
+                    attention_count: 0,
                     unread: 0,
                     selected: false,
                 },
-            )
-        }
-        Node::Group {
-            server,
-            project,
-            rows,
-        } => {
-            let resolved: Vec<_> = rows.iter().filter_map(|row| resolve(s, row, rel)).collect();
-            let data = resolved.first().and_then(|row| row.project_data(s));
-            let group = Group {
-                server,
-                project: *project,
-                name: data
-                    .as_ref()
-                    .map_or_else(|| "Chats".into(), |project| project.name.clone()),
-                project_data: data,
-                rows: resolved.iter().collect(),
-            };
-            group_header(
-                s,
-                p,
-                &group,
-                s.sidebar_group_collapsed(server, *project),
-                rel,
             )
         }
         Node::SearchHeader(count) => section_title(
@@ -1961,18 +1999,27 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                 .px(8.0)
                 .center_y()
                 .fill(if selected { p.coral_bg } else { p.selected })
-                .on_drawn_layout(move |s: &mut State, rect| {
+                .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                     s.drop_rects.insert(key.clone(), rect);
+                    tx.live_only();
                 })
                 .child(meta_label(&format!("{section:?}"), p.muted))
         }
         Node::Shelf {
             section,
-            count,
+            rows,
             index,
             inset,
         } => {
             let index = *index;
+            let count = rows.len();
+            let attention = (!s.shelves[index])
+                .then(|| {
+                    let entries: Vec<_> =
+                        rows.iter().filter_map(|row| resolve(s, row, rel)).collect();
+                    aggregate_attention(s, p, entries.iter(), rel)
+                })
+                .flatten();
             let title = format!("{section:?}");
             let key = format!("drop-{section:?}");
             col()
@@ -1993,8 +2040,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         .center_y()
                         .gap(6.0)
                         .hover(p.selected)
-                        .on_drawn_layout(move |s: &mut State, rect| {
+                        .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                             s.drop_rects.insert(key.clone(), rect);
+                            tx.live_only();
                         })
                         .on_press(move |s: &mut State| {
                             s.shelves[index] = !s.shelves[index];
@@ -2002,6 +2050,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         })
                         .child(meta_label(&title, p.faint))
                         .child(spacer())
+                        .child(attention.map_or_else(el, |(ink, word)| {
+                            attention_dot(format!("shelf-attention-{section:?}"), ink, word)
+                        }))
                         .child(label(count.to_string(), TIMER, p.faint))
                         .child(
                             icon(
@@ -2037,7 +2088,7 @@ fn windowed(
         .growth(rune::GrowthSpec::default())
         .virtual_rows(
             end.saturating_sub(start),
-            48.0,
+            64.0,
             move |_: &State, index| keys.nodes[start + index].0.clone().into(),
             move |s: &State, index| {
                 let (key, node) = &build.nodes[start + index];
@@ -2140,10 +2191,10 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
     row.captain.hash(&mut hash);
     row.draft.hash(&mut hash);
     row.title_match.hash(&mut hash);
+    rel.pull_requests.get(&row.id).hash(&mut hash);
     s.dark.hash(&mut hash);
     s.artwork.device_scale().to_bits().hash(&mut hash);
     s.portraits.motion_allowed().hash(&mut hash);
-    s.sidebar_grouped().hash(&mut hash);
     sidebar_row_width(s).to_bits().hash(&mut hash);
     s.search.text.hash(&mut hash);
     s.show_archive.hash(&mut hash);
@@ -2161,8 +2212,10 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
     if local && let Some(thread) = rel.local.get(&id).and_then(|&index| s.threads.get(index)) {
         thread.title.hash(&mut hash);
         thread.model.hash(&mut hash);
+        thread.model_id.hash(&mut hash);
         thread.harness.hash(&mut hash);
-        thread.branch.hash(&mut hash);
+        local_row_branch(s, thread).hash(&mut hash);
+        row_diff(s, &row.id).hash(&mut hash);
         thread.updated.hash(&mut hash);
         thread.unread().hash(&mut hash);
         thread.life.woke(now).hash(&mut hash);
@@ -2179,13 +2232,17 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
         }
         crate::agents::active_count(thread).hash(&mut hash);
         (s.selected_row() == id || s.selected_threads.contains(&id)).hash(&mut hash);
-        (s.hovered_row == Some(RowTarget::Thread(id))).hash(&mut hash);
         workspace_named_by_filter(s, server, thread.project).hash(&mut hash);
         if let Some(project) = s.project(thread.project) {
             project.name.hash(&mut hash);
-            project.icon.hash(&mut hash);
         }
         (s.thread_section(thread, now) as u8).hash(&mut hash);
+        if !row.captain && thread.machine == "local" {
+            sidebar_preview::row_actions_open(s, &row.id).hash(&mut hash);
+            s.lifecycle_busy(id).hash(&mut hash);
+            s.row_pending(thread).hash(&mut hash);
+            thread.queued().hash(&mut hash);
+        }
         thread.pinned().hash(&mut hash);
         if row.draft {
             thread.draft.text.lines().next().hash(&mut hash);
@@ -2214,6 +2271,12 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                 child.unread().hash(&mut hash);
                 child.archived().hash(&mut hash);
                 child.request.is_some().hash(&mut hash);
+                child
+                    .request
+                    .as_ref()
+                    .map(|request| request["method"].as_str())
+                    .hash(&mut hash);
+                child.life.settled().hash(&mut hash);
                 if child.status == Status::Running {
                     child
                         .started
@@ -2222,8 +2285,13 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                         .hash(&mut hash);
                 }
             }
+            for task in s.tasks_for(id) {
+                task.child_id.hash(&mut hash);
+                task.state.id().hash(&mut hash);
+            }
         }
     } else if let Some(projection) = s.machines.views.get(server) {
+        row_diff(s, &row.id).hash(&mut hash);
         let record = remote_record(projection, rel, server, id);
         record.hash(&mut hash);
         projection["index"]["projects"].hash(&mut hash);
@@ -2243,7 +2311,9 @@ fn row_revision(s: &State, row: &IndexedRow, rel: &Relations) -> u64 {
                     "request",
                     "elapsed",
                     "agentsActive",
+                    "branch",
                     "model",
+                    "model_id",
                     "harness",
                 ] {
                     view.record[key].hash(&mut hash);

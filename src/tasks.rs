@@ -789,7 +789,11 @@ impl State {
 
     pub fn attention(&self) -> Vec<AttentionItem> {
         let mut items = Vec::new();
-        for thread in self.threads.iter().filter(|t| !t.archived()) {
+        for thread in self
+            .threads
+            .iter()
+            .filter(|t| !t.archived() && !t.life.settled())
+        {
             let task = self
                 .tasks
                 .iter()
@@ -2268,6 +2272,9 @@ impl State {
         }
         let parent = self.tasks[index].parent_thread_id;
         if self.tasks[index].state.finished() {
+            if task.remote.is_none() {
+                self.require_execution_recovery(task.child_thread_id)?;
+            }
             self.check_task_capacity(parent)?;
         }
         let child = self.tasks[index].child_thread_id;
@@ -4232,6 +4239,106 @@ mod tests {
                 assert_eq!(saved, before);
             });
         }
+    }
+
+    #[test]
+    fn completed_local_worker_follow_up_uses_one_lease_before_same_tick_dispatch() {
+        let directory = crate::store::directory().unwrap();
+        let mut runtime = crate::runtime::RuntimeState::open(directory, Arc::new(|| {})).unwrap();
+        runtime.state.demo = true;
+        runtime.state.runtime_enabled = false;
+        runtime.state.use_pi_for_test();
+        let database = runtime.database.clone().unwrap();
+
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        runtime
+            .state
+            .mcp_call(1, "delegate_task", &delegate_args("first-attempt"))
+            .unwrap();
+        let state = &mut runtime.state;
+        let (commands, _events) = fake_pi(&mut state.threads[1]);
+        let first = state.threads[1].next_execution.take().unwrap();
+        state.threads[1].execution = Some(first.clone());
+        state.threads[1].run_id = Some(first.run_id);
+        state.threads[1].status = Status::Completed;
+        state.threads[1].pending_injections.clear();
+        state.tasks[0].finish(TaskState::Completed, "first reply", "");
+        state.tasks[0].delivered = true;
+        let observed_attempt = state.tasks[0].attempt_id.clone();
+        runtime.persist_for_test(capture.finish()).unwrap();
+
+        // Refuse replacement while the completed-looking worker still lacks
+        // terminal evidence. Do not mutate its attempt or dispatch a prompt.
+        database.begin().unwrap();
+        let state = &mut runtime.state;
+        let args = json!({
+            "thread_id":2, "attempt_id":observed_attempt,
+            "client_request_id":"follow-up", "message":"Review the fix."
+        });
+        let error = state.mcp_call(1, "task_send", &args).unwrap_err();
+        assert!(error.contains("prepared"), "{error}");
+        assert_eq!(state.tasks[0].attempt_id, observed_attempt);
+        assert!(commands.try_recv().is_err());
+        state
+            .execution
+            .terminal(&first.lease_id, "done", lifecycle::now(), "fixture result")
+            .unwrap();
+        runtime.persist_for_test(Vec::new()).unwrap();
+
+        database.begin().unwrap();
+        let capture = crate::outbox::Capture::begin();
+        let state = &mut runtime.state;
+        let baseline = state.execution_baseline();
+        let device = state.identity.controller_id.clone();
+        let older_input = state.threads[1].enqueue_injection("An unrelated completion".into());
+        let (reply, received) = mpsc::channel();
+        state.mcp_request(crate::mcp::Request {
+            thread: 1,
+            tool: "task_send".into(),
+            args,
+            reply,
+        });
+        state.poll_tasks(Instant::now());
+        state.refresh_execution(lifecycle::now());
+        state
+            .prepare_execution_after_command(&baseline, &device)
+            .unwrap();
+        let attempt = state.threads[1].execution.clone().unwrap();
+        assert_eq!(attempt.generation, first.generation + 1);
+        assert_eq!(
+            attempt.attempt_id.as_ref(),
+            Some(&state.tasks[0].attempt_id)
+        );
+        assert_ne!(state.tasks[0].attempt_id, observed_attempt);
+        assert!(state.threads[1].next_execution.is_none());
+        assert_eq!(
+            delivery_id(&state.threads[1].pending_injections[1].text),
+            Some(older_input.as_str()),
+            "an unrelated injection must not consume the attempt's lease"
+        );
+        let effects = capture.finish();
+        let prompts: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| effect.prompt_run())
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].0, attempt.run_id);
+        assert!(received.try_recv().is_err());
+        assert!(commands.try_recv().is_err());
+
+        runtime.persist_for_test(effects).unwrap();
+        assert!(received.try_recv().unwrap().is_ok());
+        let prompt = commands.try_recv().unwrap();
+        assert_eq!(prompt["runId"], attempt.run_id);
+        assert!(
+            prompt["message"]
+                .as_str()
+                .unwrap()
+                .contains("Review the fix.")
+        );
+        assert!(commands.try_recv().is_err());
+        assert!(runtime.failure().is_none());
     }
 
     #[test]

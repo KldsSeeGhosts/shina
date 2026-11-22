@@ -1414,7 +1414,7 @@ fn main() {
                 state.new_thread_in(None);
                 state.dark = true;
             }),
-            // The narrowest docked sidebar, 200 pt, with the attention badge beside the wordmark.
+            // The narrowest docked sidebar, 200 pt, with the compose button beside the wordmark.
             ("sidebar-narrow", |state| {
                 captain_workspace_demo(state);
                 // At 620 pt the sidebar docks only in compact mode.
@@ -1434,6 +1434,7 @@ fn main() {
                 state.populate_demo();
                 state.current_mut().work[0].expanded = false;
             }),
+            ("sidebar-cards", |state| state.populate_sidebar_cards_demo()),
             ("thinking-output", |state| {
                 state.populate_demo();
                 state.current_mut().thoughts[0].expanded = true;
@@ -1498,7 +1499,6 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
                 // the banner counts them from the tasks, so its number is what Review lists.
                 state.demo_stop(19);
                 state.recovery_notice = Some("Shina was closed while 2 tasks were running. Check their partial work, then resume or dismiss them.".into());
-                state.attention_menu = true;
             }),
             ("captain-goal-empty", |state| {
                 captain_workspace_demo(state);

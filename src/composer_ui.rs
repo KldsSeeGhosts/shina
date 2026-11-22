@@ -666,7 +666,6 @@ pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
         && s.row_menu.is_none()
         && s.snooze_menu.is_none()
         && !s.custom_snooze_open
-        && !s.attention_menu
         && !s.compact_sidebar
         && !s.machines.picker
         && !s.machines.dialog
@@ -944,7 +943,8 @@ pub(super) fn controls(
         .gap(4.0)
         .min_w(0.0)
         .h(if resting { 32.0 } else { 30.0 })
-        .px(if resting { 16.0 } else { 6.0 });
+        .pl(if resting { 16.0 } else { 5.0 })
+        .pr(if resting { 16.0 } else { 8.0 });
     controls = bind_anchor(s, 2, controls.offset(controls_x, controls_y));
     if resting {
         let [model_x, model_y] = anchor_offset(s, 3, true);

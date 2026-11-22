@@ -169,7 +169,20 @@ impl Thread {
         ) {
             return;
         }
-        if self.status.busy() || self.configuring {
+        // A reasoning choice stays recorded while a configure is in flight: the newest
+        // wanted level renders at once and the acknowledgement path reconciles it in
+        // order, instead of dropping a rapid second pick or sending a concurrent change.
+        let reasoning = matches!(
+            id.as_str(),
+            "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
+        ) && value.as_str().is_some()
+            && matches!(self.harness.as_str(), "pi" | "codex" | "claude");
+        let can_configure = if reasoning {
+            self.can_choose_thinking()
+        } else {
+            !self.status.busy() && !self.configuring
+        };
+        if !can_configure {
             return;
         }
         self.model_options.retain(|o| o.id != id);
@@ -197,13 +210,11 @@ impl Thread {
                 self.context_window = Some(tokens);
             }
         }
-        if matches!(
-            id.as_str(),
-            "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
-        ) && let Some(level) = value.as_str()
-            && matches!(self.harness.as_str(), "pi" | "codex" | "claude")
-        {
+        if reasoning && let Some(level) = value.as_str() {
             self.selected_thinking = Some(level.to_owned());
+            if self.configuring {
+                return;
+            }
             if self.pi.is_none() || self.initializing {
                 self.thinking = level.to_owned();
             } else if self.command("set_thinking_level", json!({"level": level})) {

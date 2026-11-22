@@ -612,7 +612,6 @@ pub(super) fn suggestion_menu_open(s: &State) -> bool {
         || s.row_menu.is_some()
         || s.thread_menu
         || s.settings_menu
-        || s.attention_menu
         || s.plan_menu.is_some()
         || s.snooze_menu.is_some()
         || s.current().context.popover_open()

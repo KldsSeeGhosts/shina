@@ -1415,7 +1415,7 @@ pub(crate) fn tick(state: &mut State, tx: &mut Tx) -> bool {
 
 /// KSG `formatCompactDiffCount`: exact to 999, then one-decimal k/m/b that
 /// trims a trailing ".0" below 10.
-fn format_compact_diff_count(value: u32) -> String {
+pub(super) fn format_compact_diff_count(value: u32) -> String {
     fn compact(value: f32, suffix: &str) -> String {
         if value < 10.0 {
             let mut text = format!("{value:.1}");

@@ -56,7 +56,7 @@ Already ported:
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
 | `inspector_ui::view`, `agents_ui::view` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`, `chat/ProviderSubagentBar.tsx` (fixed Overview/Agents/Crew/Context/Diff strip; Agents is thread-scoped) |
-| `sidebar_ui::content`, `sidebar_row::{thread_row_el,captain_row_el}`, `sidebar_preview::view` | `SidebarThreadRow`, `Sidebar.logic.ts`, `SidebarProjectFolderHeader`; two-line rows and the delayed preview follow the Shina Wave 3 spec |
+| `sidebar_ui::content`, `sidebar_row::{thread_row_el,captain_row_el}`, `sidebar_preview::view` | KSG Code's flat list and `SidebarThreadRow` card variant for active and pinned threads. Keep project and machine on each card, separate from the title. Use the model avatar, or Shina's default avatar when no model avatar matches. Only shelves and drafts use slim rows. Captain rows keep their portraits and crew attention count. |
 | `pi_ui::access_picker`, `updates_ui::footer`, `updates_ui::popover` | `chat/ComposerPermissionsSection.tsx` and `sidebar/SidebarUpdatePill.tsx`, adapted to the Wave 3 access radio group and quiet footer |
 | `top_bar::bar`, `quick_switcher::view` | `chat/CommandPalette.tsx`, `chat/CommandPaletteResults.tsx` (row metrics for the switcher; the single 40 pt title bar with nav buttons and the breadcrumb title is a Shina-only design) |
 
@@ -98,3 +98,4 @@ Removed at the user's request. Do not add them back:
 
 - Prefer releases over local builds so Windows and macOS stay in sync without drift.
 - After checks pass, commit and push your changes rather than leaving them only as local working-tree edits or local builds.
+- For PRs that change the UI, embed labeled Before and After screenshots in the PR description. Capture the base revision and the PR revision with matching demo data, platform, viewport, scale, theme, and UI state. Prefer Shina's `--demo --snap` mode and never use a personal profile. Attach the images to the PR or link durable copies outside the code branch. If a matching Before screenshot is impossible, say why.

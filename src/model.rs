@@ -21,7 +21,8 @@ use std::{
 pub const DEFAULT_MODEL: &str = "Default model";
 pub const SIDEBAR_MIN: f32 = 220.0;
 pub const SIDEBAR_MAX: f32 = 420.0;
-pub const DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 336.0;
+const PREVIOUS_DEFAULT_SIDEBAR_WIDTH: f32 = 288.0;
 pub(crate) const INJECTION_PREFIX: &str = "[Shina orchestration]\n";
 
 struct ContextAssetDownload {
@@ -616,6 +617,16 @@ pub enum SettingsPicker {
     Thinking,
 }
 
+/// One in-flight gesture on the effort slider: where the thumb is held and which control
+/// the gesture belongs to. `key` hashes the thread, model, option id and levels the press
+/// began on, so a stale release after a thread, model or option change cannot commit a
+/// level into a context the user never aimed at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThinkingDrag {
+    pub frac: f32,
+    pub key: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowTarget {
     Thread(usize),
@@ -627,14 +638,6 @@ pub enum ProjectScope {
     All,
     Project(ProjectId),
     NoProject,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SidebarGrouping {
-    #[default]
-    Workspace,
-    Recent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2034,15 +2037,76 @@ impl Thread {
             self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
             return;
         }
-        if self.status.busy() || self.configuring {
+        if !self.can_choose_thinking() {
             return;
         }
         self.selected_thinking = Some(level.clone());
+        if self.configuring {
+            // An earlier configure is still awaiting its response. The wanted level is
+            // recorded; the acknowledgement path reconciles it in order instead of
+            // sending a second, concurrent change.
+            return;
+        }
         if self.pi.is_none() || self.initializing {
             self.thinking = level;
         } else if self.command("set_thinking_level", json!({"level":level})) {
             self.configuring = true;
             self.pending_thinking = Some(level);
+        }
+    }
+
+    /// A second effort pick can queue behind the first. A pending model change still locks
+    /// effort because its available levels can change with the model.
+    pub fn can_choose_thinking(&self) -> bool {
+        !self.status.busy() && (!self.configuring || self.pending_thinking.is_some())
+    }
+
+    /// After a configure response clears `configuring`, send the reasoning level the user
+    /// last chose when it still differs from what the provider applied. Runs serialized,
+    /// one command at a time, so rapid picks during an in-flight acknowledgement land in
+    /// order instead of racing or being lost.
+    fn reconcile_thinking(&mut self) {
+        if self.pi.is_none() || self.initializing || self.status.busy() || self.configuring {
+            return;
+        }
+        let Some(level) = self.selected_thinking.clone() else {
+            return;
+        };
+        if level == self.thinking {
+            return;
+        }
+        if self.command("set_thinking_level", json!({"level": level})) {
+            self.configuring = true;
+            self.pending_thinking = Some(level);
+        }
+    }
+
+    /// A refused `set_thinking_level` leaves no trace of the level the provider would not
+    /// run: `model_options` and the draft's pinned selections revert to `self.thinking`,
+    /// so the reasoning menu and the next composer render what is actually in effect.
+    fn revert_rejected_thinking(&mut self) {
+        let rejected = self.pending_thinking.clone();
+        let applied = self.thinking.clone();
+        let revert_option = |option: &mut crate::model_selection::ProviderOptionSelection| {
+            if matches!(
+                option.id.as_str(),
+                "thinking" | "effort" | "reasoningEffort" | "reasoning" | "thought_level"
+            ) && option.value.as_str() == rejected.as_deref()
+            {
+                option.value = crate::model_selection::OptionValue::Str(applied.clone());
+            }
+        };
+        for option in &mut self.model_options {
+            revert_option(option);
+        }
+        for selection in self
+            .draft_model_state
+            .model_selection_by_provider
+            .values_mut()
+        {
+            for option in &mut selection.options {
+                revert_option(option);
+            }
         }
     }
 
@@ -2947,6 +3011,14 @@ impl Thread {
         delivery
     }
 
+    pub(crate) fn pending_local_attempt(&self) -> Option<&str> {
+        if self.delegated && self.peer_origin.is_none() {
+            self.next_execution.as_ref()?.attempt_id.as_deref()
+        } else {
+            None
+        }
+    }
+
     fn flush_injection(&mut self) -> bool {
         if self.offline_blocked
             || self.provider_update_held
@@ -2995,6 +3067,32 @@ impl Thread {
                 Some("Choose a CPA model before Shina can deliver queued messages.".into());
             return false;
         }
+        let prepared_local_attempt = self.pending_local_attempt().is_some();
+        if let Some(attempt) = self.pending_local_attempt() {
+            // Startup can report Running before an admitted brief has started.
+            // Never send this brief into a different turn that actually began.
+            if self.status.busy()
+                && self.started.is_some()
+                && self.run_id.is_some()
+                && self.provider_terminal_run != self.run_id
+            {
+                return false;
+            }
+            let Some(index) = self.pending_injections.iter().position(|input| {
+                input.peer_input.is_none() && tasks::delivery_id(&input.text) == Some(attempt)
+            }) else {
+                return false;
+            };
+            // Other messages (including reports from this worker's own crew)
+            // must not take the run identity reserved for the new brief.
+            if index > 0 {
+                let brief = self
+                    .pending_injections
+                    .remove(index)
+                    .expect("located brief");
+                self.pending_injections.push_front(brief);
+            }
+        }
         let text = self.pending_injections[0].text.clone();
         let peer_input = self.pending_injections[0].peer_input;
         let peer_execution = peer_input
@@ -3024,7 +3122,8 @@ impl Thread {
             .as_ref()
             .filter(|run| self.status.busy() && Some(*run) == self.run_id.as_ref())
             .is_some();
-        if !self.status.busy()
+        if prepared_local_attempt
+            || !self.status.busy()
             || self.run_id.is_none()
             || peer_execution.is_some() && self.provider_terminal_run == self.run_id
         {
@@ -3703,8 +3802,20 @@ impl Thread {
                         return;
                     }
                     if matches!(command, "set_model" | "set_thinking_level") {
+                        if command == "set_thinking_level"
+                            && self.pending_thinking.is_some()
+                            && self.selected_thinking == self.pending_thinking
+                        {
+                            // The rejected level must not stay selected: drop the pin and
+                            // every recorded choice of it back to what the provider runs.
+                            self.selected_thinking = None;
+                            self.revert_rejected_thinking();
+                        }
                         self.configuring = false;
                         self.pending_thinking = None;
+                        if command == "set_thinking_level" {
+                            self.reconcile_thinking();
+                        }
                     }
                     if command == "prompt"
                         && self
@@ -3833,6 +3944,7 @@ impl Thread {
                                 &confirmed,
                             );
                         }
+                        self.reconcile_thinking();
                     }
                     "get_messages" if record["id"] == "history" => {
                         // `history_loaded` also covers the optimistic server
@@ -4947,14 +5059,13 @@ impl NavHistory {
 
 pub(crate) struct ExecutionBaseline {
     runs: std::collections::BTreeMap<usize, Option<String>>,
-    task_ids: std::collections::BTreeSet<String>,
-    attempts: std::collections::BTreeMap<String, String>,
     tasks: std::collections::BTreeMap<String, (uuid::Uuid, Option<uuid::Uuid>, Option<usize>)>,
 }
 
 pub struct State {
     /// None means a command/global change. A poll records only changed threads.
     pub(crate) persistence_scope: Option<std::collections::HashSet<usize>>,
+    pub(crate) execution_command_device: Option<String>,
     /// The durable admission scheduler shared by delegated tasks, crew
     /// members and peer-launched workers. Persisted with the index.
     pub(crate) scheduler: admission::Scheduler,
@@ -5028,11 +5139,8 @@ pub struct State {
     pub keybindings_watcher: crate::keybindings::KeybindingsWatcher,
     pub thread_defaults: crate::ui::settings_ui::ThreadDefaults,
     pub fleet: crate::fleet_update::Fleet,
-    /// The sidebar's "N need you" popover is open.
-    pub attention_menu: bool,
     /// Where a right-click opened the row menu, in window points.
     pub row_menu_at: Option<(f32, f32)>,
-    pub hovered_row: Option<RowTarget>,
     pub rename_thread: Option<usize>,
     pub rename_edit: TextEdit,
     pub delete_thread: Option<usize>,
@@ -5043,10 +5151,6 @@ pub struct State {
     context_import_rxs: Vec<std::sync::mpsc::Receiver<ContextAssetDownload>>,
     pub project_scope: ProjectScope,
     pub scope_additional: Vec<ProjectId>,
-    /// Whether ordinary sidebar threads group under workspace headers (default) or list flat.
-    pub sidebar_grouping: SidebarGrouping,
-    /// Workspace groups collapsed in the sidebar, keyed by `(server, project)`.
-    pub collapsed_groups: std::collections::BTreeSet<(String, Option<usize>)>,
     pub selected_threads: Vec<usize>,
     pub selection_anchor: Option<usize>,
     /// Whether the Snoozed and Settled shelves are open.
@@ -5250,8 +5354,8 @@ pub struct State {
     pub model_favorites: Option<Vec<crate::model_picker::ModelFavorite>>,
     model_favorites_migrated: bool,
     /// Where the effort slider's thumb is held while dragged, from 0 (lowest level) to 1
-    /// (highest). The level is chosen on release.
-    pub thinking_drag: Option<f32>,
+    /// (highest), and which gesture context it belongs to. The level is chosen on release.
+    pub thinking_drag: Option<ThinkingDrag>,
     pub model_search: TextEdit,
     pub thread_find: ThreadFindState,
     pub sidebar_search: SidebarSearchState,
@@ -5345,12 +5449,6 @@ impl State {
                 .iter()
                 .map(|thread| (thread.id, thread.run_id.clone()))
                 .collect(),
-            task_ids: self.tasks.iter().map(|task| task.id.clone()).collect(),
-            attempts: self
-                .tasks
-                .iter()
-                .map(|task| (task.id.clone(), task.attempt_id.clone()))
-                .collect(),
             tasks: self
                 .tasks
                 .iter()
@@ -5413,32 +5511,6 @@ impl State {
             .collect();
         for (id, queues) in changed_threads {
             self.allocate_local_execution(id, device, queues)?;
-        }
-
-        let local_tasks: Vec<usize> = self
-            .tasks
-            .iter()
-            .enumerate()
-            .filter(|(_, task)| {
-                task.remote.is_none()
-                    && matches!(
-                        task.state,
-                        TaskState::Queued | TaskState::Starting | TaskState::Running
-                    )
-                    && (!baseline.task_ids.contains(&task.id)
-                        || baseline.attempts.get(&task.id) != Some(&task.attempt_id))
-                    && self
-                        .threads
-                        .iter()
-                        .find(|thread| thread.id == task.child_thread_id)
-                        .is_some_and(|thread| {
-                            !matches!(thread.status, Status::Completed | Status::Failed)
-                        })
-            })
-            .map(|(index, _)| index)
-            .collect();
-        for index in local_tasks {
-            self.allocate_local_task_execution(index, device)?;
         }
 
         let task_ids: Vec<String> = self.tasks.iter().map(|task| task.id.clone()).collect();
@@ -5677,15 +5749,28 @@ impl State {
         Ok(lease)
     }
 
+    fn prepared_local_attempt(
+        &self,
+        task: &Task,
+        thread: &Thread,
+    ) -> Option<&crate::execution::Lease> {
+        let binding = thread.next_execution.as_ref()?;
+        let lease = self.execution.get(&binding.lease_id)?;
+        (lease.phase == crate::execution::Phase::Prepared
+            && lease.executor_id == self.identity.executor_id
+            && lease.executor_thread_alias == Some(thread.id as u64)
+            && lease.attempt_id.as_deref() == Some(task.attempt_id.as_str())
+            && lease.delivery_id.as_deref() == Some(task.delivery_id.as_str())
+            && lease.binding() == *binding)
+            .then_some(lease)
+    }
+
     fn allocate_local_task_execution(
         &mut self,
         task_index: usize,
-        device: &str,
-    ) -> Result<crate::execution::Lease, String> {
+        initiating_device: &str,
+    ) -> Result<(), String> {
         let task = self.tasks.get(task_index).ok_or("Unknown local task.")?;
-        let initiating_device = self
-            .execution_initiator_for_thread(task.parent_thread_id)
-            .unwrap_or_else(|| device.to_owned());
         let thread_id = task.child_thread_id;
         let identity = self.snapshot_identity();
         let thread = self
@@ -5693,13 +5778,16 @@ impl State {
             .iter()
             .find(|thread| thread.id == thread_id)
             .ok_or("Local task has no child thread.")?;
+        if self.prepared_local_attempt(task, thread).is_some() {
+            return Ok(());
+        }
         let logical_thread_uid = identity
             .thread_uid(thread_id)
             .ok_or("Local task thread has no logical identity.")?
             .to_owned();
         let executor = self.identity.executor_id.clone();
         let (lease, _) = self.execution.prepare(crate::execution::Prepare {
-            scope: self.execution_scope(&initiating_device, &executor),
+            scope: self.execution_scope(initiating_device, &executor),
             logical_captain_uid: thread
                 .captain
                 .and_then(|captain| identity.captain_uid(captain).map(str::to_owned)),
@@ -5720,7 +5808,7 @@ impl State {
         {
             thread.next_execution = Some(lease.binding());
         }
-        Ok(lease)
+        Ok(())
     }
 
     /// Move persisted provider observations into the lease book. A queued peer
@@ -6179,9 +6267,7 @@ impl State {
             keybindings_watcher: Default::default(),
             thread_defaults: Default::default(),
             fleet: Default::default(),
-            attention_menu: false,
             row_menu_at: None,
-            hovered_row: None,
             rename_thread: None,
             rename_edit: TextEdit::default(),
             delete_thread: None,
@@ -6192,8 +6278,6 @@ impl State {
             context_import_rxs: Vec::new(),
             project_scope: ProjectScope::All,
             scope_additional: vec![],
-            sidebar_grouping: SidebarGrouping::Workspace,
-            collapsed_groups: std::collections::BTreeSet::new(),
             selected_threads: vec![],
             selection_anchor: None,
             shelves: [false; 2],
@@ -6404,6 +6488,7 @@ impl State {
                 &crate::store::directory().unwrap_or_default(),
             ),
             execution: crate::execution::Book::default(),
+            execution_command_device: None,
             task_operations: Vec::new(),
             peer_task_intents: Vec::new(),
             recovery_notice: None,
@@ -6490,7 +6575,6 @@ impl State {
             && self.code_picker.open.is_none()
             && self.attachment_preview.is_none()
             && self.transcript_preview.is_none()
-            && !self.attention_menu
             && self.citation_comment.is_none()
             && !self.brief.confirm_reset
             && !self.brief.profile_open
@@ -7956,36 +8040,6 @@ impl State {
         });
         rows.extend(ordinary);
         rows
-    }
-    /// Whether the sidebar renders workspace group headers right now: Workspace grouping is
-    /// enabled, no search or archive filter is active, and the list is not narrowed to one
-    /// workspace.
-    pub fn sidebar_grouped(&self) -> bool {
-        let single_workspace = self.project_scope != ProjectScope::All
-            && self.scope_additional.is_empty()
-            && self.machines.scope_remote.is_empty();
-        self.sidebar_grouping == SidebarGrouping::Workspace
-            && self.search.text.is_empty()
-            && !self.show_archive
-            && !single_workspace
-    }
-    pub fn sidebar_group_collapsed(&self, server: &str, project: Option<usize>) -> bool {
-        self.collapsed_groups
-            .contains(&(server.to_string(), project))
-    }
-    pub fn toggle_sidebar_group(&mut self, server: String, project: Option<usize>) {
-        let key = (server, project);
-        if !self.collapsed_groups.remove(&key) {
-            self.collapsed_groups.insert(key);
-        }
-        self.checkpoint();
-    }
-    pub fn toggle_sidebar_grouping(&mut self) {
-        self.sidebar_grouping = match self.sidebar_grouping {
-            SidebarGrouping::Workspace => SidebarGrouping::Recent,
-            SidebarGrouping::Recent => SidebarGrouping::Workspace,
-        };
-        self.checkpoint();
     }
     /// Whether an unsent draft has a "Drafts" row. Other drafts need content. The open draft keeps
     /// whatever it had when it was opened, so its row does not appear or vanish while typing.
@@ -16926,6 +16980,7 @@ impl State {
             "preferences": prefs_value,
             "draftModelStates": draft_model_states,
             "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
+            "sidebarWidthDefault":DEFAULT_SIDEBAR_WIDTH,
             "rightPanelWidth":self.right_panel_width,
             "scope": match self.project_scope { ProjectScope::All => json!("all"),
                 ProjectScope::NoProject => json!("none"), ProjectScope::Project(id) => json!(id) },
@@ -16948,17 +17003,6 @@ impl State {
             value["diffTreeWidth"] = json!(width);
         }
         value["tabsEnabled"] = json!(self.tabs_enabled);
-        if self.sidebar_grouping != SidebarGrouping::default() {
-            value["sidebarGrouping"] = json!(self.sidebar_grouping);
-        }
-        if !self.collapsed_groups.is_empty() {
-            value["collapsedGroups"] = json!(
-                self.collapsed_groups
-                    .iter()
-                    .map(|(server, project)| json!([server, project]))
-                    .collect::<Vec<_>>()
-            );
-        }
         value
     }
     pub(crate) fn runtime_input_snapshot(
@@ -17004,6 +17048,13 @@ impl State {
             })
             .transpose()?
             .unwrap_or(DEFAULT_SIDEBAR_WIDTH);
+        // Give profiles still on the old default the wider cards. A width saved by the
+        // new layout, including a deliberately chosen 288 pt, stays as the user left it.
+        if ui.get("sidebarWidthDefault").is_none()
+            && self.sidebar_width == PREVIOUS_DEFAULT_SIDEBAR_WIDTH
+        {
+            self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+        }
         // Panel state itself is session-only; the width is the one saved value.
         self.right_panel_width = ui
             .get("rightPanelWidth")
@@ -17030,28 +17081,6 @@ impl State {
         if let Some(enabled) = ui.get("tabsEnabled").and_then(Value::as_bool) {
             self.tabs_enabled = enabled;
         }
-        self.sidebar_grouping = ui
-            .get("sidebarGrouping")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        self.collapsed_groups = ui
-            .get("collapsedGroups")
-            .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let pair = entry.as_array()?;
-                        let server = pair.first()?.as_str()?.to_owned();
-                        let project = match pair.get(1)? {
-                            Value::Null => None,
-                            v => Some(usize::try_from(v.as_u64()?).ok()?),
-                        };
-                        Some((server, project))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         self.project_scope = match ui["scope"].as_str() {
             Some("all") => ProjectScope::All,
             Some("none") => ProjectScope::NoProject,
@@ -17706,6 +17735,35 @@ impl State {
                 .map(|routine| routine.id),
         )
     }
+    pub(crate) fn populate_sidebar_cards_demo(&mut self) {
+        self.populate_demo();
+        self.dark = true;
+        let thread = &mut self.threads[0];
+        thread.title = "Intermittent Thread Stoppages".into();
+        thread.branch = Some("work/sable-dogfood".into());
+        self.captain_reports.push(crew_reports::CrewReport {
+            id: "demo-sidebar-pr".into(),
+            captain: 0,
+            thread_id: thread.id,
+            run_id: "demo-sidebar-run".into(),
+            title: thread.title.clone(),
+            outcome: crew_reports::CrewOutcome::Completed,
+            policy: Default::default(),
+            summary: "Example pull request reference.".into(),
+            error: String::new(),
+            created_at: lifecycle::now(),
+            request_id: None,
+            question: None,
+            artifacts: vec![crew_reports::CrewArtifact {
+                kind: crew_reports::ArtifactKind::PullRequest,
+                label: "Example pull request".into(),
+                reference: "https://github.com/example/shina/pull/84".into(),
+            }],
+            delivered: true,
+            hold_delivery: false,
+        });
+    }
+
     pub fn populate_demo(&mut self) {
         self.demo = true;
         self.captains = Captain::presets();
@@ -19519,6 +19577,22 @@ mod tests {
         assert!(state.store.is_none());
         state.checkpoint();
         assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn wider_sidebar_default_migrates_without_overwriting_saved_widths() {
+        let mut state = State::new(".".into(), false);
+        let mut ui = state.ui_snapshot();
+        ui.as_object_mut().unwrap().remove("sidebarWidthDefault");
+        ui["sidebarWidth"] = json!(288);
+        state.restore_ui(&ui).unwrap();
+        assert_eq!(state.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+        ui["sidebarWidth"] = json!(300);
+        state.restore_ui(&ui).unwrap();
+        assert_eq!(state.sidebar_width, 300.0);
+        state.sidebar_width = 288.0;
+        state.restore_ui(&state.ui_snapshot()).unwrap();
+        assert_eq!(state.sidebar_width, 288.0);
     }
     #[test]
     fn blank_drafts_never_hold_a_sidebar_row_or_accumulate() {
