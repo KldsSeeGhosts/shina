@@ -1197,6 +1197,66 @@ mod tests {
     }
 
     #[test]
+    fn bundled_fable_5_2_exposes_fast_mode_without_changing_effort_or_capacity() {
+        let catalog = bundled_claude_model_catalog(0);
+        let fable = "claude-fable-5-2";
+        let supported = resolve_claude_models_for_version(&catalog, Some("2.1.321"));
+        let row = supported.iter().find(|model| model.slug == fable).unwrap();
+        let options = &row.capabilities.option_descriptors;
+        assert_eq!(
+            options.iter().map(|option| option.id()).collect::<Vec<_>>(),
+            ["effort", "ultracode", "fastMode"]
+        );
+        assert!(matches!(
+            (&options[1], &options[2]),
+            (
+                ProviderOptionDescriptor::Boolean {
+                    current_value: None,
+                    ..
+                },
+                ProviderOptionDescriptor::Boolean {
+                    current_value: None,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(
+            claude_thinking_levels(&row.capabilities),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            resolve_claude_catalog_effort(&catalog, fable, None).as_deref(),
+            Some("medium")
+        );
+        for (effort, native) in [
+            ("max", Some("max")),
+            ("ultracode", Some("xhigh")),
+            ("ultrathink", None),
+        ] {
+            assert_eq!(
+                normalize_claude_catalog_effort(&catalog, Some(effort), fable).as_deref(),
+                native
+            );
+        }
+        assert_eq!(resolve_claude_model_slug(&catalog, "fable"), fable);
+        assert_eq!(
+            resolve_claude_catalog_context_window_tokens(&catalog, Some(&selection("fable"))),
+            Some(1_000_000)
+        );
+        let previous = supported
+            .iter()
+            .find(|model| model.slug == "claude-fable-5-1")
+            .unwrap();
+        assert!(
+            !previous
+                .capabilities
+                .option_descriptors
+                .iter()
+                .any(|option| option.id() == "fastMode")
+        );
+    }
+
+    #[test]
     fn resolves_aliases_and_declarative_adapter_mappings() {
         let mut data = synthetic_manifest();
         data["providers"]["claudeAgent"]["models"]
