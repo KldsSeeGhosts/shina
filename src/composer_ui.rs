@@ -1063,8 +1063,6 @@ pub(super) fn controls(
             .size(28.0, 24.0)
             .preserve_focus_on_press(true),
         );
-    } else if s.composer_ui.overflow.get() {
-        s.composer_ui.overflow.set(false);
     }
     // KSG Code's ComposerStashBadge sits at the right end of the composer footer.
     controls = controls.child(composer_stash::badge(s, p));
