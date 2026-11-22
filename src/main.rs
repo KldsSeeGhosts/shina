@@ -1454,13 +1454,11 @@ fn main() {
                 typed_work_demo(state);
                 state.dark = true;
             }),
+            // The details card with its folded rows shown. It docks from about 1400 pt wide.
             ("session-details", |state| {
                 state.populate_demo();
                 state.dark = true;
-                let key = state.panel_key();
-                state
-                    .right_panels
-                    .open(&key, crate::right_panel::SingletonKind::Overview);
+                state.details.more = true;
             }),
             // The Inspector's Work tab on a plain thread with two provider subagents.
             ("inspector-work", |state| {
@@ -1487,6 +1485,55 @@ fn main() {
                 state
                     .right_panels
                     .open(&key, crate::right_panel::SingletonKind::Work);
+            }),
+            // The docked details card with a running subagent, the previous agents unfolded
+            // and one agent's hover card.
+            ("details-agents", |state| {
+                state.populate_demo();
+                state.dark = true;
+                let message =
+                    |text: &str| serde_json::json!([{"role": "assistant", "content": [{"type": "text", "text": text}]}]);
+                state.current_mut().apply(serde_json::json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": "demo-reviewers",
+                    "toolName": "subagent",
+                    "args": {"tasks": [
+                        {"agent": "Review the reconnect fix", "task": "Review the listener order", "model": "gpt-6.2-sol"},
+                        {"agent": "Check retry cleanup", "task": "Check that each retry removes the listener", "model": "gpt-6.2-sol"},
+                        {"agent": "Run the socket tests", "task": "Run the socket test suite", "model": "claude-fable-5-2"}
+                    ]}
+                }));
+                state.current_mut().apply(serde_json::json!({
+                    "type": "tool_execution_end",
+                    "toolCallId": "demo-reviewers",
+                    "durationMs": 72_000,
+                    "result": {"details": {"results": [
+                        {"agent": "Review the reconnect fix", "task": "Review the listener order", "model": "gpt-6.2-sol",
+                         "finished": true, "messages": message("APPROVE. The listener attaches before the socket opens.")},
+                        {"agent": "Check retry cleanup", "task": "Check that each retry removes the listener", "model": "gpt-6.2-sol",
+                         "finished": true, "messages": message("Cleanup runs before every retry.")},
+                        {"agent": "Run the socket tests", "task": "Run the socket test suite", "model": "claude-fable-5-2",
+                         "finished": true, "exitCode": 1, "errorMessage": "2 tests failed"}
+                    ]}}
+                }));
+                state.current_mut().apply(serde_json::json!({
+                    "type": "tool_execution_start",
+                    "toolCallId": "demo-subagents",
+                    "toolName": "subagent",
+                    "args": {"tasks": [
+                        {"agent": "Fix the failing socket tests", "task": "Fix the two failing socket tests", "model": "gpt-6.2-sol"}
+                    ]}
+                }));
+                state.current_mut().apply(serde_json::json!({
+                    "type": "tool_execution_update",
+                    "toolCallId": "demo-subagents",
+                    "partialResult": {"details": {"results": [
+                        {"agent": "Fix the failing socket tests", "task": "Fix the two failing socket tests", "model": "gpt-6.2-sol",
+                         "finished": false, "activity": "Reading src/transport/socket.test.ts"}
+                    ]}}
+                }));
+                state.details.previous_open = true;
+                state.details.hover = Some("lineage-row-agent-demo-reviewers-0".into());
             }),
             // The same tab on a Captain home: the crew roster grouped by state.
             ("inspector-work-crew", |state| {

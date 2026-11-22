@@ -175,6 +175,10 @@ glyph!(
     r#"<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>"#
 );
 glyph!(
+    HISTORY,
+    r#"<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>"#
+);
+glyph!(
     MORE,
     r#"<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>"#
 );
@@ -348,6 +352,7 @@ pub(super) const NAMES: &[&str] = &[
     "trash",
     "calendar",
     "clock",
+    "history",
     "agents",
     "arrow-up-circle",
     "lock-open",
@@ -436,6 +441,7 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "trash" => &TRASH,
         "calendar" => &CALENDAR,
         "clock" => &CLOCK,
+        "history" => &HISTORY,
         "agents" | "bot" => &AGENTS,
         "arrow-up-circle" => &ARROW_UP_CIRCLE,
         "lock-open" => &LOCK_OPEN,

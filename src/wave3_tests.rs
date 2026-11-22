@@ -175,6 +175,43 @@ fn work_tab_stacks_subagents_above_the_crew_and_says_when_nothing_runs() {
 }
 
 #[test]
+fn details_card_docks_clear_of_the_lane_and_opens_a_subagent_in_the_work_tab() {
+    // A column this wide docks the card in its corner, and the lane stops short of it.
+    let mut rt = runtime(1600.0);
+    rt.state.current_mut().apply(
+        json!({"type":"tool_execution_start","toolCallId":"dispatch","toolName":"subagent",
+        "args":{"tasks":[{"agent":"scout","task":"Find the source"}]}}),
+    );
+    rt.invalidate();
+    rt.frame(0.0);
+    rt.frame(0.25);
+    let card = bounds(&rt, "details-card", 1600.0);
+    let lane = rt.presented("chat-lane").expect("lane").0;
+    assert!(
+        lane[0] + lane[2] <= card[0] - 32.0 + 0.5,
+        "{lane:?} {card:?}"
+    );
+
+    // The running subagent is a row in the Lineage card. Pressing it opens the Work tab
+    // with that agent unfolded.
+    press(&mut rt, "lineage-row-agent-dispatch-0");
+    rt.frame(0.5);
+    rt.frame(1.0);
+    assert_eq!(
+        rt.state.right_panel_active_view(),
+        Some(crate::right_panel::PanelView::Work)
+    );
+    assert!(rt.presented("agent-detail-dispatch-0").is_some());
+
+    // Beside the open panel the column is too narrow to dock the card, so the top bar's
+    // button opens it as a popover.
+    assert!(rt.presented("details-card").is_none());
+    press(&mut rt, "header-details");
+    rt.frame(1.0);
+    bounds(&rt, "details-card", 1600.0);
+}
+
+#[test]
 fn diff_blockers_keep_paths_and_actions_inside_the_panel() {
     for width in WIDTHS {
         let mut rt = runtime(width);

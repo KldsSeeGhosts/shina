@@ -406,6 +406,22 @@ fn actions(
         p,
         |s| s.thread_menu = !s.thread_menu,
     ));
+    // The details card: hidden or shown where it docks, a popover where it cannot.
+    if details_ui::available(s) {
+        let shown = if s.details.fits.get() {
+            s.details.docked
+        } else {
+            s.details.popover
+        };
+        row = row.child(toggle_button(
+            "header-details",
+            "Toggle thread details",
+            "info",
+            shown,
+            p,
+            |s: &mut State| s.details_toggle(),
+        ));
+    }
     // The panel toggle stays at every width: at compact it is the only way to
     // the Inspector.
     let panel_open = s.right_panel().open;
