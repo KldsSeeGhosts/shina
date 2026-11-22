@@ -34,66 +34,140 @@ fn heading_style(size: f32, line: f32) -> TextStyle {
     TextStyle::new(size, 600.0).lh(line).tracking(-0.01 * size)
 }
 
-/// KSG's `MarkdownCodeBlockFrame`: a 12 px card with a hairline, a 32 px header with the
-/// lowercase language in 11.5 px mono and a quiet copy button.
-fn code_frame(code: El, language: &str, source: String, identity: &str, p: Palette) -> El {
-    col()
-        .key(format!("code-{identity}"))
-        .min_w(0.0)
-        .radius(12.0)
-        .clip_rounded(12.0)
-        .border(1.0, p.line)
-        .fill(p.code_bg)
-        .child(
-            row()
-                .h(32.0)
-                .pl(12.0)
-                .pr(6.0)
-                .gap(6.0)
-                .center_y()
-                .child(label(
-                    language.to_lowercase(),
-                    TextStyle::new(12.0, 400.0).family(rune::Family::SystemMono),
-                    p.muted,
-                ))
-                .child(spacer())
-                .child(
-                    icon_button(
-                        &format!("copy-code-{identity}"),
-                        "Copy code",
-                        "copy",
-                        p,
-                        |_| {},
-                    )
-                    .help("Copy code")
-                    .on_press_tx(move |_: &mut State, tx| tx.copy(source.clone())),
-                ),
-        )
-        .child(rule(p))
-        .child(code)
+/// KSG's `--code-header-fill`: faint surface tint over `code_bg` (`#ffffff05` dark / `#00000003` light).
+fn code_header_fill(dark: bool) -> Color {
+    if dark {
+        Color::WHITE.alpha(0.02)
+    } else {
+        Color::BLACK.alpha(0.012)
+    }
 }
 
+/// Ported from KSG Code's `MarkdownCodeBlockFrame` and `MarkdownCodeBlock`: a radius-8
+/// `surface-well` card with a 32 px tinted header, 11.5 px mono language label, per-block
+/// soft-wrap toggle (default wrapped), and copy button.
+fn code_frame(
+    code: El,
+    language: &str,
+    source: String,
+    identity: &str,
+    p: Palette,
+    dark: bool,
+    wrap_state: Option<bool>,
+) -> El {
+    let mut actions = row().center_y().gap(2.0);
+    if let Some(wrapped) = wrap_state {
+        let wrap_id = identity.to_owned();
+        let wrap_label = if wrapped {
+            "Disable line wrap"
+        } else {
+            "Wrap lines"
+        };
+        actions = actions.child(
+            el().key(format!("wrap-code-{identity}"))
+                .role("button")
+                .cursor(rune::Cursor::Pointer)
+                .label(wrap_label)
+                .help(wrap_label)
+                .checked(wrapped)
+                .focusable(true)
+                .size(24.0, 24.0)
+                .center()
+                .radius(6.0)
+                .hover(p.selected)
+                .press(p.selected)
+                .on_press(move |s: &mut State| {
+                    let set = std::sync::Arc::make_mut(&mut s.unwrapped_code_blocks);
+                    if !set.remove(&wrap_id) {
+                        set.insert(wrap_id.clone());
+                    }
+                    s.code_wrap_version = s.code_wrap_version.wrapping_add(1);
+                })
+                .child(icon("wrap-text", if wrapped { p.ink } else { p.muted }).size(14.0, 14.0)),
+        );
+    }
+    actions = actions.child(
+        el().key(format!("copy-code-{identity}"))
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label("Copy code")
+            .help("Copy code")
+            .focusable(true)
+            .size(24.0, 24.0)
+            .center()
+            .radius(6.0)
+            .hover(p.selected)
+            .press(p.selected)
+            .on_press_tx(move |_: &mut State, tx| tx.copy(source.clone()))
+            .child(icon("copy", p.muted).size(14.0, 14.0)),
+    );
+    col().min_w(0.0).child(
+        col()
+            .key(format!("code-{identity}"))
+            .min_w(0.0)
+            .radius(8.0)
+            .clip_rounded(8.0)
+            .border(1.0, p.line)
+            .fill(p.code_bg)
+            .child(
+                row()
+                    .h(32.0)
+                    .pl(14.0)
+                    .pr(6.0)
+                    .gap(4.0)
+                    .center_y()
+                    .fill(code_header_fill(dark))
+                    .child(label(
+                        language.to_lowercase(),
+                        TextStyle::new(11.5, 400.0).family(rune::Family::SystemMono),
+                        p.muted,
+                    ))
+                    .child(spacer())
+                    .child(actions),
+            )
+            .child(rule(p))
+            .child(code),
+    )
+}
+
+fn count_code_blocks(source: &str) -> usize {
+    Parser::new_ext(source, OPTIONS)
+        .filter(|event| matches!(event, Event::Start(Tag::CodeBlock(_))))
+        .count()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ordinary(
     source: &str,
     style: &MarkdownStyle,
     streaming: bool,
     user: bool,
     identity: String,
+    fence_base: usize,
     p: Palette,
+    dark: bool,
+    unwrapped: std::sync::Arc<std::collections::HashSet<String>>,
     find: Option<(&str, Option<usize>)>,
 ) -> El {
+    let wrap_identity = identity.clone();
     let mut md = Markdown::new(source)
         .streaming(streaming)
         .selectable(true)
         .copy_source(!user)
         .scroll_wide(true)
+        .wrap_code(true)
+        .code_wrap(move |index, _src| {
+            !unwrapped.contains(&format!("{wrap_identity}-{}", fence_base + index))
+        })
         .code_frame(move |code, frame| {
             code_frame(
                 code,
                 frame.language.unwrap_or("text"),
                 frame.source.to_owned(),
-                &format!("{identity}-{}", frame.index),
+                &format!("{identity}-{}", fence_base + frame.index),
                 p,
+                dark,
+                Some(frame.wrapped),
             )
         });
     if let Some((query, active_occ)) = find {
@@ -113,6 +187,7 @@ fn ordinary(
 }
 
 /// Ported from KSG Code's ChatMarkdown and chat/MarkdownCodeBlock.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_with_find(
     source: &str,
     p: Palette,
@@ -121,6 +196,7 @@ pub(super) fn render_with_find(
     user: bool,
     streaming: bool,
     identity: &str,
+    unwrapped: &std::sync::Arc<std::collections::HashSet<String>>,
     find: Option<(&str, Option<usize>)>,
 ) -> El {
     let source = if user {
@@ -210,11 +286,23 @@ pub(super) fn render_with_find(
         }
     }
     if diffs.is_empty() {
-        return ordinary(&source, &style, streaming, user, identity.into(), p, find);
+        return ordinary(
+            &source,
+            &style,
+            streaming,
+            user,
+            identity.into(),
+            0,
+            p,
+            dark,
+            unwrapped.clone(),
+            find,
+        );
     }
     let diff_style = style.clone().code_block_padding(12.0, 6.0);
     let mut content = col().w_full().min_w(0.0).gap(12.0).selection_group(true);
     let mut from = 0;
+    let mut fence_base = 0usize;
     let mut occ_base = 0usize;
     let chunk_find = |slice: &str, occ_base: &mut usize| -> Option<(&str, Option<usize>)> {
         let (query, active_occ) = find?;
@@ -233,10 +321,14 @@ pub(super) fn render_with_find(
                 &style,
                 streaming,
                 user,
-                format!("{identity}-part-{from}"),
+                identity.into(),
+                fence_base,
                 p,
+                dark,
+                unwrapped.clone(),
                 part_find,
             ));
+            fence_base += count_code_blocks(slice);
         }
         // Tinted rows run edge to edge, so the block keeps a 6 px pad above the first row and
         // below the last, in place of the 12 px that left an empty line under the header.
@@ -267,7 +359,10 @@ pub(super) fn render_with_find(
             code,
             &format!("{identity}-diff-{}", range.start),
             p,
+            dark,
+            None,
         ));
+        fence_base += 1;
         from = range.end;
     }
     if !source[from..].trim().is_empty() {
@@ -278,8 +373,11 @@ pub(super) fn render_with_find(
             &style,
             streaming,
             user,
-            format!("{identity}-part-{from}"),
+            identity.into(),
+            fence_base,
             p,
+            dark,
+            unwrapped.clone(),
             part_find,
         ));
     }

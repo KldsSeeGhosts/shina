@@ -798,6 +798,12 @@ impl ThreadView {
         if thread.remote.is_some() {
             thread.request_generation = self.generation;
         }
+        if thread.live_work_collapsed
+            && (thread.run_id != self.run_id || !self.status.busy() || !thread.status.busy())
+        {
+            thread.live_work_collapsed = false;
+            thread.timeline_cache.borrow_mut().touch_disclosure();
+        }
         thread.status = self.status;
         thread.run_id = self.run_id;
         thread.resumable_run_id = self.resumable_run_id;
@@ -7969,5 +7975,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn projected_run_change_resets_live_work_fold() {
+        let mut thread = Thread::new(1);
+        thread.status = Status::Running;
+        thread.run_id = Some("run-1".into());
+        thread.live_work_collapsed = true;
+
+        // Same running turn keeps the fold closed.
+        let same = ThreadView::capture(&thread);
+        same.apply(&mut thread).unwrap();
+        assert!(thread.live_work_collapsed);
+
+        // Switching to a new projected run resets the fold.
+        let mut next = ThreadView::capture(&thread);
+        next.run_id = Some("run-2".into());
+        next.apply(&mut thread).unwrap();
+        assert!(!thread.live_work_collapsed);
+
+        // Settling a projected run also resets the fold.
+        thread.live_work_collapsed = true;
+        let mut settled = ThreadView::capture(&thread);
+        settled.status = Status::Completed;
+        settled.apply(&mut thread).unwrap();
+        assert!(!thread.live_work_collapsed);
     }
 }

@@ -8954,27 +8954,31 @@ fn quiet_inks(p: Palette) -> (Color, Color) {
     (p.muted, p.faint)
 }
 
-/// Ported from KSG Code's WorkLogLine: a 24 px icon slot, a label and adjacent disclosure.
+/// Ported from KSG Code's `WorkLogLine`, `WorkLogVerb`, and `WorkLogTarget`: a 24 px row with a
+/// 14 px glyph in a 24 px icon slot, medium foreground verb, faint detail, and an optional
+/// 12 px disclosure caret (shown on folded group headers only, never on individual rows).
+#[allow(clippy::too_many_arguments)]
 fn activity_line(
     key: String,
     a11y: String,
     action: (String, &str),
     failed: bool,
     open: bool,
+    show_caret: bool,
     glyph: &str,
     p: Palette,
 ) -> El {
     let (verb, detail) = action;
-    let (secondary, tertiary) = quiet_inks(p);
     let mut line = row()
         .key(key)
         .role("button")
         .cursor(rune::Cursor::Pointer)
         .label(a11y)
+        .expanded(open)
         .focusable(true)
         .center_y()
         .gap(5.0)
-        .min_h(26.0)
+        .min_h(24.0)
         .px(6.0)
         .ml(-6.0)
         .radius(6.0)
@@ -8982,17 +8986,17 @@ fn activity_line(
         .child(
             el().size(24.0, 24.0)
                 .center()
-                .child(tool_icon(glyph, secondary)),
+                .child(icon(glyph, if failed { p.danger } else { p.faint }).size(14.0, 14.0)),
         )
-        // The verb is medium weight; what it acted on is regular, as KSG's tool rows.
+        // KSG's `WorkLogVerb` is medium foreground (or danger on failure); `WorkLogTarget` is faint.
         .child(label(
             verb,
             TextStyle::new(13.0, 500.0).tracking(-0.08),
-            if failed { p.danger } else { secondary },
+            if failed { p.danger } else { p.ink },
         ));
     if !detail.is_empty() {
         line = line.child(
-            label(detail, ACTIVITY, tertiary)
+            label(detail, ACTIVITY, p.faint)
                 .truncate()
                 .shrink()
                 .min_w(0.0),
@@ -9001,8 +9005,10 @@ fn activity_line(
     if failed {
         line = line.child(meta_text("failed", p.danger));
     }
-    line.child(icon(if open { "chevron" } else { "open" }, tertiary).opacity(0.8))
-        .child(spacer())
+    if show_caret {
+        line = line.child(icon(if open { "chevron" } else { "open" }, p.faint).size(12.0, 12.0));
+    }
+    line.child(spacer())
 }
 
 /// KSG Code's `WORKING_BAR_CLASS_NAME` (`chat/TimelineRowParts.tsx`): a 32 pt bar over a 1 px
@@ -9065,12 +9071,15 @@ fn working_label(t: &Thread) -> (&'static str, Option<u64>) {
 /// The tabular timer in the bar's own 13 px type, so each tick keeps its width.
 const BAR_TIMER: TextStyle = ACTIVITY.features(TABULAR);
 
-/// Ported from KSG Code's `WorkingTimelineRow`: the running turn's bar at its top, under the
-/// captain's name. It is not a toggle while the turn runs, so it has no chevron.
-fn working_bar(t: &Thread, p: Palette) -> El {
+/// Ported from KSG Code's `WorkingTimelineRow`: the running turn's 32 pt bar at its top.
+/// When earlier work history exists before the live tail (or is currently folded), clicking the
+/// bar folds or unfolds earlier work while keeping the live tail visible.
+fn working_bar(t: &Thread, start: usize, foldable: bool, p: Palette) -> El {
     let (words, seconds) = working_label(t);
+    let expanded = !t.live_work_collapsed;
     let mut text = row().center_y().min_w(0.0).shrink().child(
         label(words, ACTIVITY, p.muted)
+            .group_color(p.ink)
             .key(format!("working-label-{}", t.id))
             .truncate()
             .shrink()
@@ -9078,13 +9087,43 @@ fn working_bar(t: &Thread, p: Palette) -> El {
     );
     if let Some(seconds) = seconds {
         text = text.child(
-            label(timer_label(seconds), BAR_TIMER, p.muted).key(format!("live-timer-{}", t.id)),
+            label(timer_label(seconds), BAR_TIMER, p.muted)
+                .group_color(p.ink)
+                .key(format!("live-timer-{}", t.id)),
         );
     }
-    working_bar_frame(p)
-        .key(format!("working-bar-{}", t.id))
-        .role("status")
-        .child(text)
+    let key = format!("working-bar-{}", t.id);
+    if !foldable {
+        return working_bar_frame(p).key(key).role("status").child(text);
+    }
+    let press_key = key.clone();
+    working_bar_frame(p).child(
+        row()
+            .key(key)
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(if expanded {
+                "Collapse work history"
+            } else {
+                "Expand work history"
+            })
+            .expanded(expanded)
+            .focusable(true)
+            .hover_group()
+            .h_full()
+            .center_y()
+            .gap(8.0)
+            .radius(6.0)
+            .child(text)
+            .child(icon(if expanded { "chevron" } else { "open" }, p.faint).size(12.0, 12.0))
+            .on_press_tx(move |s: &mut State, tx| {
+                tx.keep_on_screen(press_key.clone());
+                let t = s.current_mut();
+                t.live_work_collapsed = !t.live_work_collapsed;
+                t.timeline_cache.get_mut().touch_message(start);
+                t.timeline_cache.get_mut().touch_disclosure();
+            }),
+    )
 }
 
 fn inline_tool(s: &State, p: Palette, index: usize) -> El {
@@ -9122,6 +9161,7 @@ fn inline_tool(s: &State, p: Palette, index: usize) -> El {
                 (tool_verb(tool), &tool.detail),
                 tool.failed,
                 tool.expanded,
+                false,
                 work_ui::kind_icon(tool.resolved_kind()),
                 p,
             )
@@ -9267,6 +9307,7 @@ fn work_group_head(s: &State, p: Palette, entries: &[WorkEntry]) -> El {
                 (summary.clone(), ""),
                 failed,
                 expanded,
+                true,
                 glyph,
                 p,
             )
@@ -9349,7 +9390,14 @@ fn transcript_part(
             let memo_find = find_param.map(|(q, occ)| (q.to_owned(), occ));
             let rendered = memo(
                 assistant_body_key(t, *message, *from),
-                (chunk, s.dark, streaming, wide, memo_find),
+                (
+                    chunk,
+                    s.dark,
+                    streaming,
+                    wide,
+                    s.code_wrap_version,
+                    memo_find,
+                ),
                 || {
                     markdown_ui::render_with_find(
                         chunk,
@@ -9359,6 +9407,7 @@ fn transcript_part(
                         false,
                         streaming,
                         &format!("{thread_id}-{message_id}-{offset}"),
+                        &s.unwrapped_code_blocks,
                         find_param,
                     )
                 },
@@ -9617,12 +9666,16 @@ fn activity_content(glyph: &str, text: &str, ink: Color, key: Option<String>) ->
     }
     // A full-width row bounds the label, so it truncates at the lane instead of overflowing.
     row()
-        .min_h(26.0)
+        .min_h(24.0)
         .center_y()
         .gap(5.0)
         .w_full()
         .min_w(0.0)
-        .child(el().size(24.0, 24.0).center().child(tool_icon(glyph, ink)))
+        .child(
+            el().size(24.0, 24.0)
+                .center()
+                .child(icon(glyph, ink).size(14.0, 14.0)),
+        )
         .child(words)
 }
 
@@ -9761,7 +9814,7 @@ fn live_work(s: &State, p: Palette, parts: &[TranscriptPart], tail: LiveTail, st
                 .child(
                     el().size(24.0, 24.0)
                         .center()
-                        .child(tool_icon("brain", p.muted)),
+                        .child(icon("brain", p.faint).size(14.0, 14.0)),
                 )
                 .child(
                     label(line, ACTIVITY.lh(20.0), p.muted)
@@ -9860,6 +9913,7 @@ fn assistant_turn_piece(
             (
                 s.dark,
                 wide,
+                s.code_wrap_version,
                 rune::memo::layout_with("chat-lane", |rect| rect[2].to_bits()),
                 s.viewport_width.to_bits(),
                 s.demo,
@@ -10031,6 +10085,60 @@ impl WorkItem {
     }
 }
 
+/// Whether a part in a running turn is current activity or a live card that stays visible even
+/// when earlier work history is folded behind the `Working for` bar.
+fn live_part_stays_visible(t: &Thread, parts: &[TranscriptPart], index: usize) -> bool {
+    let at_end = index + 1 == parts.len();
+    match &parts[index] {
+        TranscriptPart::Work(entries) => {
+            at_end
+                || entries.iter().any(|entry| match *entry {
+                    WorkEntry::Tool(i) => !t.tools[i].done,
+                    WorkEntry::Thought(i) => !t.thoughts[i].done,
+                })
+        }
+        TranscriptPart::Tools(indices) => {
+            at_end
+                || is_lifted_card(t, &parts[index])
+                || indices.iter().any(|&i| {
+                    let tool = &t.tools[i];
+                    !tool.done || tool.resolved_kind() == crate::work::ToolKind::Plan
+                })
+        }
+        TranscriptPart::Compaction(i) => {
+            at_end
+                || t.native
+                    .compactions
+                    .get(*i)
+                    .is_some_and(|item| item["running"] == true)
+        }
+        TranscriptPart::Retry(i) => {
+            at_end
+                || crate::work::retry_events(t)
+                    .get(*i)
+                    .is_some_and(|event| event["running"] == true)
+        }
+        TranscriptPart::Text { .. } | TranscriptPart::Thought(_) => at_end,
+    }
+}
+
+/// Whether a running turn has earlier work history before its live tail that can fold behind the
+/// 32 pt `Working for` bar.
+fn live_work_foldable(t: &Thread, parts: &[TranscriptPart], layout: TurnLayout) -> bool {
+    if !layout.live {
+        return false;
+    }
+    if t.live_work_collapsed {
+        return true;
+    }
+    let Some(last) = layout.last_work else {
+        return false;
+    };
+    parts[..=last].iter().enumerate().any(|(index, _)| {
+        Some(index) != layout.preamble && !live_part_stays_visible(t, parts, index)
+    })
+}
+
 /// A running turn's work column ends in its live tail, which folds into one `work-live` row
 /// and unfolds below it. Before prose, and in a finished turn, a streak of two or more steps
 /// folds under its header (KSG's `work-toggle`); a lone call stays its own row.
@@ -10044,6 +10152,9 @@ fn work_items(t: &Thread, parts: &[TranscriptPart], layout: TurnLayout) -> Vec<W
         if Some(index) == layout.preamble
             || !layout.live && !layout.inline_work && is_lifted_card(t, part)
         {
+            continue;
+        }
+        if layout.live && t.live_work_collapsed && !live_part_stays_visible(t, parts, index) {
             continue;
         }
         match part {
@@ -10421,6 +10532,7 @@ fn work_slice(
             (
                 s.dark,
                 wide,
+                s.code_wrap_version,
                 rune::memo::layout_with("chat-lane", |rect| rect[2].to_bits()),
                 s.viewport_width.to_bits(),
             ),
@@ -10511,9 +10623,14 @@ fn build_assistant_turn(
     let items = work_items(t, &parts, layout);
     let work_key = format!("work-rows-{}", message_key(t, start));
     if live {
-        // KSG's `WorkingTimelineRow`: the turn's bar at its top while it runs.
+        // KSG's `WorkingTimelineRow`: the turn's 32 pt bar at its top while it runs.
         if head {
-            response = response.child(working_bar(t, p));
+            response = response.child(working_bar(
+                t,
+                start,
+                live_work_foldable(t, &parts, layout),
+                p,
+            ));
         }
     } else if !inline_work && (last_work.is_some() || work.is_some_and(|work| work.stopped)) {
         let expanded = work.is_some_and(|work| work.expanded);
@@ -10914,7 +11031,7 @@ impl TimelineCache {
         self.touch_item("messages", message);
     }
 
-    fn touch_disclosure(&mut self) {
+    pub(crate) fn touch_disclosure(&mut self) {
         self.disclosure += 1;
     }
 
@@ -10976,7 +11093,8 @@ impl TimelineStructure {
             let now = match kind {
                 0 => t.tools.get(index).map(|tool| tool.group_expanded),
                 1 => t.thoughts.get(index).map(|thought| thought.expanded),
-                _ => t.work.get(index).map(|work| work.expanded),
+                2 => t.work.get(index).map(|work| work.expanded),
+                _ => Some(t.live_work_collapsed),
             };
             now != Some(open)
         })
@@ -11455,6 +11573,9 @@ fn push_turn_pieces(
         return false;
     }
     let live = end == t.messages.len() && t.status.busy();
+    if live {
+        probe.push((3, 0, t.live_work_collapsed));
+    }
     if let Some(&index) = structure.work_index.get(&start) {
         probe.push((2, index, t.work[index].expanded));
     }
@@ -11611,7 +11732,7 @@ fn build_user_or_system_row(
             } else {
                 memo(
                     format!("msg-md-{}-{message_id}", t.id),
-                    (&message.text, s.dark, wide, memo_find),
+                    (&message.text, s.dark, wide, s.code_wrap_version, memo_find),
                     || {
                         markdown_ui::render_with_find(
                             &message.text,
@@ -11621,22 +11742,23 @@ fn build_user_or_system_row(
                             true,
                             false,
                             &format!("user-{}-{message_id}", t.id),
+                            &s.unwrapped_code_blocks,
                             find_query.map(|q| (q, active_occ)),
                         )
                     },
                 )
             };
+            // Ported from KSG Code's `TimelineUserMessageRow`: borderless `surface-bubble`
+            // with radius 14 and `px-3.5 py-2.5` padding.
             user = user.child(
                 content
                     .key(format!("{key}-text"))
                     .max_w(max_width)
                     .min_w(0.0)
-                    .padding(12.0)
-                    .radius(12.0)
-                    .fill(p.message_bg)
-                    // Both themes outline the bubble in `frame`: 2 px at night, 1 px by day (the
-                    // `line` colour disappeared on the `message_bg` fill). No shadow.
-                    .border(if s.dark { 2.0 } else { 1.0 }, p.frame),
+                    .px(14.0)
+                    .py(10.0)
+                    .radius(14.0)
+                    .fill(p.message_bg),
             );
         }
         row().justify_end().child(user)
@@ -18023,6 +18145,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn code_blocks_wrap_by_default_and_toggle_wrap_per_block() {
+        let mut rt = runtime(960.0);
+        rt.state.populate_demo();
+        let thread = rt.state.current_mut();
+        thread.tools.clear();
+        thread.thoughts.clear();
+        thread.work.clear();
+        thread.captain = None;
+        let long_line = "let very_long_identifier_for_wrapping_check = ".to_owned()
+            + &"\"segment_value\" + ".repeat(14)
+            + "\"end\";";
+        thread.messages = vec![crate::model::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: "Pi",
+            text: format!("```rust\n{long_line}\n```"),
+            images: vec![],
+            context: None,
+        }];
+        rt.frame(0.0);
+        let thread = rt.state.current();
+        let id = format!("{}-{}-0-0", thread.id, thread.messages[0].id);
+        let wrap_key = format!("wrap-code-{id}");
+        let code_key = format!("code-{id}");
+        let button_label = |rt: &Runtime<State>| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(wrap_key.as_str()))
+                .and_then(|e| e.label)
+        };
+        assert_eq!(button_label(&rt).as_deref(), Some("Disable line wrap"));
+        let wrapped_h = rt.presented(&code_key).unwrap().0[3];
+
+        press(&mut rt, &wrap_key);
+        rt.frame(1.0);
+        assert!(rt.state.unwrapped_code_blocks.contains(&id));
+        assert_eq!(button_label(&rt).as_deref(), Some("Wrap lines"));
+        let unwrapped_h = rt.presented(&code_key).unwrap().0[3];
+        assert!(
+            wrapped_h > unwrapped_h,
+            "wrapped height {wrapped_h} should exceed unwrapped height {unwrapped_h}"
+        );
+
+        // Appending a diff fence mid-stream keeps the preceding code block's wrap identity stable.
+        rt.state.current_mut().messages[0]
+            .text
+            .push_str("\n\n```diff\n- old()\n+ new()\n```");
+        rt.state.current_mut().transcript_content += 1;
+        rt.invalidate();
+        rt.frame(1.5);
+        assert_eq!(button_label(&rt).as_deref(), Some("Wrap lines"));
+        assert!((rt.presented(&code_key).unwrap().0[3] - unwrapped_h).abs() < 0.5);
+
+        press(&mut rt, &wrap_key);
+        rt.frame(2.0);
+        assert!(!rt.state.unwrapped_code_blocks.contains(&id));
+        assert_eq!(button_label(&rt).as_deref(), Some("Disable line wrap"));
+        assert!((rt.presented(&code_key).unwrap().0[3] - wrapped_h).abs() < 0.5);
+    }
+
+    #[test]
     fn machine_selector_labels_and_link_dialog_fit_supported_widths() {
         for width in [1280.0] {
             let mut rt = runtime(width);
@@ -21343,6 +21525,101 @@ pub(crate) mod tests {
                 "{width}"
             );
         }
+    }
+
+    #[test]
+    fn working_bar_toggles_earlier_live_work_while_keeping_live_tail_visible() {
+        let mut rt = streak_runtime(1280.0);
+        let bar = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("working-bar-1"))
+            .expect("working bar");
+        assert_eq!(bar.role, "button");
+        assert_eq!(bar.label.as_deref(), Some("Collapse work history"));
+        assert!(rt.presented("toggle-tool-group-1-0").is_some());
+        assert!(rt.presented("live-work-1").is_some());
+
+        press(&mut rt, "working-bar-1");
+        rt.frame(1.0);
+        assert!(rt.state.current().live_work_collapsed);
+        assert!(rt.presented("toggle-tool-group-1-0").is_none());
+        assert!(rt.presented("live-work-1").is_some());
+        let bar = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("working-bar-1"))
+            .expect("collapsed working bar");
+        assert_eq!(bar.label.as_deref(), Some("Expand work history"));
+
+        // Active compaction arriving while the live fold is closed stays visible.
+        {
+            let t = rt.state.current_mut();
+            let message = t.messages.len().saturating_sub(1);
+            let offset = t.messages.get(message).map_or(0, |m| m.text.len());
+            t.native.compactions.push(json!({
+                "running": true,
+                "anchor": { "message": message, "offset": offset }
+            }));
+            t.transcript_structure += 1;
+            t.timeline_cache.get_mut().touch_disclosure();
+        }
+        rt.invalidate();
+        rt.frame(1.5);
+        assert!(rt.state.current().live_work_collapsed);
+        assert!(rt.presented("toggle-tool-group-1-0").is_none());
+        assert!(rt.presented("toggle-tool-group-1-2").is_some());
+        assert!(rt.presented("compaction-0").is_some());
+
+        // Tool reveal opens the live fold before resolving the hidden tool row.
+        let hidden_tool_id = rt.state.current().tools[0].id.clone();
+        rt.state.reveal_tool(hidden_tool_id);
+        rt.invalidate();
+        rt.frame(2.0);
+        assert!(!rt.state.current().live_work_collapsed);
+        assert!(rt.presented("toggle-tool-group-1-0").is_some());
+
+        // Collapse again and verify thread find reveals folded interim prose in the live turn.
+        press(&mut rt, "working-bar-1");
+        rt.frame(2.5);
+        assert!(rt.state.current().live_work_collapsed);
+        let msg_id = rt.state.current().messages[0].id.clone();
+        rt.state.open_thread_find();
+        rt.state.thread_find.query.replace_text("checking");
+        rt.state.thread_find.pending_reveal = Some(crate::thread_find::ThreadFindMatch {
+            entry_id: msg_id.clone(),
+            occurrence: 0,
+        });
+        rt.update(|s, tx| {
+            s.consume_pending_find_reveal(tx);
+        });
+        rt.frame(3.0);
+        assert!(!rt.state.current().live_work_collapsed);
+        assert!(rt.presented("toggle-tool-group-1-0").is_some());
+        assert!(rt.presented("compaction-0").is_some());
+
+        // Collapse again and verify citation navigation reveals folded interim prose too.
+        press(&mut rt, "working-bar-1");
+        rt.frame(3.5);
+        assert!(rt.state.current().live_work_collapsed);
+        let citation = crate::composer_context::AssistantCitation {
+            version: 1,
+            environment_id: rt.state.machine_identity("local"),
+            thread_id: rt.state.current().id.to_string(),
+            message_id: msg_id,
+            text: "checking".into(),
+            comment: None,
+            start: 0,
+            end: 8,
+            prefix: String::new(),
+            suffix: String::new(),
+        };
+        rt.update(move |s, tx| {
+            assert!(s.navigate_to_citation(&citation, tx));
+        });
+        rt.frame(4.0);
+        assert!(!rt.state.current().live_work_collapsed);
+        assert!(rt.presented("toggle-tool-group-1-0").is_some());
     }
 
     #[test]

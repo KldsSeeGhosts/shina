@@ -121,11 +121,11 @@ fn reading_body(
             false,
             false,
             false,
-            "captain-doc-markdown",
+            &format!("captain-doc-{}-{captain}-{name}", s.machines.selected),
+            &s.unwrapped_code_blocks,
             None,
         ));
     }
-    let _ = captain;
     body
 }
 
@@ -235,7 +235,11 @@ fn editor_body(s: &State, p: Palette, key: &DocumentDraftKey, draft: &DocumentDr
                     false,
                     false,
                     false,
-                    "captain-doc-theirs-markdown",
+                    &format!(
+                        "captain-doc-theirs-{}-{}-{}-{revision}",
+                        key.server, key.captain, key.name
+                    ),
+                    &s.unwrapped_code_blocks,
                     None,
                 )),
         );

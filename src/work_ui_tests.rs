@@ -188,6 +188,12 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
                 .iter()
                 .any(|e| e.text.as_deref() == Some("Thought ×3"))
         );
+        // Collapsed thought rows show the first line preview beside the verb.
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.text.as_deref() == Some("First thought."))
+        );
         // The mixed streak folds under its summary; unfolded, its thought is its own row.
         assert!(rt.find(&format!("inline-thought-{id}-3")).is_none());
         press(&mut rt, &format!("toggle-tool-group-{id}-0"));

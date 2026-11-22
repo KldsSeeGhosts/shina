@@ -887,13 +887,22 @@ fn notebook_view(s: &State, p: Palette, width: f32) -> El {
         format!("{} KB", attachment.bytes.div_ceil(1024))
     };
     let mut cells = col().w_full().min_w(0.0).px(20.0).py(24.0).gap(20.0);
+    let preview_id = format!("{}-{}-{}", preview.machine, preview.thread, attachment.id);
     for (index, cell) in notebook
         .cells
         .iter()
         .take(preview.notebook_visible)
         .enumerate()
     {
-        cells = cells.child(notebook_cell(s, p, index, cell, &notebook.language, width));
+        cells = cells.child(notebook_cell(
+            s,
+            p,
+            &preview_id,
+            index,
+            cell,
+            &notebook.language,
+            width,
+        ));
     }
     if notebook.cells.is_empty() {
         cells = cells.child(label("This notebook is empty.", SMALL, p.muted));
@@ -968,6 +977,7 @@ fn notebook_view(s: &State, p: Palette, width: f32) -> El {
 fn notebook_cell(
     s: &State,
     p: Palette,
+    preview_id: &str,
     index: usize,
     cell: &attachment_notebook_preview::NotebookCell,
     language: &str,
@@ -1011,7 +1021,8 @@ fn notebook_cell(
                     width > 760.0,
                     false,
                     false,
-                    &format!("notebook-md-{index}"),
+                    &format!("notebook-md-{preview_id}-{index}"),
+                    &s.unwrapped_code_blocks,
                     None,
                 ),
             ));
@@ -2365,7 +2376,13 @@ pub(super) fn view(s: &State, p: Palette) -> El {
                             width > 760.0,
                             false,
                             false,
-                            "attachment-preview-markdown",
+                            &format!(
+                                "attachment-preview-{}-{}-{}",
+                                preview.machine,
+                                preview.thread,
+                                preview.selected().id
+                            ),
+                            &s.unwrapped_code_blocks,
                             None,
                         )
                     } else {

@@ -229,6 +229,7 @@ pub(super) fn questionnaire_drawer(s: &State, p: Palette, lane: f32) -> El {
                                 false,
                                 false,
                                 &format!("question-{}-{}", t.id, question.id),
+                                &s.unwrapped_code_blocks,
                                 None,
                             )
                             .key("questionnaire-markdown"),

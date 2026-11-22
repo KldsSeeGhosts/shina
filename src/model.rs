@@ -1117,6 +1117,8 @@ pub struct Thread {
     pub(crate) transcript_content: u64,
     /// Derived row keys and event indexes. No transcript payloads are retained.
     pub(crate) timeline_cache: std::cell::RefCell<crate::ui::TimelineCache>,
+    /// Whether earlier work history in the running turn is folded behind its `Working for` bar.
+    pub live_work_collapsed: bool,
     pub draft: TextEdit,
     pub queued_edit: Option<QueuedEdit>,
     queued_save: Option<(uuid::Uuid, uuid::Uuid)>,
@@ -1767,6 +1769,7 @@ impl Thread {
             transcript_structure: 0,
             transcript_content: 0,
             timeline_cache: Default::default(),
+            live_work_collapsed: false,
             draft: crate::composer_rich::draft(""),
             prompt_history: crate::composer::History::default(),
             typing_guard: crate::composer::TypingGuard::default(),
@@ -4442,6 +4445,7 @@ impl Thread {
                 self.prompt_suggestion = None;
                 self.life.last_started_at = Some(lifecycle::now());
                 self.status = Status::Running;
+                self.live_work_collapsed = false;
                 self.assistant = None;
                 self.phase = "Waiting for the model".into();
                 self.started.get_or_insert_with(Instant::now);
@@ -4467,6 +4471,7 @@ impl Thread {
                     self.resumable_run_id = None;
                 }
                 self.finish_run();
+                self.live_work_collapsed = false;
                 if self
                     .native
                     .questionnaire
@@ -5269,6 +5274,10 @@ pub struct State {
     pub plan_menu: Option<String>,
     pub plan_copied: Option<(String, u64)>,
     pub plan_expanded: std::collections::HashSet<String>,
+    /// Code block identities where the user toggled soft line wrapping off (default is wrapped).
+    pub unwrapped_code_blocks: std::sync::Arc<std::collections::HashSet<String>>,
+    /// Bumped when any code block's soft-wrap state changes so memoized markdown rebuilds.
+    pub code_wrap_version: u64,
     pub plan_save_dialog: Option<PlanSaveDialog>,
     pub plan_save_last_path: Option<String>,
     next_plan_save_request_id: u64,
@@ -6401,6 +6410,8 @@ impl State {
             plan_menu: None,
             plan_copied: None,
             plan_expanded: Default::default(),
+            unwrapped_code_blocks: Default::default(),
+            code_wrap_version: 0,
             plan_save_dialog: None,
             plan_save_last_path: None,
             next_plan_save_request_id: 0,
@@ -6709,6 +6720,11 @@ impl State {
             .iter()
             .rposition(|m| m.role != "Pi")
             .map_or(0, |i| i + 1);
+        let in_live_turn = t.status.busy() && t.messages[start..].iter().all(|m| m.role == "Pi");
+        if in_live_turn && t.live_work_collapsed {
+            t.live_work_collapsed = false;
+            t.timeline_cache.get_mut().touch_disclosure();
+        }
         t.tools[index].expanded = true;
         for tool in &mut t.tools[..=index] {
             if tool.anchor.message >= start {
@@ -7437,6 +7453,13 @@ impl State {
                 .iter()
                 .rposition(|m| m.role != "Pi")
                 .map_or(0, |i| i + 1);
+            let in_live_turn =
+                t.status.busy() && t.messages[start..].iter().all(|m| m.role == "Pi");
+            if in_live_turn && t.live_work_collapsed {
+                t.live_work_collapsed = false;
+                t.timeline_cache.get_mut().touch_message(start);
+                t.timeline_cache.get_mut().touch_disclosure();
+            }
             if let Some(work) = t.work.iter_mut().find(|w| w.start == start) {
                 work.expanded = true;
             } else if plan_index.is_some() {
@@ -7556,7 +7579,7 @@ impl State {
         if self.current().id != id || self.machines.selected != machine {
             return false;
         }
-        let t = self.current();
+        let t = self.current_mut();
         let msg_idx = t.messages.iter().position(|m| m.id == citation.message_id);
         let row_key = match msg_idx {
             Some(idx) if t.messages[idx].role == "Pi" => {
@@ -7564,10 +7587,18 @@ impl State {
                     .iter()
                     .rposition(|m| m.role != "Pi")
                     .map_or(0, |i| i + 1);
+                let in_live_turn =
+                    t.status.busy() && t.messages[start..].iter().all(|m| m.role == "Pi");
+                if in_live_turn && t.live_work_collapsed {
+                    t.live_work_collapsed = false;
+                    t.timeline_cache.get_mut().touch_message(start);
+                    t.timeline_cache.get_mut().touch_disclosure();
+                }
                 format!("turn-{id}-{}", t.messages[start].id)
             }
             _ => format!("row-{id}-{}", citation.message_id),
         };
+        let t = self.current();
         // A long open turn is split into rows; scroll to the one holding the quote.
         let row_key = msg_idx
             .and_then(|message| {
