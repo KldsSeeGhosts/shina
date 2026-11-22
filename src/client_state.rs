@@ -3729,6 +3729,8 @@ impl State {
             thread.id = id;
         }
         thread.project = project;
+        // The source machine's catalogs say nothing about the target's workspace.
+        thread.forget_workspace_catalog(false);
         // Thread pills without an owner meant a thread on the machine the
         // draft was on; record it before the draft changes hands, the way
         // restoring a saved draft stamps its machine.
@@ -3747,6 +3749,12 @@ impl State {
         self.open_kept_tab(self.threads.len() - 1);
         self.crew_draft_strip_foreign();
         self.apply_retarget_rules();
+        // An empty Pi catalog means a server that does not project one, the case
+        // `apply_projected_catalog` leaves alone.
+        if !self.catalog.models.is_empty() {
+            self.apply_catalog();
+        }
+        self.apply_native_catalogs();
         self.checkpoint();
     }
 
@@ -3928,10 +3936,16 @@ impl State {
 
     pub fn choose_draft_project(&mut self, project: Option<usize>) {
         if self.current().client_draft {
-            if self.current().project != project {
-                self.current_mut().base_branch = None;
+            let changed = self.current().project != project;
+            if changed {
+                let thread = self.current_mut();
+                thread.base_branch = None;
+                thread.forget_workspace_catalog(true);
             }
             self.current_mut().project = project;
+            if changed {
+                self.apply_native_catalogs();
+            }
             self.project_picker = None;
             self.machines.draft_picker = None;
             self.ensure_vcs_branches(false);
@@ -5002,6 +5016,7 @@ impl State {
                     self.choose_harness(harness);
                 }
                 if let Some(model) = args["model"].as_str() {
+                    self.sync_cursor_catalog_models(self.active);
                     self.current_mut()
                         .set_model(text("provider")?, model.into());
                 }
@@ -5169,6 +5184,7 @@ impl State {
                     Option<(String, String)>,
                 >(args["selectedModel"].clone())
                 {
+                    self.sync_cursor_catalog_models(self.active);
                     self.current_mut().set_model(provider, model);
                 }
                 if let Some(thinking) = args["thinking"].as_str() {
@@ -6304,6 +6320,47 @@ mod tests {
             remote.try_recv().is_err(),
             "a matched switch sends nothing until Send"
         );
+    }
+
+    #[test]
+    fn a_retargeted_draft_drops_the_source_machines_catalog_rows() {
+        let (mut state, _local, _remote) = draft_routing_fixture();
+        client_draft_on(&mut state, Some(1), "carry me");
+        let source_model = AgentModel {
+            provider: "codex".into(),
+            id: "source-only".into(),
+            name: "Source only".into(),
+            thinking_levels: vec!["low".into(), "xhigh".into()],
+            ..Default::default()
+        };
+        let thread = state.current_mut();
+        thread.harness = "codex".into();
+        thread.model_provider = "codex".into();
+        thread.model_id = "source-only".into();
+        thread.models = vec![source_model.clone()];
+        thread.thinking_levels = source_model.thinking_levels.clone();
+        thread.cursor_catalog_models = Some(vec![source_model]);
+        thread
+            .native
+            .commands
+            .push(crate::model::pi_session::SlashCommand {
+                name: "source-command".into(),
+                description: String::new(),
+                source: "codex".into(),
+            });
+        thread.native.commands_loaded = true;
+
+        state.retarget_draft("server-b");
+        assert_eq!(state.machines.selected, "server-b");
+        let moved = state.current();
+        assert_eq!(moved.project, Some(7));
+        assert!(moved.models.is_empty());
+        assert!(
+            moved.thinking_levels.is_empty(),
+            "the reasoning menu must not offer the source machine's levels"
+        );
+        assert!(moved.cursor_catalog_models.is_none());
+        assert!(moved.native.commands.is_empty() && !moved.native.commands_loaded);
     }
 
     #[test]

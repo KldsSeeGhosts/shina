@@ -4,7 +4,31 @@ use super::*;
 #[derive(Default)]
 pub(super) struct NativeModelMetadata {
     models: Vec<AgentModel>,
+    cwd: Option<PathBuf>,
+    models_cwd: Option<PathBuf>,
+    workspace_snapshots: std::collections::BTreeMap<PathBuf, Vec<AgentModel>>,
     update_required_models: Vec<crate::model_picker::UpdateRequiredModel>,
+}
+
+impl NativeModelMetadata {
+    fn models_for_workspace(&self, cwd: Option<&std::path::Path>) -> Option<&[AgentModel]> {
+        crate::session::models_owned_by(
+            &self.models,
+            &self.workspace_snapshots,
+            self.cwd.as_deref(),
+            self.models_cwd.as_deref(),
+            cwd,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceScope<'a> {
+    Any,
+    Thread {
+        cwd: Option<&'a std::path::Path>,
+        projectless: bool,
+    },
 }
 
 #[derive(Default)]
@@ -254,7 +278,16 @@ impl State {
             let previous = &self.client_views["nativeCatalogs"][harness];
             let models_changed = previous["models"] != next["models"];
             let updates_changed = previous["updateRequiredModels"] != next["updateRequiredModels"];
-            if models_changed || updates_changed {
+            let cwd_changed = previous["cwd"] != next["cwd"];
+            let models_cwd_changed = previous["modelsCwd"] != next["modelsCwd"];
+            let snapshots_changed = previous["workspaceSnapshots"] != next["workspaceSnapshots"];
+            if models_changed
+                || updates_changed
+                || cwd_changed
+                || models_cwd_changed
+                || snapshots_changed
+                || !self.projected_native_catalogs.contains_key(harness)
+            {
                 let cached = self
                     .projected_native_catalogs
                     .entry(harness.clone())
@@ -266,6 +299,19 @@ impl State {
                 if updates_changed {
                     cached.update_required_models =
                         serde_json::from_value(next["updateRequiredModels"].clone())
+                            .unwrap_or_default();
+                }
+                if cwd_changed || models_cwd_changed {
+                    cached.cwd = next["cwd"].as_str().map(PathBuf::from);
+                    cached.models_cwd = if next.get("modelsCwd").is_some() {
+                        next["modelsCwd"].as_str().map(PathBuf::from)
+                    } else {
+                        cached.cwd.clone()
+                    };
+                }
+                if snapshots_changed {
+                    cached.workspace_snapshots =
+                        serde_json::from_value(next["workspaceSnapshots"].clone())
                             .unwrap_or_default();
                 }
             }
@@ -303,6 +349,36 @@ impl State {
         let catalog = self.acp_catalogs.get(harness).unwrap_or(catalog);
         (catalog.loading(), catalog.error.as_deref())
     }
+
+    /// The canonical catalog for a native or ACP harness; an ACP entry wins over
+    /// the built-in catalog, matching `native_catalog_status`.
+    pub(super) fn native_catalog(&self, harness: &str) -> Option<&crate::session::NativeCatalog> {
+        let builtin = match harness {
+            "codex" => Some(&self.codex_catalog),
+            "claude" => Some(&self.claude_catalog),
+            "antigravity" => Some(&self.antigravity_catalog),
+            "cursor" => Some(&self.cursor_catalog),
+            _ => None,
+        };
+        self.acp_catalogs.get(harness).or(builtin)
+    }
+
+    pub(super) fn native_catalog_mut(
+        &mut self,
+        harness: &str,
+    ) -> Option<&mut crate::session::NativeCatalog> {
+        if let Some(catalog) = self.acp_catalogs.get_mut(harness) {
+            return Some(catalog);
+        }
+        match harness {
+            "codex" => Some(&mut self.codex_catalog),
+            "claude" => Some(&mut self.claude_catalog),
+            "antigravity" => Some(&mut self.antigravity_catalog),
+            "cursor" => Some(&mut self.cursor_catalog),
+            _ => None,
+        }
+    }
+
     pub(super) fn refresh_provider_availability(&mut self, force: bool) {
         if !self.demo && (self.runtime_enabled || self.client.is_some()) {
             self.provider_availability.refresh(self.wake.clone(), force);
@@ -315,7 +391,7 @@ impl State {
         changed
     }
 
-    fn builtin_cli_available(&self, id: &str) -> bool {
+    pub(super) fn builtin_cli_available(&self, id: &str) -> bool {
         if self.client.is_some() {
             // Prefer the selected server's current discovery, including removals.
             if let Some(ids) = self.client_views["harnessIds"].as_array() {
@@ -329,6 +405,7 @@ impl State {
             .last
             .as_ref()
             .is_some_and(|state| match id {
+                "codex" => true,
                 "claude" => state.claude,
                 "antigravity" => state.antigravity,
                 "cursor" => state.cursor,
@@ -336,7 +413,9 @@ impl State {
             })
     }
 
-    pub(super) fn refresh_native_catalogs(&mut self, force: bool) -> bool {
+    /// `interval` marks the event-loop pass: healthy catalogs that opt out keep
+    /// their snapshot, matching KSG's per-provider `refreshOnInterval`.
+    pub(super) fn refresh_native_catalogs(&mut self, force: bool, interval: bool) -> bool {
         if self.demo || !self.runtime_enabled || self.client.is_some() {
             return false;
         }
@@ -387,7 +466,7 @@ impl State {
         {
             changed |= self
                 .cursor_catalog
-                .refresh("cursor", &cwd, wake.clone(), optional_force);
+                .refresh("cursor", acp_cwd, wake.clone(), optional_force);
         }
         self.acp_catalogs
             .retain(|id, _| self.harnesses.agents.iter().any(|agent| agent.id == *id));
@@ -396,7 +475,7 @@ impl State {
                 .acp_catalogs
                 .entry(agent.id.clone())
                 .or_default()
-                .refresh_acp(agent, acp_cwd, wake.clone(), optional_force);
+                .refresh_acp(agent, acp_cwd, wake.clone(), optional_force, interval);
         }
         if changed {
             self.apply_native_catalogs();
@@ -404,65 +483,124 @@ impl State {
         changed
     }
 
+    pub(crate) fn catalog_workspace_cwd(&self, index: usize) -> Option<PathBuf> {
+        if let Ok(dir) = self.thread_directory(index) {
+            return Some(dir);
+        }
+        let thread = self.threads.get(index)?;
+        if !thread.client_draft {
+            return None;
+        }
+        if let Some(worktree_path) = &thread.worktree_path {
+            return Some(PathBuf::from(worktree_path));
+        }
+        self.project(thread.project)
+            .map(|project| project.path.clone())
+    }
+
+    /// A chat with no project runs in `<data_dir>/chats/<id>`, a folder Shina
+    /// creates for it.
+    fn scratch_chat_dir(&self, dir: &std::path::Path) -> bool {
+        dir.parent() == Some(self.data_dir.join("chats").as_path())
+    }
+
     pub(super) fn apply_native_catalogs(&mut self) {
         if self.client.is_some() {
-            for harness in self.projected_native_catalogs.keys().map(String::as_str) {
-                if !self
-                    .threads
-                    .iter()
-                    .any(|thread| thread.client_draft && thread.harness == harness)
-                {
+            let directories: Vec<_> = (0..self.threads.len())
+                .map(|index| self.catalog_workspace_cwd(index))
+                .collect();
+            let updates: Vec<_> = (0..self.threads.len())
+                .map(|index| {
+                    let thread = &self.threads[index];
+                    if !thread.client_draft
+                        || !self.projected_native_catalogs.contains_key(&thread.harness)
+                    {
+                        return None;
+                    }
+                    let harness = thread.harness.as_str();
+                    let cwd = directories[index].as_deref();
+                    let models = self
+                        .projected_native_catalogs
+                        .get(harness)
+                        .and_then(|meta| meta.models_for_workspace(cwd))
+                        .map(|models| models.to_vec());
+                    // A client draft's reasoning levels always reflect its current
+                    // workspace snapshot or workspace-scoped rows. An empty snapshot
+                    // or a refresh that drops the selected model clears stale levels.
+                    let levels = match &models {
+                        Some(models) => models
+                            .iter()
+                            .find(|model| {
+                                model.provider == thread.model_provider
+                                    && model.id == thread.model_id
+                            })
+                            .map(AgentModel::reasoning_levels)
+                            .unwrap_or_default(),
+                        None => self
+                            .harness_model_refs_for_workspace(
+                                harness,
+                                cwd,
+                                thread.project.is_none(),
+                            )
+                            .iter()
+                            .find(|model| {
+                                model.provider == thread.model_provider
+                                    && model.id == thread.model_id
+                            })
+                            .map(AgentModel::reasoning_levels)
+                            .unwrap_or_default(),
+                    };
+                    Some((harness.to_owned(), models, levels))
+                })
+                .collect();
+            let projects = &self.projects.entries;
+            for (thread, update) in self.threads.iter_mut().zip(updates) {
+                let Some((harness, models, levels)) = update else {
                     continue;
+                };
+                let catalog = &self.client_views["nativeCatalogs"][&harness];
+                if let Some(models) = models {
+                    if harness == "cursor" {
+                        thread.cursor_catalog_models = Some(models.clone());
+                    }
+                    if thread.models != models {
+                        thread.models = models;
+                    }
+                } else {
+                    if harness == "cursor" {
+                        thread.cursor_catalog_models = None;
+                    }
+                    if !thread.models.is_empty() {
+                        thread.models.clear();
+                    }
                 }
-                let catalog = &self.client_views["nativeCatalogs"][harness];
-                let refs = self.harness_model_refs(harness);
-                let models = (refs.iter().next().is_some()
-                    && self.threads.iter().any(|thread| {
-                        thread.client_draft
-                            && thread.harness == harness
-                            && !thread.models.iter().eq(refs.iter())
-                    }))
-                .then(|| refs.iter().cloned().collect::<Vec<_>>());
-                let projects = &self.projects.entries;
-                for thread in self
-                    .threads
-                    .iter_mut()
-                    .filter(|thread| thread.client_draft && thread.harness == harness)
+                if thread.thinking_levels != levels {
+                    thread.thinking_levels = levels;
+                }
+                thread.harness_state["codexNativeExtensions"] = catalog["extensions"].clone();
+                if catalog["ready"] == true
+                    && projects
+                        .iter()
+                        .find(|project| Some(project.id) == thread.project)
+                        .is_some_and(|project| {
+                            catalog["cwd"]
+                                .as_str()
+                                .is_some_and(|cwd| std::path::Path::new(cwd) == project.path)
+                        })
                 {
-                    if let Some(models) = &models
-                        && thread.models != *models
-                    {
-                        thread.models.clone_from(models);
-                    }
-                    thread.refresh_thinking_levels();
-                    thread.harness_state["codexNativeExtensions"] = catalog["extensions"].clone();
-                    if catalog["ready"] == true
-                        && projects
-                            .iter()
-                            .find(|project| Some(project.id) == thread.project)
-                            .is_some_and(|project| {
-                                catalog["cwd"]
-                                    .as_str()
-                                    .is_some_and(|cwd| std::path::Path::new(cwd) == project.path)
+                    let commands = catalog["commands"].as_array().cloned().unwrap_or_default();
+                    thread.native.skills = crate::composer_skills::from_commands(&commands);
+                    thread.native.commands = commands
+                        .iter()
+                        .filter_map(|command| {
+                            Some(pi_session::SlashCommand {
+                                name: command["name"].as_str()?.into(),
+                                description: command["description"].as_str().unwrap_or("").into(),
+                                source: command["source"].as_str().unwrap_or(&harness).into(),
                             })
-                    {
-                        let commands = catalog["commands"].as_array().cloned().unwrap_or_default();
-                        thread.native.skills = crate::composer_skills::from_commands(&commands);
-                        thread.native.commands = commands
-                            .iter()
-                            .filter_map(|command| {
-                                Some(pi_session::SlashCommand {
-                                    name: command["name"].as_str()?.into(),
-                                    description: command["description"]
-                                        .as_str()
-                                        .unwrap_or("")
-                                        .into(),
-                                    source: command["source"].as_str().unwrap_or(harness).into(),
-                                })
-                            })
-                            .collect();
-                        thread.native.commands_loaded = true;
-                    }
+                        })
+                        .collect();
+                    thread.native.commands_loaded = true;
                 }
             }
             return;
@@ -483,32 +621,41 @@ impl State {
                     _ => continue,
                 }
             };
-            if thread.pi.is_some() {
+            let workspace_models = catalog.models_for_workspace(directories[index].as_deref());
+            if thread.harness == "cursor" {
+                let next = workspace_models.map(|models| models.to_vec());
+                if thread.cursor_catalog_models != next {
+                    thread.cursor_catalog_models = next;
+                }
+            }
+            if thread.pi.is_some() && (thread.harness != "cursor" || acp_catalog.is_some()) {
                 continue;
             }
             if thread.harness_state["catalogRevision"].as_u64() == Some(catalog.revision) {
                 continue;
             }
             thread.harness_state["catalogRevision"] = json!(catalog.revision);
-            if acp_catalog.is_none()
+            if thread.pi.is_none()
+                && acp_catalog.is_none()
                 && let Some(error) = &catalog.error
                 && crate::usage_limits::authentication_error(error)
             {
                 thread.error = Some(error.clone());
                 thread.status = Status::Failed;
             }
-            if !catalog.commands_ready() {
+            if thread.pi.is_none() && !catalog.commands_ready() {
                 thread.native.commands_loaded = false;
                 thread.native.commands.clear();
                 thread.native.skills.clear();
             }
-            if !catalog.models.is_empty() {
-                if thread.models != catalog.models {
-                    thread.models.clone_from(&catalog.models);
+            if let Some(models) = workspace_models {
+                if thread.models != models {
+                    thread.models = models.to_vec();
                 }
                 thread.refresh_thinking_levels();
             }
-            if catalog.commands_ready() && directories[index] == catalog.cwd {
+            if thread.pi.is_none() && catalog.commands_ready() && directories[index] == catalog.cwd
+            {
                 thread.native.skills = crate::composer_skills::from_commands(&catalog.commands);
                 thread.native.commands = catalog
                     .commands
@@ -527,6 +674,34 @@ impl State {
             }
         }
         self.sync_fallback_model(crate::lifecycle::now() as i64);
+    }
+
+    fn cursor_catalog_models_for_cwd(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<Vec<AgentModel>> {
+        if self.client.is_some() {
+            return self
+                .projected_native_catalogs
+                .get("cursor")
+                .and_then(|catalog| catalog.models_for_workspace(cwd))
+                .map(|models| models.to_vec());
+        }
+        let catalog = self.native_catalog("cursor")?;
+        catalog
+            .models_for_workspace(cwd)
+            .map(|models| models.to_vec())
+    }
+
+    pub(crate) fn sync_cursor_catalog_models(&mut self, index: usize) {
+        if self.threads[index].harness != "cursor" {
+            return;
+        }
+        let cwd = self.catalog_workspace_cwd(index);
+        let next = self.cursor_catalog_models_for_cwd(cwd.as_deref());
+        if self.threads[index].cursor_catalog_models != next {
+            self.threads[index].cursor_catalog_models = next;
+        }
     }
 
     pub(super) fn validate_harness(&self, id: &str) -> Result<(), String> {
@@ -549,41 +724,98 @@ impl State {
     }
 
     fn harness_model_refs(&self, harness: &str) -> ModelRefs<'_> {
+        self.harness_model_refs_in_scope(harness, WorkspaceScope::Any)
+    }
+
+    fn harness_model_refs_for_cwd(
+        &self,
+        harness: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> ModelRefs<'_> {
+        let projectless =
+            cwd.is_some_and(|dir| !self.projects.entries.iter().any(|p| p.path == dir));
+        self.harness_model_refs_for_workspace(harness, cwd, projectless)
+    }
+
+    fn harness_model_refs_for_workspace(
+        &self,
+        harness: &str,
+        cwd: Option<&std::path::Path>,
+        projectless: bool,
+    ) -> ModelRefs<'_> {
+        self.harness_model_refs_in_scope(harness, WorkspaceScope::Thread { cwd, projectless })
+    }
+
+    fn harness_model_refs_in_scope(
+        &self,
+        harness: &str,
+        scope: WorkspaceScope<'_>,
+    ) -> ModelRefs<'_> {
         let provider = if harness == "pi" { "cpa" } else { harness };
-        let projected = self
+        let projected_opt = self
             .projected_native_catalogs
             .get(harness)
-            .map_or(&[][..], |c| c.models.as_slice());
+            .and_then(|c| match scope {
+                WorkspaceScope::Any => (!c.models.is_empty()).then_some(c.models.as_slice()),
+                WorkspaceScope::Thread { cwd, .. } => c.models_for_workspace(cwd),
+            });
+        let projected = projected_opt.unwrap_or(&[]);
         let acp = self.acp_catalogs.get(harness);
         let projected_acp = self.client_views["nativeCatalogs"][harness]["name"].is_string();
-        let acp_models = if projected_acp {
-            projected
-        } else {
-            acp.map_or(&[][..], |catalog| catalog.models.as_slice())
-        };
-        if !acp_models.is_empty() {
-            // An advertised catalog replaces earlier results. Don't merge stale rows from
-            // other threads back into the provider's picker tab.
-            return ModelRefs::Slice(acp_models);
+        if projected_acp {
+            if let Some(models) = projected_opt {
+                return ModelRefs::Slice(models);
+            }
+        } else if let Some(catalog) = acp {
+            let acp_models = match scope {
+                WorkspaceScope::Any => {
+                    (!catalog.models.is_empty()).then_some(catalog.models.as_slice())
+                }
+                WorkspaceScope::Thread { cwd, .. } => catalog.models_for_workspace(cwd),
+            };
+            if let Some(models) = acp_models {
+                // An advertised catalog replaces earlier results. Don't merge stale rows from
+                // other threads back into the provider's picker tab.
+                return ModelRefs::Slice(models);
+            }
         }
         if harness == "cursor" && acp.is_none() && !projected_acp {
-            let models = if self.client.is_some() {
-                projected
+            if self.client.is_some() {
+                if let Some(models) = projected_opt {
+                    return ModelRefs::Slice(models);
+                }
             } else {
-                &self.cursor_catalog.models
-            };
-            if !models.is_empty() {
-                return ModelRefs::Slice(models);
+                let cursor_models = match scope {
+                    WorkspaceScope::Any => (!self.cursor_catalog.models.is_empty())
+                        .then_some(self.cursor_catalog.models.as_slice()),
+                    WorkspaceScope::Thread { cwd, .. } => {
+                        self.cursor_catalog.models_for_workspace(cwd)
+                    }
+                };
+                if let Some(models) = cursor_models {
+                    return ModelRefs::Slice(models);
+                }
+            }
+        }
+        fn catalog_slice<'a>(
+            cat: &'a crate::session::NativeCatalog,
+            scope: WorkspaceScope<'_>,
+        ) -> &'a [AgentModel] {
+            match scope {
+                WorkspaceScope::Any => cat.models.as_slice(),
+                WorkspaceScope::Thread { cwd, .. } => cat.models_for_workspace(cwd).unwrap_or(&[]),
             }
         }
         let catalog = match harness {
             "pi" => self.catalog.models.as_slice(),
-            "codex" => self.codex_catalog.models.as_slice(),
-            "claude" => self.claude_catalog.models.as_slice(),
+            "codex" => catalog_slice(&self.codex_catalog, scope),
+            "claude" => catalog_slice(&self.claude_catalog, scope),
             "antigravity" if acp.is_none() && !projected_acp => {
-                self.antigravity_catalog.models.as_slice()
+                catalog_slice(&self.antigravity_catalog, scope)
             }
-            "cursor" if acp.is_none() && !projected_acp => self.cursor_catalog.models.as_slice(),
+            "cursor" if acp.is_none() && !projected_acp => {
+                catalog_slice(&self.cursor_catalog, scope)
+            }
             _ => &[],
         };
         let default = self
@@ -591,10 +823,45 @@ impl State {
             .default_model
             .as_ref()
             .filter(|default| harness == "pi" && !catalog.iter().any(|m| m.id == default.id));
+        // Another thread's cached rows count only for the workspace that produced
+        // them, and an unknown workspace borrows none. On the local machine only,
+        // projectless Codex and Claude chats share cached rows across their own
+        // scratch folders because those folders hold no provider config. A linked
+        // machine or any registered project stays isolated to its exact folder.
+        // Pi's CPA catalog is machine-wide and has no owner folder.
+        let scratch_shared = self.machines.selected == "local"
+            && matches!(harness, "codex" | "claude")
+            && acp.is_none()
+            && !projected_acp;
+        let same_workspace = |index: usize| match scope {
+            WorkspaceScope::Any => true,
+            WorkspaceScope::Thread { cwd: None, .. } => false,
+            WorkspaceScope::Thread {
+                cwd: Some(dir),
+                projectless,
+            } => self.catalog_workspace_cwd(index).is_some_and(|cached| {
+                cached == dir
+                    || (scratch_shared
+                        && projectless
+                        && self.threads[index].project.is_none()
+                        && self.threads[index].machine == "local"
+                        && !self.projects.entries.iter().any(|p| p.path == dir)
+                        && !self.projects.entries.iter().any(|p| p.path == cached)
+                        && self.scratch_chat_dir(&cached)
+                        && self.scratch_chat_dir(dir))
+            }),
+        };
         let mut thread_models = self
             .threads
             .iter()
-            .filter(|t| t.harness == harness && !t.models.is_empty())
+            .enumerate()
+            .filter(|(idx, t)| {
+                t.harness == harness
+                    && !t.models.is_empty()
+                    && !(t.client_draft && self.projected_native_catalogs.contains_key(harness))
+                    && (harness == "pi" || same_workspace(*idx))
+            })
+            .map(|(_, t)| t)
             .peekable();
         if (projected.is_empty() || catalog.is_empty())
             && default.is_none()
@@ -629,29 +896,68 @@ impl State {
         self.harness_model_refs(harness).iter().cloned().collect()
     }
 
-    pub(super) fn default_harness_model(&self, harness: &str) -> Option<&AgentModel> {
-        let refs = self.harness_model_refs(harness);
+    pub(super) fn harness_models_for_cwd(
+        &self,
+        harness: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> Vec<AgentModel> {
+        self.harness_model_refs_for_cwd(harness, cwd)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn harness_models_for_thread(&self, index: usize, harness: &str) -> Vec<AgentModel> {
+        let cwd = self.catalog_workspace_cwd(index);
+        let projectless = self.threads.get(index).is_some_and(|t| t.project.is_none());
+        self.harness_model_refs_for_workspace(harness, cwd.as_deref(), projectless)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn default_harness_model(
+        &self,
+        harness: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<&AgentModel> {
+        let refs = self.harness_model_refs_for_cwd(harness, cwd);
         refs.iter()
             .find(|model| model.is_default)
             .or_else(|| refs.iter().next())
     }
 
-    pub(super) fn harness_model(&self, harness: &str, model_id: &str) -> Option<&AgentModel> {
-        self.harness_model_refs(harness)
+    pub(super) fn harness_model(
+        &self,
+        harness: &str,
+        model_id: &str,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<&AgentModel> {
+        self.harness_model_refs_for_cwd(harness, cwd)
             .iter()
             .find(|model| model.id == model_id)
     }
 
-    pub(super) fn add_harness_capabilities(&self, capabilities: &mut Value) {
+    pub(super) fn add_harness_capabilities(
+        &self,
+        caller_index: Option<usize>,
+        capabilities: &mut Value,
+    ) {
         let harnesses = self
             .harness_ids()
             .iter()
-            .map(|harness| self.harness_capability(harness))
+            .map(|harness| self.harness_capability(harness, caller_index))
             .collect::<Vec<_>>();
         capabilities["harnesses"] = json!(harnesses);
-        let codex_models = self.harness_models("codex");
-        let claude_models = self.harness_models("claude");
-        let cursor_models = self.harness_models("cursor");
+        let scoped = |harness: &str| match caller_index {
+            Some(index) => self
+                .workspace_models(index, harness)
+                .unwrap_or_else(|| self.harness_models_for_thread(index, harness)),
+            None => self.harness_models(harness),
+        };
+        let codex_models = scoped("codex");
+        let claude_models = scoped("claude");
+        let cursor_models = scoped("cursor");
         let values = capabilities["models"].as_array_mut().expect("models array");
         for model in codex_models
             .into_iter()
@@ -1102,6 +1408,22 @@ impl State {
 
     fn composer_model_refs(&self, instance: &str) -> ModelRefs<'_> {
         let t = self.current();
+        let cwd = self.catalog_workspace_cwd(self.active);
+        if (instance != t.harness || t.pi.is_none() || instance == "cursor")
+            && let Some(dir) = cwd.as_deref()
+            && let Some(models) = if self.client.is_some() {
+                self.projected_native_catalogs
+                    .get(instance)
+                    .and_then(|catalog| catalog.workspace_snapshots.get(dir))
+                    .map(Vec::as_slice)
+            } else {
+                self.native_catalog(instance)
+                    .and_then(|catalog| catalog.workspace_snapshots.get(dir))
+                    .map(Vec::as_slice)
+            }
+        {
+            return ModelRefs::Slice(models);
+        }
         if instance == "cursor"
             && !self
                 .harnesses
@@ -1113,21 +1435,24 @@ impl State {
             let catalog = if self.client.is_some() {
                 self.projected_native_catalogs
                     .get(instance)
-                    .map(|catalog| catalog.models.as_slice())
+                    .and_then(|catalog| catalog.models_for_workspace(cwd.as_deref()))
             } else {
-                Some(self.cursor_catalog.models.as_slice())
+                self.cursor_catalog.models_for_workspace(cwd.as_deref())
             };
             if let Some(models) = catalog.filter(|models| !models.is_empty()) {
                 return ModelRefs::Slice(models);
             }
         }
+        let skip_draft_cached_models =
+            t.client_draft && self.projected_native_catalogs.contains_key(instance);
         if instance == t.harness
             && !t.models.is_empty()
+            && !skip_draft_cached_models
             && (t.pi.is_some() || !self.acp_catalogs.contains_key(instance))
         {
             ModelRefs::Slice(&t.models)
         } else {
-            self.harness_model_refs(instance)
+            self.harness_model_refs_for_workspace(instance, cwd.as_deref(), t.project.is_none())
         }
     }
 
@@ -1398,6 +1723,9 @@ impl State {
         } else {
             instance_id.to_owned()
         };
+        if instance_id == "cursor" {
+            self.sync_cursor_catalog_models(self.active);
+        }
         self.current_mut().set_model(provider, next.model.clone());
         for opt in &next.options {
             self.current_mut()
@@ -1698,11 +2026,32 @@ impl State {
     }
 
     pub(super) fn apply_sticky_composer_to_draft(&mut self, index: usize) {
-        let sticky = self.preferences.sticky_composer.clone();
+        let mut sticky = self.preferences.sticky_composer.clone();
         if sticky.sticky_active_provider.is_none()
             && sticky.sticky_model_selection_by_provider.is_empty()
         {
             return;
+        }
+        let cwd = self.catalog_workspace_cwd(index);
+        let projectless = self.threads[index].project.is_none();
+        sticky
+            .sticky_model_selection_by_provider
+            .retain(|instance_id, sel| {
+                let provider = if instance_id == "pi" {
+                    "cpa"
+                } else {
+                    instance_id.as_str()
+                };
+                self.harness_model_refs_for_workspace(instance_id, cwd.as_deref(), projectless)
+                    .iter()
+                    .any(|m| m.provider == provider && m.id == sel.model)
+            });
+        if let Some(active) = sticky.sticky_active_provider.as_deref()
+            && !sticky
+                .sticky_model_selection_by_provider
+                .contains_key(active)
+        {
+            sticky.sticky_active_provider = None;
         }
         crate::model_selection::apply_sticky_state(
             &mut self.threads[index].draft_model_state,
@@ -1718,7 +2067,7 @@ impl State {
             } else {
                 active.clone()
             };
-            let models = self.harness_models(active);
+            let models = self.harness_models_for_thread(index, active);
             if models
                 .iter()
                 .any(|m| m.provider == provider && m.id == sel.model)
@@ -1872,7 +2221,7 @@ mod tests {
             assert!(state.current().session.is_none());
             assert_eq!(state.current().models[0].thinking_levels, ["low", "high"]);
             let mut capabilities = json!({"models":[],"runtime":{}});
-            state.add_harness_capabilities(&mut capabilities);
+            state.add_harness_capabilities(None, &mut capabilities);
             assert!(
                 capabilities["models"]
                     .as_array()
@@ -2148,5 +2497,938 @@ mod tests {
                 .unwrap()
                 .contains("New fixture memory")
         );
+    }
+
+    #[test]
+    fn workspace_fallback_does_not_seed_another_folder_and_empty_snapshot_is_honored() {
+        let mut state = State::new(PathBuf::new(), false);
+        let project_a = crate::projects::Project::new(1, PathBuf::from("folder-a"));
+        let project_b = crate::projects::Project::new(2, PathBuf::from("folder-b"));
+        let dir_a = project_a.path.clone();
+        let dir_b = project_b.path.clone();
+        let id_a = project_a.id;
+        let id_b = project_b.id;
+        state.projects.entries.push(project_a);
+        state.projects.entries.push(project_b);
+        state.threads[0].project = Some(id_b);
+        state.threads[0].harness = "opencode".into();
+        let mut catalog = crate::session::NativeCatalog::default();
+        catalog.cwd = Some(dir_a.clone());
+        catalog.models_cwd = Some(dir_a.clone());
+        catalog.models = vec![AgentModel {
+            provider: "opencode".into(),
+            id: "model-a".into(),
+            name: "Model A".into(),
+            ..Default::default()
+        }];
+        catalog.revision = 1;
+        catalog.set_workspace_models(&dir_a, &catalog.models.clone());
+        state.acp_catalogs.insert("opencode".into(), catalog);
+
+        state.apply_native_catalogs();
+        assert!(
+            state.threads[0].models.is_empty(),
+            "another folder's fallback catalog must not seed a thread with no workspace snapshot"
+        );
+        // Switching discovery's active cwd to folder B before discovery replies keeps
+        // models_cwd on folder A and must still not leak folder A's models into folder B.
+        {
+            let catalog = state.acp_catalogs.get_mut("opencode").unwrap();
+            catalog.cwd = Some(dir_b.clone());
+            catalog.revision += 1;
+        }
+        state.apply_native_catalogs();
+        assert!(
+            state.threads[0].models.is_empty(),
+            "in-flight discovery for folder B must not leak folder A's cached models into folder B"
+        );
+        // Switching to folder A copies folder A's snapshot.
+        state.threads[0].project = Some(id_a);
+        state.threads[0].harness_state["catalogRevision"] = Value::Null;
+        state.apply_native_catalogs();
+        assert_eq!(state.threads[0].models.len(), 1);
+        assert_eq!(state.threads[0].models[0].id, "model-a");
+
+        // An explicitly empty snapshot for folder B clears thread.models and is honored by picker.
+        state.threads[0].project = Some(id_b);
+        state
+            .acp_catalogs
+            .get_mut("opencode")
+            .unwrap()
+            .set_workspace_models(&dir_b, &[]);
+        state.apply_native_catalogs();
+        assert!(state.threads[0].models.is_empty());
+        assert_eq!(state.composer_model_refs("opencode").iter().count(), 0);
+        assert_eq!(state.workspace_models(0, "opencode"), Some(vec![]));
+    }
+
+    #[test]
+    fn cursor_picker_and_set_model_validate_against_the_fresh_workspace_catalog_after_live_acp_models()
+     {
+        let mut state = State::new(PathBuf::new(), false);
+        let project = crate::projects::Project::new(1, PathBuf::from("cursor-workspace"));
+        let dir = project.path.clone();
+        let project_id = project.id;
+        state.projects.entries.push(project);
+        state.threads[0].project = Some(project_id);
+        state.threads[0].harness = "cursor".into();
+        let old_model = AgentModel {
+            provider: "cursor".into(),
+            id: "old-model".into(),
+            name: "Old Model".into(),
+            ..Default::default()
+        };
+        let new_model = AgentModel {
+            provider: "cursor".into(),
+            id: "new-model".into(),
+            name: "New Model".into(),
+            ..Default::default()
+        };
+        state
+            .provider_availability
+            .last
+            .get_or_insert_with(Default::default)
+            .cursor = true;
+        state.cursor_catalog.installed = true;
+        state.cursor_catalog.cwd = Some(dir.clone());
+        state.cursor_catalog.models = vec![old_model.clone(), new_model.clone()];
+        state
+            .cursor_catalog
+            .set_workspace_models(&dir, &[old_model.clone(), new_model.clone()]);
+        state.apply_native_catalogs();
+
+        // Live ACP session overwrites thread.models with the older session list.
+        let (pi, commands, _) = Pi::test_connection();
+        state.threads[0].pi = Some(pi);
+        state.threads[0].apply(json!({
+            "type": "response",
+            "command": "get_available_models",
+            "success": true,
+            "data": {"models": [{"id": "old-model", "name": "Old Model", "provider": "cursor"}]}
+        }));
+        assert_eq!(state.threads[0].models.len(), 1);
+        assert_eq!(state.threads[0].models[0].id, "old-model");
+
+        // Picker still exposes new-model and picking it marks fromCursorCatalog: true.
+        let picker = state.composer_model_refs("cursor");
+        assert!(picker.iter().any(|model| model.id == "new-model"));
+        state.select_model_from_picker("cursor", "new-model");
+        let cmd = commands.try_recv().expect("set_model sent");
+        assert_eq!(cmd["type"], "set_model");
+        assert_eq!(cmd["modelId"], "new-model");
+        assert_eq!(cmd["fromCursorCatalog"], true);
+    }
+
+    #[test]
+    fn cursor_startup_prunes_stale_saved_options_and_drops_rejected_options() {
+        let mut state = State::new(PathBuf::new(), false);
+        let thread = &mut state.threads[0];
+        thread.harness = "cursor".into();
+        let (pi, commands, _) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.state_loaded = true;
+        thread.history_loaded = true;
+        thread.startup_model_applied = true;
+        thread.startup_thinking_applied = true;
+        thread.model_id = "cursor-pro".into();
+        thread.models = vec![AgentModel {
+            provider: "cursor".into(),
+            id: "cursor-pro".into(),
+            name: "Cursor Pro".into(),
+            capabilities: crate::descriptors::ModelCapabilities {
+                option_descriptors: vec![crate::descriptors::ProviderOptionDescriptor::Select {
+                    id: "context".into(),
+                    label: "Context".into(),
+                    description: None,
+                    options: vec![crate::descriptors::ProviderOptionChoice {
+                        id: "200k".into(),
+                        label: "200K".into(),
+                        description: None,
+                        is_default: false,
+                    }],
+                    current_value: Some("200k".into()),
+                    prompt_injected_values: vec![],
+                    role: None,
+                }],
+            },
+            ..Default::default()
+        }];
+        // Stale unsupported option + valid advertised option.
+        thread.model_options = vec![
+            crate::model_selection::ProviderOptionSelection {
+                id: "contextWindow".into(),
+                value: crate::model_selection::OptionValue::Str("2m".into()),
+            },
+            crate::model_selection::ProviderOptionSelection {
+                id: "contextWindow".into(),
+                value: crate::model_selection::OptionValue::Str("200k".into()),
+            },
+        ];
+
+        thread.drive_session();
+        // Stale "2m" was pruned; only supported "200k" was sent.
+        let sent = commands.try_recv().expect("supported set_option sent");
+        assert_eq!(sent["type"], "set_option");
+        assert_eq!(sent["optionId"], "contextWindow");
+        assert_eq!(sent["value"], "200k");
+        assert_eq!(thread.model_options.len(), 1);
+
+        // If the CLI rejects the option during startup, it is also removed before failing.
+        thread.apply(json!({
+            "type": "response",
+            "command": "set_option",
+            "success": false,
+            "error": "Rejected tier"
+        }));
+        assert!(
+            thread.model_options.is_empty(),
+            "rejected startup option must not remain saved to poison retries"
+        );
+    }
+
+    #[test]
+    fn registered_cursor_live_thread_resolves_fresh_catalog_for_thread_configure() {
+        let mut state = State::new(PathBuf::new(), false);
+        let project = crate::projects::Project::new(1, PathBuf::from("cursor-acp-workspace"));
+        let dir = project.path.clone();
+        let project_id = project.id;
+        state.projects.entries.push(project);
+        state.threads[0].project = Some(project_id);
+        state.threads[0].harness = "cursor".into();
+        let old_model = AgentModel {
+            provider: "cursor".into(),
+            id: "old-model".into(),
+            name: "Old Model".into(),
+            ..Default::default()
+        };
+        let new_model = AgentModel {
+            provider: "cursor".into(),
+            id: "new-model".into(),
+            name: "New Model".into(),
+            ..Default::default()
+        };
+        // Start a live session with only old-model before fresh discovery lands.
+        let (pi, commands, _) = Pi::test_connection();
+        state.threads[0].pi = Some(pi);
+        state.threads[0].models = vec![old_model.clone()];
+
+        // Fresh discovery on registered ACP cursor adds new-model.
+        let mut catalog = crate::session::NativeCatalog::default();
+        catalog.installed = true;
+        catalog.cwd = Some(dir.clone());
+        catalog.models_cwd = Some(dir.clone());
+        catalog.models = vec![old_model.clone(), new_model.clone()];
+        catalog.set_workspace_models(&dir, &[old_model.clone(), new_model.clone()]);
+        state.acp_catalogs.insert("cursor".into(), catalog);
+
+        // Even without calling apply_native_catalogs or select_model_from_picker,
+        // the daemon's thread.configure path resolves host catalog membership.
+        let cmd = crate::protocol::Command {
+            command_id: uuid::Uuid::new_v4(),
+            method: "thread.configure".into(),
+            params: json!({"provider": "cursor", "model": "new-model"}),
+        };
+        state
+            .execute_command(&cmd)
+            .expect("thread.configure succeeds");
+        let sent = commands.try_recv().expect("set_model sent");
+        assert_eq!(sent["type"], "set_model");
+        assert_eq!(sent["modelId"], "new-model");
+        assert_eq!(sent["fromCursorCatalog"], true);
+
+        // And apply_native_catalogs keeps live thread.models intact while updating cursor_catalog_models.
+        state.threads[0].cursor_catalog_models = None;
+        state.apply_native_catalogs();
+        assert_eq!(state.threads[0].models.len(), 1);
+        assert_eq!(state.threads[0].models[0].id, "old-model");
+        assert!(
+            state.threads[0]
+                .cursor_catalog_models
+                .as_ref()
+                .is_some_and(|models| models.iter().any(|model| model.id == "new-model"))
+        );
+    }
+
+    #[test]
+    fn cursor_startup_prunes_saved_options_when_handshake_republishes_cached_rows_without_live_controls()
+     {
+        let mut state = State::new(PathBuf::new(), false);
+        let thread = &mut state.threads[0];
+        thread.harness = "cursor".into();
+        let (pi, commands, _) = Pi::test_connection();
+        thread.pi = Some(pi);
+        thread.initializing = true;
+        thread.state_loaded = true;
+        thread.history_loaded = true;
+        thread.startup_model_applied = true;
+        thread.startup_thinking_applied = true;
+        thread.model_id = "cursor-pro".into();
+        thread.model_options = vec![crate::model_selection::ProviderOptionSelection {
+            id: "contextWindow".into(),
+            value: crate::model_selection::OptionValue::Str("1m".into()),
+        }];
+
+        // Handshake republishes cached row with stale cached optionDescriptors,
+        // but reports empty liveOptionDescriptors (and advertised: false).
+        thread.apply(json!({
+            "type": "response",
+            "command": "get_available_models",
+            "success": true,
+            "data": {
+                "advertised": false,
+                "liveOptionDescriptors": [],
+                "models": [{
+                    "id": "cursor-pro",
+                    "name": "Cursor Pro",
+                    "provider": "cursor",
+                    "capabilities": {
+                        "optionDescriptors": [{
+                            "kind": "select",
+                            "id": "context",
+                            "label": "Context",
+                            "options": [{"id": "1m", "label": "1M", "isDefault": true}],
+                            "currentValue": "1m"
+                        }]
+                    }
+                }]
+            }
+        }));
+
+        thread.drive_session();
+        let sent: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+        assert!(
+            !sent.iter().any(|cmd| cmd["type"] == "set_option"),
+            "stale cached descriptors must not trigger a failing set_option during startup: {sent:?}"
+        );
+        assert!(thread.model_options.is_empty());
+        assert!(!thread.initializing);
+    }
+
+    #[test]
+    fn pending_workspace_scan_does_not_leak_previous_folder_into_picker_or_draft_seeding() {
+        let mut state = State::new(PathBuf::new(), false);
+        let project_a = crate::projects::Project::new(1, PathBuf::from("workspace-a"));
+        let project_b = crate::projects::Project::new(2, PathBuf::from("workspace-b"));
+        let dir_a = project_a.path.clone();
+        let dir_b = project_b.path.clone();
+        let id_a = project_a.id;
+        let id_b = project_b.id;
+        state.projects.entries.push(project_a);
+        state.projects.entries.push(project_b);
+        state
+            .provider_availability
+            .last
+            .get_or_insert_with(Default::default)
+            .cursor = true;
+
+        let cursor_model_a = AgentModel {
+            provider: "cursor".into(),
+            id: "cursor-model-a".into(),
+            name: "Cursor Model A".into(),
+            ..Default::default()
+        };
+        state.cursor_catalog.installed = true;
+        state.cursor_catalog.cwd = Some(dir_b.clone());
+        state.cursor_catalog.models_cwd = Some(dir_a.clone());
+        state.cursor_catalog.models = vec![cursor_model_a.clone()];
+        state
+            .cursor_catalog
+            .set_workspace_models(&dir_a, std::slice::from_ref(&cursor_model_a));
+
+        let acp_model_a = AgentModel {
+            provider: "opencode".into(),
+            id: "opencode-model-a".into(),
+            name: "OpenCode Model A".into(),
+            ..Default::default()
+        };
+        let mut acp_catalog = crate::session::NativeCatalog::default();
+        acp_catalog.installed = true;
+        acp_catalog.cwd = Some(dir_b.clone());
+        acp_catalog.models_cwd = Some(dir_a.clone());
+        acp_catalog.models = vec![acp_model_a.clone()];
+        acp_catalog.set_workspace_models(&dir_a, std::slice::from_ref(&acp_model_a));
+        state.acp_catalogs.insert("opencode".into(), acp_catalog);
+
+        // Thread 0 lives in folder A and holds folder A's discovered models.
+        state.threads[0].project = Some(id_a);
+        state.threads[0].harness = "cursor".into();
+        state.threads[0].models = vec![cursor_model_a.clone()];
+
+        // Thread 1 lives in folder B while folder B's discovery is still pending.
+        let mut thread_b = Thread::new(2);
+        thread_b.project = Some(id_b);
+        thread_b.harness = "cursor".into();
+        state.threads.push(thread_b);
+        state.active = 1;
+
+        assert_eq!(
+            state.composer_model_refs("cursor").iter().count(),
+            0,
+            "picker fallback must not expose folder A's built-in Cursor models in folder B"
+        );
+        assert_eq!(
+            state.composer_model_refs("opencode").iter().count(),
+            0,
+            "picker fallback must not expose folder A's ACP models in folder B"
+        );
+
+        // Draft seeding via inherit_composer must not copy folder A's models into folder B.
+        let seed = json!({
+            "harness": "cursor",
+            "model": ["cursor", "cursor-model-a"],
+            "access": "supervised"
+        });
+        state.inherit_composer(1, &seed);
+        assert!(
+            state.threads[1].models.is_empty(),
+            "inherit_composer must not seed folder B's draft with folder A's Cursor models"
+        );
+
+        // Sticky composer selection from folder A must not leak into folder B's draft_model_state
+        // or resolve as folder B's effective composer model while B's scan is pending.
+        state.preferences.sticky_composer.sticky_active_provider = Some("cursor".into());
+        state
+            .preferences
+            .sticky_composer
+            .sticky_model_selection_by_provider
+            .insert(
+                "cursor".into(),
+                crate::model_selection::ModelSelection {
+                    instance_id: "cursor".into(),
+                    model: "cursor-model-a".into(),
+                    options: vec![],
+                },
+            );
+        state.threads[1].harness = "cursor".into();
+        state.threads[1].selected_model = None;
+        state.threads[1].model_id.clear();
+        state.threads[1].draft_model_state = Default::default();
+        state.apply_sticky_composer_to_draft(1);
+        assert!(
+            !state.threads[1]
+                .draft_model_state
+                .model_selection_by_provider
+                .contains_key("cursor"),
+            "sticky selection from folder A must not be copied into folder B's draft_model_state"
+        );
+        assert_ne!(
+            state.resolved_composer_model_selection().1,
+            "cursor-model-a",
+            "effective composer model in folder B must not resolve folder A's sticky model"
+        );
+    }
+
+    #[test]
+    fn client_mode_projected_catalogs_isolate_workspaces_while_discovery_is_pending() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        let project_a = crate::projects::Project::new(1, PathBuf::from("remote-a"));
+        let project_b = crate::projects::Project::new(2, PathBuf::from("remote-b"));
+        let dir_a = project_a.path.clone();
+        let dir_b = project_b.path.clone();
+        let id_a = project_a.id;
+        let id_b = project_b.id;
+        state.projects.entries.push(project_a);
+        state.projects.entries.push(project_b);
+
+        let cursor_model_a = AgentModel {
+            provider: "cursor".into(),
+            id: "cursor-remote-a".into(),
+            name: "Cursor Remote A".into(),
+            ..Default::default()
+        };
+        let mut cursor_server = crate::session::NativeCatalog::default();
+        cursor_server.installed = true;
+        cursor_server.cwd = Some(dir_b.clone());
+        cursor_server.models_cwd = Some(dir_a.clone());
+        cursor_server.models = vec![cursor_model_a.clone()];
+        cursor_server.set_workspace_models(&dir_a, std::slice::from_ref(&cursor_model_a));
+
+        let acp_model_a = AgentModel {
+            provider: "opencode".into(),
+            id: "opencode-remote-a".into(),
+            name: "OpenCode Remote A".into(),
+            ..Default::default()
+        };
+        let mut acp_server = crate::session::NativeCatalog::from_acp_fixture(
+            crate::harness::Agent {
+                id: "opencode".into(),
+                name: "OpenCode".into(),
+                command: "opencode".into(),
+                args: vec![],
+                env: Default::default(),
+            },
+            vec![acp_model_a.clone()],
+        );
+        acp_server.cwd = Some(dir_b.clone());
+        acp_server.models_cwd = Some(dir_a.clone());
+        acp_server.set_workspace_models(&dir_a, std::slice::from_ref(&acp_model_a));
+
+        let projected = json!({
+            "harnessIds": ["pi", "codex", "claude", "cursor", "opencode"],
+            "nativeCatalogs": {
+                "cursor": cursor_server.snapshot(),
+                "opencode": acp_server.snapshot(),
+            }
+        });
+        state.update_projected_native_models(&projected);
+        state.client_views = projected;
+        state.provider_availability.last = Some(crate::harness::Availability {
+            claude: true,
+            antigravity: false,
+            cursor: true,
+        });
+
+        // Client draft in folder B must not inherit folder A's projected models while B is scanning.
+        state.threads[0].project = Some(id_b);
+        state.threads[0].harness = "cursor".into();
+        state.threads[0].client_draft = true;
+        state.apply_native_catalogs();
+        assert!(state.threads[0].models.is_empty());
+        assert_eq!(state.composer_model_refs("cursor").iter().count(), 0);
+        assert_eq!(state.composer_model_refs("opencode").iter().count(), 0);
+
+        // Switching to folder A exposes folder A's projected workspace models.
+        state.choose_draft_project(Some(id_a));
+        assert_eq!(state.threads[0].models.len(), 1);
+        assert_eq!(state.threads[0].models[0].id, "cursor-remote-a");
+        assert!(
+            state
+                .composer_model_refs("opencode")
+                .iter()
+                .any(|model| model.id == "opencode-remote-a")
+        );
+
+        // Switching the client draft back from folder A to folder B clears cached models so
+        // folder A's models never leak into folder B via the picker or cached thread state.
+        state.choose_draft_project(Some(id_b));
+        assert!(state.threads[0].models.is_empty());
+        assert!(state.threads[0].cursor_catalog_models.is_none());
+        assert_eq!(state.composer_model_refs("cursor").iter().count(), 0);
+        assert_eq!(state.composer_model_refs("opencode").iter().count(), 0);
+
+        // Even if a draft still held stale models from folder A before a projection refresh,
+        // apply_native_catalogs clears them on a catalog miss for folder B.
+        state.threads[0].models = vec![cursor_model_a.clone()];
+        state.threads[0].cursor_catalog_models = Some(vec![cursor_model_a.clone()]);
+        assert_eq!(state.composer_model_refs("cursor").iter().count(), 0);
+        state.apply_native_catalogs();
+        assert!(state.threads[0].models.is_empty());
+        assert!(state.threads[0].cursor_catalog_models.is_none());
+
+        // Linked-machine device-only drafts have no server-reported directory in client_views.
+        state.machines.selected = "remote".into();
+        assert!(state.thread_directory(0).is_err());
+
+        let seed = json!({
+            "harness": "cursor",
+            "model": ["cursor", "cursor-remote-a"],
+            "access": "supervised"
+        });
+
+        // Linked-machine draft in folder B must not inherit folder A's Cursor model.
+        state.threads[0].project = Some(id_b);
+        state.inherit_composer(0, &seed);
+        assert!(state.threads[0].models.is_empty());
+        assert_ne!(state.threads[0].model_id, "cursor-remote-a");
+        assert_eq!(state.composer_model_refs("cursor").iter().count(), 0);
+        assert_eq!(state.composer_model_refs("opencode").iter().count(), 0);
+
+        // Linked-machine projectless draft (unknown workspace -> None) must not treat None as
+        // unscoped and inherit folder A's models.
+        state.choose_draft_project(None);
+        state.inherit_composer(0, &seed);
+        assert!(state.threads[0].models.is_empty());
+        assert_ne!(state.threads[0].model_id, "cursor-remote-a");
+        assert_eq!(state.composer_model_refs("cursor").iter().count(), 0);
+        assert_eq!(state.composer_model_refs("opencode").iter().count(), 0);
+
+        // Switching the linked-machine draft to folder A exposes folder A's models, and
+        // switching back to folder B clears them again.
+        state.threads[0].harness = "cursor".into();
+        state.choose_draft_project(Some(id_a));
+        assert_eq!(state.threads[0].models.len(), 1);
+        assert_eq!(state.threads[0].models[0].id, "cursor-remote-a");
+        state.choose_draft_project(Some(id_b));
+        assert!(state.threads[0].models.is_empty());
+        assert_eq!(state.composer_model_refs("cursor").iter().count(), 0);
+    }
+
+    fn leveled_model(harness: &str, id: &str, levels: &[&str]) -> AgentModel {
+        AgentModel {
+            provider: harness.into(),
+            id: id.into(),
+            name: id.into(),
+            thinking_levels: levels.iter().map(|level| (*level).into()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_linked_draft_with_an_unknown_directory_borrows_no_scratch_thread_models() {
+        for harness in ["codex", "claude"] {
+            let mut state = State::new(PathBuf::new(), false);
+            state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+            state.machines.selected = "remote".into();
+            let scratch = PathBuf::from("/srv/shina/chats/7");
+            let other_scratch = PathBuf::from("/srv/shina/chats/9");
+            let model = leveled_model(harness, "scratch-only", &["low", "high"]);
+
+            // The server discovered this model for one scratch chat's folder.
+            let mut server = crate::session::NativeCatalog::default();
+            server.installed = true;
+            server.cwd = Some(scratch.clone());
+            server.models_cwd = Some(scratch.clone());
+            server.models = vec![model.clone()];
+            server.set_workspace_models(&scratch, std::slice::from_ref(&model));
+            let mut projected = json!({
+                "harnessIds": ["pi", "codex", "claude"],
+                "directories": {"7": scratch, "9": other_scratch},
+                "nativeCatalogs": {},
+            });
+            projected["nativeCatalogs"][harness] = server.snapshot();
+            state.update_projected_native_models(&projected);
+            state.client_views = projected;
+
+            // Thread 0 is the device's projectless draft. The server has not
+            // reported a directory for it.
+            state.threads[0].client_draft = true;
+            state.threads[0].harness = harness.into();
+            // Threads 7 and 9 are projected scratch chats with cached rows.
+            for id in [7, 9] {
+                let mut cached = Thread::new(id);
+                cached.harness = harness.into();
+                cached.models = vec![model.clone()];
+                state.threads.push(cached);
+            }
+            state.active = 0;
+            assert!(state.thread_directory(0).is_err());
+            assert!(state.catalog_workspace_cwd(0).is_none());
+
+            assert!(
+                state.harness_models_for_cwd(harness, None).is_empty(),
+                "{harness}: an unknown workspace must not borrow another scratch folder's rows"
+            );
+            assert_eq!(state.composer_model_refs(harness).iter().count(), 0);
+
+            state.inherit_composer(
+                0,
+                &json!({"harness": harness, "model": [harness, "scratch-only"],
+                    "thinking": "high", "access": "supervised"}),
+            );
+            assert!(state.threads[0].models.is_empty());
+            assert!(state.threads[0].thinking_levels.is_empty());
+            assert_ne!(state.threads[0].model_id, "scratch-only");
+
+            state.threads[0].harness = harness.into();
+            state.preferences.sticky_composer.sticky_active_provider = Some(harness.into());
+            state
+                .preferences
+                .sticky_composer
+                .sticky_model_selection_by_provider
+                .insert(
+                    harness.into(),
+                    crate::model_selection::ModelSelection {
+                        instance_id: harness.into(),
+                        model: "scratch-only".into(),
+                        options: vec![],
+                    },
+                );
+            state.apply_sticky_composer_to_draft(0);
+            assert!(
+                !state.threads[0]
+                    .draft_model_state
+                    .model_selection_by_provider
+                    .contains_key(harness)
+            );
+            assert_ne!(state.threads[0].model_id, "scratch-only");
+            state.apply_native_catalogs();
+            assert!(state.threads[0].models.is_empty());
+            assert!(state.threads[0].thinking_levels.is_empty());
+
+            // The folder that produced the rows still gets them. A linked machine's
+            // other folders are separate workspaces, scratch or not.
+            assert_eq!(
+                state.harness_models_for_cwd(harness, Some(&scratch)),
+                [model.clone()]
+            );
+            state.projected_native_catalogs.clear();
+            assert_eq!(
+                state.harness_models_for_cwd(harness, Some(&scratch)),
+                [model.clone()]
+            );
+            assert_eq!(
+                state.harness_models_for_cwd(harness, Some(&other_scratch)),
+                [model.clone()],
+                "{harness}: folder 9 reads the rows its own thread cached"
+            );
+            state.threads[2].models.clear();
+            assert!(
+                state
+                    .harness_models_for_cwd(harness, Some(&other_scratch))
+                    .is_empty(),
+                "{harness}: folder 7's cached rows must not answer for folder 9"
+            );
+        }
+    }
+
+    #[test]
+    fn local_scratch_chats_share_cached_models_and_projects_do_not() {
+        for harness in ["codex", "claude"] {
+            let mut state = State::new(PathBuf::new(), false);
+            let project = crate::projects::Project::new(1, PathBuf::from("a-project"));
+            let project_id = project.id;
+            state.projects.entries.push(project);
+            let model = leveled_model(harness, "cached", &["high"]);
+            state.threads[0].harness = harness.into();
+            state.threads[0].models = vec![model.clone()];
+            state.threads.push(Thread::new(50));
+            let mut in_project = Thread::new(51);
+            in_project.project = Some(project_id);
+            state.threads.push(in_project);
+
+            let sibling = state.catalog_workspace_cwd(1);
+            assert_ne!(sibling, state.catalog_workspace_cwd(0));
+            assert_eq!(
+                state.harness_models_for_cwd(harness, sibling.as_deref()),
+                [model.clone()],
+                "{harness}: a chat's scratch folder holds no provider config of its own"
+            );
+            let project_dir = state.catalog_workspace_cwd(2);
+            assert!(
+                state
+                    .harness_models_for_cwd(harness, project_dir.as_deref())
+                    .is_empty(),
+                "{harness}: a scratch chat's rows must not seed a project"
+            );
+            assert!(state.harness_models_for_cwd(harness, None).is_empty());
+
+            // The reverse holds too: a project's rows do not reach a scratch chat.
+            state.threads[0].project = Some(project_id);
+            assert!(
+                state
+                    .harness_models_for_cwd(harness, sibling.as_deref())
+                    .is_empty()
+            );
+            assert_eq!(
+                state.harness_models_for_cwd(harness, project_dir.as_deref()),
+                [model.clone()]
+            );
+
+            // A linked machine with the same `<data_dir>/chats` profile path never
+            // shares sibling scratch folders, nor does a project registered under `chats/`.
+            state.threads[0].project = None;
+            state.machines.selected = "remote".into();
+            assert!(
+                state
+                    .harness_models_for_cwd(harness, sibling.as_deref())
+                    .is_empty(),
+                "{harness}: linked machine must not share sibling scratch folders"
+            );
+            state.machines.selected = "local".into();
+            let chat_project = crate::projects::Project::new(2, sibling.clone().unwrap());
+            let chat_project_id = chat_project.id;
+            state.projects.entries.push(chat_project);
+            state.threads[1].project = Some(chat_project_id);
+            assert!(
+                state.harness_models_for_thread(1, harness).is_empty(),
+                "{harness}: project registered under chats/ must not borrow a scratch chat"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_a_draft_project_drops_the_old_folders_reasoning_levels_and_commands() {
+        let mut state = State::new(PathBuf::new(), false);
+        state.client = Some(crate::client::Client::new(state.data_dir.clone()));
+        let project_a = crate::projects::Project::new(1, PathBuf::from("levels-a"));
+        let project_b = crate::projects::Project::new(2, PathBuf::from("levels-b"));
+        let dir_a = project_a.path.clone();
+        let id_a = project_a.id;
+        let id_b = project_b.id;
+        state.projects.entries.push(project_a);
+        state.projects.entries.push(project_b);
+
+        let model_a = leveled_model("codex", "model-a", &["low", "high", "xhigh"]);
+        let mut server = crate::session::NativeCatalog::default();
+        server.installed = true;
+        server.cwd = Some(dir_a.clone());
+        server.models_cwd = Some(dir_a.clone());
+        server.models = vec![model_a.clone()];
+        server.set_workspace_models(&dir_a, std::slice::from_ref(&model_a));
+        let projected = json!({
+            "harnessIds": ["pi", "codex", "claude"],
+            "nativeCatalogs": {"codex": server.snapshot()},
+        });
+        state.update_projected_native_models(&projected);
+        state.client_views = projected;
+
+        let draft = &mut state.threads[0];
+        draft.client_draft = true;
+        draft.harness = "codex".into();
+        draft.project = Some(id_a);
+        draft.model_provider = "codex".into();
+        draft.model_id = "model-a".into();
+        state.apply_native_catalogs();
+        assert_eq!(state.threads[0].models, [model_a.clone()]);
+        assert_eq!(state.threads[0].thinking_levels, ["low", "high", "xhigh"]);
+        state.threads[0]
+            .native
+            .commands
+            .push(pi_session::SlashCommand {
+                name: "folder-a-command".into(),
+                description: String::new(),
+                source: "codex".into(),
+            });
+        state.threads[0].native.commands_loaded = true;
+
+        // Folder B has no catalog yet. Nothing folder A reported stays visible.
+        state.choose_draft_project(Some(id_b));
+        let draft = &state.threads[0];
+        assert!(draft.models.is_empty());
+        assert!(
+            draft.thinking_levels.is_empty(),
+            "the reasoning menu must not offer folder A's levels while folder B scans"
+        );
+        assert!(draft.native.commands.is_empty() && !draft.native.commands_loaded);
+        let descriptors = state.active_model_descriptors();
+        assert!(
+            crate::descriptors::split_column_and_footer_controls(&descriptors)
+                .effort
+                .is_none()
+        );
+
+        // Stale rows that reach a catalog miss are cleared with their levels.
+        state.threads[0].models = vec![model_a.clone()];
+        state.threads[0].thinking_levels = vec!["low".into(), "high".into(), "xhigh".into()];
+        state.apply_native_catalogs();
+        assert!(state.threads[0].models.is_empty());
+        assert!(state.threads[0].thinking_levels.is_empty());
+
+        // A thread already running in folder B is that folder's own evidence, so
+        // its levels for the selected model show while the catalog is pending.
+        let mut sibling = Thread::new(40);
+        sibling.harness = "codex".into();
+        sibling.project = Some(id_b);
+        sibling.models = vec![leveled_model("codex", "model-b", &["medium"])];
+        state.threads.push(sibling);
+        state.threads[0].model_id = "model-b".into();
+        state.apply_native_catalogs();
+        assert!(state.threads[0].models.is_empty());
+        assert_eq!(state.threads[0].thinking_levels, ["medium"]);
+
+        // Back in folder A the selected model has no row, so folder B's levels go.
+        state.choose_draft_project(Some(id_a));
+        assert_eq!(state.threads[0].models, [model_a.clone()]);
+        assert!(state.threads[0].thinking_levels.is_empty());
+
+        // A refresh that drops the selected model or sends an explicit empty
+        // snapshot clears stale reasoning levels on the draft.
+        state.threads[0].model_id = "model-a".into();
+        state.apply_native_catalogs();
+        assert_eq!(state.threads[0].thinking_levels, ["low", "high", "xhigh"]);
+        let other = leveled_model("codex", "other-model", &["low"]);
+        server.models = vec![other.clone()];
+        server.set_workspace_models(&dir_a, std::slice::from_ref(&other));
+        let dropped = json!({
+            "harnessIds": ["pi", "codex", "claude"],
+            "nativeCatalogs": {"codex": server.snapshot()},
+        });
+        state.update_projected_native_models(&dropped);
+        state.client_views = dropped;
+        state.apply_native_catalogs();
+        assert_eq!(state.threads[0].models, [other]);
+        assert!(
+            state.threads[0].thinking_levels.is_empty(),
+            "dropping the selected model on refresh must clear stale reasoning levels"
+        );
+
+        state.threads[0].model_id = "other-model".into();
+        state.apply_native_catalogs();
+        assert_eq!(state.threads[0].thinking_levels, ["low"]);
+        server.models.clear();
+        server.set_workspace_models(&dir_a, &[]);
+        let empty = json!({
+            "harnessIds": ["pi", "codex", "claude"],
+            "nativeCatalogs": {"codex": server.snapshot()},
+        });
+        state.update_projected_native_models(&empty);
+        state.client_views = empty;
+        state.apply_native_catalogs();
+        assert!(state.threads[0].models.is_empty());
+        assert!(
+            state.threads[0].thinking_levels.is_empty(),
+            "an explicit empty snapshot must clear stale reasoning levels"
+        );
+    }
+
+    #[test]
+    fn delegation_does_not_fall_back_to_models_from_other_projects() {
+        let mut state = State::new(PathBuf::new(), false);
+        let project_a = crate::projects::Project::new(1, PathBuf::from("delegate-a"));
+        let project_b = crate::projects::Project::new(2, PathBuf::from("delegate-b"));
+        let id_a = project_a.id;
+        let id_b = project_b.id;
+        let dir_b = project_b.path.clone();
+        state.projects.entries.push(project_a);
+        state.projects.entries.push(project_b);
+
+        let codex_b = leveled_model("codex", "proj-b-codex", &["high"]);
+        let claude_b = leveled_model("claude", "proj-b-claude", &["high"]);
+        state
+            .codex_catalog
+            .set_workspace_models(&dir_b, std::slice::from_ref(&codex_b));
+        state
+            .claude_catalog
+            .set_workspace_models(&dir_b, std::slice::from_ref(&claude_b));
+
+        // Thread 0 in project A has no snapshot; thread 1 in project B has cached rows.
+        state.threads[0].harness = "codex".into();
+        state.threads[0].project = Some(id_a);
+        let mut other_codex = Thread::new(10);
+        other_codex.harness = "codex".into();
+        other_codex.project = Some(id_b);
+        other_codex.models = vec![codex_b];
+        state.threads.push(other_codex);
+        let mut other_claude = Thread::new(11);
+        other_claude.harness = "claude".into();
+        other_claude.project = Some(id_b);
+        other_claude.models = vec![claude_b];
+        state.threads.push(other_claude);
+
+        assert!(
+            state.delegation_models(&state.threads[0]).0.is_empty(),
+            "same-harness delegation must not fall back to another project's models"
+        );
+        assert!(
+            state.harness_models_for_thread(0, "claude").is_empty(),
+            "cross-harness delegation must not borrow another project's models"
+        );
+        let capabilities = state.orchestrator_capabilities(0);
+        assert_eq!(
+            capabilities["ready"], false,
+            "orchestrator_capabilities must not report ready using another project's models"
+        );
+        assert!(
+            capabilities["models"]
+                .as_array()
+                .is_some_and(|models| models.is_empty()),
+            "orchestrator_capabilities must not advertise another project's models: {capabilities}"
+        );
+        for harness in ["codex", "claude"] {
+            let entry = capabilities["harnesses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == harness)
+                .unwrap();
+            assert!(
+                entry["models"]
+                    .as_array()
+                    .is_some_and(|models| models.is_empty()),
+                "{harness} harness capability must not advertise another project's models: {entry}"
+            );
+        }
     }
 }

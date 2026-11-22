@@ -752,7 +752,7 @@ impl State {
         let harnesses = self
             .harness_ids()
             .iter()
-            .map(|harness| self.harness_capability(harness))
+            .map(|harness| self.harness_capability(harness, Some(index)))
             .collect::<Vec<_>>();
         let peers = self
             .delegation_peers()
@@ -818,7 +818,7 @@ impl State {
 
     /// One local harness probe used by both the caller record and the
     /// capability table this account publishes to linked peers.
-    pub(super) fn harness_capability(&self, harness: &str) -> Value {
+    pub(super) fn harness_capability(&self, harness: &str, caller_index: Option<usize>) -> Value {
         let (name, provider, protocol) = match harness {
             "pi" => ("Pi".to_owned(), "cpa", "pi.rpc"),
             "codex" => ("Codex".to_owned(), "codex", "codex.app-server"),
@@ -906,8 +906,14 @@ impl State {
         };
         entry["executable"] = json!(ready);
         entry["reason"] = json!(reason);
+        let models = match caller_index {
+            Some(index) => self
+                .workspace_models(index, harness)
+                .unwrap_or_else(|| self.harness_models_for_thread(index, harness)),
+            None => self.harness_models(harness),
+        };
         entry["models"] = json!(
-            self.harness_models(harness)
+            models
                 .iter()
                 .map(|model| json!({"id": model.id, "reasoning_levels": model.thinking_levels}))
                 .collect::<Vec<_>>()

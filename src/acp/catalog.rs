@@ -16,7 +16,7 @@ pub(super) fn model_select(options: &[Value]) -> Option<&Value> {
     })
 }
 
-fn choices(option: &Value) -> impl Iterator<Item = &Value> {
+pub(super) fn choices(option: &Value) -> impl Iterator<Item = &Value> {
     option["options"]
         .as_array()
         .into_iter()
@@ -100,7 +100,7 @@ pub(super) fn model_rows(
     descriptors: &[ProviderOptionDescriptor],
     previous: &[Value],
     input: &[&str],
-) -> (Vec<Value>, Option<String>) {
+) -> (Vec<Value>, Option<String>, bool) {
     let explicit = model_select(options);
     let legacy_rows = legacy["availableModels"]
         .as_array()
@@ -136,6 +136,7 @@ pub(super) fn model_rows(
     }
     let use_previous = !previous.is_empty()
         && (models.is_empty() || (models.len() == 1 && explicit.is_none() && previous.len() > 1));
+    let advertised_live = !use_previous && !candidates.is_empty();
     let current = if use_previous {
         models = previous
             .iter()
@@ -160,7 +161,7 @@ pub(super) fn model_rows(
         for row in &mut rows {
             row["isDefault"] = json!(row["id"].as_str() == current);
         }
-        return (rows, current.map(str::to_owned));
+        return (rows, current.map(str::to_owned), false);
     }
 
     let model_specific: HashSet<_> = options
@@ -227,5 +228,5 @@ pub(super) fn model_rows(
             })
         })
         .collect();
-    (rows, current.map(str::to_owned))
+    (rows, current.map(str::to_owned), advertised_live)
 }

@@ -4970,7 +4970,7 @@ impl State {
                     "harness":harness,"provider":m.provider,"id":m.id,"name":m.name,"reasoning_levels":m.thinking_levels
                 })).collect::<Vec<_>>()
             ).collect::<Vec<_>>(),"runtime":{}});
-            self.add_harness_capabilities(&mut capabilities);
+            self.add_harness_capabilities(None, &mut capabilities);
             capabilities["projects"] = json!(
                 self.projects
                     .entries

@@ -509,7 +509,7 @@ pub fn start(
                     models,
                 );
             }
-            return crate::cursor::start(start, wake);
+            return crate::cursor::start(start, wake, models);
         }
         let agent = Registry::read().find(&start.id)?;
         crate::acp::start_with_catalog(agent, start, wake, models)

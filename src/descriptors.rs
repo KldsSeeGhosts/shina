@@ -390,6 +390,11 @@ fn get_reported_option_value(
     raw_selection_value(&rep.options, id).cloned()
 }
 
+/// Ported from `packages/shared/src/model.ts` (`DEFAULT_VARIANT_CHOICE_ID`): the
+/// variant choice that sends no variant, distinct from any variant name a provider
+/// defines.
+pub const DEFAULT_VARIANT_CHOICE_ID: &str = "t3:default";
+
 /// Ported from `packages/shared/src/model.ts` (`getProviderOptionCurrentValue`).
 pub fn get_provider_option_current_value(
     descriptor: &ProviderOptionDescriptor,
@@ -400,6 +405,16 @@ pub fn get_provider_option_current_value(
     let has_explicit = selection.is_some_and(|s| s.options.iter().any(|o| o.id == id));
     if let Some(reported) = get_reported_option_value(id, selection, reported_selection) {
         return Some(reported);
+    }
+    // Without an explicit variant none is sent, which is exactly the catalog's
+    // Default choice.
+    if let ProviderOptionDescriptor::Select { options, .. } = descriptor
+        && id == "variant"
+        && selection.is_some()
+        && !has_explicit
+        && options.iter().any(|o| o.id == DEFAULT_VARIANT_CHOICE_ID)
+    {
+        return Some(OptionValue::Str(DEFAULT_VARIANT_CHOICE_ID.into()));
     }
     if id == "variant" && selection.is_some() && !has_explicit {
         return None;
@@ -1389,6 +1404,74 @@ mod tests {
         assert_eq!(
             read_prompt_ultrathink("Please ultrathink about this"),
             PromptUltrathink::Body
+        );
+    }
+
+    #[test]
+    fn variant_select_reports_the_default_choice_without_an_explicit_pick() {
+        let choice = |id: &str| ProviderOptionChoice {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            is_default: false,
+        };
+        let descriptor = ProviderOptionDescriptor::Select {
+            id: "variant".into(),
+            label: "Reasoning".into(),
+            description: None,
+            options: vec![
+                choice(DEFAULT_VARIANT_CHOICE_ID),
+                choice("low"),
+                choice("high"),
+            ],
+            current_value: Some(DEFAULT_VARIANT_CHOICE_ID.into()),
+            prompt_injected_values: vec![],
+            role: None,
+        };
+        let selection = ModelSelection {
+            instance_id: "opencode".into(),
+            model: "custom-model".into(),
+            options: vec![],
+        };
+        // No explicit variant: the current value is the Default choice, not none.
+        assert_eq!(
+            get_provider_option_current_value(&descriptor, Some(&selection), None),
+            Some(OptionValue::Str(DEFAULT_VARIANT_CHOICE_ID.into()))
+        );
+        // As in KSG, the explicit pick resolves the descriptor first; the
+        // current-value helper reads that resolved descriptor for display.
+        let mut picked = selection.clone();
+        picked.options.push(ProviderOptionSelection {
+            id: "variant".into(),
+            value: OptionValue::Str("high".into()),
+        });
+        let resolved = get_provider_option_descriptors(
+            &ModelCapabilities {
+                option_descriptors: vec![descriptor.clone()],
+            },
+            &picked.options,
+        );
+        assert_eq!(
+            get_provider_option_current_value(&resolved[0], Some(&picked), None),
+            Some(OptionValue::Str("high".into()))
+        );
+        assert_eq!(
+            get_provider_option_current_value(&descriptor, Some(&selection), Some(&picked)),
+            Some(OptionValue::Str("high".into()))
+        );
+        // Without a Default choice in the catalog, no explicit pick still means none.
+        let no_default = ProviderOptionDescriptor::Select {
+            id: "variant".into(),
+            label: "Reasoning".into(),
+            description: None,
+            options: vec![choice("low"), choice("high")],
+            current_value: None,
+            prompt_injected_values: vec![],
+            role: None,
+        };
+        assert_eq!(
+            get_provider_option_current_value(&no_default, Some(&selection), None),
+            None
         );
     }
 

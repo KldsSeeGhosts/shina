@@ -12,7 +12,7 @@ use rune::{TextEdit, Tx, Waker};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -310,6 +310,22 @@ struct Selection {
     provider: String,
     model: String,
     reasoning: Option<String>,
+}
+
+/// KSG `advertisedModel`: a slug or an alias match accepts the requested id.
+fn advertised_delegation_model<'a>(
+    models: &'a [AgentModel],
+    provider: &str,
+    model_id: &str,
+) -> Option<&'a AgentModel> {
+    models.iter().find(|model| {
+        model.provider == provider
+            && (model.id == model_id
+                || model
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(model_id)))
+    })
 }
 
 impl Selection {
@@ -1199,6 +1215,12 @@ pub struct Thread {
     pub draft_model_state: crate::model_selection::DraftModelState,
     startup_model_applied: bool,
     startup_thinking_applied: bool,
+    startup_cursor_option: usize,
+    pending_cursor_option: Option<String>,
+    pub(crate) cursor_catalog_models: Option<Vec<AgentModel>>,
+    /// Live option descriptors reported by the current ACP session handshake,
+    /// kept separate from fallback cached model rows.
+    live_option_descriptors: Option<Vec<crate::descriptors::ProviderOptionDescriptor>>,
     startup_selection_check: Option<String>,
     startup_selection_verified: bool,
     context_startup_requested: bool,
@@ -1822,6 +1844,10 @@ impl Thread {
             draft_model_state: Default::default(),
             startup_model_applied: false,
             startup_thinking_applied: false,
+            startup_cursor_option: 0,
+            pending_cursor_option: None,
+            cursor_catalog_models: None,
+            live_option_descriptors: None,
             startup_selection_check: None,
             startup_selection_verified: false,
             context_startup_requested: false,
@@ -1897,6 +1923,9 @@ impl Thread {
         self.peer_input_history = None;
         self.startup_model_applied = false;
         self.startup_thinking_applied = false;
+        self.startup_cursor_option = 0;
+        self.pending_cursor_option = None;
+        self.live_option_descriptors = None;
         self.startup_selection_check = None;
         self.startup_selection_verified = false;
         self.context_startup_requested = false;
@@ -2027,10 +2056,6 @@ impl Thread {
 
     pub fn set_thinking(&mut self, level: String) {
         if self.forward("thread.configure", json!({"thinking":level})) {
-            return;
-        }
-        if !matches!(self.harness.as_str(), "pi" | "codex" | "claude") {
-            self.error = Some("ACP reasoning selection is not supported in Shina. Use the agent's own configuration.".into());
             return;
         }
         if !self.can_choose_thinking() {
@@ -2166,6 +2191,15 @@ impl Thread {
     }
 
     pub fn command(&mut self, kind: &str, mut data: Value) -> bool {
+        if kind == "set_model" && self.harness == "cursor" {
+            let models = self
+                .cursor_catalog_models
+                .as_deref()
+                .unwrap_or(self.models.as_slice());
+            data["fromCursorCatalog"] = json!(models.iter().any(|model| {
+                model.provider == "cursor" && model.id == data["modelId"] && !model.is_unavailable
+            }));
+        }
         if kind == "prompt" {
             self.prompt_suggestion = None;
             if data.get("runId").is_none()
@@ -3302,7 +3336,10 @@ impl Thread {
 
     /// Settings and history are transport details, never conversation states.
     fn drive_session(&mut self) {
-        if self.pi.is_none()
+        // Boot recovery only reads history. poll_tasks disconnects this session
+        // in the same tick, before the outbox can send any captured commands.
+        if self.recovering_task
+            || self.pi.is_none()
             || self.configuring
             || matches!(self.status, Status::Failed | Status::Paused)
             || self.offline_blocked
@@ -3332,6 +3369,40 @@ impl Thread {
                     self.pending_thinking = Some(level.clone());
                     self.configuring = self.command("set_thinking_level", json!({"level":level}));
                     if !self.configuring {
+                        self.fail_session(self.error.clone().unwrap());
+                    }
+                    return;
+                }
+            }
+            // Drafts can pick Cursor's context and other native tiers before an
+            // ACP session exists. Validate each saved option against the live
+            // session's descriptors after the model handshake, prune stale ones,
+            // and wait for each supported change to be accepted.
+            if self.harness == "cursor" {
+                let live_descriptors = self.live_option_descriptors.as_deref().or_else(|| {
+                    self.models
+                        .iter()
+                        .find(|model| model.id == self.model_id)
+                        .map(|model| model.capabilities.option_descriptors.as_slice())
+                });
+                while self.startup_cursor_option < self.model_options.len() {
+                    let option = self.model_options[self.startup_cursor_option].clone();
+                    if let Some(descriptors) = live_descriptors
+                        && !crate::cursor::option_supported_by_descriptors(
+                            descriptors,
+                            &option.id,
+                            &option.value,
+                        )
+                    {
+                        self.model_options.remove(self.startup_cursor_option);
+                        continue;
+                    }
+                    let data = json!({"optionId":option.id,"value":option.value});
+                    self.pending_cursor_option = Some(option.id);
+                    self.startup_cursor_option += 1;
+                    self.configuring = self.command("set_option", data);
+                    if !self.configuring {
+                        self.pending_cursor_option = None;
                         self.fail_session(self.error.clone().unwrap());
                     }
                     return;
@@ -3458,25 +3529,32 @@ impl Thread {
         }
     }
 
+    /// Reads the selected model's levels from `models`. A model with no row there
+    /// keeps the levels its session or server last reported.
     fn refresh_thinking_levels(&mut self) {
         if let Some(model) = self
             .models
             .iter()
             .find(|m| m.provider == self.model_provider && m.id == self.model_id)
         {
-            if let Some(reasoning) = model
-                .capabilities
-                .option_descriptors
-                .iter()
-                .find(|d| crate::descriptors::is_reasoning_control(d))
-            {
-                let choices = crate::descriptors::selectable_provider_option_choices(reasoning);
-                if !choices.is_empty() {
-                    self.thinking_levels = choices.into_iter().map(|c| c.id).collect();
-                    return;
-                }
-            }
-            self.thinking_levels = model.thinking_levels.clone();
+            self.thinking_levels = model.reasoning_levels();
+        }
+    }
+
+    /// A draft that moves to another folder or machine drops what the old
+    /// workspace's catalog told it: model rows, reasoning levels and commands.
+    /// The next catalog pass fills them in for the new workspace. Pi's CPA rows
+    /// belong to the machine, so they survive a folder change on it.
+    pub(crate) fn forget_workspace_catalog(&mut self, same_machine: bool) {
+        self.cursor_catalog_models = None;
+        self.native.commands.clear();
+        self.native.skills.clear();
+        self.native.commands_loaded = false;
+        self.thinking_levels.clear();
+        if same_machine && self.harness == "pi" {
+            self.refresh_thinking_levels();
+        } else {
+            self.models.clear();
         }
     }
 
@@ -3784,6 +3862,11 @@ impl Thread {
                     }
                     self.error = Some(string(&record, "error").to_owned());
                     if self.initializing {
+                        if command == "set_option"
+                            && let Some(rejected) = self.pending_cursor_option.take()
+                        {
+                            self.model_options.retain(|option| option.id != rejected);
+                        }
                         self.fail_session(self.error.clone().unwrap());
                         return;
                     }
@@ -3830,6 +3913,10 @@ impl Thread {
                         if data["turnCapabilities"].is_object() {
                             self.harness_state["turnCapabilities"] =
                                 data["turnCapabilities"].clone();
+                        }
+                        if data["liveOptionDescriptors"].is_array() {
+                            self.live_option_descriptors =
+                                serde_json::from_value(data["liveOptionDescriptors"].clone()).ok();
                         }
                         if self
                             .startup_selection_check
@@ -3881,6 +3968,14 @@ impl Thread {
                         }
                     }
                     "get_available_models" => {
+                        if record["data"]["liveOptionDescriptors"].is_array() {
+                            self.live_option_descriptors = serde_json::from_value(
+                                record["data"]["liveOptionDescriptors"].clone(),
+                            )
+                            .ok();
+                        } else if record["data"]["advertised"] == false {
+                            self.live_option_descriptors = Some(Vec::new());
+                        }
                         self.models = record["data"]["models"]
                             .as_array()
                             .map(|models| {
@@ -3941,6 +4036,10 @@ impl Thread {
                             );
                         }
                         self.reconcile_thinking();
+                    }
+                    "set_option" if self.initializing && self.harness == "cursor" => {
+                        self.pending_cursor_option = None;
+                        self.configuring = false;
                     }
                     "get_messages" if record["id"] == "history" => {
                         // `history_loaded` also covers the optimistic server
@@ -5415,6 +5514,11 @@ pub struct State {
     pub antigravity_catalog: crate::session::NativeCatalog,
     pub cursor_catalog: crate::session::NativeCatalog,
     pub(crate) acp_catalogs: std::collections::BTreeMap<String, crate::session::NativeCatalog>,
+    /// KSG `refreshWorkspaceSnapshot` work in flight: a folder's own provider
+    /// config is probed off the picker's catalog so a delegation retry can see
+    /// the models that workspace advertises.
+    pub(crate) workspace_model_scans:
+        std::collections::BTreeMap<(String, PathBuf), crate::session::NativeCatalog>,
     pub harnesses: crate::harness::Registry,
     provider_availability: crate::harness::AvailabilityProbe,
     refresh_optional_catalogs: bool,
@@ -6476,6 +6580,7 @@ impl State {
             antigravity_catalog: Default::default(),
             cursor_catalog: Default::default(),
             acp_catalogs: Default::default(),
+            workspace_model_scans: Default::default(),
             harnesses: crate::harness::Registry::read(),
             provider_availability: Default::default(),
             refresh_optional_catalogs: false,
@@ -9644,7 +9749,8 @@ impl State {
             self.threads[index].native.access =
                 AccessMode::parse(access).unwrap_or(AccessMode::Supervised);
         }
-        let models = self.harness_models(harness);
+        let cwd = self.catalog_workspace_cwd(index);
+        let models = self.harness_models_for_cwd(harness, cwd.as_deref());
         let selection: Option<(String, String)> =
             serde_json::from_value(seed["model"].clone()).ok().flatten();
         let Some(model) = selection.as_ref().and_then(|(provider, id)| {
@@ -10050,8 +10156,23 @@ impl State {
     /// Models Shina can validate against, preferring the live catalog over the caller's last
     /// handshake metadata. The string records which source was used.
     fn delegation_models(&self, caller: &Thread) -> (Vec<AgentModel>, &'static str) {
+        if let Some(models) = self.workspace_delegation_models(caller) {
+            return (models, "workspace");
+        }
         if caller.harness != "pi" {
-            return (self.harness_models(&caller.harness), "caller");
+            let models = self
+                .threads
+                .iter()
+                .position(|t| t.id == caller.id)
+                .map(|index| self.harness_models_for_thread(index, &caller.harness))
+                .unwrap_or_default();
+            if !models.is_empty() {
+                return (models, "caller");
+            }
+            if !caller.models.is_empty() {
+                return (caller.models.clone(), "caller");
+            }
+            return (models, "caller");
         }
         let mut models = self.catalog.models.clone();
         if let Some(default) = &self.catalog.default_model
@@ -10068,6 +10189,79 @@ impl State {
             return (caller.models.clone(), "caller");
         }
         (models, "none")
+    }
+
+    /// KSG `withWorkspaceModels`: the caller folder's own provider config can
+    /// add models that only its workspace snapshot lists. A recorded snapshot
+    /// for that folder replaces the machine-wide list, never merges into it.
+    fn workspace_delegation_models(&self, caller: &Thread) -> Option<Vec<AgentModel>> {
+        let index = self.threads.iter().position(|t| t.id == caller.id)?;
+        self.workspace_models(index, &caller.harness)
+    }
+
+    /// The workspace snapshot for `harness` under the caller's folder, when one
+    /// was recorded.
+    fn workspace_models(&self, caller_index: usize, harness: &str) -> Option<Vec<AgentModel>> {
+        if harness == "pi" {
+            return None;
+        }
+        let cwd = self.thread_directory(caller_index).ok()?;
+        self.native_catalog(harness)
+            .and_then(|catalog| catalog.workspace_snapshots.get(&cwd).cloned())
+    }
+
+    /// KSG `scanWorkspace`: probe the caller folder's provider config in the
+    /// background when no workspace snapshot exists yet. A failed or stale scan
+    /// retries after the catalog's own backoff, never twice in flight.
+    fn scan_workspace_catalog(&mut self, harness: &str, cwd: &Path) {
+        if self.demo || !self.runtime_enabled || self.client.is_some() || !cwd.is_dir() {
+            return;
+        }
+        let key = (harness.to_owned(), cwd.to_path_buf());
+        if let Some(scan) = self.workspace_model_scans.get(&key) {
+            if scan.loading() || !scan.retry_ready() {
+                return;
+            }
+        }
+        let wake = self.wake.clone();
+        let mut catalog = crate::session::NativeCatalog::default();
+        let configured = self
+            .harnesses
+            .agents
+            .iter()
+            .find(|agent| agent.id == harness);
+        let started = if let Some(agent) = configured {
+            catalog.refresh_acp(agent, cwd, wake, false, false)
+        } else {
+            match harness {
+                "codex" | "claude" | "antigravity" | "cursor" => {
+                    self.builtin_cli_available(harness)
+                        && catalog.refresh(harness, cwd, wake, false)
+                }
+                _ => false,
+            }
+        };
+        if started {
+            self.workspace_model_scans.insert(key, catalog);
+        }
+    }
+
+    /// KSG `OrchestratorMcpService.capabilities`/`delegate` unscanned-provider
+    /// pass: kick a background scan for the caller's folder when its snapshot
+    /// is missing.
+    fn scan_caller_workspace(&mut self, caller_index: usize, harness: &str) {
+        if harness == "pi" {
+            return;
+        }
+        let Ok(cwd) = self.thread_directory(caller_index) else {
+            return;
+        };
+        let missing = self
+            .native_catalog(harness)
+            .is_none_or(|catalog| !catalog.workspace_snapshots.contains_key(&cwd));
+        if missing {
+            self.scan_workspace_catalog(harness, &cwd);
+        }
     }
 
     fn default_selection(&self) -> Option<Selection> {
@@ -10130,9 +10324,8 @@ impl State {
                 Ok(())
             };
         }
-        let Some(model) = models
-            .iter()
-            .find(|model| model.provider == selection.provider && model.id == selection.model)
+        let Some(model) =
+            advertised_delegation_model(models, selection.provider.as_str(), &selection.model)
         else {
             let available = models
                 .iter()
@@ -10168,7 +10361,11 @@ impl State {
         Ok(())
     }
 
-    fn orchestrator_capabilities(&self, caller_index: usize) -> Value {
+    fn orchestrator_capabilities(&mut self, caller_index: usize) -> Value {
+        // KSG `capabilities` scans unscanned providers for the caller's folder in
+        // the background; the next call or delegation retry sees their models.
+        let harness = self.threads[caller_index].harness.clone();
+        self.scan_caller_workspace(caller_index, &harness);
         let caller = &self.threads[caller_index];
         let (models, source) = self.delegation_models(caller);
         let default_selection = self.default_selection();
@@ -10223,7 +10420,7 @@ impl State {
                 "When ready is false, discovery has not produced a usable catalog. Do not invent model ids or levels."
             ],
         });
-        self.add_harness_capabilities(&mut capabilities);
+        self.add_harness_capabilities(Some(caller_index), &mut capabilities);
         let peers = crate::database::for_path(&self.data_dir.join("index.json"))
             .and_then(|database| database.peers().ok())
             .unwrap_or_else(|| self.peers.clone());
@@ -13530,7 +13727,10 @@ impl State {
             return Err(format!("{} is unavailable.", opt.name));
         }
 
-        let models = self.harness_models(&selection.instance_id);
+        // These rows seed the new threads, so they come from the sending draft's
+        // workspace and never from another folder's catalog.
+        let cwd = self.catalog_workspace_cwd(self.active);
+        let models = self.harness_models_for_cwd(&selection.instance_id, cwd.as_deref());
         if has_images
             && models
                 .iter()
@@ -14597,8 +14797,10 @@ impl State {
                 options,
             });
         }
+        // The default is for the open thread, so only its workspace's rows count.
+        let cwd = self.catalog_workspace_cwd(self.active);
         let model = self
-            .default_harness_model(harness)
+            .default_harness_model(harness, cwd.as_deref())
             .map(|m| m.id.clone())
             .unwrap_or_else(|| {
                 crate::model_selection::default_model_by_provider(harness).to_owned()
@@ -14669,7 +14871,8 @@ impl State {
         {
             return m.name.clone();
         }
-        self.harness_model(harness, model_id)
+        let cwd = self.catalog_workspace_cwd(self.active);
+        self.harness_model(harness, model_id, cwd.as_deref())
             .map(|m| m.name.clone())
             .unwrap_or_else(|| model_id.to_owned())
     }
@@ -14689,7 +14892,8 @@ impl State {
         } else {
             selection.instance_id.clone()
         };
-        let models = self.harness_models(&selection.instance_id);
+        let cwd = self.catalog_workspace_cwd(index);
+        let models = self.harness_models_for_cwd(&selection.instance_id, cwd.as_deref());
         if self.threads[index].models.is_empty() && !models.is_empty() {
             self.threads[index].models = models;
         }
@@ -15733,7 +15937,7 @@ impl State {
         if self.forward("catalog.refresh", json!({})) {
             return;
         }
-        self.refresh_native_catalogs(true);
+        self.refresh_native_catalogs(true, false);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_some()
         {
@@ -15770,7 +15974,7 @@ impl State {
             self.forward("catalog.refresh", json!({"modelCatalogOnly": true}));
             return;
         }
-        self.refresh_native_catalogs(false);
+        self.refresh_native_catalogs(false, false);
         if !self.demo && self.runtime_enabled {
             self.catalog
                 .refresh_with_mode(self.data_dir.clone(), self.wake.clone(), false);
@@ -15784,7 +15988,7 @@ impl State {
         if self.forward("catalog.refresh", json!({"force": true})) {
             return;
         }
-        self.refresh_native_catalogs(true);
+        self.refresh_native_catalogs(true, false);
         if matches!(self.current().harness.as_str(), "codex" | "claude")
             && self.current().pi.is_some()
         {
@@ -15873,7 +16077,7 @@ impl State {
             self.apply_native_catalogs();
         }
         self.checkpoint();
-        self.refresh_native_catalogs(false);
+        self.refresh_native_catalogs(false, false);
     }
 
     fn apply_catalog(&mut self) {
@@ -18199,10 +18403,32 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
     if let Some(remaining) = state.catalog.remaining() {
         tx.wake_after(remaining);
     }
-    changed |= state.refresh_native_catalogs(false);
+    changed |= state.refresh_native_catalogs(false, true);
     let mut acp_changed = false;
     for (harness, catalog) in &mut state.acp_catalogs {
         acp_changed |= catalog.poll(harness);
+    }
+    // KSG `refreshWorkspaceSnapshot` results: a completed per-folder scan lands
+    // on the canonical catalog's workspace_snapshots, then the scan is dropped.
+    let scan_keys: Vec<_> = state.workspace_model_scans.keys().cloned().collect();
+    for (harness, cwd) in scan_keys {
+        let key = (harness.clone(), cwd.clone());
+        let (changed, done) = {
+            let Some(scan) = state.workspace_model_scans.get_mut(&key) else {
+                continue;
+            };
+            (scan.poll(&harness), scan.commands_ready())
+        };
+        acp_changed |= changed;
+        if !done {
+            continue;
+        }
+        let scan = state.workspace_model_scans.remove(&key).unwrap();
+        if scan.error.is_none()
+            && let Some(catalog) = state.native_catalog_mut(&harness)
+        {
+            catalog.set_workspace_models(&cwd, &scan.models);
+        }
     }
     if state.codex_catalog.poll("codex")
         | state.claude_catalog.poll("claude")
@@ -18219,6 +18445,10 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
         || state.cursor_catalog.loading()
         || state
             .acp_catalogs
+            .values()
+            .any(crate::session::NativeCatalog::loading)
+        || state
+            .workspace_model_scans
             .values()
             .any(crate::session::NativeCatalog::loading)
     {
@@ -19853,6 +20083,31 @@ mod tests {
     }
 
     #[test]
+    fn cursor_startup_waits_for_saved_options_before_driving_the_prompt() {
+        let mut thread = Thread::new(2);
+        thread.harness = "cursor".into();
+        let (commands, _events) = preparing_pi(&mut thread);
+        thread.state_loaded = true;
+        thread.history_loaded = true;
+        thread.set_option(
+            "contextWindow".into(),
+            crate::model_selection::OptionValue::Str("2m".into()),
+        );
+        thread.drive_session();
+        let choose = commands.try_recv().unwrap();
+        assert_eq!(choose["type"], "set_option");
+        assert_eq!(choose["optionId"], "contextWindow");
+        assert_eq!(choose["value"], "2m");
+        assert!(thread.initializing);
+        assert!(thread.configuring);
+        assert!(commands.try_recv().is_err());
+        thread.apply(json!({"type":"response","id":choose["id"],
+            "command":"set_option","success":true}));
+        assert!(!thread.initializing);
+        assert!(!thread.configuring);
+    }
+
+    #[test]
     fn invalid_delegation_targets_are_rejected_without_creating_children() {
         let mut state = State::new(".".into(), false);
         state.demo = true;
@@ -20010,6 +20265,70 @@ mod tests {
         let child = state.threads.last().unwrap();
         assert_eq!(child.selected_model, Some(("cpa".into(), "fast".into())));
         assert_eq!(child.selected_thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn antigravity_delegation_accepts_a_model_id_with_a_thinking_level() {
+        let mut state = State::new(".".into(), false);
+        state.demo = true;
+        state.threads[0].harness = "antigravity".into();
+        state.threads[0].model_provider = "antigravity".into();
+        state.threads[0].model_id = "gemini-3.8-flash".into();
+        state.provider_availability.last = Some(crate::harness::Availability {
+            claude: false,
+            antigravity: true,
+            cursor: false,
+        });
+        state.test_connect_pi = Some(Box::new(|_, _| None));
+        // KSG `antigravitySuffixedModel`: Antigravity 1.3 appends the thinking
+        // level to the model id; the delegation maps it to the family plus the
+        // level as its reasoning option.
+        let mut flash = model_with_levels("gemini-3.8-flash", &["off", "low", "medium", "high"]);
+        flash.provider = "antigravity".into();
+        state.antigravity_catalog.models = vec![flash];
+        let result = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({
+                    "prompt":"Route the level",
+                    "target":{"model":"gemini-3.8-flash-high"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["selection"]["model"], "gemini-3.8-flash");
+        assert_eq!(result["selection"]["options"]["reasoning"], "high");
+        let child = state.threads.last().unwrap();
+        assert_eq!(
+            child.selected_model,
+            Some(("antigravity".into(), "gemini-3.8-flash".into()))
+        );
+        assert_eq!(child.selected_thinking.as_deref(), Some("high"));
+        // An explicit reasoning option still wins over the suffix.
+        let result = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({
+                    "prompt":"Override the suffix",
+                    "target":{"model":"gemini-3.8-flash-high","options":{"reasoning":"low"}}
+                }),
+            )
+            .unwrap();
+        assert_eq!(result["selection"]["model"], "gemini-3.8-flash");
+        assert_eq!(result["selection"]["options"]["reasoning"], "low");
+        // A suffix that is not an advertised level still fails the catalog check.
+        let error = state
+            .mcp_call(
+                1,
+                "delegate_task",
+                &json!({
+                    "prompt":"Bad level",
+                    "target":{"model":"gemini-3.8-flash-ultra"}
+                }),
+            )
+            .unwrap_err();
+        assert!(error.contains("is not in the current catalog"), "{error}");
     }
 
     #[test]

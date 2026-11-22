@@ -229,8 +229,15 @@ fn route_family(id: &str) -> &str {
 }
 /// KSG `ROUTE_SUFFIX.test`: whether an id ends in a known `-effort` route suffix.
 fn has_route_suffix(id: &str) -> bool {
-    id.rsplit_once('-')
-        .is_some_and(|(_, suffix)| GATEWAY_EFFORTS.iter().any(|(e, _)| suffix == *e))
+    gateway_route_effort(id).is_some()
+}
+
+pub(crate) fn gateway_route_effort(id: &str) -> Option<&str> {
+    let (_, suffix) = id.rsplit_once('-')?;
+    GATEWAY_EFFORTS
+        .iter()
+        .any(|(effort, _)| *effort == suffix)
+        .then_some(suffix)
 }
 /// KSG `matchesRoute`: an exact route, or a family selection matching the route's family.
 fn matches_route(selection: &str, id: &str) -> bool {

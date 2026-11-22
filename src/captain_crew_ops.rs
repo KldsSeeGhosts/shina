@@ -191,7 +191,8 @@ impl State {
         let models = if harness == home.harness {
             self.delegation_models(home).0
         } else {
-            self.harness_models(harness)
+            self.workspace_models(home_index, harness)
+                .unwrap_or_else(|| self.harness_models_for_thread(home_index, harness))
         };
         let inherited = if harness == home.harness {
             self.inherited_selection(home_index)

@@ -430,7 +430,7 @@ fn acp_discovery_does_not_retry_or_authenticate_after_a_denial() {
     let dir = crate::store::directory().unwrap();
     let mut catalog = crate::session::NativeCatalog::default();
     let wake: Waker = Arc::new(|| {});
-    assert!(catalog.refresh_acp(&agent, &dir, wake.clone(), false));
+    assert!(catalog.refresh_acp(&agent, &dir, wake.clone(), false, false));
     let deadline = Instant::now() + Duration::from_secs(10);
     while catalog.loading() {
         assert!(Instant::now() < deadline);
@@ -444,7 +444,7 @@ fn acp_discovery_does_not_retry_or_authenticate_after_a_denial() {
             .unwrap()
             .contains("sign in to the agent outside Shina")
     );
-    assert!(!catalog.refresh_acp(&agent, &dir, wake, false));
+    assert!(!catalog.refresh_acp(&agent, &dir, wake, false, false));
     assert_eq!(
         records(&log)
             .iter()
@@ -806,4 +806,462 @@ fn http_response_reads_exact_content_length_without_waiting_for_eof() {
     ] {
         assert!(http_response(&mut std::io::Cursor::new(invalid)).is_err());
     }
+}
+/// A grok `session/load` that never answers still starts once its replay goes
+/// quiet, and the real response arriving later is adopted when nothing changed
+/// the session in between.
+fn grok_load_client() -> Client {
+    let mut start = spec(SessionSource::Resume("fixture-session".into()));
+    start.id = "grok".into();
+    let mut client = Client::new(start);
+    assert!(client.replay_idle);
+    client.capabilities = json!({"mcpCapabilities":{"http":true},"loadSession":true});
+    client.start_session().unwrap();
+    client
+}
+
+fn grok_load_request(client: &mut Client) -> Value {
+    let load = client
+        .wire
+        .iter()
+        .find(|r| r["method"] == "session/load")
+        .expect("session/load request")
+        .clone();
+    assert_eq!(load["params"]["sessionId"], "fixture-session");
+    load
+}
+
+fn grok_replay_chunk(client: &mut Client, text: &str) {
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"fixture-session",
+            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}}))
+        .unwrap();
+}
+
+fn grok_provisional_start(client: &mut Client) {
+    client.load_gate.as_mut().unwrap().last_activity =
+        Some(Instant::now() - Duration::from_secs(3));
+    client.check_load_gate(Instant::now()).unwrap();
+    assert!(client.ready);
+    assert!(client.late_load.is_some());
+    assert!(client.load_gate.is_none());
+}
+
+#[test]
+fn grok_replay_idle_starts_the_session_and_adopts_a_late_load_response() {
+    let mut client = grok_load_client();
+    let load = grok_load_request(&mut client);
+    let gate = client.load_gate.as_ref().expect("load gate");
+    assert_eq!(gate.session_id, "fixture-session");
+    assert!(
+        client.pending[load["id"].as_str().unwrap()]
+            .deadline
+            .unwrap()
+            > Instant::now() + Duration::from_secs(60),
+        "session/load keeps the 90 second deadline"
+    );
+
+    // Replay traffic marks activity; the gate stays closed until the gap idles.
+    grok_replay_chunk(&mut client, "Earlier reply");
+    client.check_load_gate(Instant::now()).unwrap();
+    assert!(!client.ready);
+    grok_provisional_start(&mut client);
+
+    // The provisional start ran the same publish path as a real response.
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|e| e["command"] == "get_available_models")
+    );
+    assert!(client.events.iter().any(|e| e["command"] == "get_messages"));
+    assert_eq!(client.history[0]["content"][0]["text"], "Earlier reply");
+    client.events.clear();
+
+    // The real response is adopted: its catalog replaces the provisional one.
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":load["id"],"result":{
+            "sessionId":"fixture-session",
+            "configOptions":[{"category":"model","id":"model","type":"select",
+                "currentValue":"grok-real","options":[{"value":"grok-real","name":"Real"}]}]}}))
+        .unwrap();
+    assert!(client.late_load.is_none());
+    assert_eq!(client.models[0]["id"], "grok-real");
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|e| e["command"] == "get_available_models")
+    );
+    assert!(!client.events.iter().any(|e| e["command"] == "get_messages"));
+}
+
+#[test]
+fn grok_late_load_is_dropped_after_a_session_write() {
+    let mut client = grok_load_client();
+    let load = grok_load_request(&mut client);
+    client.configure_models(&json!({"configOptions":[
+        {"category":"model","id":"model","type":"select","currentValue":"a",
+         "options":[{"value":"a","name":"A"}]}]}));
+    grok_replay_chunk(&mut client, "Earlier reply");
+    grok_provisional_start(&mut client);
+
+    // A session write makes the still-pending load response stale.
+    client.running = false;
+    client
+        .command(json!({"type":"set_option","id":"opt","optionId":"model","value":"a"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["method"],
+        "session/set_config_option"
+    );
+    client.events.clear();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":load["id"],"result":{
+            "sessionId":"fixture-session",
+            "configOptions":[{"category":"model","id":"model","type":"select",
+                "currentValue":"stale","options":[{"value":"stale","name":"Stale"}]}]}}))
+        .unwrap();
+    assert!(client.late_load.is_none());
+    assert_eq!(client.model["id"], "a", "the stale response must not apply");
+    assert!(
+        !client
+            .events
+            .iter()
+            .any(|e| e["command"] == "get_available_models")
+    );
+}
+
+#[test]
+fn grok_late_load_is_dropped_after_a_config_notification() {
+    let mut client = grok_load_client();
+    let load = grok_load_request(&mut client);
+    grok_replay_chunk(&mut client, "Earlier reply");
+    grok_provisional_start(&mut client);
+
+    // A config notification bumps the change count just like a write.
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"fixture-session",
+            "update":{"sessionUpdate":"config_option_update","configOptions":[]}}}))
+        .unwrap();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":load["id"],"result":{
+            "sessionId":"fixture-session",
+            "configOptions":[{"category":"model","id":"model","type":"select",
+                "currentValue":"stale","options":[{"value":"stale","name":"Stale"}]}]}}))
+        .unwrap();
+    assert!(client.late_load.is_none());
+    assert_ne!(client.model["id"], "stale");
+}
+
+#[test]
+fn grok_late_load_error_keeps_the_provisional_session() {
+    let mut client = grok_load_client();
+    let load = grok_load_request(&mut client);
+    grok_replay_chunk(&mut client, "Earlier reply");
+    grok_provisional_start(&mut client);
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":load["id"],
+            "error":{"code":-32603,"message":"gone"}}))
+        .unwrap();
+    assert!(client.late_load.is_none());
+    assert!(client.ready);
+}
+
+#[test]
+fn replay_idle_never_fires_for_a_non_grok_load() {
+    let mut client = Client::new(spec(SessionSource::Resume("fixture-session".into())));
+    assert!(!client.replay_idle);
+    client.capabilities = json!({"mcpCapabilities":{"http":true},"loadSession":true});
+    client.start_session().unwrap();
+    // The gate still tracks the load for its candidate config snapshot.
+    client.load_gate.as_mut().unwrap().last_activity =
+        Some(Instant::now() - Duration::from_secs(3));
+    client.check_load_gate(Instant::now()).unwrap();
+    assert!(!client.ready);
+    assert!(client.late_load.is_none());
+}
+
+#[test]
+fn grok_load_reply_after_its_deadline_is_ignored() {
+    let mut client = grok_load_client();
+    let load = grok_load_request(&mut client);
+    grok_replay_chunk(&mut client, "Earlier reply");
+    grok_provisional_start(&mut client);
+    client
+        .check_request_deadlines(Instant::now() + SESSION_LOAD_TIMEOUT)
+        .unwrap();
+    client.events.clear();
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":load["id"],"result":{
+            "configOptions":[{"category":"model","id":"model","type":"select",
+                "currentValue":"too-late","options":[{"value":"too-late","name":"Too late"}]}]}}))
+        .unwrap();
+    assert!(client.ready);
+    assert!(client.events.is_empty());
+    assert_ne!(client.model["id"], "too-late");
+}
+
+#[test]
+fn get_state_reports_the_reasoning_level_the_agent_applied() {
+    let mut client = Client::new(spec(SessionSource::New));
+    ready(&mut client);
+    client.configure_models(&json!({"configOptions":[
+        {"category":"thought_level","id":"thought_level","type":"select",
+         "currentValue":"medium","options":[{"value":"low","name":"Low"},{"value":"medium","name":"Medium"},{"value":"high","name":"High"}]}]}));
+    client.running = false;
+    client
+        .command(json!({"type":"set_thinking_level","id":"think","level":"high"}))
+        .unwrap();
+    let request = client.wire.pop().unwrap();
+    assert_eq!(request["method"], "session/set_config_option");
+    // A bare acknowledgement without echoed configOptions still records the level.
+    client
+        .incoming(json!({"jsonrpc":"2.0","id":request["id"],"result":{}}))
+        .unwrap();
+    assert_eq!(client.state()["thinkingLevel"], "high");
+    // A delegated child's get_state verification reads the same value.
+}
+
+#[test]
+fn local_droid_pairs_a_select_and_custom_answer_into_one_question() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.flavor = Flavor::detect("local-agent", r"C:\tools\DROID.CMD");
+    assert_eq!(client.flavor, Flavor::Droid);
+    ready(&mut client);
+    client.running = true;
+    client.incoming(json!({"jsonrpc":"2.0","id":42,"method":"elicitation/create","params":{
+        "mode":"form","requestedSchema":{"required":["question_1","question_2"],
+        "properties":{
+            "question_1":{"type":"string","title":"Format","description":"Which format?",
+                "oneOf":[{"const":"option_1","title":"Plain text"},{"const":"other","title":"Other"}]},
+            "question_1_other":{"type":"string"},
+            "question_2":{"type":"string","title":"Output","description":"Which output?",
+                "oneOf":[{"const":"option_1","title":"HTML"},{"const":"other","title":"Other"}]},
+            "question_2_other":{"type":"string"}
+        }}}})).unwrap();
+    let event = client.events.last().unwrap();
+    assert_eq!(event["questions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        event["questions"][1]["options"].as_array().unwrap().len(),
+        1
+    );
+    client
+        .command(json!({"type":"extension_ui_response","id":event["id"],
+        "value":"{\"question_1\":\"option_1\",\"question_2\":\"Markdown\"}"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap(),
+        &json!({"jsonrpc":"2.0","id":42,
+        "result":{"action":"accept","content":{"question_1":"option_1",
+            "question_2":"other","question_2_other":"Markdown"}}})
+    );
+}
+
+#[test]
+fn local_glm_and_vibe_enable_their_provider_specific_events() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.flavor = Flavor::detect("local-agent", "/tools/glm");
+    assert_eq!(client.flavor, Flavor::Glm);
+    ready(&mut client);
+    client
+        .command(json!({"type":"prompt","id":"1","message":"hello"}))
+        .unwrap();
+    let id = client.wire.last().unwrap()["id"].clone();
+    client
+        .incoming(
+            json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn",
+        "usage":{"totalTokens":3000,"inputTokens":2500,"outputTokens":500}}}),
+        )
+        .unwrap();
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|event| event["field"] == "lastTurnUsage"
+                && event["value"]
+                    == json!({"totalTokens":3000,"inputTokens":2500,"outputTokens":500}))
+    );
+
+    client.flavor = Flavor::detect("local-agent", "/tools/mistral-vibe-acp");
+    assert_eq!(client.flavor, Flavor::Vibe);
+    client
+        .command(json!({"type":"prompt","id":"2","message":"hello"}))
+        .unwrap();
+    let id = client.wire.last().unwrap()["id"].clone();
+    client
+        .incoming(
+            json!({"jsonrpc":"2.0","method":"_session/retrying","params":{
+        "sessionId":client.session,"category":"rate_limited","attempt":1,"detail":"retrying"}}),
+        )
+        .unwrap();
+    assert!(
+        client
+            .events
+            .iter()
+            .any(|event| event["field"] == "providerRetry"
+                && event["value"]["class"] == "usage_limit")
+    );
+    assert!(
+        client
+            .incoming(json!({"jsonrpc":"2.0","id":id,
+        "error":{"code":-31001,"message":"limit reached"}}))
+            .unwrap_err()
+            .contains("rate limit")
+    );
+    assert_eq!(Flavor::detect("factory-droid", "runner"), Flavor::Droid);
+    assert_eq!(
+        Flavor::detect("local-agent", "our-glm-wrapper"),
+        Flavor::Generic
+    );
+}
+
+#[test]
+fn an_existing_cursor_session_accepts_a_refreshed_catalog_model_and_its_native_tier() {
+    let mut start = spec(SessionSource::New);
+    start.id = "cursor".into();
+    let mut client = Client::new(start);
+    ready(&mut client);
+    let model = |id: &str| {
+        json!({"id":"model","category":"model","type":"select",
+        "currentValue":id,"options":[{"value":id,"name":id}]})
+    };
+    client.configure_models(&json!({"configOptions":[model("old-model")]}));
+    client
+        .command(json!({"type":"set_model","id":"pick","modelId":"new-model",
+        "fromCursorCatalog":true}))
+        .unwrap();
+    let request = client.wire.last().unwrap();
+    assert_eq!(request["params"]["value"], "new-model");
+    client.incoming(json!({"jsonrpc":"2.0","id":request["id"],"result":{"configOptions":[
+        model("new-model"),{"id":"context","type":"select","category":"model_config",
+            "currentValue":"200k","options":[{"value":"200k","name":"200K"},{"value":"2m","name":"2M Max"}]}]}})).unwrap();
+    assert_eq!(client.model["id"], "new-model");
+    client
+        .command(json!({"type":"set_option","id":"tier","optionId":"contextWindow","value":"2m"}))
+        .unwrap();
+    assert_eq!(
+        client.wire.last().unwrap()["params"],
+        json!({"sessionId":"fixture-session","configId":"context","value":"2m"})
+    );
+}
+
+#[test]
+fn delayed_replay_updates_after_readiness_do_not_overwrite_live_controls_or_emit_deltas() {
+    let mut client = grok_load_client();
+    let _load = grok_load_request(&mut client);
+    grok_replay_chunk(&mut client, "Startup history");
+    grok_provisional_start(&mut client);
+    // Live session moves to a newer model and clears events.
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"fixture-session",
+            "update":{"sessionUpdate":"config_option_update","configOptions":[
+                {"category":"model","id":"model","type":"select","currentValue":"live-model",
+                 "options":[{"value":"live-model","name":"Live"}]}]}}}))
+        .unwrap();
+    assert_eq!(client.model["id"], "live-model");
+    let changes_before = client.session_changes;
+    let history_before = client.history.clone();
+    client.events.clear();
+
+    // Delayed replay config and text must not overwrite live state or stream as live output.
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"fixture-session",
+            "_meta":{"isReplay":true},
+            "update":{"sessionUpdate":"config_option_update","configOptions":[
+                {"category":"model","id":"model","type":"select","currentValue":"stale-replay",
+                 "options":[{"value":"stale-replay","name":"Stale"}]}]}}}))
+        .unwrap();
+    client
+        .incoming(json!({"jsonrpc":"2.0","method":"session/update","params":{
+            "sessionId":"fixture-session",
+            "_meta":{"isReplay":true},
+            "update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Replayed delta"}}}}))
+        .unwrap();
+
+    assert_eq!(client.model["id"], "live-model");
+    assert_eq!(client.session_changes, changes_before);
+    assert_eq!(client.history, history_before);
+    assert!(
+        client.events.is_empty(),
+        "delayed replay must emit no live events: {:?}",
+        client.events
+    );
+}
+
+#[test]
+fn republished_seed_models_are_marked_not_advertised_live() {
+    let mut client = Client::new(spec(SessionSource::New));
+    client.models = vec![json!({
+        "id": "seeded-from-elsewhere",
+        "name": "Seeded",
+        "provider": "acp",
+        "capabilities": {
+            "optionDescriptors": [{
+                "kind": "select",
+                "id": "context",
+                "label": "Context",
+                "options": [{"id": "1m", "label": "1M", "isDefault": true}],
+                "currentValue": "1m"
+            }]
+        }
+    })];
+    ready(&mut client);
+    client.events.clear();
+    client.configure_models(&json!({}));
+    client.publish_models();
+    let published = client
+        .events
+        .iter()
+        .find(|event| event["command"] == "get_available_models")
+        .expect("models published");
+    assert_eq!(published["data"]["advertised"], false);
+    assert_eq!(published["data"]["liveOptionDescriptors"], json!([]));
+    assert_eq!(
+        published["data"]["models"][0]["id"],
+        "seeded-from-elsewhere"
+    );
+
+    client.events.clear();
+    client.configure_models(&json!({"configOptions":[
+        {"category":"model","id":"model","type":"select","currentValue":"live-a",
+         "options":[{"value":"live-a","name":"Live A"}]}]}));
+    client.publish_models();
+    let live = client
+        .events
+        .iter()
+        .find(|event| event["command"] == "get_available_models")
+        .expect("live models published");
+    assert_eq!(live["data"]["advertised"], true);
+}
+
+#[test]
+fn cursor_set_option_rejects_unadvertised_option_and_choice() {
+    let mut start = spec(SessionSource::New);
+    start.id = "cursor".into();
+    let mut client = Client::new(start);
+    ready(&mut client);
+    client.configure_models(&json!({"configOptions":[
+        {"id":"context","type":"select","category":"model_config","currentValue":"200k",
+         "options":[{"value":"200k","name":"200K"}]}]}));
+    let wire_before = client.wire.len();
+    client.events.clear();
+
+    client
+        .command(
+            json!({"type":"set_option","id":"bad-val","optionId":"contextWindow","value":"2m"}),
+        )
+        .unwrap();
+    assert_eq!(client.wire.len(), wire_before);
+    assert_eq!(client.events.last().unwrap()["success"], false);
+
+    client
+        .command(json!({"type":"set_option","id":"missing","optionId":"maxMode","value":true}))
+        .unwrap();
+    assert_eq!(client.wire.len(), wire_before);
+    assert_eq!(client.events.last().unwrap()["success"], false);
 }

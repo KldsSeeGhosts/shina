@@ -46,7 +46,13 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
         .filter(|t| t.remote.is_some())
         .map(|t| t.child_thread_id)
         .collect();
-    for (index, thread) in state.threads.iter_mut().enumerate() {
+    for index in 0..state.threads.len() {
+        let workspace = state
+            .acp_catalogs
+            .contains_key(&state.threads[index].harness)
+            .then(|| state.thread_directory(index).ok())
+            .flatten();
+        let thread = &mut state.threads[index];
         if remote_children.contains(&thread.id) {
             continue;
         }
@@ -108,11 +114,13 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
                     }
                     batch.run_ended |= settled;
                     let acp_catalog = state.acp_catalogs.get_mut(&thread.harness).filter(|_| {
-                        record["command"] == "get_available_models" && record["success"] == true
+                        record["command"] == "get_available_models"
+                            && record["success"] == true
+                            && record["data"]["advertised"] != false
                     });
                     thread.apply(record);
                     if let Some(catalog) = acp_catalog {
-                        catalog.apply_live_acp_models(&thread.models);
+                        catalog.apply_live_acp_models(&thread.models, workspace.as_deref());
                     }
                     if settled
                         || changes_before.is_some_and(|before| {
@@ -159,11 +167,18 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
                 .wakes
                 .push(deadline.saturating_duration_since(Instant::now()));
         }
+        let start_timeout = if thread.session.is_some()
+            && !matches!(thread.harness.as_str(), "pi" | "codex" | "claude")
+        {
+            crate::acp::RESUME_START_TIMEOUT
+        } else {
+            START_TIMEOUT
+        };
         if !thread.offline_blocked
             && thread.request.is_none()
             && thread
                 .session_started
-                .is_some_and(|at| at.elapsed() >= START_TIMEOUT)
+                .is_some_and(|at| at.elapsed() >= start_timeout)
         {
             thread.fail_session(
                 "Pi did not finish preparing the session. Retry to resume it.".into(),
@@ -214,7 +229,7 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
             let remaining = if thread.offline_blocked {
                 Duration::from_secs(2)
             } else if let Some(started) = thread.session_started {
-                START_TIMEOUT.saturating_sub(started.elapsed())
+                start_timeout.saturating_sub(started.elapsed())
             } else if !thread.status.busy() && !thread.configuring {
                 IDLE_TIMEOUT.saturating_sub(thread.last_activity.elapsed())
             } else {
