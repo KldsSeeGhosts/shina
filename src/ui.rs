@@ -351,14 +351,28 @@ pub(crate) fn html_theme(dark: bool) -> serde_json::Value {
     );
     serde_json::json!({"appearance":if dark {"dark"} else {"light"},"variables":variables})
 }
-pub const SANS_FAMILY: &str = "Anthropic Sans Variable Text, Inter Variable";
+/// Every piece of UI text uses this one stack, as KSG Code's `--font-sans` does. The user's KSG
+/// Appearance setting names Anthropic Sans, so an installed copy comes first. The font lists
+/// its family twice ("Anthropic Sans Variable Text" in name ID 1 and "Anthropic Sans Variable"
+/// in ID 16), and Rune registers the file under the second, so both names are here. Without the
+/// font installed, text falls back to the bundled Inter (KSG's default). Tests lay out in the
+/// bundled Inter alone, so a measurement is the same on every machine.
+#[cfg(not(test))]
+pub const SANS_FAMILY: &str =
+    "Anthropic Sans Variable Text, Anthropic Sans Variable, Inter Variable";
+#[cfg(test)]
+pub const SANS_FAMILY: &str = "Inter Variable";
+/// Code, inline code, keycaps and diff gutters: Anthropic Mono when installed (the user's KSG
+/// code font), else the system's.
+#[cfg(not(test))]
+pub const MONO_FAMILY: &str = "Anthropic Mono Web, Cascadia Mono, Consolas";
+#[cfg(test)]
+pub const MONO_FAMILY: &str = "Cascadia Mono, Consolas";
 pub const FONTS: &[&[u8]] = &[include_bytes!("../assets/fonts/InterVariable.ttf")];
-/// KSG Code's small UI text: Inter at `size`, weight 500, for section labels, counts, timers,
+/// KSG Code's small UI text: `size` at weight 500, for section labels, counts, timers,
 /// status words, badges and the controls under the composer. The wordmark uses it at 15.
 const fn meta(size: f32) -> TextStyle {
-    TextStyle::new(size, 500.0)
-        .lh(size + 5.0)
-        .family(rune::Family::Named("Inter Variable"))
+    TextStyle::new(size, 500.0).lh(size + 5.0)
 }
 /// Section labels, counts and status words.
 const META: TextStyle = meta(12.0);
@@ -378,41 +392,27 @@ const MONO_META: TextStyle = TextStyle::new(12.0, 400.0)
 const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(21.0).tracking(-0.10);
 /// Assistant answers use KSG Code's `.chat-markdown`: `text-sm leading-relaxed`, 14/22.5.
 const PROSE: TextStyle = TextStyle::new(14.0, 400.0).lh(22.5).tracking(-0.10);
-const COMPOSER: TextStyle = TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10);
+/// The composer's text, as KSG Code's `ComposerPromptEditorTiptap` sets it: `text-sm` on
+/// `.composer-text`'s 1.25 rem lines.
+const COMPOSER: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0).tracking(-0.10);
 /// The new-thread greeting, ported from KSG Code's `DraftHeroHeadline`: centred Inter,
 /// `text-3xl font-medium tracking-tight`, or `text-2xl` when the pane is narrow.
-const HEADING: TextStyle = TextStyle::new(30.0, 500.0)
-    .lh(36.0)
-    .tracking(-0.75)
-    .family(rune::Family::Named("Inter Variable"));
+const HEADING: TextStyle = TextStyle::new(30.0, 500.0).lh(36.0).tracking(-0.75);
 const DIALOG_TITLE: TextStyle = IDENTITY;
 /// The captain's name in the Inspector's Overview (spec §0.1 `IDENTITY`): Inter 16/600,
 /// tight tracking. Replaces the old Source Serif treatment, per the all-Inter rule.
-const IDENTITY: TextStyle = TextStyle::new(16.0, 600.0)
-    .lh(22.0)
-    .tracking(-0.16)
-    .family(rune::Family::Named("Inter Variable"));
-const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 500.0)
-    .lh(32.0)
-    .tracking(-0.6)
-    .family(rune::Family::Named("Inter Variable"));
+const IDENTITY: TextStyle = TextStyle::new(16.0, 600.0).lh(22.0).tracking(-0.16);
+const HEADING_NARROW: TextStyle = TextStyle::new(24.0, 500.0).lh(32.0).tracking(-0.6);
 /// A chat pane this wide (a 1600 px window with the sidebar open) gets a longer measure and
 /// larger body text. It follows the pane, not the window, so an open session panel or a wide
 /// sidebar keeps the reading size that fits the lane.
 const WIDE_PANE: f32 = 1200.0;
-fn body_style(wide: bool) -> TextStyle {
-    if wide {
-        TextStyle::new(15.0, 400.0).lh(23.0).tracking(-0.10)
-    } else {
-        BODY
-    }
+/// KSG Code keeps one text size at every pane width, so a wide pane no longer steps up to 15.
+fn body_style(_wide: bool) -> TextStyle {
+    BODY
 }
-fn prose_style(wide: bool) -> TextStyle {
-    if wide {
-        TextStyle::new(15.0, 400.0).lh(24.0).tracking(-0.15)
-    } else {
-        PROSE
-    }
+fn prose_style(_wide: bool) -> TextStyle {
+    PROSE
 }
 /// The chat lane's content width, ported from KSG Code's `.chat-content-lane`
 /// (`max-width: var(--chat-content-max-width)`, 45 rem at every pane width). Messages, tool
@@ -4470,9 +4470,7 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
             header = header.child(
                 label(
                     "Shina",
-                    TextStyle::new(size, 600.0)
-                        .tracking(-0.01 * size)
-                        .family(rune::Family::Named("Inter Variable")),
+                    TextStyle::new(size, 600.0).tracking(-0.01 * size),
                     p.ink,
                 )
                 .key("shina-wordmark")
@@ -15147,13 +15145,8 @@ fn composer_decorations(
     p: Palette,
 ) -> (Vec<rune::text::Span>, Vec<(usize, usize, Option<Color>)>) {
     let t = s.current();
-    let (mut spans, strikes) = crate::composer_source::preview_decorations(
-        &t.draft,
-        COMPOSER.family(rune::Family::Named("Inter Variable")),
-        p.faint,
-        p.ink,
-        p.code_bg,
-    );
+    let (mut spans, strikes) =
+        crate::composer_source::preview_decorations(&t.draft, COMPOSER, p.faint, p.ink, p.code_bg);
     spans.extend(t.code_highlight.borrow_mut().spans(
         &t.draft,
         s.dark,
@@ -15618,7 +15611,7 @@ fn composer(
     // the actions row always sits below the text and the card never grows past the cap. A bare
     // field with `max_h` laid out at the cap but let the card size to all of its text, which
     // drew the last lines under the actions and left an empty strip below them.
-    let composer_style = COMPOSER.family(rune::Family::Named("Inter Variable"));
+    let composer_style = COMPOSER;
     let offered_suggestion = s.offered_prompt_suggestion();
     let blank_preview = rune::TextEdit::default();
     let field = text_input(
@@ -17674,7 +17667,7 @@ pub(crate) mod tests {
             view,
             (width, 720.0),
             Env::new(false, 1.0),
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, MONO_FAMILY)),
         );
         // As the app sets it in `main`.
         rt.set_tab_visits_controls(true);
@@ -20597,7 +20590,7 @@ pub(crate) mod tests {
             view,
             (1280.0, 1400.0),
             Env::new(false, 1.0),
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, MONO_FAMILY)),
         );
         tall.state.populate_demo();
         tall.frame(0.0);
@@ -21612,8 +21605,10 @@ pub(crate) mod tests {
                 TranscriptPart::Work(vec![Thought(2), Tool(2), Tool(3)])
             );
             let lane = rt.presented("chat-lane").unwrap().0;
+            // A work row's hover wash starts 6 pt before the lane, so its icon slot sits on the
+            // lane edge as KSG's does.
             let inside = |rect: [f32; 4]| {
-                rect[0] >= lane[0] - 0.5 && rect[0] + rect[2] <= lane[0] + lane[2] + 0.5
+                rect[0] >= lane[0] - 6.5 && rect[0] + rect[2] <= lane[0] + lane[2] + 0.5
             };
             // "Working for 12s" heads the turn.
             assert!(texts(&rt).iter().any(|text| text == "Working for "));
@@ -24152,7 +24147,8 @@ pub(crate) mod tests {
             tap(&mut rt, rune::Key::Up);
             assert_eq!(rt.state.current().draft.text, long, "{width}: recall");
             let (field, _) = rt.presented("composer-input").expect("composer input");
-            let lines = ((field[3] - 2.0 * COMPOSER_FIELD_PAD) / 23.0).round() as usize;
+            // `COMPOSER`'s line height.
+            let lines = ((field[3] - 2.0 * COMPOSER_FIELD_PAD) / 20.0).round() as usize;
             assert!(lines >= 2, "{width}: the prompt wraps, {field:?}");
 
             // The caret starts on the last line. Up climbs the wrapped lines first, and only

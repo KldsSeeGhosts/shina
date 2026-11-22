@@ -1394,7 +1394,7 @@ mod tests {
             },
             (620.0, 720.0),
             rune::Env::new(false, 1.0),
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)),
         );
         rt.frame(0.0);
         assert!(rt.find("skill-empty").is_some());

@@ -662,7 +662,7 @@ pub(super) fn render(s: &State, p: Palette, wide: bool, message: &Message, max_w
 fn fit_label(label: &str, style: TextStyle, max_width: f32) -> String {
     thread_local! {
         static TEXT: std::cell::RefCell<rune::text::TextSystem> = std::cell::RefCell::new(
-            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")));
+            rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)));
     }
     // Rune's pill reserves its icon, padding and margins in the text layout.
     let limit = (max_width - style.size * 2.2).max(style.size);

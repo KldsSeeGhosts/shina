@@ -1228,7 +1228,7 @@ mod tests {
                 view,
                 (width, 720.0),
                 rune::Env::new(false, 1.0),
-                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)),
             );
             rt.frame(0.0);
             let (option, _) = rt.presented("access-read-only").expect("Read only option");
@@ -1269,7 +1269,7 @@ mod tests {
                 view,
                 (width, 720.0),
                 rune::Env::new(false, 1.0),
-                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)),
             );
             rt.frame(0.0);
             assert!(
@@ -1304,7 +1304,7 @@ mod tests {
                 view,
                 (width, 720.0),
                 rune::Env::new(false, 1.0),
-                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, "Cascadia Mono, Consolas")),
+                rune::text::TextSystem::new(FONTS, (SANS_FAMILY, crate::ui::MONO_FAMILY)),
             );
             rt.frame(0.0);
             assert!(

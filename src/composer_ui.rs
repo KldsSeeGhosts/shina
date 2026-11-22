@@ -87,7 +87,8 @@ pub(super) fn measure(s: &State, cx: &Cx<State>) {
         .natural_height
         .set(cx.layout_with("composer-natural", |r| r[3]));
     if let Some(height) = cx.layout_with("measure-composer-prompt", |r| r[3]) {
-        s.composer_ui.wrapped_prompt.set(height > 23.0 + 8.0 + 1.0);
+        // Taller than one 20 pt `COMPOSER` line and the field's padding.
+        s.composer_ui.wrapped_prompt.set(height > 20.0 + 8.0 + 1.0);
         s.composer_ui
             .prompt_height
             .set(height.clamp(COMPOSER_FIELD_MIN, COMPOSER_FIELD_MAX));
@@ -503,16 +504,13 @@ pub(super) fn measurement_probes(s: &State, model: &ComposerModelDisplay, p: Pal
             icon_button("measure-access-icon", "Permissions", "shield", p, |_| {}).size(28.0, 24.0),
         ))
         .child(
-            text_input(
-                &s.current().draft,
-                COMPOSER.family(rune::Family::Named("Inter Variable")),
-            )
-            .key("measure-composer-prompt")
-            .w(s.composer_ui.expanded_width.get().max(1.0) + 8.0)
-            .padding(4.0)
-            .pill_colors(p.selected, Some(p.ink))
-            .pill_icon(composer_menu::pill_icon)
-            .inert(),
+            text_input(&s.current().draft, COMPOSER)
+                .key("measure-composer-prompt")
+                .w(s.composer_ui.expanded_width.get().max(1.0) + 8.0)
+                .padding(4.0)
+                .pill_colors(p.selected, Some(p.ink))
+                .pill_icon(composer_menu::pill_icon)
+                .inert(),
         )
 }
 
@@ -758,7 +756,7 @@ pub(crate) fn paste(s: &mut State, content: &rune::ClipboardContent, tx: &mut Tx
 pub(super) fn collapsed(s: &State, width: f32, expanded_width: f32) -> bool {
     s.composer_ui.expanded_width.set(expanded_width);
     let t = s.current();
-    let style = COMPOSER.family(rune::Family::Named("Inter Variable"));
+    let style = COMPOSER;
     // Measure at the expanded width, not beside resting actions, to avoid oscillation.
     let text = t.draft.display().0;
     let (natural, _) = rune::text::measure(&text, &[], style, None);
