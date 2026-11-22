@@ -781,6 +781,8 @@ pub struct MovePicker {
     pub mode: MoveMode,
     /// The element key the picker hangs from.
     pub anchor: String,
+    /// Captured pointer position when opened from a context menu without a mounted row.
+    pub at: Option<(f32, f32)>,
 }
 
 /// The Captain lifecycle actions the shared confirmation dialog can ask for.
@@ -5179,6 +5181,8 @@ pub struct State {
     pub plan_save_last_path: Option<String>,
     next_plan_save_request_id: u64,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
+    pub snooze_anchor: Option<String>,
+    pub snooze_at: Option<(f32, f32)>,
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
     pub snooze_edit: TextEdit,
@@ -6308,6 +6312,8 @@ impl State {
             citation_highlight: None,
             citation_comment: None,
             snooze_menu: None,
+            snooze_anchor: None,
+            snooze_at: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
             snooze_edit: TextEdit::default(),
@@ -6926,6 +6932,8 @@ impl State {
         // A retired record's sheet belongs to the thread it was opened from.
         self.brief.record = None;
         self.brief.confirm_reset = false;
+        self.brief.recruit = None;
+        self.brief.more = None;
         self.plan_menu = None;
         self.env_mode_picker = false;
         self.base_branch_picker = false;
@@ -9142,15 +9150,21 @@ impl State {
         self.snooze_blocker(id).is_none()
     }
     pub fn open_snooze(&mut self, id: usize) {
+        self.open_snooze_from(id, None, None);
+    }
+    pub fn open_snooze_from(&mut self, id: usize, anchor: Option<String>, at: Option<(f32, f32)>) {
         if self.snooze_blocker(id).is_some() {
             return;
         }
         self.row_menu = None;
+        self.row_menu_at = None;
         self.thread_menu = false;
         self.snooze_menu = Some((
             id,
             lifecycle::snooze_choices_from(self.thread_defaults.snooze_presets()),
         ));
+        self.snooze_anchor = anchor;
+        self.snooze_at = at;
         self.snooze_targets = if self.selected_threads.contains(&id) {
             self.selected_threads.clone()
         } else {
@@ -9165,6 +9179,8 @@ impl State {
             json!({"threadId":id,"action":"snooze","until":until}),
         ) {
             self.snooze_menu = None;
+            self.snooze_anchor = None;
+            self.snooze_at = None;
             return;
         }
         if until <= lifecycle::now() || !self.can_snooze(id) {
@@ -9176,6 +9192,8 @@ impl State {
         self.remember(Action::Snooze, i);
         self.threads[i].life.snooze(lifecycle::now(), until);
         self.snooze_menu = None;
+        self.snooze_anchor = None;
+        self.snooze_at = None;
         self.advance_parked(id);
         self.checkpoint();
     }
@@ -12629,6 +12647,19 @@ impl State {
         Some((machine, project.path.to_string_lossy().into_owned()))
     }
 
+    /// Whether the current thread hides its composer behind a read-only Captain bar
+    /// (an archived Captain home or an earlier Captain conversation).
+    pub fn composer_hidden(&self) -> bool {
+        let t = self.current();
+        let archived_home = t.captain_home
+            && t.captain
+                .is_some_and(|captain| self.captain_phase(captain) == CaptainPhase::Archived);
+        let earlier_home = self.is_captain_home(t)
+            && t.captain
+                .is_some_and(|captain| self.captain_home(captain) != Some(t.id));
+        archived_home || earlier_home
+    }
+
     pub fn composer_vcs_controls(&self) -> ComposerVcsControls {
         if self.demo {
             return ComposerVcsControls::Hidden;
@@ -12784,6 +12815,19 @@ impl State {
         } else {
             None
         };
+        let controls = self.composer_vcs_controls();
+        if !matches!(
+            controls,
+            ComposerVcsControls::Editable {
+                mode: ThreadEnvMode::Worktree,
+                ..
+            }
+        ) {
+            self.base_branch_picker = false;
+        }
+        if !matches!(controls, ComposerVcsControls::Editable { .. }) {
+            self.env_mode_picker = false;
+        }
         if let Some(default_branch) = default_branch {
             let mut updated_active = false;
             let default_mode = self.effective_default_thread_env_mode();

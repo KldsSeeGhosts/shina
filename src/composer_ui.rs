@@ -649,8 +649,16 @@ impl State {
 /// Popup checks also cover an unfocused popup. There is no embedded terminal or side chat
 /// input in Shina; their separate native windows never deliver keys to this window.
 pub(crate) fn redirect_allowed(s: &State, focused: Option<&str>) -> bool {
-    focused.is_none_or(|key| key == format!("conversation-{}", s.current().id))
-        && !s.thread_find.query.focused
+    focused.is_none_or(|key| {
+        key == format!("conversation-{}", s.current().id)
+            // The draft surface itself: the hero's inline project picker and the collapsed
+            // draft preview. Rune's focus rescue hands the keyboard to the nearest surviving
+            // control when the expanded field folds into its inert preview, and lands on the
+            // picker. Text and paste there still mean the draft. Space and Return keep
+            // pressing them: activation runs before the window's `on_key` in `route_key`.
+            || key == "draft-project"
+            || key == "composer-preview"
+    }) && !s.thread_find.query.focused
         && !s.current().draft.is_composing()
         && !s.settings_menu
         && s.settings_picker.is_none()

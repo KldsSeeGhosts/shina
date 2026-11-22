@@ -1186,8 +1186,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if docked && let Some(preview) = sidebar_preview::view(s, p, sidebar_width) {
         root = root.child(preview);
     }
-    if let Some(notice) = s.composer_notices.open_details_notice() {
-        root = root.child(composer_notice_details_popover(notice, p));
+    if let Some(notice) = s.composer_notices.open_details_notice()
+        && let Some(popover) =
+            composer_notice_details_popover(notice, p, lane_width(main_width, wide), cx)
+    {
+        root = root.child(popover);
     }
     // Citation chips get a comment action pinned over each pill's right end,
     // mounted at the root like the other composer overlays so nothing clips it.
@@ -1221,26 +1224,75 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
         root = root.child(captain_editor(s, p, height));
     } else if s.settings_picker.is_some() {
-        root = root.child(settings_picker(s, &composer_model, p));
+        if s.composer_hidden() {
+            root = root.child(
+                el().key("settings-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.settings_picker = None),
+            );
+        } else {
+            root = root.child(settings_picker(s, &composer_model, p));
+        }
     } else if s.captain_picker {
-        root = root.child(captain_picker(s, p));
+        let anchor = (!s.composer_hidden())
+            .then(|| {
+                if s.composer_ui.visible_blocks.get() >= 2
+                    && cx.layout_with("captain-selector", |_| ()).is_some()
+                {
+                    Some("captain-selector")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else if cx.layout_with("captain-selector", |_| ()).is_some() {
+                    Some("captain-selector")
+                } else if cx.layout_with("composer", |_| ()).is_some() {
+                    Some("composer")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(captain_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("captain-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.cancel_captain_flow()),
+            );
+        }
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
     } else if s.current().native.access_picker {
-        let anchor = if cx.layout_with("access-mode", |_| ()).is_some() {
-            "access-mode"
-        } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
-            "composer-overflow"
+        if s.composer_hidden() {
+            root = root.child(
+                el().key("access-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.current_mut().native.access_picker = false),
+            );
         } else {
-            "composer"
-        };
-        root = root.child(pi_ui::access_picker(s, p, anchor));
+            let anchor = if cx.layout_with("access-mode", |_| ()).is_some() {
+                "access-mode"
+            } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                "composer-overflow"
+            } else {
+                "composer"
+            };
+            root = root.child(pi_ui::access_picker(s, p, anchor));
+        }
     } else if s.current().native.conversation.is_some() {
         root = root.child(pi_ui::conversation_picker(s, p));
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
     } else if s.plan_menu.is_some() {
-        root = root.child(work_ui::plan_menu(s, p));
+        if let Some(menu) = work_ui::plan_menu(s, p, cx) {
+            root = root.child(menu);
+        }
     }
     if s.row_menu.is_some() {
         // A right-click opens the menu where it landed; the keyboard opens it beside the row.
@@ -1251,7 +1303,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     .size(0.0, 0.0),
             );
         }
-        root = root.child(row_menu(s, p));
+        if let Some(menu) = row_menu(s, p, cx) {
+            root = root.child(menu);
+        }
     }
     if s.tab_menu.is_some() {
         if let Some((x, y)) = s.tab_menu_at {
@@ -1264,31 +1318,144 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(thread_tab_menu(s, p));
     }
     if s.snooze_menu.is_some() {
-        root = root.child(snooze_menu(s, p));
+        if let Some((x, y)) = s.snooze_at {
+            root = root.child(
+                el().key("snooze-menu-point")
+                    .absolute(x / zoom, y / zoom)
+                    .size(0.0, 0.0),
+            );
+        }
+        if let Some(menu) = snooze_menu(s, p, cx) {
+            root = root.child(menu);
+        }
     }
     if s.settings_menu {
         root = root.child(settings_ui::dialog(s, p));
     }
     if s.machines.picker {
-        root = root.child(machine_picker(s, p));
+        let anchor = (!s.composer_hidden())
+            .then(|| {
+                if s.composer_ui.visible_blocks.get() > 0
+                    && cx.layout_with("machine-selector", |_| ()).is_some()
+                {
+                    Some("machine-selector")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else if cx.layout_with("machine-selector", |_| ()).is_some() {
+                    Some("machine-selector")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(machine_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("machine-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.machines.picker = false),
+            );
+        }
     }
     if s.env_mode_picker {
-        root = root.child(env_mode_picker(s, p));
+        let can_show = !s.composer_hidden()
+            && matches!(
+                s.composer_vcs_controls(),
+                crate::model::ComposerVcsControls::Editable { .. }
+            );
+        let anchor = can_show
+            .then(|| {
+                if s.composer_ui.visible_blocks.get() > 0
+                    && cx.layout_with("env-mode-trigger", |_| ()).is_some()
+                {
+                    Some("env-mode-trigger")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else if cx.layout_with("env-mode-trigger", |_| ()).is_some() {
+                    Some("env-mode-trigger")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(env_mode_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("env-mode-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.env_mode_picker = false),
+            );
+        }
     }
     if s.base_branch_picker {
-        root = root.child(base_branch_picker(s, p));
+        let can_show = !s.composer_hidden()
+            && matches!(
+                s.composer_vcs_controls(),
+                crate::model::ComposerVcsControls::Editable {
+                    mode: crate::model::ThreadEnvMode::Worktree,
+                    ..
+                }
+            );
+        let anchor = can_show
+            .then(|| {
+                if cx.layout_with("base-branch-trigger", |_| ()).is_some() {
+                    Some("base-branch-trigger")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(base_branch_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("base-branch-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.base_branch_picker = false),
+            );
+        }
     }
     if s.composer_ui.overflow.get() {
-        root = root.child(composer_ui::overflow_menu(s, p));
+        if !s.composer_hidden() && cx.layout_with("composer-overflow", |_| ()).is_some() {
+            root = root.child(composer_ui::overflow_menu(s, p));
+        } else {
+            root = root.child(
+                el().key("composer-overflow-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.composer_ui.overflow.set(false)),
+            );
+        }
     }
     if composer_stash::menu_open(s) {
-        // KSG's drawer portal, mounted beside the other composer popovers.
-        root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+        if !s.composer_hidden() && cx.layout_with("composer-stash-badge", |_| ()).is_some() {
+            // KSG's drawer portal, mounted beside the other composer popovers.
+            root = root.child(composer_stash::menu(s, p, lane_width(main_width, wide)));
+        } else {
+            root = root.child(
+                el().key("composer-stash-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.stash_menu = false),
+            );
+        }
     }
     if composer_code_picker::menu_open(s) {
         root = root.child(composer_code_picker::menu(s, p));
     }
-    if let Some(popover) = citation_comment::popover(s, p) {
+    if let Some(popover) = citation_comment::popover(s, p, cx) {
         root = root.child(popover);
     }
     if s.machines.dialog {
@@ -1306,25 +1473,57 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let crew_overlay_captain = captain_ui::brief_captain(s)
         .or_else(|| s.current().crew_captain.filter(|c| *c < s.captains.len()));
     if let Some(captain) = crew_overlay_captain {
-        if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain) {
+        if let Some(menu) = crew_membership_ui::recruit_palette(s, p, captain, cx) {
             root = root.child(menu);
         }
         // A secondary press on a Crew Roster row opens the member's More menu right there,
         // anchored to the row.
         if let Some(thread_id) = s.brief.more {
+            let anchor = format!("crew-chip-{thread_id}");
+            if cx.layout_with(&anchor, |_| ()).is_some() {
+                root = root.child(
+                    crew_membership_ui::more_menu(s, p, captain, thread_id)
+                        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::End, 4.0)
+                        .modal(true, |s: &mut State| s.brief.more = None),
+                );
+            } else {
+                root = root.child(
+                    el().key("crew-more-dismiss")
+                        .absolute(0.0, 0.0)
+                        .size(0.0, 0.0)
+                        .a11y_hidden()
+                        .on_layout(|s: &mut State, _| s.brief.more = None),
+                );
+            }
+        }
+    } else {
+        if s.brief.recruit.is_some() {
             root = root.child(
-                crew_membership_ui::more_menu(s, p, captain, thread_id)
-                    .anchored_fit(
-                        format!("crew-chip-{thread_id}"),
-                        rune::Side::Bottom,
-                        rune::Align::End,
-                        4.0,
-                    )
-                    .modal(true, |s: &mut State| s.brief.more = None),
+                el().key("crew-recruit-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.brief.recruit = None),
+            );
+        }
+        if s.brief.more.is_some() {
+            root = root.child(
+                el().key("crew-more-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.brief.more = None),
             );
         }
     }
-    if let Some(menu) = crew_membership_ui::move_picker(s, p) {
+    if let Some((x, y)) = s.brief.moving.as_ref().and_then(|m| m.at) {
+        root = root.child(
+            el().key("crew-move-point")
+                .absolute(x / zoom, y / zoom)
+                .size(0.0, 0.0),
+        );
+    }
+    if let Some(menu) = crew_membership_ui::move_picker(s, p, cx) {
         root = root.child(menu);
     }
     if !s.toasts.is_empty() {
@@ -5336,7 +5535,7 @@ fn captain_selector_trigger(s: &State, p: Palette, icon_only: bool) -> El {
 /// Ported from KSG Code's `ModelPickerContent` (searchable list in a bordered popover card)
 /// and `BranchToolbarEnvironmentSelector` (anchored above the composer footer control).
 /// Captains, portraits, and the "No captain" / "New captain" rows are Shina-specific.
-fn captain_picker(s: &State, p: Palette) -> El {
+fn captain_picker(s: &State, p: Palette, anchor: &str) -> El {
     let t = s.current();
     let selected_captain = t.captain;
     let query = s.captain_picker_query.text.trim().to_lowercase();
@@ -5543,21 +5742,12 @@ fn captain_picker(s: &State, p: Palette) -> El {
         .child(label("New captain", TextStyle::new(14.0, 500.0), p.ink));
     card = card.child(col().py(4.0).child(new_captain));
 
-    card.anchored_fit(
-        if s.composer_ui.visible_blocks.get() < 2 {
-            "composer-overflow"
-        } else {
-            "captain-selector"
-        },
-        rune::Side::Top,
-        rune::Align::Start,
-        6.0,
-    )
-    .focus_return("composer-input")
-    .modal(true, |s: &mut State| {
-        s.cancel_captain_flow();
-        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-    })
+    card.anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.cancel_captain_flow();
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// A portrait's cell in the captain editor's grid: the 40 pt face and 4 pt each side.
@@ -6447,6 +6637,7 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                 ),
             );
         } else {
+            let snooze_anchor = anchor.to_owned();
             actions = actions.child(
                 gated_menu_item(
                     "menu-snooze-thread",
@@ -6455,7 +6646,14 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                     p,
                     s.snooze_blocker(id),
                 )
-                .on_press(move |s: &mut State| s.open_snooze(id)),
+                .on_press(move |s: &mut State| {
+                    let at = if snooze_anchor == "thread-actions" {
+                        None
+                    } else {
+                        s.row_menu_at
+                    };
+                    s.open_snooze_from(id, Some(snooze_anchor.clone()), at);
+                }),
             );
         }
     }
@@ -6619,13 +6817,20 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                             {
                                 return;
                             }
+                            let at = if move_anchor == "thread-actions" {
+                                None
+                            } else {
+                                s.row_menu_at
+                            };
                             s.row_menu = None;
+                            s.row_menu_at = None;
                             s.thread_menu = false;
                             s.brief.moving = Some(crate::model::MovePicker {
                                 server: move_server.clone(),
                                 thread: id,
                                 mode: crate::model::MoveMode::Move { from: owner },
                                 anchor: move_anchor.clone(),
+                                at,
                             });
                         }),
                 )
@@ -6688,13 +6893,20 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                     if s.machines.selected != join_server {
                         return;
                     }
+                    let at = if join_anchor == "thread-actions" {
+                        None
+                    } else {
+                        s.row_menu_at
+                    };
                     s.row_menu = None;
+                    s.row_menu_at = None;
                     s.thread_menu = false;
                     s.brief.moving = Some(crate::model::MovePicker {
                         server: join_server.clone(),
                         thread: id,
                         mode: crate::model::MoveMode::Join,
                         anchor: join_anchor.clone(),
+                        at,
                     });
                 }),
             );
@@ -6862,8 +7074,45 @@ fn captain_lifecycle_menu_item(
     })
 }
 
-fn snooze_menu(s: &State, p: Palette) -> El {
-    let (_, choices) = s.snooze_menu.as_ref().unwrap();
+fn snooze_menu(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let (id, choices) = s.snooze_menu.as_ref()?;
+    let id = *id;
+    let row_key = format!("thread-{id}");
+    // Under Rune #1339 an anchored overlay whose anchor is not mounted is
+    // suppressed visually while still holding modal focus. Use `thread-actions`
+    // for header launches, a mounted row or captured pointer point for sidebar
+    // launches, and never mount a modal without a live anchor.
+    let (anchor, side, align) = if s.snooze_anchor.as_deref() == Some("thread-actions")
+        && cx.layout_with("thread-actions", |_| ()).is_some()
+    {
+        (
+            "thread-actions".to_owned(),
+            rune::Side::Bottom,
+            rune::Align::End,
+        )
+    } else if let Some(a) = s
+        .snooze_anchor
+        .as_deref()
+        .filter(|a| cx.layout_with(a, |_| ()).is_some())
+    {
+        (a.to_owned(), rune::Side::Right, rune::Align::Start)
+    } else if cx.layout_with(&row_key, |_| ()).is_some() {
+        (row_key, rune::Side::Right, rune::Align::Start)
+    } else if s.snooze_at.is_some() {
+        (
+            "snooze-menu-point".to_owned(),
+            rune::Side::Right,
+            rune::Align::Start,
+        )
+    } else if cx.layout_with("thread-actions", |_| ()).is_some() {
+        (
+            "thread-actions".to_owned(),
+            rune::Side::Bottom,
+            rune::Align::End,
+        )
+    } else {
+        return None;
+    };
     let mut card = col()
         .key("snooze-menu")
         .role("menu")
@@ -6947,18 +7196,17 @@ fn snooze_menu(s: &State, p: Palette) -> El {
     if let Some(error) = &s.lifecycle_error {
         card = card.child(label(error, SMALL, p.danger).wrap());
     }
-    // A popover on the thread's row, like the thread menu: no scrim, no Cancel row. Escape and a
+    // A popover on the thread's row or header trigger: no scrim, no Cancel row. Escape and a
     // press outside close it.
-    card.anchored_fit(
-        format!("thread-{}", s.snooze_menu.as_ref().unwrap().0),
-        rune::Side::Right,
-        rune::Align::Start,
-        4.0,
+    Some(
+        card.anchored_fit(anchor, side, align, 4.0)
+            .modal(true, |s: &mut State| {
+                s.snooze_menu = None;
+                s.snooze_anchor = None;
+                s.snooze_at = None;
+                s.lifecycle_error = None;
+            }),
     )
-    .modal(true, |s: &mut State| {
-        s.snooze_menu = None;
-        s.lifecycle_error = None;
-    })
 }
 
 fn bulk_thread_actions(s: &State, p: Palette) -> El {
@@ -6980,10 +7228,12 @@ fn bulk_thread_actions(s: &State, p: Palette) -> El {
             )
             .on_press(move |s: &mut State| {
                 let ids = s.selected_threads.clone();
+                let at = s.row_menu_at;
                 s.row_menu = None;
+                s.row_menu_at = None;
                 if action == 2 {
                     if let Some(id) = ids.first() {
-                        s.open_snooze(*id);
+                        s.open_snooze_from(*id, Some(format!("thread-{}", *id)), at);
                     }
                     return;
                 }
@@ -7013,83 +7263,106 @@ fn bulk_thread_actions(s: &State, p: Palette) -> El {
     actions
 }
 
-fn row_menu(s: &State, p: Palette) -> El {
-    let target = s.row_menu.expect("row menu target");
+fn row_menu(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let target = s.row_menu?;
     let (anchor, actions) = match target {
-        RowTarget::Thread(id) => (
-            format!("thread-{id}"),
-            if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
-                bulk_thread_actions(s, p)
+        RowTarget::Thread(id) => {
+            let row_key = format!("thread-{id}");
+            let anchor = if s.row_menu_at.is_some() {
+                "row-menu-point".to_owned()
+            } else if cx.layout_with(&row_key, |_| ()).is_some() {
+                row_key
+            } else if cx.layout_with("thread-actions", |_| ()).is_some() {
+                "thread-actions".to_owned()
             } else {
-                thread_actions(s, id, p, &format!("thread-{id}"))
-            },
-        ),
-        RowTarget::Project(id) => (
-            format!("project-option-{id}"),
-            col()
-                .child(
-                    menu_item("menu-project-new-thread", "New thread", "compose", p).on_press(
-                        move |s: &mut State| {
-                            s.row_menu = None;
-                            s.new_thread_in(Some(id));
-                        },
-                    ),
-                )
-                .child(
-                    menu_item("menu-project-captain", "Open Captain", "grid", p).on_press(
-                        move |s: &mut State| {
+                return None;
+            };
+            (
+                anchor,
+                if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
+                    bulk_thread_actions(s, p)
+                } else {
+                    thread_actions(s, id, p, &format!("thread-{id}"))
+                },
+            )
+        }
+        RowTarget::Project(id) => {
+            let option_key = format!("project-option-{id}");
+            let anchor = if s.row_menu_at.is_some() {
+                "row-menu-point".to_owned()
+            } else if cx.layout_with(&option_key, |_| ()).is_some() {
+                option_key
+            } else {
+                return None;
+            };
+            (
+                anchor,
+                col()
+                    .child(
+                        menu_item("menu-project-new-thread", "New thread", "compose", p).on_press(
+                            move |s: &mut State| {
+                                s.row_menu = None;
+                                s.new_thread_in(Some(id));
+                            },
+                        ),
+                    )
+                    .child(
+                        menu_item("menu-project-captain", "Open Captain", "grid", p).on_press(
+                            move |s: &mut State| {
+                                s.row_menu = None;
+                                s.project_picker = None;
+                                s.choose_project_captain(id);
+                            },
+                        ),
+                    )
+                    .child(
+                        menu_item(
+                            "menu-remove-project",
+                            "Remove workspace from list",
+                            "close",
+                            p,
+                        )
+                        .on_press(move |s: &mut State| {
                             s.row_menu = None;
                             s.project_picker = None;
-                            s.choose_project_captain(id);
-                        },
+                            s.remove_project(id);
+                        }),
                     ),
-                )
-                .child(
-                    menu_item(
-                        "menu-remove-project",
-                        "Remove workspace from list",
-                        "close",
-                        p,
-                    )
-                    .on_press(move |s: &mut State| {
-                        s.row_menu = None;
-                        s.project_picker = None;
-                        s.remove_project(id);
-                    }),
-                ),
-        ),
+            )
+        }
     };
-    col()
-        .key("row-context-menu")
-        .instant_changes()
-        .role("menu")
-        .focus_group()
-        .label("Row actions")
-        .w(222.0)
-        .padding(4.0)
-        .gap(1.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.frame)
-        .box_shadow(soft_shadow(p))
-        .anchored_fit(
-            if s.row_menu_at.is_some() {
-                "row-menu-point".into()
-            } else {
-                anchor
-            },
-            // Beside the point, as a native context menu opens, so the window clamps it
-            // vertically instead of cutting it short.
-            if s.row_menu_at.is_some() || matches!(target, RowTarget::Thread(_)) {
-                rune::Side::Right
-            } else {
-                rune::Side::Bottom
-            },
-            rune::Align::Start,
-            if s.row_menu_at.is_some() { 2.0 } else { 4.0 },
-        )
-        .modal(true, |s: &mut State| s.row_menu = None)
-        .child(actions)
+    Some(
+        col()
+            .key("row-context-menu")
+            .instant_changes()
+            .role("menu")
+            .focus_group()
+            .label("Row actions")
+            .w(222.0)
+            .padding(4.0)
+            .gap(1.0)
+            .radius(12.0)
+            .fill(p.card)
+            .border(1.0, p.frame)
+            .box_shadow(soft_shadow(p))
+            .anchored_fit(
+                anchor,
+                // Beside the point, as a native context menu opens, so the window clamps it
+                // vertically instead of cutting it short.
+                if s.row_menu_at.is_some() || matches!(target, RowTarget::Thread(_)) {
+                    rune::Side::Right
+                } else {
+                    rune::Side::Bottom
+                },
+                rune::Align::Start,
+                if s.row_menu_at.is_some() { 2.0 } else { 4.0 },
+            )
+            .modal(true, |s: &mut State| {
+                s.row_menu = None;
+                s.row_menu_at = None;
+            })
+            .child(actions),
+    )
 }
 
 fn thread_dialog(s: &State, p: Palette) -> El {
@@ -13472,6 +13745,28 @@ fn composer_shell(p: Palette, inner: El, strip: Option<El>) -> El {
         .child(strip)
 }
 
+fn composer_notice_overflows(notice: &crate::composer_notices::Notice, lane: f32) -> bool {
+    let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
+    let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
+    let action_style = TextStyle::new(12.0, 500.0);
+    let mut actions_width = 0.0;
+    for act in &notice.actions {
+        actions_width += 20.0 + rune::text::measure(&act.label, &[], action_style, None).0 + 4.0;
+    }
+    let dismiss_width = if notice.dismiss_label.is_some() {
+        24.0 + 4.0
+    } else {
+        0.0
+    };
+    let available_text =
+        (lane - 4.0 - 8.0 - 24.0 - 4.0 - actions_width - dismiss_width - 4.0).max(0.0);
+    let title_width = rune::text::measure(&notice.title, &[], title_style, None).0;
+    let desc_width = notice.description.as_deref().map_or(0.0, |desc| {
+        4.0 + rune::text::measure(desc, &[], desc_style, None).0
+    });
+    title_width + desc_width > available_text + 0.5
+}
+
 /// Ported from KSG Code's `ComposerBannerStack` and `ComposerBanner` (`attached`,
 /// `density="comfortable"`), inside the composer tray: 15 px outer corners on the top notice,
 /// variant colour on the icon and a 2 px left edge.
@@ -13483,7 +13778,6 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
     }
     let title_style = TextStyle::new(12.0, 500.0).lh(16.0);
     let desc_style = TextStyle::new(12.0, 400.0).lh(16.0);
-    let action_style = TextStyle::new(12.0, 500.0);
     let mut stack = col().key("composer-notices").w_full().gap(0.0);
     for (index, notice) in notices.iter().enumerate() {
         let top = index == 0;
@@ -13506,23 +13800,7 @@ fn composer_notice_stack(s: &State, p: Palette, lane: f32) -> Option<El> {
             Some(desc) if !desc.is_empty() => format!("{}: {desc}", notice.title),
             _ => notice.title.clone(),
         };
-        let mut actions_width = 0.0;
-        for act in &notice.actions {
-            actions_width +=
-                20.0 + rune::text::measure(&act.label, &[], action_style, None).0 + 4.0;
-        }
-        let dismiss_width = if notice.dismiss_label.is_some() {
-            24.0 + 4.0
-        } else {
-            0.0
-        };
-        let available_text =
-            (lane - 4.0 - 8.0 - 24.0 - 4.0 - actions_width - dismiss_width - 4.0).max(0.0);
-        let title_width = rune::text::measure(&notice.title, &[], title_style, None).0;
-        let desc_width = notice.description.as_deref().map_or(0.0, |desc| {
-            4.0 + rune::text::measure(desc, &[], desc_style, None).0
-        });
-        let overflows = title_width + desc_width > available_text + 0.5;
+        let overflows = composer_notice_overflows(notice, lane);
 
         let mut content = row()
             .key(format!("composer-notice-content-{}", notice.id))
@@ -13787,7 +14065,30 @@ fn usage_limits_notice_body(
 }
 
 /// Overflow details popover for a composer notice, reusing `context_popover` styling.
-fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: Palette) -> El {
+fn composer_notice_details_popover(
+    notice: &crate::composer_notices::Notice,
+    p: Palette,
+    lane: f32,
+    cx: &Cx<State>,
+) -> Option<El> {
+    let trigger = format!("composer-notice-details-{}", notice.id);
+    let row_key = format!("composer-notice-{}", notice.id);
+    let anchor =
+        if composer_notice_overflows(notice, lane) && cx.layout_with(&trigger, |_| ()).is_some() {
+            trigger
+        } else if cx.layout_with(&row_key, |_| ()).is_some() {
+            row_key
+        } else if cx.layout_with("composer", |_| ()).is_some() {
+            "composer".to_owned()
+        } else {
+            return Some(
+                el().key("composer-notice-details-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.composer_notices.close_details()),
+            );
+        };
     let mut card = col()
         .key("composer-notice-details-popover")
         .role("dialog")
@@ -13801,12 +14102,7 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
         .fill(p.card)
         .border(1.0, p.frame)
         .box_shadow(soft_shadow(p))
-        .anchored(
-            &format!("composer-notice-details-{}", notice.id),
-            rune::Side::Top,
-            rune::Align::End,
-            4.0,
-        )
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::End, 4.0)
         .modal(true, |s: &mut State| s.composer_notices.close_details())
         .on_key(|s: &mut State, event, _| {
             if event.key == rune::Key::Escape {
@@ -13842,7 +14138,7 @@ fn composer_notice_details_popover(notice: &crate::composer_notices::Notice, p: 
                 .selectable(true),
         );
     }
-    card
+    Some(card)
 }
 
 /// Derives the breakdown legend for a thread when breakdown rows are available.
@@ -15807,7 +16103,7 @@ fn machine_option(key: &str, title: &str, server: &str, online: bool, p: Palette
 }
 
 /// Ported from KSG Code's BranchToolbarEnvironmentSelector SelectPopup/SelectGroup.
-fn machine_picker(s: &State, p: Palette) -> El {
+fn machine_picker(s: &State, p: Palette, anchor: &str) -> El {
     let mut menu = col()
         .key("machine-picker")
         .role("menu")
@@ -15843,25 +16139,16 @@ fn machine_picker(s: &State, p: Palette) -> El {
             s.machines.dialog = true;
         }),
     );
-    menu.anchored_fit(
-        if s.composer_ui.visible_blocks.get() == 0 {
-            "composer-overflow"
-        } else {
-            "machine-selector"
-        },
-        rune::Side::Top,
-        rune::Align::Start,
-        6.0,
-    )
-    .focus_return("composer-input")
-    .modal(true, |s: &mut State| {
-        s.machines.picker = false;
-        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-    })
+    menu.anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.machines.picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// Ported from KSG Code's `BranchToolbarEnvModeSelector` `SelectPopup`.
-fn env_mode_picker(s: &State, p: Palette) -> El {
+fn env_mode_picker(s: &State, p: Palette, anchor: &str) -> El {
     let force_worktree = s.is_multi_model_active();
     let active = if force_worktree {
         crate::model::ThreadEnvMode::Worktree
@@ -15951,25 +16238,16 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         }
         menu = menu.child(item);
     }
-    menu.anchored_fit(
-        if s.composer_ui.visible_blocks.get() == 0 {
-            "composer-overflow"
-        } else {
-            "env-mode-trigger"
-        },
-        rune::Side::Top,
-        rune::Align::Start,
-        6.0,
-    )
-    .focus_return("composer-input")
-    .modal(true, |s: &mut State| {
-        s.env_mode_picker = false;
-        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-    })
+    menu.anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.env_mode_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// Ported from KSG Code's `BranchPicker` and `BranchToolbarBranchSelector`.
-fn base_branch_picker(s: &State, p: Palette) -> El {
+fn base_branch_picker(s: &State, p: Palette, anchor: &str) -> El {
     let t = s.current();
     let selected_branch = t.base_branch.as_deref();
     let start_from_origin = t.effective_start_from_origin();
@@ -16157,12 +16435,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
         .child(list)
         .child(rule(p))
         .child(origin_row)
-        .anchored_fit(
-            "base-branch-trigger",
-            rune::Side::Top,
-            rune::Align::Start,
-            6.0,
-        )
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| {
             s.base_branch_picker = false;
@@ -18629,6 +18902,128 @@ pub(crate) mod tests {
             press(&mut rt, &thread_href);
             assert_eq!(rt.state.current().id, 2);
         }
+    }
+
+    #[test]
+    fn transcript_context_copy_handles_authored_isolates_multibyte_pills_and_partial_pill_selections()
+     {
+        let mut rt = runtime(1280.0);
+        rt.on_key = Some(crate::key);
+        let clipboard = rune::clipboard::memory();
+        rt.use_clipboard(&clipboard);
+
+        let r1 = crate::composer_context::thread_context_record("local", 2, "αβγ日本語");
+        let r2 = crate::composer_context::thread_context_record("local", 3, "δεζ中文");
+        let href1 = crate::composer_context::format_composer_context_href("thread", &r1.context_id);
+        let href2 = crate::composer_context::format_composer_context_href("thread", &r2.context_id);
+        // Pill 1 gets Rune-generated U+2068/U+2069 marks; the standalone LRI..PDI and
+        // Pill 2's surrounding U+2068/U+2069 are authored and must stay intact.
+        let source = format!(
+            "Start [αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})\u{2069} tail"
+        );
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "context-bidi".into(),
+            role: "You",
+            text: source,
+            images: Vec::new(),
+            context: Some(crate::composer_context::MessageContext {
+                version: 1,
+                records: vec![r1.clone(), r2.clone()],
+            }),
+        });
+        let mut t2 = Thread::new(2);
+        t2.title = "αβγ日本語".into();
+        let mut t3 = Thread::new(3);
+        t3.title = "δεζ中文".into();
+        rt.state.threads.push(t2);
+        rt.state.threads.push(t3);
+        rt.frame(0.0);
+
+        let key = "context-text-1-context-bidi-0";
+        let copy_cmd = || rune::KeyEvent {
+            key: rune::Key::Command('c'),
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        };
+
+        // 1. Full copy: no panic, both pills exported, authored marks kept, no generated marks leaked.
+        rt.update(|_, tx| {
+            tx.blur();
+            tx.select_all_text(key);
+        });
+        rt.frame(0.0);
+        rt.key(copy_cmd());
+        rt.frame(0.0);
+        let full = clipboard.content().unwrap();
+        let expected_full = format!(
+            "Start [αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})\u{2069} tail"
+        );
+        assert_eq!(full.text(), expected_full);
+        let frag =
+            crate::composer_context::decode_composer_context_clipboard_html(full.html()).unwrap();
+        assert_eq!(frag.records, vec![r1.clone(), r2.clone()]);
+
+        // 2. Partial selection starting inside Pill 1's multibyte label through end of text.
+        let rendered = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .and_then(|e| e.text)
+            .expect("rendered pill text");
+        let inside_p1 = rendered
+            .find("日本語")
+            .expect("multibyte midpoint inside pill 1");
+        let inside_p2 = rendered
+            .find("中文")
+            .expect("multibyte midpoint inside pill 2");
+        let end_all = rendered.len();
+        rt.update(move |_, tx| {
+            tx.blur();
+            tx.select_text(key, inside_p1..end_all);
+        });
+        rt.frame(0.0);
+        assert!(
+            rt.selection().is_some(),
+            "partial selection from inside pill 1"
+        );
+        rt.key(copy_cmd());
+        rt.frame(0.0);
+        let from_p1 = clipboard.content().unwrap();
+        assert_eq!(
+            from_p1.text(),
+            format!(
+                "[αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})\u{2069} tail"
+            )
+        );
+        let frag_from_p1 =
+            crate::composer_context::decode_composer_context_clipboard_html(from_p1.html())
+                .unwrap();
+        assert_eq!(frag_from_p1.records, vec![r1.clone(), r2.clone()]);
+
+        // 3. Partial selection from start of text ending inside Pill 2's multibyte label.
+        rt.update(move |_, tx| {
+            tx.blur();
+            tx.select_text(key, 0..inside_p2);
+        });
+        rt.frame(0.0);
+        assert!(
+            rt.selection().is_some(),
+            "partial selection ending inside pill 2"
+        );
+        rt.key(copy_cmd());
+        rt.frame(0.0);
+        let to_p2 = clipboard.content().unwrap();
+        assert_eq!(
+            to_p2.text(),
+            format!(
+                "Start [αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})"
+            )
+        );
+        let frag_to_p2 =
+            crate::composer_context::decode_composer_context_clipboard_html(to_p2.html()).unwrap();
+        assert_eq!(frag_to_p2.records, vec![r1, r2]);
     }
 
     #[test]
@@ -23452,6 +23847,42 @@ pub(crate) mod tests {
         press(&mut rt, "thread-undo");
         assert!(!rt.state.threads[0].life.snoozed(lifecycle::now()));
         assert!(rt.state.undo.is_none());
+    }
+
+    #[test]
+    fn snooze_menu_from_header_stays_visible_when_sidebar_row_is_scrolled_away() {
+        let mut rt = runtime(1280.0);
+        for i in 2..=45 {
+            let mut t = Thread::new(i);
+            t.title = format!("Thread {i}");
+            t.life.updated_at = 1_000 + i as u64;
+            rt.state.threads.push(t);
+        }
+        // Thread 1 sits at the bottom of the virtualized sidebar list, outside the mounted range.
+        rt.state.threads[0].life.updated_at = 1;
+        let id = rt.state.current().id;
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert!(
+            rt.presented(&format!("thread-{id}")).is_none(),
+            "current thread row should be virtualized out of the mounted sidebar range"
+        );
+        press(&mut rt, "thread-actions");
+        press(&mut rt, "menu-snooze-thread");
+        let (menu, opacity) = rt
+            .presented("snooze-menu")
+            .expect("header snooze menu must remain visible when sidebar row is unmounted");
+        assert!(
+            menu[2] > 0.0 && menu[3] > 0.0 && opacity > 0.0,
+            "snooze menu must not be suppressed: rect={menu:?} opacity={opacity}"
+        );
+        assert!(menu[0] >= 0.0 && menu[0] + menu[2] <= 1280.5, "{menu:?}");
+        assert!(menu[1] >= 0.0 && menu[1] + menu[3] <= 720.5, "{menu:?}");
+        press(&mut rt, "snooze-preset-0");
+        assert!(
+            rt.state.threads[0].life.snoozed(lifecycle::now()),
+            "activating a preset inside the fallback-anchored snooze menu must snooze the thread"
+        );
     }
 
     #[test]
@@ -32365,7 +32796,7 @@ pub(crate) mod tests {
                 rt.frame(0.0);
                 assert_eq!(rt.state.current().id, id);
                 assert_eq!(rt.state.current().draft.text, "Repeat/IME");
-                rt.ime(rune::Ime::Preedit("あ".into(), None));
+                rt.ime(rune::Ime::Preedit("あ".into(), None, Vec::new()));
                 rt.frame(0.0);
                 assert!(rt.state.current().draft.is_composing());
                 rt.key(enter_chord(true));
@@ -33239,6 +33670,469 @@ pub(crate) mod tests {
                 "{width}"
             );
         }
+    }
+
+    #[test]
+    fn citation_comment_popover_stays_visible_when_short_draft_folds_narrow() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.replace_text("Short draft");
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "msg-cite-narrow".into(),
+            role: "Pi",
+            text: "the quoted passage".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        let citation = crate::assistant_citation::build_assistant_citation(
+            "local",
+            &rt.state.current().id.to_string(),
+            "msg-cite-narrow",
+            "the quoted passage",
+            0,
+            18,
+        )
+        .unwrap();
+        let record =
+            crate::assistant_citation::citation_context_record(citation, "msg-cite-narrow", None);
+        let context_id = record.context_id.clone();
+        rt.state.current_mut().insert_context_chip(record);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.25);
+
+        let pencil = format!("citation-comment-{context_id}");
+        assert!(rt.presented(&pencil).is_some());
+        press(&mut rt, &pencil);
+        assert!(rt.presented("citation-comment-popover").is_some());
+
+        // Narrowing below 640 px folds the short draft into composer-preview and removes the pencil.
+        rt.state.viewport_width = 620.0;
+        rt.set_viewport((620.0, 720.0), 1.0);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.25);
+        assert!(
+            rt.presented(&pencil).is_none(),
+            "pencil anchor should unmount when short draft folds"
+        );
+        let (rect, opacity) = rt
+            .presented("citation-comment-popover")
+            .expect("citation popover must fall back to a mounted composer anchor");
+        assert!(
+            rect[2] > 0.0 && rect[3] > 0.0 && opacity > 0.0,
+            "citation popover must not be suppressed: rect={rect:?} opacity={opacity}"
+        );
+        assert!(rect[0] >= -1.0 && rect[0] + rect[2] <= 621.0, "{rect:?}");
+        assert!(rect[1] >= -1.0 && rect[1] + rect[3] <= 721.0, "{rect:?}");
+
+        // Editing and saving through the fallback-anchored popover must still work.
+        rt.update(|s, _| {
+            s.citation_comment
+                .as_mut()
+                .unwrap()
+                .draft
+                .replace_text("kept while narrow");
+        });
+        rt.frame(0.0);
+        press(&mut rt, "citation-comment-save");
+        rt.frame(1.0);
+        assert!(rt.presented("citation-comment-popover").is_none());
+        let saved = rt
+            .state
+            .current()
+            .draft_context
+            .iter()
+            .find(|r| r.context_id == context_id)
+            .and_then(|r| match &r.data {
+                crate::composer_context::ComposerContextData::Response { citation, .. } => {
+                    citation.comment.as_deref()
+                }
+                _ => None,
+            });
+        assert_eq!(saved, Some("kept while narrow"));
+    }
+
+    #[test]
+    fn plan_menu_hides_instead_of_trapping_focus_when_plan_row_leaves_viewport() {
+        let mut rt = runtime(1280.0);
+        let t = rt.state.current_mut();
+        t.apply(serde_json::json!({
+            "type": "harness_update",
+            "field": "plan",
+            "value": { "planId": "p1", "markdown": "# Plan\n- Step 1" }
+        }));
+        t.work[0].expanded = true;
+        let card_id = format!("{}-0", t.id);
+        let actions_key = format!("plan-actions-{card_id}");
+        let menu_key = format!("plan-menu-{card_id}");
+        rt.frame(0.0);
+        rt.frame(1.0);
+        press(&mut rt, &actions_key);
+        rt.frame(2.0);
+        let (menu, opacity) = rt
+            .presented(&menu_key)
+            .expect("plan menu must be visible while plan row is mounted");
+        assert!(
+            menu[2] > 0.0 && menu[3] > 0.0 && opacity > 0.0,
+            "plan menu must not be suppressed: rect={menu:?} opacity={opacity}"
+        );
+
+        // Removing the plan trigger from the mounted tree must clear `plan_menu`
+        // rather than leaving an invisible modal or stale flag behind.
+        rt.state.current_mut().work[0].expanded = false;
+        rt.invalidate();
+        rt.frame(2.5);
+        rt.frame(3.5);
+        assert!(rt.presented(&actions_key).is_none());
+        assert!(rt.presented(&menu_key).is_none());
+        assert!(
+            rt.state.plan_menu.is_none(),
+            "stale plan_menu flag must be cleared when its trigger unmounts"
+        );
+        assert!(
+            rt.state.preview_allowed(),
+            "clearing stale plan_menu must restore sidebar previews"
+        );
+        press(&mut rt, "thread-actions");
+        assert!(
+            rt.presented("thread-menu").is_some(),
+            "header menu must remain reachable without focus trapped by a hidden plan menu"
+        );
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(4.5);
+
+        // Re-expanding the plan row must not resurrect the dismissed plan menu.
+        rt.state.current_mut().work[0].expanded = true;
+        rt.invalidate();
+        rt.frame(5.0);
+        rt.frame(6.0);
+        assert!(rt.presented(&actions_key).is_some());
+        assert!(rt.presented(&menu_key).is_none());
+    }
+
+    #[test]
+    fn crew_move_picker_stays_visible_when_launched_without_sidebar_row() {
+        let mut rt = crew_runtime(1280.0);
+        let next_id = rt.state.threads.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let mut thread = Thread::new(next_id);
+        thread.title = "Standalone root thread".into();
+        thread.project = rt.state.current().project;
+        thread.messages.push(crate::model::Message {
+            id: "msg-crew-join".into(),
+            role: "User",
+            text: "Ready to join".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        let idx = rt.state.threads.len();
+        rt.state.threads.push(thread);
+        rt.state.active = idx;
+        rt.state.tabs_enabled = false;
+        rt.state.sidebar = false;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        assert!(
+            rt.presented(&format!("thread-{next_id}")).is_none(),
+            "thread sidebar row must not be mounted when sidebar is closed and tabs are off"
+        );
+        let (title_rect, _) = rt
+            .presented("thread-title")
+            .expect("top bar thread title should be mounted");
+        let cx = title_rect[0] + title_rect[2] / 2.0;
+        let cy = title_rect[1] + title_rect[3] / 2.0;
+        rt.secondary_down(cx, cy);
+        rt.secondary_up(cx, cy);
+        rt.frame(1.5);
+        rt.frame(2.5);
+        press(&mut rt, "menu-crew-recruit");
+        rt.frame(3.0);
+        rt.frame(4.0);
+
+        let (picker, opacity) = rt
+            .presented("crew-move-picker")
+            .expect("crew move picker must stay visible when sidebar row is absent");
+        assert!(
+            picker[2] > 0.0 && picker[3] > 0.0 && opacity > 0.0,
+            "crew move picker must not be suppressed: rect={picker:?} opacity={opacity}"
+        );
+        assert!(
+            picker[0] >= -1.0 && picker[0] + picker[2] <= 1281.0,
+            "{picker:?}"
+        );
+        assert!(
+            picker[1] >= -1.0 && picker[1] + picker[3] <= 721.0,
+            "{picker:?}"
+        );
+
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(4.5);
+        rt.frame(5.5);
+        assert!(rt.state.brief.moving.is_none());
+        assert!(rt.presented("crew-move-picker").is_none());
+    }
+
+    #[test]
+    fn composer_notice_details_popover_stays_visible_when_widening_unmounts_details_button() {
+        use crate::composer_notices::{Notice, Variant};
+
+        let mut rt = runtime(620.0);
+        rt.state.composer_notices.push(
+            Notice::new("att-mid", Variant::Info, "alert", "Sync notice")
+                .description(Some(
+                    "This description overflows at 620 px wide and fits cleanly once widened to 1920 px."
+                        .into(),
+                ))
+                .dismiss_label("Dismiss notice"),
+        );
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        assert!(
+            rt.presented("composer-notice-details-att-mid").is_some(),
+            "Details button should mount at 620 px"
+        );
+        press(&mut rt, "composer-notice-details-att-mid");
+        rt.frame(2.0);
+        let (narrow_rect, narrow_opacity) = rt
+            .presented("composer-notice-details-popover")
+            .expect("details popover should open at 620 px");
+        assert!(
+            narrow_rect[2] > 0.0 && narrow_rect[3] > 0.0 && narrow_opacity > 0.0,
+            "narrow details popover must be visible: rect={narrow_rect:?} opacity={narrow_opacity}"
+        );
+
+        // Widening the window makes the notice fit on one line, unmounting the Details button.
+        rt.state.viewport_width = 1920.0;
+        rt.set_viewport((1920.0, 720.0), 1.0);
+        rt.invalidate();
+        rt.frame(2.5);
+        assert!(
+            rt.presented("composer-notice-details-att-mid").is_none(),
+            "Details button should unmount once the notice fits at 1920 px"
+        );
+        let (wide_rect, wide_opacity) = rt
+            .presented("composer-notice-details-popover")
+            .expect("details popover must fall back to a mounted notice anchor on widen");
+        assert!(
+            wide_rect[2] > 0.0 && wide_rect[3] > 0.0 && wide_opacity > 0.0,
+            "widened details popover must not be suppressed: rect={wide_rect:?} opacity={wide_opacity}"
+        );
+        assert!(
+            wide_rect[0] >= -1.0 && wide_rect[0] + wide_rect[2] <= 1921.0,
+            "{wide_rect:?}"
+        );
+        assert!(
+            wide_rect[1] >= -1.0 && wide_rect[1] + wide_rect[3] <= 721.0,
+            "{wide_rect:?}"
+        );
+
+        press(&mut rt, "close-notice-details");
+        rt.frame(3.0);
+        rt.frame(4.0);
+        assert!(rt.presented("composer-notice-details-popover").is_none());
+        assert!(rt.state.composer_notices.open_details_notice().is_none());
+    }
+
+    #[test]
+    fn base_branch_picker_dismisses_when_refresh_reports_not_a_git_repo() {
+        let mut rt = runtime(1280.0);
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path.clone()),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        rt.state
+            .set_draft_env_mode(crate::model::ThreadEnvMode::Worktree);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        press(&mut rt, "base-branch-trigger");
+        rt.frame(2.0);
+        let (picker, opacity) = rt
+            .presented("base-branch-picker")
+            .expect("base branch picker should open on a git repo");
+        assert!(
+            picker[2] > 0.0 && picker[3] > 0.0 && opacity > 0.0,
+            "base branch picker must be visible: rect={picker:?} opacity={opacity}"
+        );
+
+        // Refresh returns is_repo: false, removing base-branch-trigger.
+        rt.state.apply_vcs_branches_result(
+            "local".into(),
+            project_path,
+            Ok(crate::vcs::VcsListBranchesResult {
+                is_at_repository_root: None,
+                refs: Vec::new(),
+                is_repo: false,
+                has_primary_remote: false,
+                next_cursor: None,
+                total_count: 0,
+            }),
+        );
+        rt.invalidate();
+        rt.frame(2.5);
+        rt.frame(3.5);
+        assert!(!rt.state.base_branch_picker);
+        assert!(rt.presented("base-branch-trigger").is_none());
+        assert!(rt.presented("base-branch-picker").is_none());
+        assert!(rt.state.preview_allowed());
+        press(&mut rt, "thread-actions");
+        assert!(
+            rt.presented("thread-menu").is_some(),
+            "focus must not stay trapped after base branch picker dismisses"
+        );
+    }
+
+    #[test]
+    fn navigating_away_from_captain_clears_recruit_and_more_overlay_flags() {
+        let mut rt = crew_runtime(1280.0);
+        let captain = rt.state.current().captain.expect("captain home");
+        let next_id = rt.state.threads.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let mut other = Thread::new(next_id);
+        other.title = "Ordinary thread".into();
+        let other_idx = rt.state.threads.len();
+        rt.state.threads.push(other);
+
+        // Programmatic switch away from Captain (bypassing focus_tab) must still
+        // clear stale recruit and more flags via the layout dismiss sentinel.
+        rt.state.brief.recruit = Some(crate::model::RecruitPicker {
+            server: rt.state.machines.selected.clone(),
+            captain,
+            query: rune::TextEdit::default(),
+        });
+        rt.state.brief.more = Some(next_id);
+        rt.state.active = other_idx;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert!(rt.state.brief.recruit.is_none());
+        assert!(rt.state.brief.more.is_none());
+        assert!(rt.state.preview_allowed());
+
+        // Switching via show_thread also clears both flags immediately.
+        rt.state.show_thread(0);
+        rt.state.brief.recruit = Some(crate::model::RecruitPicker {
+            server: rt.state.machines.selected.clone(),
+            captain,
+            query: rune::TextEdit::default(),
+        });
+        rt.state.brief.more = Some(next_id);
+        rt.state.show_thread(other_idx);
+        assert!(rt.state.brief.recruit.is_none());
+        assert!(rt.state.brief.more.is_none());
+        assert!(rt.state.preview_allowed());
+    }
+
+    #[test]
+    fn composer_overflow_menu_dismisses_when_widening_removes_overflow_button() {
+        let mut rt = runtime(620.0);
+        rt.state.compact_sidebar = true;
+        rt.state.current_mut().client_draft = true;
+        rt.state.current_mut().draft.focused = true;
+        rt.state.current_mut().crew_draft = Some(crate::model::CrewDraftTarget {
+            server: "local".into(),
+            captain: 0,
+            name: "Ember".into(),
+        });
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        rt.state
+            .set_draft_env_mode(crate::model::ThreadEnvMode::Worktree);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        assert!(
+            rt.presented("composer-overflow").is_some(),
+            "narrow crew draft should show More composer controls"
+        );
+        press(&mut rt, "composer-overflow");
+        rt.frame(2.0);
+        let (menu, opacity) = rt
+            .presented("composer-overflow-menu")
+            .expect("composer overflow menu should open at 620 px");
+        assert!(
+            menu[2] > 0.0 && menu[3] > 0.0 && opacity > 0.0,
+            "composer overflow menu must be visible: rect={menu:?} opacity={opacity}"
+        );
+
+        // Widening until every composer control fits inline removes the overflow trigger.
+        rt.state.compact_sidebar = false;
+        rt.state.viewport_width = 1280.0;
+        rt.set_viewport((1280.0, 720.0), 1.0);
+        rt.invalidate();
+        rt.frame(2.5);
+        rt.frame(3.5);
+        assert!(
+            rt.presented("composer-overflow").is_none(),
+            "overflow button should unmount at 1280 px"
+        );
+        assert!(
+            rt.presented("composer-overflow-menu").is_none(),
+            "overflow menu must unmount when its trigger disappears"
+        );
+        assert!(!rt.state.composer_ui.overflow.get());
+        assert!(rt.state.preview_allowed());
+
+        // Underlying controls must respond immediately without focus trapped by a hidden modal.
+        press(&mut rt, "thread-actions");
+        assert!(
+            rt.presented("thread-menu").is_some(),
+            "underlying chat controls must respond after composer overflow menu dismisses"
+        );
     }
 
     #[test]

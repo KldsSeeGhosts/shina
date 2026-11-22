@@ -375,8 +375,17 @@ pub(super) fn chip_actions(s: &State, p: Palette, cx: &Cx<State>, zoom: f32) -> 
 /// The comment editor card: KSG's `PopoverPopup` (`width="md"`,
 /// `padding="compact"`) above the chip — the field, the over-limit line and
 /// the Cancel/Save row.
-pub(super) fn popover(s: &State, p: Palette) -> Option<El> {
+pub(super) fn popover(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
     let ed = s.citation_comment.as_ref()?;
+    let anchor = if cx.layout_with(&ed.anchor, |_| ()).is_some() {
+        ed.anchor.as_str()
+    } else if cx.layout_with("composer-preview", |_| ()).is_some() {
+        "composer-preview"
+    } else if cx.layout_with("composer", |_| ()).is_some() {
+        "composer"
+    } else {
+        return None;
+    };
     let too_long = utf16_len(&ed.draft.text) > ASSISTANT_CITATION_MAX_COMMENT_LENGTH;
     let field = text_input(&ed.draft, TextStyle::new(14.0, 400.0))
         .key("citation-comment-input")
@@ -418,7 +427,7 @@ pub(super) fn popover(s: &State, p: Palette) -> Option<El> {
         .fill(p.card)
         .border(1.0, p.frame)
         .box_shadow(soft_shadow(p))
-        .anchored_fit(&ed.anchor, rune::Side::Top, rune::Align::End, 4.0)
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::End, 4.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| outside_dismiss(s))
         .on_key(|s: &mut State, event, _| {

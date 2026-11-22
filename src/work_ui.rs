@@ -801,25 +801,30 @@ pub(super) fn plan_card(s: &State, p: Palette, index: usize) -> El {
 }
 
 /// Ported from KSG Code's `ProposedPlanCard` actions menu, reusing `thread_menu` and `menu_item`.
-pub(super) fn plan_menu(s: &State, p: Palette) -> El {
-    let Some(id) = s.plan_menu.clone() else {
-        return el();
-    };
+pub(super) fn plan_menu(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let id = s.plan_menu.clone()?;
+    let anchor = format!("plan-actions-{id}");
+    // Under Rune #1339 an anchored modal whose trigger scrolled out of the
+    // virtualized timeline is suppressed visually while still holding focus.
+    // Dismiss the state on layout instead of mounting an invisible modal or
+    // leaving `plan_menu` stale.
+    if cx.layout_with(&anchor, |_| ()).is_none() {
+        return Some(
+            el().key("plan-menu-dismiss")
+                .absolute(0.0, 0.0)
+                .size(0.0, 0.0)
+                .a11y_hidden()
+                .on_layout(|s: &mut State, _| s.plan_menu = None),
+        );
+    }
     let t = s.current();
     let prefix = format!("{}-", t.id);
-    let Some(index) = id
+    let index = id
         .strip_prefix(&prefix)
-        .and_then(|raw| raw.parse::<usize>().ok())
-    else {
-        return el();
-    };
-    let Some(tool) = t.tools.get(index) else {
-        return el();
-    };
+        .and_then(|raw| raw.parse::<usize>().ok())?;
+    let tool = t.tools.get(index)?;
     let plan = crate::work::plan_data(&tool.input);
-    let Some(plan_markdown) = plan["markdown"].as_str() else {
-        return el();
-    };
+    let plan_markdown = plan["markdown"].as_str()?;
     let thread_id = t.id;
     let export_contents = crate::plan_export::normalize_plan_markdown_for_export(plan_markdown);
     let download_filename =
@@ -828,70 +833,77 @@ pub(super) fn plan_menu(s: &State, p: Palette) -> El {
     let can_save =
         s.can_write_project_file(t) && !s.plan_save_dialog.as_ref().is_some_and(|d| d.saving);
 
-    col()
-        .key(format!("plan-menu-{id}"))
-        .role("menu")
-        .focus_group()
-        .label("Plan actions")
-        .w(212.0)
-        .padding(4.0)
-        .gap(1.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.frame)
-        .box_shadow(soft_shadow(p))
-        .anchored_fit(
-            format!("plan-actions-{id}"),
-            rune::Side::Bottom,
-            rune::Align::End,
-            4.0,
-        )
-        .modal(true, |s: &mut State| s.plan_menu = None)
-        .child(
-            menu_item(
-                &format!("plan-copy-{id}"),
-                if copied {
-                    "Copied!"
-                } else {
-                    "Copy to clipboard"
-                },
-                if copied { "check" } else { "copy" },
-                p,
+    Some(
+        col()
+            .key(format!("plan-menu-{id}"))
+            .role("menu")
+            .focus_group()
+            .label("Plan actions")
+            .w(212.0)
+            .padding(4.0)
+            .gap(1.0)
+            .radius(12.0)
+            .fill(p.card)
+            .border(1.0, p.frame)
+            .box_shadow(soft_shadow(p))
+            .anchored_fit(anchor, rune::Side::Bottom, rune::Align::End, 4.0)
+            .modal(true, |s: &mut State| s.plan_menu = None)
+            .child(
+                menu_item(
+                    &format!("plan-copy-{id}"),
+                    if copied {
+                        "Copied!"
+                    } else {
+                        "Copy to clipboard"
+                    },
+                    if copied { "check" } else { "copy" },
+                    p,
+                )
+                .on_press_tx({
+                    let copy_id = id.clone();
+                    let contents = export_contents.clone();
+                    move |s: &mut State, tx| {
+                        tx.copy(contents.clone());
+                        s.mark_plan_copied(copy_id.clone(), tx);
+                        s.plan_menu = None;
+                    }
+                }),
             )
-            .on_press_tx({
-                let copy_id = id.clone();
-                let contents = export_contents.clone();
-                move |s: &mut State, tx| {
-                    tx.copy(contents.clone());
-                    s.mark_plan_copied(copy_id.clone(), tx);
-                    s.plan_menu = None;
-                }
-            }),
-        )
-        .child(
-            menu_item(
-                &format!("plan-download-{id}"),
-                "Download as markdown",
-                "file",
-                p,
-            )
-            .on_press_tx({
-                let contents = export_contents.clone();
-                let filename = download_filename.clone();
-                move |s: &mut State, tx| {
-                    s.plan_menu = None;
-                    let contents = contents.clone();
-                    tx.save_file(
-                        rune::FileDialogOptions {
-                            title: "Download as markdown".into(),
-                            directory: crate::projects::downloads_dir(),
-                            file_name: Some(filename.clone()),
-                            ..Default::default()
-                        }
-                        .filter("Markdown", &["md"]),
-                        move |s: &mut State, result, _| match result {
-                            Ok(Some(path)) => {
-                                if let Err(error) = std::fs::write(&path, contents.as_bytes()) {
+            .child(
+                menu_item(
+                    &format!("plan-download-{id}"),
+                    "Download as markdown",
+                    "file",
+                    p,
+                )
+                .on_press_tx({
+                    let contents = export_contents.clone();
+                    let filename = download_filename.clone();
+                    move |s: &mut State, tx| {
+                        s.plan_menu = None;
+                        let contents = contents.clone();
+                        tx.save_file(
+                            rune::FileDialogOptions {
+                                title: "Download as markdown".into(),
+                                directory: crate::projects::downloads_dir(),
+                                file_name: Some(filename.clone()),
+                                ..Default::default()
+                            }
+                            .filter("Markdown", &["md"]),
+                            move |s: &mut State, result, _| match result {
+                                Ok(Some(path)) => {
+                                    if let Err(error) = std::fs::write(&path, contents.as_bytes()) {
+                                        s.push_toast(
+                                            crate::model::ToastKind::Error,
+                                            "Could not download plan",
+                                            Some(error.to_string()),
+                                            None,
+                                            Some(5_000),
+                                        );
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
                                     s.push_toast(
                                         crate::model::ToastKind::Error,
                                         "Could not download plan",
@@ -900,33 +912,23 @@ pub(super) fn plan_menu(s: &State, p: Palette) -> El {
                                         Some(5_000),
                                     );
                                 }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                s.push_toast(
-                                    crate::model::ToastKind::Error,
-                                    "Could not download plan",
-                                    Some(error.to_string()),
-                                    None,
-                                    Some(5_000),
-                                );
-                            }
-                        },
-                    );
-                }
-            }),
-        )
-        .child(
-            menu_item(&format!("plan-save-{id}"), "Save to workspace", "folder", p)
-                .disabled(!can_save)
-                .on_press({
-                    let markdown = plan_markdown.to_owned();
-                    move |s: &mut State| {
-                        s.plan_menu = None;
-                        s.open_plan_save_dialog(thread_id, &markdown);
+                            },
+                        );
                     }
                 }),
-        )
+            )
+            .child(
+                menu_item(&format!("plan-save-{id}"), "Save to workspace", "folder", p)
+                    .disabled(!can_save)
+                    .on_press({
+                        let markdown = plan_markdown.to_owned();
+                        move |s: &mut State| {
+                            s.plan_menu = None;
+                            s.open_plan_save_dialog(thread_id, &markdown);
+                        }
+                    }),
+            ),
+    )
 }
 
 /// Ported from KSG Code's `SavePlanToWorkspaceForm`, reusing `thread_dialog` structure and styling.

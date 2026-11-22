@@ -547,7 +547,7 @@ fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: 
                     "Snooze",
                     "clock",
                     p,
-                    move |s| s.open_snooze(id),
+                    move |s| s.open_snooze_from(id, Some(format!("thread-{id}")), None),
                 )
                 .size(20.0, 20.0)
                 .blocked(
