@@ -237,6 +237,299 @@ pub fn save_plan(history: &mut Vec<Value>, id: &str, source: &Value) {
     }
 }
 
+/// Shells a `-c`-style flag unwraps to its script, as KSG Code's `withoutShellWrapper`
+/// (`work-log/commandLabel.ts`) does for `bash -lc "…"` and `powershell -Command "…"`.
+const SHELL_PROGRAMS: &[&str] = &["sh", "bash", "zsh", "dash", "ash", "ksh", "fish"];
+const WINDOWS_SHELL_PROGRAMS: &[&str] = &["cmd", "powershell", "pwsh"];
+
+/// A quote-aware whitespace split, enough of KSG's `tokenizeShellCommand` for
+/// wrapper stripping and program names.
+fn shell_tokens(command: &str) -> Vec<String> {
+    let mut tokens = vec![];
+    let mut current = String::new();
+    let mut quote = '\0';
+    let mut escape = false;
+    for c in command.trim().chars() {
+        if escape {
+            current.push(c);
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' if quote != '\'' => escape = true,
+            '"' | '\'' if quote == '\0' => quote = c,
+            _ if c == quote => quote = '\0',
+            _ if c.is_whitespace() && quote == '\0' => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn token_program(token: &str) -> String {
+    token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(".exe")
+        .to_ascii_lowercase()
+}
+
+/// KSG's `withoutShellWrapper`: a `sh -c`/`cmd /c`/`powershell -Command` invocation's
+/// script is what the row reads. Anything else keeps its own text.
+fn without_shell_wrapper(command: &str) -> String {
+    let tokens = shell_tokens(command);
+    if tokens.is_empty() {
+        return command.trim().to_owned();
+    }
+    let program = token_program(&tokens[0]);
+    let script_index = if SHELL_PROGRAMS.contains(&program.as_str()) {
+        tokens[1..]
+            .iter()
+            .position(|arg| {
+                arg == "--command"
+                    || arg
+                        .strip_prefix('-')
+                        .is_some_and(|flags| !flags.is_empty() && flags.contains('c'))
+            })
+            .map(|i| i + 2)
+    } else if WINDOWS_SHELL_PROGRAMS.contains(&program.as_str()) {
+        tokens[1..]
+            .iter()
+            .position(|arg| {
+                arg.eq_ignore_ascii_case("/c")
+                    || arg.eq_ignore_ascii_case("-command")
+                    || arg.eq_ignore_ascii_case("-c")
+            })
+            .map(|i| i + 2)
+    } else {
+        None
+    };
+    match script_index {
+        // The script must be the last token, as KSG requires.
+        Some(index) if index == tokens.len() - 1 => tokens[index].clone(),
+        _ => command.trim().to_owned(),
+    }
+}
+
+/// Control characters as their Unicode pictures, as KSG's `withVisibleControlCharacters`.
+fn visible_control_characters(command: &str) -> String {
+    command
+        .chars()
+        .map(|c| match c {
+            '\n' => '␊',
+            '\r' => '␍',
+            '\t' => '␉',
+            '\u{b}' => '␋',
+            '\u{c}' => '␌',
+            _ => c,
+        })
+        .collect()
+}
+
+/// Ported from KSG Code's `commandDisplayText`: the command a row shows, shell wrapper
+/// stripped and control characters drawn.
+pub fn command_display_text(command: &str) -> String {
+    visible_control_characters(&without_shell_wrapper(command))
+}
+
+/// Ported from KSG Code's `commandProgramName` for the live row ("Running cargo"): the
+/// basename of what the command actually runs, unwrapped like the row's own text.
+pub fn command_program_name(command: &str) -> Option<String> {
+    let tokens = shell_tokens(&without_shell_wrapper(command));
+    tokens.first().map(|token| token_program(token))
+}
+
+/// The workspace-relative path KSG's `formatWorkspaceRelativePath` shows.
+pub fn relative_path(path: &str, root: &std::path::Path) -> String {
+    // Projection paths belong to their host. Do not canonicalize or read their files.
+    let root = root.to_string_lossy().replace('\\', "/");
+    let path = path.replace('\\', "/");
+    path.strip_prefix(&format!("{}/", root.trim_end_matches('/')))
+        .unwrap_or(&path)
+        .to_owned()
+}
+
+/// KSG's `SEARCH_QUERY_KEYS`, `SEARCH_GLOB_KEYS` and `SEARCH_TARGET_KEYS`
+/// (`packages/shared/src/toolActivity.ts`).
+const SEARCH_QUERY_KEYS: &[&str] = &["pattern", "query", "searchTerm", "regex", "grep", "needle"];
+const SEARCH_GLOB_KEYS: &[&str] = &[
+    "glob",
+    "globPattern",
+    "glob_pattern",
+    "include",
+    "filePattern",
+    "file_pattern",
+];
+const SEARCH_TARGET_KEYS: &[&str] = &[
+    "path",
+    "target_directory",
+    "targetDirectory",
+    "directory",
+    "cwd",
+    "root",
+];
+
+fn first_input_string<'a>(
+    input: &'a serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| input.get(*key)?.as_str().map(str::trim))
+        .filter(|value| !value.is_empty())
+}
+
+/// KSG's `searchTargetName`: the last non-dot segment of the target path.
+fn search_target_name(value: &str) -> String {
+    value
+        .rsplit(['\\', '/'])
+        .find(|part| !part.is_empty() && *part != ".")
+        .unwrap_or(value)
+        .to_owned()
+}
+
+/// Ported from KSG's `formatSearchToolLabel`: "Searched {query} in {target}",
+/// "Searched files {glob}", "Searched in {target}", in that priority.
+pub fn search_label(tool: &Tool) -> Option<String> {
+    let input = tool.input.as_object()?;
+    let query = first_input_string(input, SEARCH_QUERY_KEYS);
+    let glob = first_input_string(input, SEARCH_GLOB_KEYS);
+    let target = first_input_string(input, SEARCH_TARGET_KEYS).map(|v| search_target_name(v));
+    match (query, glob, target) {
+        (Some(query), _, Some(target)) => Some(format!("Searched {query} in {target}")),
+        (_, Some(glob), Some(target)) => Some(format!("Searched files {glob} in {target}")),
+        (_, Some(glob), None) => Some(format!("Searched files {glob}")),
+        (Some(query), _, None) => Some(format!("Searched {query}")),
+        (None, None, Some(target)) => Some(format!("Searched in {target}")),
+        (None, None, None) => None,
+    }
+}
+
+/// KSG's `PATH_KEYS` and the nested records `collectToolFilePaths` walks
+/// (`packages/shared/src/toolActivity.ts`), depth 4 and at most 8 paths.
+const PATH_KEYS: &[&str] = &[
+    "path",
+    "filePath",
+    "file_path",
+    "relativePath",
+    "filename",
+    "fileName",
+    "newPath",
+    "oldPath",
+];
+const PATH_NEST_KEYS: &[&str] = &[
+    "locations",
+    "item",
+    "input",
+    "result",
+    "rawInput",
+    "data",
+    "changes",
+];
+
+fn collect_paths(
+    value: &Value,
+    paths: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    depth: usize,
+) {
+    if depth > 4 || paths.len() >= 8 {
+        return;
+    }
+    if let Value::Array(items) = value {
+        for item in items {
+            collect_paths(item, paths, seen, depth + 1);
+            if paths.len() >= 8 {
+                return;
+            }
+        }
+        return;
+    }
+    let Some(record) = value.as_object() else {
+        return;
+    };
+    for key in PATH_KEYS {
+        if let Some(candidate) = record
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            && seen.insert(candidate.to_owned())
+        {
+            paths.push(candidate.to_owned());
+            if paths.len() >= 8 {
+                return;
+            }
+        }
+    }
+    for key in PATH_NEST_KEYS {
+        if let Some(nested) = record.get(*key) {
+            collect_paths(nested, paths, seen, depth + 1);
+            if paths.len() >= 8 {
+                return;
+            }
+        }
+    }
+}
+
+/// KSG's `workEntryReadRawPaths`: the call's changed files first, then the paths its
+/// input names, deduplicated.
+pub fn read_paths(tool: &Tool) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut paths: Vec<String> = Vec::new();
+    for change in &tool.changes {
+        if seen.insert(change.path.clone()) {
+            paths.push(change.path.clone());
+        }
+    }
+    if paths.is_empty() {
+        collect_paths(&tool.input, &mut paths, &mut seen, 0);
+    }
+    paths
+}
+
+/// KSG's `TEST_COMMAND_PATTERN` (`shared/toolOutput.ts` `commandRunsTests`): a failed
+/// test run styles its row as a failure, not a failed call.
+pub fn command_runs_tests(command: &str) -> bool {
+    const RUNNERS: &[&str] = &[
+        "vitest", "jest", "pytest", "mocha", "ava", "rspec", "phpunit", "ctest",
+    ];
+    const WRAPPED: &[&str] = &[
+        "bun", "deno", "go", "cargo", "dotnet", "mix", "swift", "npm", "pnpm", "yarn", "vp",
+    ];
+    const TEST_SHORT: &[&str] = &["npm", "pnpm", "yarn", "bun"];
+    let tokens = shell_tokens(&without_shell_wrapper(command));
+    let programs: Vec<String> = tokens.iter().map(|t| token_program(t)).collect();
+    let test_arg = |arg: &str| arg == "test" || arg.starts_with("test:");
+    for (i, program) in programs.iter().enumerate() {
+        let next = programs.get(i + 1).map(String::as_str);
+        if RUNNERS.contains(&program.as_str())
+            || (program == "playwright" && next.is_some_and(test_arg))
+        {
+            return true;
+        }
+        if WRAPPED.contains(&program.as_str())
+            && (next.is_some_and(test_arg)
+                || (TEST_SHORT.contains(&program.as_str()) && next == Some("t"))
+                || (next == Some("run")
+                    && programs
+                        .get(i + 2)
+                        .map(String::as_str)
+                        .is_some_and(|arg| test_arg(arg) || arg == "t")))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// KSG's summarizeToolGroup: two highest-priority actions, in first-seen order,
 /// plus the number of calls not represented by those actions.
 pub fn summarize(tools: &[&Tool]) -> String {
@@ -267,7 +560,6 @@ pub fn summarize(tools: &[&Tool]) -> String {
     let mut labels = vec![];
     for i in &selected {
         let (kind, calls) = &groups[*i];
-        let running = calls.iter().any(|t| !t.done && !t.failed);
         let n = if *kind == FileChange {
             let mut paths = std::collections::HashSet::new();
             let mut unknown = 0;
@@ -291,56 +583,16 @@ pub fn summarize(tools: &[&Tool]) -> String {
             calls.len()
         };
         labels.push(match kind {
-            Command => format!(
-                "{} {}",
-                if running { "Running" } else { "Ran" },
-                count(n, "command", "commands")
-            ),
-            FileChange => format!(
-                "{} {}",
-                if running { "Changing" } else { "Changed" },
-                count(n, "file", "files")
-            ),
-            FileSearch => format!(
-                "{} code {}",
-                if running { "Searching" } else { "Searched" },
-                count(n, "time", "times")
-            ),
-            WebSearch => format!(
-                "{} the web {}",
-                if running { "Searching" } else { "Searched" },
-                count(n, "time", "times")
-            ),
-            Read => format!(
-                "{} {}",
-                if running { "Reading" } else { "Read" },
-                count(n, "file", "files")
-            ),
-            List => format!(
-                "{} {}",
-                if running { "Listing" } else { "Listed" },
-                count(n, "directory", "directories")
-            ),
-            Subagent => format!(
-                "{} {}",
-                if running { "Delegating" } else { "Delegated" },
-                count(n, "task", "tasks")
-            ),
-            Plan => format!(
-                "{} {}",
-                if running { "Updating" } else { "Updated" },
-                count(n, "plan", "plans")
-            ),
-            Html => format!(
-                "{} {}",
-                if running { "Rendering" } else { "Rendered" },
-                count(n, "page", "pages")
-            ),
-            Other => format!(
-                "{} {}",
-                if running { "Using" } else { "Used" },
-                count(n, "tool", "tools")
-            ),
+            Command => format!("Ran {}", count(n, "command", "commands")),
+            FileChange => format!("Changed {}", count(n, "file", "files")),
+            FileSearch => format!("Searched code {}", count(n, "time", "times")),
+            WebSearch => format!("Searched the web {}", count(n, "time", "times")),
+            Read => format!("Read {}", count(n, "file", "files")),
+            List => format!("Listed {}", count(n, "directory", "directories")),
+            Subagent => format!("Delegated {}", count(n, "task", "tasks")),
+            Plan => format!("Updated {}", count(n, "plan", "plans")),
+            Html => format!("Rendered {}", count(n, "page", "pages")),
+            Other => format!("Used {}", count(n, "tool", "tools")),
         });
     }
     let remaining: Vec<_> = groups
@@ -351,12 +603,7 @@ pub fn summarize(tools: &[&Tool]) -> String {
         .collect();
     if !remaining.is_empty() {
         labels.push(format!(
-            "{} {}",
-            if remaining.iter().any(|t| !t.done && !t.failed) {
-                "Performing"
-            } else {
-                "Performed"
-            },
+            "Performed {}",
             count(remaining.len(), "other action", "other actions")
         ));
     }
@@ -431,19 +678,53 @@ mod tests {
             summarize(&thread.tools.iter().collect::<Vec<_>>()),
             "Changed 2 files, ran 1 command, and performed 3 other actions"
         );
+        // KSG's summary is always past tense, even for calls still running.
         thread.tools[3].done = false;
-        assert_eq!(
-            summarize(&thread.tools.iter().collect::<Vec<_>>()),
-            "Changed 2 files, running 1 command, and performed 3 other actions"
-        );
         thread.tools[0].done = false;
         assert_eq!(
             summarize(&thread.tools.iter().collect::<Vec<_>>()),
-            "Changed 2 files, running 1 command, and performing 3 other actions"
+            "Changed 2 files, ran 1 command, and performed 3 other actions"
         );
         assert_eq!(
             summarize(&[&thread.tools[3], &thread.tools[1]]),
-            "Running 1 command and changed 2 files"
+            "Ran 1 command and changed 2 files"
         );
+    }
+
+    #[test]
+    fn command_rows_show_the_script_shell_wrappers_run() {
+        assert_eq!(command_display_text("cargo test"), "cargo test");
+        assert_eq!(
+            command_display_text(r#"bash -lc "cargo test -j 4""#),
+            "cargo test -j 4"
+        );
+        assert_eq!(
+            command_display_text("powershell -Command Get-ChildItem"),
+            "Get-ChildItem"
+        );
+        // A script that is not the last argument keeps the whole line.
+        assert_eq!(
+            command_display_text("bash -c 'ls' extra"),
+            "bash -c 'ls' extra"
+        );
+        assert_eq!(command_display_text("printf 'a\nb'"), "printf 'a␊b'");
+    }
+
+    #[test]
+    fn live_command_rows_name_the_program_and_test_runs_flag_severity() {
+        assert_eq!(
+            command_program_name("cargo test -j 4").as_deref(),
+            Some("cargo")
+        );
+        assert_eq!(
+            command_program_name(r#"bash -lc "cargo test""#).as_deref(),
+            Some("cargo")
+        );
+        assert!(command_runs_tests("cargo test"));
+        assert!(command_runs_tests("npm run test"));
+        assert!(command_runs_tests(r#"bash -lc "cargo test""#));
+        assert!(command_runs_tests("vitest"));
+        assert!(!command_runs_tests("cargo build"));
+        assert!(!command_runs_tests("cargo testrunner-build"));
     }
 }
