@@ -8,7 +8,7 @@ Since 2026-11-18 Shina matches KSG Code's own visual design (the redesign merged
 
 Notes for the skin in code:
 
-- `Palette` in `src/ui.rs` holds KSG's neutral surfaces and Wave 3's status colours. Use `lift` for an active option on a card and `row` for sidebar selection. Use `sea` for working and focus, `brass` for requests, `danger` for failure and deletions, and `ok` for success and additions. Each status has its own `_bg` tint. `coral` keeps its existing primary-button role. Use opaque `ink`, `muted` and `faint` for text. Hover blends in linear light, so keep its dark wash below selection and never stack two washes. Contrast tests in `src/ui.rs` and `src/markdown_ui.rs` cover both themes and the hover composites.
+- `Palette` in `src/ui.rs` holds KSG's neutral surfaces and Wave 3's status colours. Use `lift` for an active option on a card and `row` for sidebar selection. Use `sea` for working and focus, `brass` for requests, `danger` for failure and deletions, and `ok` for success and additions. Each status has its own `_bg` tint. `coral` keeps its existing primary-button role. Text uses KSG's ramp from `index.css`: `strong` (`--strong-foreground`) for the open sidebar thread and other active labels, `ink` (`--foreground`) for prose, titles and values, `muted` (`--muted-foreground`) for tool rows, labels and meta text, and `faint` (`--placeholder`) for carets, timestamps and counts. `faint` reads 3:1, not 4.5:1, so never put text a reader needs in it. All four are opaque. Hover blends in linear light, so keep its dark wash below selection and never stack two washes. Contrast tests in `src/ui.rs` and `src/markdown_ui.rs` cover both themes and the hover composites.
 - All UI text is Inter. `meta(size)`, `META` and `META_LABEL` are the small 12 px weight 500 styles for labels, counts, timers, status words and badges; section labels are sentence case. The system mono is only for code, inline code, keycaps, branch names and diff gutters. Prose, titles and the empty-thread greetings follow KSG's type scale (14/22.5 prose, `DraftHeroHeadline` at 30/500 with tight tracking).
 - Corners follow KSG's radii: 6 for rows and chips, 8 for buttons, inputs and tabs, 12 for cards, menus, dialogs and code blocks, 16 for user bubbles and the composer tray with the 15 px main card inside it.
 - `framed` is a 1 px `frame` border with KSG's soft control shadow, for things you act on. `outlined` is the border only, for keycaps, counts and badges. Use `soft_shadow` for menus and popovers and `dialog_shadow` for scrim-backed dialogs. There are no hard offset shadows.
@@ -51,7 +51,8 @@ Already ported:
 | `crew_ui::task_card` | `chat/ProviderSubagentBar.tsx` restyled as a single 32 pt work row (spec §3.7) |
 | `crew_ui::crew_tray`, `crew_ui::now_popover` | `chat/QueuedRunsControl.tsx`, `chat/ThreadRelationshipsControl.tsx`. A flat 28 pt strip, labelled Crew on a Captain home and Now on a thread with subagents. It opens a dismissible popover and never expands in place. The popover's footer opens the Inspector's Work tab. |
 | `crew_ui::parent_bar`, `crew_ui::crew_bar` | Shina-only 36 pt borderless notice bars (`p.selected`), shown only for actionable recovery/offline/pending-crew states (spec §3.8) |
-| `inspector_ui` bodies: `overview_body`, `worker_overview_body`, `work_body`, `peer_crew_body` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`. The Work tab is Shina-only: subagents (`agents_ui::view`) above the crew roster (`crew_ui::roster_row` groups and a pinned 44 pt footer), both in 44 pt two-line rows with a 24 pt avatar. |
+| `inspector_ui::session_body` (`workspace_card`, `lineage_card`, `session_card`, `details_tray`, `details_row`) | `chat/ThreadDetailsPanel.tsx`, `ThreadDetailsSection.tsx`, `threadDetailsPanelStyles.ts`, `ThreadDetailsUsage.tsx`, `index.css` (`.thread-details-stack`). A stack of 14 pt trays, each holding a 10 pt inner surface of 28 pt rows. The session card (model, access, harness, session ID) is Shina-only. |
+| `inspector_ui` bodies: `overview_body`, `work_body`, `peer_crew_body` | `chat/ChatRightPanel.tsx`, `RightPanelTabs.tsx`. The Work tab is Shina-only: subagents (`agents_ui::view`) above the crew roster (`crew_ui::roster_row` groups and a pinned 44 pt footer), both in 44 pt two-line rows with a 24 pt avatar. |
 | `captain_hero` | `chat/DraftHeroHeadline.tsx` |
 | `captain_selector_trigger`, `captain_picker` | `chat/BranchToolbarEnvironmentSelector.tsx`, `chat/ModelPickerContent.tsx` (with Shina-only captain rows) |
 | `harness_icon` and the harness "ACP" tag | `chat/ModelListRow.tsx`, `chat/ProviderInstanceIcon.tsx` |
@@ -70,6 +71,8 @@ Removed at the user's request. Do not add them back:
 - The "No sandbox" note under the composer.
 - The desktop task plan panel and the Plan toggle on the crew strip. Captains keep the `task_*` MCP tools.
 
+The user wants Shina to match KSG Code verbatim (restated 2026-11-22). When a Shina design and KSG's differ, copy KSG's values, weights and layout from `origin/ksg/dev` exactly, and keep a Shina-only piece only where KSG has nothing equivalent. Compare by screenshot: capture the running KSG Code window and Shina's `--demo --snap` at the same pixel size and theme.
+
 ### Tailwind to Rune
 
 1 rem is 16 px. Tailwind spacing is 4 px per step.
@@ -86,7 +89,7 @@ Removed at the user's request. Do not add them back:
 | `absolute right-1 top-1` | `.pin(None, Some(4.0), Some(4.0), None)` |
 | `object-cover` image | `.pixels_fit(pixels, rune::SurfaceFit::Fill)` |
 | `text-center` on wrapping text | `.align(rune::Align::Center).wrap().w_full()` |
-| `max-w-(--chat-content-max-width)` (45 rem) | `measure(wide)` |
+| `max-w-(--chat-content-max-width)` (45 rem at every width) | `measure(wide)` |
 | `flex-1 basis-0` | `.h(0.0).grow(1.0).min_h(0.0)` (Rune has no `basis`) |
 
 ## Checks
