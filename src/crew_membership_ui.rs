@@ -295,10 +295,10 @@ fn structurally_excluded(thread: &crate::model::Thread) -> bool {
 /// "Can't join yet". Keyboard follows the focus group: arrows skip disabled rows.
 pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize, cx: &Cx<State>) -> Option<El> {
     let picker = s.brief.recruit.as_ref()?;
-    if picker.server != s.machines.selected || picker.captain != captain {
-        return None;
-    }
-    if cx.layout_with("crew-roster-recruit", |_| ()).is_none() {
+    if picker.server != s.machines.selected
+        || picker.captain != captain
+        || cx.layout_with("crew-roster-recruit", |_| ()).is_none()
+    {
         return Some(
             el().key("crew-recruit-dismiss")
                 .absolute(0.0, 0.0)

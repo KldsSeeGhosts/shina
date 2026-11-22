@@ -1224,20 +1224,40 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         let height = cx.layout_with("workspace-root", |r| r[3]).unwrap_or(840.0);
         root = root.child(captain_editor(s, p, height));
     } else if s.settings_picker.is_some() {
-        root = root.child(settings_picker(s, &composer_model, p));
+        if s.composer_hidden() {
+            root = root.child(
+                el().key("settings-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.settings_picker = None),
+            );
+        } else {
+            root = root.child(settings_picker(s, &composer_model, p));
+        }
     } else if s.captain_picker {
         root = root.child(captain_picker(s, p));
     } else if s.projects.clone_open {
         root = root.child(clone_dialog(s, p));
     } else if s.current().native.access_picker {
-        let anchor = if cx.layout_with("access-mode", |_| ()).is_some() {
-            "access-mode"
-        } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
-            "composer-overflow"
+        if s.composer_hidden() {
+            root = root.child(
+                el().key("access-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.current_mut().native.access_picker = false),
+            );
         } else {
-            "composer"
-        };
-        root = root.child(pi_ui::access_picker(s, p, anchor));
+            let anchor = if cx.layout_with("access-mode", |_| ()).is_some() {
+                "access-mode"
+            } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                "composer-overflow"
+            } else {
+                "composer"
+            };
+            root = root.child(pi_ui::access_picker(s, p, anchor));
+        }
     } else if s.current().native.conversation.is_some() {
         root = root.child(pi_ui::conversation_picker(s, p));
     } else if s.thread_menu {
@@ -1289,10 +1309,69 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(machine_picker(s, p));
     }
     if s.env_mode_picker {
-        root = root.child(env_mode_picker(s, p));
+        let can_show = !s.composer_hidden()
+            && matches!(
+                s.composer_vcs_controls(),
+                crate::model::ComposerVcsControls::Editable { .. }
+            );
+        let anchor = can_show
+            .then(|| {
+                if s.composer_ui.visible_blocks.get() > 0
+                    && cx.layout_with("env-mode-trigger", |_| ()).is_some()
+                {
+                    Some("env-mode-trigger")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else if cx.layout_with("env-mode-trigger", |_| ()).is_some() {
+                    Some("env-mode-trigger")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(env_mode_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("env-mode-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.env_mode_picker = false),
+            );
+        }
     }
     if s.base_branch_picker {
-        root = root.child(base_branch_picker(s, p));
+        let can_show = !s.composer_hidden()
+            && matches!(
+                s.composer_vcs_controls(),
+                crate::model::ComposerVcsControls::Editable {
+                    mode: crate::model::ThreadEnvMode::Worktree,
+                    ..
+                }
+            );
+        let anchor = can_show
+            .then(|| {
+                if cx.layout_with("base-branch-trigger", |_| ()).is_some() {
+                    Some("base-branch-trigger")
+                } else if cx.layout_with("composer-overflow", |_| ()).is_some() {
+                    Some("composer-overflow")
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(anchor) = anchor {
+            root = root.child(base_branch_picker(s, p, anchor));
+        } else {
+            root = root.child(
+                el().key("base-branch-picker-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.base_branch_picker = false),
+            );
+        }
     }
     if s.composer_ui.overflow.get() {
         root = root.child(composer_ui::overflow_menu(s, p));
@@ -1344,6 +1423,25 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                         .on_layout(|s: &mut State, _| s.brief.more = None),
                 );
             }
+        }
+    } else {
+        if s.brief.recruit.is_some() {
+            root = root.child(
+                el().key("crew-recruit-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.brief.recruit = None),
+            );
+        }
+        if s.brief.more.is_some() {
+            root = root.child(
+                el().key("crew-more-dismiss")
+                    .absolute(0.0, 0.0)
+                    .size(0.0, 0.0)
+                    .a11y_hidden()
+                    .on_layout(|s: &mut State, _| s.brief.more = None),
+            );
         }
     }
     if let Some((x, y)) = s.brief.moving.as_ref().and_then(|m| m.at) {
@@ -15996,7 +16094,7 @@ fn machine_picker(s: &State, p: Palette) -> El {
 }
 
 /// Ported from KSG Code's `BranchToolbarEnvModeSelector` `SelectPopup`.
-fn env_mode_picker(s: &State, p: Palette) -> El {
+fn env_mode_picker(s: &State, p: Palette, anchor: &str) -> El {
     let force_worktree = s.is_multi_model_active();
     let active = if force_worktree {
         crate::model::ThreadEnvMode::Worktree
@@ -16086,25 +16184,16 @@ fn env_mode_picker(s: &State, p: Palette) -> El {
         }
         menu = menu.child(item);
     }
-    menu.anchored_fit(
-        if s.composer_ui.visible_blocks.get() == 0 {
-            "composer-overflow"
-        } else {
-            "env-mode-trigger"
-        },
-        rune::Side::Top,
-        rune::Align::Start,
-        6.0,
-    )
-    .focus_return("composer-input")
-    .modal(true, |s: &mut State| {
-        s.env_mode_picker = false;
-        s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
-    })
+    menu.anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
+        .focus_return("composer-input")
+        .modal(true, |s: &mut State| {
+            s.env_mode_picker = false;
+            s.restore_composer_focus(composer_ui::FocusReason::MenuClosed);
+        })
 }
 
 /// Ported from KSG Code's `BranchPicker` and `BranchToolbarBranchSelector`.
-fn base_branch_picker(s: &State, p: Palette) -> El {
+fn base_branch_picker(s: &State, p: Palette, anchor: &str) -> El {
     let t = s.current();
     let selected_branch = t.base_branch.as_deref();
     let start_from_origin = t.effective_start_from_origin();
@@ -16292,12 +16381,7 @@ fn base_branch_picker(s: &State, p: Palette) -> El {
         .child(list)
         .child(rule(p))
         .child(origin_row)
-        .anchored_fit(
-            "base-branch-trigger",
-            rune::Side::Top,
-            rune::Align::Start,
-            6.0,
-        )
+        .anchored_fit(anchor, rune::Side::Top, rune::Align::Start, 6.0)
         .focus_return("composer-input")
         .modal(true, |s: &mut State| {
             s.base_branch_picker = false;
@@ -33802,6 +33886,117 @@ pub(crate) mod tests {
         rt.frame(4.0);
         assert!(rt.presented("composer-notice-details-popover").is_none());
         assert!(rt.state.composer_notices.open_details_notice().is_none());
+    }
+
+    #[test]
+    fn base_branch_picker_dismisses_when_refresh_reports_not_a_git_repo() {
+        let mut rt = runtime(1280.0);
+        let project_path = rt
+            .state
+            .project(rt.state.current().project)
+            .unwrap()
+            .path
+            .to_string_lossy()
+            .into_owned();
+        rt.state.vcs_branches.insert(
+            ("local".into(), project_path.clone()),
+            crate::model::VcsBranchCacheEntry {
+                is_repo: true,
+                loaded: true,
+                loading: false,
+                error: None,
+                refs: vec![crate::vcs::VcsRef {
+                    name: "main".into(),
+                    is_remote: Some(false),
+                    remote_name: None,
+                    upstream_ref: None,
+                    current: true,
+                    is_default: true,
+                    worktree_path: None,
+                }],
+            },
+        );
+        rt.state
+            .set_draft_env_mode(crate::model::ThreadEnvMode::Worktree);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+
+        press(&mut rt, "base-branch-trigger");
+        rt.frame(2.0);
+        let (picker, opacity) = rt
+            .presented("base-branch-picker")
+            .expect("base branch picker should open on a git repo");
+        assert!(
+            picker[2] > 0.0 && picker[3] > 0.0 && opacity > 0.0,
+            "base branch picker must be visible: rect={picker:?} opacity={opacity}"
+        );
+
+        // Refresh returns is_repo: false, removing base-branch-trigger.
+        rt.state.apply_vcs_branches_result(
+            "local".into(),
+            project_path,
+            Ok(crate::vcs::VcsListBranchesResult {
+                is_at_repository_root: None,
+                refs: Vec::new(),
+                is_repo: false,
+                has_primary_remote: false,
+                next_cursor: None,
+                total_count: 0,
+            }),
+        );
+        rt.invalidate();
+        rt.frame(2.5);
+        rt.frame(3.5);
+        assert!(!rt.state.base_branch_picker);
+        assert!(rt.presented("base-branch-trigger").is_none());
+        assert!(rt.presented("base-branch-picker").is_none());
+        assert!(rt.state.preview_allowed());
+        press(&mut rt, "thread-actions");
+        assert!(
+            rt.presented("thread-menu").is_some(),
+            "focus must not stay trapped after base branch picker dismisses"
+        );
+    }
+
+    #[test]
+    fn navigating_away_from_captain_clears_recruit_and_more_overlay_flags() {
+        let mut rt = crew_runtime(1280.0);
+        let captain = rt.state.current().captain.expect("captain home");
+        let next_id = rt.state.threads.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let mut other = Thread::new(next_id);
+        other.title = "Ordinary thread".into();
+        let other_idx = rt.state.threads.len();
+        rt.state.threads.push(other);
+
+        // Programmatic switch away from Captain (bypassing focus_tab) must still
+        // clear stale recruit and more flags via the layout dismiss sentinel.
+        rt.state.brief.recruit = Some(crate::model::RecruitPicker {
+            server: rt.state.machines.selected.clone(),
+            captain,
+            query: rune::TextEdit::default(),
+        });
+        rt.state.brief.more = Some(next_id);
+        rt.state.active = other_idx;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert!(rt.state.brief.recruit.is_none());
+        assert!(rt.state.brief.more.is_none());
+        assert!(rt.state.preview_allowed());
+
+        // Switching via show_thread also clears both flags immediately.
+        rt.state.show_thread(0);
+        rt.state.brief.recruit = Some(crate::model::RecruitPicker {
+            server: rt.state.machines.selected.clone(),
+            captain,
+            query: rune::TextEdit::default(),
+        });
+        rt.state.brief.more = Some(next_id);
+        rt.state.show_thread(other_idx);
+        assert!(rt.state.brief.recruit.is_none());
+        assert!(rt.state.brief.more.is_none());
+        assert!(rt.state.preview_allowed());
     }
 
     #[test]

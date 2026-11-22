@@ -6932,6 +6932,8 @@ impl State {
         // A retired record's sheet belongs to the thread it was opened from.
         self.brief.record = None;
         self.brief.confirm_reset = false;
+        self.brief.recruit = None;
+        self.brief.more = None;
         self.plan_menu = None;
         self.env_mode_picker = false;
         self.base_branch_picker = false;
@@ -12645,6 +12647,19 @@ impl State {
         Some((machine, project.path.to_string_lossy().into_owned()))
     }
 
+    /// Whether the current thread hides its composer behind a read-only Captain bar
+    /// (an archived Captain home or an earlier Captain conversation).
+    pub fn composer_hidden(&self) -> bool {
+        let t = self.current();
+        let archived_home = t.captain_home
+            && t.captain
+                .is_some_and(|captain| self.captain_phase(captain) == CaptainPhase::Archived);
+        let earlier_home = self.is_captain_home(t)
+            && t.captain
+                .is_some_and(|captain| self.captain_home(captain) != Some(t.id));
+        archived_home || earlier_home
+    }
+
     pub fn composer_vcs_controls(&self) -> ComposerVcsControls {
         if self.demo {
             return ComposerVcsControls::Hidden;
@@ -12800,6 +12815,19 @@ impl State {
         } else {
             None
         };
+        let controls = self.composer_vcs_controls();
+        if !matches!(
+            controls,
+            ComposerVcsControls::Editable {
+                mode: ThreadEnvMode::Worktree,
+                ..
+            }
+        ) {
+            self.base_branch_picker = false;
+        }
+        if !matches!(controls, ComposerVcsControls::Editable { .. }) {
+            self.env_mode_picker = false;
+        }
         if let Some(default_branch) = default_branch {
             let mut updated_active = false;
             let default_mode = self.effective_default_thread_env_mode();

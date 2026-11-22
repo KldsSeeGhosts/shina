@@ -235,7 +235,7 @@ fn modal_dialog_open(state: &State) -> bool {
         || state.brief.lifecycle.is_some()
 }
 
-fn composer_controls_blocked(state: &State) -> bool {
+fn chat_find_blocked(state: &State) -> bool {
     let t = state.current();
     state.demo
         || state.settings_menu
@@ -252,6 +252,10 @@ fn composer_controls_blocked(state: &State) -> bool {
         || state.attachment_preview.is_some()
         || t.native.conversation.is_some()
         || t.native.questionnaire.is_some()
+}
+
+fn composer_controls_blocked(state: &State) -> bool {
+    chat_find_blocked(state) || state.composer_hidden()
 }
 
 fn dispatch_global_command(
@@ -412,7 +416,7 @@ fn dispatch_global_command(
             ui::composer_stash::command(state);
         }
         "chat.find" => {
-            if composer_controls_blocked(state) {
+            if chat_find_blocked(state) {
                 return false;
             }
             state.open_thread_find();
@@ -1938,5 +1942,62 @@ mod tests {
         // Previous wraps to the last row rather than the worker's own position.
         let last = state.sidebar_navigation().last().copied().unwrap();
         assert_eq!(state.current().id, state.threads[last].id);
+    }
+
+    #[test]
+    fn composer_picker_shortcuts_are_blocked_on_an_earlier_captain_conversation() {
+        let mut state = State::new(".".into(), false);
+        crate::captain_workspace_demo(&mut state);
+        state.demo = false;
+        let earlier_idx = state.active;
+        let earlier_id = state.current().id;
+        let captain = state.current().captain.expect("captain home");
+        let newer_id = state.threads.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        let mut newer = model::Thread::new(newer_id);
+        newer.title = "Current captain chat".into();
+        newer.captain_home = true;
+        newer.captain = Some(captain);
+        let newer_idx = state.threads.len();
+        state.threads.push(newer);
+        state.show_thread(earlier_idx);
+        assert_eq!(state.captain_home(captain), Some(newer_id));
+        assert_ne!(state.captain_home(captain), Some(earlier_id));
+        assert!(state.composer_hidden());
+
+        let event = KeyEvent {
+            key: rune::Key::Text(" ".into()),
+            mods: Default::default(),
+        };
+        for cmd in [
+            "modelPicker.toggle",
+            "composer.effort",
+            "composer.mode",
+            "composer.increaseEffort",
+            "composer.decreaseEffort",
+        ] {
+            assert!(
+                !dispatch_global_command(&mut state, cmd, &event, false, None),
+                "{cmd} must be blocked when the composer is absent"
+            );
+        }
+        assert!(state.settings_picker.is_none());
+        assert!(!state.current().native.access_picker);
+        assert!(
+            dispatch_global_command(&mut state, "chat.find", &event, false, None),
+            "find in thread should remain available on an earlier conversation"
+        );
+        state.close_thread_find();
+
+        // On the current home thread (composer visible), the shortcut works.
+        state.show_thread(newer_idx);
+        assert!(!state.composer_hidden());
+        assert!(dispatch_global_command(
+            &mut state,
+            "modelPicker.toggle",
+            &event,
+            false,
+            None
+        ));
+        assert_eq!(state.settings_picker, Some(model::SettingsPicker::Model));
     }
 }
