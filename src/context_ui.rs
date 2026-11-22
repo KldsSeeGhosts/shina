@@ -8,6 +8,7 @@
 //! the composer ring already measures, the memory book, the captain's scope
 //! and the conversation controls, ported from KSG Code's
 //! `chat/ContextWindowMeter.tsx` and the Brief's `ThreadDetailsSection` rows.
+use super::META_COMPACT as META;
 use super::*;
 
 use super::crew_ui::{active_wash, ghost_button, hover_wash, motion, solid_button};

@@ -5,7 +5,8 @@
 //! The Brief is ported from KSG Code's `chat/ThreadDetailsPanel.tsx` and
 //! `chat/ThreadDetailsSection.tsx`: sections with a small muted heading and a hairline between
 //! them, 32 px rows at a 10 px radius. It shares crew_ui's design language: hover is ink at 6 %,
-//! active 8 %, hairlines at 10 % ink, motion of 0.18 s on `cubic-bezier(.23, 1, .32, 1)`.
+//! active 8 %, opaque hairlines in `line`, motion of 0.18 s on `cubic-bezier(.23, 1, .32, 1)`.
+use super::META_COMPACT as META;
 use super::crew_ui::{active_wash, ghost_button, hover_wash, motion, solid_button};
 use super::*;
 use crate::model::BackgroundStatus;

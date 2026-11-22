@@ -216,7 +216,7 @@ fn palette(dark: bool) -> Palette {
             frame: color("#2c2c2c"),
             portrait_frame: color("#2c2c2c"),
             shadow: color("#000000").alpha(0.45),
-            field_line: color("#333333"),
+            field_line: color("#707070"),
             ring: color("#8aa4ff"),
             message_bg: color("#222222"),
             code_bg: color("#131313"),
@@ -233,7 +233,7 @@ fn palette(dark: bool) -> Palette {
             line: color("#e6e6e6"),
             ink: color("#1c1d20"),
             muted: color("#55595f"),
-            faint: color("#666666"),
+            faint: color("#626262"),
             selected: color("#000000").alpha(0.045),
             row: color("#ffffff"),
             coral: color("#141518"),
@@ -251,7 +251,7 @@ fn palette(dark: bool) -> Palette {
             frame: color("#e1e1e1"),
             portrait_frame: color("#e3e3e3"),
             shadow: color("#000000").alpha(0.10),
-            field_line: color("#d9d9d9"),
+            field_line: color("#858585"),
             ring: color("#1d4ed8"),
             message_bg: color("#ececec"),
             code_bg: color("#f0f0f0"),
@@ -346,6 +346,8 @@ const fn meta(size: f32) -> TextStyle {
 }
 /// Section labels, counts and status words.
 const META: TextStyle = meta(12.0);
+/// Compact 12/500 meta rows in Brief, Context, and crew cards (16 pt line height).
+const META_COMPACT: TextStyle = TextStyle::new(12.0, 500.0).lh(16.0);
 /// Section labels: KSG's sidebar group headings, sentence case with a little air.
 const META_LABEL: TextStyle = meta(12.0).tracking(0.1);
 /// Inter 13/500, thread titles in the bar and highlighted sidebar rows.
@@ -780,18 +782,29 @@ fn toggle_button(
     p: Palette,
     action: impl Fn(&mut State) + 'static,
 ) -> El {
-    el().key(key)
+    let active_fill = if p.panel.luminance() < 0.5 {
+        p.lift
+    } else {
+        p.card
+    };
+    let mut button = el()
+        .key(key)
         .role("button")
         .cursor(rune::Cursor::Pointer)
         .label(title)
+        .checked(on)
         .focusable(true)
         .size(24.0, 24.0)
         .center()
         .radius(6.0)
-        .fill(if on { p.lift } else { Color::TRANSPARENT })
+        .fill(if on { active_fill } else { Color::TRANSPARENT })
         .hover(p.selected)
         .on_press(action)
-        .child(tool_icon(glyph, if on { p.ink } else { p.muted }))
+        .child(tool_icon(glyph, if on { p.ink } else { p.muted }));
+    if on {
+        button = button.border(1.0, p.field_line);
+    }
+    button
 }
 /// The status a view should show for the open tab: a captain's home stands for the whole
 /// captain, so it shows the most urgent of its threads; any other tab shows itself.
@@ -829,27 +842,22 @@ fn status_mark(status: Status, p: Palette, size: f32) -> El {
     }
     .a11y_hidden()
 }
-/// A live status slot in the top bar, intrinsic width. The text sits in tabular
-/// figures and fades between values on Shina's motion curve, so a ticking timer
-/// never reflows the row around it.
-fn status_slot(key: &str, status: Status, text: Option<String>, p: Palette) -> El {
+/// A status slot in the top bar, intrinsic width. Fades between states on
+/// Shina's motion curve; the live elapsed timer lives in the timeline's working bar.
+fn status_slot(key: &str, status: Status, p: Palette) -> El {
     let mut slot = row().key(key).h(20.0).shrink().center_y();
-    let text = match text {
-        Some(text) => text,
-        None if matches!(status, Status::Ready | Status::Completed) => return slot,
-        None => status.label().into(),
-    };
-    slot = slot.label(text.clone()).child(
+    if matches!(status, Status::Ready | Status::Completed) {
+        return slot;
+    }
+    let text = status.label();
+    slot = slot.label(text).child(
         row()
-            .key(format!("{key}-{}", status.label()))
+            .key(format!("{key}-{text}"))
             .center_y()
             .gap(6.0)
             .opacity_motion(MOTION_SLOW)
             .child(status_mark(status, p, 6.0))
-            .child(
-                label(text, META.features(TABULAR), status_ink(status, p))
-                    .key(format!("{key}-text")),
-            ),
+            .child(label(text, META, status_ink(status, p)).key(format!("{key}-text"))),
     );
     slot
 }
@@ -22332,6 +22340,24 @@ pub(crate) mod tests {
 
     #[test]
     fn reading_and_control_text_keep_accessible_contrast_in_both_themes() {
+        fn over_srgb(base: Color, overlay: Color) -> Color {
+            use rune::color::{srgb_decode, srgb_encode};
+            let a = overlay.a;
+            let blend = |b: f32, o: f32| {
+                let (b, o) = (srgb_encode(b), srgb_encode(o));
+                srgb_decode(b * (1.0 - a) + o * a)
+            };
+            Color {
+                r: blend(base.r, overlay.r),
+                g: blend(base.g, overlay.g),
+                b: blend(base.b, overlay.b),
+                a: 1.0,
+            }
+        }
+        fn ratio(a: Color, b: Color) -> f32 {
+            let (a, b) = (a.luminance(), b.luminance());
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
         for dark in [false, true] {
             let p = palette(dark);
             for (index, (foreground, background)) in [
@@ -22342,16 +22368,26 @@ pub(crate) mod tests {
                 (p.muted, p.card),
                 (p.faint, p.panel),
                 (p.faint, p.card),
+                (p.faint, p.card_top),
+                (p.faint, p.card_bottom),
                 (p.faint, p.bg),
+                (p.faint, p.lift),
                 (p.faint, p.bg.mix(p.selected, p.selected.a)),
+                (p.faint, over_srgb(p.bg, p.selected)),
+                (p.faint, p.panel.mix(p.selected, p.selected.a)),
+                (p.faint, over_srgb(p.panel, p.selected)),
                 (p.faint, p.card.mix(p.selected, p.selected.a)),
+                (p.faint, over_srgb(p.card, p.selected)),
                 (p.faint, p.code_bg),
                 (p.ink, p.message_bg),
                 // The "Shina" role label sits on the coral wash.
                 (p.ink, p.panel.mix(p.coral_bg, p.coral_bg.a)),
+                (p.ink, over_srgb(p.panel, p.coral_bg)),
                 (p.muted, p.code_bg),
                 (p.muted, p.bg.mix(p.selected, p.selected.a)),
+                (p.muted, over_srgb(p.bg, p.selected)),
                 (p.muted, p.card.mix(p.selected, p.selected.a)),
+                (p.muted, over_srgb(p.card, p.selected)),
                 (p.sea, p.panel),
                 (p.sea, p.card),
                 (p.sea, p.bg),
@@ -22361,16 +22397,30 @@ pub(crate) mod tests {
                 (p.brass, p.panel),
                 (p.brass, p.brass_bg),
                 (p.brass, p.bg.mix(p.selected, p.selected.a)),
+                (p.brass, over_srgb(p.bg, p.selected)),
             ]
             .into_iter()
             .enumerate()
             {
-                let a = foreground.luminance();
-                let b = background.luminance();
-                let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                let contrast = ratio(foreground, background);
                 assert!(
                     contrast >= 4.5,
                     "text contrast {contrast:.2} in pair {index}, dark={dark}"
+                );
+            }
+            // WCAG 1.4.11: non-text control boundaries (fields, checkboxes, radios, active toggles)
+            // must read at 3:1 or better against every surface they sit on.
+            for (name, surface) in [
+                ("bg", p.bg),
+                ("panel", p.panel),
+                ("tray", p.tray),
+                ("card", p.card),
+                ("lift", p.lift),
+            ] {
+                let contrast = ratio(p.field_line, surface);
+                assert!(
+                    contrast >= 3.0,
+                    "field_line contrast {contrast:.2} on {name}, dark={dark}"
                 );
             }
         }

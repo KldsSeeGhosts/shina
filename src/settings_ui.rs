@@ -1160,13 +1160,13 @@ pub(super) fn dialog(s: &State, p: Palette) -> El {
                 ))
                 .child(search),
         )
-        .child(el().h(1.0).w_full().fill(p.line).hairline())
+        .child(el().h(1.0).w_full().fill(p.frame))
         .child(
             row()
                 .grow(1.0)
                 .min_h(0.0)
                 .child(nav)
-                .child(el().w(1.0).h_full().fill(p.line).hairline())
+                .child(el().w(1.0).h_full().fill(p.frame))
                 .child(content),
         );
     let mut backdrop = el()

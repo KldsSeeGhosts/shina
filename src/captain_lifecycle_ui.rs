@@ -5,6 +5,7 @@
 //! The dialogs adapt captain_ui's `reset_dialog`, itself ported from KSG's
 //! `ui/alert-dialog.tsx`. Captain-specific group actions have no KSG equivalent: KSG's
 //! `Sidebar.tsx` only confirms one thread's archive or delete at a time.
+use super::META_COMPACT as META;
 use super::captain_ui::{quiet_note, switch};
 use super::crew_ui::{active_wash, ghost_button, hover_wash, mark_slot, motion};
 use super::*;

@@ -10,6 +10,7 @@
 //! to reach", "Delivered to") is not an answer; and the card stays until an answer
 //! record exists. Artifact claims render as bounded labels with the owning
 //! machine named — Shina never opens their paths or runs their references.
+use super::META_COMPACT as META;
 use super::*;
 use crate::model::ReportPolicy;
 use crate::model::crew_question_state::CrewQuestionView;

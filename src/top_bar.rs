@@ -75,7 +75,7 @@ pub(super) fn bar(s: &State, p: Palette, narrow: bool, compact: bool, tabs_width
                 .child(agents_ui::chip("chat-status-agents", active, p)),
         );
     } else if !s.demo && !matches!(t.status, Status::Ready | Status::Completed) {
-        bar = bar.child(status_slot("chat-status", t.status, None, p));
+        bar = bar.child(status_slot("chat-status", t.status, p));
     }
     bar = bar
         .child(spacer())

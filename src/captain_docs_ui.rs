@@ -6,6 +6,7 @@
 //! The panel's structure follows the KSG `RightPanelSurfaceContent` bodies: a header row with
 //! the document's title and actions, then the scrollable body. Skin and tokens are KSG Code's,
 //! through the shared `Palette`.
+use super::META_COMPACT as META;
 use super::captain_ui::quiet_note;
 use super::crew_ui::{ghost_button, solid_button};
 use super::markdown_ui;

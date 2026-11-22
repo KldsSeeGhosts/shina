@@ -92,7 +92,7 @@ pub(super) fn more_menu(s: &State, p: Palette, captain: usize, thread_id: usize)
         ));
     if let Some(reason) = reason {
         menu = menu.child(
-            label(reason, META, p.muted)
+            label(reason, META_MENU, p.muted)
                 .key("crew-menu-reason")
                 .wrap()
                 .px(8.0)
@@ -129,6 +129,8 @@ fn menu_row(
     }
     row_
 }
+
+const META_MENU: TextStyle = TextStyle::new(12.0, 500.0);
 
 /// Report a crew command's outcome on the Brief's error line; a pending id needs no banner.
 fn report_mutation(s: &mut State, result: Result<crate::model::CrewMutation, String>) {
@@ -245,7 +247,7 @@ pub(super) fn move_picker(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
                     .children(
                         reason
                             .iter()
-                            .map(|reason| label(reason, META, p.faint).wrap()),
+                            .map(|reason| label(reason, META_MENU, p.faint).wrap()),
                     ),
             );
         if reason.is_none() {
@@ -530,8 +532,8 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize, cx: &Cx<Sta
                             .grow(1.0)
                             .min_w(0.0),
                     )
-                    .child(label(workspace, META, p.muted).truncate().shrink())
-                    .child(label(age, META, p.faint)),
+                    .child(label(workspace, META_MENU, p.muted).truncate().shrink())
+                    .child(label(age, META_MENU, p.faint)),
             );
         }
     }
@@ -569,12 +571,12 @@ pub(super) fn recruit_palette(s: &State, p: Palette, captain: usize, cx: &Cx<Sta
                             .min_w(0.0)
                             .child(label(title, TextStyle::new(13.0, 500.0), p.faint).truncate())
                             .child(
-                                label(reason, META, p.faint)
+                                label(reason, META_MENU, p.faint)
                                     .key(format!("crew-recruit-reason-{id}"))
                                     .wrap(),
                             ),
                     )
-                    .child(label(workspace, META, p.faint).truncate().shrink()),
+                    .child(label(workspace, META_MENU, p.faint).truncate().shrink()),
             );
         }
     }
