@@ -5179,6 +5179,8 @@ pub struct State {
     pub plan_save_last_path: Option<String>,
     next_plan_save_request_id: u64,
     pub snooze_menu: Option<(usize, Vec<SnoozeChoice>)>,
+    pub snooze_anchor: Option<String>,
+    pub snooze_at: Option<(f32, f32)>,
     pub snooze_targets: Vec<usize>,
     pub custom_snooze_open: bool,
     pub snooze_edit: TextEdit,
@@ -6308,6 +6310,8 @@ impl State {
             citation_highlight: None,
             citation_comment: None,
             snooze_menu: None,
+            snooze_anchor: None,
+            snooze_at: None,
             snooze_targets: vec![],
             custom_snooze_open: false,
             snooze_edit: TextEdit::default(),
@@ -8407,6 +8411,7 @@ impl State {
             .map(|parent| self.effective_home(parent))
             .unwrap_or(current.id)
     }
+    #[cfg(test)]
     pub fn visible_sidebar_threads(&self) -> Vec<usize> {
         let mut settled = 0;
         self.sidebar_threads()
@@ -9141,15 +9146,21 @@ impl State {
         self.snooze_blocker(id).is_none()
     }
     pub fn open_snooze(&mut self, id: usize) {
+        self.open_snooze_from(id, None, None);
+    }
+    pub fn open_snooze_from(&mut self, id: usize, anchor: Option<String>, at: Option<(f32, f32)>) {
         if self.snooze_blocker(id).is_some() {
             return;
         }
         self.row_menu = None;
+        self.row_menu_at = None;
         self.thread_menu = false;
         self.snooze_menu = Some((
             id,
             lifecycle::snooze_choices_from(self.thread_defaults.snooze_presets()),
         ));
+        self.snooze_anchor = anchor;
+        self.snooze_at = at;
         self.snooze_targets = if self.selected_threads.contains(&id) {
             self.selected_threads.clone()
         } else {
@@ -9164,6 +9175,8 @@ impl State {
             json!({"threadId":id,"action":"snooze","until":until}),
         ) {
             self.snooze_menu = None;
+            self.snooze_anchor = None;
+            self.snooze_at = None;
             return;
         }
         if until <= lifecycle::now() || !self.can_snooze(id) {
@@ -9175,6 +9188,8 @@ impl State {
         self.remember(Action::Snooze, i);
         self.threads[i].life.snooze(lifecycle::now(), until);
         self.snooze_menu = None;
+        self.snooze_anchor = None;
+        self.snooze_at = None;
         self.advance_parked(id);
         self.checkpoint();
     }

@@ -1240,7 +1240,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else if s.thread_menu {
         root = root.child(thread_menu(s, p));
     } else if s.plan_menu.is_some() {
-        root = root.child(work_ui::plan_menu(s, p));
+        if let Some(menu) = work_ui::plan_menu(s, p, cx) {
+            root = root.child(menu);
+        }
     }
     if s.row_menu.is_some() {
         // A right-click opens the menu where it landed; the keyboard opens it beside the row.
@@ -1251,7 +1253,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                     .size(0.0, 0.0),
             );
         }
-        root = root.child(row_menu(s, p));
+        if let Some(menu) = row_menu(s, p, cx) {
+            root = root.child(menu);
+        }
     }
     if s.tab_menu.is_some() {
         if let Some((x, y)) = s.tab_menu_at {
@@ -1264,7 +1268,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         root = root.child(thread_tab_menu(s, p));
     }
     if s.snooze_menu.is_some() {
-        root = root.child(snooze_menu(s, p));
+        if let Some((x, y)) = s.snooze_at {
+            root = root.child(
+                el().key("snooze-menu-point")
+                    .absolute(x / zoom, y / zoom)
+                    .size(0.0, 0.0),
+            );
+        }
+        if let Some(menu) = snooze_menu(s, p, cx) {
+            root = root.child(menu);
+        }
     }
     if s.settings_menu {
         root = root.child(settings_ui::dialog(s, p));
@@ -1288,7 +1301,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if composer_code_picker::menu_open(s) {
         root = root.child(composer_code_picker::menu(s, p));
     }
-    if let Some(popover) = citation_comment::popover(s, p) {
+    if let Some(popover) = citation_comment::popover(s, p, cx) {
         root = root.child(popover);
     }
     if s.machines.dialog {
@@ -1312,16 +1325,14 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         // A secondary press on a Crew Roster row opens the member's More menu right there,
         // anchored to the row.
         if let Some(thread_id) = s.brief.more {
-            root = root.child(
-                crew_membership_ui::more_menu(s, p, captain, thread_id)
-                    .anchored_fit(
-                        format!("crew-chip-{thread_id}"),
-                        rune::Side::Bottom,
-                        rune::Align::End,
-                        4.0,
-                    )
-                    .modal(true, |s: &mut State| s.brief.more = None),
-            );
+            let anchor = format!("crew-chip-{thread_id}");
+            if cx.layout_with(&anchor, |_| ()).is_some() {
+                root = root.child(
+                    crew_membership_ui::more_menu(s, p, captain, thread_id)
+                        .anchored_fit(anchor, rune::Side::Bottom, rune::Align::End, 4.0)
+                        .modal(true, |s: &mut State| s.brief.more = None),
+                );
+            }
         }
     }
     if let Some(menu) = crew_membership_ui::move_picker(s, p) {
@@ -5039,23 +5050,6 @@ fn sidebar_docked(s: &State) -> bool {
     (s.sidebar && !compact) || (compact && s.compact_sidebar)
 }
 
-/// Where a thread row's popover anchors: its sidebar row when that is on screen, else the
-/// header's actions button. A row exists only while the sidebar is docked and lists the
-/// thread; opened from the header menu, for a row filtered or shelved away, or under a
-/// compact window with no dock, the row key would not resolve and Rune suppresses the
-/// overlay rather than drawing it at the window's origin.
-fn sidebar_row_anchor(s: &State, id: usize) -> String {
-    if sidebar_docked(s)
-        && s.visible_sidebar_threads()
-            .iter()
-            .any(|&i| s.threads[i].id == id)
-    {
-        format!("thread-{id}")
-    } else {
-        "thread-actions".to_owned()
-    }
-}
-
 /// Advances the sidebar's portrait animations. Called from the app's poll; the answer is
 /// when to wake for the next frame, or None when no portrait plays.
 pub(crate) fn tick_portraits(
@@ -6464,6 +6458,7 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                 ),
             );
         } else {
+            let snooze_anchor = anchor.to_owned();
             actions = actions.child(
                 gated_menu_item(
                     "menu-snooze-thread",
@@ -6472,7 +6467,14 @@ fn thread_actions(s: &State, id: usize, p: Palette, anchor: &str) -> El {
                     p,
                     s.snooze_blocker(id),
                 )
-                .on_press(move |s: &mut State| s.open_snooze(id)),
+                .on_press(move |s: &mut State| {
+                    let at = if snooze_anchor == "thread-actions" {
+                        None
+                    } else {
+                        s.row_menu_at
+                    };
+                    s.open_snooze_from(id, Some(snooze_anchor.clone()), at);
+                }),
             );
         }
     }
@@ -6879,8 +6881,45 @@ fn captain_lifecycle_menu_item(
     })
 }
 
-fn snooze_menu(s: &State, p: Palette) -> El {
-    let (_, choices) = s.snooze_menu.as_ref().unwrap();
+fn snooze_menu(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let (id, choices) = s.snooze_menu.as_ref()?;
+    let id = *id;
+    let row_key = format!("thread-{id}");
+    // Under Rune #1339 an anchored overlay whose anchor is not mounted is
+    // suppressed visually while still holding modal focus. Use `thread-actions`
+    // for header launches, a mounted row or captured pointer point for sidebar
+    // launches, and never mount a modal without a live anchor.
+    let (anchor, side, align) = if s.snooze_anchor.as_deref() == Some("thread-actions")
+        && cx.layout_with("thread-actions", |_| ()).is_some()
+    {
+        (
+            "thread-actions".to_owned(),
+            rune::Side::Bottom,
+            rune::Align::End,
+        )
+    } else if let Some(a) = s
+        .snooze_anchor
+        .as_deref()
+        .filter(|a| cx.layout_with(a, |_| ()).is_some())
+    {
+        (a.to_owned(), rune::Side::Right, rune::Align::Start)
+    } else if cx.layout_with(&row_key, |_| ()).is_some() {
+        (row_key, rune::Side::Right, rune::Align::Start)
+    } else if s.snooze_at.is_some() {
+        (
+            "snooze-menu-point".to_owned(),
+            rune::Side::Right,
+            rune::Align::Start,
+        )
+    } else if cx.layout_with("thread-actions", |_| ()).is_some() {
+        (
+            "thread-actions".to_owned(),
+            rune::Side::Bottom,
+            rune::Align::End,
+        )
+    } else {
+        return None;
+    };
     let mut card = col()
         .key("snooze-menu")
         .role("menu")
@@ -6964,15 +7003,17 @@ fn snooze_menu(s: &State, p: Palette) -> El {
     if let Some(error) = &s.lifecycle_error {
         card = card.child(label(error, SMALL, p.danger).wrap());
     }
-    // A popover on the thread's row, like the thread menu: no scrim, no Cancel row. Escape and a
+    // A popover on the thread's row or header trigger: no scrim, no Cancel row. Escape and a
     // press outside close it.
-    let id = s.snooze_menu.as_ref().unwrap().0;
-    let anchor = sidebar_row_anchor(s, id);
-    card.anchored_fit(anchor, rune::Side::Right, rune::Align::Start, 4.0)
-        .modal(true, |s: &mut State| {
-            s.snooze_menu = None;
-            s.lifecycle_error = None;
-        })
+    Some(
+        card.anchored_fit(anchor, side, align, 4.0)
+            .modal(true, |s: &mut State| {
+                s.snooze_menu = None;
+                s.snooze_anchor = None;
+                s.snooze_at = None;
+                s.lifecycle_error = None;
+            }),
+    )
 }
 
 fn bulk_thread_actions(s: &State, p: Palette) -> El {
@@ -6994,10 +7035,12 @@ fn bulk_thread_actions(s: &State, p: Palette) -> El {
             )
             .on_press(move |s: &mut State| {
                 let ids = s.selected_threads.clone();
+                let at = s.row_menu_at;
                 s.row_menu = None;
+                s.row_menu_at = None;
                 if action == 2 {
                     if let Some(id) = ids.first() {
-                        s.open_snooze(*id);
+                        s.open_snooze_from(*id, Some(format!("thread-{}", *id)), at);
                     }
                     return;
                 }
@@ -7027,83 +7070,106 @@ fn bulk_thread_actions(s: &State, p: Palette) -> El {
     actions
 }
 
-fn row_menu(s: &State, p: Palette) -> El {
-    let target = s.row_menu.expect("row menu target");
+fn row_menu(s: &State, p: Palette, cx: &Cx<State>) -> Option<El> {
+    let target = s.row_menu?;
     let (anchor, actions) = match target {
-        RowTarget::Thread(id) => (
-            sidebar_row_anchor(s, id),
-            if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
-                bulk_thread_actions(s, p)
+        RowTarget::Thread(id) => {
+            let row_key = format!("thread-{id}");
+            let anchor = if s.row_menu_at.is_some() {
+                "row-menu-point".to_owned()
+            } else if cx.layout_with(&row_key, |_| ()).is_some() {
+                row_key
+            } else if cx.layout_with("thread-actions", |_| ()).is_some() {
+                "thread-actions".to_owned()
             } else {
-                thread_actions(s, id, p, &format!("thread-{id}"))
-            },
-        ),
-        RowTarget::Project(id) => (
-            format!("project-option-{id}"),
-            col()
-                .child(
-                    menu_item("menu-project-new-thread", "New thread", "compose", p).on_press(
-                        move |s: &mut State| {
-                            s.row_menu = None;
-                            s.new_thread_in(Some(id));
-                        },
-                    ),
-                )
-                .child(
-                    menu_item("menu-project-captain", "Open Captain", "grid", p).on_press(
-                        move |s: &mut State| {
+                return None;
+            };
+            (
+                anchor,
+                if s.selected_threads.contains(&id) && s.selected_threads.len() > 1 {
+                    bulk_thread_actions(s, p)
+                } else {
+                    thread_actions(s, id, p, &format!("thread-{id}"))
+                },
+            )
+        }
+        RowTarget::Project(id) => {
+            let option_key = format!("project-option-{id}");
+            let anchor = if s.row_menu_at.is_some() {
+                "row-menu-point".to_owned()
+            } else if cx.layout_with(&option_key, |_| ()).is_some() {
+                option_key
+            } else {
+                return None;
+            };
+            (
+                anchor,
+                col()
+                    .child(
+                        menu_item("menu-project-new-thread", "New thread", "compose", p).on_press(
+                            move |s: &mut State| {
+                                s.row_menu = None;
+                                s.new_thread_in(Some(id));
+                            },
+                        ),
+                    )
+                    .child(
+                        menu_item("menu-project-captain", "Open Captain", "grid", p).on_press(
+                            move |s: &mut State| {
+                                s.row_menu = None;
+                                s.project_picker = None;
+                                s.choose_project_captain(id);
+                            },
+                        ),
+                    )
+                    .child(
+                        menu_item(
+                            "menu-remove-project",
+                            "Remove workspace from list",
+                            "close",
+                            p,
+                        )
+                        .on_press(move |s: &mut State| {
                             s.row_menu = None;
                             s.project_picker = None;
-                            s.choose_project_captain(id);
-                        },
+                            s.remove_project(id);
+                        }),
                     ),
-                )
-                .child(
-                    menu_item(
-                        "menu-remove-project",
-                        "Remove workspace from list",
-                        "close",
-                        p,
-                    )
-                    .on_press(move |s: &mut State| {
-                        s.row_menu = None;
-                        s.project_picker = None;
-                        s.remove_project(id);
-                    }),
-                ),
-        ),
+            )
+        }
     };
-    col()
-        .key("row-context-menu")
-        .instant_changes()
-        .role("menu")
-        .focus_group()
-        .label("Row actions")
-        .w(222.0)
-        .padding(4.0)
-        .gap(1.0)
-        .radius(12.0)
-        .fill(p.card)
-        .border(1.0, p.frame)
-        .box_shadow(soft_shadow(p))
-        .anchored_fit(
-            if s.row_menu_at.is_some() {
-                "row-menu-point".into()
-            } else {
-                anchor
-            },
-            // Beside the point, as a native context menu opens, so the window clamps it
-            // vertically instead of cutting it short.
-            if s.row_menu_at.is_some() || matches!(target, RowTarget::Thread(_)) {
-                rune::Side::Right
-            } else {
-                rune::Side::Bottom
-            },
-            rune::Align::Start,
-            if s.row_menu_at.is_some() { 2.0 } else { 4.0 },
-        )
-        .modal(true, |s: &mut State| s.row_menu = None)
-        .child(actions)
+    Some(
+        col()
+            .key("row-context-menu")
+            .instant_changes()
+            .role("menu")
+            .focus_group()
+            .label("Row actions")
+            .w(222.0)
+            .padding(4.0)
+            .gap(1.0)
+            .radius(12.0)
+            .fill(p.card)
+            .border(1.0, p.frame)
+            .box_shadow(soft_shadow(p))
+            .anchored_fit(
+                anchor,
+                // Beside the point, as a native context menu opens, so the window clamps it
+                // vertically instead of cutting it short.
+                if s.row_menu_at.is_some() || matches!(target, RowTarget::Thread(_)) {
+                    rune::Side::Right
+                } else {
+                    rune::Side::Bottom
+                },
+                rune::Align::Start,
+                if s.row_menu_at.is_some() { 2.0 } else { 4.0 },
+            )
+            .modal(true, |s: &mut State| {
+                s.row_menu = None;
+                s.row_menu_at = None;
+            })
+            .child(actions),
+    )
 }
 
 fn thread_dialog(s: &State, p: Palette) -> El {
@@ -18646,6 +18712,128 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn transcript_context_copy_handles_authored_isolates_multibyte_pills_and_partial_pill_selections()
+     {
+        let mut rt = runtime(1280.0);
+        rt.on_key = Some(crate::key);
+        let clipboard = rune::clipboard::memory();
+        rt.use_clipboard(&clipboard);
+
+        let r1 = crate::composer_context::thread_context_record("local", 2, "αβγ日本語");
+        let r2 = crate::composer_context::thread_context_record("local", 3, "δεζ中文");
+        let href1 = crate::composer_context::format_composer_context_href("thread", &r1.context_id);
+        let href2 = crate::composer_context::format_composer_context_href("thread", &r2.context_id);
+        // Pill 1 gets Rune-generated U+2068/U+2069 marks; the standalone LRI..PDI and
+        // Pill 2's surrounding U+2068/U+2069 are authored and must stay intact.
+        let source = format!(
+            "Start [αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})\u{2069} tail"
+        );
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "context-bidi".into(),
+            role: "You",
+            text: source,
+            images: Vec::new(),
+            context: Some(crate::composer_context::MessageContext {
+                version: 1,
+                records: vec![r1.clone(), r2.clone()],
+            }),
+        });
+        let mut t2 = Thread::new(2);
+        t2.title = "αβγ日本語".into();
+        let mut t3 = Thread::new(3);
+        t3.title = "δεζ中文".into();
+        rt.state.threads.push(t2);
+        rt.state.threads.push(t3);
+        rt.frame(0.0);
+
+        let key = "context-text-1-context-bidi-0";
+        let copy_cmd = || rune::KeyEvent {
+            key: rune::Key::Command('c'),
+            mods: rune::Mods {
+                cmd: true,
+                ..Default::default()
+            },
+        };
+
+        // 1. Full copy: no panic, both pills exported, authored marks kept, no generated marks leaked.
+        rt.update(|_, tx| {
+            tx.blur();
+            tx.select_all_text(key);
+        });
+        rt.frame(0.0);
+        rt.key(copy_cmd());
+        rt.frame(0.0);
+        let full = clipboard.content().unwrap();
+        let expected_full = format!(
+            "Start [αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})\u{2069} tail"
+        );
+        assert_eq!(full.text(), expected_full);
+        let frag =
+            crate::composer_context::decode_composer_context_clipboard_html(full.html()).unwrap();
+        assert_eq!(frag.records, vec![r1.clone(), r2.clone()]);
+
+        // 2. Partial selection starting inside Pill 1's multibyte label through end of text.
+        let rendered = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .and_then(|e| e.text)
+            .expect("rendered pill text");
+        let inside_p1 = rendered
+            .find("日本語")
+            .expect("multibyte midpoint inside pill 1");
+        let inside_p2 = rendered
+            .find("中文")
+            .expect("multibyte midpoint inside pill 2");
+        let end_all = rendered.len();
+        rt.update(move |_, tx| {
+            tx.blur();
+            tx.select_text(key, inside_p1..end_all);
+        });
+        rt.frame(0.0);
+        assert!(
+            rt.selection().is_some(),
+            "partial selection from inside pill 1"
+        );
+        rt.key(copy_cmd());
+        rt.frame(0.0);
+        let from_p1 = clipboard.content().unwrap();
+        assert_eq!(
+            from_p1.text(),
+            format!(
+                "[αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})\u{2069} tail"
+            )
+        );
+        let frag_from_p1 =
+            crate::composer_context::decode_composer_context_clipboard_html(from_p1.html())
+                .unwrap();
+        assert_eq!(frag_from_p1.records, vec![r1.clone(), r2.clone()]);
+
+        // 3. Partial selection from start of text ending inside Pill 2's multibyte label.
+        rt.update(move |_, tx| {
+            tx.blur();
+            tx.select_text(key, 0..inside_p2);
+        });
+        rt.frame(0.0);
+        assert!(
+            rt.selection().is_some(),
+            "partial selection ending inside pill 2"
+        );
+        rt.key(copy_cmd());
+        rt.frame(0.0);
+        let to_p2 = clipboard.content().unwrap();
+        assert_eq!(
+            to_p2.text(),
+            format!(
+                "Start [αβγ日本語]({href1}) mid \u{2066}RTL\u{2069} \u{2068}[δεζ中文]({href2})"
+            )
+        );
+        let frag_to_p2 =
+            crate::composer_context::decode_composer_context_clipboard_html(to_p2.html()).unwrap();
+        assert_eq!(frag_to_p2.records, vec![r1, r2]);
+    }
+
+    #[test]
     fn transcript_thread_chip_opens_linked_machine_and_future_context_stays_unresolved() {
         for width in [620.0, 960.0, 1280.0, 1920.0] {
             let mut rt = runtime(width);
@@ -23466,6 +23654,33 @@ pub(crate) mod tests {
         press(&mut rt, "thread-undo");
         assert!(!rt.state.threads[0].life.snoozed(lifecycle::now()));
         assert!(rt.state.undo.is_none());
+    }
+
+    #[test]
+    fn snooze_menu_from_header_stays_visible_when_sidebar_row_is_scrolled_away() {
+        let mut rt = runtime(1280.0);
+        for i in 2..=45 {
+            let mut t = Thread::new(i);
+            t.title = format!("Thread {i}");
+            t.life.updated_at = 1_000 + i as u64;
+            rt.state.threads.push(t);
+        }
+        // Thread 1 sits at the bottom of the virtualized sidebar list, outside the mounted range.
+        rt.state.threads[0].life.updated_at = 1;
+        let id = rt.state.current().id;
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert!(
+            rt.presented(&format!("thread-{id}")).is_none(),
+            "current thread row should be virtualized out of the mounted sidebar range"
+        );
+        press(&mut rt, "thread-actions");
+        press(&mut rt, "menu-snooze-thread");
+        let (menu, _) = rt
+            .presented("snooze-menu")
+            .expect("header snooze menu must remain visible when sidebar row is unmounted");
+        assert!(menu[0] >= 0.0 && menu[0] + menu[2] <= 1280.5, "{menu:?}");
+        assert!(menu[1] >= 0.0 && menu[1] + menu[3] <= 720.5, "{menu:?}");
     }
 
     #[test]
@@ -33253,6 +33468,95 @@ pub(crate) mod tests {
                 "{width}"
             );
         }
+    }
+
+    #[test]
+    fn citation_comment_popover_stays_visible_when_short_draft_folds_narrow() {
+        let mut rt = runtime(1280.0);
+        rt.state.current_mut().draft.replace_text("Short draft");
+        rt.state.current_mut().messages.push(crate::model::Message {
+            id: "msg-cite-narrow".into(),
+            role: "Pi",
+            text: "the quoted passage".into(),
+            images: Vec::new(),
+            context: None,
+        });
+        let citation = crate::assistant_citation::build_assistant_citation(
+            "local",
+            &rt.state.current().id.to_string(),
+            "msg-cite-narrow",
+            "the quoted passage",
+            0,
+            18,
+        )
+        .unwrap();
+        let record =
+            crate::assistant_citation::citation_context_record(citation, "msg-cite-narrow", None);
+        let context_id = record.context_id.clone();
+        rt.state.current_mut().insert_context_chip(record);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.25);
+
+        let pencil = format!("citation-comment-{context_id}");
+        assert!(rt.presented(&pencil).is_some());
+        press(&mut rt, &pencil);
+        assert!(rt.presented("citation-comment-popover").is_some());
+
+        // Narrowing below 640 px folds the short draft into composer-preview and removes the pencil.
+        rt.state.viewport_width = 620.0;
+        rt.set_viewport((620.0, 720.0), 1.0);
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(0.25);
+        assert!(
+            rt.presented(&pencil).is_none(),
+            "pencil anchor should unmount when short draft folds"
+        );
+        let (rect, _) = rt
+            .presented("citation-comment-popover")
+            .expect("citation popover must fall back to a mounted composer anchor");
+        assert!(rect[0] >= -1.0 && rect[0] + rect[2] <= 621.0, "{rect:?}");
+        assert!(rect[1] >= -1.0 && rect[1] + rect[3] <= 721.0, "{rect:?}");
+
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Escape,
+            mods: Default::default(),
+        });
+        rt.frame(1.0);
+        assert!(rt.presented("citation-comment-popover").is_none());
+    }
+
+    #[test]
+    fn plan_menu_hides_instead_of_trapping_focus_when_plan_row_leaves_viewport() {
+        let mut rt = runtime(1280.0);
+        let t = rt.state.current_mut();
+        t.apply(serde_json::json!({
+            "type": "harness_update",
+            "field": "plan",
+            "value": { "planId": "p1", "markdown": "# Plan\n- Step 1" }
+        }));
+        t.work[0].expanded = true;
+        let card_id = format!("{}-0", t.id);
+        let actions_key = format!("plan-actions-{card_id}");
+        let menu_key = format!("plan-menu-{card_id}");
+        rt.frame(0.0);
+        rt.frame(1.0);
+        press(&mut rt, &actions_key);
+        assert!(rt.presented(&menu_key).is_some());
+
+        // Removing the plan trigger from the mounted tree must not leave an invisible modal active.
+        rt.state.current_mut().work[0].expanded = false;
+        rt.invalidate();
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert!(rt.presented(&actions_key).is_none());
+        assert!(rt.presented(&menu_key).is_none());
+        press(&mut rt, "thread-actions");
+        assert!(
+            rt.presented("thread-menu").is_some(),
+            "header menu must remain reachable without focus trapped by a hidden plan menu"
+        );
     }
 
     #[test]

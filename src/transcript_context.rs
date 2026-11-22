@@ -173,6 +173,83 @@ struct CopyLink {
 struct CopyText {
     text: String,
     links: Vec<CopyLink>,
+    generated_marks: Vec<Range<usize>>,
+}
+
+/// Mirror Rune's `TextSpec::apply_isolates` so `TextSelection` byte offsets on
+/// rendered pill text line up with `CopyText` and only Rune-generated isolate
+/// marks (never authored bidi marks) are removed when copying.
+fn apply_pill_isolates(text: &str, mut copied: Vec<CopyLink>) -> CopyText {
+    copied.sort_by_key(|link| (link.range.start, link.range.end));
+    let mut marked = String::with_capacity(text.len() + copied.len() * 6);
+    let mut marked_links = Vec::with_capacity(copied.len());
+    let mut generated_marks = Vec::with_capacity(copied.len() * 2);
+    let mut at = 0;
+    for link in copied {
+        let (a, b) = (link.range.start, link.range.end);
+        let ok = a < b
+            && b <= text.len()
+            && a >= at
+            && text.is_char_boundary(a)
+            && text.is_char_boundary(b);
+        if !ok {
+            continue;
+        }
+        // Rune skips adding isolates when the pill is already wrapped by authored marks.
+        let already_marked = text[..a].ends_with(['\u{2066}', '\u{2067}', '\u{2068}'])
+            && text[b..].starts_with('\u{2069}');
+        marked.push_str(&text[at..a]);
+        if !already_marked {
+            let open = marked.len();
+            marked.push('\u{2068}');
+            generated_marks.push(open..marked.len());
+        }
+        let link_start = marked.len();
+        marked.push_str(&text[a..b]);
+        let link_end = marked.len();
+        if !already_marked {
+            let close = marked.len();
+            marked.push('\u{2069}');
+            generated_marks.push(close..marked.len());
+        }
+        marked_links.push(CopyLink {
+            range: link_start..link_end,
+            ..link
+        });
+        at = b;
+    }
+    marked.push_str(&text[at..]);
+    CopyText {
+        text: marked,
+        links: marked_links,
+        generated_marks,
+    }
+}
+
+fn push_without_generated_marks(
+    out: &mut String,
+    text: &str,
+    range: Range<usize>,
+    marks: &[Range<usize>],
+) {
+    let mut at = range.start;
+    for mark in marks {
+        if mark.end <= at {
+            continue;
+        }
+        if mark.start >= range.end {
+            break;
+        }
+        let cut_start = mark.start.max(at);
+        let cut_end = mark.end.min(range.end);
+        if cut_start > at {
+            out.push_str(&text[at..cut_start]);
+        }
+        at = cut_end;
+    }
+    if at < range.end {
+        out.push_str(&text[at..range.end]);
+    }
 }
 
 struct Document<'a> {
@@ -529,43 +606,7 @@ impl<'a> Document<'a> {
                 el = el.help("This context is no longer available.");
             }
         }
-        // `El::pill` turns each chip into a bidi isolate: Rune rewrites the
-        // element's content with U+2068/U+2069 marks around it
-        // (`TextSpec::apply_isolates`), so `TextSelection` ranges on the text are
-        // in those marked coordinates. Keep the copy bookkeeping in them too.
-        let mut marked = String::with_capacity(text.len() + copied.len() * 6);
-        let mut marked_links = Vec::with_capacity(copied.len());
-        let mut at = 0;
-        let mut marks = 0usize;
-        for link in copied.into_iter() {
-            let (a, b) = (link.range.start, link.range.end);
-            let ok = a < b
-                && b <= text.len()
-                && a >= at
-                && text.is_char_boundary(a)
-                && text.is_char_boundary(b);
-            if !ok {
-                continue;
-            }
-            marked.push_str(&text[at..a]);
-            marked.push('\u{2068}');
-            marked.push_str(&text[a..b]);
-            marked.push('\u{2069}');
-            marked_links.push(CopyLink {
-                range: (a + 6 * marks + 3)..(b + 6 * marks + 3),
-                ..link
-            });
-            at = b;
-            marks += 1;
-        }
-        marked.push_str(&text[at..]);
-        self.copies.insert(
-            key,
-            CopyText {
-                text: marked,
-                links: marked_links,
-            },
-        );
+        self.copies.insert(key, apply_pill_isolates(&text, copied));
         let message_id = self.message.id.clone();
         el.on_link(move |s: &mut State, href, tx| activate(s, &message_id, href, tx))
             .on_secondary_press(|s: &mut State, at, tx| {
@@ -891,13 +932,27 @@ fn selection_payload(
                 continue;
             };
             let range = text.range();
+            if range.start > range.end
+                || range.end > copy.text.len()
+                || !copy.text.is_char_boundary(range.start)
+                || !copy.text.is_char_boundary(range.end)
+            {
+                continue;
+            }
             let mut body = String::new();
             let mut cursor = range.start;
             for link in &copy.links {
                 if link.range.start >= range.end || link.range.end <= range.start {
                     continue;
                 }
-                body.push_str(&copy.text[cursor..link.range.start.max(cursor)]);
+                if link.range.start > cursor {
+                    push_without_generated_marks(
+                        &mut body,
+                        &copy.text,
+                        cursor..link.range.start,
+                        &copy.generated_marks,
+                    );
+                }
                 body.push_str(&link.markdown);
                 cursor = link.range.end.min(range.end);
                 records.extend(
@@ -908,9 +963,14 @@ fn selection_payload(
                 );
                 message_id = Some(message.id.clone());
             }
-            body.push_str(&copy.text[cursor..range.end]);
-            // The marked content's isolate marks are layout, not copied text.
-            body.retain(|c| !('\u{2066}'..='\u{2069}').contains(&c));
+            if cursor < range.end {
+                push_without_generated_marks(
+                    &mut body,
+                    &copy.text,
+                    cursor..range.end,
+                    &copy.generated_marks,
+                );
+            }
             selected.push((text.path().to_string(), body));
         }
     }
