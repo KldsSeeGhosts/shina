@@ -136,6 +136,8 @@ impl RuntimeState {
         runtime.database = Some(database);
         runtime.state.refresh_execution(crate::lifecycle::now());
         runtime.state.mark_execution_restart_uncertain();
+        runtime.state.fence_exited_provider_jobs();
+        runtime.state.start_task_recovery();
         runtime.reconcile_provider_intents()?;
         if let Some(outcome) = &runtime.updates.outcome {
             runtime
@@ -1033,6 +1035,7 @@ impl RuntimeState {
             .database
             .as_ref()
             .map(|_| crate::outbox::Capture::begin());
+        self.state.record_shutdown_interruptions();
         self.state.begin_runtime_shutdown();
         self.state.mark_execution_restart_uncertain();
         if let Some(capture) = capture {
@@ -1067,6 +1070,8 @@ impl RuntimeState {
             .as_ref()
             .map(|_| crate::outbox::Capture::begin());
         self.state.stop_runtime();
+        crate::backend::shutdown_all();
+        self.state.fence_exited_provider_jobs();
         let result = if let Some(capture) = capture {
             self.persist(None, capture.finish())
         } else {

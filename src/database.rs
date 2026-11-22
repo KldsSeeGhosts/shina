@@ -2067,6 +2067,7 @@ mod tests {
             outbox::send(
                 &sender,
                 json!({"type":"prompt","message":"Only once","runId":run}),
+                None,
             )
             .unwrap();
             let effects = capture.finish();

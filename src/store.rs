@@ -17,6 +17,7 @@ use std::{
 /// request and the next frame. Only an actual drop following a clean save removes it.
 pub struct RunMarker {
     path: PathBuf,
+    #[cfg(test)]
     pub previous_unclean: bool,
     refreshed: std::time::Instant,
     pub clean: bool,
@@ -25,6 +26,7 @@ pub struct RunMarker {
 impl RunMarker {
     pub fn start(directory: &std::path::Path) -> Result<Self, String> {
         let path = directory.join("run-marker.json");
+        #[cfg(test)]
         let previous_unclean = match fs::metadata(&path) {
             Ok(_) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -32,6 +34,7 @@ impl RunMarker {
         };
         let mut marker = Self {
             path,
+            #[cfg(test)]
             previous_unclean,
             refreshed: std::time::Instant::now(),
             clean: false,

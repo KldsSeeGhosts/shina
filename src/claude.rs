@@ -2825,7 +2825,7 @@ fn run_mode(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut process = crate::process::Process::spawn(&mut command)
+    let mut process = backend::spawn_provider(&mut command, events, wake)
         .map_err(|e| format!("Could not start Claude: {e}"))?;
     let mut stdin = process.stdin.take().unwrap();
     let stdout = process.stdout.take().unwrap();

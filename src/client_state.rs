@@ -1521,7 +1521,6 @@ impl State {
         self.validate_captain_deleted_storage()?;
         self.runtime_enabled = true;
         self.warm_repository_identities();
-        self.start_task_recovery();
         self.refresh_catalog();
         self.checkpoint_and_flush()
     }
@@ -1612,6 +1611,7 @@ impl State {
                     break;
                 };
                 match event {
+                    Event::ProviderJob(_) => {}
                     Event::Record(record) => thread.apply(record),
                     Event::Error(error) => thread.fail_session(error),
                     Event::Diagnostic(message) => thread.diagnostic(&message),
