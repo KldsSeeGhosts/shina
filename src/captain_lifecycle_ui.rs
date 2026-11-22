@@ -937,11 +937,14 @@ pub(super) fn archived_bar(s: &State, p: Palette, wide: bool, pane_width: f32) -
         Some(reason) => unarchive.help(reason),
         None => unarchive,
     };
+    // The lane the conversation and composer resolve (`chatCanvasLayout.ts`); `None` until
+    // C5 mounts the Details card.
+    let lane = chat_lane(pane_width, wide, None);
     let bar = row()
         .key("captain-archived-bar")
         .role("status")
         .label(format!("{name} is archived, read-only"))
-        .w(lane_width(pane_width, wide))
+        .w(lane.width)
         .min_h(44.0)
         .px(14.0)
         .py(8.0)
@@ -964,7 +967,8 @@ pub(super) fn archived_bar(s: &State, p: Palette, wide: bool, pane_width: f32) -
     col()
         .key("captain-archived-lane")
         .w_full()
-        .px(lane_gutter(pane_width))
+        .pl(lane_gutter(pane_width) + lane.inset_start)
+        .pr(lane_gutter(pane_width) + lane.inset_end)
         .pb(16.0)
         .items_center()
         .child(bar)
