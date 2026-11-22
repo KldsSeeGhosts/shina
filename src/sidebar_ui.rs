@@ -1747,18 +1747,24 @@ fn clear_search(s: &mut State) {
     s.sync_sidebar_search_input();
 }
 
+// KSG's clear control inside `InputGroup`: an icon-micro button (20 pt) with a 12 pt glyph.
 pub(super) fn search_clear(s: &State, p: Palette) -> El {
     if s.search.text.is_empty() {
         return el();
     }
-    icon_button(
-        "thread-search-clear",
-        "Clear search",
-        "close",
-        p,
-        clear_search,
-    )
-    .size(22.0, 22.0)
+    el().key("thread-search-clear")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label("Clear search")
+        .help("Clear search")
+        .focusable(true)
+        .size(20.0, 20.0)
+        .center()
+        .radius(4.0)
+        .hover(p.selected)
+        .press(p.selected)
+        .on_press(clear_search)
+        .child(icon("close", p.muted).size(12.0, 12.0))
 }
 
 fn search_empty(s: &State, p: Palette) -> El {
@@ -1869,9 +1875,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
             }
             heading
         }
-        Node::Threads(after_captains) => section_title("Threads", p)
-            .mt(if *after_captains { 8.0 } else { 0.0 })
-            .child(project_switcher(s, p).help("Add workspace")),
+        Node::Threads(after_captains) => {
+            section_title("Threads", p).mt(if *after_captains { 8.0 } else { 0.0 })
+        }
         Node::Drafts => section_title("Drafts", p),
         Node::FormerHeading => section_title("Former captains", p),
         Node::Former(index) => {
