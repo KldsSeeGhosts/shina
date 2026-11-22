@@ -312,6 +312,26 @@ glyph!(
     WRAP_TEXT,
     r#"<path d="M3 6h18"/><path d="M3 12h15a3 3 0 1 1 0 6h-4"/><path d="m16 16-2 2 2 2"/><path d="M3 18h7"/>"#
 );
+glyph!(
+    GLOBE,
+    r#"<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>"#
+);
+glyph!(
+    SQUARE_PEN,
+    r#"<path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .505-.852z"/>"#
+);
+glyph!(
+    LIST_TODO,
+    r#"<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>"#
+);
+glyph!(
+    HAMMER,
+    r#"<path d="m15 12-8.373 8.373a1 1 0 1 1-3-3L12 9"/><path d="m18 15 4-4"/><path d="m21.5 11.5-1.914-1.914A2 2 0 0 1 19 8.172V7l-2.26-2.26a6 6 0 0 0-4.202-1.756L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.172a2 2 0 0 1 1.414.586L18.5 14.5"/>"#
+);
+glyph!(
+    CIRCLE_ALERT,
+    r#"<circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/>"#
+);
 
 /// Every name `glyph` knows, for tests.
 #[cfg(test)]
@@ -402,6 +422,12 @@ pub(super) const NAMES: &[&str] = &[
     "info",
     "book",
     "wrap-text",
+    "globe",
+    "square-pen",
+    "list-todo",
+    "hammer",
+    "circle-alert",
+    "x",
 ];
 
 /// The glyph for an icon name. Unknown names draw a check.
@@ -487,6 +513,12 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "info" => &INFO,
         "book" => &BOOK,
         "wrap-text" => &WRAP_TEXT,
+        "globe" => &GLOBE,
+        "square-pen" => &SQUARE_PEN,
+        "list-todo" => &LIST_TODO,
+        "hammer" => &HAMMER,
+        "circle-alert" => &CIRCLE_ALERT,
+        "x" => &CLOSE,
         _ => &CHECK,
     }
 }
