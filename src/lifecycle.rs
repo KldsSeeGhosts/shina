@@ -205,16 +205,19 @@ impl Lifecycle {
 pub enum Section {
     Pinned,
     Active,
+    Working,
     Snoozed,
     Settled,
 }
-pub fn section(life: &Lifecycle, now: u64) -> Section {
+pub fn section(life: &Lifecycle, now: u64, working: bool) -> Section {
     if life.snoozed(now) {
         Section::Snoozed
     } else if life.settled() {
         Section::Settled
     } else if life.pinned_at.is_some() {
         Section::Pinned
+    } else if working {
+        Section::Working
     } else {
         Section::Active
     }
@@ -230,7 +233,9 @@ pub(crate) enum Rank {
     Settled(std::cmp::Reverse<u64>),
 }
 
-pub(crate) fn rank(section: Section, life: &Lifecycle) -> Rank {
+// `returned` is the thread's Working-shelf return time: a thread that just finished work
+// sorts into the inbox where it landed, as KSG's `sortInboxThreadsByReturn` orders it.
+pub(crate) fn rank(section: Section, life: &Lifecycle, returned: u64) -> Rank {
     use std::cmp::Reverse;
     match section {
         Section::Pinned => life.pin_order_key.as_ref().map_or_else(
@@ -243,10 +248,19 @@ pub(crate) fn rank(section: Section, life: &Lifecycle) -> Rank {
                 life.unsettled_at.unwrap_or(0),
                 life.last_requested_at.unwrap_or(0),
                 life.last_completed_at.unwrap_or(0),
+                returned,
             ]
             .into_iter()
             .max()
             .unwrap(),
+        )),
+        // KSG's `sortWorkingThreadsBySend`: latest user-authored or requested time wins.
+        Section::Working => Rank::Active(Reverse(
+            life.created_at.max(
+                life.latest_user_message_at
+                    .or(life.last_requested_at)
+                    .unwrap_or(0),
+            ),
         )),
         Section::Snoozed => Rank::Snoozed(life.snoozed_until),
         Section::Settled => Rank::Settled(Reverse(life.settled_at.unwrap_or_else(|| {
@@ -264,11 +278,17 @@ pub(crate) fn rank(section: Section, life: &Lifecycle) -> Rank {
     }
 }
 
-pub fn compare(section: Section, a: &Lifecycle, b: &Lifecycle) -> Ordering {
-    rank(section, a).cmp(&rank(section, b))
+pub fn compare(
+    section: Section,
+    a: &Lifecycle,
+    b: &Lifecycle,
+    a_return: u64,
+    b_return: u64,
+) -> Ordering {
+    rank(section, a, a_return).cmp(&rank(section, b, b_return))
 }
 
-/// Rune supplies pointer drags on Windows. The timed Snoozed shelf rejects drops.
+/// Rune supplies pointer drags on Windows. Working is not draggable; timed shelves reject drops.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropPlan {
     Pin,
@@ -282,7 +302,7 @@ pub enum DropPlan {
 pub fn plan_drop(from: Section, to: Section) -> DropPlan {
     use Section::*;
     match (from, to) {
-        (_, Snoozed) => DropPlan::None,
+        (Working, _) | (_, Working | Snoozed) => DropPlan::None,
         (Pinned, Pinned) => DropPlan::ReorderPin,
         (_, Pinned) => DropPlan::Pin,
         (Pinned, Active) => DropPlan::Unpin,
@@ -355,6 +375,31 @@ pub fn spread_pin_keys(count: usize) -> Vec<String> {
             String::from_utf8(key).unwrap()
         })
         .collect()
+}
+
+// KSG's Working shelf grace: a thread that stops running keeps its shelf place for two
+// seconds so a brief gap between turns does not bounce the row back into the inbox.
+#[derive(Clone, Debug, Default)]
+pub struct Working {
+    pub was_working: bool,
+    pub deadline: Option<u64>,
+    pub returned_at: u64,
+}
+impl Working {
+    pub fn observe(&mut self, now: u64, working: bool, skip: bool) -> bool {
+        if working && !skip {
+            self.was_working = true;
+            self.deadline = None;
+        } else if self.was_working {
+            let deadline = *self.deadline.get_or_insert(now + 2000);
+            if skip || now >= deadline {
+                self.was_working = false;
+                self.deadline = None;
+                self.returned_at = now;
+            }
+        }
+        self.was_working
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,13 +685,14 @@ mod tests {
     #[test]
     fn exact_section_priority_and_manual_override() {
         let mut l = Lifecycle::new(1);
-        assert_eq!(section(&l, 10), Section::Active);
+        assert_eq!(section(&l, 10, false), Section::Active);
+        assert_eq!(section(&l, 10, true), Section::Working);
         l.pin(2, Some("n".into()));
-        assert_eq!(section(&l, 10), Section::Pinned);
+        assert_eq!(section(&l, 10, true), Section::Pinned);
         l.settled_override = Some(Settled::Settled);
-        assert_eq!(section(&l, 10), Section::Settled);
+        assert_eq!(section(&l, 10, true), Section::Settled);
         l.snooze(3, 100);
-        assert_eq!(section(&l, 10), Section::Snoozed);
+        assert_eq!(section(&l, 10, true), Section::Snoozed);
         l.settle(20);
         assert_eq!(l.pinned_at, None);
         assert_eq!(l.snoozed_until, None);
@@ -662,23 +708,25 @@ mod tests {
         let mut a = Lifecycle::new(10);
         let mut b = Lifecycle::new(20);
         a.pin_order_key = Some("n".into());
-        assert_eq!(compare(Section::Pinned, &a, &b), Ordering::Less);
+        assert_eq!(compare(Section::Pinned, &a, &b, 0, 0), Ordering::Less);
         b.pin_order_key = Some("b".into());
-        assert_eq!(compare(Section::Pinned, &a, &b), Ordering::Greater);
+        assert_eq!(compare(Section::Pinned, &a, &b, 0, 0), Ordering::Greater);
         a.pin_order_key = None;
         b.pin_order_key = None;
-        assert_eq!(compare(Section::Pinned, &a, &b), Ordering::Greater);
+        assert_eq!(compare(Section::Pinned, &a, &b, 0, 0), Ordering::Greater);
         a.last_completed_at = Some(30);
-        assert_eq!(compare(Section::Active, &a, &b), Ordering::Less);
+        assert_eq!(compare(Section::Active, &a, &b, 0, 0), Ordering::Less);
+        a.latest_user_message_at = Some(40);
+        assert_eq!(compare(Section::Working, &a, &b, 0, 0), Ordering::Less);
         a.snoozed_until = Some(50);
         b.snoozed_until = Some(60);
-        assert_eq!(compare(Section::Snoozed, &a, &b), Ordering::Less);
+        assert_eq!(compare(Section::Snoozed, &a, &b, 0, 0), Ordering::Less);
         a.settled_at = Some(2);
         b.settled_at = Some(1);
-        assert_eq!(compare(Section::Settled, &a, &b), Ordering::Less);
+        assert_eq!(compare(Section::Settled, &a, &b, 0, 0), Ordering::Less);
         a.settled_at = None;
         b.settled_at = None;
-        assert_eq!(compare(Section::Settled, &a, &b), Ordering::Less);
+        assert_eq!(compare(Section::Settled, &a, &b, 0, 0), Ordering::Less);
     }
 
     #[test]
@@ -785,10 +833,27 @@ mod tests {
     }
 
     #[test]
-    fn drop_plan_table_rejects_timed_targets() {
+    fn working_linger_and_actionable_bypass() {
+        let mut w = Working::default();
+        // A running thread lands on the shelf and lingers for two seconds after it stops.
+        assert!(w.observe(10, true, false));
+        assert!(w.observe(20, false, false));
+        assert!(w.observe(2019, false, false));
+        assert!(!w.observe(2020, false, false));
+        assert_eq!(w.returned_at, 2020);
+        // Pinned, snoozed, settled, archived and actionable threads skip the shelf at once.
+        assert!(w.observe(2030, true, false));
+        assert!(!w.observe(2031, false, true));
+        assert_eq!(w.returned_at, 2031);
+    }
+
+    #[test]
+    fn drop_plan_table_rejects_timed_targets_and_working_sources() {
         use Section::*;
-        for from in [Pinned, Active, Snoozed, Settled] {
+        for from in [Pinned, Active, Working, Snoozed, Settled] {
             assert_eq!(plan_drop(from, Snoozed), DropPlan::None);
+            assert_eq!(plan_drop(from, Working), DropPlan::None);
+            assert_eq!(plan_drop(Working, from), DropPlan::None);
         }
         assert_eq!(plan_drop(Pinned, Pinned), DropPlan::ReorderPin);
         assert_eq!(plan_drop(Active, Pinned), DropPlan::Pin);

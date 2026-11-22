@@ -276,12 +276,11 @@ mod tests {
             let (x, y) = rt.find("thread-900").unwrap();
             rt.pointer_move(x, y);
             rt.frame(1.0);
-            let portrait = rt.presented("thread-provider-portrait-900").unwrap().0;
+            // KSG's card has no lead avatar; the title column stays left of the actions.
             let title = rt.presented("thread-row-title-900").unwrap().0;
             let snooze = rt.presented("thread-snooze-900").unwrap().0;
             let settle = rt.presented("thread-park-900").unwrap().0;
             assert_eq!(idle_title, title, "{width}");
-            assert!(portrait[0] + portrait[2] <= snooze[0], "{width}");
             assert!(snooze[1] + snooze[3] <= title[1], "{width}");
             assert!(snooze[0] + snooze[2] <= settle[0] + 0.5, "{width}");
             assert!(

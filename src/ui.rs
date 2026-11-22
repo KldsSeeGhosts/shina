@@ -5174,7 +5174,8 @@ fn section_title(title: &str, p: Palette) -> El {
         .child(spacer())
 }
 /// A shelf heading's height.
-const SHELF_HEADING: f32 = 28.0;
+// KSG's `CollapsibleSectionHeader` is `h-8` (32 px).
+const SHELF_HEADING: f32 = 32.0;
 /// A selected sidebar row: KSG's `row` fill; light theme adds a hairline border.
 fn select_bar(item: El, selected: bool, dark: bool, p: Palette) -> El {
     if !selected {
@@ -18154,6 +18155,9 @@ pub(crate) mod tests {
                 rt.state.populate_demo();
                 rt.state.demo = false;
                 rt.state.composer_ui.force_expanded = true;
+                // KSG's 256 px sidebar leaves room for the docked details card here; this
+                // walk covers the main column's order, so keep the card off.
+                rt.state.details.docked = false;
                 if empty {
                     rt.state.new_thread_in(None);
                 }
@@ -20666,8 +20670,10 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
         rt.frame(0.0);
-        // A running thread stays in its own place in the list; there is no Working shelf.
-        assert!(rt.find("shelf-Working").is_none());
+        // KSG's Working shelf collects running threads at the bottom of the list.
+        assert!(rt.find("shelf-Working").is_some());
+        // Thread 2 is running, so it lives on the collapsed Working shelf.
+        assert!(rt.find("thread-2").is_none());
         // Shelves sit at the bottom of the sidebar, just above its footer.
         let mut tall = Runtime::with_text(
             State::new(".".into(), false),
@@ -20685,15 +20691,19 @@ pub(crate) mod tests {
             footer[1] - (settled[1] + settled[3]) < 40.0,
             "Settled {settled:?} is not above the footer {footer:?}"
         );
-        assert!(rt.find("thread-2").is_some());
         assert!(rt.find("shelf-Snoozed").is_some());
         assert!(rt.find("shelf-Settled").is_some());
         assert!(rt.find("thread-4").is_none());
         assert!(rt.find("thread-5").is_none());
+        rt.update(|_, tx| tx.scroll_into_view("shelf-Working"));
+        rt.frame(0.5);
+        press(&mut rt, "shelf-Working");
+        assert!(rt.state.shelves[0]);
+        assert!(rt.find("thread-2").is_some());
         rt.update(|_, tx| tx.scroll_into_view("shelf-Snoozed"));
         rt.frame(0.5);
         press(&mut rt, "shelf-Snoozed");
-        assert!(rt.state.shelves[0]);
+        assert!(rt.state.shelves[1]);
         assert!(rt.find("thread-4").is_some());
         rt.state.open_kept_tab(3);
         rt.frame(0.0);
@@ -20709,7 +20719,7 @@ pub(crate) mod tests {
             t.life.settle(lifecycle::now() - id as u64);
             rt.state.threads.push(t);
         }
-        rt.state.shelves[1] = true;
+        rt.state.shelves[2] = true;
         rt.invalidate();
         rt.frame(0.0);
         let count = |s: &State| {
@@ -22142,11 +22152,9 @@ pub(crate) mod tests {
             assert!(rt.presented("parent-bar").is_none(), "{width}");
             assert_inside(&mut rt, width, &["composer"]);
             assert!(rt.presented("crew-tray").is_none());
-            // The worker's details card links back to its captain. Beside an open Inspector
-            // the card cannot dock, so the top bar opens it as a popover.
-            assert!(rt.presented("details-card").is_none(), "{width}");
-            press(&mut rt, "header-details");
-            rt.frame(1.0);
+            // The worker's details card links back to its captain. KSG's 256 px sidebar
+            // leaves the lane wide enough for the card to dock under the covering Inspector.
+            assert!(rt.presented("details-card").is_some(), "{width}");
             press(&mut rt, "open-captain-from-overview");
             assert_eq!(rt.state.current().id, 7, "{width}");
             press(&mut rt, "needs-you-source-2");

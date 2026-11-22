@@ -558,6 +558,7 @@ pub(super) struct Entry<'a> {
     pub local: Option<usize>,
     pub captain: bool,
     pub draft: bool,
+    pub section: lifecycle::Section,
     pub life: lifecycle::Lifecycle,
     record: Option<&'a Value>,
     projection: Option<&'a crate::client_history::Projection>,
@@ -669,8 +670,9 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             }
             let section = s.thread_section(thread, at);
             let shelf = match section {
-                Section::Snoozed => Some(0),
-                Section::Settled => Some(1),
+                Section::Working => Some(0),
+                Section::Snoozed => Some(1),
+                Section::Settled => Some(2),
                 _ => None,
             };
             let visible = captain
@@ -682,6 +684,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 local: Some(index),
                 captain,
                 draft: s.draft_listed(thread),
+                section,
                 life: thread.life.clone(),
                 record: None,
                 projection: None,
@@ -877,12 +880,13 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             {
                 continue;
             }
+            let section = lifecycle::section(&life, at, false);
             let visible = if !query.is_empty() {
                 true
             } else {
-                match lifecycle::section(&life, at) {
-                    Section::Snoozed => s.shelves[0],
-                    Section::Settled => s.shelves[1],
+                match section {
+                    Section::Snoozed => s.shelves[1],
+                    Section::Settled => s.shelves[2],
                     _ => true,
                 }
             };
@@ -892,6 +896,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 local: None,
                 captain,
                 draft,
+                section,
                 life,
                 record: Some(record),
                 projection: Some(projection),
@@ -910,8 +915,12 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
         .map(|(rank, (server, id))| ((server.as_str(), *id), rank))
         .collect();
     entries.sort_by_cached_key(|row| {
-        let section = lifecycle::section(&row.life, at);
-        let rank = lifecycle::rank(section, &row.life);
+        let section = row.section;
+        let returned = row
+            .local
+            .map(|i| s.threads[i].working.returned_at)
+            .unwrap_or(0);
+        let rank = lifecycle::rank(section, &row.life, returned);
         let category = if searching {
             if row.title_match { 0 } else { 1 }
         } else if row.captain {
@@ -1038,6 +1047,7 @@ fn structure_signature(s: &State, at: u64) -> u64 {
         t.delegated.hash(&mut hash);
         s.draft_listed(t).hash(&mut hash);
         (s.thread_section(t, at) as u8).hash(&mut hash);
+        t.working.returned_at.hash(&mut hash);
         let life = &t.life;
         life.archived_at.hash(&mut hash);
         life.pinned_at.hash(&mut hash);
@@ -1190,7 +1200,7 @@ impl Plan {
     }
 }
 
-fn build_plan(s: &State, at: u64, version: u64) -> Plan {
+fn build_plan(s: &State, _at: u64, version: u64) -> Plan {
     let mut plan = Plan {
         version,
         ..Plan::default()
@@ -1244,12 +1254,19 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         }
     }
     let dragging = s.drag_thread.is_some();
+    // KSG's `Sidebar.logic.ts` partition: Working, Snoozed and Settled fold into shelves
+    // at the bottom of the list in that order.
+    let snoozed_exists = all
+        .iter()
+        .any(|row| !row.draft && row.section == Section::Snoozed);
     let settled_exists = all
         .iter()
-        .any(|row| !row.draft && lifecycle::section(&row.life, at) == Section::Settled);
+        .any(|row| !row.draft && row.section == Section::Settled);
+    let settled_shown = settled_exists || dragging;
     let sections = [
         Section::Pinned,
         Section::Active,
+        Section::Working,
         Section::Snoozed,
         Section::Settled,
     ];
@@ -1257,23 +1274,32 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         let rows: Vec<_> = all
             .iter()
             .copied()
-            .filter(|row| !row.draft && lifecycle::section(&row.life, at) == section)
+            .filter(|row| !row.draft && row.section == section)
             .collect();
-        if matches!(section, Section::Snoozed | Section::Settled) {
+        if matches!(
+            section,
+            Section::Working | Section::Snoozed | Section::Settled
+        ) {
             if rows.is_empty() && !(dragging && section == Section::Settled) {
                 continue;
             }
+            let below = match section {
+                Section::Working => usize::from(snoozed_exists) + usize::from(settled_shown),
+                Section::Snoozed => usize::from(settled_shown),
+                _ => 0,
+            };
+            let index = match section {
+                Section::Working => 0,
+                Section::Snoozed => 1,
+                _ => 2,
+            };
             plan.add(
                 format!("shelf-block-{section:?}"),
                 Node::Shelf {
                     section,
                     rows: rows.iter().map(|row| IndexedRow::new(row)).collect(),
-                    index: usize::from(section == Section::Settled),
-                    inset: if section == Section::Snoozed && (settled_exists || dragging) {
-                        SHELF_HEADING
-                    } else {
-                        0.0
-                    },
+                    index,
+                    inset: below as f32 * SHELF_HEADING,
                 },
             );
         } else if dragging {
@@ -1287,7 +1313,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         for row in rows.iter().copied().filter(|row| row.visible).take(limit) {
             plan.thread(s, row);
         }
-        if section == Section::Settled && s.shelves[1] && rows.len() > limit {
+        if section == Section::Settled && s.shelves[2] && rows.len() > limit {
             plan.add("settled-more", Node::More((rows.len() - limit).min(25)));
         }
     }
@@ -1397,12 +1423,17 @@ fn resolve<'a>(s: &'a State, row: &'a IndexedRow, rel: &Relations) -> Option<Ent
     } else {
         None
     };
+    let section = match local {
+        Some(i) => s.thread_section(&s.threads[i], lifecycle::now()),
+        None => lifecycle::section(&life, lifecycle::now(), false),
+    };
     Some(Entry {
         server,
         id,
         local,
         captain: row.captain,
         draft: row.draft,
+        section,
         life,
         record,
         projection,
@@ -1549,7 +1580,7 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             },
         );
     }
-    let section = lifecycle::section(&entry.life, now);
+    let section = entry.section;
     let shelved = matches!(section, Section::Snoozed | Section::Settled);
     let badge = entry
         .project(s)
@@ -1972,11 +2003,10 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         .cursor(rune::Cursor::Pointer)
                         .label(format!("{title}, {count} threads"))
                         .h(SHELF_HEADING)
-                        .pl(ROW_INSET)
-                        .pr(4.0)
+                        .px(8.0)
                         .radius(6.0)
                         .center_y()
-                        .gap(6.0)
+                        .gap(8.0)
                         .hover(p.selected)
                         .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                             s.drop_rects.insert(key.clone(), rect);
@@ -1991,7 +2021,7 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         .child(attention.map_or_else(el, |(ink, word)| {
                             attention_dot(format!("shelf-attention-{section:?}"), ink, word)
                         }))
-                        .child(label(count.to_string(), TIMER, p.faint))
+                        .child(meta_label(&count.to_string(), p.faint))
                         .child(
                             icon(
                                 if s.shelves[index] {

@@ -4,7 +4,7 @@ use crate::captains::{Captain, CaptainEditor};
 use crate::context::ContextMeter;
 use crate::harness::Session as Pi;
 use crate::lifecycle::{
-    self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep,
+    self, Action, DropPlan, Lifecycle, Section, SnoozeChoice, UndoNotice, UndoStep, Working,
 };
 use crate::projects::{Project, ProjectId};
 use crate::session::{AgentModel, Catalog, IDLE_TIMEOUT, START_TIMEOUT};
@@ -1213,6 +1213,9 @@ pub struct Thread {
     /// the older rule, where any session means the thread has been used.
     pub never_sent: bool,
     pub life: Lifecycle,
+    /// Working-shelf state: the two-second linger after a run ends and the return stamp
+    /// that orders the thread back into the inbox, as KSG's `inboxReturnTracker` does.
+    pub working: Working,
     pub started: Option<Instant>,
     pub elapsed: Option<u64>,
     pub captain: Option<usize>,
@@ -1845,6 +1848,7 @@ impl Thread {
             session: None,
             never_sent: true,
             life: Lifecycle::new(lifecycle::now()),
+            working: Working::default(),
             started: None,
             elapsed: None,
             captain: None,
@@ -5290,8 +5294,8 @@ pub struct State {
     pub scope_additional: Vec<ProjectId>,
     pub selected_threads: Vec<usize>,
     pub selection_anchor: Option<usize>,
-    /// Whether the Snoozed and Settled shelves are open.
-    pub shelves: [bool; 2],
+    /// Whether the Working, Snoozed and Settled shelves are open.
+    pub shelves: [bool; 3],
     pub settled_visible: usize,
     /// Which request the unified composer request banner is showing, clamped to
     /// the live request count each frame (spec §3.6).
@@ -6431,7 +6435,7 @@ impl State {
             scope_additional: vec![],
             selected_threads: vec![],
             selection_anchor: None,
-            shelves: [false; 2],
+            shelves: [false; 3],
             settled_visible: 10,
             needs_you_page: 0,
             now_popover: false,
@@ -7863,7 +7867,15 @@ impl State {
             self.draft_listed(b)
                 .cmp(&self.draft_listed(a))
                 .then_with(|| sa.cmp(&sb))
-                .then_with(|| lifecycle::compare(sa, &a.life, &b.life))
+                .then_with(|| {
+                    lifecycle::compare(
+                        sa,
+                        &a.life,
+                        &b.life,
+                        a.working.returned_at,
+                        b.working.returned_at,
+                    )
+                })
                 .then_with(|| a.id.cmp(&b.id))
                 .then_with(|| a.machine.cmp(&b.machine))
         });
@@ -8206,7 +8218,15 @@ impl State {
                         let sa = state.thread_section(ta, at);
                         let sb = state.thread_section(tb, at);
                         sa.cmp(&sb)
-                            .then_with(|| lifecycle::compare(sa, &ta.life, &tb.life))
+                            .then_with(|| {
+                                lifecycle::compare(
+                                    sa,
+                                    &ta.life,
+                                    &tb.life,
+                                    ta.working.returned_at,
+                                    tb.working.returned_at,
+                                )
+                            })
                             .then(ta.id.cmp(&tb.id))
                     })
             };
@@ -8538,7 +8558,13 @@ impl State {
                 Section::Active
             };
         }
-        lifecycle::section(&t.life, at)
+        // KSG's `isThreadWorking`: a running thread leaves the inbox for the Working
+        // shelf, but a thread waiting on the user stays where it is.
+        lifecycle::section(
+            &t.life,
+            at,
+            t.working.was_working || t.status == Status::Running && !self.row_pending(t),
+        )
     }
     fn connection_instructions(&self, index: usize) -> Option<String> {
         if self.threads[index].crew_captain.is_some() {
@@ -8594,8 +8620,9 @@ impl State {
                 }
                 let section = self.thread_section(t, lifecycle::now());
                 let shelf = match section {
-                    Section::Snoozed => Some(0),
-                    Section::Settled => Some(1),
+                    Section::Working => Some(0),
+                    Section::Snoozed => Some(1),
+                    Section::Settled => Some(2),
                     _ => None,
                 };
                 if let Some(shelf) = shelf {
@@ -9003,6 +9030,7 @@ impl State {
             let key = self.first_pin_key(id);
             self.threads[index].life.pin(lifecycle::now(), Some(key));
         }
+        self.threads[index].working = Working::default();
         self.checkpoint();
     }
     pub fn archive_thread(&mut self, id: usize) {
@@ -9068,6 +9096,7 @@ impl State {
             self.threads[index].disconnect();
             self.remove_tab(id, false);
         }
+        self.threads[index].working = Working::default();
         self.checkpoint();
     }
     fn first_pin_key(&mut self, except: usize) -> String {
@@ -9083,6 +9112,8 @@ impl State {
                 Section::Pinned,
                 &self.threads[*a].life,
                 &self.threads[*b].life,
+                0,
+                0,
             )
         });
         let after = pins
@@ -9244,6 +9275,7 @@ impl State {
             self.threads[i].disconnect();
             self.advance_parked(id);
         }
+        self.threads[i].working = Working::default();
         self.checkpoint();
     }
     fn advance_parked(&mut self, id: usize) {
@@ -9358,6 +9390,7 @@ impl State {
         let i = self.threads.iter().position(|t| t.id == id).unwrap();
         self.remember(Action::Snooze, i);
         self.threads[i].life.snooze(lifecycle::now(), until);
+        self.threads[i].working = Working::default();
         self.snooze_menu = None;
         self.snooze_anchor = None;
         self.snooze_at = None;
@@ -9378,6 +9411,7 @@ impl State {
             .find(|t| t.id == id && t.machine == "local")
         {
             t.life.unsnooze(lifecycle::now());
+            t.working = Working::default();
         }
         self.checkpoint();
     }
@@ -9655,6 +9689,8 @@ impl State {
                         Section::Pinned,
                         &self.threads[*a].life,
                         &self.threads[*b].life,
+                        0,
+                        0,
                     )
                 });
                 let place = before
@@ -9683,6 +9719,7 @@ impl State {
             DropPlan::Wake => self.unsnooze_thread(id),
             DropPlan::None => return,
         }
+        self.threads[i].working = Working::default();
         self.checkpoint();
     }
     /// Called each minute and after run-end events. PR integration can call this same hook.
@@ -9709,6 +9746,7 @@ impl State {
         for (i, stamp) in &eligible {
             self.threads[*i].life.settle(*stamp);
             self.threads[*i].disconnect();
+            self.threads[*i].working = Working::default();
         }
         !eligible.is_empty()
     }
@@ -17294,7 +17332,7 @@ impl State {
             "background": self.background.settings,
             "preferences": prefs_value,
             "draftModelStates": draft_model_states,
-            "version":1, "shelves":[false, self.shelves[0], self.shelves[1]], "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
+            "version":1, "shelves":self.shelves, "sidebar":self.sidebar, "sidebarWidth":self.sidebar_width,
             "sidebarWidthDefault":DEFAULT_SIDEBAR_WIDTH,
             "detailsCard":self.details.docked,
             "rightPanelWidth":self.right_panel_width,
@@ -17348,11 +17386,8 @@ impl State {
         self.preferences =
             serde_json::from_value(ui.get("preferences").cloned().unwrap_or(json!({})))
                 .map_err(|_| "Invalid UI preferences.")?;
-        // The first entry belonged to the removed Working shelf. It is still written so
-        // earlier versions can read the file.
-        let shelves: [bool; 3] =
+        self.shelves =
             serde_json::from_value(ui["shelves"].clone()).map_err(|_| "Invalid shelf state.")?;
-        self.shelves = [shelves[1], shelves[2]];
         self.sidebar = ui["sidebar"].as_bool().ok_or("Invalid sidebar state.")?;
         self.sidebar_width = ui
             .get("sidebarWidth")
@@ -18270,7 +18305,7 @@ impl State {
             .life
             .snooze(lifecycle::now(), lifecycle::now() + 10_800_000);
         self.threads[4].life.settle(lifecycle::now() - 86_400_000);
-        self.shelves = [false; 2];
+        self.shelves = [false; 3];
         self.undo = None;
         self.tabs = vec![1, 3, 10];
     }
@@ -18690,6 +18725,7 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                         .is_some_and(|failed| failed > t.life.snoozed_at.unwrap_or(u64::MAX)))
         })
         .collect();
+    let pending: Vec<_> = state.threads.iter().map(|t| state.row_pending(t)).collect();
     for (i, t) in state.threads.iter_mut().enumerate() {
         if t.life
             .snoozed_until
@@ -18707,6 +18743,17 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
                 scope.insert(t.id);
             }
             changed = true;
+        }
+        // KSG's working-shelf grace: a run that just ended keeps its Working place for
+        // two seconds so consecutive turns do not bounce the row between shelves.
+        let skip =
+            pending[i] || t.pinned() || t.life.settled() || t.life.snoozed(at) || t.archived();
+        let working = t.status == Status::Running && t.machine == "local";
+        let previous = t.working.was_working;
+        t.working.observe(at, working, skip);
+        changed |= previous != t.working.was_working;
+        if let Some(deadline) = t.working.deadline {
+            tx.wake_after(Duration::from_millis(deadline.saturating_sub(at)));
         }
         if let Some(wake) = t.life.snoozed_until.filter(|wake| *wake > at) {
             tx.wake_after(Duration::from_millis(wake - at));
