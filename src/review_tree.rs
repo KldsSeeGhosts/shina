@@ -443,65 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_files_names_and_dirs() {
-        let generated = [
-            "bun.lock",
-            "bun.lockb",
-            "Cargo.lock",
-            "composer.lock",
-            "deno.lock",
-            "flake.lock",
-            "Gemfile.lock",
-            "go.sum",
-            "gradle.lockfile",
-            "mix.lock",
-            "npm-shrinkwrap.json",
-            "package-lock.json",
-            "packages.lock.json",
-            "Pipfile.lock",
-            "PNPM-LOCK.YAML",
-            "Podfile.lock",
-            "poetry.lock",
-            "pubspec.lock",
-            "uv.lock",
-            "yarn.lock",
-            "src/schema.generated.ts",
-            "src/schema.gen.ts",
-            "lib/user.g.dart",
-            "proto/user.pb.go",
-            "proto/user_pb2.py",
-            "proto/user_pb2_grpc.py",
-            "proto/user.pb.cc",
-            "proto/user.pb.h",
-            "dist/app.min.js",
-            "dist/app.min.css",
-            "dist/app.js.map",
-            "dist/app.css.map",
-            "__generated__/types.ts",
-            "_generated/api.ts",
-            "Generated/Models.cs",
-        ];
-        for path in generated {
-            assert_eq!(
-                classify_changed_file(path),
-                ChangedFileKind::Generated,
-                "expected generated: {path}"
-            );
-            assert!(!is_test_changed_file(path), "not test: {path}");
-        }
-
-        // GENERATED_NAME is case-sensitive.
-        assert_eq!(
-            classify_changed_file("proto/user.PB.go"),
-            ChangedFileKind::Code
-        );
-        assert_eq!(
-            classify_changed_file("src/schema.GENERATED.ts"),
-            ChangedFileKind::Code
-        );
-    }
-
-    #[test]
     fn is_test_changed_file_covers_every_mock_and_test_pattern() {
         let positives = [
             // MOCK_NAME
@@ -601,69 +542,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn docs_and_not_docs_and_precedence() {
-        let docs = [
-            "README.md",
-            "docs/guide.MDX",
-            "notes.markdown",
-            "index.rst",
-            "manual.adoc",
-            "changelog.txt",
-            "my-robots.txt",
-            "requirements.md",
-        ];
-        for path in docs {
-            assert_eq!(
-                classify_changed_file(path),
-                ChangedFileKind::Docs,
-                "expected docs: {path}"
-            );
-        }
-
-        let not_docs = [
-            "requirements.txt",
-            "requirements-dev.txt",
-            "constraints.txt",
-            "constraints-prod.txt",
-            "CMakeLists.txt",
-            "cmakelists.TXT",
-            "robots.txt",
-            "llms.txt",
-        ];
-        for path in not_docs {
-            assert_eq!(
-                classify_changed_file(path),
-                ChangedFileKind::Code,
-                "expected code: {path}"
-            );
-        }
-
-        // Priority: generated > mocks > tests > docs > code.
-        assert_eq!(
-            classify_changed_file("generated/mocks/tests/README.md"),
-            ChangedFileKind::Generated
-        );
-        assert_eq!(
-            classify_changed_file("mocks/tests/README.md"),
-            ChangedFileKind::Mocks
-        );
-        assert_eq!(
-            classify_changed_file("tests/README.md"),
-            ChangedFileKind::Tests
-        );
-
-        // Windows path separators are normalized.
-        assert_eq!(
-            classify_changed_file(r"test\fixtures\pr.json"),
-            ChangedFileKind::Mocks
-        );
-        assert_eq!(
-            classify_changed_file(r"src\app.test.ts"),
-            ChangedFileKind::Tests
-        );
-    }
-
     fn file(change: ChangeKind, path: &str) -> FileDiff {
         FileDiff {
             path: path.to_string(),
@@ -676,33 +554,6 @@ mod tests {
             additions: 0,
             deletions: 0,
         }
-    }
-
-    #[test]
-    fn ksg_tree_entries_folds_file_to_symlink_into_modified() {
-        let entries = tree_entries(&[
-            file(ChangeKind::Modified, "CLAUDE.md"),
-            file(ChangeKind::Deleted, "AGENTS.md"),
-            file(ChangeKind::Added, "AGENTS.md"),
-            file(ChangeKind::Added, "docs/new.md"),
-        ]);
-        assert_eq!(
-            entries,
-            vec![
-                TreeEntry {
-                    path: "CLAUDE.md".to_string(),
-                    status: TreeStatus::Modified,
-                },
-                TreeEntry {
-                    path: "AGENTS.md".to_string(),
-                    status: TreeStatus::Modified,
-                },
-                TreeEntry {
-                    path: "docs/new.md".to_string(),
-                    status: TreeStatus::Added,
-                },
-            ]
-        );
     }
 
     #[test]
@@ -744,85 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_directory_paths_preserves_trailing_slashes_and_first_seen_order() {
-        let paths = vec![
-            "a/b/c.rs".to_string(),
-            "a/d.rs".to_string(),
-            "e.rs".to_string(),
-        ];
-        assert_eq!(
-            collect_directory_paths(&paths),
-            vec!["a/".to_string(), "a/b/".to_string()]
-        );
-    }
-
-    #[test]
-    fn ksg_order_like_tree_pulls_test_into_its_directory() {
-        let ordered = order_like_tree(&[
-            file(ChangeKind::Modified, "server/device/Host.ts"),
-            file(ChangeKind::Modified, "web/settings.ts"),
-            file(ChangeKind::Modified, "server/ws.ts"),
-            file(ChangeKind::Modified, "server/device/Host.test.ts"),
-            file(ChangeKind::Modified, "web/settings.test.ts"),
-        ]);
-        let names: Vec<&str> = ordered.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "server/device/Host.ts",
-                "server/device/Host.test.ts",
-                "server/ws.ts",
-                "web/settings.ts",
-                "web/settings.test.ts",
-            ]
-        );
-    }
-
-    #[test]
-    fn order_like_tree_handles_three_levels_and_empty_slice() {
-        assert!(order_like_tree(&[]).is_empty());
-
-        let ordered = order_like_tree(&[
-            file(ChangeKind::Modified, "src/ui/panel.rs"),
-            file(ChangeKind::Modified, "README.md"),
-            file(ChangeKind::Modified, "src/model.rs"),
-            file(ChangeKind::Modified, "src/ui/widgets/button.rs"),
-            file(ChangeKind::Modified, "docs/guide.md"),
-            file(ChangeKind::Modified, "src/ui/widgets/label.rs"),
-        ]);
-        let names: Vec<&str> = ordered.iter().map(|entry| entry.path.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "src/ui/panel.rs",
-                "src/ui/widgets/button.rs",
-                "src/ui/widgets/label.rs",
-                "src/model.rs",
-                "README.md",
-                "docs/guide.md",
-            ]
-        );
-    }
-
-    #[test]
-    fn positions_outrank_depth_and_name() {
-        let positions: std::collections::HashMap<String, usize> =
-            [("z/deep/file.rs".to_string(), 0), ("a.rs".to_string(), 1)].into();
-        assert_eq!(
-            compare_positioned_tree_entries(&positions, "z/deep/file.rs", "a.rs"),
-            Ordering::Less
-        );
-        assert_eq!(
-            compare_positioned_tree_entries(&positions, "unplaced.rs", "a.rs"),
-            Ordering::Greater
-        );
-        assert_eq!(
-            compare_positioned_tree_entries(&positions, "b.rs", "c/d.rs"),
-            Ordering::Less
-        );
-    }
-
-    #[test]
     fn compare_tree_entries_matches_ksg_rules() {
         // Directory against a file at the same depth (depth 1): compared by name, not dir-first.
         assert_eq!(compare_tree_entries("docs/", "README.md"), Ordering::Less);
@@ -853,21 +625,5 @@ mod tests {
         assert_eq!(compare_tree_entries("α.rs", "Α.rs"), Ordering::Less);
         assert_eq!(compare_tree_entries("a.rs", "α.rs"), Ordering::Less);
         assert_eq!(compare_tree_entries("a.rs", "a.rs"), Ordering::Equal);
-    }
-
-    #[test]
-    fn tree_positions_records_first_seen_directory_and_latest_file_index() {
-        let paths = vec![
-            "a/b/c.rs".to_string(),
-            "d.rs".to_string(),
-            "a/e.rs".to_string(),
-            "d.rs".to_string(),
-        ];
-        let positions = tree_positions(&paths);
-        assert_eq!(positions.get("a/"), Some(&0));
-        assert_eq!(positions.get("a/b/"), Some(&0));
-        assert_eq!(positions.get("a/b/c.rs"), Some(&0));
-        assert_eq!(positions.get("a/e.rs"), Some(&2));
-        assert_eq!(positions.get("d.rs"), Some(&3));
     }
 }

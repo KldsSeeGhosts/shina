@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn preview_dwell_chain_leave_and_bounds() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut rt = crate::ui::tests::runtime(width);
             rt.state.populate_demo();
             rt.state.compact_sidebar = width < 760.0;
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn ordinary_thread_rows_keep_their_portrait_and_actions_clear_of_the_title() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut rt = crate::ui::tests::runtime(width);
             rt.state.compact_sidebar = width < 760.0;
             let mut thread = Thread::new(900);

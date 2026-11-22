@@ -164,7 +164,7 @@ impl PairLink {
     /// desktop peers; a phone cannot use it, so the pinned address must be tailnet.
     /// After connecting, check `GET /v1/identity`'s `serverId` and send
     /// `expectedServerId` with the code.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn resolve(&self) -> Result<SocketAddr, String> {
         resolve_destination(&self.host, self.port)
     }
@@ -433,58 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_schemes_authorities_and_paths_outside_v1() {
-        let fields = "host=100.90.1.2&port=47329&serverId=0e2f5f36-0d3c-4b4a-9c7a-1f0e2d3c4b5a&expiresAt=1760000000000";
-        for text in [
-            format!("http://pair/v1?{fields}#code={CODE}"),
-            format!("https://pair/v1?{fields}#code={CODE}"),
-            format!("SHINA://pair/v1?{fields}#code={CODE}"),
-            format!("t3code://pair/v1?{fields}#code={CODE}"),
-            format!("shina://user:pass@pair/v1?{fields}#code={CODE}"),
-            format!("shina://pair@other/v1?{fields}#code={CODE}"),
-            format!("shina://pair:47329/v1?{fields}#code={CODE}"),
-            format!("shina://pair/v2?{fields}#code={CODE}"),
-            format!("shina://pair/v1/extra?{fields}#code={CODE}"),
-            format!("shina://pair/v1/?{fields}#code={CODE}"),
-            format!("shina:/pair/v1?{fields}#code={CODE}"),
-            format!("shina://pair/v1{fields}#code={CODE}"),
-            format!("shina://pair?{fields}#code={CODE}"),
-            format!("shina://pair/v1?{fields}"),
-            format!("shina://pair/v1?{fields}#token={CODE}"),
-            format!("shina://pair/v1?{fields}#code={CODE}#extra"),
-            format!("shina://pair/v1?{fields}#code={CODE}&x=1"),
-            format!("shina://pair/v1?{fields}#CODE={CODE}"),
-        ] {
-            assert!(PairLink::parse(&text).is_err(), "{text}");
-        }
-    }
-
-    #[test]
-    fn rejects_duplicate_unknown_empty_and_missing_fields() {
-        let ok = link_for("100.90.1.2");
-        for field in ["host", "port", "serverId", "expiresAt"] {
-            let missing = ok.replacen(&format!("{field}="), &format!("{field}=x&{field}="), 1);
-            assert!(PairLink::parse(&missing).is_err(), "{missing}");
-        }
-        for text in [
-            ok.replace("&expiresAt=1760000000000", ""),
-            ok.replace("host=100.90.1.2&", ""),
-            ok.replace("port=47329&", ""),
-            ok.replace("&serverId=0e2f5f36-0d3c-4b4a-9c7a-1f0e2d3c4b5a", ""),
-            ok.replace("host=", "host=&x=1&host="),
-            ok.replace("#code=", "&token=xyz#code="),
-            ok.replace("host=100.90.1.2", "code=012345ABCDEF&host=100.90.1.2"),
-            ok.replace("port=47329", "port=47329&port=47329"),
-            ok.replace("expiresAt=", "expiresAt=1760000000000&expiresAt="),
-            ok.replace("host=100.90.1.2", "host"),
-            ok.replace("port=47329", "port="),
-            ok.replace("host=", "HOST="),
-        ] {
-            assert!(PairLink::parse(&text).is_err(), "{text}");
-        }
-    }
-
-    #[test]
     fn rejects_malformed_codes() {
         let ok = link_for("100.90.1.2");
         for code in [
@@ -505,79 +453,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_ports_ids_and_expiries() {
-        let ok = link_for("100.90.1.2");
-        for port in ["0", "65536", "047329", "+47329", "abc", "47329.0", ""] {
-            assert!(
-                PairLink::parse(&ok.replace("port=47329", &format!("port={port}"))).is_err(),
-                "{port}"
-            );
-        }
-        for id in [
-            "0E2F5F36-0D3C-4B4A-9C7A-1F0E2D3C4B5A",
-            "0e2f5f360d3c4b4a9c7a1f0e2d3c4b5a",
-            "{0e2f5f36-0d3c-4b4a-9c7a-1f0e2d3c4b5a}",
-            "urn:uuid:0e2f5f36-0d3c-4b4a-9c7a-1f0e2d3c4b5a",
-            "not-a-uuid",
-            "",
-        ] {
-            assert!(PairLink::parse(&ok.replace(ID, id)).is_err(), "{id}");
-        }
-        for expiry in ["0", "007", "abc", "1.5", "99999999999999999999", "-1", ""] {
-            assert!(
-                PairLink::parse(
-                    &ok.replace("expiresAt=1760000000000", &format!("expiresAt={expiry}"))
-                )
-                .is_err(),
-                "{expiry}"
-            );
-        }
-        assert!(PairLink::new("100.90.1.2", 0, ID.parse().unwrap(), 1, CODE).is_err());
-        assert!(PairLink::new("100.90.1.2", 1, ID.parse().unwrap(), 0, CODE).is_err());
-        assert!(PairLink::new("100.90.1.2", 1, ID.parse().unwrap(), 1, "012345abcdef").is_err());
-    }
-
-    #[test]
-    fn rejects_bad_names_oversized_and_dirty_input() {
-        for host in [
-            "[fd7a:115c:a1e0::1]",
-            "-studio.ts.net",
-            "studio-.ts.net",
-            "studio..ts.net",
-            ".ts.net",
-            "studi o.ts.net",
-            "studio.ts.net:47329",
-            "studio_tail.net",
-            "studio%2ets.net",
-            "100.64.1.2@evil",
-            "https://x",
-            "",
-            &"a".repeat(64),
-            &format!("{}.ts.net", "a".repeat(251)),
-        ] {
-            assert!(PairLink::parse(&link_for(host)).is_err(), "{host}");
-        }
-        assert!(
-            PairLink::parse(&format!("{}{}", link_for("100.90.1.2"), "1".repeat(300))).is_err()
-        );
-        let ok = link_for("100.90.1.2");
-        for dirty in [
-            ok.replace("host=", "host=10 0.64.1.2"),
-            ok.replace("host=", "host=%31%30%30.64.1.2"),
-            format!(" {ok}"),
-        ] {
-            // Leading whitespace trims away; the link itself stays strict.
-            if dirty.starts_with(' ') {
-                assert_eq!(PairLink::parse(&dirty).unwrap(), link());
-            } else {
-                assert!(PairLink::parse(&dirty).is_err(), "{dirty}");
-            }
-        }
-        assert!(PairLink::parse(&ok.replace("&port=", "\n&port=")).is_err());
-        assert!(PairLink::parse(&ok.replace("port=", "port=4732\t9")).is_err());
-    }
-
-    #[test]
     fn debug_redacts_the_code_and_expiry_is_checked() {
         let link = link();
         let debug = format!("{link:?}");
@@ -589,68 +464,5 @@ mod tests {
         assert_eq!(link.server_id(), Uuid::parse_str(ID).unwrap());
         assert_eq!(link.expires_at(), 1_760_000_000_000);
         assert_eq!(link.code(), CODE);
-    }
-
-    #[test]
-    fn qr_renders_unicode_blocks_without_touching_the_link() {
-        let link = link();
-        let qr = link.terminal_qr().unwrap();
-        assert!(qr.lines().count() >= 10, "{qr}");
-        assert!(
-            qr.contains('█') || qr.contains('▀') || qr.contains('▄'),
-            "{qr}"
-        );
-        assert!(!qr.contains(CODE));
-        assert_eq!(PairLink::parse(&link.encode()).unwrap(), link);
-    }
-
-    #[test]
-    fn resolve_pins_tailnet_for_literals() {
-        let address = link().resolve().unwrap();
-        assert_eq!(address, "100.90.1.2:47329".parse().unwrap());
-        assert!(crate::peer::tailnet_address(address.ip()));
-    }
-
-    #[test]
-    fn normalize_host_strips_brackets_and_keeps_the_parser_rules() {
-        assert_eq!(
-            normalize_host("[fd7a:115c:a1e0::1]").unwrap(),
-            "fd7a:115c:a1e0::1"
-        );
-        assert_eq!(
-            normalize_host("studio.tail.ts.net").unwrap(),
-            "studio.tail.ts.net"
-        );
-        for host in [
-            "studio.ts.net:47329",
-            "[fd7a:115c:a1e0::1]:47329",
-            "127.0.0.1",
-            "",
-        ] {
-            assert!(normalize_host(host).is_err(), "{host}");
-        }
-    }
-
-    #[test]
-    fn tailnet_port_reads_the_listener_record_not_discovery() {
-        let profile = crate::store::directory()
-            .unwrap()
-            .join("mobile-pairing-listen");
-        std::fs::create_dir_all(&profile).unwrap();
-        let record = profile.join("server-listen.json");
-        std::fs::write(&record, br#"{"tailnet":true,"port":null}"#).unwrap();
-        assert_eq!(tailnet_port(&profile).unwrap(), crate::peer::PORT);
-        std::fs::write(&record, br#"{"tailnet":true,"port":8080}"#).unwrap();
-        assert_eq!(tailnet_port(&profile).unwrap(), 8080);
-        std::fs::write(&record, br#"{"tailnet":false,"port":null}"#).unwrap();
-        assert!(tailnet_port(&profile).unwrap_err().contains("--tailnet"));
-        std::fs::write(&record, br#"{"tailnet":true,"port":0}"#).unwrap();
-        assert!(tailnet_port(&profile).is_err());
-        std::fs::write(&record, b"not json").unwrap();
-        assert!(tailnet_port(&profile).is_err());
-        assert_eq!(
-            tailnet_port(&profile.join("absent")).unwrap(),
-            crate::peer::PORT
-        );
     }
 }

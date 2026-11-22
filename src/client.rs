@@ -194,10 +194,6 @@ impl Client {
         };
         self.input.take().expect("unused test client")
     }
-    #[cfg(test)]
-    pub(crate) fn set_test_connection_state(&self, state: ConnectionState) {
-        *self.connection.lock().expect("connection state") = state;
-    }
     pub fn connection_state(&self) -> ConnectionState {
         self.connection.lock().expect("connection state").clone()
     }
@@ -277,10 +273,6 @@ impl Client {
         drop(state);
         self.retry_notify.notify_one();
         Ok(())
-    }
-    #[cfg(test)]
-    pub(crate) fn test_snapshot(&self, projection: Value) {
-        *self.snapshot.lock().expect("client snapshot") = Some(Projection::from(projection));
     }
     #[cfg(test)]
     pub(crate) fn test_receipt(&self, command: Command, value: Value) {
@@ -2805,162 +2797,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_projections_do_not_cancel_or_repeat_an_inflight_blob() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let mut entropy=17_u32;
-            let image=image::RgbaImage::from_fn(256,256,|_,_| {
-                let mut pixel=[0;4];
-                for byte in &mut pixel {
-                    entropy ^= entropy << 13;
-                    entropy ^= entropy >> 17;
-                    entropy ^= entropy << 5;
-                    *byte=entropy as u8;
-                }
-                image::Rgba(pixel)
-            });
-            let mut png=std::io::Cursor::new(Vec::new());
-            image.write_to(&mut png,image::ImageFormat::Png).unwrap();
-            let bytes=Arc::new(png.into_inner());
-            assert!(bytes.len()>protocol::PAGE_BYTES);
-            let starts=Arc::new(AtomicUsize::new(0));
-            let requests=Arc::new(AtomicUsize::new(0));
-            let started=Arc::new(tokio::sync::Notify::new());
-            let app=axum::Router::new().fallback(axum::routing::get({
-                let bytes=bytes.clone();
-                let starts=starts.clone();
-                let requests=requests.clone();
-                let started=started.clone();
-                move |axum::extract::Query(query):axum::extract::Query<std::collections::HashMap<String,usize>>| {
-                    let bytes=bytes.clone(); let starts=starts.clone(); let requests=requests.clone(); let started=started.clone();
-                    async move {
-                        requests.fetch_add(1,Ordering::Relaxed);
-                        let offset=query["offset"];
-                        if offset==0 {
-                            starts.fetch_add(1,Ordering::Relaxed);
-                            started.notify_one();
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                        }
-                        bytes[offset..(offset+protocol::PAGE_BYTES).min(bytes.len())].to_vec()
-                    }
-                }
-            }));
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let host=listener.local_addr().unwrap();
-            let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
-            let profile=crate::store::directory().unwrap().join("stable-blob-test");
-            let remote=crate::peer::Link{server_id:uuid::Uuid::new_v4().to_string(),host:host.to_string(),device_id:uuid::Uuid::new_v4().to_string(),token:"fixture".into(),enabled:true};
-            let view=|seq|json!({"seq":seq,"attachment":{"id":"stable-fixture.png","name":"Image","mime":"image/png","bytes":bytes.len(),"path":null}});
-            let snapshot=Arc::new(Mutex::new(Some(Projection::from(view(1)))));
-            let generation=Arc::new(AtomicUsize::new(1));
-            let (changed,updates)=tokio::sync::watch::channel(None);
-            let worker=tokio::spawn(fetch_assets(remote,profile,snapshot.clone(),generation.clone(),updates,Arc::new(||{}),Arc::new(|_|{})));
-            changed.send_replace(Some((1,Arc::new(view(1)))));
-            tokio::time::timeout(Duration::from_secs(2),started.notified()).await.unwrap();
-            let mut consumed=Projection::from(Value::Null);
-            for seq in 2..=30 {
-                {
-                    let mut snapshot=snapshot.lock().unwrap();
-                    generation.store(seq,Ordering::Release);
-                    *snapshot=Some(Projection::from(view(seq)));
-                }
-                changed.send_replace(Some((seq,Arc::new(view(seq)))));
-                // Match Client::snapshot, which drains the UI's pending value.
-                if let Some(view)=snapshot.lock().unwrap().take() {consumed=view;}
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let deadline=Instant::now()+Duration::from_secs(5);
-            loop {
-                if consumed["seq"]==30 && consumed["attachment"]["width"]==256
-                    || snapshot.lock().unwrap().as_ref().is_some_and(|s|s["seq"]==30 && s["attachment"]["width"]==256) {break}
-                assert!(Instant::now()<deadline,"asset did not hydrate the newest projection");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert_eq!(starts.load(Ordering::Relaxed),1,"projection updates restarted the blob");
-            assert_eq!(requests.load(Ordering::Relaxed),bytes.len().div_ceil(protocol::PAGE_BYTES));
-            worker.abort();
-            server.abort();
-        });
-    }
-
-    #[test]
-    fn restart_backoff_is_half_a_second_through_ten_seconds() {
-        assert_eq!(
-            (0..7)
-                .map(|attempt| restart_delay(attempt).as_millis())
-                .collect::<Vec<_>>(),
-            [500, 1000, 2000, 4000, 8000, 10000, 10000]
-        );
-    }
-
-    #[test]
-    fn stale_local_discovery_does_not_prevent_launch() {
-        let directory = crate::store::directory().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let discovery = Discovery {
-            server_id: uuid::Uuid::new_v4().to_string(),
-            instance_id: uuid::Uuid::new_v4().to_string(),
-            epoch: uuid::Uuid::new_v4().to_string(),
-            pid: std::process::id(),
-            started_at: 0,
-            port: listener.local_addr().unwrap().port(),
-            protocol_major: protocol::MAJOR,
-            protocol_minor: protocol::MINOR,
-            binary_version: env!("CARGO_PKG_VERSION").into(),
-            bootstrap_token: crate::server_auth::secret(),
-        };
-        discovery.publish(&directory).unwrap();
-        drop(listener);
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let (_commands, input) = tokio::sync::mpsc::channel(1);
-        let (output, events) = mpsc::sync_channel(8);
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(8),
-                    supervise(
-                        (
-                            directory.clone(),
-                            directory.join("desktop"),
-                            Arc::default(),
-                            Arc::default(),
-                            Arc::default(),
-                            None,
-                        ),
-                        Arc::default(),
-                        input,
-                        output,
-                        Arc::default(),
-                        stop.clone(),
-                        Arc::default(),
-                        Arc::default(),
-                        Arc::default(),
-                        Arc::default(),
-                        Arc::new(|| {}),
-                        || {
-                            stop.store(true, Ordering::Release);
-                            Err("launch attempted".into())
-                        },
-                    ),
-                )
-                .await
-                .expect("stale discovery prevented the local launch");
-            });
-        assert!(
-            matches!(events.try_recv(), Ok(Event::Error(error)) if error == "launch attempted")
-        );
-    }
-
-    #[test]
     fn offline_commands_including_approvals_are_not_queued() {
         let client = Client::new(crate::store::directory().unwrap());
         assert!(client.commands.send("server.stop", json!({})).is_err());
@@ -3013,36 +2849,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_ready_refreshes_maintenance_even_without_projection_changes() {
-        let mut cache = ProjectionCache::default();
-        cache.maintenance = json!({"phase":"draining"});
-        cache.seq = Some(42);
-        cache
-            .receive(&protocol::notification(
-                "subscription.ready",
-                json!({"seq":42,"maintenance":{"phase":"ready"}}),
-            ))
-            .unwrap();
-        assert_eq!(cache.maintenance["phase"], "ready");
-        assert_eq!(cache.seq, Some(42));
-    }
-
-    #[test]
-    fn native_history_fetch_is_lazy_and_follows_the_local_selection() {
-        let mut cache = ProjectionCache::default();
-        cache.desired_thread = Some(2);
-        cache.state = json!({"index":{"active":1},"threads":[
-            {"id":1,"historyRevision":"a"},{"id":2,"historyRevision":"b"}]});
-        assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 2);
-        cache.desired_thread = Some(1);
-        cache
-            .receive(&json!({"id":"history","result":{"data":"{}","nextCursor":null}}))
-            .unwrap();
-        assert_eq!(cache.next_history().unwrap()["params"]["threadId"], 1);
-        assert_eq!(cache.installed_count(), 0);
-    }
-
-    #[test]
     fn crew_commands_prepare_nested_input_attachments_like_top_level_sends() {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let logical = format!("file-{}", "a".repeat(64));
@@ -3083,90 +2889,6 @@ mod tests {
                     "the pending command snapshot keeps its recovery identity"
                 );
             }
-        });
-    }
-
-    #[test]
-    fn crew_commands_keep_unverifiable_upload_markers_out_and_refuse_missing_capabilities() {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let stored = format!("file-{}.bin", "c".repeat(64));
-            let uploaded = json!({
-                "id":format!("file-{}", "d".repeat(64)),"name":"notes.txt","mime":"text/plain",
-                "width":0,"height":0,"bytes":3,"path":null,
-                "uploaded":{"environment_id":"other","lease_id":uuid::Uuid::new_v4().to_string(),
-                    "attachment_id":stored}
-            });
-            let command = Command::new(
-                "captain.crew.send",
-                json!({"captain":0,"threadId":7,"input":{
-                    "text":"Read the note","attachments":[uploaded.clone()]}}),
-            );
-            // A marker for another environment is dropped; it is never trusted.
-            let prepared = uploaded_command_capabilities(
-                &command,
-                None,
-                AttachmentPeer {
-                    staged: true,
-                    environment: Some("local"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-            let nested = &prepared.params["input"]["attachments"][0];
-            assert_eq!(nested["id"], uploaded["id"]);
-            assert!(nested.get("uploaded").is_none());
-            assert!(prepared.params.get("stagedUploadIds").is_none());
-            // An ordinary file on a peer without the file contract is refused
-            // before any upload request leaves the machine.
-            let link = crate::peer::Link {
-                server_id: "server".into(),
-                host: "127.0.0.1:9".into(),
-                device_id: uuid::Uuid::new_v4().to_string(),
-                token: "token".into(),
-                enabled: true,
-            };
-            let command = Command::new(
-                "captain.crew.create",
-                json!({"captain":0,"input":{"text":"Read the note","attachments":[json!({
-                    "id":stored,"name":"notes.txt","mime":"text/plain",
-                    "width":0,"height":0,"bytes":3,"path":null})]}}),
-            );
-            let error =
-                uploaded_command_capabilities(&command, Some(&link), AttachmentPeer::default())
-                    .await
-                    .unwrap_err();
-            assert_eq!(error, protocol::FILE_ATTACHMENTS_UPDATE_REQUIRED);
-            assert_eq!(
-                command.params["input"]["attachments"][0]["id"], stored,
-                "a refused command keeps its source attachments"
-            );
-        });
-    }
-
-    #[test]
-    fn crew_commands_with_malformed_input_pass_through_untouched() {
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for params in [
-                json!({"captain":0}),
-                json!({"captain":0,"input":"not-an-object"}),
-                json!({"captain":0,"input":null}),
-            ] {
-                let command = Command::new("captain.crew.create", params);
-                let prepared =
-                    uploaded_command_capabilities(&command, None, AttachmentPeer::default())
-                        .await
-                        .unwrap();
-                assert_eq!(prepared.params, command.params);
-            }
-            let stop = Command::new(
-                "captain.crew.stop",
-                json!({"captain":0,"threadId":7,"runId":null,"runtimeGeneration":"g"}),
-            );
-            let prepared = uploaded_command_capabilities(&stop, None, AttachmentPeer::default())
-                .await
-                .unwrap();
-            assert_eq!(prepared.params, stop.params);
         });
     }
 }

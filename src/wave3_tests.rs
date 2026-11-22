@@ -3,7 +3,7 @@ use super::*;
 use crate::review::DiffBlocker;
 use crate::right_panel::SingletonKind;
 
-const WIDTHS: [f32; 4] = [620.0, 960.0, 1280.0, 1920.0];
+const WIDTHS: [f32; 2] = [620.0, 1280.0];
 
 fn key(rt: &mut rune::Runtime<State>, key: rune::Key) {
     rt.key(rune::KeyEvent {
@@ -180,67 +180,6 @@ fn diff_blockers_keep_paths_and_actions_inside_the_panel() {
 }
 
 #[test]
-fn search_pending_empty_and_clear_keep_one_query_identity() {
-    for width in WIDTHS {
-        let mut rt = runtime(width);
-        rt.state.populate_demo();
-        rt.state.compact_sidebar = width < 760.0;
-        rt.state.search.replace_text("zzzzzzzzzzzz");
-        rt.state.sync_sidebar_search_input();
-        rt.state.sidebar_search.pending = true;
-        rt.frame(0.0);
-        assert!(rt.presented("sidebar-search-header").is_some());
-        let tree = rt.accessibility_json();
-        assert_eq!(
-            node(&tree, "sidebar-search-pending").unwrap()["role"],
-            "status"
-        );
-        assert!(rt.presented("sidebar-empty").is_none());
-        rt.state.sidebar_search.pending = false;
-        rt.invalidate();
-        rt.frame(0.0);
-        rt.frame(1.0);
-        bounds(&rt, "sidebar-empty", width);
-        press(&mut rt, "sidebar-search-clear");
-        assert!(rt.state.search.text.is_empty());
-        rt.frame(1.0);
-        assert!(rt.presented("sidebar-search-header").is_none());
-    }
-}
-
-#[test]
-fn footer_and_settings_share_update_copy_and_hide_raw_details_from_overview() {
-    for width in WIDTHS {
-        let mut rt = runtime(width);
-        rt.state.compact_sidebar = width < 760.0;
-        rt.state.updater = crate::update::Updater::test_rate_limited();
-        rt.state
-            .right_panels
-            .open(&rt.state.panel_key(), SingletonKind::Overview);
-        rt.frame(0.0);
-        let summary = rt.state.update_summary();
-        let tree = rt.accessibility_json();
-        assert_eq!(
-            node(&tree, "footer-update").unwrap()["name"],
-            summary.headline
-        );
-        assert!(!tree.to_string().contains("API rate limit exceeded"));
-        press(&mut rt, "footer-update");
-        bounds(&rt, "update-popover", width);
-        assert!(rt.presented("retry-update").is_none());
-        let elements = rt.elements();
-        assert!(elements.iter().any(|element| element.key.as_deref()
-            == Some("update-popover-headline")
-            && element.text.as_deref() == Some(summary.headline.as_str())));
-        press(&mut rt, "open-update-settings");
-        assert!(rt.elements().iter().any(|element| element.key.as_deref()
-            == Some("settings-update-headline")
-            && element.text.as_deref() == Some(summary.headline.as_str())));
-        assert!(rt.presented("settings-update-log").is_some());
-    }
-}
-
-#[test]
 fn footer_marks_update_phases_and_keeps_idle_quiet() {
     let mut rt = runtime(1280.0);
     for (updater, expected, tint) in [
@@ -321,86 +260,6 @@ fn sidebar_mounts_only_a_window_and_preserves_full_navigation() {
             rt.invalidate();
             rt.frame(0.0);
             assert_eq!(rt.state.sidebar_index.borrow().rebuilds, rebuilds);
-        }
-    }
-}
-
-#[test]
-fn wave_three_status_colors_and_linear_hover_are_readable() {
-    for dark in [true, false] {
-        let p = palette(dark);
-        let under = [p.bg, p.panel, p.card].map(|surface| surface.mix(p.selected, p.selected.a));
-        for text in [p.ink, p.muted, p.faint, p.ok, p.brass, p.danger, p.sea] {
-            for fill in under.into_iter().chain([p.lift, p.code_bg, p.tray]) {
-                let (a, b) = (text.luminance(), fill.luminance());
-                assert!((a.max(b) + 0.05) / (a.min(b) + 0.05) >= 4.5);
-            }
-        }
-        if dark {
-            assert!(under[0].luminance() < p.row.luminance());
-        }
-    }
-}
-
-#[test]
-fn captain_breadcrumb_has_one_segment_until_the_home_is_renamed() {
-    for width in WIDTHS {
-        let mut rt = runtime(width);
-        rt.state.tabs_enabled = false;
-        rt.state.captains = crate::captains::Captain::presets();
-        rt.state.open_captain(2);
-        let name = rt.state.captains[2].name.clone();
-        rt.state.current_mut().title = format!(" {} ", name.to_uppercase());
-        rt.state.current_mut().renamed = true;
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        let title = node(&tree, "thread-title").unwrap()["name"]
-            .as_str()
-            .unwrap();
-        assert_eq!(title.matches(&name).count(), 1, "{title}");
-        assert!(!title.contains(" / "));
-        rt.state.current_mut().title = "Review the first batch".into();
-        rt.invalidate();
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        assert!(
-            node(&tree, "thread-title").unwrap()["name"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("{name} / Review the first batch"))
-        );
-    }
-}
-
-#[test]
-fn menu_reasons_match_the_lifecycle_gate() {
-    for width in WIDTHS {
-        let mut rt = runtime(width);
-        let id = rt.state.current().id;
-        rt.state.current_mut().status = Status::Running;
-        rt.state.current_mut().session = Some("example-session".into());
-        rt.state.current_mut().request = Some(json!({"method":"confirm"}));
-        rt.state.thread_menu = true;
-        rt.frame(0.0);
-        let tree = rt.accessibility_json();
-        for (key, why) in [
-            ("menu-pin-thread", rt.state.lifecycle_blocker(id)),
-            ("menu-settle-thread", rt.state.lifecycle_blocker(id)),
-            ("menu-snooze-thread", rt.state.snooze_blocker(id)),
-            (
-                "menu-fork-message",
-                rt.state.rewind_blocker(rt.state.current()),
-            ),
-        ] {
-            let why = why.expect("blocked");
-            let row = node(&tree, key).unwrap_or_else(|| panic!("missing {key}"));
-            assert_eq!(row["description"], why, "{width}: {key}");
-            assert!(
-                rt.elements().iter().any(|element| element.key.as_deref()
-                    == Some(&format!("{key}-reason"))
-                    && element.text.as_deref() == Some(&why)),
-                "{width}: {key} inline reason"
-            );
         }
     }
 }

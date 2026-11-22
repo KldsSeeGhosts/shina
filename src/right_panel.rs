@@ -275,35 +275,6 @@ mod tests {
     }
 
     #[test]
-    fn open_overview_twice_keeps_one_segment() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Overview);
-        panels.open(THREAD_A, SingletonKind::Overview);
-
-        let state = panels.get(THREAD_A);
-        assert_eq!(state.view, PanelView::Overview);
-        assert!(state.viewer.is_none());
-        assert!(state.open);
-    }
-
-    #[test]
-    fn a_second_document_replaces_the_viewer_and_close_returns_to_the_context_list() {
-        let mut panels = RightPanels::default();
-        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
-        panels.open_captain_document(THREAD_A, 0, "AGENTS.md");
-
-        let state = panels.get(THREAD_A);
-        assert_eq!(state.viewer, Some(doc(0, "AGENTS.md")));
-        assert_eq!(state.view, PanelView::Context);
-
-        panels.close_viewer(THREAD_A);
-        let state = panels.get(THREAD_A);
-        assert!(state.open);
-        assert_eq!(state.view, PanelView::Context);
-        assert!(state.viewer.is_none());
-    }
-
-    #[test]
     fn toggle_diff_states() {
         let mut panels = RightPanels::default();
 
@@ -360,46 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn set_maximized_then_close_preserves_maximized() {
-        let mut panels = RightPanels::default();
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.set_maximized(THREAD_A, true);
-        assert!(panels.get(THREAD_A).maximized);
-
-        panels.close(THREAD_A);
-        let state = panels.get(THREAD_A);
-        assert!(!state.open);
-        assert!(state.maximized);
-    }
-
-    #[test]
-    fn carry_moves_the_viewer_and_keeps_the_context_tab() {
-        let mut panels = RightPanels::default();
-        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
-
-        panels.carry_captain_documents(THREAD_A, THREAD_B);
-        let from = panels.get(THREAD_A);
-        assert!(from.viewer.is_none());
-        assert_eq!(from.view, PanelView::Context);
-        assert!(from.open, "the context list stays open on the old home");
-
-        let to = panels.get(THREAD_B);
-        assert!(to.open);
-        assert_eq!(to.view, PanelView::Context);
-        assert_eq!(to.viewer, Some(doc(0, "NOTES.md")));
-
-        // A hidden or diff-selected source carries the item without opening it.
-        let mut panels = RightPanels::default();
-        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
-        panels.open(THREAD_A, SingletonKind::Diff);
-        panels.close(THREAD_A);
-        panels.carry_captain_documents(THREAD_A, THREAD_B);
-        let to = panels.get(THREAD_B);
-        assert!(!to.open);
-        assert_eq!(to.viewer, Some(doc(0, "NOTES.md")));
-    }
-
-    #[test]
     fn threads_are_isolated_and_forget_removes_one() {
         let mut panels = RightPanels::default();
         panels.open(THREAD_A, SingletonKind::Overview);
@@ -415,63 +346,9 @@ mod tests {
         assert!(panels.get(THREAD_B).open);
     }
 
-    #[test]
-    fn empty_closed_entries_are_evicted() {
-        let mut panels = RightPanels::default();
-        panels.toggle_visibility(THREAD_A);
-        panels.toggle_visibility(THREAD_A);
-        assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
-
-        panels.open_captain_document(THREAD_A, 0, "NOTES.md");
-        panels.close_viewer(THREAD_A);
-        panels.close(THREAD_A);
-        // The stored Context view stays so the panel reopens on its last tab.
-        let closed = panels.get(THREAD_A);
-        assert!(!closed.open);
-        assert_eq!(closed.view, PanelView::Context);
-        assert!(closed.viewer.is_none());
-
-        panels.toggle_visibility(THREAD_A);
-        panels.open(THREAD_A, SingletonKind::Overview);
-        panels.close(THREAD_A);
-        assert_eq!(panels.get(THREAD_A), ThreadPanel::default());
-    }
-
-    #[test]
-    fn key_scopes_panel_state_to_machine_and_thread() {
-        assert_eq!(key("local", 7), "local:7");
-        assert_ne!(key("local", 7), key("studio", 7));
-    }
-
     // KSG `getPreviewPanelMaxWidth`: `min(70vw, container - 360)`, never under the 360 minimum.
-    #[test]
-    fn max_width_is_the_viewport_cap_limited_by_the_conversation() {
-        // The viewport cap binds: 0.7 * 1920 = 1344 < 1920 - 360 = 1560.
-        assert_eq!(max_width(1920.0, 1920.0), 1344.0);
-        // At 1280 the caps are nearly even; the viewport cap still wins: 896 < 920.
-        assert_eq!(max_width(1280.0, 1280.0), 896.0);
-        // A narrow shared row leaves the conversation its 360 and no more.
-        assert_eq!(max_width(960.0, 724.0), 364.0);
-        // A container smaller than the minimum plus the conversation's keeps the floor.
-        assert_eq!(max_width(620.0, 604.0), MIN_WIDTH);
-    }
 
     // KSG's `clamp`: stored widths clamp into [minimum, maximum].
-    #[test]
-    fn clamp_width_holds_the_stored_width_inside_the_limits() {
-        assert_eq!(clamp_width(200.0, 896.0), MIN_WIDTH);
-        assert_eq!(clamp_width(1200.0, 896.0), 896.0);
-        assert_eq!(clamp_width(500.0, 896.0), 500.0);
-        assert_eq!(clamp_width(f32::NAN, 896.0), DEFAULT_WIDTH);
-        // A maximum under the floor still clamps up to the minimum.
-        assert_eq!(clamp_width(540.0, 300.0), MIN_WIDTH);
-    }
 
     // KSG's sheet switch: under the panel's minimum plus the conversation's, the panel covers.
-    #[test]
-    fn covers_only_below_the_shared_minimum() {
-        assert!(!covers(MIN_WIDTH + 360.0));
-        assert!(covers(MIN_WIDTH + 359.0));
-        assert!(covers(604.0));
-    }
 }

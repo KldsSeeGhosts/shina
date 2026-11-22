@@ -74,7 +74,7 @@ pub(crate) fn list_login_shell_candidates(
     candidates
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn build_path_capture_command(shell: &str) -> String {
     let basename = std::path::Path::new(shell)
         .file_name()

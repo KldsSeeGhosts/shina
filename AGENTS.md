@@ -25,7 +25,7 @@ Workflow:
 2. Read its markup and Tailwind classes, plus any CSS variables in `apps/web/src/index.css`.
 3. Convert the classes to Rune values with the table below. Copy KSG's proportions, structure and look. Use the matching `Palette` token for each KSG colour variable.
 4. Put a short comment on the Rune function that names the KSG source, such as "ported from KSG Code's `ComposerAttachmentStrip`".
-5. Add or update a headless layout test in `src/ui.rs` (`runtime(width)`, `rt.presented(key)`). Check at least 620, 960, 1280 and 1920 px wide.
+5. Add or update a headless layout test only when layout or behavior changes in a way users hit day to day. Check only the width or widths where the layout actually branches (such as one narrow and one wide breakpoint), not a blanket four-width loop.
 
 Already ported:
 
@@ -90,7 +90,9 @@ Removed at the user's request. Do not add them back:
 
 ## Checks
 
-- `cargo build`, `cargo test`, and `cargo fmt` must pass. Remove helpers your change leaves unused.
+- Run `cargo fmt --check`, `cargo build -j 4`, and targeted tests only (`cargo test -j 4 --bin shina -- <filter> -- --test-threads=4`), one worktree at a time. Do not run the full test suite locally unless investigating a repo-wide failure; GitHub Actions CI runs the full unit and integration suites on every PR. Review agents must follow the same targeted-test limit.
+- Do not write pointless tests for contrived states, styling trivia, or edge cases that day-to-day use will not encounter. Test real user workflows, data-safety invariants, and bugs that actually happened. Avoid duplicating coverage across extra widths, themes, or overlapping unit tests when one focused test covers the behavior.
+- Remove helpers your change leaves unused.
 - To look at a dev build, run `target\debug\shina.exe` with `LOCALAPPDATA` set to a temporary folder. That keeps it away from the user's real threads in `%LOCALAPPDATA%\Shina`.
 - Tests find elements by `.key(...)`. Keep existing keys when restyling, or update every test that uses them.
 

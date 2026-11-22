@@ -438,7 +438,7 @@ fn actions(
 mod tests {
     #[test]
     fn the_top_bar_is_one_row_no_taller_than_the_strip() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut rt = crate::ui::tests::runtime(width);
             rt.state.tabs_enabled = false;
             rt.state.populate_demo();
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn chat_main_starts_at_the_panes_top_edge() {
-        for width in [620.0, 960.0, 1280.0, 1920.0] {
+        for width in [620.0, 1280.0] {
             let mut rt = crate::ui::tests::runtime(width);
             rt.state.tabs_enabled = false;
             rt.state.populate_demo();

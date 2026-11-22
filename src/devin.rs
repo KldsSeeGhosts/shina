@@ -159,6 +159,7 @@ fn cached_command() -> Option<PathBuf> {
 
 /// Scan `tools/devin/<version>/<platform-target>` newest-first, like KSG's
 /// `installRoot` walk. The registry ships the binary under `bin/`.
+#[cfg(not(test))]
 fn cached_command_in(tools_root: &Path) -> Option<PathBuf> {
     let root = tools_root.join("devin");
     let mut versions: Vec<String> = std::fs::read_dir(&root)
@@ -188,6 +189,7 @@ fn cached_command_in(tools_root: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(test))]
 fn platform_targets() -> Vec<String> {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
@@ -209,6 +211,7 @@ fn platform_targets() -> Vec<String> {
 }
 
 /// localeCompare `{numeric:true}` for registry version directory names.
+#[cfg(not(test))]
 fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (a, b) = (a.as_bytes(), b.as_bytes());

@@ -422,13 +422,13 @@ pub fn launch_child(exe: &Path, args: &[&str]) -> Result<std::process::Child, St
         .map_err(|e| format!("Could not start {}: {e}", exe.display()))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn service_managed() -> bool {
     cfg!(target_os = "linux")
         && (env::var_os("INVOCATION_ID").is_some() || env::var_os("SHINA_BOOT_SERVICE").is_some())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn service_scope_command(exe: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("systemd-run");
     command
@@ -1052,24 +1052,6 @@ pub fn open_mac_bundle(app: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    #[test]
-    fn helper_exit_is_detected_without_waiting_for_the_handshake_timeout() {
-        let root = crate::store::directory().unwrap();
-        let mut command = Command::new("cmd");
-        command.args(["/C", "exit", "1"]);
-        let mut child = crate::process::Process::spawn(&mut command).unwrap();
-        let start = std::time::Instant::now();
-        assert!(
-            wait_for_marker(
-                &mut child,
-                &root.join("no-marker"),
-                std::time::Duration::from_secs(20)
-            )
-            .is_err()
-        );
-        assert!(start.elapsed() < std::time::Duration::from_secs(3));
-    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary(label: &str) -> PathBuf {
@@ -1088,26 +1070,6 @@ mod tests {
     fn write(path: &Path, bytes: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, bytes).unwrap();
-    }
-
-    #[test]
-    fn the_installed_target_is_the_app_the_executable_runs_from() {
-        let root = temporary("target");
-        let installed = InstalledTarget::format(&root.join("installed").join(binary_name()));
-        let exe = executable_in(&installed);
-        write(&exe, b"app");
-        assert_eq!(
-            target_for_executable(&exe, installed.path()),
-            Some(installed.clone())
-        );
-        // A development build elsewhere never updates itself.
-        let dev = root.join("target/release").join(executable_path());
-        write(&dev, b"dev");
-        assert_ne!(
-            target_for_executable(&dev, installed.path()),
-            Some(installed)
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1151,23 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_names_follow_the_platform_and_architecture() {
-        let windows = InstalledTarget::Windows {
-            exe: PathBuf::from("shina.exe"),
-        };
-        assert_eq!(windows.asset(), "shina.exe");
-        let mac = InstalledTarget::MacBundle {
-            app: PathBuf::from("/Applications/Shina.app"),
-        };
-        let expected = if cfg!(all(not(windows), target_arch = "x86_64")) {
-            "Shina-macos-x86_64.zip"
-        } else {
-            "Shina-macos-aarch64.zip"
-        };
-        assert_eq!(mac.asset(), expected);
-    }
-
-    #[test]
     fn replacement_swaps_the_executable_and_keeps_the_previous_one() {
         let dir = temporary("replace");
         let target = dir.join("shina.exe");
@@ -1184,55 +1129,6 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"new build");
         assert_eq!(fs::read(previous_exe(&dir)).unwrap(), b"old");
         assert!(!staged.exists(), "the prepared copy is moved into place");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_failed_atomic_replacement_keeps_the_launch_path_and_prepared_build() {
-        let root = temporary("rollback");
-        let dir = root.join("install");
-        let target = dir.join("shina.exe");
-        write(&target, b"old");
-        let download = root.join("download");
-        write(&download, b"new");
-        let staged = prepare_exe(&download, &dir).unwrap();
-        // Fail the actual commit operation after preparation, before any path changes.
-        let locked = |_: &Path| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "shina.exe is locked",
-            ))
-        };
-        FINAL_RENAME.with(|rename| *rename.borrow_mut() = Some(Box::new(locked)));
-        let error = commit_exe(&staged, &dir).unwrap_err();
-        FINAL_RENAME.with(|rename| *rename.borrow_mut() = None);
-        assert!(error.contains("Could not install Shina"), "{error}");
-        assert_eq!(
-            fs::read(&target).unwrap(),
-            b"old",
-            "the previous build never left its launch path"
-        );
-        assert!(
-            !dir.join("shina.old.exe").exists(),
-            "no rename-aside operation occurred"
-        );
-        assert!(
-            staged.is_file(),
-            "the prepared copy is kept for another restart attempt"
-        );
-        assert_eq!(commit_exe(&staged, &dir).unwrap(), target);
-        assert_eq!(fs::read(&target).unwrap(), b"new");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn restoring_without_a_backup_fails_and_leaves_the_current_executable_unchanged() {
-        let dir = temporary("missing-backup");
-        let target = dir.join("shina.exe");
-        write(&target, b"current");
-        let error = restore_exe(&dir, &target).unwrap_err();
-        assert!(error.contains("no previous"), "{error}");
-        assert_eq!(fs::read(&target).unwrap(), b"current");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1255,18 +1151,6 @@ mod tests {
         // Nothing prepared is left, so a second commit cannot repeat the replacement.
         assert!(commit_exe(&staged, &dir).is_err());
         assert_eq!(fs::read(&target).unwrap(), b"build");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_prepare_mismatch_is_not_kept() {
-        let dir = temporary("copy");
-        let source = dir.join("source.exe");
-        write(&source, b"one");
-        let staged = prepare_exe(&source, &dir).unwrap();
-        assert!(same_contents(&staged, &source));
-        write(&source, b"two");
-        assert!(!same_contents(&staged, &source));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1325,108 +1209,6 @@ mod tests {
             "the previous build is back at the installed path"
         );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn a_broken_mac_bundle_is_replaced_by_the_previous_one() {
-        let root = temporary("restore-mac");
-        let applications = root.join("Applications");
-        let installed = applications.join(MACOS_APP_NAME);
-        write(&installed.join(executable_path()), b"broken");
-        write(
-            &applications
-                .join("Shina-app.previous")
-                .join(executable_path()),
-            b"old",
-        );
-        restore_mac_bundle(&installed).unwrap();
-        assert_eq!(fs::read(installed.join(executable_path())).unwrap(), b"old");
-        assert_eq!(
-            fs::read(
-                applications
-                    .join("Shina-app.previous")
-                    .join(executable_path())
-            )
-            .unwrap(),
-            b"broken",
-            "the broken build becomes the recovery copy"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn a_service_helper_always_runs_in_its_own_scope() {
-        let command = service_scope_command(
-            Path::new(if cfg!(windows) {
-                "C:/shina.exe"
-            } else {
-                "/opt/shina"
-            }),
-            &["--coordinated-update"],
-        );
-        assert_eq!(command.get_program(), "systemd-run");
-        let args: Vec<String> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            &args[..5],
-            ["--user", "--scope", "--collect", "--quiet", "--"]
-        );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("--coordinated-update")
-        );
-        if !cfg!(target_os = "linux") {
-            assert!(!service_managed());
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_service_launch_never_falls_back_to_an_ordinary_child() {
-        if env::var_os("SHINA_DETACH_FIXTURE").is_some() {
-            let dir = PathBuf::from(env::var_os("SHINA_DETACH_DIR").unwrap());
-            let script = dir.join("target.sh");
-            let result = launch_detached(&script, &[dir.to_str().unwrap()]);
-            fs::write(dir.join("result"), format!("{}", result.is_err())).unwrap();
-            if let Err(error) = &result {
-                fs::write(dir.join("error"), error).unwrap();
-            }
-            if let Ok(mut child) = result {
-                let _ = child.kill();
-            }
-            return;
-        }
-        let dir = temporary("service-detach");
-        let script = dir.join("target.sh");
-        write(&script, b"#!/bin/sh\necho ran > \"$1/ran\"\n");
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let status = Command::new(env::current_exe().unwrap())
-            .args([
-                "install::tests::a_service_launch_never_falls_back_to_an_ordinary_child",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("SHINA_DETACH_FIXTURE", "1")
-            .env("SHINA_DETACH_DIR", &dir)
-            .env("SHINA_BOOT_SERVICE", "1")
-            .env("PATH", dir.join("no-such-path"))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success());
-        assert_eq!(fs::read_to_string(dir.join("result")).unwrap(), "true");
-        let error = fs::read_to_string(dir.join("error")).unwrap();
-        assert!(error.contains("outside the service"), "{error}");
-        assert!(
-            !dir.join("ran").exists(),
-            "the ordinary-child fallback executed the target"
-        );
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

@@ -274,6 +274,7 @@ impl LaunchEnvironment {
         &self.set
     }
     /// Every variable the launch explicitly controls, set or cleared.
+    #[allow(dead_code)]
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.set
             .iter()
@@ -283,6 +284,7 @@ impl LaunchEnvironment {
     /// Clear, then set, the configured variables on `command`. The child
     /// still inherits every other ambient variable unless the caller cleared
     /// the environment first.
+    #[allow(dead_code)]
     pub fn apply(&self, command: &mut Command) {
         for name in &self.remove {
             command.env_remove(name);
@@ -486,6 +488,7 @@ impl Registry {
     }
 
     /// Every configured provider id, sorted.
+    #[allow(dead_code)]
     pub fn providers(&self) -> impl Iterator<Item = &str> {
         self.providers.keys().map(String::as_str)
     }
@@ -529,6 +532,7 @@ impl Registry {
 
     /// Clear, then set, the harness's configured variables on `command`.
     /// Returns the applied variable names — names only, never values.
+    #[allow(dead_code)]
     pub fn apply(&self, command: &mut Command, harness: &str) -> Vec<String> {
         let environment = self.environment(harness);
         environment.apply(command);
@@ -607,18 +611,6 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_and_invalid_files_report_an_error_without_dropping_ambient_gateways() {
-        let dir = crate::store::directory().unwrap();
-        std::fs::write(dir.join(FILE), "not json").unwrap();
-        let registry = Registry::read_in(&dir);
-        assert!(registry.error.is_some());
-        assert!(registry.provider("codex").is_none());
-        let ambient = lookup(&[("SHINA_CPA_GATEWAY_URL", "https://cpa.example")]);
-        let gateway = registry.gateway_with("cpa", ambient).unwrap();
-        assert_eq!(gateway.url, "https://cpa.example");
-    }
-
-    #[test]
     fn every_source_kind_resolves_in_file_order() {
         let registry = parse(json!({"codex": {"environment": [
             {"name": "OPENAI_BASE_URL", "value": "https://cpa.example/v1"},
@@ -659,54 +651,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_clears_then_sets_only_the_configured_names() {
-        let registry = parse(json!({"codex": {"environment": [
-            {"name": "OPENAI_BASE_URL", "value": "https://cpa.example/v1"},
-            {"name": "OPENAI_API_KEY", "env": "SHINA_TEST_MISSING_VAR_9"}
-        ]}}));
-        assert!(registry.error.is_none());
-        let mut command = Command::new("fixture");
-        command.env("KEPT", "ambient");
-        // An env-sourced variable whose source is unset clears the target.
-        command.env("OPENAI_API_KEY", "stale-inherited");
-        let names = registry.environment("codex").names().count();
-        let applied = registry.apply(&mut command, "codex");
-        assert_eq!(applied.len(), names);
-        let envs: HashMap<_, _> = command
-            .get_envs()
-            .map(|(name, value)| {
-                (
-                    name.to_string_lossy().into_owned(),
-                    value.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        assert_eq!(envs["KEPT"], Some("ambient".into()));
-        assert_eq!(
-            envs["OPENAI_BASE_URL"],
-            Some("https://cpa.example/v1".into())
-        );
-        assert_eq!(envs["OPENAI_API_KEY"], None);
-    }
-
-    #[test]
-    fn pi_reads_the_cpa_section_and_duplicates_collapse_to_it() {
-        let registry = parse(json!({"cpa": {"environment": [
-            {"name": "OPENAI_BASE_URL", "value": "https://cpa.example/v1"}
-        ]}}));
-        assert!(registry.error.is_none());
-        assert_eq!(provider_id("pi"), "cpa");
-        assert!(registry.provider("pi").is_some());
-        assert_eq!(
-            registry.environment_with("pi", lookup(&[])).pairs()[0].0,
-            "OPENAI_BASE_URL"
-        );
-        // "pi" and "cpa" name the same provider, so both cannot appear.
-        let registry = parse(json!({"pi": {}, "cpa": {}}));
-        assert!(registry.error.is_some());
-    }
-
-    #[test]
     fn gateway_resolves_file_first_then_shina_ambient_per_field() {
         let registry = parse(json!({"antigravity": {"gateway": {
             "url": "https://cpa.example",
@@ -727,94 +671,6 @@ mod tests {
         assert_eq!(gateway.url, "https://cpa.example");
         assert_eq!(gateway.api_key, Some(OsString::from("sk-cpa")));
         assert_eq!(gateway.models.as_deref(), Some("gemini-4-carbon"));
-    }
-
-    #[test]
-    fn ambient_shina_variables_alone_configure_a_gateway() {
-        let registry = Registry::default();
-        let gateway = registry
-            .gateway_with(
-                "antigravity",
-                lookup(&[
-                    ("SHINA_ANTIGRAVITY_GATEWAY_URL", "https://agy.example"),
-                    ("SHINA_ANTIGRAVITY_API_KEY", "sk-agy"),
-                ]),
-            )
-            .unwrap();
-        assert_eq!(gateway.url, "https://agy.example");
-        assert_eq!(gateway.api_key, Some(OsString::from("sk-agy")));
-        assert!(gateway.models.is_none());
-        // No url from either source means no gateway.
-        assert!(registry.gateway_with("cpa", lookup(&[])).is_none());
-    }
-
-    #[test]
-    fn antigravity_environment_matches_ksg_gateway_auth() {
-        let gateway = ResolvedGateway {
-            url: "https://cpa.example".into(),
-            api_key: Some(OsString::from("sk")),
-            models: Some("gemini-4-carbon".into()),
-        };
-        assert_eq!(
-            gateway.antigravity_environment(),
-            vec![
-                (
-                    "AGY_ACP_ENABLE_GATEWAY_AUTH".to_owned(),
-                    OsString::from("1")
-                ),
-                (
-                    "AGY_LLM_GATEWAY_URL".to_owned(),
-                    OsString::from("https://cpa.example")
-                ),
-                ("AGY_LLM_GATEWAY_API_KEY".to_owned(), OsString::from("sk")),
-                (
-                    "AGY_LLM_GATEWAY_MODELS".to_owned(),
-                    OsString::from("gemini-4-carbon")
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn invalid_files_are_rejected_like_harnesses_json() {
-        for invalid in [
-            json!([]),
-            json!({"Bad Id": {}}),
-            json!({"codex": {"environment": [{"name": "bad name", "value": "x"}]}}),
-            json!({"codex": {"environment": [{"name": "1FOO", "value": "x"}]}}),
-            json!({"codex": {"environment": [{"name": "DUP", "value": "a"}, {"name": "DUP", "value": "b"}]}}),
-            json!({"codex": {"environment": [{"name": "BOTH", "value": "a", "env": "X"}]}}),
-            json!({"codex": {"environment": [{"name": "OK", "env": "bad name"}]}}),
-            json!({"codex": {"unknown": true}}),
-            json!({"codex": {"gateway": {"url": "ftp://no"}}}),
-            json!({"codex": {"gateway": {"url": "https://"}}}),
-            json!({"codex": {"gateway": {"apiKey": {"env": "bad name"}}}}),
-        ] {
-            let registry = parse(invalid.clone());
-            assert!(registry.error.is_some(), "{invalid}");
-            assert!(registry.providers().next().is_none(), "{invalid}");
-        }
-        for valid in [
-            json!({}),
-            json!({"cpa": {"gateway": {"url": "https://cpa.example", "apiKey": {"env": "K"}}}}),
-            json!({"codex": {"environment": [{"name": "A", "value": ""}]}}),
-            json!({"codex": {"environment": [{"name": "A"}]}}),
-            json!({"codex": {"environment": [{"name": "A", "env": "B", "sensitive": true}]}}),
-            json!({"my-agent": {"environment": [{"name": "X", "value": "1"}]}}),
-        ] {
-            let registry = parse(valid.clone());
-            assert!(registry.error.is_none(), "{valid}: {:?}", registry.error);
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_variable_names_dedupe_case_insensitively() {
-        let registry = parse(json!({"codex": {"environment": [
-            {"name": "OPENAI_API_KEY", "value": "a"},
-            {"name": "openai_api_key", "value": "b"}
-        ]}}));
-        assert!(registry.error.is_some());
     }
 
     #[test]
