@@ -1,6 +1,8 @@
 //! ACP v1 JSON-RPC over stdio, ported from KSG's effect-acp and provider-acp.
 //! The UI sees the same event envelope as Pi. No provider authentication is performed here.
 mod catalog;
+mod registry_flavor;
+use registry_flavor::Flavor;
 
 use crate::{
     backend::{self, Event, HostLink, Pi, SessionOwner, SessionSource},
@@ -129,8 +131,19 @@ pub(crate) fn start_with_catalog(
     models: &[crate::session::AgentModel],
 ) -> Result<Pi, String> {
     let command = agent.process()?;
+    start_command_with_catalog(agent, start, wake, command, models)
+}
+
+pub(crate) fn start_command_with_catalog(
+    agent: Agent,
+    start: Start,
+    wake: Waker,
+    command: std::process::Command,
+    models: &[crate::session::AgentModel],
+) -> Result<Pi, String> {
     let previous = models.iter().map(|model| json!({
         "id":model.id, "name":model.name, "provider":model.provider,
+        "aliases":model.aliases,
         "isDefault":model.is_default, "thinkingLevels":model.thinking_levels,
         "capabilities":model.capabilities,
         "input":model.supports_images.map(|images| if images { vec!["text", "image"] } else { vec!["text"] }),
@@ -172,6 +185,7 @@ fn start_worker(
         return Err("ACP requires Shina's MCP bridge. Retry after the bridge is available.".into());
     }
     let claude = crate::composer_skills::is_claude(&agent);
+    let flavor = Flavor::detect(&agent.id, &agent.command);
     let skill_args = agent.args.clone();
     let inherit_config = agent.env.iter().any(|name| name == "CLAUDE_CONFIG_DIR");
     let inherit_plugins = agent
@@ -220,7 +234,7 @@ fn start_worker(
                     vec![]
                 };
                 run(
-                    command, start, input, events, wake, stopped, owner, skills, previous,
+                    command, start, input, events, wake, stopped, owner, skills, previous, flavor,
                 )
             };
             #[cfg(test)]
@@ -238,6 +252,36 @@ fn start_worker(
 struct Pending {
     request: Value,
     deadline: Option<Instant>,
+}
+
+/// KSG `defaultSessionLoadTimeout`: a `session/load` gets 90 seconds, bounded by
+/// the real response or the replay-idle gap, whichever proves the session first.
+const SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
+const SESSION_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const RESUME_START_TIMEOUT: Duration =
+    SESSION_LOAD_TIMEOUT.saturating_add(SESSION_INITIALIZE_TIMEOUT);
+/// KSG `defaultSessionLoadReplayIdleGap`: replay quiet for two seconds proves a
+/// `session/load` usable when the agent never answers the request itself.
+const LOAD_REPLAY_IDLE_GAP: Duration = Duration::from_secs(2);
+
+/// KSG `SessionLoadGate`: replay traffic on the loading session marks progress
+/// while the real `session/load` response is still in flight.
+struct LoadGate {
+    request_id: String,
+    session_id: String,
+    sent_at: Instant,
+    last_activity: Option<Instant>,
+    candidate_config_options: Option<Value>,
+}
+
+/// KSG `lateSessionLoad`: after a replay-idle start the real `session/load`
+/// response is still pending; it is adopted only when nothing newer changed
+/// the session in between.
+struct LateLoad {
+    request_id: String,
+    baseline_changes: u64,
+    config_options: Vec<Value>,
+    modes: Value,
 }
 
 struct Permission {
@@ -263,6 +307,41 @@ fn supports_active_steering(meta: &Value) -> bool {
         && advertisement["holdsPrompt"] == true
 }
 
+/// KSG `sessionUpdateCountsAsLoadReplayActivity`: traffic that proves a
+/// `session/load` replay is still writing. Chunks count only with real text.
+fn load_replay_activity(params: &Value) -> bool {
+    if params["_meta"]["isReplay"] == true {
+        return true;
+    }
+    let update = &params["update"];
+    let text_len = |content: &Value| {
+        if content["type"] == "text" {
+            content["text"].as_str().map(str::len).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    match update["sessionUpdate"].as_str().unwrap_or("") {
+        "agent_message_chunk" | "agent_thought_chunk" => text_len(&update["content"]) > 0,
+        "agent_message" | "agent_thought" => update["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(|part| text_len(part) > 0)),
+        "tool_call"
+        | "tool_call_update"
+        | "plan"
+        | "plan_update"
+        | "plan_removed"
+        | "available_commands_update"
+        | "current_mode_update"
+        | "config_option_update"
+        | "session_info_update"
+        | "usage_update"
+        | "compaction_update"
+        | "compaction_summary_chunk" => true,
+        _ => false,
+    }
+}
+
 /// Protocol state is separate from process supervision so negotiation and reduction are testable.
 struct Client {
     start: Start,
@@ -274,6 +353,8 @@ struct Client {
     session: Option<String>,
     pending: HashMap<String, Pending>,
     permissions: HashMap<String, Permission>,
+    droid_forms: HashMap<String, (Value, Vec<Value>)>,
+    flavor: Flavor,
     serial: usize,
     ready: bool,
     running: bool,
@@ -308,13 +389,25 @@ struct Client {
     gateway_models: String,
     /// The adapter-owned `reasoningEffort` pick, re-applied to each route select.
     gateway_effort: Option<String>,
+    /// The reasoning level last confirmed by the agent, so `get_state` can report
+    /// a real `thinkingLevel` for delegated selection verification.
+    applied_thinking: Option<String>,
     /// `setup.models` from session start: legacy combined ids for gateway row lookup.
     legacy_models: Value,
     /// The session's ACP `modes` block, for KSG's setMode modeState.
     modes: Value,
     early_config_options: Option<Value>,
     catalog_started: Option<Instant>,
+    load_gate: Option<LoadGate>,
+    late_load: Option<LateLoad>,
+    /// KSG `sessionChangeCount`: session writes and config/mode notifications.
+    /// A late `session/load` response predates all of them.
+    session_changes: u64,
+    /// KSG `sessionLoadReplayIdleReadiness`: grok's `session/load` may never
+    /// reply, so replay going quiet is the readiness signal.
+    replay_idle: bool,
     models_advertised: bool,
+    live_models_advertised: bool,
     commands_advertised: bool,
     catalog_delete_deadline: Option<Instant>,
     file_reads: bool,
@@ -332,6 +425,8 @@ impl Client {
         let awareness_sent = start.context_sent;
         let restart_steering = !matches!(start.id.as_str(), "github-copilot-cli" | "copilot");
         let devin = start.id == "devin" && !start.metadata_only;
+        let replay_idle = start.id.contains("grok");
+        let flavor = Flavor::detect(&start.id, "");
         Self {
             start,
             capabilities: Value::Null,
@@ -342,6 +437,8 @@ impl Client {
             session: None,
             pending: HashMap::new(),
             permissions: HashMap::new(),
+            droid_forms: HashMap::new(),
+            flavor,
             serial: 0,
             ready: false,
             running: false,
@@ -369,11 +466,17 @@ impl Client {
             antigravity_gateway: false,
             gateway_models: String::new(),
             gateway_effort: None,
+            applied_thinking: None,
             legacy_models: Value::Null,
             modes: Value::Null,
             early_config_options: None,
             catalog_started: None,
+            load_gate: None,
+            late_load: None,
+            session_changes: 0,
+            replay_idle,
             models_advertised: false,
+            live_models_advertised: false,
             commands_advertised: false,
             catalog_delete_deadline: None,
             file_reads: false,
@@ -394,9 +497,17 @@ impl Client {
         commands
     }
 
-    fn request(&mut self, method: &str, params: Value, request: Value) {
+    fn request(&mut self, method: &str, params: Value, request: Value) -> String {
         self.serial += 1;
         let id = format!("shina-acp-{}", self.serial);
+        // KSG `sessionChangeCount`: a session write is newer than any late
+        // `session/load` response still in flight.
+        if matches!(
+            method,
+            "session/set_config_option" | "session/set_mode" | "session/set_model"
+        ) {
+            self.session_changes += 1;
+        }
         self.pending.insert(
             id.clone(),
             Pending {
@@ -407,6 +518,7 @@ impl Client {
         );
         self.wire
             .push(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
+        id
     }
 
     fn initialize(&mut self) {
@@ -430,6 +542,9 @@ impl Client {
         if self.devin {
             client_capabilities["_meta"] = crate::devin::client_capabilities_meta();
         }
+        if self.flavor == Flavor::Droid && !self.start.metadata_only {
+            client_capabilities["elicitation"] = json!({"form":{}});
+        }
         self.request(
             "initialize",
             json!({
@@ -450,8 +565,26 @@ impl Client {
     }
 
     fn state(&self) -> Value {
-        json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":"",
-            "turnCapabilities":self.turn_capabilities()})
+        let thinking = self
+            .applied_thinking
+            .as_deref()
+            .or(self.gateway_effort.as_deref())
+            .unwrap_or("");
+        json!({"sessionFile":self.session,"isStreaming":self.running,"model":self.model,"thinkingLevel":thinking,
+            "turnCapabilities":self.turn_capabilities(),"liveOptionDescriptors":self.option_descriptors})
+    }
+
+    /// The reasoning control's advertised current level, when the session offers one.
+    fn advertised_thinking(&self) -> Option<&str> {
+        self.option_descriptors
+            .iter()
+            .find(|d| crate::descriptors::is_reasoning_control(d))
+            .and_then(|d| match d {
+                crate::descriptors::ProviderOptionDescriptor::Select { current_value, .. } => {
+                    current_value.as_deref()
+                }
+                crate::descriptors::ProviderOptionDescriptor::Boolean { .. } => None,
+            })
     }
 
     fn current_thinking_levels(&self) -> Vec<String> {
@@ -527,6 +660,37 @@ impl Client {
                 {
                     return Err("ACP agent replayed another session.".into());
                 }
+                // KSG `SessionLoadGate`: replay traffic on the loading session
+                // marks progress; a config snapshot becomes the candidate the
+                // provisional start adopts.
+                if let Some(gate) = &mut self.load_gate
+                    && gate.session_id == id
+                {
+                    if load_replay_activity(&record["params"]) {
+                        gate.last_activity = Some(Instant::now());
+                    }
+                    if record["params"]["update"]["sessionUpdate"] == "config_option_update" {
+                        gate.candidate_config_options =
+                            Some(record["params"]["update"]["configOptions"].clone());
+                    }
+                }
+                // After readiness, explicitly marked replay notifications must
+                // not enter the live reducer, overwrite newer controls, or
+                // stream replayed output as live deltas.
+                if self.ready && record["params"]["_meta"]["isReplay"] == true {
+                    return Ok(());
+                }
+                // KSG `sessionChangeCount`: a processed config or mode update is
+                // newer than a pending `session/load` response. Replay and
+                // gated traffic predates it, as do pre-ready startup updates.
+                if self.ready
+                    && matches!(
+                        record["params"]["update"]["sessionUpdate"].as_str(),
+                        Some("config_option_update" | "current_mode_update")
+                    )
+                {
+                    self.session_changes += 1;
+                }
                 if self.devin {
                     // KSG's adapter order: resolve embedded terminal content on the raw
                     // notification, then normalizeDevinSessionUpdate reroutes children.
@@ -561,6 +725,57 @@ impl Client {
                     self.update(&normalized["update"]);
                 } else {
                     self.update(&record["params"]["update"]);
+                }
+            } else if method == "_session/retrying"
+                && self.flavor == Flavor::Vibe
+                && record.get("id").is_none()
+                && self.running
+                && record["params"]["sessionId"].as_str() == self.session.as_deref()
+            {
+                let notice = &record["params"];
+                let category = notice["category"].as_str().unwrap_or("unknown");
+                let class = match category {
+                    "rate_limited" => "usage_limit",
+                    "server_error" | "timed_out" | "connection" => "transport_error",
+                    _ => "provider_error",
+                };
+                let mut detail: String = notice["detail"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(500)
+                    .collect();
+                if let Some(host) = &self.start.link {
+                    detail = detail.replace(&host.token, "[redacted]");
+                }
+                self.events
+                    .push(json!({"type":"harness_update","field":"providerRetry",
+                    "value":{"class":class,"detail":detail,"attempt":notice["attempt"]}}));
+            } else if method == "elicitation/create"
+                && self.flavor == Flavor::Droid
+                && record.get("id").is_some()
+            {
+                let params = &record["params"];
+                let valid = self.running
+                    && !self.start.metadata_only
+                    && self.droid_forms.len() < 32
+                    && params["sessionId"]
+                        .as_str()
+                        .is_none_or(|id| Some(id) == self.session.as_deref());
+                if let Some(questions) = valid
+                    .then(|| registry_flavor::droid_questions(params))
+                    .flatten()
+                {
+                    self.serial += 1;
+                    let key = format!("acp-elicitation-{}", self.serial);
+                    self.events.push(json!({"type":"extension_ui_request","id":key,"method":"input",
+                        "title":"Question","questions":questions,"responseCapability":{"type":"live"}}));
+                    self.droid_forms
+                        .insert(key, (record["id"].clone(), questions));
+                } else {
+                    self.wire.push(
+                        json!({"jsonrpc":"2.0","id":record["id"],"result":{"action":"decline"}}),
+                    );
                 }
             } else if method == "session/request_permission" && record.get("id").is_some() {
                 self.permission(&record)?;
@@ -600,6 +815,9 @@ impl Client {
         };
         let request = pending.request;
         let kind = request["type"].as_str().unwrap_or("");
+        if kind == "expired_load" {
+            return Ok(());
+        }
         if kind == "steer" {
             let original = &request["original"];
             match record["result"]["status"].as_str() {
@@ -633,6 +851,7 @@ impl Client {
         if !record["error"].is_null() {
             let error = &record["error"];
             if kind == "start"
+                && !self.ready
                 && !self.start.metadata_only
                 && error["code"] == -32602
                 && self.capabilities["mcpCapabilities"]["http"] == true
@@ -644,9 +863,7 @@ impl Client {
                 self.stdio_fallback = true;
                 let mut params = request["params"].clone();
                 params["mcpServers"] = self.mcp_servers()?;
-                let mut retry = request.clone();
-                retry["params"] = params.clone();
-                self.request(request["method"].as_str().unwrap(), params, retry);
+                self.request_session_start(request["method"].as_str().unwrap(), params);
                 return Ok(());
             }
             if kind == "antigravity_gateway" {
@@ -696,6 +913,8 @@ impl Client {
                 format!(
                     "ACP authentication failed during {kind}: {message}. Configure or sign in to the agent outside Shina, then retry."
                 )
+            } else if kind == "prompt" && self.flavor == Flavor::Vibe && error["code"] == -31001 {
+                format!("ACP prompt failed: provider rate limit: {message}")
             } else {
                 format!("ACP {kind} failed: {message}")
             };
@@ -703,6 +922,13 @@ impl Client {
                 return Err(message);
             }
             if matches!(kind, "initialize" | "start") {
+                if self.late_load.is_some() {
+                    // KSG: a `session/load` that fails after replay-idle
+                    // readiness is dropped; the provisional session keeps
+                    // running on what the replay already proved.
+                    self.late_load = None;
+                    return Ok(());
+                }
                 return Err(message);
             }
             if kind == "prompt" {
@@ -745,61 +971,48 @@ impl Client {
             }
             "authenticate" => self.start_session()?,
             "start" => {
-                if let Some(session) = result["sessionId"].as_str() {
-                    self.session = Some(session.into());
+                let mut result = result.clone();
+                if result["configOptions"].is_null()
+                    && let Some(candidates) = self
+                        .load_gate
+                        .as_ref()
+                        .and_then(|gate| gate.candidate_config_options.clone())
+                {
+                    // KSG `candidateConfigOptions`: a replayed config snapshot
+                    // fills a load response that carries none of its own.
+                    result["configOptions"] = candidates;
                 }
-                if self.session.as_deref().is_none_or(str::is_empty) {
-                    return Err("ACP agent did not return a session id.".into());
-                }
-                // The persisted per-session marker avoids repeating context after resume.
-                self.finish_replay();
-                let mut configuration = result.clone();
-                if let Some(options) = self.early_config_options.take() {
-                    configuration["configOptions"] = options;
-                }
-                self.configure_models(&configuration);
-                self.ready = true;
-                if self.start.metadata_only {
-                    self.catalog_started = Some(Instant::now());
-                    self.models_advertised |= catalog::advertises_models(
-                        result["configOptions"]
-                            .as_array()
-                            .map(Vec::as_slice)
-                            .unwrap_or_default(),
-                        &result["models"],
-                    );
+                if let Some(late) = self.late_load.take() {
+                    // KSG `adoptLateSessionLoad`: the provisional replay-idle
+                    // start already ran; anything that changed the session
+                    // since is newer than this response, so it is dropped.
+                    if self.session_changes != late.baseline_changes
+                        || self.config_options != late.config_options
+                        || self.modes != late.modes
+                    {
+                        return Ok(());
+                    }
+                    if result["sessionId"]
+                        .as_str()
+                        .is_some_and(|id| Some(id) != self.session.as_deref())
+                    {
+                        return Ok(());
+                    }
+                    // Late setup is metadata only. Do not replay history or
+                    // rerun setup against a session that may have started a turn.
+                    if result["configOptions"].is_null() {
+                        result["configOptions"] = json!(self.config_options);
+                    }
+                    self.configure_models(&result);
+                    self.publish_models_and_state("late-load-state");
+                    if let Some(modes) = result.get("modes") {
+                        self.events
+                            .push(json!({"type":"harness_update","field":"modes","value":modes}));
+                    }
                     return Ok(());
                 }
-                // KSG sessionModeForPolicy: the thread's runtime policy becomes the
-                // session mode at setup; the agy CLI maps yolo/auto_edit to default.
-                if self.antigravity && !self.start.metadata_only {
-                    let access = self
-                        .start
-                        .link
-                        .as_ref()
-                        .map(|h| h.access_mode.as_str())
-                        .unwrap_or("");
-                    let policy = crate::antigravity::permission_mode(access).to_owned();
-                    self.antigravity_set_mode(&policy, json!({"type":"antigravity_mode"}));
-                }
-                self.publish_models();
-                self.reply(
-                    &json!({"id":"levels","type":"get_available_thinking_levels"}),
-                    json!({"levels":self.current_thinking_levels()}),
-                );
-                self.reply(&json!({"id":"state","type":"get_state"}), self.state());
-                self.reply(
-                    &json!({"id":"history","type":"get_messages"}),
-                    self.history_value(),
-                );
-                self.reply(
-                    &json!({"id":"commands","type":"get_commands"}),
-                    json!({"commands":self.available_commands()}),
-                );
-                if let Some(modes) = result.get("modes") {
-                    self.events
-                        .push(json!({"type":"harness_update","field":"modes","value":modes}));
-                }
+                self.load_gate = None;
+                self.complete_start(&result)?;
             }
             "prompt" => {
                 if let Some(error) = result.get("error").filter(|e| !e.is_null()) {
@@ -807,6 +1020,22 @@ impl Client {
                         .as_str()
                         .unwrap_or("ACP prompt failed")
                         .to_owned());
+                }
+                if self.flavor == Flavor::Glm && result["usage"].is_object() {
+                    let usage = [
+                        "inputTokens",
+                        "outputTokens",
+                        "totalTokens",
+                        "cachedReadTokens",
+                        "cachedWriteTokens",
+                        "thoughtTokens",
+                    ]
+                    .into_iter()
+                    .filter_map(|key| Some((key.to_owned(), json!(result["usage"][key].as_u64()?))))
+                    .collect::<serde_json::Map<_, _>>();
+                    self.events.push(
+                        json!({"type":"harness_update","field":"lastTurnUsage","value":usage}),
+                    );
                 }
                 self.settle(result["stopReason"] == "cancelled");
             }
@@ -849,7 +1078,7 @@ impl Client {
                         self.request(
                             "session/set_config_option",
                             json!({"sessionId":self.session,"configId":config_id,"value":level}),
-                            json!({"type":"antigravity_level","original":original,"combined":combined}),
+                            json!({"type":"antigravity_level","original":original,"combined":combined,"level":level}),
                         );
                         return Ok(());
                     }
@@ -884,6 +1113,9 @@ impl Client {
                     {
                         self.model = model.clone();
                     }
+                    self.applied_thinking = crate::antigravity::gateway_route_effort(route)
+                        .or_else(|| request["effort"].as_str())
+                        .map(str::to_owned);
                 }
                 let original = request["original"].clone();
                 if original["type"] == "set_option" {
@@ -908,6 +1140,8 @@ impl Client {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
                     self.publish_models();
+                } else if let Some(level) = request["level"].as_str() {
+                    self.applied_thinking = Some(level.to_owned());
                 }
                 self.pending_thinking = None;
                 let combined = request["combined"]
@@ -928,6 +1162,21 @@ impl Client {
                 if result["configOptions"].is_array() {
                     self.configure_models(result);
                     self.publish_models();
+                } else {
+                    // A bare acknowledgement keeps the sent level as the applied one.
+                    let level = if kind == "set_thinking_level" {
+                        request["level"].as_str()
+                    } else if self.option_descriptors.iter().any(|d| {
+                        crate::descriptors::is_reasoning_control(d)
+                            && Some(d.id()) == request["optionId"].as_str()
+                    }) {
+                        request["value"].as_str()
+                    } else {
+                        None
+                    };
+                    if let Some(level) = level.filter(|l| !l.is_empty()) {
+                        self.applied_thinking = Some(level.to_owned());
+                    }
                 }
                 self.reply(&request, result.clone());
             }
@@ -939,7 +1188,11 @@ impl Client {
     fn publish_models(&mut self) {
         self.reply(
             &json!({"id":"models","type":"get_available_models"}),
-            json!({"models":self.models}),
+            json!({
+                "models": self.models,
+                "advertised": self.live_models_advertised,
+                "liveOptionDescriptors": self.option_descriptors,
+            }),
         );
     }
 
@@ -1015,11 +1268,135 @@ impl Client {
         {
             params["_meta"] = meta;
         }
-        self.request(
+        self.request_session_start(method, params);
+        Ok(())
+    }
+
+    fn request_session_start(&mut self, method: &str, params: Value) {
+        let request_id = self.request(
             method,
             params.clone(),
             json!({"type":"start","method":method,"params":params}),
         );
+        if method == "session/load" {
+            let sent_at = Instant::now();
+            if let Some(pending) = self.pending.get_mut(&request_id) {
+                pending.deadline = Some(sent_at + SESSION_LOAD_TIMEOUT);
+            }
+            self.load_gate = Some(LoadGate {
+                request_id,
+                session_id: self.session.clone().unwrap_or_default(),
+                sent_at,
+                last_activity: None,
+                candidate_config_options: None,
+            });
+        }
+    }
+
+    fn complete_start(&mut self, result: &Value) -> Result<(), String> {
+        if let Some(session) = result["sessionId"].as_str() {
+            self.session = Some(session.into());
+        }
+        if self.session.as_deref().is_none_or(str::is_empty) {
+            return Err("ACP agent did not return a session id.".into());
+        }
+        self.finish_replay();
+        let mut configuration = result.clone();
+        if let Some(options) = self.early_config_options.take()
+            && (configuration["configOptions"].is_null()
+                || !matches!(self.start.source, SessionSource::Resume(_)))
+        {
+            configuration["configOptions"] = options;
+        }
+        self.configure_models(&configuration);
+        self.ready = true;
+        if self.start.metadata_only {
+            self.catalog_started = Some(Instant::now());
+            self.models_advertised |=
+                catalog::advertises_models(self.config_options.as_slice(), &self.legacy_models);
+            return Ok(());
+        }
+        if self.antigravity {
+            let access = self.start.link.as_ref().map_or("", |h| &h.access_mode);
+            let policy = crate::antigravity::permission_mode(access);
+            self.antigravity_set_mode(policy, json!({"type":"antigravity_mode"}));
+        }
+        self.publish_models_and_state("state");
+        self.reply(
+            &json!({"id":"history","type":"get_messages"}),
+            self.history_value(),
+        );
+        self.reply(
+            &json!({"id":"commands","type":"get_commands"}),
+            json!({"commands":self.available_commands()}),
+        );
+        if let Some(modes) = result.get("modes") {
+            self.events
+                .push(json!({"type":"harness_update","field":"modes","value":modes}));
+        }
+        Ok(())
+    }
+
+    fn publish_models_and_state(&mut self, state_id: &str) {
+        self.publish_models();
+        self.reply(
+            &json!({"id":"levels","type":"get_available_thinking_levels"}),
+            json!({"levels":self.current_thinking_levels()}),
+        );
+        self.reply(&json!({"id":state_id,"type":"get_state"}), self.state());
+    }
+
+    /// Grok can complete the replay without answering session/load. Adopt
+    /// the replay snapshot after it goes quiet, then follow its real response.
+    fn check_load_gate(&mut self, now: Instant) -> Result<(), String> {
+        if !self.replay_idle || self.ready {
+            return Ok(());
+        }
+        let Some(gate) = &self.load_gate else {
+            return Ok(());
+        };
+        if !gate
+            .last_activity
+            .is_some_and(|last| now.saturating_duration_since(last) >= LOAD_REPLAY_IDLE_GAP)
+        {
+            return Ok(());
+        }
+        let gate = self.load_gate.take().unwrap();
+        let result = json!({
+            "modes": self.initialize_result["_meta"]["modeState"],
+            "configOptions": gate.candidate_config_options,
+        });
+        self.complete_start(&result)?;
+        self.late_load = Some(LateLoad {
+            request_id: gate.request_id,
+            baseline_changes: self.session_changes,
+            config_options: self.config_options.clone(),
+            modes: self.modes.clone(),
+        });
+        Ok(())
+    }
+
+    fn check_request_deadlines(&mut self, now: Instant) -> Result<(), String> {
+        if self.late_load.as_ref().is_some_and(|late| {
+            self.pending
+                .get(&late.request_id)
+                .and_then(|p| p.deadline)
+                .is_some_and(|deadline| now >= deadline)
+        }) {
+            let late = self.late_load.take().unwrap();
+            // Keep the request ID so a later reply is ignored, not treated as
+            // a protocol error that tears down the usable session.
+            let pending = self.pending.get_mut(&late.request_id).unwrap();
+            pending.deadline = None;
+            pending.request = json!({"type":"expired_load"});
+        }
+        if self
+            .pending
+            .values()
+            .any(|p| p.deadline.is_some_and(|deadline| now >= deadline))
+        {
+            return Err("ACP agent did not answer a session operation before its deadline.".into());
+        }
         Ok(())
     }
 
@@ -1128,8 +1505,17 @@ impl Client {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        if let Some(level) = self.advertised_thinking().map(str::to_owned) {
+            self.applied_thinking = Some(level);
+        }
         // KSG observeThinkingLevels + buildAntigravityModelsFromSession.
         if self.antigravity {
+            if !self.gateway_models.is_empty() {
+                self.applied_thinking = crate::antigravity::current_model(&self.config_options)
+                    .as_deref()
+                    .and_then(crate::antigravity::gateway_route_effort)
+                    .map(str::to_owned);
+            }
             crate::antigravity::observe_thinking_levels(
                 &self.config_options,
                 &mut self.thinking_levels,
@@ -1143,6 +1529,7 @@ impl Client {
             crate::antigravity::apply_manifest(&mut rows);
             self.model_option = crate::antigravity::model_config(&self.config_options)
                 .and_then(|c| c["id"].as_str().map(str::to_owned));
+            self.live_models_advertised = !rows.is_empty();
             self.models = rows
                 .iter()
                 .map(|row| self.antigravity_model_value(row))
@@ -1163,7 +1550,7 @@ impl Client {
         } else {
             &["text"][..]
         };
-        let (rows, current) = catalog::model_rows(
+        let (rows, current, advertised_live) = catalog::model_rows(
             &self.start.id,
             &self.config_options,
             &self.legacy_models,
@@ -1175,6 +1562,7 @@ impl Client {
             },
             input,
         );
+        self.live_models_advertised = advertised_live;
         self.models = rows;
         self.model = self
             .models
@@ -1344,8 +1732,8 @@ impl Client {
             );
             return true;
         };
-        let pending =
-            json!({"type":"antigravity_gateway","original":record,"route":route,"row":row.slug});
+        let pending = json!({"type":"antigravity_gateway","original":record,"route":route,
+            "row":row.slug,"effort":crate::antigravity::gateway_route_effort(&route)});
         if let Some(config_id) = crate::antigravity::model_config(&self.config_options)
             .and_then(|c| c["id"].as_str().map(str::to_owned))
         {
@@ -1368,7 +1756,7 @@ impl Client {
         true
     }
 
-    fn command(&mut self, record: Value) -> Result<(), String> {
+    fn command(&mut self, mut record: Value) -> Result<(), String> {
         let kind = record["type"].as_str().unwrap_or("");
         if self.start.metadata_only && !matches!(kind, "get_available_models" | "get_commands") {
             self.reject(
@@ -1379,6 +1767,11 @@ impl Client {
         }
         if kind == "extension_ui_response" {
             let key = record["id"].as_str().unwrap_or("");
+            if let Some((id, questions)) = self.droid_forms.remove(key) {
+                self.wire.push(json!({"jsonrpc":"2.0","id":id,
+                    "result":registry_flavor::droid_answer(&questions, &record)}));
+                return Ok(());
+            }
             if let Some(permission) = self.permissions.remove(key) {
                 if let Some(question) = &permission.question {
                     let supplied: Value = record["value"]
@@ -1462,6 +1855,9 @@ impl Client {
                 for (_, permission) in self.permissions.drain() {
                     self.wire.push(permission_response(permission.id, None));
                 }
+                for (_, (id, _)) in self.droid_forms.drain() {
+                    self.wire.push(json!({"jsonrpc":"2.0","id":id,"result":{"action":"cancel"}}));
+                }
                 self.cancelling = self.running;
                 self.wire.push(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":self.session}}));
                 self.reply(&record, json!({}));
@@ -1542,17 +1938,39 @@ impl Client {
                     }
                 } else if record["modelId"] == "default" && self.model["id"] == "default" {
                     self.reply(&record, self.model.clone());
-                } else if !self.models.iter().any(|model| model["id"] == record["modelId"]) {
-                    self.reject(&record, "This ACP agent did not advertise that model. Refresh the session or choose one of its advertised models.");
-                } else if let Some(option) = &self.model_option {
-                    self.request("session/set_config_option", json!({"sessionId":self.session,"configId":option,"value":record["modelId"]}), record);
                 } else {
-                    self.request("session/set_model", json!({"sessionId":self.session,"modelId":record["modelId"]}), record);
+                    let requested = record["modelId"].as_str().unwrap_or("");
+                    let advertised = self.models.iter().find(|model| {
+                        model["id"] == requested
+                            || model["aliases"].as_array().into_iter().flatten()
+                                .any(|alias| alias.as_str().is_some_and(|alias| alias.eq_ignore_ascii_case(requested)))
+                    }).and_then(|model| model["id"].as_str());
+                    // Cursor's account catalog can be newer than this session's
+                    // startup list. Let the CLI validate a freshly catalogued pick.
+                    let resolved = advertised.or_else(|| {
+                        (self.start.id == "cursor" && record["fromCursorCatalog"] == true && !requested.is_empty())
+                            .then_some(requested)
+                    });
+                    let Some(resolved) = resolved else {
+                        self.reject(&record, "This ACP agent did not advertise that model. Refresh the session or choose one of its advertised models.");
+                        return Ok(());
+                    };
+                    record["modelId"] = json!(resolved);
+                    if let Some(option) = &self.model_option {
+                        self.request("session/set_config_option", json!({"sessionId":self.session,"configId":option,"value":record["modelId"]}), record);
+                    } else {
+                        self.request("session/set_model", json!({"sessionId":self.session,"modelId":record["modelId"]}), record);
+                    }
                 }
             }
             "set_thinking_level" => {
                 if self.running {
                     self.reject(&record, "Wait for the ACP run to finish before changing reasoning.");
+                } else if self.antigravity && !self.gateway_models.is_empty() {
+                    self.gateway_effort = record["level"].as_str().map(str::to_owned);
+                    if !self.antigravity_gateway_select(None, &record) {
+                        self.reject(&record, "Antigravity did not advertise a gateway reasoning option.");
+                    }
                 } else if let Some(reasoning) = self
                     .option_descriptors
                     .iter()
@@ -1624,13 +2042,51 @@ impl Client {
                             );
                         }
                     } else {
-                        let value = match record["value"].as_str() {
+                        let mut value = match record["value"].as_str() {
                             Some(v) if v == crate::descriptors::ACP_EMPTY_OPTION_VALUE => json!(""),
                             _ => record["value"].clone(),
                         };
+                        let mut config_id = option_id;
+                        if self.start.id == "cursor" {
+                            let option = self
+                                .config_options
+                                .iter()
+                                .find(|option| option["id"] == option_id)
+                                .or_else(|| {
+                                    let native = crate::cursor::native_option_id(option_id);
+                                    self.config_options
+                                        .iter()
+                                        .find(|option| option["id"] == native)
+                                });
+                            let Some(option) = option else {
+                                self.reject(
+                                    &record,
+                                    format!(
+                                        "Cursor did not advertise the '{option_id}' option for this session."
+                                    ),
+                                );
+                                return Ok(());
+                            };
+                            config_id = option["id"].as_str().unwrap_or(option_id);
+                            if option["type"] == "select" {
+                                if let Some(enabled) = value.as_bool() {
+                                    value = json!(enabled.to_string());
+                                }
+                                if !catalog::choices(option).any(|choice| choice["value"] == value) {
+                                    self.reject(
+                                        &record,
+                                        format!(
+                                            "Cursor did not advertise value {} for '{config_id}'.",
+                                            value
+                                        ),
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
                         self.request(
                             "session/set_config_option",
-                            json!({"sessionId":self.session,"configId":option_id,"value":value}),
+                            json!({"sessionId":self.session,"configId":config_id,"value":value}),
                             record,
                         );
                     }
@@ -1753,6 +2209,11 @@ impl Client {
     }
 
     fn settle(&mut self, aborted: bool) {
+        self.droid_forms.clear();
+        if self.flavor == Flavor::Vibe {
+            self.events
+                .push(json!({"type":"harness_update","field":"providerRetry","value":null}));
+        }
         self.running = false;
         self.turn_id = None;
         let aborted = aborted || self.cancelling;
@@ -2231,6 +2692,9 @@ impl Client {
                 }
             }
             "current_mode_update" => {
+                if self.ready {
+                    self.note_modes(update);
+                }
                 self.events.push(
                     json!({"type":"harness_update","field":update["sessionUpdate"],"value":update}),
                 );
@@ -2468,6 +2932,7 @@ fn run(
     owner: &SessionOwner,
     claude_skills: Vec<crate::composer_skills::Skill>,
     previous: Vec<Value>,
+    flavor: Flavor,
 ) -> Result<(), String> {
     command
         .current_dir(&start.workspace)
@@ -2565,6 +3030,7 @@ fn run(
         let _ = write_result.send(result);
     });
     let mut client = Client::new(start);
+    client.flavor = flavor;
     client.models = previous;
     let executable = command.get_program().to_string_lossy();
     if executable.rsplit(['/', '\\']).next().is_some_and(|name| {
@@ -2623,17 +3089,16 @@ fn run(
                     }
                 }
             }
-            if !client.ready && started.elapsed() >= Duration::from_secs(15) {
-                return Err("ACP agent did not initialize its session within 15 seconds.".into());
-            }
-            if client.pending.values().any(|p| {
-                p.deadline
-                    .is_some_and(|deadline| Instant::now() >= deadline)
-            }) {
-                return Err(
-                    "ACP agent did not answer a session operation within 30 seconds.".into(),
+            if !client.ready {
+                let expired = client.load_gate.as_ref().map_or_else(
+                    || started.elapsed() >= SESSION_INITIALIZE_TIMEOUT,
+                    |gate| gate.sent_at.elapsed() >= SESSION_LOAD_TIMEOUT,
                 );
+                if expired {
+                    return Err("ACP agent did not initialize its session in time.".into());
+                }
             }
+            client.check_request_deadlines(Instant::now())?;
             for record in std::mem::take(&mut client.wire) {
                 writes
                     .try_send(record)
@@ -2674,6 +3139,7 @@ fn run(
                 }
             }
             client.settle_discovery(Instant::now());
+            client.check_load_gate(Instant::now())?;
             // terminal/wait_for_exit answers once the child records an exit status.
             client.flush_terminal_waiters();
             // Publish responses before the UI can dispatch its next operation.

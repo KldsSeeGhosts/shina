@@ -46,6 +46,18 @@ pub struct AgentModel {
 }
 
 impl AgentModel {
+    /// The levels the reasoning menu offers for this model: its reasoning
+    /// control's selectable choices, or the plain list when it has no control.
+    pub(crate) fn reasoning_levels(&self) -> Vec<String> {
+        let choices =
+            crate::descriptors::model_reasoning_levels(&self.capabilities.option_descriptors);
+        if choices.is_empty() {
+            self.thinking_levels.clone()
+        } else {
+            choices
+        }
+    }
+
     pub fn from_harness_value(model: &Value, harness: &str) -> Option<Self> {
         if harness == "pi" {
             return Self::from_value(model);
@@ -258,6 +270,9 @@ pub struct NativeCatalog {
     pub commands: Vec<Value>,
     pub extensions: bool,
     pub cwd: Option<PathBuf>,
+    /// The workspace that produced `self.models`, tracked separately from `self.cwd`
+    /// while a scan for another workspace is in flight.
+    pub models_cwd: Option<PathBuf>,
     pub revision: u64,
     pub installed: bool,
     pub version: Option<String>,
@@ -269,6 +284,10 @@ pub struct NativeCatalog {
     pub usage_limits: Value,
     pub usage_limits_raw: Value,
     pub usage_account: Value,
+    /// KSG `workspaceSnapshots[cwd].models`: a folder's own provider config can
+    /// add models that only its workspace lists; every discovered cwd keeps its
+    /// own list after the catalog moves on.
+    pub workspace_snapshots: std::collections::BTreeMap<PathBuf, Vec<AgentModel>>,
     pi: Option<Pi>,
     attempted: bool,
     complete: bool,
@@ -293,6 +312,7 @@ impl NativeCatalog {
 
     pub fn snapshot(&self) -> Value {
         serde_json::json!({"models":self.models,"commands":self.commands,"cwd":self.cwd,
+            "modelsCwd":self.models_cwd,"workspaceSnapshots":self.workspace_snapshots,
             "extensions":self.extensions,"ready":self.complete,"error":self.error,"loading":self.loading(),
             "installed":self.installed,"version":self.version,"authStatus":self.auth_status,
             "updateRequiredModels":self.update_required_models,"providerMessage":self.provider_message,
@@ -319,6 +339,7 @@ impl NativeCatalog {
         workspace: &Path,
         wake: Waker,
         force: bool,
+        interval: bool,
     ) -> bool {
         if self.agent.as_ref() != Some(agent) {
             *self = Self {
@@ -326,6 +347,19 @@ impl NativeCatalog {
                 revision: self.revision,
                 ..Default::default()
             };
+        }
+        // KSG `refreshOnInterval`: each check starts the CLI again, so a healthy
+        // Grok or OpenCode catalog is rechecked only on an explicit refresh or a
+        // directory change; an unhealthy one keeps polling until it recovers.
+        const INTERVAL_SKIP: &[&str] = &["grok", "opencode"];
+        if interval
+            && !force
+            && INTERVAL_SKIP.contains(&agent.id.as_str())
+            && self.complete
+            && self.error.is_none()
+            && self.cwd.as_deref() == Some(workspace)
+        {
+            return false;
         }
         if !force
             && self
@@ -339,6 +373,18 @@ impl NativeCatalog {
             let start = crate::harness::Start::discovery(&agent.id, workspace);
             crate::acp::start(agent.clone(), start, wake)
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_acp_fixture(agent: crate::harness::Agent, models: Vec<AgentModel>) -> Self {
+        Self {
+            agent: Some(agent),
+            models,
+            installed: true,
+            complete: true,
+            revision: 1,
+            ..Default::default()
+        }
     }
 
     fn refresh_with(
@@ -372,6 +418,7 @@ impl NativeCatalog {
             }
         }
         let models = force
+            || changed
             || !self.attempted
             || self
                 .loaded
@@ -451,6 +498,10 @@ impl NativeCatalog {
                                 .filter_map(|model| AgentModel::from_harness_value(model, harness))
                                 .collect();
                             self.models_loaded = true;
+                            self.models_cwd = self.cwd.clone();
+                            if let Some(cwd) = self.cwd.clone() {
+                                self.workspace_snapshots.insert(cwd, self.models.clone());
+                            }
                             self.revision += 1;
                         }
                         Some("get_commands") => {
@@ -498,13 +549,57 @@ impl NativeCatalog {
         self.complete
     }
 
-    pub(crate) fn apply_live_acp_models(&mut self, models: &[AgentModel]) {
-        if models.is_empty() || self.models == models {
+    /// See `models_owned_by`.
+    pub(crate) fn models_for_workspace(&self, cwd: Option<&Path>) -> Option<&[AgentModel]> {
+        models_owned_by(
+            &self.models,
+            &self.workspace_snapshots,
+            self.cwd.as_deref(),
+            self.models_cwd.as_deref(),
+            cwd,
+        )
+    }
+
+    pub(crate) fn set_workspace_models(&mut self, cwd: &Path, models: &[AgentModel]) {
+        if self.workspace_snapshots.get(cwd).map(Vec::as_slice) != Some(models) {
+            self.workspace_snapshots
+                .insert(cwd.to_path_buf(), models.to_vec());
+            self.revision += 1;
+        }
+    }
+
+    /// A live session's catalog must not replace the list for another folder.
+    pub(crate) fn apply_live_acp_models(&mut self, models: &[AgentModel], cwd: Option<&Path>) {
+        if models.is_empty() {
+            return;
+        }
+        if let Some(cwd) = cwd {
+            self.set_workspace_models(cwd, models);
+        }
+        // Discovery's own list changes only for the folder it is scanning. A session
+        // in another folder, or one whose folder is unknown, cannot claim it.
+        if self.cwd.is_some() && self.cwd.as_deref() != cwd {
+            return;
+        }
+        let target_cwd = cwd.map(Path::to_path_buf);
+        if self.models == models && self.models_cwd == target_cwd {
             return;
         }
         self.models = models.to_vec();
+        self.models_cwd = target_cwd;
         self.installed = true;
         self.revision += 1;
+    }
+
+    /// Matches `refresh_with`'s retry gate: a failed or stale scan may run again.
+    pub(crate) fn retry_ready(&self) -> bool {
+        !self
+            .error
+            .as_deref()
+            .is_some_and(crate::usage_limits::authentication_error)
+            && self
+                .last_attempt
+                .is_none_or(|at| at.elapsed() >= CATALOG_RETRY_TTL)
     }
 
     fn fail(&mut self, error: String) {
@@ -512,6 +607,96 @@ impl NativeCatalog {
         self.error = Some(error);
         self.pi = None;
         self.started = None;
+    }
+}
+
+/// The one rule for which workspace a catalog's models belong to, shared by a
+/// server's `NativeCatalog` and a client's projected copy of it.
+///
+/// A folder's recorded snapshot wins, including an empty one (`Some(&[])`).
+/// Otherwise `models` answer only the folder that produced them (`models_cwd`).
+/// A catalog that has recorded no folder at all, such as a fixture or a server
+/// from before folders were tracked, answers every caller. An unknown `cwd`
+/// matches nothing else, so it can never borrow another folder's list.
+pub(crate) fn models_owned_by<'a>(
+    models: &'a [AgentModel],
+    workspace_snapshots: &'a std::collections::BTreeMap<PathBuf, Vec<AgentModel>>,
+    catalog_cwd: Option<&Path>,
+    models_cwd: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<&'a [AgentModel]> {
+    if let Some(models) = cwd.and_then(|cwd| workspace_snapshots.get(cwd)) {
+        return Some(models.as_slice());
+    }
+    let unowned = models_cwd.is_none() && catalog_cwd.is_none();
+    let owned = unowned || (cwd.is_some() && cwd == models_cwd);
+    (owned && !models.is_empty()).then_some(models)
+}
+
+#[cfg(test)]
+mod native_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_workspace_never_owns_or_borrows_a_folders_models() {
+        let folder = PathBuf::from("known-workspace");
+        let model = |id: &str| AgentModel {
+            id: id.into(),
+            ..Default::default()
+        };
+        // Discovery is scanning `folder` and holds models of unrecorded origin.
+        let mut catalog = NativeCatalog {
+            cwd: Some(folder.clone()),
+            models: vec![model("unrecorded")],
+            ..Default::default()
+        };
+        assert!(catalog.models_for_workspace(None).is_none());
+        assert!(catalog.models_for_workspace(Some(&folder)).is_none());
+        // A live session with no known folder cannot become that folder's list.
+        let revision = catalog.revision;
+        catalog.apply_live_acp_models(&[model("unknown-session")], None);
+        assert_eq!(catalog.models, [model("unrecorded")]);
+        assert_eq!(catalog.models_cwd, None);
+        assert_eq!(catalog.revision, revision);
+        assert!(catalog.workspace_snapshots.is_empty());
+        // A catalog that never recorded a folder still answers every caller.
+        let fixture = NativeCatalog {
+            models: vec![model("fixture")],
+            ..Default::default()
+        };
+        assert_eq!(
+            fixture.models_for_workspace(None),
+            Some(&[model("fixture")][..])
+        );
+        assert_eq!(
+            fixture.models_for_workspace(Some(&folder)),
+            Some(&[model("fixture")][..])
+        );
+    }
+
+    #[test]
+    fn live_acp_models_stay_in_the_session_workspace() {
+        let first = PathBuf::from("first-workspace");
+        let second = PathBuf::from("second-workspace");
+        let model = |id: &str| AgentModel {
+            id: id.into(),
+            ..Default::default()
+        };
+        let mut catalog = NativeCatalog {
+            cwd: Some(first.clone()),
+            models: vec![model("first-model")],
+            ..Default::default()
+        };
+        catalog.set_workspace_models(&first, &[model("first-model")]);
+        let revision = catalog.revision;
+        catalog.apply_live_acp_models(&[model("new-second-model")], Some(&second));
+        assert_eq!(catalog.models, [model("first-model")]);
+        assert_eq!(catalog.workspace_snapshots[&first], [model("first-model")]);
+        assert_eq!(
+            catalog.workspace_snapshots[&second],
+            [model("new-second-model")]
+        );
+        assert!(catalog.revision > revision);
     }
 }
 

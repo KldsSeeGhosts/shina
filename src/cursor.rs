@@ -151,7 +151,11 @@ pub fn cli_available() -> bool {
 }
 
 /// Session start: the resolved `agent acp` command on the shared ACP runtime.
-pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
+pub fn start(
+    start: Start,
+    wake: Waker,
+    models: &[crate::session::AgentModel],
+) -> Result<Pi, String> {
     let agent = Agent {
         id: "cursor".into(),
         name: "Cursor".into(),
@@ -160,7 +164,7 @@ pub fn start(start: Start, wake: Waker) -> Result<Pi, String> {
         env: vec![],
     };
     let command = command(&start.workspace)?;
-    crate::acp::start_command(agent, start, wake, command)
+    crate::acp::start_command_with_catalog(agent, start, wake, command, models)
 }
 
 /// KSG `checkCursorProviderStatus`: a metadata-only catalog probe. No
@@ -173,7 +177,8 @@ pub fn discover(workspace: PathBuf, wake: Waker) -> Pi {
         owner,
         None,
         move |input, events, _wake, stopped, _owner| {
-            let command = process()?;
+            let mut command = process()?;
+            command.current_dir(&start.workspace);
             if stopped.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -322,6 +327,10 @@ fn probe_version(command: &Command) -> Option<String> {
 /// env, plus the probe's argument and a null stdin.
 fn probe_command(command: &Command, arg: &str) -> Command {
     let mut probe = Command::new(command.get_program());
+    probe.env_clear();
+    if let Some(cwd) = command.get_current_dir() {
+        probe.current_dir(cwd);
+    }
     for arg in command.get_args() {
         probe.arg(arg);
     }
@@ -564,6 +573,43 @@ fn provider_option_id(native: &str) -> String {
         _ => native,
     }
     .into()
+}
+
+pub(crate) fn native_option_id(id: &str) -> &str {
+    match id {
+        "contextWindow" => "context",
+        "fastMode" => "fast",
+        _ => id,
+    }
+}
+
+/// Check whether a saved option selection is still offered by a live session's
+/// advertised option descriptors.
+pub(crate) fn option_supported_by_descriptors(
+    descriptors: &[ProviderOptionDescriptor],
+    option_id: &str,
+    value: &crate::model_selection::OptionValue,
+) -> bool {
+    let native = native_option_id(option_id);
+    let Some(descriptor) = descriptors
+        .iter()
+        .find(|d| d.id() == option_id || d.id() == native)
+    else {
+        return false;
+    };
+    match descriptor {
+        ProviderOptionDescriptor::Boolean { .. } => {
+            matches!(value, crate::model_selection::OptionValue::Bool(_))
+        }
+        ProviderOptionDescriptor::Select { options, .. } => {
+            let target = match value {
+                crate::model_selection::OptionValue::Str(s) => s.as_str(),
+                crate::model_selection::OptionValue::Bool(true) => "true",
+                crate::model_selection::OptionValue::Bool(false) => "false",
+            };
+            options.iter().any(|choice| choice.id == target)
+        }
+    }
 }
 
 /// KSG `cursorSdkParameterPriority`: reasoning first, then context, fast and

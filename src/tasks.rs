@@ -1153,10 +1153,13 @@ impl State {
                 "target.provider must be {provider} for harness {harness}."
             ));
         }
+        // KSG `withWorkspaceModels`: the caller folder's own provider config
+        // decides what the target accepts.
         let models = if harness == self.threads[caller_index].harness {
             self.delegation_models(&self.threads[caller_index]).0
         } else {
-            self.harness_models(&harness)
+            self.workspace_models(caller_index, &harness)
+                .unwrap_or_else(|| self.harness_models_for_thread(caller_index, &harness))
         };
         let inherited = if harness == self.threads[caller_index].harness {
             self.inherited_selection(caller_index)
@@ -1180,14 +1183,42 @@ impl State {
                 }),
             None => inherited,
         };
+        // KSG `antigravitySuffixedModel`: Antigravity 1.3 model ids append the
+        // thinking level (`gemini-3.8-flash-high`); the agent still accepts the
+        // family with the level as its reasoning option. Only an explicitly
+        // requested model resolves this way, never an inherited one.
+        let mut selection = selection;
+        if provider == "antigravity"
+            && let Some(selection) = &mut selection
+            && target.as_ref().is_some_and(|t| t.model.is_some())
+            && advertised_delegation_model(&models, &selection.provider, &selection.model).is_none()
+            && let Some((family, level)) = selection
+                .model
+                .rsplit_once('-')
+                .map(|(family, level)| (family.to_owned(), level.to_owned()))
+            && models
+                .iter()
+                .find(|model| model.provider == selection.provider && model.id == family)
+                .is_some_and(|model| model.thinking_levels.iter().any(|l| l == &level))
+        {
+            selection.model = family;
+            if target.as_ref().is_none_or(|t| t.reasoning.is_none()) {
+                selection.reasoning = Some(level);
+            }
+        }
         if selection.is_none() && target.as_ref().is_some_and(|t| t.reasoning.is_some()) {
             return Err(
                 "A reasoning target requires an advertised model so Shina can validate the level."
                     .into(),
             );
         }
-        if let Some(selection) = &selection {
+        if let Some(selection) = &mut selection {
             self.validate_delegation_selection(&models, selection, target.is_some())?;
+            if let Some(model) =
+                advertised_delegation_model(&models, &selection.provider, &selection.model)
+            {
+                selection.model.clone_from(&model.id);
+            }
         }
         let project = self.delegation_workspace(caller_index, args)?;
         if let Some(project) = self.project(project)
@@ -1234,6 +1265,14 @@ impl State {
     ) -> Result<Value, String> {
         let caller = self.threads[caller_index].id;
         self.check_task_capacity(caller)?;
+        // KSG `scanWorkspace`: the target harness is probed for the caller's
+        // folder in the background, so a retry sees the folder's provider config.
+        if let Ok(target) = parse_delegation_target(args) {
+            let harness = target
+                .and_then(|t| t.harness)
+                .unwrap_or_else(|| self.threads[caller_index].harness.clone());
+            self.scan_caller_workspace(caller_index, &harness);
+        }
         let prepared =
             self.prepare_local_delegation(caller_index, args, request_key, self.next_id)?;
         let status = self.stage_local_delegation(caller_index, args, request_key, prepared)?;
@@ -3867,6 +3906,33 @@ mod tests {
         assert_eq!(state.tasks[0].state, TaskState::Cancelled);
         assert!(!state.tasks[0].delivered);
         assert!(state.tasks[0].hold_delivery);
+    }
+
+    #[test]
+    fn boot_history_reducer_settles_without_starting_the_parent() {
+        let mut state = state_with_task();
+        state.demo = true;
+        state.threads[1].session = Some("fixture.jsonl".into());
+        state.prepare_task_recovery();
+        let record = history(
+            &state.tasks[0],
+            vec![json!({"role":"assistant","stopReason":"stop","content":"Recovered final"})],
+        );
+        let (_, events) = fake_pi(&mut state.threads[1]);
+        state.threads[1].initializing = true;
+        state.threads[1].state_loaded = true;
+        events.send(Event::Record(record)).unwrap();
+
+        let capture = crate::outbox::Capture::begin();
+        super::runtime_poll::poll_threads(&mut state);
+        state.poll_tasks(Instant::now());
+        assert!(capture.finish().is_empty());
+
+        assert_eq!(state.tasks[0].state, TaskState::Completed);
+        assert!(state.threads[1].pi.is_none());
+        assert!(state.threads[0].pi.is_none());
+        assert!(state.threads[0].pending_injections.is_empty());
+        assert_eq!(state.tasks[0].result_excerpt, "Recovered final");
     }
 
     #[test]
