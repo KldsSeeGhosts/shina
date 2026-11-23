@@ -432,12 +432,12 @@ impl State {
         if !self.provider_update_drivers.contains("codex") {
             changed |= self
                 .codex_catalog
-                .refresh("codex", &cwd, wake.clone(), force);
+                .refresh("codex", &cwd, wake.clone(), force, interval);
         }
         if !self.provider_update_drivers.contains("claude") {
             changed |= self
                 .claude_catalog
-                .refresh("claude", &cwd, wake.clone(), force);
+                .refresh("claude", &cwd, wake.clone(), force, interval);
         }
         if !self.refresh_optional_catalogs
             && self.builtin_cli_available("antigravity")
@@ -453,6 +453,7 @@ impl State {
                 acp_cwd,
                 wake.clone(),
                 optional_force,
+                interval,
             );
         }
         if !self.refresh_optional_catalogs
@@ -464,9 +465,13 @@ impl State {
                 .any(|agent| agent.id == "cursor")
             && !self.provider_update_drivers.contains("cursor")
         {
-            changed |= self
-                .cursor_catalog
-                .refresh("cursor", acp_cwd, wake.clone(), optional_force);
+            changed |= self.cursor_catalog.refresh(
+                "cursor",
+                acp_cwd,
+                wake.clone(),
+                optional_force,
+                interval,
+            );
         }
         self.acp_catalogs
             .retain(|id, _| self.harnesses.agents.iter().any(|agent| agent.id == *id));
