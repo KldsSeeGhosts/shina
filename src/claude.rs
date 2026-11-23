@@ -404,8 +404,9 @@ struct Client {
     reported: Vec<crate::claude_catalog::ClaudeReportedModel>,
     /// Manifest catalog routed through this CLI's reported model ids.
     catalog: crate::claude_catalog::ClaudeModelCatalog,
-    /// `claude --version` output parsed to semver, as KSG's provider probe reads it.
+    /// The version reported by the handshake, init event or a legacy CLI probe.
     version: Option<String>,
+    version_probe: Option<Command>,
     /// `maxEffortLevel` caps from Claude Code `get_settings`, per settings source.
     effort_cap_sources: Vec<crate::claude_catalog::ClaudeEffortCapSource>,
     /// Options applied so far; the api model id resolves against the full selection.
@@ -477,6 +478,7 @@ impl Client {
             reported: vec![],
             catalog: Default::default(),
             version: None,
+            version_probe: None,
             effort_cap_sources: vec![],
             model_options: vec![],
             probe: false,
@@ -781,6 +783,11 @@ impl Client {
                     .init_deadline
                     .is_some_and(|deadline| Instant::now() >= deadline))
         {
+            if let Some(command) = self.version_probe.take()
+                && self.version.is_none()
+            {
+                self.version = claude_cli_version(command);
+            }
             self.finish_initialized();
         }
     }
@@ -2767,13 +2774,17 @@ fn run(
     run_mode(command, start, input, events, wake, stopped, owner, false)
 }
 
-/// KSG's provider probe (`claude --version` + `parseCliVersionResult`): the first
-/// semver token in the CLI's version output gates which manifest models it runs.
-fn claude_cli_version() -> Option<String> {
+/// Older CLIs can omit the version during discovery. Keep KSG's version fallback
+/// for those CLIs, using the same executable and a bounded, windowless launch.
+fn claude_cli_version(mut command: Command) -> Option<String> {
     static VERSION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?").unwrap()
     });
-    let output = process().ok()?.arg("--version").output().ok()?;
+    command.arg("--version");
+    let output = crate::process::output(&mut command, Duration::from_secs(3), 8192).ok()?;
+    if !output.status.success() {
+        return None;
+    }
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -2809,10 +2820,16 @@ fn run_mode(
     }
     load_history(&mut client)?;
     client.probe = probe;
-    // KSG probes `claude --version` once per provider probe; sessions learn the
-    // version from the `system`/`init` frame instead of paying a second spawn.
     if probe {
-        client.version = claude_cli_version();
+        let mut version = Command::new(command.get_program());
+        version.args(command.get_args());
+        for (key, value) in command.get_envs() {
+            match value {
+                Some(value) => version.env(key, value),
+                None => version.env_remove(key),
+            };
+        }
+        client.version_probe = Some(version);
     }
     let gateway_grace = if probe {
         claude_gateway_discovery_grace()

@@ -10403,7 +10403,7 @@ impl State {
             match harness {
                 "codex" | "claude" | "antigravity" | "cursor" => {
                     self.builtin_cli_available(harness)
-                        && catalog.refresh(harness, cwd, wake, false)
+                        && catalog.refresh(harness, cwd, wake, false, false)
                 }
                 _ => false,
             }

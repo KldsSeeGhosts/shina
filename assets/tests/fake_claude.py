@@ -9,6 +9,15 @@ import uuid
 
 args = sys.argv[1:]
 log_path = args[args.index("--log") + 1]
+launch_record = dict(argv=args, mcp_token=os.environ.get("SHINA_MCP_TOKEN"))
+if os.name == "nt" and ("--handshake-version" in args or "--legacy-version" in args):
+    import ctypes
+    launch_record["console_window"] = bool(ctypes.windll.kernel32.GetConsoleWindow())
+if "--version" in args:
+    with open(log_path, "a", encoding="utf8") as log:
+        log.write(json.dumps(launch_record) + "\n")
+    print("9.9.9 (Claude Code)")
+    sys.exit(0)
 session = args[args.index("--resume") + 1] if "--resume" in args else (
     args[args.index("--session-id") + 1] if "--session-id" in args else str(uuid.uuid4()))
 callbacks = {}
@@ -118,7 +127,7 @@ def allowed(response):
 
 
 with open(log_path, "a", encoding="utf8") as log:
-    log.write(json.dumps(dict(argv=args, mcp_token=os.environ.get("SHINA_MCP_TOKEN"))) + "\n")
+    log.write(json.dumps(launch_record) + "\n")
     log.flush()
     for line in sys.stdin:
         record = json.loads(line)
@@ -137,6 +146,8 @@ with open(log_path, "a", encoding="utf8") as log:
                             commands=[dict(name="review", description="Review changes")],
                             models=[dict(value="default", displayName="Claude fixture",
                                          supportsEffort=True, supportedEffortLevels=["low", "high"])])
+                if "--handshake-version" in args:
+                    data["claude_code_version"] = "9.9.9"
             elif subtype == "interrupt":
                 holding = False
                 data = dict(still_queued=[], cancelled=[])
@@ -144,10 +155,12 @@ with open(log_path, "a", encoding="utf8") as log:
                 data = dict(mcpServers=mcp_servers())
             emit(dict(type="control_response", response=dict(subtype="success",
                       request_id=record["request_id"], response=data)))
-            if subtype == "initialize":
-                emit(dict(type="system", subtype="init", model="default",
-                          claude_code_version="9.9.9",
-                          capabilities=["interrupt_receipt_v1", "interrupt_cancel_queued_v1"]))
+            if subtype == "initialize" and "--handshake-version" not in args:
+                init = dict(type="system", subtype="init", model="default",
+                            capabilities=["interrupt_receipt_v1", "interrupt_cancel_queued_v1"])
+                if "--legacy-version" not in args:
+                    init["claude_code_version"] = "9.9.9"
+                emit(init)
             if subtype == "interrupt":
                 finish()
         elif record["type"] == "control_response":

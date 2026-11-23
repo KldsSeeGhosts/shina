@@ -323,7 +323,24 @@ impl NativeCatalog {
         self.pi.is_some()
     }
 
-    pub fn refresh(&mut self, harness: &str, workspace: &Path, wake: Waker, force: bool) -> bool {
+    pub fn refresh(
+        &mut self,
+        harness: &str,
+        workspace: &Path,
+        wake: Waker,
+        force: bool,
+        interval: bool,
+    ) -> bool {
+        // Claude discovery starts a CLI. After the first attempt, recheck on
+        // demand or on a workspace change, never on the idle timer alone.
+        if harness == "claude"
+            && interval
+            && !force
+            && self.attempted
+            && self.cwd.as_deref() == Some(workspace)
+        {
+            return false;
+        }
         self.refresh_with(workspace, force, |models, workspace| match harness {
             "codex" => Ok(crate::codex::discover(workspace, wake, models)),
             "claude" => Ok(crate::claude::discover(workspace, wake)),
@@ -636,6 +653,22 @@ pub(crate) fn models_owned_by<'a>(
 #[cfg(test)]
 mod native_catalog_tests {
     use super::*;
+
+    #[test]
+    fn claude_catalog_does_not_relaunch_on_the_poll_timer() {
+        let workspace = Path::new("workspace");
+        let mut catalog = NativeCatalog {
+            cwd: Some(workspace.into()),
+            loaded: Some(Instant::now() - CATALOG_TTL),
+            attempted: true,
+            complete: true,
+            ..Default::default()
+        };
+        let wake: Waker = std::sync::Arc::new(|| {});
+        assert!(!catalog.refresh("claude", workspace, wake.clone(), false, true));
+        catalog.fail("fixture probe failed".into());
+        assert!(!catalog.refresh("claude", workspace, wake, false, true));
+    }
 
     #[test]
     fn an_unknown_workspace_never_owns_or_borrows_a_folders_models() {

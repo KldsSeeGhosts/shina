@@ -68,16 +68,23 @@ fn approval_cancel_interrupts_decline_does_not_and_session_uses_session_rules() 
 
 #[test]
 fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
+    for version in ["--handshake-version", "--legacy-version"] {
+        check_claude_catalog_probe(version);
+    }
+}
+
+fn check_claude_catalog_probe(version: &str) {
     let dir = crate::store::directory().unwrap();
     let script = dir.join("claude-probe.py");
     std::fs::write(&script, include_str!("../assets/tests/fake_claude.py")).unwrap();
-    let log = dir.join("claude-probe.jsonl");
+    let log = dir.join(format!("claude-probe{version}.jsonl"));
     let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
     command
         .arg("-u")
         .arg(script)
         .arg("--log")
         .arg(&log)
+        .arg(version)
         .env("CLAUDE_CONFIG_DIR", dir.join("probe-config"));
     let start = Start::discovery("claude", dir.clone());
     let pi = Pi::worker(
@@ -115,6 +122,22 @@ fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
     );
     let wire = records(&log);
     assert!(wire.iter().all(|record| record["type"] != "user"));
+    if cfg!(windows) {
+        assert!(
+            wire.iter()
+                .filter(|record| record["argv"].is_array())
+                .all(|record| record["console_window"] == false)
+        );
+    }
+    let launches = wire.iter().filter_map(|record| record["argv"].as_array());
+    assert_eq!(
+        launches.clone().count(),
+        if version == "--legacy-version" { 2 } else { 1 }
+    );
+    assert_eq!(
+        launches.flatten().any(|arg| arg == "--version"),
+        version == "--legacy-version"
+    );
     let mut launch = Command::new("claude");
     Client::new(Start::discovery("claude", dir)).launch(&mut launch);
     let args: Vec<_> = launch
