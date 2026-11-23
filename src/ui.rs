@@ -962,16 +962,16 @@ use tabs_and_menus::*;
 use timeline::*;
 use work_rows::*;
 
-pub(crate) use approval_dialog::long_turn_fixture;
 pub(crate) use attachments_ui::tray_attachments;
 pub(crate) use chrome::tick_portraits;
 pub(crate) use empty_hero::HERO_PORTRAIT_ROW;
-pub(crate) use environment_pickers::{
+pub(crate) use model_picker_ui::{
     cycle_model_picker_harness, jump_model_picker_index, step_reasoning_effort,
 };
 pub use root_view::view;
 pub(crate) use timeline::{
-    TimelineCache, restore_timeline_position, timeline_text_row, timeline_tool_row,
+    TimelineCache, long_turn_fixture, restore_timeline_position, timeline_text_row,
+    timeline_tool_row,
 };
 
 #[cfg(test)]

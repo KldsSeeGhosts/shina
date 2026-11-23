@@ -1891,16 +1891,16 @@ mod sidebar_state;
 mod thread;
 #[path = "model/thread_events.rs"]
 mod thread_events;
+#[path = "model/util.rs"]
+mod util;
 #[path = "model/worktrees_and_multi.rs"]
 mod worktrees_and_multi;
 
-pub use poll::{
-    ZOOM_STEPS, is_clear_command, is_compact_command, poll, snap_zoom, string, truncate,
-};
-use poll::{
-    content_images, content_text, next_counter, selection_value, tool_detail, wait_seconds,
-};
-pub(crate) use poll::{parse_delegation_target, status_word};
+pub(crate) use delegation::parse_delegation_target;
+pub use poll::{is_clear_command, is_compact_command, poll};
+pub(crate) use util::status_word;
+pub use util::{ZOOM_STEPS, snap_zoom, string, truncate};
+use util::{content_images, content_text, selection_value, tool_detail};
 
 #[cfg(test)]
 #[path = "model/tests.rs"]

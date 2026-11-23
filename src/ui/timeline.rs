@@ -1668,3 +1668,109 @@ pub(super) fn assistant_selection_toolbar(s: &State, p: Palette, cx: &Cx<State>)
             .child(toolbar),
     )
 }
+
+pub(super) const LONG_PREAMBLE: &str = "Starting the audit.\n\n";
+pub(super) const LONG_MIDDLE: &str = "Halfway marker between the steps.\n\n";
+
+/// One assistant turn with `parts` alternating thought and command parts (every
+/// fiftieth a group of two commands), prose between the halves, a large output on every tool and every fifth output open.
+/// `live` leaves it running; otherwise it is complete with its work expanded,
+/// followed by short questions and answers.
+/// The tests and the `long-turn-live` and `long-turn-expanded` profiling scenes share it.
+pub(crate) fn long_turn_fixture(state: &mut State, parts: usize, live: bool) {
+    state.populate_demo();
+    state.compact_sidebar = true;
+    let t = state.current_mut();
+    let tool_template = t.tools[3].clone();
+    let thought_template = t.thoughts[0].clone();
+    t.captain = None;
+    t.messages.clear();
+    t.tools.clear();
+    t.thoughts.clear();
+    t.work.clear();
+    t.native.compactions.clear();
+    t.harness_state["workRetries"] = json!([]);
+    t.started = None;
+    t.transcript_structure = 1;
+    t.messages.push(crate::model::Message {
+        id: "long-user".into(),
+        role: "You",
+        text: "Audit every package.".into(),
+        images: vec![],
+        context: None,
+    });
+    t.messages.push(crate::model::Message {
+        id: "long-answer".into(),
+        role: "Pi",
+        text: format!("{LONG_PREAMBLE}{LONG_MIDDLE}Done. Every package passed."),
+        images: vec![],
+        context: None,
+    });
+    let output = "test result: ok. 1 passed; 0 failed\n".repeat(600);
+    for index in 0..parts {
+        let offset = if index < parts / 2 {
+            LONG_PREAMBLE.len()
+        } else {
+            LONG_PREAMBLE.len() + LONG_MIDDLE.len()
+        };
+        let anchor = crate::model::ToolAnchor { message: 1, offset };
+        if index % 2 == 0 {
+            let mut thought = thought_template.clone();
+            thought.anchor = anchor;
+            thought.block = index;
+            thought.order = 2 * index as u64 + 1;
+            thought.text = format!("Thinking about package {index}.");
+            thought.done = true;
+            thought.expanded = false;
+            t.thoughts.push(thought);
+        } else {
+            let mut tool = tool_template.clone();
+            tool.id = format!("long-tool-{index}");
+            tool.anchor = anchor;
+            tool.block = index;
+            tool.order = 2 * index as u64 + 1;
+            tool.detail = format!("cargo test -p package-{index}");
+            tool.output = output.clone();
+            tool.done = true;
+            tool.failed = false;
+            tool.expanded = index % 10 == 1;
+            // Every fiftieth step runs two commands at once: a tool group.
+            let pair = (index % 50 == 1).then(|| {
+                let mut pair = tool.clone();
+                pair.id = format!("long-tool-{index}-pair");
+                pair.order += 1;
+                pair.expanded = false;
+                pair
+            });
+            t.tools.extend(std::iter::once(tool).chain(pair));
+        }
+    }
+    if live {
+        t.status = Status::Running;
+    } else {
+        t.status = Status::Completed;
+        t.work.push(crate::model::AssistantWork {
+            start: 1,
+            stopped: false,
+            stopped_order: 0,
+            expanded: true,
+            elapsed: Some(600),
+            outcome: Some(Status::Completed),
+        });
+        // Later turns, so the long one is read away from the bottom.
+        for index in 0..12 {
+            for (id, role, text) in [
+                ("after-user", "You", "Thanks. Anything else?"),
+                ("after-answer", "Pi", "No, that covers it."),
+            ] {
+                t.messages.push(crate::model::Message {
+                    id: format!("{id}-{index}"),
+                    role,
+                    text: text.into(),
+                    images: vec![],
+                    context: None,
+                });
+            }
+        }
+    }
+}

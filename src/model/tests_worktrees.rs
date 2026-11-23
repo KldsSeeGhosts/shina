@@ -874,7 +874,3 @@ fn right_panel_state_is_per_thread() {
         crate::right_panel::ThreadPanel::default()
     );
 }
-
-// The width is the one panel value saved with the UI snapshot.
-
-// `rightPanelOpen` in the shortcut context follows the current thread's panel.

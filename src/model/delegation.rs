@@ -1032,3 +1032,154 @@ impl State {
         changed
     }
 }
+
+pub(crate) fn parse_delegation_target(args: &Value) -> Result<Option<DelegationTarget>, String> {
+    let Some(target) = args.get("target") else {
+        return Ok(None);
+    };
+    let object = target.as_object().ok_or(
+        "target must be an object with harness or model, and optional provider and options.",
+    )?;
+    if let Some(key) = object.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "machine"
+                | "environmentId"
+                | "projectId"
+                | "repository"
+                | "harness"
+                | "provider"
+                | "model"
+                | "options"
+        )
+    }) {
+        return Err(format!(
+            "Unknown target setting {key}. Use harness, provider, model and options."
+        ));
+    }
+    let harness = object
+        .get("harness")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| crate::harness::valid_id(id))
+                .map(str::to_owned)
+                .ok_or("target.harness must be pi, codex, claude, or an installed ACP id.")
+        })
+        .transpose()?;
+    remote_tasks::target_machine(args)?;
+    if let Some(project) = object.get("projectId") {
+        if project
+            .as_u64()
+            .is_none_or(|id| id == 0 || id >= usize::MAX as u64)
+        {
+            return Err(
+                "target.projectId must be a positive project id on the named machine.".into(),
+            );
+        }
+        if remote_tasks::target_machine(args)?.is_none_or(|machine| machine == "local") {
+            return Err("target.projectId requires target.environmentId or target.machine.".into());
+        }
+        if args.get("workspace").is_some() {
+            return Err("Pass target.projectId or workspace, not both.".into());
+        }
+        if object.get("repository").is_some() {
+            return Err("Pass target.projectId or target.repository, not both.".into());
+        }
+    }
+    if let Some(repository) = object.get("repository") {
+        if repository
+            .as_str()
+            .is_none_or(|selector| selector.trim().is_empty())
+        {
+            return Err("target.repository must name a catalog id or repository URL.".into());
+        }
+        if remote_tasks::target_machine(args)?.is_none_or(|machine| machine == "local") {
+            return Err("target.repository requires a linked target.machine.".into());
+        }
+        if args.get("workspace").is_some() {
+            return Err("Pass target.repository or workspace, not both.".into());
+        }
+    }
+    if !object.contains_key("model")
+        && harness.is_none()
+        && remote_tasks::target_machine(args)?.is_none()
+    {
+        return Err("target.model is required when target is set without a harness.".into());
+    }
+    let model = object
+        .get("model")
+        .map(|value| {
+            value.as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .ok_or(
+            "target.model must be a non-empty exact model id from orchestrator_capabilities.",
+        )
+        })
+        .transpose()?;
+    let provider = object
+        .get("provider")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .ok_or("target.provider must be a nonempty string.")
+        })
+        .transpose()?;
+    let reasoning = match object.get("options") {
+        None => None,
+        Some(options) => {
+            let options = options
+                .as_object()
+                .ok_or("target.options must be an object with reasoning, or its alias thinking.")?;
+            let mut reasoning: Option<String> = None;
+            for (key, value) in options {
+                let level = match key.as_str() {
+                    "reasoning" | "thinking" => value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|level| !level.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "target.options.{key} must be a non-empty reasoning level from orchestrator_capabilities."
+                            )
+                        })?,
+                    _ => {
+                        return Err(format!(
+                            "Unknown target.options setting {key}. Use reasoning, or its alias thinking."
+                        ));
+                    }
+                };
+                if let Some(existing) = &reasoning
+                    && existing != level
+                {
+                    return Err(
+                        "target.options.reasoning and target.options.thinking disagree. Pass one level."
+                            .into(),
+                    );
+                }
+                reasoning = Some(level.to_owned());
+            }
+            reasoning
+        }
+    };
+    Ok(Some(DelegationTarget {
+        harness,
+        provider,
+        model,
+        reasoning,
+    }))
+}
+
+fn wait_seconds(args: &Value) -> Result<u64, String> {
+    match args.get("wait_seconds") {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .filter(|&seconds| seconds <= 600)
+            .ok_or_else(|| "wait_seconds must be an integer from 0 to 600.".into()),
+    }
+}

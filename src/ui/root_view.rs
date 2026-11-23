@@ -2,7 +2,7 @@ use super::*;
 
 /// The chat pane rounds its top corners (KSG's `--radius-pane: 14px`) and runs square to the
 /// window's bottom edge.
-pub(super) const PANE_CORNERS: [f32; 4] = [14.0, 14.0, 0.0, 0.0];
+const PANE_CORNERS: [f32; 4] = [14.0, 14.0, 0.0, 0.0];
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     #[cfg(test)]

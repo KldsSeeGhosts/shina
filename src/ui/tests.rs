@@ -228,7 +228,7 @@ fn tab_to(rt: &mut Runtime<State>, key: &str) {
     }
     panic!("Tab never reaches {key}");
 }
-pub(crate) fn tap(rt: &mut Runtime<State>, key: rune::Key) {
+pub(super) fn tap(rt: &mut Runtime<State>, key: rune::Key) {
     rt.key(rune::KeyEvent {
         key,
         mods: Default::default(),
@@ -831,7 +831,7 @@ fn machine_selector_labels_and_link_dialog_fit_supported_widths() {
     }
 }
 
-pub(crate) fn press(rt: &mut Runtime<State>, key: &str) {
+pub(super) fn press(rt: &mut Runtime<State>, key: &str) {
     rt.frame(0.25);
     if key == "composer-input" && rt.presented("composer-preview").is_some() {
         let (x, y) = rt.find("composer-preview").expect("collapsed composer");

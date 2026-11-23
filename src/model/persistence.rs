@@ -2042,3 +2042,18 @@ impl State {
         self.tabs = vec![1, 3, 10];
     }
 }
+
+fn next_counter(saved: &Value, maximum: usize) -> Result<usize, String> {
+    let minimum = maximum.checked_add(1).ok_or("Invalid id counter.")?;
+    let next = if saved.is_null() {
+        minimum
+    } else {
+        usize::try_from(saved.as_u64().ok_or("Invalid id counter.")?)
+            .map_err(|_| "Invalid id counter.")?
+            .max(minimum)
+    };
+    if next == usize::MAX {
+        return Err("Thread or project ids exhausted.".into());
+    }
+    Ok(next)
+}
