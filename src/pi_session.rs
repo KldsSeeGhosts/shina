@@ -75,8 +75,17 @@ pub fn session_history(record: &mut Value) {
         .collect();
     let fork_messages: Vec<_> = branch.iter().filter(|e| e["type"] == "message" && e["message"]["role"] == "user")
         .map(|e| json!({"entryId":e["id"],"text":content_text(&e["message"]["content"]),"content":e["message"]["content"]})).collect();
-    record["data"] =
-        json!({"messages":messages,"compactions":compactions,"forkMessages":fork_messages});
+    // A result accepted before a rewind was still delivered. Check all
+    // branches for those markers, without restoring them into the transcript.
+    let result_deliveries: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry["type"] == "message" && entry["message"]["role"] == "user")
+        .filter_map(|entry| {
+            tasks::delivery_id(&content_text(&entry["message"]["content"])).map(str::to_owned)
+        })
+        .collect();
+    record["data"] = json!({"messages":messages,"compactions":compactions,
+        "forkMessages":fork_messages,"resultDeliveries":result_deliveries});
 }
 
 fn approval_key(request: &Value) -> String {

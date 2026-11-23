@@ -1712,10 +1712,9 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
             }),
             ("captain-attention", |state| {
                 captain_workspace_demo(state);
-                // Two workers were running when Shina closed. Their tasks come back stopped, and
-                // the banner counts them from the tasks, so its number is what Review lists.
+                // Two workers were running when Shina closed and could not continue by themselves.
+                // Their tasks come back stopped.
                 state.demo_stop(19);
-                state.recovery_notice = Some("Shina was closed while 2 tasks were running. Check their partial work, then resume or dismiss them.".into());
             }),
             ("captain-goal-empty", |state| {
                 captain_workspace_demo(state);

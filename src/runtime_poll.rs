@@ -72,6 +72,11 @@ pub(super) fn poll_threads(state: &mut State) -> Batch {
             thread.updated = crate::projects::now();
             thread.life.updated_at = lifecycle::now();
             match event {
+                Event::ProviderJob(job) => {
+                    if let Some(pi) = &mut thread.pi {
+                        pi.note_provider_job(job);
+                    }
+                }
                 Event::Record(record) => {
                     state.background.observe_record(&record);
                     let settled = record["type"] == "agent_settled";

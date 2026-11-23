@@ -279,30 +279,15 @@ fn a_crash_after_the_reservation_never_starts_the_prompt_twice() {
         Some("interrupted") => &receipt["result"]["previousResult"],
         _ => panic!("Expected the committed delegation receipt: {replay}"),
     };
-    let task_id = task["task_id"].as_str().unwrap().to_owned();
     let child = task["thread_id"].as_u64().unwrap();
 
-    // Recovery never counts a crashed prompt as delivered work: the task
-    // settles as interrupted with no provider side effect.
-    client.until(|state| {
-        state["index"]["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["id"] == task_id && task["state"] == "interrupted")
-    });
-    assert!(
-        prompts(&profile, child).is_empty(),
-        "a prompt that never dispatched must not replay during recovery"
-    );
-    let status = scheduling_status(&mut client);
-    assert_eq!(status["held"], json!([]), "{status}");
-    accepted(&client.command(
-        "task.resume",
-        json!({"taskId":task_id}),
-        uuid::Uuid::new_v4(),
-    ));
+    // Recovery never counts a crashed prompt as delivered work. The prompt
+    // never reached the provider, so the task continues by itself and the
+    // provider sees the brief exactly once.
     until_prompts(&profile, child, 1);
+    // One attempt holds capacity: the crashed one released its reservation.
+    let status = scheduling_status(&mut client);
+    assert_eq!(status["held"].as_array().unwrap().len(), 1, "{status}");
     assert_eq!(prompts(&profile, child).len(), 1);
     profile.stop();
 }

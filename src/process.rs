@@ -38,8 +38,41 @@ pub struct Process {
     _job: std::os::windows::io::OwnedHandle,
 }
 
+/// A provider job is unique to one launch on one Windows installation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProviderJob {
+    id: String,
+    host: String,
+}
+
+impl ProviderJob {
+    pub(crate) fn exited(&self) -> bool {
+        #[cfg(windows)]
+        {
+            windows::job_exited(self)
+        }
+        #[cfg(not(windows))]
+        false
+    }
+}
+
 impl Process {
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_owned(command, None)
+    }
+
+    pub(crate) fn spawn_provider(command: &mut Command) -> io::Result<(Self, Option<ProviderJob>)> {
+        #[cfg(windows)]
+        let job = windows::host().map(|host| ProviderJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            host: host.into(),
+        });
+        #[cfg(not(windows))]
+        let job = None;
+        Ok((Self::spawn_owned(command, job.as_ref())?, job))
+    }
+
+    fn spawn_owned(command: &mut Command, _job: Option<&ProviderJob>) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -53,7 +86,7 @@ impl Process {
         }
         let child = command.spawn()?;
         #[cfg(windows)]
-        let job = match windows::own(&child).and_then(|job| {
+        let job = match windows::own(&child, _job).and_then(|job| {
             windows::resume(&child)?;
             Ok(job)
         }) {
@@ -215,9 +248,27 @@ mod windows {
         peak_process_memory: usize,
         peak_job_memory: usize,
     }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Accounting {
+        times: [i64; 4],
+        page_faults: u32,
+        total_processes: u32,
+        active_processes: u32,
+        terminated_processes: u32,
+    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn OpenJobObjectW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+        fn QueryInformationJobObject(
+            job: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            size: u32,
+            returned: *mut u32,
+        ) -> i32;
         fn SetInformationJobObject(
             job: *mut c_void,
             class: i32,
@@ -231,6 +282,79 @@ mod windows {
         fn Thread32Next(snapshot: *mut c_void, entry: *mut ThreadEntry) -> i32;
         fn OpenThread(access: u32, inherit: i32, id: u32) -> *mut c_void;
         fn ResumeThread(thread: *mut c_void) -> u32;
+    }
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegGetValueW(
+            key: *mut c_void,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    pub fn host() -> Option<&'static str> {
+        use sha2::{Digest, Sha256};
+        static HOST: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+            let mut raw = [0u16; 64];
+            let mut size = std::mem::size_of_val(&raw) as u32;
+            let status = unsafe {
+                RegGetValueW(
+                    0x80000002u32 as i32 as isize as *mut c_void, // HKEY_LOCAL_MACHINE
+                    wide("SOFTWARE\\Microsoft\\Cryptography").as_ptr(),
+                    wide("MachineGuid").as_ptr(),
+                    0x00010002, // RRF_SUBKEY_WOW6464KEY | RRF_RT_REG_SZ
+                    std::ptr::null_mut(),
+                    raw.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            };
+            if status != 0 {
+                return None;
+            }
+            let end = raw.iter().position(|unit| *unit == 0)?;
+            let guid = uuid::Uuid::parse_str(&String::from_utf16(&raw[..end]).ok()?).ok()?;
+            let mut hash = Sha256::new();
+            hash.update(b"shina-provider-job");
+            hash.update(guid.as_bytes());
+            Some(format!("{:x}", hash.finalize()))
+        });
+        HOST.as_deref()
+    }
+
+    fn job_name(job: &ProviderJob) -> Vec<u16> {
+        wide(&format!("Global\\Shina-Provider-{}", job.id))
+    }
+
+    pub fn job_exited(job: &ProviderJob) -> bool {
+        if host() != Some(job.host.as_str()) || uuid::Uuid::parse_str(&job.id).is_err() {
+            return false;
+        }
+        let raw = unsafe { OpenJobObjectW(4, 0, job_name(job).as_ptr()) }; // JOB_OBJECT_QUERY
+        if raw.is_null() {
+            // Windows terminates the job's processes before destroying a
+            // kill-on-close job. Access errors are not evidence of absence.
+            return unsafe { GetLastError() } == 2; // ERROR_FILE_NOT_FOUND
+        }
+        let _handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut info = Accounting::default();
+        let result = unsafe {
+            QueryInformationJobObject(
+                raw,
+                1, // JobObjectBasicAccountingInformation
+                (&mut info as *mut Accounting).cast(),
+                std::mem::size_of_val(&info) as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        result != 0 && info.active_processes == 0
     }
     #[repr(C)]
     #[derive(Default)]
@@ -273,12 +397,22 @@ mod windows {
             "Could not find the suspended child's main thread.",
         ))
     }
-    pub fn own(child: &Child) -> io::Result<OwnedHandle> {
-        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    pub fn own(child: &Child, identity: Option<&ProviderJob>) -> io::Result<OwnedHandle> {
+        let name = identity.map(job_name);
+        let raw = unsafe {
+            CreateJobObjectW(
+                std::ptr::null(),
+                name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr()),
+            )
+        };
         if raw.is_null() {
             return Err(io::Error::last_os_error());
         }
+        let existed = unsafe { GetLastError() } == 183; // ERROR_ALREADY_EXISTS
         let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        if identity.is_some() && existed {
+            return Err(io::Error::other("Provider job name already exists."));
+        }
         let mut limits = ExtendedLimits::default();
         limits.basic.flags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if unsafe {
@@ -350,6 +484,27 @@ mod tests {
         process.terminate();
         process.reap(Duration::from_secs(2)).unwrap();
         assert!(join_for(writer, Duration::from_secs(2)).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execution_job_is_gone_after_the_executor_handle_closes() {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = command("Start-Sleep -Seconds 60");
+        command.creation_flags(0x08000000 | 0x00000004);
+        let mut child = command.spawn().unwrap();
+        let identity = ProviderJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            host: windows::host().unwrap().into(),
+        };
+        let owner = windows::own(&child, Some(&identity)).unwrap();
+        windows::resume(&child).unwrap();
+        assert!(!identity.exited());
+        // Windows closes this non-inheritable handle when the executor crashes.
+        drop(owner);
+        wait_child(&mut child, Duration::from_secs(3)).unwrap();
+        assert!(identity.exited());
     }
 
     #[cfg(windows)]

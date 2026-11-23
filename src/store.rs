@@ -17,7 +17,6 @@ use std::{
 /// request and the next frame. Only an actual drop following a clean save removes it.
 pub struct RunMarker {
     path: PathBuf,
-    pub previous_unclean: bool,
     refreshed: std::time::Instant,
     pub clean: bool,
 }
@@ -25,14 +24,8 @@ pub struct RunMarker {
 impl RunMarker {
     pub fn start(directory: &std::path::Path) -> Result<Self, String> {
         let path = directory.join("run-marker.json");
-        let previous_unclean = match fs::metadata(&path) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(format!("Could not inspect Shina's run marker: {error}")),
-        };
         let mut marker = Self {
             path,
-            previous_unclean,
             refreshed: std::time::Instant::now(),
             clean: false,
         };
@@ -759,13 +752,12 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
     #[test]
-    fn run_markers_distinguish_unclean_exits_and_clear_only_on_clean_drop() {
+    fn run_markers_clear_only_on_clean_drop() {
         let root = directory().unwrap().join("markers");
         fs::create_dir_all(&root).unwrap();
         let marker_path = root.join("run-marker.json");
         {
             let mut marker = RunMarker::start(&root).unwrap();
-            assert!(!marker.previous_unclean);
             marker.refreshed -= Duration::from_secs(61);
             marker.tick().unwrap();
             assert!(marker.refreshed.elapsed() < Duration::from_secs(1));
@@ -774,7 +766,6 @@ mod tests {
         assert!(marker_path.exists(), "unclean drop keeps evidence");
         {
             let mut marker = RunMarker::start(&root).unwrap();
-            assert!(marker.previous_unclean);
             marker.clean = true;
             assert!(
                 marker_path.exists(),
@@ -789,7 +780,6 @@ mod tests {
         }
         assert!(!marker_path.exists());
         let mut marker = RunMarker::start(&root).unwrap();
-        assert!(!marker.previous_unclean);
         marker.clean = true;
     }
 

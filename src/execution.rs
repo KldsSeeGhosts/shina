@@ -129,6 +129,12 @@ pub struct Lease {
     pub dispatched_at: Option<u64>,
     #[serde(default)]
     pub executor_accepted_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_job: Option<crate::process::ProviderJob>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) restart_continuation_blocked: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) shutdown_interrupted: bool,
     #[serde(default)]
     pub provider_accepted_at: Option<u64>,
     #[serde(default)]
@@ -268,6 +274,9 @@ pub fn lease_from_assignment(
         saved_at: now,
         dispatched_at: Some(now),
         executor_accepted_at: None,
+        provider_job: None,
+        restart_continuation_blocked: false,
+        shutdown_interrupted: false,
         provider_accepted_at: None,
         running_at: None,
         terminal_at: None,
@@ -448,6 +457,9 @@ impl Book {
             saved_at: request.now,
             dispatched_at: None,
             executor_accepted_at: None,
+            provider_job: None,
+            restart_continuation_blocked: false,
+            shutdown_interrupted: false,
             provider_accepted_at: None,
             running_at: None,
             terminal_at: None,
@@ -794,6 +806,27 @@ impl Book {
                 id,
                 now,
                 "controller or executor restarted before terminal or verified fence evidence",
+            );
+        }
+        !ids.is_empty()
+    }
+
+    pub(crate) fn fence_exited_provider_jobs(&mut self, executor: &str, now: u64) -> bool {
+        let ids: Vec<_> = self
+            .leases
+            .iter()
+            .filter(|lease| {
+                lease.executor_id == executor
+                    && lease.phase == Phase::Uncertain
+                    && lease.provider_job.as_ref().is_some_and(|job| job.exited())
+            })
+            .map(|lease| lease.lease_id.clone())
+            .collect();
+        for id in &ids {
+            let _ = self.fence(
+                id,
+                now,
+                "Windows confirmed the exact provider job has no live processes",
             );
         }
         !ids.is_empty()

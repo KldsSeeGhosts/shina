@@ -10,7 +10,10 @@ const OPERATION_DISPATCHED: &str = "dispatched";
 const OPERATION_NOT_OBSERVED: &str = "not_observed";
 const OPERATION_ACCEPTED: &str = "accepted";
 const OPERATION_REJECTED: &str = "rejected";
-const RESUME_MESSAGE: &str = "Shina restarted mid-task. Check the current state of the files and any partial changes or tool actions, then finish the task. Do not assume earlier actions failed or repeat them without checking.";
+const RESUME_MESSAGE: &str = "Shina restarted mid-task. Check the current state of the files and any partial changes or tool actions, then finish the task. Before repeating a change, confirm it did not take effect and is not still running. If you cannot tell, say so instead of repeating it.";
+// KSG Code's RestartContinuation.ts bounds consecutive restart continuations.
+const MAX_RESTART_CONTINUATIONS: usize = 3;
+const RESTART_LOOP_WINDOW_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,10 +88,28 @@ pub(super) struct Task {
     /// A follow-up must not overwrite an earlier result awaiting acceptance.
     #[serde(default)]
     prior_deliveries: Vec<ResultDelivery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    restart_continuations: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    result_dispatch: Option<ResultDispatch>,
     #[serde(skip)]
     pub(super) recovering: bool,
     #[serde(skip)]
     pub(super) hold_delivery: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum ResultDispatch {
+    Session {
+        thread_id: usize,
+        session_key: [u8; 32],
+    },
+    Unknown,
+}
+
+fn result_session_key(session: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(session.as_bytes()).into()
 }
 
 /// One stable request key and the canonical intent hash it committed. The hash
@@ -449,6 +470,8 @@ impl Task {
             machine: thread.machine.clone(),
             model_target,
             prior_deliveries: Vec::new(),
+            restart_continuations: Vec::new(),
+            result_dispatch: None,
             state: TaskState::Queued,
             delivered: false,
             result_excerpt: String::new(),
@@ -555,12 +578,14 @@ impl Task {
         )
     }
 
-    pub(super) fn reconcile(&mut self, record: &Value) {
+    /// Returns whether history permits a continuation, independently of process evidence.
+    pub(super) fn reconcile(&mut self, record: &Value) -> bool {
         self.recovering = false;
         // A persisted failure/cancellation is already a conclusive local decision.
         if matches!(self.state, TaskState::Failed | TaskState::Cancelled) {
-            return;
+            return false;
         }
+        let mut can_continue = false;
         let result = (|| {
             if record["success"] == false {
                 return Err(
@@ -570,12 +595,19 @@ impl Task {
             let messages = record["data"]["messages"]
                 .as_array()
                 .ok_or("Pi history is uncertain. Check the saved session before resuming.")?;
-            let accepted = messages
-                .iter()
-                .rposition(|message| {
-                    message["role"] == "user"
-                        && content_text(&message["content"]) == self.attempt_message
-                })
+            // An absent marker in valid history can mean the brief never
+            // arrived. Newer user input after the marker is ambiguous.
+            let accepted = messages.iter().rposition(|message| {
+                message["role"] == "user"
+                    && content_text(&message["content"]) == self.attempt_message
+            });
+            can_continue = record["success"] == true
+                && record["data"]["historyReplayed"] != false
+                && !self.state.finished()
+                && accepted.is_none_or(|accepted| {
+                    messages[accepted + 1..].iter().all(|m| m["role"] != "user")
+                });
+            let accepted = accepted
                 .ok_or("Pi history does not show acceptance of this brief. It was not replayed.")?;
             let after = &messages[accepted + 1..];
             let last = after.last().ok_or(
@@ -605,11 +637,15 @@ impl Task {
                 let saved_finished_at = self.finished_at;
                 self.finish(TaskState::Completed, &reply, "");
                 self.finished_at = saved_finished_at.or(timestamp).or(self.finished_at);
+                false
             }
             Err(error) => {
+                if self.state != TaskState::Interrupted || self.error_excerpt.is_empty() {
+                    self.error_excerpt = error.into();
+                }
                 self.state = TaskState::Interrupted;
                 self.finished_at = None;
-                self.error_excerpt = error.into();
+                can_continue
             }
         }
     }
@@ -677,6 +713,15 @@ impl Thread {
             if self.recovering_task {
                 self.task_history = Some(record.clone());
             }
+            self.task_result_history = (self.harness == "pi" && record["success"] == true)
+                .then(|| {
+                    record["data"]["resultDeliveries"]
+                        .as_array()?
+                        .iter()
+                        .map(|id| id.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .flatten();
             if record["success"] != false
                 && let Some(messages) = record["data"]["messages"].as_array()
             {
@@ -918,7 +963,7 @@ impl State {
         Ok(())
     }
 
-    /// Explicit user action. An interrupted brief is never automatically replayed.
+    /// Explicit user action. It uses the same guarded continuation as restart recovery.
     pub fn resume_task(&mut self, task_id: &str) -> Result<(), String> {
         if let Some(result) = self.remote("task.resume", json!({"taskId":task_id})) {
             return result.map(|_| ());
@@ -928,6 +973,13 @@ impl State {
             .iter()
             .position(|task| task.id == task_id)
             .ok_or("There is no such task.")?;
+        self.queue_task_continuation(index)?;
+        self.start_queued_tasks();
+        self.checkpoint();
+        Ok(())
+    }
+
+    fn queue_task_continuation(&mut self, index: usize) -> Result<(), String> {
         if self.tasks[index].recovering || self.tasks[index].state != TaskState::Interrupted {
             return Err("Only a reconciled interrupted task can be resumed.".into());
         }
@@ -937,10 +989,7 @@ impl State {
             "{RESUME_MESSAGE}\n\nOriginal brief for reference. Do not repeat completed actions:\n{}",
             self.tasks[index].brief
         );
-        self.queue_task_attempt(index, &message)?;
-        self.start_queued_tasks();
-        self.checkpoint();
-        Ok(())
+        self.queue_task_attempt(index, &message)
     }
 
     /// Explicit user action. The cancellation result is durable and goes to the parent.
@@ -2353,6 +2402,8 @@ impl State {
         task.started_at = None;
         task.finished_at = None;
         task.hold_delivery = false;
+        task.restart_continuations.clear();
+        task.result_dispatch = None;
         if let Some(child) = self
             .threads
             .iter()
@@ -2954,6 +3005,7 @@ impl State {
                 || delivery_id(&task.attempt_message).is_none_or(|id| !valid_id(id))
                 || task.result_excerpt.chars().count() > 6000
                 || task.error_excerpt.chars().count() > 2000
+                || task.restart_continuations.len() > MAX_RESTART_CONTINUATIONS
                 || task.memory_suggestions.len() > 256
                 || serde_json::to_vec(&task.memory_suggestions)
                     .expect("suggestion serialization")
@@ -3113,7 +3165,7 @@ impl State {
         self.prepare_crew_report_recovery();
     }
 
-    pub(super) fn start_task_recovery(&mut self) {
+    pub(crate) fn start_task_recovery(&mut self) {
         let children: Vec<_> = self
             .threads
             .iter()
@@ -3122,8 +3174,202 @@ impl State {
             .map(|(i, _)| i)
             .collect();
         for child in children {
+            let id = self.threads[child].id;
+            if let Some(index) = self
+                .tasks
+                .iter()
+                .position(|task| task.child_thread_id == id)
+                && let Err(error) = self.require_execution_recovery(id)
+            {
+                let task = &mut self.tasks[index];
+                if !task.state.finished() {
+                    task.state = TaskState::Interrupted;
+                    task.finished_at = None;
+                    task.error_excerpt = error;
+                }
+                task.recovering = false;
+                self.threads[child].recovering_task = false;
+                continue;
+            }
             self.connect_thread(child);
         }
+    }
+
+    fn local_task_lease(&self, task: &Task) -> Option<&crate::execution::Lease> {
+        let identity = self.snapshot_identity();
+        let lease = self
+            .execution
+            .latest(identity.thread_uid(task.child_thread_id)?)?;
+        (task.remote.is_none()
+            && lease.executor_id == self.identity.executor_id
+            && lease.controller_id == self.identity.controller_id
+            && lease.attempt_id.as_deref() == Some(task.attempt_id.as_str())
+            && lease.delivery_id.as_deref() == Some(task.delivery_id.as_str()))
+        .then_some(lease)
+    }
+
+    fn continue_recovered_task(&mut self, index: usize, now: u64) {
+        use crate::execution::Phase;
+        let task = &self.tasks[index];
+        let Some(lease) = self.local_task_lease(task) else {
+            return;
+        };
+        if lease.restart_continuation_blocked
+            || !(lease.phase == Phase::Fenced
+                && lease.provider_job.as_ref().is_some_and(|job| job.exited())
+                || lease.phase == Phase::Terminal
+                    && (lease.terminal_status.as_deref() == Some("not_dispatched")
+                        || lease.shutdown_interrupted
+                            && lease.terminal_status.as_deref() == Some("cancelled")
+                            && lease.provider_job.as_ref().is_some_and(|job| job.exited())))
+        {
+            return;
+        }
+        let window_start = now.saturating_sub(RESTART_LOOP_WINDOW_MS);
+        let lease_id = lease.lease_id.clone();
+        self.tasks[index]
+            .restart_continuations
+            .retain(|at| *at >= window_start);
+        if self.tasks[index].restart_continuations.len() >= MAX_RESTART_CONTINUATIONS {
+            self.tasks[index].error_excerpt =
+                "Shina reached the restart continuation limit. Check partial work before resuming."
+                    .into();
+        } else {
+            let mut chain = self.tasks[index].restart_continuations.clone();
+            match self.queue_task_continuation(index) {
+                Ok(()) => {
+                    chain.push(now);
+                    self.tasks[index].restart_continuations = chain;
+                    return;
+                }
+                Err(error) => {
+                    self.tasks[index].error_excerpt = excerpt(
+                        &format!("Automatic continuation could not start. {error}"),
+                        2000,
+                    );
+                }
+            }
+        }
+        if let Some(lease) = self.execution.get_mut(&lease_id) {
+            lease.restart_continuation_blocked = true;
+        }
+    }
+
+    pub(super) fn task_needs_result_history(&self, task: &Task) -> bool {
+        task.hold_delivery
+            && !task.delivered
+            && task.state == TaskState::Completed
+            && self
+                .local_task_lease(task)
+                .is_some_and(|lease| lease.provider_job.is_some())
+    }
+
+    /// Persist where the result may have been accepted, in the same commit
+    /// that allows the prompt to reach the provider.
+    pub(super) fn record_task_result_dispatch(&mut self, command: &str, text: &str) {
+        let Some(delivery) = delivery_id(text) else {
+            return;
+        };
+        let Some(task) = self.tasks.iter_mut().find(|task| {
+            task.delivery_id == delivery && task.state.finished() && task.remote.is_none()
+        }) else {
+            return;
+        };
+        let route = self
+            .threads
+            .iter()
+            .find(|thread| thread.injection_id.as_deref() == Some(command))
+            .and_then(|thread| {
+                Some(ResultDispatch::Session {
+                    thread_id: thread.id,
+                    session_key: result_session_key(thread.session.as_deref()?),
+                })
+            })
+            .unwrap_or(ResultDispatch::Unknown);
+        task.result_dispatch = Some(match &task.result_dispatch {
+            None => route,
+            Some(previous) if *previous == route => route,
+            Some(_) => ResultDispatch::Unknown,
+        });
+    }
+
+    /// Only the original, still-current parent can prove absence of its result
+    /// marker. Prior or rerouted deliveries keep their existing review policy.
+    fn release_reconciled_task_results(&mut self) -> bool {
+        let mut changed = false;
+        let mut identity = None;
+        for index in 0..self.tasks.len() {
+            let task = &self.tasks[index];
+            if task.recovering
+                || !self.task_needs_result_history(task)
+                || task.coordinator_captain.is_some_and(|captain| {
+                    self.captain_recovery_mode(captain) != captain_inbox::RecoveryMode::Unattended
+                        || self.captain_phase(captain) != captain_lifecycle::CaptainPhase::Active
+                        || self.captain_home(captain) != Some(task.parent_thread_id)
+                        || self.unattended_blocker(captain).is_some()
+                })
+                || self
+                    .task_home(task)
+                    .is_some_and(|home| home != task.parent_thread_id)
+                || !self
+                    .local_task_lease(task)
+                    .is_some_and(|lease| !lease.phase.blocks_replacement())
+            {
+                continue;
+            }
+            let Some(parent) = self.threads.iter().position(|thread| {
+                thread.id == task.parent_thread_id && !thread.archived() && !thread.life.settled()
+            }) else {
+                continue;
+            };
+            let thread = &self.threads[parent];
+            let session_matches = match &task.result_dispatch {
+                None => true,
+                Some(ResultDispatch::Session {
+                    thread_id,
+                    session_key,
+                }) => {
+                    *thread_id == thread.id
+                        && thread.session.as_deref().map(result_session_key) == Some(*session_key)
+                }
+                Some(ResultDispatch::Unknown) => false,
+            };
+            if thread.machine != "local"
+                || thread.harness != "pi"
+                || thread.session.is_none()
+                || !session_matches
+                || thread.request.is_some()
+                || thread.status.busy()
+                || thread.status == Status::Paused
+                || self.require_execution_recovery(thread.id).is_err()
+                || !identity
+                    .get_or_insert_with(|| self.snapshot_identity())
+                    .thread_uid(thread.id)
+                    .and_then(|uid| self.execution.latest(uid))
+                    .is_some_and(|lease| !lease.restart_continuation_blocked)
+            {
+                continue;
+            }
+            if thread.pi.is_some()
+                && let Some(history) = &thread.task_result_history
+            {
+                if history.contains(&task.delivery_id) {
+                    self.tasks[index].delivered = true;
+                } else {
+                    self.tasks[index].hold_delivery = false;
+                }
+                changed = true;
+            } else if thread.pi.is_none()
+                && !thread.task_delivery_probe_started
+                && !self.network_blocked()
+                && !self.provider_update_drivers.contains(&thread.harness)
+            {
+                self.threads[parent].task_delivery_probe_started = true;
+                self.connect_thread(parent);
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub(super) fn poll_tasks(&mut self, now: Instant) -> bool {
@@ -3131,7 +3377,8 @@ impl State {
         changed |= self.poll_remote_tasks();
         let routes: Vec<Option<usize>> =
             self.tasks.iter().map(|task| self.task_home(task)).collect();
-        for task in &mut self.tasks {
+        let mut continuations = Vec::new();
+        for (index, task) in self.tasks.iter_mut().enumerate() {
             if task.remote.is_some() {
                 continue;
             }
@@ -3144,9 +3391,20 @@ impl State {
             };
             if task.recovering {
                 if let Some(history) = thread.task_history.take() {
-                    task.reconcile(&history);
+                    let was_active = matches!(
+                        task.state,
+                        TaskState::Starting | TaskState::Running | TaskState::Queued
+                    );
+                    if task.reconcile(&history)
+                        && was_active
+                        && thread.request.is_none()
+                        && !thread.status.busy()
+                    {
+                        continuations.push(index);
+                    }
                     thread.recovering_task = false;
-                    // Recover history only. Never continue an agent turn at boot.
+                    // The history connection never sends a prompt. Admission
+                    // starts any replacement after the exact lease is checked.
                     thread.disconnect();
                     thread.task_result = None;
                     thread.completion_notified = true;
@@ -3202,6 +3460,9 @@ impl State {
                     thread.error.as_deref().unwrap_or(""),
                 );
                 task.memory_suggestions = std::mem::take(&mut thread.memory_suggestions);
+                if task.state == TaskState::Completed && !task.restart_continuations.is_empty() {
+                    task.hold_delivery = true;
+                }
                 changed = true;
             } else if task.state == TaskState::Starting
                 && thread.injection_id.is_none()
@@ -3212,7 +3473,11 @@ impl State {
                 changed = true;
             }
         }
+        for index in continuations {
+            self.continue_recovered_task(index, lifecycle::now());
+        }
         changed |= self.reconcile_task_acceptances();
+        changed |= self.release_reconciled_task_results();
         // Save outcomes before handing the result to another process.
         if changed {
             self.checkpoint();
@@ -3935,6 +4200,176 @@ mod tests {
         assert_eq!(state.tasks[0].result_excerpt, "Recovered final");
     }
 
+    #[cfg(windows)]
+    fn restart_fixture_job() -> (crate::process::Process, crate::process::ProviderJob) {
+        let mut command = std::process::Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 60",
+        ]);
+        let (process, job) = crate::process::Process::spawn_provider(&mut command).unwrap();
+        (process, job.expect("Windows provider job identity"))
+    }
+
+    #[cfg(windows)]
+    fn restart_fixture_snapshot(job: Option<&crate::process::ProviderJob>, prior: usize) -> Value {
+        let mut state = state_with_task();
+        state.threads[1].session = Some("test-only-child.jsonl".into());
+        state.tasks[0].restart_continuations = vec![lifecycle::now(); prior];
+        let device = state.identity.controller_id.clone();
+        state.allocate_local_task_execution(0, &device).unwrap();
+        let binding = state.threads[1].next_execution.clone().unwrap();
+        let (mut pi, _commands, _events) = Pi::test_connection();
+        if let Some(job) = job {
+            pi.note_provider_job(job.clone());
+        }
+        let capture = crate::outbox::Capture::begin();
+        pi.send(json!({"type":"prompt","id":"fixture","runId":binding.run_id}))
+            .unwrap();
+        state.mark_execution_prompts_dispatched(&capture.finish());
+        assert_eq!(
+            state
+                .execution
+                .get(&binding.lease_id)
+                .unwrap()
+                .provider_job
+                .as_ref(),
+            job
+        );
+        state.snapshot()
+    }
+
+    #[cfg(windows)]
+    fn restore_restart_fixture(snapshot: &Value) -> State {
+        let mut state = State::new(PathBuf::new(), false);
+        state.demo = true;
+        state.restore_global(snapshot).unwrap();
+        state.prepare_task_recovery();
+        state.mark_execution_restart_uncertain();
+        state.fence_exited_provider_jobs();
+        state.start_task_recovery();
+        state
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tasks_continue_after_the_exact_provider_job_exits() {
+        let (mut process, job) = restart_fixture_job();
+        let tracked = restart_fixture_snapshot(Some(&job), 0);
+        let legacy = restart_fixture_snapshot(None, 0);
+        for snapshot in [&tracked, &legacy] {
+            let mut state = restore_restart_fixture(snapshot);
+            state.poll_tasks(Instant::now());
+            assert_eq!(state.tasks[0].state, TaskState::Interrupted);
+            assert!(state.require_execution_recovery(2).is_err());
+            assert!(state.threads[1].pending_injections.is_empty());
+        }
+        process.terminate();
+        process.reap(Duration::from_secs(3)).unwrap();
+        drop(process);
+
+        let mut state = restore_restart_fixture(&tracked);
+        let previous_attempt = state.tasks[0].attempt_id.clone();
+        state.threads[1].task_history = Some(history(&state.tasks[0], vec![]));
+        state.poll_tasks(Instant::now());
+        assert_eq!(state.tasks[0].state, TaskState::Starting);
+        assert_ne!(state.tasks[0].attempt_id, previous_attempt);
+        assert!(state.tasks[0].attempt_message.contains(RESUME_MESSAGE));
+        assert!(state.tasks[0].attempt_message.contains("Inspect the files"));
+        assert_eq!(state.tasks[0].restart_continuations.len(), 1);
+
+        let mut state = restore_restart_fixture(&tracked);
+        state.threads[1].task_history = Some(history(
+            &state.tasks[0],
+            vec![json!({"role":"assistant","stopReason":"stop","content":"Finished before exit"})],
+        ));
+        state.poll_tasks(Instant::now());
+        assert_eq!(state.tasks[0].state, TaskState::Completed);
+        assert_eq!(state.tasks[0].attempt_id, previous_attempt);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tasks_stop_automatically_continuing_at_the_saved_limit() {
+        let (mut process, job) = restart_fixture_job();
+        let snapshot = restart_fixture_snapshot(Some(&job), MAX_RESTART_CONTINUATIONS);
+        process.terminate();
+        process.reap(Duration::from_secs(3)).unwrap();
+        drop(process);
+        let mut state = restore_restart_fixture(&snapshot);
+        state.threads[1].task_history = Some(history(&state.tasks[0], vec![]));
+        state.poll_tasks(Instant::now());
+        assert_eq!(state.tasks[0].state, TaskState::Interrupted);
+        assert!(state.tasks[0].error_excerpt.contains("continuation limit"));
+        assert!(state.threads[1].pending_injections.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tasks_wake_the_parent_once_after_checking_its_provider_history() {
+        let (mut process, job) = restart_fixture_job();
+        let snapshot = restart_fixture_snapshot(Some(&job), 0);
+        process.terminate();
+        process.reap(Duration::from_secs(3)).unwrap();
+        drop(process);
+        for already_accepted in [false, true] {
+            let mut state = restore_restart_fixture(&snapshot);
+            state.threads[0].harness = "pi".into();
+            state.threads[0].session = Some("test-only-parent.jsonl".into());
+            state.threads[0].run_id = Some(uuid::Uuid::new_v4().to_string());
+            let device = state.identity.controller_id.clone();
+            let parent = state.allocate_local_execution(1, &device, false).unwrap();
+            state
+                .execution
+                .terminal(
+                    &parent.lease_id,
+                    "cancelled",
+                    lifecycle::now(),
+                    "provider settled",
+                )
+                .unwrap();
+            let (commands, _events) = fake_pi(&mut state.threads[0]);
+            state.threads[1].task_history = Some(history(
+                &state.tasks[0],
+                vec![json!({"role":"assistant","stopReason":"stop","content":"Child finished"})],
+            ));
+            state.poll_tasks(Instant::now());
+            assert!(state.threads[0].pending_injections.is_empty());
+            let result = state.tasks[0].completion_message();
+            state.threads[0].injection_id = Some("result-before-restart".into());
+            state.record_task_result_dispatch("result-before-restart", &result);
+            state.threads[0].injection_id = None;
+            let entries = if already_accepted {
+                vec![
+                    json!({"id":"previous-branch","type":"message","parentId":null,
+                    "message":{"role":"user","content":result}}),
+                ]
+            } else {
+                vec![]
+            };
+            let mut response = json!({"type":"response","id":"history","command":"get_entries",
+                "success":true,"data":{"entries":entries,"leafId":null}});
+            session_history(&mut response);
+            state.threads[0].apply(response);
+            state.poll_tasks(Instant::now());
+            state.poll_tasks(Instant::now());
+            assert_eq!(state.tasks[0].delivered, already_accepted);
+            assert_eq!(
+                state.threads[0].pending_injections.len(),
+                usize::from(!already_accepted)
+            );
+            assert_eq!(
+                commands
+                    .try_iter()
+                    .filter(|command| command["type"] == "prompt")
+                    .count(),
+                usize::from(!already_accepted)
+            );
+        }
+    }
+
     #[test]
     fn the_ui_can_answer_a_child_request_but_mcp_cannot_approve_it() {
         let mut state = state_with_task();
@@ -3993,7 +4428,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_notices_distinguish_clean_and_unclean_task_shutdown() {
+    fn task_recovery_does_not_create_a_sidebar_banner() {
         let mut source = state_with_task();
         source.threads[1].session = Some("test-only-session.jsonl".into());
         let mut second = Thread::new(3);
@@ -4013,13 +4448,8 @@ mod tests {
         {
             let mut restored = State::new(PathBuf::new(), false);
             restored.load_global_for_test();
-            assert!(
-                restored
-                    .recovery_notice
-                    .as_deref()
-                    .unwrap()
-                    .contains("Shina was closed while 2 tasks were running")
-            );
+            assert!(restored.recovery_notice.is_none());
+            assert!(restored.tasks.iter().all(|task| task.recovering));
             restored.checkpoint_and_flush().unwrap();
             restored.mark_clean_quit();
         }
@@ -4027,13 +4457,8 @@ mod tests {
         drop(marker); // Simulate an unclean termination, without starting any process.
         let mut restored = State::new(PathBuf::new(), false);
         restored.load_global_for_test();
-        assert!(
-            restored
-                .recovery_notice
-                .as_deref()
-                .unwrap()
-                .starts_with("Shina closed unexpectedly")
-        );
+        assert!(restored.recovery_notice.is_none());
+        assert!(restored.tasks.iter().all(|task| task.recovering));
     }
 
     #[test]

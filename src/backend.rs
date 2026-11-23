@@ -16,6 +16,7 @@ use std::{
 };
 
 pub enum Event {
+    ProviderJob(crate::process::ProviderJob),
     Record(Value),
     Error(String),
     Diagnostic(String),
@@ -48,6 +49,7 @@ pub struct Pi {
     stopped: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     owner: Arc<SessionOwner>,
+    provider_job: Option<crate::process::ProviderJob>,
 }
 
 pub(crate) struct ShutdownFence {
@@ -247,6 +249,7 @@ impl Pi {
             stopped,
             finished,
             owner: session_owner,
+            provider_job: None,
         }
     }
     #[cfg(test)]
@@ -267,6 +270,7 @@ impl Pi {
                 stopped: Arc::new(AtomicBool::new(false)),
                 finished: Arc::new(AtomicBool::new(true)),
                 owner: Arc::default(),
+                provider_job: None,
             },
             input,
             output,
@@ -401,12 +405,33 @@ impl Pi {
             stopped,
             finished,
             owner: session_owner,
+            provider_job: None,
         }
     }
 
     pub fn send(&self, record: Value) -> Result<(), String> {
-        crate::outbox::send(&self.commands, record)
+        crate::outbox::send(&self.commands, record, self.provider_job.as_ref())
     }
+
+    pub(crate) fn note_provider_job(&mut self, job: crate::process::ProviderJob) {
+        self.provider_job = Some(job);
+    }
+}
+
+pub(crate) fn spawn_provider(
+    command: &mut Command,
+    output: &SyncSender<Event>,
+    wake: &Waker,
+) -> std::io::Result<crate::process::Process> {
+    let (process, job) = crate::process::Process::spawn_provider(command)?;
+    if let Some(job) = job
+        && !publish(output, wake, Event::ProviderJob(job))
+    {
+        return Err(std::io::Error::other(
+            "Provider connection closed during launch.",
+        ));
+    }
+    Ok(process)
 }
 
 pub(crate) fn publish(output: &SyncSender<Event>, wake: &Waker, event: Event) -> bool {
@@ -605,7 +630,7 @@ fn run(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let mut child = crate::process::Process::spawn(&mut command)
+    let mut child = spawn_provider(&mut command, output, wake)
         .map_err(|e| format!("Could not start Pi: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
