@@ -682,6 +682,123 @@ fn typed_work_demo(state: &mut State) {
     t.work[0].elapsed = Some(42);
 }
 
+/// A finished turn with five changed files across three directories, so the
+/// changed-files card shows its header totals and a tree with expanded
+/// folders. Demo data only.
+fn changed_files_demo(state: &mut State) {
+    state.populate_demo();
+    let t = state.current_mut();
+    t.messages.truncate(2);
+    t.tools.clear();
+    t.thoughts.clear();
+    t.work.clear();
+    t.messages[1].text =
+        "I'll add capped backoff to the reconnect path, surface failures in the toast, \
+         and cover both with tests."
+            .into();
+    t.messages.push(model::Message {
+        id: "changed-files-reply".into(),
+        role: "Pi",
+        text: "The reconnect path now retries with capped backoff and the toast shows the last \
+               failure. Both regressions are covered.\n\nThe transport tests and the reconnect \
+               test pass."
+            .into(),
+        images: Vec::new(),
+        context: None,
+    });
+    t.work.push(model::AssistantWork {
+        start: 1,
+        stopped: false,
+        stopped_order: 0,
+        expanded: false,
+        elapsed: Some(96),
+        outcome: Some(model::Status::Completed),
+    });
+    let change =
+        |path: &str, operation: &str, additions: usize, deletions: usize| crate::work::FileChange {
+            path: path.into(),
+            old_path: None,
+            operation: operation.into(),
+            diff: String::new(),
+            additions,
+            deletions,
+        };
+    let mut block = 0usize;
+    let mut tool = |id: &str, name: &str, detail: &str, changes: Vec<crate::work::FileChange>| {
+        block += 1;
+        model::Tool {
+            id: id.into(),
+            kind: None,
+            changes,
+            input: serde_json::Value::Null,
+            raw_expanded: false,
+            order: 0,
+            name: name.into(),
+            detail: detail.into(),
+            done: true,
+            failed: false,
+            output: "Example activity, not a real tool execution.".into(),
+            anchor: model::ToolAnchor {
+                message: 1,
+                offset: 0,
+            },
+            block,
+            expanded: false,
+            group_expanded: false,
+            started: None,
+            duration_ms: Some(240),
+            subagents: vec![],
+            images: vec![],
+            structured: serde_json::Value::Null,
+            parent_call: None,
+            exit_code: None,
+        }
+    };
+    t.tools = vec![
+        tool("cf-read", "read", "src/transport/socket.ts", vec![]),
+        tool(
+            "cf-socket",
+            "edit",
+            "src/transport/socket.ts",
+            vec![change("src/transport/socket.ts", "update", 18, 4)],
+        ),
+        tool(
+            "cf-backoff",
+            "write",
+            "src/transport/backoff.ts",
+            vec![change("src/transport/backoff.ts", "add", 64, 0)],
+        ),
+        tool(
+            "cf-toast",
+            "edit",
+            "src/ui/toast.tsx",
+            vec![change("src/ui/toast.tsx", "update", 9, 11)],
+        ),
+        tool(
+            "cf-reconnect-test",
+            "write",
+            "tests/reconnect.test.ts",
+            vec![change("tests/reconnect.test.ts", "add", 47, 0)],
+        ),
+        tool(
+            "cf-socket-test",
+            "edit",
+            "tests/socket.test.ts",
+            vec![change("tests/socket.test.ts", "update", 3, 1)],
+        ),
+        tool("cf-test", "powershell", "npm test -- reconnect", vec![]),
+    ];
+    t.elapsed = Some(96);
+    // Show the card's folders expanded for the snapshot; the product default
+    // stays collapsed as KSG's is.
+    let turn_key = format!("message-{}-id-{}", t.id, t.messages[1].id);
+    state
+        .changed_files
+        .entry(format!("changed-files-{turn_key}"))
+        .or_default()
+        .all_expanded = true;
+}
+
 /// Opt-in visual fixture. Its blobs always use an isolated temporary profile.
 fn html_demo(state: &mut State) {
     state.populate_demo();
@@ -1452,6 +1569,11 @@ fn main() {
             ("typed-work", typed_work_demo),
             ("typed-work-dark", |state| {
                 typed_work_demo(state);
+                state.dark = true;
+            }),
+            ("changed-files", changed_files_demo),
+            ("changed-files-dark", |state| {
+                changed_files_demo(state);
                 state.dark = true;
             }),
             // The details card with its folded rows shown. It docks from about 1400 pt wide.

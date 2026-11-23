@@ -1160,7 +1160,16 @@ impl State {
         if let Some(Done::Ready(ready)) = &mut diff.done {
             ready.rows = flatten(&ready.files, hide, collapsed);
             ready.rows_version += 1;
-            ready.tree_rows = diff_tree::flatten_tree(&ready.files, hide, &diff.dirs_collapsed);
+            let inputs: Vec<diff_tree::TreeFile<'_>> = ready
+                .files
+                .iter()
+                .map(|entry| diff_tree::TreeFile {
+                    path: &entry.file.path,
+                    status: diff_tree::tree_status(&entry.file.change),
+                    stat: Some((entry.additions, entry.deletions)),
+                })
+                .collect();
+            ready.tree_rows = diff_tree::flatten_tree(&inputs, hide, &diff.dirs_collapsed, " / ");
             ready.tree_version += 1;
         }
     }

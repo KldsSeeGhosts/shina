@@ -66,6 +66,8 @@ mod captain_docs_ui;
 mod captain_lifecycle_ui;
 #[path = "captain_ui.rs"]
 mod captain_ui;
+#[path = "changed_files.rs"]
+pub(crate) mod changed_files;
 #[path = "citation_comment.rs"]
 pub(crate) mod citation_comment;
 #[path = "composer_code_picker.rs"]
@@ -10938,9 +10940,46 @@ fn build_assistant_turn(
         }
         response = response.child(rows);
     }
+    // KSG's `AssistantChangedFilesSection`: the changed-files card mounts inside the turn's
+    // last assistant message, under its prose and above the meta row, once the turn has
+    // finished.
+    let mut changed_files_card = if tail && !live {
+        changed_files::card(s, p, start, end)
+    } else {
+        None
+    };
     if tail && (!live || last_work.is_some()) {
+        let card_after = changed_files_card
+            .is_some()
+            .then(|| {
+                t.messages[start..end]
+                    .iter()
+                    .rposition(|m| m.role == "Pi")
+                    .map(|index| start + index)
+            })
+            .flatten()
+            .and_then(|message| {
+                parts[from..]
+                    .iter()
+                    .rposition(|part| {
+                        matches!(part, TranscriptPart::Text { message: m, .. } if *m == message)
+                    })
+                    .map(|index| from + index)
+            });
         for index in from..parts.len() {
             response = response.child(render_part(index));
+            tail_children += 1;
+            if Some(index) == card_after
+                && let Some(card) = changed_files_card.take()
+            {
+                response = response.child(card);
+                tail_children += 1;
+            }
+        }
+        // The last message has no visible prose (empty, folded into the work group or
+        // outside the tail): the card follows its content like KSG's in-message mount.
+        if let Some(card) = changed_files_card.take() {
+            response = response.child(card);
             tail_children += 1;
         }
     }

@@ -125,7 +125,7 @@ fn padded(content: El) -> El {
     content.px(12.0).py(9.0)
 }
 
-fn relative(path: &str, root: &std::path::Path) -> String {
+pub(super) fn relative(path: &str, root: &std::path::Path) -> String {
     // Projection paths belong to their host. Do not canonicalize or read their files.
     let root = root.to_string_lossy().replace('\\', "/");
     let path = path.replace('\\', "/");
