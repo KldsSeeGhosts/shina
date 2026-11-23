@@ -267,37 +267,16 @@ fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relati
             },
         );
     }
-    let lead = if worker {
+    if worker {
         let task = crew_ui::worker_task_mark(s, thread);
         if !thread.life.settled() && thread.request.is_none() && task == Some(Status::Waiting) {
             state = RowStatus::Interrupted;
         }
-        let mark = task.unwrap_or(status);
-        let mut avatar = crewmate_avatar(s, p, &thread.model, mark, 16.0)
-            .key(format!("worker-captain-portrait-{id}"));
-        if thread.actionable() || thread.unread() || task.is_some() {
-            avatar = el().size(16.0, 16.0).child(avatar).key(
-                if thread.actionable() || thread.unread() {
-                    format!("worker-alert-{id}")
-                } else {
-                    format!("worker-task-mark-{id}")
-                },
-            );
-        }
-        avatar
-    } else if !draft {
-        thread_avatar(
-            s,
-            p,
-            &thread.model_id,
-            &thread.model,
-            status,
-            thread.pinned(),
-        )
-        .key(format!("thread-provider-portrait-{suffix}"))
-    } else {
-        lead_mark(state, thread.pinned(), draft, p)
-    };
+    }
+    let badge = thread
+        .project
+        .is_some()
+        .then(|| project_tile(s, p, s.project(thread.project), 16.0));
     let snippet = entry.search_hit.as_ref().map(|hit| {
         search_snippet_el(
             entry.server,
@@ -348,7 +327,10 @@ fn render_local(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relati
             harness: Some(&thread.harness),
             model: Some(&thread.model),
             agents_active: crate::agents::active_count(thread),
-            lead,
+            badge,
+            pinned: thread.pinned(),
+            unsent: draft || !thread.draft.text.trim().is_empty(),
+            worktree: thread.worktree_path.is_some(),
             selected: entry.selected(s),
             shelved,
             draft,
@@ -481,45 +463,6 @@ fn row_age(
     }
 }
 
-fn lead_mark(status: RowStatus, pinned: bool, draft: bool, p: Palette) -> El {
-    if status != RowStatus::Idle {
-        status.mark(p)
-    } else if pinned || draft {
-        icon(if pinned { "pin" } else { "edit" }, p.faint).size(12.0, 12.0)
-    } else {
-        el()
-    }
-}
-
-pub(super) fn thread_mascot(model_id: &str, label: &str) -> crate::visuals::ProviderMascot {
-    use crate::visuals::{ProviderMascot, provider_mascot_for};
-    match provider_mascot_for(model_id) {
-        ProviderMascot::Default => provider_mascot_for(label),
-        mascot => mascot,
-    }
-}
-
-fn thread_avatar(
-    s: &State,
-    p: Palette,
-    model_id: &str,
-    label: &str,
-    status: Status,
-    pinned: bool,
-) -> El {
-    let avatar = mascot_avatar(s, p, thread_mascot(model_id, label), status, 16.0);
-    if !pinned {
-        return avatar;
-    }
-    el().size(16.0, 16.0).child(avatar).child(
-        icon("pin", p.ink)
-            .size(9.0, 9.0)
-            .pin(None, Some(-2.0), Some(-2.0), None)
-            .radius(3.0)
-            .fill(p.card),
-    )
-}
-
 /// KSG Code's `SidebarThreadRow` uses the trailing slot for hover actions.
 fn row_actions(s: &State, p: Palette, thread: &Thread, section: Section, draft: bool) -> (El, f32) {
     let id = thread.id;
@@ -615,6 +558,7 @@ pub(super) struct Entry<'a> {
     pub local: Option<usize>,
     pub captain: bool,
     pub draft: bool,
+    pub section: lifecycle::Section,
     pub life: lifecycle::Lifecycle,
     record: Option<&'a Value>,
     projection: Option<&'a crate::client_history::Projection>,
@@ -726,8 +670,9 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             }
             let section = s.thread_section(thread, at);
             let shelf = match section {
-                Section::Snoozed => Some(0),
-                Section::Settled => Some(1),
+                Section::Working => Some(0),
+                Section::Snoozed => Some(1),
+                Section::Settled => Some(2),
                 _ => None,
             };
             let visible = captain
@@ -739,6 +684,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 local: Some(index),
                 captain,
                 draft: s.draft_listed(thread),
+                section,
                 life: thread.life.clone(),
                 record: None,
                 projection: None,
@@ -934,12 +880,13 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
             {
                 continue;
             }
+            let section = lifecycle::section(&life, at, false);
             let visible = if !query.is_empty() {
                 true
             } else {
-                match lifecycle::section(&life, at) {
-                    Section::Snoozed => s.shelves[0],
-                    Section::Settled => s.shelves[1],
+                match section {
+                    Section::Snoozed => s.shelves[1],
+                    Section::Settled => s.shelves[2],
                     _ => true,
                 }
             };
@@ -949,6 +896,7 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
                 local: None,
                 captain,
                 draft,
+                section,
                 life,
                 record: Some(record),
                 projection: Some(projection),
@@ -967,8 +915,12 @@ pub(super) fn entries(s: &State) -> Vec<Entry<'_>> {
         .map(|(rank, (server, id))| ((server.as_str(), *id), rank))
         .collect();
     entries.sort_by_cached_key(|row| {
-        let section = lifecycle::section(&row.life, at);
-        let rank = lifecycle::rank(section, &row.life);
+        let section = row.section;
+        let returned = row
+            .local
+            .map(|i| s.threads[i].working.returned_at)
+            .unwrap_or(0);
+        let rank = lifecycle::rank(section, &row.life, returned);
         let category = if searching {
             if row.title_match { 0 } else { 1 }
         } else if row.captain {
@@ -1095,6 +1047,7 @@ fn structure_signature(s: &State, at: u64) -> u64 {
         t.delegated.hash(&mut hash);
         s.draft_listed(t).hash(&mut hash);
         (s.thread_section(t, at) as u8).hash(&mut hash);
+        t.working.returned_at.hash(&mut hash);
         let life = &t.life;
         life.archived_at.hash(&mut hash);
         life.pinned_at.hash(&mut hash);
@@ -1247,7 +1200,7 @@ impl Plan {
     }
 }
 
-fn build_plan(s: &State, at: u64, version: u64) -> Plan {
+fn build_plan(s: &State, _at: u64, version: u64) -> Plan {
     let mut plan = Plan {
         version,
         ..Plan::default()
@@ -1301,12 +1254,19 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         }
     }
     let dragging = s.drag_thread.is_some();
+    // KSG's `Sidebar.logic.ts` partition: Working, Snoozed and Settled fold into shelves
+    // at the bottom of the list in that order.
+    let snoozed_exists = all
+        .iter()
+        .any(|row| !row.draft && row.section == Section::Snoozed);
     let settled_exists = all
         .iter()
-        .any(|row| !row.draft && lifecycle::section(&row.life, at) == Section::Settled);
+        .any(|row| !row.draft && row.section == Section::Settled);
+    let settled_shown = settled_exists || dragging;
     let sections = [
         Section::Pinned,
         Section::Active,
+        Section::Working,
         Section::Snoozed,
         Section::Settled,
     ];
@@ -1314,23 +1274,32 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         let rows: Vec<_> = all
             .iter()
             .copied()
-            .filter(|row| !row.draft && lifecycle::section(&row.life, at) == section)
+            .filter(|row| !row.draft && row.section == section)
             .collect();
-        if matches!(section, Section::Snoozed | Section::Settled) {
+        if matches!(
+            section,
+            Section::Working | Section::Snoozed | Section::Settled
+        ) {
             if rows.is_empty() && !(dragging && section == Section::Settled) {
                 continue;
             }
+            let below = match section {
+                Section::Working => usize::from(snoozed_exists) + usize::from(settled_shown),
+                Section::Snoozed => usize::from(settled_shown),
+                _ => 0,
+            };
+            let index = match section {
+                Section::Working => 0,
+                Section::Snoozed => 1,
+                _ => 2,
+            };
             plan.add(
                 format!("shelf-block-{section:?}"),
                 Node::Shelf {
                     section,
                     rows: rows.iter().map(|row| IndexedRow::new(row)).collect(),
-                    index: usize::from(section == Section::Settled),
-                    inset: if section == Section::Snoozed && (settled_exists || dragging) {
-                        SHELF_HEADING
-                    } else {
-                        0.0
-                    },
+                    index,
+                    inset: below as f32 * SHELF_HEADING,
                 },
             );
         } else if dragging {
@@ -1344,7 +1313,7 @@ fn build_plan(s: &State, at: u64, version: u64) -> Plan {
         for row in rows.iter().copied().filter(|row| row.visible).take(limit) {
             plan.thread(s, row);
         }
-        if section == Section::Settled && s.shelves[1] && rows.len() > limit {
+        if section == Section::Settled && s.shelves[2] && rows.len() > limit {
             plan.add("settled-more", Node::More((rows.len() - limit).min(25)));
         }
     }
@@ -1454,12 +1423,17 @@ fn resolve<'a>(s: &'a State, row: &'a IndexedRow, rel: &Relations) -> Option<Ent
     } else {
         None
     };
+    let section = match local {
+        Some(i) => s.thread_section(&s.threads[i], lifecycle::now()),
+        None => lifecycle::section(&life, lifecycle::now(), false),
+    };
     Some(Entry {
         server,
         id,
         local,
         captain: row.captain,
         draft: row.draft,
+        section,
         life,
         record,
         projection,
@@ -1606,29 +1580,12 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
             },
         );
     }
-    let section = lifecycle::section(&entry.life, now);
+    let section = entry.section;
     let shelved = matches!(section, Section::Snoozed | Section::Settled);
-    let worker = !record["crewCaptain"].is_null()
-        || record["parent"]
-            .as_u64()
-            .and_then(|id| remote_record(projection, rel, entry.server, id as usize))
-            .is_some_and(|parent| parent["captainHome"] == true);
-    let lead = if worker {
-        crewmate_avatar(s, p, model.unwrap_or_default(), status, 16.0)
-            .key(format!("crewmate-{}-{id}", entry.server))
-    } else if !entry.draft {
-        thread_avatar(
-            s,
-            p,
-            view.record["model_id"].as_str().unwrap_or_default(),
-            model.unwrap_or_default(),
-            status,
-            entry.life.pinned_at.is_some(),
-        )
-        .key(format!("thread-provider-portrait-{suffix}"))
-    } else {
-        lead_mark(state, entry.life.pinned_at.is_some(), entry.draft, p)
-    };
+    let badge = entry
+        .project(s)
+        .is_some()
+        .then(|| project_tile(s, p, project.as_ref(), 16.0));
     let saved = &s.machines.ui[entry.server]["drafts"][id.to_string()];
     let draft = saved
         .as_str()
@@ -1680,7 +1637,13 @@ fn render_remote(s: &State, p: Palette, entry: &Entry<'_>, item: El, rel: &Relat
                 .as_u64()
                 .or_else(|| record["agentsActive"].as_u64())
                 .unwrap_or_default() as usize,
-            lead,
+            badge,
+            pinned: entry.life.pinned_at.is_some(),
+            unsent: entry.draft || !draft.trim().is_empty(),
+            worktree: view.record["worktreePath"]
+                .as_str()
+                .or_else(|| record["worktreePath"].as_str())
+                .is_some(),
             selected: entry.selected(s),
             shelved,
             draft: entry.draft,
@@ -1815,18 +1778,24 @@ fn clear_search(s: &mut State) {
     s.sync_sidebar_search_input();
 }
 
+// KSG's clear control inside `InputGroup`: an icon-micro button (20 pt) with a 12 pt glyph.
 pub(super) fn search_clear(s: &State, p: Palette) -> El {
     if s.search.text.is_empty() {
         return el();
     }
-    icon_button(
-        "thread-search-clear",
-        "Clear search",
-        "close",
-        p,
-        clear_search,
-    )
-    .size(22.0, 22.0)
+    el().key("thread-search-clear")
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label("Clear search")
+        .help("Clear search")
+        .focusable(true)
+        .size(20.0, 20.0)
+        .center()
+        .radius(4.0)
+        .hover(p.selected)
+        .press(p.selected)
+        .on_press(clear_search)
+        .child(icon("close", p.muted).size(12.0, 12.0))
 }
 
 fn search_empty(s: &State, p: Palette) -> El {
@@ -1937,9 +1906,9 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
             }
             heading
         }
-        Node::Threads(after_captains) => section_title("Threads", p)
-            .mt(if *after_captains { 8.0 } else { 0.0 })
-            .child(project_switcher(s, p).help("Add workspace")),
+        Node::Threads(after_captains) => {
+            section_title("Threads", p).mt(if *after_captains { 8.0 } else { 0.0 })
+        }
         Node::Drafts => section_title("Drafts", p),
         Node::FormerHeading => section_title("Former captains", p),
         Node::Former(index) => {
@@ -2034,11 +2003,10 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         .cursor(rune::Cursor::Pointer)
                         .label(format!("{title}, {count} threads"))
                         .h(SHELF_HEADING)
-                        .pl(ROW_INSET)
-                        .pr(4.0)
+                        .px(8.0)
                         .radius(6.0)
                         .center_y()
-                        .gap(6.0)
+                        .gap(8.0)
                         .hover(p.selected)
                         .on_drawn_layout_tx(move |s: &mut State, rect, tx| {
                             s.drop_rects.insert(key.clone(), rect);
@@ -2053,7 +2021,7 @@ fn render_node(s: &State, p: Palette, node: &Node, rel: &Relations) -> El {
                         .child(attention.map_or_else(el, |(ink, word)| {
                             attention_dot(format!("shelf-attention-{section:?}"), ink, word)
                         }))
-                        .child(label(count.to_string(), TIMER, p.faint))
+                        .child(meta_label(&count.to_string(), p.faint))
                         .child(
                             icon(
                                 if s.shelves[index] {
@@ -2125,10 +2093,10 @@ pub(super) fn content(s: &State, p: Palette) -> El {
                 p,
                 first,
                 index,
-                if shelf == 0 {
-                    "sidebar-rows"
-                } else {
-                    "sidebar-snoozed-rows"
+                match shelf {
+                    0 => "sidebar-rows",
+                    1 => "sidebar-working-rows",
+                    _ => "sidebar-snoozed-rows",
                 },
             ));
         }

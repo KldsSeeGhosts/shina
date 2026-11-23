@@ -1667,7 +1667,7 @@ Tighten the composer's spacing to match KSG Code's ComposerSurface.".into(),
             }),
             ("shelves-expanded", |state| {
                 state.populate_demo();
-                state.shelves = [true; 2];
+                state.shelves = [true; 3];
             }),
             ("snooze-menu", |state| {
                 state.populate_demo();
