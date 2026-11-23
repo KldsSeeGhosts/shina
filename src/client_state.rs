@@ -6892,7 +6892,7 @@ mod tests {
         state.zoom = 1.1;
         state.sidebar_width = 312.0;
         state.sidebar = false;
-        state.shelves = [true, false];
+        state.shelves = [false, true, false];
         state.preferences.confirm_delete = false;
         state.current_mut().draft.replace_text("local unsent text");
         state.checkpoint_client();
@@ -6912,7 +6912,7 @@ mod tests {
             assert_eq!(state.zoom, 1.1);
             assert_eq!(state.sidebar_width, 312.0);
             assert!(!state.sidebar);
-            assert_eq!(state.shelves, [true, false]);
+            assert_eq!(state.shelves, [false, true, false]);
             assert!(!state.preferences.confirm_delete);
             assert_eq!(
                 state.current().draft.text,

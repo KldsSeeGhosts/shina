@@ -175,6 +175,8 @@ struct Palette {
     on_brass: Color,
     sea: Color,
     sea_bg: Color,
+    /// KSG's `--sidebar-status-input`: a thread waiting on user input.
+    input: Color,
     danger: Color,
     danger_bg: Color,
     ok: Color,
@@ -224,6 +226,7 @@ fn palette(dark: bool) -> Palette {
             on_brass: color("#111215"),
             sea: color("#8aa4ff"),
             sea_bg: color("#1d2338"),
+            input: color("#a5b4fc"),
             danger: color("#ff6b63"),
             danger_bg: color("#2e1a1b"),
             ok: color("#4cc35f"),
@@ -262,6 +265,7 @@ fn palette(dark: bool) -> Palette {
             on_brass: color("#ffffff"),
             sea: color("#1d4ed8"),
             sea_bg: color("#e3e9fb"),
+            input: color("#4f46e5"),
             danger: color("#b42318"),
             danger_bg: color("#fbe7e4"),
             ok: color("#176f31"),
@@ -4510,34 +4514,17 @@ fn sidebar_header(s: &State, p: Palette, compact: bool, line: f32, wordmark_line
             );
         }
     }
-    header.child(spacer()).child(
-        icon_button("new-thread", "New thread", "compose", p, |_| {})
-            .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
-            .help(if s.projects.entries.iter().all(|project| project.hidden) {
-                "New thread"
-            } else {
-                "New thread. Shift-click: in the current workspace"
-            }),
-    )
+    header.child(spacer())
 }
 
-/// The title strip's left end when the sidebar is not docked: the toggle, the 24 px mark and
-/// the compose button, then the gap before the tabs. The wordmark waits for the sidebar.
+/// The title strip's left end when the sidebar is not docked: the toggle and the 24 px mark,
+/// then the gap before the tabs. The wordmark waits for the sidebar.
 fn undocked_header(s: &State, p: Palette, compact: bool) -> El {
     row()
         .h(36.0)
         .center_y()
         .child(sidebar_toggle(p, compact))
         .child(shina_mark(s, p))
-        .child(
-            icon_button("new-thread", "New thread", "compose", p, |_| {})
-                .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
-                .help(if s.projects.entries.iter().all(|project| project.hidden) {
-                    "New thread"
-                } else {
-                    "New thread. Shift-click: in the current workspace"
-                }),
-        )
         .pr(HEADER_TAB_GAP)
 }
 /// The space between the compose button, at the header's end, and the first tab.
@@ -4548,6 +4535,15 @@ const HEADER_TOGGLE: f32 = 24.0;
 const HEADER_MARK: f32 = 24.0;
 /// "Shina" in Inter 15/600.
 const WORDMARK_WIDTH: f32 = 40.0;
+
+/// KSG's `SidebarHeaderIconButton`: a 28 pt icon control in the sidebar's header row.
+fn header_control(item: El, p: Palette) -> El {
+    item.size(28.0, 28.0)
+        .center()
+        .radius(8.0)
+        .hover(p.selected)
+        .press(p.selected)
+}
 
 fn sidebar(s: &State, p: Palette, width: f32) -> El {
     let mut side = col()
@@ -4609,37 +4605,67 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     if let Some(notice) = crew_ui::recovery_banner(s, p) {
         side = side.child(notice);
     }
-    let scope_button = el()
-        .key("project-scope")
-        .role("button")
-        .cursor(rune::Cursor::Pointer)
-        .label(format!("Workspace: {scope_words}"))
-        .help(format!("Workspace: {scope_words}"))
-        .focusable(true)
-        .size(24.0, 24.0)
-        .center()
-        .radius(6.0)
-        .fill(if scoped {
-            p.coral_bg
-        } else {
-            Color::TRANSPARENT
-        })
-        .hover(if scoped { p.coral_bg } else { p.selected })
-        .on_press(|s: &mut State| s.open_picker(ProjectPicker::Scope))
-        .child(tool_icon("filter", if scoped { p.sea } else { p.muted }));
+    // KSG's `SidebarThreadHeader`: the search field beside 28 pt controls for the project
+    // scope, Add project and New thread, at 4 pt gaps.
+    let scoped_projects: Vec<crate::projects::ProjectId> = match s.project_scope {
+        ProjectScope::Project(id) => {
+            let mut ids = vec![id];
+            ids.extend(s.scope_additional.iter().copied());
+            ids
+        }
+        _ => s.scope_additional.clone(),
+    };
+    let scope_glyph = if scoped_projects.len() > 1 {
+        row()
+            .child(project_tile(
+                s,
+                p,
+                s.project(Some(scoped_projects[0])),
+                14.0,
+            ))
+            .child(
+                el().size(14.0, 14.0)
+                    .ml(-4.0)
+                    .radius(4.0)
+                    .border(1.0, p.bg)
+                    .child(project_tile(
+                        s,
+                        p,
+                        s.project(Some(scoped_projects[1])),
+                        14.0,
+                    )),
+            )
+    } else if let Some(&id) = scoped_projects.first() {
+        project_tile(s, p, s.project(Some(id)), 16.0)
+    } else {
+        icon("folder", if scoped { p.sea } else { p.muted }).size(14.0, 14.0)
+    };
+    let scope_button = header_control(
+        el().key("project-scope")
+            .role("button")
+            .cursor(rune::Cursor::Pointer)
+            .label(format!("Workspace: {scope_words}"))
+            .help(format!("Workspace: {scope_words}"))
+            .focusable(true)
+            .on_press(|s: &mut State| s.open_picker(ProjectPicker::Scope))
+            .child(scope_glyph),
+        p,
+    );
     side = side.child(
         row()
             .key("workspace-context")
-            .h(32.0)
+            .h(28.0)
+            .mt(8.0)
             .mb(8.0)
             .center_y()
+            .gap(4.0)
             .child(
                 row()
                     .key("thread-search-field")
                     .h(28.0)
-                    .pl(10.0)
-                    .pr(4.0)
-                    .gap(8.0)
+                    .pl(6.0)
+                    .pr(6.0)
+                    .gap(6.0)
                     .center_y()
                     .radius(8.0)
                     .grow(1.0)
@@ -4649,7 +4675,13 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                     .fill(p.row)
                     .caret(p.ink, p.coral_bg)
                     .border(1.0, if s.search.focused { p.ring } else { p.frame })
-                    .child(icon("search", p.muted).size(13.0, 13.0))
+                    // KSG seats the 13 px glyph in a 16 px slot, so the placeholder starts
+                    // where the rows' labels do.
+                    .child(
+                        el().size(16.0, 16.0)
+                            .center()
+                            .child(icon("search", p.muted).size(13.0, 13.0)),
+                    )
                     .child(
                         text_input(&s.search, ROW_QUIET)
                             .key("thread-search")
@@ -4675,9 +4707,35 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                                 }
                             }),
                     )
-                    .child(sidebar_ui::search_clear(s, p))
-                    .child(scope_button),
-            ),
+                    .child(sidebar_ui::search_clear(s, p)),
+            )
+            .child(scope_button)
+            .child(header_control(
+                el().key("project-switcher")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("Add workspace")
+                    .focusable(true)
+                    .on_press(|s: &mut State| s.open_picker(ProjectPicker::AddProject))
+                    .help("Add workspace")
+                    .child(icon("folder-plus", p.muted).size(14.0, 14.0)),
+                p,
+            ))
+            .child(header_control(
+                el().key("new-thread")
+                    .role("button")
+                    .cursor(rune::Cursor::Pointer)
+                    .label("New thread")
+                    .focusable(true)
+                    .on_press_tx(|s: &mut State, tx| s.new_thread_click(tx.mods().shift))
+                    .help(if s.projects.entries.iter().all(|project| project.hidden) {
+                        "New thread"
+                    } else {
+                        "New thread. Shift-click: in the current workspace"
+                    })
+                    .child(icon("compose", p.muted).size(14.0, 14.0)),
+                p,
+            )),
     );
     // A workspace filter names itself and clears in one click.
     if scoped {
@@ -4780,17 +4838,20 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .child(keycap_chip("Ctrl+Z", p)),
         );
     }
-    // The footer is a row of quiet icons, as in T3 Code: no divider and no wordmark. Settings
-    // holds preferences such as the theme.
+    // The footer is a row of quiet icons, as in T3 Code: no divider and no wordmark.
+    // Ported from KSG Code's `SidebarChrome` footer (`SidebarUtilityItem`): 32 px icon-only
+    // controls with 16 px glyphs, 4 px apart, in an 8/12 px padded strip. Settings holds
+    // preferences such as the theme.
     side = side.child(
         row()
             .key("sidebar-footer")
-            .h(40.0)
-            .px(4.0)
-            .gap(2.0)
+            .pt(8.0)
+            .pb(12.0)
+            .px(8.0)
+            .gap(4.0)
             .center_y()
             .child(
-                toggle_button(
+                footer_button(
                     "sidebar-settings",
                     "Settings",
                     "settings",
@@ -4801,7 +4862,7 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
                 .help("Settings"),
             )
             .child(
-                toggle_button(
+                footer_button(
                     "show-archive",
                     if s.show_archive {
                         "Back to threads"
@@ -4821,14 +4882,34 @@ fn sidebar(s: &State, p: Palette, width: f32) -> El {
     side
 }
 
-/// Preferences behind the footer's gear: the "You" profile, background work, and the theme.
-/// The background rows are KSG Code's `SettingsRow` with a `Switch` (see `captain_ui`); a
-/// captain's routines live in its Brief.
-/// Add or restore a project. Project ownership stays on threads, not sidebar folders.
-fn project_switcher(_: &State, p: Palette) -> El {
-    icon_button("project-switcher", "Add workspace", "folder-plus", p, |s| {
-        s.open_picker(ProjectPicker::AddProject)
-    })
+/// KSG's `SidebarUtilityItem`: a 32 px `size="footer"` icon button with a 16 px glyph and
+/// the shared 8 px control radius, showing its on state with a card fill like `toggle_button`.
+fn footer_button(
+    key: &str,
+    title: &str,
+    glyph: &str,
+    on: bool,
+    p: Palette,
+    action: impl Fn(&mut State) + 'static,
+) -> El {
+    let active_fill = if p.panel.luminance() < 0.5 {
+        p.lift
+    } else {
+        p.card
+    };
+    el().key(key)
+        .role("button")
+        .cursor(rune::Cursor::Pointer)
+        .label(title)
+        .checked(on)
+        .focusable(true)
+        .size(32.0, 32.0)
+        .center()
+        .radius(8.0)
+        .fill(if on { active_fill } else { Color::TRANSPARENT })
+        .hover(p.selected)
+        .on_press(action)
+        .child(tool_icon(glyph, p.muted))
 }
 
 fn menu_item(key: &str, title: &str, glyph: &str, p: Palette) -> El {
@@ -5122,7 +5203,8 @@ fn section_title(title: &str, p: Palette) -> El {
         .child(spacer())
 }
 /// A shelf heading's height.
-const SHELF_HEADING: f32 = 28.0;
+// KSG's `CollapsibleSectionHeader` is `h-8` (32 px).
+const SHELF_HEADING: f32 = 32.0;
 /// A selected sidebar row: KSG's `row` fill; light theme adds a hairline border.
 fn select_bar(item: El, selected: bool, dark: bool, p: Palette) -> El {
     if !selected {
@@ -18102,6 +18184,9 @@ pub(crate) mod tests {
                 rt.state.populate_demo();
                 rt.state.demo = false;
                 rt.state.composer_ui.force_expanded = true;
+                // KSG's 256 px sidebar leaves room for the docked details card here; this
+                // walk covers the main column's order, so keep the card off.
+                rt.state.details.docked = false;
                 if empty {
                     rt.state.new_thread_in(None);
                 }
@@ -20614,8 +20699,10 @@ pub(crate) mod tests {
         let mut rt = runtime(1280.0);
         rt.state.populate_demo();
         rt.frame(0.0);
-        // A running thread stays in its own place in the list; there is no Working shelf.
-        assert!(rt.find("shelf-Working").is_none());
+        // KSG's Working shelf collects running threads at the bottom of the list.
+        assert!(rt.find("shelf-Working").is_some());
+        // Thread 2 is running, so it lives on the collapsed Working shelf.
+        assert!(rt.find("thread-2").is_none());
         // Shelves sit at the bottom of the sidebar, just above its footer.
         let mut tall = Runtime::with_text(
             State::new(".".into(), false),
@@ -20633,15 +20720,19 @@ pub(crate) mod tests {
             footer[1] - (settled[1] + settled[3]) < 40.0,
             "Settled {settled:?} is not above the footer {footer:?}"
         );
-        assert!(rt.find("thread-2").is_some());
         assert!(rt.find("shelf-Snoozed").is_some());
         assert!(rt.find("shelf-Settled").is_some());
         assert!(rt.find("thread-4").is_none());
         assert!(rt.find("thread-5").is_none());
+        rt.update(|_, tx| tx.scroll_into_view("shelf-Working"));
+        rt.frame(0.5);
+        press(&mut rt, "shelf-Working");
+        assert!(rt.state.shelves[0]);
+        assert!(rt.find("thread-2").is_some());
         rt.update(|_, tx| tx.scroll_into_view("shelf-Snoozed"));
         rt.frame(0.5);
         press(&mut rt, "shelf-Snoozed");
-        assert!(rt.state.shelves[0]);
+        assert!(rt.state.shelves[1]);
         assert!(rt.find("thread-4").is_some());
         rt.state.open_kept_tab(3);
         rt.frame(0.0);
@@ -20657,7 +20748,7 @@ pub(crate) mod tests {
             t.life.settle(lifecycle::now() - id as u64);
             rt.state.threads.push(t);
         }
-        rt.state.shelves[1] = true;
+        rt.state.shelves[2] = true;
         rt.invalidate();
         rt.frame(0.0);
         let count = |s: &State| {
@@ -22090,11 +22181,9 @@ pub(crate) mod tests {
             assert!(rt.presented("parent-bar").is_none(), "{width}");
             assert_inside(&mut rt, width, &["composer"]);
             assert!(rt.presented("crew-tray").is_none());
-            // The worker's details card links back to its captain. Beside an open Inspector
-            // the card cannot dock, so the top bar opens it as a popover.
-            assert!(rt.presented("details-card").is_none(), "{width}");
-            press(&mut rt, "header-details");
-            rt.frame(1.0);
+            // The worker's details card links back to its captain. KSG's 256 px sidebar
+            // leaves the lane wide enough for the card to dock under the covering Inspector.
+            assert!(rt.presented("details-card").is_some(), "{width}");
             press(&mut rt, "open-captain-from-overview");
             assert_eq!(rt.state.current().id, 7, "{width}");
             press(&mut rt, "needs-you-source-2");
