@@ -64,6 +64,14 @@ glyph!(
 glyph!(CHEVRON_DOWN, r#"<path d="m6 9 6 6 6-6"/>"#);
 glyph!(CHEVRON_UP, r#"<path d="m18 15-6-6-6 6"/>"#);
 glyph!(
+    CHEVRONS_UP_DOWN,
+    r#"<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>"#
+);
+glyph!(
+    CHEVRONS_DOWN_UP,
+    r#"<path d="m7 20 5-5 5 5"/><path d="m7 4 5 5 5-5"/>"#
+);
+glyph!(
     MONITOR,
     r#"<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/>"#
 );
@@ -398,6 +406,8 @@ pub(super) const NAMES: &[&str] = &[
     "open",
     "chevron-right",
     "chevron-left",
+    "chevrons-up-down",
+    "chevrons-down-up",
     "lock",
     "close",
     "volume",
@@ -489,6 +499,8 @@ pub(super) fn glyph(kind: &str) -> &'static Icon {
         "search" => &SEARCH,
         "chevron" | "chevron-down" => &CHEVRON_DOWN,
         "chevron-up" => &CHEVRON_UP,
+        "chevrons-up-down" => &CHEVRONS_UP_DOWN,
+        "chevrons-down-up" => &CHEVRONS_DOWN_UP,
         "open" | "chevron-right" => &CHEVRON_RIGHT,
         "lock" => &LOCK,
         "close" => &CLOSE,
