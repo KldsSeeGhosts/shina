@@ -101,7 +101,7 @@ fn claude_catalog_probe_initializes_without_a_prompt_or_persisted_session() {
             Event::Record(_) => {}
             Event::Exited => break,
             Event::Error(error) => panic!("{error}"),
-            Event::Diagnostic(_) => {}
+            Event::Diagnostic(_) | Event::ProviderJob(_) => {}
         }
     }
     // Manifest rows list under their slugs, with the manifest's display names;

@@ -1970,42 +1970,9 @@ pub(super) fn crew_bar(s: &State, p: Palette, _lane: f32) -> Option<El> {
     worker_notice(s, t.id).map(|reason| notice_bar("crew-bar", reason, None, p))
 }
 
-/// The restart notice: what happened, Review (the first interrupted task) and dismiss.
-pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
-    let Some(notice) = &s.recovery_notice else {
-        return None;
-    };
-    let interrupted = s
-        .attention()
-        .into_iter()
-        .find(|item| item.kind == AttentionKind::Interrupted)
-        .map(|item| item.thread_id);
-    // The text follows the live count of stopped tasks. The stored notice covers an unclean
-    // shutdown, where nothing is marked as stopped yet.
-    let stopped = s
-        .attention()
-        .iter()
-        .filter(|item| item.kind == AttentionKind::Interrupted)
-        .count();
-    let text = match stopped {
-        0 => notice.clone(),
-        1 => "1 task stopped when Shina closed. Review partial changes before resuming.".into(),
-        n => {
-            format!("{n} tasks stopped when Shina closed. Review partial changes before resuming.")
-        }
-    };
-    let mut actions = row().key("recovery-actions").gap(6.0).center_y();
-    if let Some(id) = interrupted {
-        actions = actions.child(solid_button(
-            "review-recovery".into(),
-            "Review",
-            p,
-            move |s| {
-                s.recovery_notice = None;
-                open_thread(s, id);
-            },
-        ));
-    }
+/// Provider update errors stay visible in the sidebar.
+pub(super) fn provider_recovery_notice(s: &State, p: Palette) -> Option<El> {
+    let text = s.recovery_notice.clone()?;
     // The dismiss control sits at the top right of the text, where a card's close control is.
     Some(
         col()
@@ -2036,8 +2003,7 @@ pub(super) fn recovery_banner(s: &State, p: Palette) -> Option<El> {
                         .mt(-3.0)
                         .mr(-3.0),
                     ),
-            )
-            .child(actions),
+            ),
     )
 }
 

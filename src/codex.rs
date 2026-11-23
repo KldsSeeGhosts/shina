@@ -2696,7 +2696,7 @@ fn run_mode(
         .stderr(Stdio::piped());
     // KSG `spawnedAtMs`: the catalog wait wants a cache write newer than spawn.
     let spawned_at_ms = crate::lifecycle::now();
-    let mut process = crate::process::Process::spawn(&mut command)
+    let mut process = backend::spawn_provider(&mut command, events, wake)
         .map_err(|e| format!("Could not start Codex: {e}"))?;
     let mut stdin = process.stdin.take().unwrap();
     let stdout = process.stdout.take().unwrap();

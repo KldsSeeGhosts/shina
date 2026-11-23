@@ -25,6 +25,7 @@ pub struct Effect {
     pub id: String,
     pub payload: Value,
     dispatch: Dispatch,
+    pub provider_job: Option<crate::process::ProviderJob>,
 }
 
 impl Effect {
@@ -39,6 +40,13 @@ impl Effect {
                 record["id"].as_str().unwrap_or_default(),
             )
         })
+    }
+
+    pub(crate) fn prompt_text(&self) -> Option<&str> {
+        let Dispatch::Harness { record, .. } = &self.dispatch else {
+            return None;
+        };
+        record["message"].as_str()
     }
 }
 
@@ -70,7 +78,11 @@ impl Drop for Capture {
     }
 }
 
-pub fn send(sender: &SyncSender<Value>, record: Value) -> Result<(), String> {
+pub fn send(
+    sender: &SyncSender<Value>,
+    record: Value,
+    provider_job: Option<&crate::process::ProviderJob>,
+) -> Result<(), String> {
     CAPTURE.with(|capture| {
         if let Some(effects) = capture.borrow_mut().as_mut() {
             if effects.len() >= 1024 {
@@ -84,6 +96,9 @@ pub fn send(sender: &SyncSender<Value>, record: Value) -> Result<(), String> {
             }
             effects.push(Effect {
                 id: uuid::Uuid::new_v4().to_string(),
+                provider_job: (record["type"] == "prompt")
+                    .then(|| provider_job.cloned())
+                    .flatten(),
                 // The durable input lives in the command/runtime input documents.
                 // Do not retain raw RPC records, which can contain credentials.
                 payload,
@@ -115,6 +130,7 @@ pub fn reply(
             }
             effects.push(Effect {
                 id: uuid::Uuid::new_v4().to_string(),
+                provider_job: None,
                 // Only the marker is durable: never the tool args, result or body.
                 payload: json!({"type":"mcp.reply"}),
                 dispatch: Dispatch::McpReply {

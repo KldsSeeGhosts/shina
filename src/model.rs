@@ -1300,6 +1300,8 @@ pub struct Thread {
     crew_report_last_run: Option<String>,
     recovering_task: bool,
     task_history: Option<Value>,
+    task_delivery_probe_started: bool,
+    task_result_history: Option<std::collections::HashSet<String>>,
     /// The live admission reservation id this crew member or peer worker
     /// holds, and the monotonic run counter its reservations key to.
     pub admission: Option<String>,
@@ -1913,6 +1915,8 @@ impl Thread {
             crew_report_last_run: None,
             recovering_task: false,
             task_history: None,
+            task_delivery_probe_started: false,
+            task_result_history: None,
             admission: None,
             admission_run: 0,
             admission_blocked: false,
@@ -3030,6 +3034,7 @@ impl Thread {
             self.restore_prompt(&prompt);
         }
         self.pi = None;
+        self.task_result_history = None;
         self.status = Status::Ready;
         self.assistant = None;
         if self.native.questionnaire.is_none() {
@@ -5975,6 +5980,15 @@ impl State {
     pub(crate) fn refresh_execution(&mut self, now: u64) -> bool {
         let mut changed = false;
         for thread in &mut self.threads {
+            if let Some(binding) = &thread.execution
+                && let Some(lease) = self.execution.get_mut(&binding.lease_id)
+                && !lease.restart_continuation_blocked
+                && (thread.stop_control.target() == Some(lease.run_id.as_str())
+                    || thread.request.is_some())
+            {
+                lease.restart_continuation_blocked = true;
+                changed = true;
+            }
             for binding in std::mem::take(&mut thread.execution_acceptances) {
                 if self.execution.get(&binding.lease_id).is_some_and(|lease| {
                     lease.binding() == binding
@@ -6177,6 +6191,26 @@ impl State {
         self.execution.mark_restart_uncertain(lifecycle::now())
     }
 
+    pub(crate) fn fence_exited_provider_jobs(&mut self) -> bool {
+        self.execution
+            .fence_exited_provider_jobs(&self.identity.executor_id, lifecycle::now())
+    }
+
+    pub(crate) fn record_shutdown_interruptions(&mut self) {
+        for thread in &self.threads {
+            if let Some(binding) = &thread.execution
+                && let Some(lease) = self.execution.get_mut(&binding.lease_id)
+                && lease.phase.in_flight()
+                && lease.provider_job.is_some()
+                && !lease.restart_continuation_blocked
+                && thread.request.is_none()
+                && thread.stop_control.target() != Some(lease.run_id.as_str())
+            {
+                lease.shutdown_interrupted = true;
+            }
+        }
+    }
+
     pub(crate) fn settle_pending_prompt_effects(
         &mut self,
         undispatched: &std::collections::HashSet<String>,
@@ -6229,6 +6263,9 @@ impl State {
             let Some((run, command)) = effect.prompt_run() else {
                 continue;
             };
+            if let Some(text) = effect.prompt_text() {
+                self.record_task_result_dispatch(command, text);
+            }
             let Some(lease) = self
                 .execution
                 .leases
@@ -6245,6 +6282,18 @@ impl State {
                     now,
                     format!("prompt {command} committed for provider dispatch"),
                 );
+            }
+            if lease.executor_id == self.identity.executor_id
+                && lease.controller_id == self.identity.controller_id
+                && let Some(stored) = self.execution.get_mut(&lease.lease_id)
+            {
+                if lease.executor_accepted_at.is_none() {
+                    stored.provider_job = effect.provider_job.clone();
+                } else if lease.provider_job != effect.provider_job {
+                    // A later write to a different or untracked process
+                    // invalidates this run's single-job evidence.
+                    stored.provider_job = None;
+                }
             }
             let _ = self.execution.transition(
                 &lease.lease_id,
@@ -16482,23 +16531,7 @@ impl State {
         if let Some(warning) = stash_warning {
             self.composer_notices.push(warning);
         }
-        let running_tasks = self
-            .tasks
-            .iter()
-            .filter(|task| matches!(task.state, TaskState::Starting | TaskState::Running))
-            .count();
         self.prepare_task_recovery();
-        if let Some(marker) = &self.run_marker
-            && (running_tasks > 0 || marker.previous_unclean)
-        {
-            self.recovery_notice = Some(if marker.previous_unclean {
-                "Shina closed unexpectedly. Recovered tasks need review. No task was automatically replayed.".into()
-            } else {
-                format!(
-                    "Shina was closed while {running_tasks} tasks were running. Review or resume them explicitly."
-                )
-            });
-        }
         if let Some(path) = self.launch_project.take()
             && let Err(error) = self.add_project(path)
         {

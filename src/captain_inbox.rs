@@ -932,7 +932,7 @@ impl State {
     /// when it is eligible. Order matters: worker reconciliation must finish
     /// before any held delivery is replayed, then human decisions,
     /// connectivity and provider holds gate the release.
-    fn unattended_blocker(&self, captain: usize) -> Option<(WaitAwaited, String)> {
+    pub(super) fn unattended_blocker(&self, captain: usize) -> Option<(WaitAwaited, String)> {
         let home = self.captain_home(captain);
         let group = self.captain_group_ids(captain);
         let peers = self.tasks.iter().filter_map(|task| {
@@ -1081,22 +1081,25 @@ impl State {
             .filter(|t| self.effective_home(t.id) == parent_thread_id)
             .map(|t| t.id)
             .collect();
-        let routed: Vec<(bool, bool)> = self
+        let routed: Vec<_> = self
             .tasks
             .iter()
             .map(|task| {
                 (
                     self.task_home(task) == Some(parent_thread_id),
                     task.coordinator_captain.is_some(),
+                    self.task_needs_result_history(task),
                 )
             })
             .collect();
         for (index, task) in self.tasks.iter_mut().enumerate() {
-            let (routed, captain_origin) = routed[index];
+            let (routed, captain_origin, needs_history) = routed[index];
             if !routed && (captain_origin || !parents.contains(&task.parent_thread_id)) {
                 continue;
             }
-            released |= task.release_result_notifications();
+            if !needs_history {
+                released |= task.release_result_notifications();
+            }
         }
         // Reports release through the same canonical event transition as
         // every other held kind, driven off the event ledger itself rather

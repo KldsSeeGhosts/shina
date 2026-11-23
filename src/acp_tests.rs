@@ -337,6 +337,7 @@ fn pump(thread: &mut Thread, predicate: impl Fn(&Thread) -> bool) {
                 panic!("ACP fixture failed: {error}\n{}", diagnostics.join("\n"))
             }
             Ok(Event::Diagnostic(message)) => diagnostics.push(message),
+            Ok(Event::ProviderJob(_)) => {}
             Ok(Event::Exited) => panic!("ACP fixture exited unexpectedly"),
             _ => {}
         }
@@ -407,6 +408,7 @@ fn antigravity_linkless_discovery_returns_models_and_commands() {
             }
             Ok(Event::Record(_)) => {}
             Ok(Event::Diagnostic(message)) => diagnostics.push(message),
+            Ok(Event::ProviderJob(_)) => {}
             Ok(Event::Error(error)) => panic!("ACP discovery failed: {error}\n{diagnostics:?}"),
             Ok(Event::Exited) => panic!("ACP discovery exited before returning its catalog"),
             Err(error) => {

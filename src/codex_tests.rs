@@ -131,7 +131,7 @@ fn prompt_free_probe_paginates_models_and_discovers_workspace_skills() {
                     break;
                 }
                 Event::Exited => break,
-                Event::Diagnostic(_) => {}
+                Event::Diagnostic(_) | Event::ProviderJob(_) => {}
             }
         }
         let wire = records(&log);
@@ -813,7 +813,7 @@ fn probe_applies_the_manifest_catalog_to_model_list() {
             Event::Record(record) => output.push(record),
             Event::Error(error) => panic!("Codex manifest probe failed: {error}"),
             Event::Exited => break,
-            Event::Diagnostic(_) => {}
+            Event::Diagnostic(_) | Event::ProviderJob(_) => {}
         }
     }
     let updates: Vec<&Value> = output
