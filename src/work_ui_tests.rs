@@ -106,40 +106,40 @@ fn expanded_kinds_fit_the_lane_and_each_output_block_is_capped() {
                 "{width}/{kind:?}: {frame:?}, lane {lane:?}"
             );
             assert!(rt.find(&format!("tool-raw-{suffix}")).is_none());
+            // KSG's WorkLogDetails bounds the whole body at 384 pt (`max-h-96`); its
+            // StructuredValue blocks cap at 320 (`max-h-80`).
+            assert!(frame[3] <= 384.5, "{width}/{kind:?}: {frame:?}");
             let block = match kind {
-                Command => "tool-text-output",
-                FileChange => "tool-diff",
-                FileSearch => "tool-search-results",
-                WebSearch => "tool-web-results",
-                _ => "tool-text-output",
+                FileChange => None,
+                FileSearch => Some(format!("tool-search-results-{suffix}")),
+                WebSearch => Some(format!("tool-web-results-{suffix}")),
+                _ => Some(format!("tool-text-output-{suffix}")),
             };
-            let key = if kind == FileChange {
-                format!("{block}-{suffix}-0")
-            } else {
-                format!("{block}-{suffix}")
-            };
-            let (rect, _) = rt.presented(&key).unwrap();
-            assert!(rect[3] <= 200.5, "{width}/{kind:?}: {rect:?}");
+            if let Some(key) = block {
+                let (rect, _) = rt.presented(&key).unwrap();
+                assert!(rect[3] <= 320.5, "{width}/{kind:?}: {rect:?}");
+            }
             if kind == FileChange {
-                let line = rt
+                // KSG's file_change inspector: the paths stay in the chat, the diff
+                // opens in the diff panel through the "Open diff" button.
+                let open = rt
                     .elements()
                     .into_iter()
-                    .find(|e| e.key.as_deref() == Some(&format!("tool-diff-line-{suffix}-0-2")))
+                    .find(|e| e.key.as_deref() == Some(&format!("tool-open-diff-{suffix}")))
                     .unwrap();
-                assert!(
-                    line.rect[2] <= rect[2] + 0.5,
-                    "{width}: long line widened the block"
-                );
-                assert!(
-                    rt.find(&format!("tool-diff-{suffix}-1")).is_none(),
-                    "delete has no fabricated diff"
-                );
+                assert_eq!(open.role, "button");
                 let path = rt
                     .elements()
                     .into_iter()
                     .find(|e| e.key.as_deref() == Some(&format!("tool-file-path-{suffix}-0")))
                     .unwrap();
-                assert_eq!(path.text.as_deref(), Some("src/lib.rs"));
+                assert_eq!(path.text.as_deref(), Some("update src/lib.rs"));
+                let removed = rt
+                    .elements()
+                    .into_iter()
+                    .find(|e| e.key.as_deref() == Some(&format!("tool-file-path-{suffix}-1")))
+                    .unwrap();
+                assert_eq!(removed.text.as_deref(), Some("delete removed.rs"));
             }
             assert!(rt.find(&format!("tool-exit-{suffix}")).is_some());
         }
@@ -186,23 +186,18 @@ fn consecutive_thoughts_share_a_row_and_expand_in_order_at_all_widths() {
         assert!(
             rt.elements()
                 .iter()
-                .any(|e| e.text.as_deref() == Some("Thought ×3"))
-        );
-        // Collapsed thought rows show the first line preview beside the verb.
-        assert!(
-            rt.elements()
-                .iter()
-                .any(|e| e.text.as_deref() == Some("First thought."))
+                .any(|e| e.text.as_deref() == Some("Thought (×3)"))
         );
         // The mixed streak folds under its summary; unfolded, its thought is its own row.
         assert!(rt.find(&format!("inline-thought-{id}-3")).is_none());
         press(&mut rt, &format!("toggle-tool-group-{id}-0"));
         rt.frame(2.0);
         assert!(rt.find(&format!("inline-thought-{id}-3")).is_some());
+        // KSG's folded single thought reads the thought's own first line.
         assert!(
             rt.elements()
                 .iter()
-                .any(|e| e.text.as_deref() == Some("Thought"))
+                .any(|e| e.text.as_deref() == Some("After the tool."))
         );
         press(&mut rt, &format!("inline-thought-{id}-0"));
         rt.frame(2.0);
