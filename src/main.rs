@@ -1357,7 +1357,12 @@ fn main() {
         Some("--service-run") => Some(
             cli.get(1)
                 .ok_or("Service descriptor required.".to_string())
-                .and_then(|path| service::launch(std::path::Path::new(path))),
+                .and_then(|path| {
+                    service::launch(
+                        std::path::Path::new(path),
+                        cli.get(2).is_some_and(|arg| arg == "--native-task"),
+                    )
+                }),
         ),
         Some("--coordinated-update") => Some(update::coordinated_helper()),
         _ => None,

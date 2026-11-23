@@ -4,5 +4,5 @@
 <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>HOST\tester</UserId></LogonTrigger></Triggers>
 <Principals><Principal id="User"><UserId>HOST\tester</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Hidden>true</Hidden><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>
-<Actions Context="User"><Exec><Command>powershell.exe</Command><Arguments>-NoProfile -NonInteractive -WindowStyle Hidden -Command &quot;$p = Start-Process -FilePath '/opt/Shina/shina' -ArgumentList '--service-run', '\&quot;/data/Shina/service.json\&quot;' -WindowStyle Hidden -PassThru; $p.WaitForExit(); exit $p.ExitCode&quot;</Arguments><WorkingDirectory>/home/test</WorkingDirectory></Exec></Actions>
+<Actions Context="User"><Exec><Command>/opt/Shina/shina</Command><Arguments>--service-run &quot;/data/Shina/service.json&quot; --native-task</Arguments><WorkingDirectory>/home/test</WorkingDirectory></Exec></Actions>
 </Task>

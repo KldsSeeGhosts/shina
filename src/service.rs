@@ -64,7 +64,9 @@ fn unit_quote(value: &str) -> String {
     )
 }
 
-fn windows_task_arguments(executable: &str, arguments: &[&str]) -> String {
+const WINDOWS_TASK_DESCRIPTION: &str = "Shina opt-in always-on server";
+
+fn legacy_windows_task_arguments(executable: &str, arguments: &[&str]) -> String {
     let arguments = arguments
         .iter()
         .map(|argument| format!("'{}'", argument.replace('\'', "''")))
@@ -77,6 +79,44 @@ fn windows_task_arguments(executable: &str, arguments: &[&str]) -> String {
         "-NoProfile -NonInteractive -WindowStyle Hidden -Command \"$p = Start-Process -FilePath '{}' -ArgumentList {arguments} -WindowStyle Hidden -PassThru; $p.WaitForExit(); exit $p.ExitCode\"",
         executable.replace('\'', "''")
     )
+}
+
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn windows_task_shell() -> PathBuf {
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    // Service CLI callers may redirect LOCALAPPDATA to isolate a profile.
+    let profile_local = std::env::var_os("USERPROFILE")
+        .map(|profile| PathBuf::from(profile).join("AppData").join("Local"));
+    let program_files = ["ProgramW6432", "ProgramFiles"].map(std::env::var_os);
+    let path = std::env::var_os("PATH");
+    find_windows_task_shell(
+        local.as_deref(),
+        profile_local.as_deref(),
+        program_files.iter().flatten().map(Path::new),
+        path.as_deref().into_iter().flat_map(std::env::split_paths),
+    )
+}
+
+fn find_windows_task_shell<'a>(
+    local: Option<&Path>,
+    profile_local: Option<&Path>,
+    program_files: impl IntoIterator<Item = &'a Path>,
+    path: impl IntoIterator<Item = PathBuf>,
+) -> PathBuf {
+    local
+        .into_iter()
+        .chain(profile_local)
+        .map(|dir| dir.join("Programs"))
+        .chain(program_files.into_iter().map(Path::to_path_buf))
+        .map(|dir| dir.join("PowerShell").join("7"))
+        .chain(path)
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|exe| exe.is_absolute() && exe.is_file())
+        // Only task management needs PowerShell. COM also works under Windows PowerShell 5.1.
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
 }
 
 #[cfg(windows)]
@@ -114,26 +154,79 @@ impl Service {
             .ok()
     }
 
-    /// Upgrade the legacy tree-wide wait without changing task grants or settings.
-    /// IgnoreNew can discard /Run until the old action exits, even after both Shina
-    /// processes have gone. COM state numbers do not depend on locale.
-    fn wait_windows_task_idle(&self) -> Result<(), String> {
-        let arguments = windows_task_arguments(
-            &self.executable.to_string_lossy(),
+    fn windows_task_arguments(&self) -> String {
+        // Older binaries ignore the trailing marker, so a rollback can still
+        // launch through a task already migrated by the new binary.
+        format!(
+            "--service-run \"{}\" --native-task",
+            self.descriptor().display()
+        )
+    }
+
+    /// Replace only a matching Shina action. Before /Run, wait for the old
+    /// instance to exit so IgnoreNew cannot discard the start request.
+    fn reconcile_windows_task(&self, previous: &Service, wait_idle: bool) -> Result<(), String> {
+        let legacy = legacy_windows_task_arguments(
+            &previous.executable.to_string_lossy(),
             &[
                 "--service-run",
-                &format!("\\\"{}\\\"", self.descriptor().display()),
+                &format!("\\\"{}\\\"", previous.descriptor().display()),
             ],
         );
-        let legacy = arguments.replace("-PassThru; $p.WaitForExit();", "-PassThru -Wait;");
-        let name = self.name.replace('\'', "''");
+        let legacy_tree = legacy.replace("-PassThru; $p.WaitForExit();", "-PassThru -Wait;");
+        // Use the task's explicit COM state rather than localized schtasks text.
         let script = format!(
-            "$ErrorActionPreference='Stop'; $s=New-Object -ComObject Schedule.Service; $s.Connect(); $f=$s.GetFolder('\\'); $t=$f.GetTask('{name}'); $d=$t.Definition; if ($d.Actions.Count -eq 1 -and $d.Actions.Item(1).Path -ieq 'powershell.exe' -and $d.Actions.Item(1).Arguments -ceq '{legacy}') {{ $d.Actions.Item(1).Arguments='{arguments}'; $null=$f.RegisterTaskDefinition('{name}',$d,4,$null,$null,3,$null) }}; $w=[Diagnostics.Stopwatch]::StartNew(); while ($t.State -eq 4 -or $t.State -eq 2) {{ if ($w.Elapsed.TotalSeconds -ge 15) {{ throw 'The previous service task did not exit within 15 seconds. No new start was requested.' }}; Start-Sleep -Milliseconds 100; $t=$f.GetTask('{name}') }}; if ($t.State -ne 3) {{ throw 'The service task is not ready to start.' }}",
-            legacy = legacy.replace('\'', "''"),
-            arguments = arguments.replace('\'', "''"),
+            r#"
+$ErrorActionPreference='Stop'
+$s=New-Object -ComObject Schedule.Service
+$s.Connect()
+$f=$s.GetFolder('\')
+$name={name}
+$w=[Diagnostics.Stopwatch]::StartNew()
+do {{
+    $t=$f.GetTask($name)
+    if (!{wait_idle} -or $t.State -notin 2,4) {{ break }}
+    if ($w.Elapsed.TotalSeconds -ge 15) {{
+        throw 'The previous service task did not exit within 15 seconds. No new start was requested.'
+    }}
+    Start-Sleep -Milliseconds 100
+}} while ($true)
+if ({wait_idle} -and $t.State -ne 3) {{ throw 'The service task is not ready to start.' }}
+$d=$t.Definition
+if ($d.RegistrationInfo.Description -cne {description} -or $d.Actions.Count -ne 1 -or
+    $d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0) {{ return }}
+$a=$d.Actions.Item(1)
+if ($a.Type -ne 0 -or $a.WorkingDirectory -ine {old_home}) {{ return }}
+$legacy=$a.Path -ieq 'powershell.exe' -and $a.Arguments -cin @({legacy},{legacy_tree})
+$native=$a.Path -ieq {old_exe} -and $a.Arguments -ceq {old_args}
+if (($legacy -or $native) -and
+    ($a.Path -ine {exe} -or $a.Arguments -cne {args} -or $a.WorkingDirectory -ine {home})) {{
+    $a.Path={exe}
+    $a.Arguments={args}
+    $a.WorkingDirectory={home}
+    # TASK_UPDATE | TASK_DONT_ADD_PRINCIPAL_ACE | TASK_IGNORE_REGISTRATION_TRIGGERS
+    $null=$f.RegisterTaskDefinition($name,$d,52,$null,$null,3,$null)
+}}
+"#,
+            name = powershell_literal(&self.name),
+            wait_idle = if wait_idle { "$true" } else { "$false" },
+            description = powershell_literal(WINDOWS_TASK_DESCRIPTION),
+            old_home = powershell_literal(&previous.home.to_string_lossy()),
+            legacy = powershell_literal(&legacy),
+            legacy_tree = powershell_literal(&legacy_tree),
+            old_exe = powershell_literal(&previous.executable.to_string_lossy()),
+            old_args = powershell_literal(&previous.windows_task_arguments()),
+            exe = powershell_literal(&self.executable.to_string_lossy()),
+            args = powershell_literal(&self.windows_task_arguments()),
+            home = powershell_literal(&self.home.to_string_lossy()),
         );
+        let shell = if std::env::var_os("SHINA_SERVICE_BIN_DIR").is_some() {
+            PathBuf::from("powershell.exe")
+        } else {
+            windows_task_shell()
+        };
         self.run(
-            "powershell.exe",
+            &shell.to_string_lossy(),
             &["-NoProfile", "-NonInteractive", "-Command", &script],
         )?;
         Ok(())
@@ -161,8 +254,6 @@ impl Service {
         let exe = self.executable.to_string_lossy();
         let descriptor = self.descriptor().to_string_lossy().into_owned();
         let log = self.log_path().to_string_lossy().into_owned();
-        let windows_arguments =
-            windows_task_arguments(&exe, &["--service-run", &format!("\\\"{descriptor}\\\"")]);
         match self.platform {
             Platform::Linux => format!(
                 "[Unit]\nDescription=Shina always-on server\nStartLimitIntervalSec=300\nStartLimitBurst=5\n\n[Service]\nType=simple\nWorkingDirectory=%h\nExecStart={} --service-run {}\nRestart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=90\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
@@ -181,7 +272,7 @@ impl Service {
                 xml(&log)
             ),
             Platform::Windows => format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><Description>Shina opt-in always-on server</Description></RegistrationInfo>\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id=\"User\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Hidden>true</Hidden><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>\n<Actions Context=\"User\"><Exec><Command>powershell.exe</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><Description>{WINDOWS_TASK_DESCRIPTION}</Description></RegistrationInfo>\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id=\"User\"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Hidden>true</Hidden><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings>\n<Actions Context=\"User\"><Exec><Command>{}</Command><Arguments>{}</Arguments><WorkingDirectory>{}</WorkingDirectory></Exec></Actions>\n</Task>\n",
                 xml(self
                     .environment
                     .get("SHINA_SERVICE_USER")
@@ -192,7 +283,8 @@ impl Service {
                     .get("SHINA_SERVICE_USER")
                     .map(String::as_str)
                     .unwrap_or("")),
-                xml(&windows_arguments),
+                xml(&exe),
+                xml(&self.windows_task_arguments()),
                 xml(&self.home.to_string_lossy())
             ),
         }
@@ -317,6 +409,9 @@ impl Service {
         Ok(format!("gui/{}", self.run("id", &["-u"])?.trim()))
     }
     pub fn start(&self) -> Result<(), String> {
+        self.start_with_previous(self)
+    }
+    fn start_with_previous(&self, previous: &Service) -> Result<(), String> {
         match self.platform {
             Platform::Linux => {
                 self.run(
@@ -337,7 +432,7 @@ impl Service {
                 }
             }
             Platform::Windows => {
-                self.wait_windows_task_idle()?;
+                self.reconcile_windows_task(previous, true)?;
                 let previous = self.launcher_pid();
                 self.run("schtasks.exe", &["/Run", "/TN", &self.name])?;
                 confirm_launcher(
@@ -835,6 +930,15 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                 .environment
                 .insert("SHINA_SERVICE_TAILNET".into(), "1".into());
         }
+        let windows_task_exists = matches!(service.platform, Platform::Windows)
+            && service
+                .run("schtasks.exe", &["/Query", "/TN", &service.name])
+                .is_ok();
+        if windows_task_exists && existing.is_none() {
+            return Err(
+                "A scheduled task with this name already exists. Choose another --name.".into(),
+            );
+        }
         if let Some(old) = &existing {
             if old.name != service.name {
                 return Err("Uninstall the existing service before changing its name.".into());
@@ -888,20 +992,22 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             }
             Platform::Mac => {}
             Platform::Windows => {
-                service.run(
-                    "schtasks.exe",
-                    &[
-                        "/Create",
-                        "/TN",
-                        &service.name,
-                        "/XML",
-                        &service.unit.to_string_lossy(),
-                        "/F",
-                    ],
-                )?;
+                if !windows_task_exists {
+                    // No /F: a task with a colliding name may belong to the user.
+                    service.run(
+                        "schtasks.exe",
+                        &[
+                            "/Create",
+                            "/TN",
+                            &service.name,
+                            "/XML",
+                            &service.unit.to_string_lossy(),
+                        ],
+                    )?;
+                }
             }
         }
-        service.start()?;
+        service.start_with_previous(existing.as_ref().unwrap_or(&service))?;
         println!(
             "Installed opt-in server service {}. Desktop login startup remains off.",
             service.name
@@ -984,7 +1090,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
 }
 
 /// KSG serviceLauncher reads the host's existing service.env at launch, not at installation.
-pub fn launch(path: &Path) -> Result<(), String> {
+pub fn launch(path: &Path, native_task: bool) -> Result<(), String> {
     let bytes = match fs::read(path) {
         Err(error)
             if cfg!(target_os = "macos")
@@ -1012,6 +1118,23 @@ pub fn launch(path: &Path) -> Result<(), String> {
         .open(&log_path)
         .map_err(|e| e.to_string())?;
     writeln!(log, "Service launcher {} started.", std::process::id()).map_err(|e| e.to_string())?;
+    if matches!(service.platform, Platform::Windows)
+        && !native_task
+        && let Ok(mut migration_log) = log.try_clone()
+    {
+        // A coordinated update restarts through a copy of the old binary. Its
+        // first run may still be wrapped; migrate for the next run without
+        // delaying readiness or stopping the current task instance.
+        let service = service.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = service.reconcile_windows_task(&service, false) {
+                let _ = writeln!(
+                    migration_log,
+                    "Could not migrate the Windows service task: {error}"
+                );
+            }
+        });
+    }
     let result = launch_server(&service, &log);
     if let Err(error) = &result {
         let _ = writeln!(log, "Service server failed: {error}");
@@ -1309,6 +1432,145 @@ mod tests {
     }
 
     #[test]
+    fn windows_task_shell_finds_per_user_pwsh_without_a_path_entry() {
+        let root = crate::store::directory().unwrap();
+        let pwsh = root.join("Programs/PowerShell/7/pwsh.exe");
+        let resolve = || find_windows_task_shell(None, Some(&root), [], []);
+        assert_eq!(resolve(), Path::new("powershell.exe"));
+        fs::create_dir_all(pwsh.parent().unwrap()).unwrap();
+        fs::write(&pwsh, []).unwrap();
+        assert_eq!(resolve(), pwsh);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a signed-in Windows user and SHINA_NATIVE_SERVICE_BINARY"]
+    fn windows_native_task_migrates_and_restarts_an_isolated_service() {
+        let binary = PathBuf::from(std::env::var_os("SHINA_NATIVE_SERVICE_BINARY").unwrap());
+        assert!(binary.is_file());
+        let name = format!("Shina-native-task-qa-{}", uuid::Uuid::new_v4());
+        let mut service = Service::current(Some(name)).unwrap();
+        let root = service.directory.join("qa profile");
+        service.directory = root.join("Shina");
+        service.unit = service.directory.join("service-task.xml");
+        service.executable = binary;
+        service
+            .environment
+            .insert("LOCALAPPDATA".into(), root.to_string_lossy().into_owned());
+        fs::create_dir_all(&service.directory).unwrap();
+        fs::write(service.descriptor(), serde_json::to_vec(&service).unwrap()).unwrap();
+        fs::write(
+            service.directory.join("service.env"),
+            format!(
+                "SHINA_PI_CLI={0}\nSHINA_CODEX_CLI={0}\nSHINA_CLAUDE_CLI={0}\n",
+                root.join("no-provider").display()
+            ),
+        )
+        .unwrap();
+        struct Cleanup(Service);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.stop();
+                let _ = self
+                    .0
+                    .run("schtasks.exe", &["/Delete", "/TN", &self.0.name, "/F"]);
+            }
+        }
+        let cleanup = Cleanup(service);
+        let service = &cleanup.0;
+        let query = || {
+            service
+                .run("schtasks.exe", &["/Query", "/TN", &service.name, "/XML"])
+                .unwrap()
+        };
+        let register = |task: &str| {
+            let bytes: Vec<_> = std::iter::once(0xfeffu16)
+                .chain(task.encode_utf16())
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            fs::write(&service.unit, bytes).unwrap();
+            service
+                .run(
+                    "schtasks.exe",
+                    &[
+                        "/Create",
+                        "/TN",
+                        &service.name,
+                        "/XML",
+                        &service.unit.to_string_lossy(),
+                        "/F",
+                    ],
+                )
+                .unwrap();
+        };
+        let native_task = service.render();
+        let native_action = format!(
+            "<Command>{}</Command>",
+            xml(&service.executable.to_string_lossy())
+        );
+        let legacy_args = legacy_windows_task_arguments(
+            &service.executable.to_string_lossy(),
+            &[
+                "--service-run",
+                &format!("\\\"{}\\\"", service.descriptor().display()),
+            ],
+        );
+        let legacy = native_task
+            .replace(&native_action, "<Command>powershell.exe</Command>")
+            .replace(&xml(&service.windows_task_arguments()), &xml(&legacy_args));
+        let custom = legacy.replace(" -NonInteractive", "");
+        register(&custom);
+        let before = query();
+        service.reconcile_windows_task(service, true).unwrap();
+        assert_eq!(query(), before, "custom action changed");
+
+        register(&legacy);
+        let wait_ready = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !service_ready(&service.directory) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "temporary service not ready"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        // Simulate an update helper from the previous release, before it knows
+        // about the native action. The new launcher migrates its own task.
+        service
+            .run("schtasks.exe", &["/Run", "/TN", &service.name])
+            .unwrap();
+        wait_ready();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let migrated = loop {
+            let xml = query();
+            if xml.contains(&native_action) {
+                break xml;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "task did not migrate: {xml}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(migrated.contains(&native_action), "{migrated}");
+        assert!(migrated.contains("<LogonType>InteractiveToken</LogonType>"));
+        // Task Scheduler omits RunLevel when it has the least-privilege default.
+        assert!(
+            !migrated.contains("<RunLevel>")
+                || migrated.contains("<RunLevel>LeastPrivilege</RunLevel>")
+        );
+        let first = service.launcher_pid().unwrap();
+        service.stop().unwrap();
+        assert!(!service_ready(&service.directory));
+        service.start().unwrap();
+        wait_ready();
+        assert_ne!(service.launcher_pid().unwrap(), first);
+        service.stop().unwrap();
+        assert!(!service_ready(&service.directory));
+    }
+
+    #[test]
     fn start_confirmation_requires_a_changed_live_launcher() {
         let mut pids = [Some(10), None, Some(20), Some(30)].into_iter();
         confirm_launcher(Some(10), || pids.next().flatten(), |pid| pid == 30, || {}).unwrap();
@@ -1442,7 +1704,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let arguments = windows_task_arguments(
+        let arguments = legacy_windows_task_arguments(
             "powershell.exe",
             &[
                 "-NoProfile",
