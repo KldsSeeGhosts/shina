@@ -354,8 +354,7 @@ fn actions(
     // The captain's away line takes the free middle space at wide windows only,
     // where it cannot push the title into the nav cluster.
     if s.viewport_width >= 1280.0 {
-        let available = rune::memo::layout_size("captain-away-slot").map(|size| size[0]);
-        if let Some(line) = captain_ui::away_status(s, p, available) {
+        if let Some(line) = captain_ui::away_status(s, p) {
             row = row.child(
                 el().key("captain-away-slot")
                     .max_w(280.0)
