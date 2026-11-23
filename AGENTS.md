@@ -1,6 +1,6 @@
 # Shina agent guide
 
-Shina is a native Rust app built on [Rune](https://github.com/anomalyco/rune). Almost all UI lives in `src/ui.rs`.
+Shina is a native Rust app built on [Rune](https://github.com/anomalyco/rune). Almost all UI lives in `src/ui.rs` and its submodules under `src/ui/`.
 
 ## Visual skin: KSG Code
 
@@ -8,7 +8,7 @@ Since 2026-11-18 Shina matches KSG Code's own visual design (the redesign merged
 
 Notes for the skin in code:
 
-- `Palette` in `src/ui.rs` holds KSG's neutral surfaces and Wave 3's status colours. Use `lift` for an active option on a card and `row` for sidebar selection. Use `sea` for working and focus, `brass` for requests, `danger` for failure and deletions, and `ok` for success and additions. Each status has its own `_bg` tint. `coral` keeps its existing primary-button role. Text uses KSG's ramp from `index.css`: `strong` (`--strong-foreground`) for the open sidebar thread and other active labels, `ink` (`--foreground`) for prose, titles and values, `muted` (`--muted-foreground`) for tool rows, labels and meta text, and `faint` (`--placeholder`) for carets, timestamps and counts. `faint` reads 3:1, not 4.5:1, so never put text a reader needs in it. All four are opaque. Hover blends in linear light, so keep its dark wash below selection and never stack two washes. Contrast tests in `src/ui.rs` and `src/markdown_ui.rs` cover both themes and the hover composites.
+- `Palette` in `src/ui.rs` holds KSG's neutral surfaces and Wave 3's status colours. Use `lift` for an active option on a card and `row` for sidebar selection. Use `sea` for working and focus, `brass` for requests, `danger` for failure and deletions, and `ok` for success and additions. Each status has its own `_bg` tint. `coral` keeps its existing primary-button role. Text uses KSG's ramp from `index.css`: `strong` (`--strong-foreground`) for the open sidebar thread and other active labels, `ink` (`--foreground`) for prose, titles and values, `muted` (`--muted-foreground`) for tool rows, labels and meta text, and `faint` (`--placeholder`) for carets, timestamps and counts. `faint` reads 3:1, not 4.5:1, so never put text a reader needs in it. All four are opaque. Hover blends in linear light, so keep its dark wash below selection and never stack two washes. Contrast tests in `src/ui/tests*.rs` and `src/markdown_ui.rs` cover both themes and the hover composites.
 - All UI text uses one stack, `SANS_FAMILY`, as KSG's `--font-sans` does: the user's installed Anthropic Sans (their KSG Appearance font) when present, else the bundled Inter, which is KSG's default. Do not pin a style to a named family. Code uses `MONO_FAMILY` (Anthropic Mono, else the system mono). `meta(size)`, `META` and `META_LABEL` are the small 12 px weight 500 styles for labels, counts, timers, status words and badges; section labels are sentence case. The system mono is only for code, inline code, keycaps, branch names and diff gutters. Prose, titles and the empty-thread greetings follow KSG's type scale (14/22.5 prose, `DraftHeroHeadline` at 30/500 with tight tracking).
 - Corners follow KSG's radii: 6 for rows and chips, 8 for buttons, inputs and tabs, 12 for cards, menus, dialogs and code blocks, 16 for user bubbles and the composer tray with the 15 px main card inside it.
 - `framed` is a 1 px `frame` border with KSG's soft control shadow, for things you act on. `outlined` is the border only, for keycaps, counts and badges. Use `soft_shadow` for menus and popovers and `dialog_shadow` for scrim-backed dialogs. There are no hard offset shadows.
@@ -29,11 +29,11 @@ Workflow:
 
 Already ported:
 
-| Shina (`src/ui.rs`) | KSG Code source |
+| Shina (`src/ui.rs`, `src/ui/`) | KSG Code source |
 | --- | --- |
 | `empty_thread`, `draft_headline` | `components/ChatView.tsx` (draft hero overlay), `components/NoProjectsHero.tsx`, `chat/DraftHeroHeadline.tsx`, `chat/DraftHeroProjectHeading.tsx` |
 | `add_project_palette`, `browse_tab_complete`, `browse_into` | `components/CommandPalette.tsx` (`add-project` flow, `getAddProjectInitialQueryForEnvironment`, `getFilesystemBrowseTabCompletion`, `browseTo`) |
-| `new_thread_click` (`src/model.rs`) | `components/Sidebar.logic.ts` (`shouldCreateNewThreadInCurrentProject`), `lib/chatThreadActions.ts` (`startNewThreadFromContext`) |
+| `new_thread_click` (`src/model/sidebar_state.rs`) | `components/Sidebar.logic.ts` (`shouldCreateNewThreadInCurrentProject`), `lib/chatThreadActions.ts` (`startNewThreadFromContext`) |
 | `composer` card and footer | `chat/ComposerSurface.tsx`, `chat/ChatComposer.tsx` |
 | `attachment_chip` | `chat/ComposerAttachmentStrip.tsx` |
 | `model_effort_trigger`, `model_picker`, `model_list`, `tallest_model_tab_h` | `chat/ProviderModelPicker.tsx`, `chat/ModelPickerContent.tsx` (`tallestTabUnits`), `chat/ModelPickerSidebar.tsx`, `chat/ModelListRow.tsx` |
