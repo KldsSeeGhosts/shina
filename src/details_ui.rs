@@ -556,17 +556,21 @@ fn lineage_row(s: &State, p: Palette, item: &LineageRow) -> El {
             s.details.hover = None;
         }
     })
-    .on_press(move |s: &mut State| {
-        s.details.hover = None;
-        s.details.popover = false;
-        match &target {
-            Target::Crew(id) => super::crew_ui::open_thread(s, *id),
-            Target::Agent(key) => {
-                s.agents_expanded.insert(key.clone());
-                agents_ui::open(s);
-            }
+    .on_press(move |s: &mut State| open(s, &target))
+}
+
+/// Opens an agent: a crew worker's own thread, or a provider subagent unfolded in the
+/// right panel's Work tab.
+fn open(s: &mut State, target: &Target) {
+    s.details.hover = None;
+    s.details.popover = false;
+    match target {
+        Target::Crew(id) => super::crew_ui::open_thread(s, *id),
+        Target::Agent(key) => {
+            s.agents_expanded.insert(key.clone());
+            agents_ui::open(s);
         }
-    })
+    }
 }
 
 /// The Lineage card, ported from KSG Code's `ThreadRelationshipsPanel`: who delegated the

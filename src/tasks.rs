@@ -963,6 +963,19 @@ impl State {
         Ok(())
     }
 
+    /// The interrupted, reconciled task this worker thread runs, which `resume_task` and
+    /// `dismiss_task` accept.
+    pub fn resumable_task(&self, child_thread_id: usize) -> Option<String> {
+        self.tasks
+            .iter()
+            .find(|task| {
+                task.child_thread_id == child_thread_id
+                    && task.state == TaskState::Interrupted
+                    && !task.recovering
+            })
+            .map(|task| task.id.clone())
+    }
+
     /// Explicit user action. It uses the same guarded continuation as restart recovery.
     pub fn resume_task(&mut self, task_id: &str) -> Result<(), String> {
         if let Some(result) = self.remote("task.resume", json!({"taskId":task_id})) {
